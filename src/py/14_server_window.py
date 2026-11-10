@@ -100,6 +100,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, signals_payload(cfg, acc, q))
             if u.path == "/api/monitor":
                 return self.send(200, build_monitor(cfg, acc))
+            if u.path == "/api/bench":
+                return self.send(200, bench_payload(cfg, acc, q))
+            if u.path == "/api/calc":
+                return self.send(200, calc_params(cfg, acc))
+            if u.path == "/api/offers":
+                return self.send(200, offers_payload(cfg, acc))
+            if u.path == "/api/ladder":
+                return self.send(200, ladder_payload(cfg, q))
             if u.path == "/api/rates":
                 return self.send(200, rates_payload(q.get("days", "365")))
             if u.path == "/api/backup":
@@ -305,6 +313,10 @@ def main():
     try:
         try:
             ratings_start()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            warmup_start()
         except Exception:  # noqa: BLE001
             pass
         srv.serve_forever()

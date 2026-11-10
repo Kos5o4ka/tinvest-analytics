@@ -237,20 +237,21 @@ def _kr_cells(txt):
     return cells
 
 
-def _kr_parse_pdf(data):
-    """Строка «Ключевая ставка, в среднем за год» таблицы основных параметров прогноза -> {год: (low, high)}."""
+def _kr_parse_pdf(data, label="Ключевая ставка", tail=r"годовых(.*)$", need=""):
+    """Строка таблицы основных параметров прогноза -> {год: (low, high)}.
+    По умолчанию «Ключевая ставка, в среднем за год»; для инфляции — label «Инфляция», need «декабрь», tail r"года(.*)$"."""
     fr = pdf_text_fragments(data)
     big = [f for f in fr if f[2] >= 8]          # мелкий шрифт — сноски и надстрочные индексы
 
     def row(y, tol=2.5):
         rs = sorted((f for f in big if abs(f[1] - y) <= tol), key=lambda f: f[0])
         return "".join(f[3] for f in rs)
-    lab = [f for f in big if f[3].startswith("Ключевая ставка")]
+    lab = [f for f in big if f[3].startswith(label) and need in row(f[1])]
     first = [f for f in big if f[3].startswith("Инфляция")]
     if not lab or not first:
         raise ValueError("нет строки таблицы")
     y0 = max(f[1] for f in first)
-    m = re.search(r"годовых(.*)$", row(lab[0][1]))
+    m = re.search(tail, row(lab[0][1]))
     cells = _kr_cells(m.group(1) if m else "")
     hdr = "".join(f[3] for f in sorted((f for f in big if y0 + 3 < f[1] < y0 + 45 and f[0] > 150), key=lambda f: (f[0], -f[1])))
     years = sorted({int(y) for y in re.findall(r"20\d\d", hdr)})
@@ -276,6 +277,31 @@ def _kr_cbr():
     years = {int(k): tuple(v) for k, v in pt.items()}
     # в таблице первым идёт последний фактический год: он не прогноз
     return {"as_of": as_of, "url": "https://www.cbr.ru" + path, "years": years}
+
+
+def inflation_forecast():
+    """Прогноз инфляции (декабрь к декабрю) из того же среднесрочного прогноза Банка России.
+    {source: 'cbr'|'none', as_of, url, yearly:[{year, low, high, mid}]} — только текущий и будущие годы.
+    Кэш 24 часа; при ошибке — source 'none' и пустой yearly (вызывающий код берёт свою оценку, например 4%)."""
+    st = store()
+    raw = st.get("infl_src", ttl=KR_TTL)
+    if raw is None:
+        try:
+            s = http_text(KR_CBR_PAGE, 30)
+            links = re.findall(r'href="(/Content/Document/File/\d+/forecast_(\d\d)(\d\d)(\d\d)\.pdf)"', s)
+            if not links:
+                raise ValueError("нет ссылки на прогноз")
+            path, yy, mm, dd = max(links, key=lambda x: x[1:])
+            yr = _kr_parse_pdf(http_bytes("https://www.cbr.ru" + path, 40), "Инфляция", r"года(.*)$", "декабрь")
+            raw = {"source": "cbr", "as_of": "20%s-%s-%s" % (yy, mm, dd), "url": "https://www.cbr.ru" + path,
+                   "years": {str(k): list(v) for k, v in yr.items()}}
+            st.put("infl_src", raw)
+        except Exception as e:  # noqa: BLE001
+            return {"source": "none", "as_of": "", "url": "", "yearly": [], "error": str(e)[:140]}
+    y0 = date.today().year
+    yearly = [{"year": int(k), "low": v[0], "high": v[1], "mid": round((v[0] + v[1]) / 2.0, 2)}
+              for k, v in sorted(raw["years"].items()) if int(k) >= y0]
+    return {"source": raw["source"], "as_of": raw["as_of"], "url": raw["url"], "yearly": yearly}
 
 
 # ── источник 2: макроопрос Банка России (HTML-таблица) ──

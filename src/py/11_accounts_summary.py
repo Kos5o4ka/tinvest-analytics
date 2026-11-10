@@ -240,3 +240,8 @@ def logo_bytes(name):
         return None
 
 
+
+
+def warmup_start():
+    """Фоновый прогрев кэшей при запуске сервера (заполняется в рамках ускорения первого запуска)."""
+    return None

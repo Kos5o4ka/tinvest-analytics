@@ -55,6 +55,10 @@ function bindPage(){
   if(S.page==='scr')bindScr();
   if(S.page==='risk')bindRisk();
   if(S.page==='mon')bindMon();
+  if(S.page==='bench')bindBench();
+  if(S.page==='calc')bindCalc();
+  if(S.page==='off')bindOff();
+  if(S.page==='lad')bindLad();
   if($('#pri-r'))$('#pri-r').onclick=()=>{S.pri=null;render()};
   if($('#pdays'))$('#pdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.payDays=+b.dataset.d;render()};
   if($('#rdays'))$('#rdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.ratesDays=+b.dataset.d;S.rates=null;render()};

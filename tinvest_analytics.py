@@ -2663,6 +2663,11 @@ def logo_bytes(name):
         return None
 
 
+
+
+def warmup_start():
+    """Фоновый прогрев кэшей при запуске сервера (заполняется в рамках ускорения первого запуска)."""
+    return None
 # ═══════════════════ внешние данные: кредитные рейтинги, КБД, ключевая ставка ═══════════════════
 # Наружу уходят только обезличенные GET-запросы к публичным страницам (t.me, cbr.ru, moex.com):
 # ни токен, ни состав портфеля никуда не передаются.
@@ -4160,20 +4165,21 @@ def _kr_cells(txt):
     return cells
 
 
-def _kr_parse_pdf(data):
-    """Строка «Ключевая ставка, в среднем за год» таблицы основных параметров прогноза -> {год: (low, high)}."""
+def _kr_parse_pdf(data, label="Ключевая ставка", tail=r"годовых(.*)$", need=""):
+    """Строка таблицы основных параметров прогноза -> {год: (low, high)}.
+    По умолчанию «Ключевая ставка, в среднем за год»; для инфляции — label «Инфляция», need «декабрь», tail r"года(.*)$"."""
     fr = pdf_text_fragments(data)
     big = [f for f in fr if f[2] >= 8]          # мелкий шрифт — сноски и надстрочные индексы
 
     def row(y, tol=2.5):
         rs = sorted((f for f in big if abs(f[1] - y) <= tol), key=lambda f: f[0])
         return "".join(f[3] for f in rs)
-    lab = [f for f in big if f[3].startswith("Ключевая ставка")]
+    lab = [f for f in big if f[3].startswith(label) and need in row(f[1])]
     first = [f for f in big if f[3].startswith("Инфляция")]
     if not lab or not first:
         raise ValueError("нет строки таблицы")
     y0 = max(f[1] for f in first)
-    m = re.search(r"годовых(.*)$", row(lab[0][1]))
+    m = re.search(tail, row(lab[0][1]))
     cells = _kr_cells(m.group(1) if m else "")
     hdr = "".join(f[3] for f in sorted((f for f in big if y0 + 3 < f[1] < y0 + 45 and f[0] > 150), key=lambda f: (f[0], -f[1])))
     years = sorted({int(y) for y in re.findall(r"20\d\d", hdr)})
@@ -4199,6 +4205,31 @@ def _kr_cbr():
     years = {int(k): tuple(v) for k, v in pt.items()}
     # в таблице первым идёт последний фактический год: он не прогноз
     return {"as_of": as_of, "url": "https://www.cbr.ru" + path, "years": years}
+
+
+def inflation_forecast():
+    """Прогноз инфляции (декабрь к декабрю) из того же среднесрочного прогноза Банка России.
+    {source: 'cbr'|'none', as_of, url, yearly:[{year, low, high, mid}]} — только текущий и будущие годы.
+    Кэш 24 часа; при ошибке — source 'none' и пустой yearly (вызывающий код берёт свою оценку, например 4%)."""
+    st = store()
+    raw = st.get("infl_src", ttl=KR_TTL)
+    if raw is None:
+        try:
+            s = http_text(KR_CBR_PAGE, 30)
+            links = re.findall(r'href="(/Content/Document/File/\d+/forecast_(\d\d)(\d\d)(\d\d)\.pdf)"', s)
+            if not links:
+                raise ValueError("нет ссылки на прогноз")
+            path, yy, mm, dd = max(links, key=lambda x: x[1:])
+            yr = _kr_parse_pdf(http_bytes("https://www.cbr.ru" + path, 40), "Инфляция", r"года(.*)$", "декабрь")
+            raw = {"source": "cbr", "as_of": "20%s-%s-%s" % (yy, mm, dd), "url": "https://www.cbr.ru" + path,
+                   "years": {str(k): list(v) for k, v in yr.items()}}
+            st.put("infl_src", raw)
+        except Exception as e:  # noqa: BLE001
+            return {"source": "none", "as_of": "", "url": "", "yearly": [], "error": str(e)[:140]}
+    y0 = date.today().year
+    yearly = [{"year": int(k), "low": v[0], "high": v[1], "mid": round((v[0] + v[1]) / 2.0, 2)}
+              for k, v in sorted(raw["years"].items()) if int(k) >= y0]
+    return {"source": raw["source"], "as_of": raw["as_of"], "url": raw["url"], "yearly": yearly}
 
 
 # ── источник 2: макроопрос Банка России (HTML-таблица) ──
@@ -5128,6 +5159,22 @@ def _build_monitor(cfg, acc, th, t0):
 def _neg(d):
     """Ключ для сортировки дат по убыванию."""
     return tuple(-ord(c) for c in d or "")
+# ═══════════════════════════════ сравнение с рынком: индексы и фонды Мосбиржи ═══════════════════════════════
+
+def bench_payload(cfg, acc, q=None):
+    return {"error": "раздел в разработке"}
+# ═══════════════════════════════ калькулятор инвестиций: параметры рынка ═══════════════════════════════
+
+def calc_params(cfg, acc):
+    return {"error": "раздел в разработке"}
+# ═══════════════════════════════ оферты и конструктор лесенки ═══════════════════════════════
+
+def offers_payload(cfg, acc):
+    return {"error": "раздел в разработке"}
+
+
+def ladder_payload(cfg, q=None):
+    return {"error": "раздел в разработке"}
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -5230,6 +5277,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, signals_payload(cfg, acc, q))
             if u.path == "/api/monitor":
                 return self.send(200, build_monitor(cfg, acc))
+            if u.path == "/api/bench":
+                return self.send(200, bench_payload(cfg, acc, q))
+            if u.path == "/api/calc":
+                return self.send(200, calc_params(cfg, acc))
+            if u.path == "/api/offers":
+                return self.send(200, offers_payload(cfg, acc))
+            if u.path == "/api/ladder":
+                return self.send(200, ladder_payload(cfg, q))
             if u.path == "/api/rates":
                 return self.send(200, rates_payload(q.get("days", "365")))
             if u.path == "/api/backup":
@@ -5435,6 +5490,10 @@ def main():
     try:
         try:
             ratings_start()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            warmup_start()
         except Exception:  # noqa: BLE001
             pass
         srv.serve_forever()
@@ -5800,6 +5859,9 @@ body.bc-open{overflow:hidden}
 .mon-th{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-top:14px}
 #mon-tab tbody tr{cursor:pointer}
 [data-theme=light] .mon-al{background:#f0f2f6}
+/* сравнение с рынком */
+/* калькулятор инвестиций */
+/* оферты и лесенка */
 </style></head>
 <body>
 <aside>
@@ -5871,11 +5933,15 @@ const IC={
  pri:'<path d="M12 2l2.6 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.4 6.1 20.1l1.6-6.7L2.5 8.9l6.9-.6z"/>',
  mkt:'<path d="M3 4v16h18"/><path d="M7 14l4-4 3 3 5-6"/>',
  reb:'<path d="M12 3v18M5 7h14M5 7l-2 6a3 3 0 0 0 6 0zM19 7l-2 6a3 3 0 0 0 6 0z"/>',
+ bench:'<path d="M3 20h18"/><path d="M6 16V9M11 16V5M16 16v-5M20 16v-8"/>',
+ calc:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2M12 11h2M16 11h0M8 15h2M12 15h2M8 18h2M12 18h4"/>',
+ off:'<path d="M4 12h12M12 7l5 5-5 5"/><path d="M20 4v16"/>',
+ lad:'<path d="M7 3v18M17 3v18M7 7h10M7 12h10M7 17h10"/>',
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const PAGES=[['dash','Обзор'],['ret','Доходность'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['mkt','Ставки'],['scr','Скринер облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['pri','Первичка'],null,['imp','Импорт отчётов'],['set','Настройки']];
+const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['pri','Первичка'],null,['imp','Импорт отчётов'],['set','Настройки']];
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
-const PERIOD_PAGES=['dash','ret','ops','fees'];
+const PERIOD_PAGES=['dash','ret','bench','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
 let st={};try{st=JSON.parse(lsGet('ta_state')||'{}')||{}}catch(e){}
 const S={page:st.page||'dash',period:st.period||'all',account:st.account||'all',hideEmpty:st.hideEmpty!==false,
@@ -6083,7 +6149,7 @@ function render(){
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri})[S.page]()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,bench:pBench,calc:pCalc,off:pOff,lad:pLad})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -6908,6 +6974,10 @@ function bindPage(){
   if(S.page==='scr')bindScr();
   if(S.page==='risk')bindRisk();
   if(S.page==='mon')bindMon();
+  if(S.page==='bench')bindBench();
+  if(S.page==='calc')bindCalc();
+  if(S.page==='off')bindOff();
+  if(S.page==='lad')bindLad();
   if($('#pri-r'))$('#pri-r').onclick=()=>{S.pri=null;render()};
   if($('#pdays'))$('#pdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.payDays=+b.dataset.d;render()};
   if($('#rdays'))$('#rdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.ratesDays=+b.dataset.d;S.rates=null;render()};
@@ -7462,6 +7532,18 @@ function bindMon(){
   if(sv)sv.onclick=async()=>{const b={};['mon_drop5','mon_drop30','mon_spread30','mon_sell_days','mon_offer_days'].forEach(k=>b[k]=$('#mt-'+k).value);
     sv.disabled=true;try{await post('/api/config',b);S.cfg=await api('/api/config')}catch(e){}S.mon=null;render()};
 }
+/* ── Сравнение с рынком: индексы облигаций, фонды ликвидности и облигационные БПИФ ── */
+function pBench(){return`<div class="card empty">Раздел в разработке</div>`}
+function bindBench(){}
+/* ── Калькулятор инвестиций ── */
+function pCalc(){return`<div class="card empty">Раздел в разработке</div>`}
+function bindCalc(){}
+/* ── Оферты: держать или предъявить ── */
+function pOff(){return`<div class="card empty">Раздел в разработке</div>`}
+function bindOff(){}
+/* ── Конструктор облигационной лестницы ── */
+function pLad(){return`<div class="card empty">Раздел в разработке</div>`}
+function bindLad(){}
 </script></body></html>
 '''
 
