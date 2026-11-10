@@ -43,7 +43,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "T-Invest Analytics"
-APP_VERSION = "0.6"
+APP_VERSION = "0.7"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -1186,7 +1186,8 @@ def bonds_report(client, rows):
                "issuers": len({r["name"].split(" ")[0] for r in bonds})}
     out.sort(key=lambda x: -(x.get("value_rub") or 0))
     return {"rows": out, "metrics": metrics, "ladder": sorted(ladder.items()), "risk": sorted(risk.items(), key=lambda x: -x[1]),
-            "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays}
+            "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays,
+            "ratings": apply_ratings(out), "ratings_info": ratings_status()}
 
 
 # ═══════════════════════════════ история стоимости и доходность ═══════════════════════════════
@@ -1919,9 +1920,14 @@ def build_summary(cfg, acc, period, force=False):
 
 
 def build_bonds(cfg, acc, force=False):
+    ratings_start()          # обновит рейтинги, если данным больше 12 часов
     key = ("bonds", token_key(cfg), acc)
     hit = None if force else mem_get(key, 600)
     if hit:
+        st = ratings_status()
+        if hit.get("ratings_info", {}).get("updated") != st["updated"]:
+            hit["ratings"] = apply_ratings(hit["rows"])
+        hit["ratings_info"] = st
         return hit
     s = build_summary(cfg, acc, "all")
     return mem_put(key, bonds_report(TInvest(cfg), s["portfolio"]["positions"]))
@@ -1988,6 +1994,364 @@ def logo_bytes(name):
         os.makedirs(LOGO_DIR, exist_ok=True)
         open(miss, "w").close()
         return None
+
+
+# ═══════════════════ внешние данные: кредитные рейтинги, КБД, ключевая ставка ═══════════════════
+# Наружу уходят только обезличенные GET-запросы к публичным страницам (t.me, cbr.ru, moex.com):
+# ни токен, ни состав портфеля никуда не передаются.
+
+EXT_UA = {"User-Agent": "Mozilla/5.0 (compatible; tinvest-analytics)"}
+_ext_ctx = []
+
+
+def http_text(url, timeout=25):
+    if not _ext_ctx:
+        _ext_ctx.append(make_ssl_context())
+    req = urllib.request.Request(url, headers=EXT_UA)
+    with urllib.request.urlopen(req, timeout=timeout, context=_ext_ctx[0]) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+# ── кредитные рейтинги (канал @issuerRatings: АКРА, Эксперт РА, НКР, НРА) ──
+
+RATING_CH = "https://t.me/s/issuerRatings"
+RATING_SCALE = ["AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-", "BB+", "BB", "BB-",
+                "B+", "B", "B-", "CCC", "CC", "C", "D"]
+RT_KEY, RT_DAYS, RT_MAX_PAGES, RT_TTL, RT_OLD = "ratings_v1", 430, 280, 12 * 3600, 600
+_L = "[AАBВCС]"
+_NOTLET = "(?<![A-Za-zА-Яа-яЁё])"
+_RATING_PATS = [re.compile(p) for p in (
+    _NOTLET + "(" + _L + "{1,3})([+\\-−–]?)\\s?(?i:\\(RU\\))",
+    _NOTLET + "ru(" + _L + "{1,3})([+\\-−–]?)(?![A-Za-zА-Яа-яЁё])(?!\\.[a-z])",
+    _NOTLET + "(" + _L + "{1,3})([+\\-−–]?)\\.ru",
+    _NOTLET + "(" + _L + "{1,3})([+\\-−–]?)\\|ru\\|")]
+_LAT = str.maketrans({"А": "A", "В": "B", "С": "C"})
+_Q_STOP = ("стабильн", "позитивн", "негативн", "развива", "наблюдени", "эксперт", "акра", "нкр", "нра", "рейтинг",
+           "подробнее")
+_LEGAL = {"пао", "ао", "ооо", "оао", "зао", "мфк", "мкк", "пко", "нко", "гк", "группа", "компания", "холдинг",
+          "корпорация", "бо", "бп", "кс", "обл", "серия", "серии", "выпуск", "сфо"}
+_rt_state = {"running": False, "progress": "", "error": ""}
+_rt_lock = threading.Lock()
+_rt_idx = {}
+
+
+def _rating_token(t):
+    best = None
+    for p in _RATING_PATS:
+        m = p.search(t)
+        if m and (best is None or m.start() < best.start()):
+            best = m
+    if not best:
+        return None
+    v = (best.group(1) + best.group(2)).translate(_LAT).upper().replace("−", "-").replace("–", "-")
+    return v if v in RATING_SCALE else None
+
+
+def _rating_issuer(t):
+    for m in re.finditer(r"[«\"“]([^»\"”]{2,70})[»\"”]", t):
+        q = m.group(1).strip()
+        ql = q.lower().replace("c", "с")
+        if any(w in ql for w in _Q_STOP) or "|" in q or re.fullmatch(r"[A-Za-z0-9 ]{1,3}", q):
+            continue
+        return q
+    m = re.search(r"(?:ПАО|АО|ООО|МФК|МКК|ПКО|НКО|ОАО|ЗАО)\s+([А-ЯЁA-Z][\wЁё\-]+(?:\s+[А-ЯЁA-Z][\wЁё\-]+)?)", t)
+    if not m:
+        m = re.search(r"рейтинг\w*\s+(?:кредитоспособности\s+|облигаци\w+\s+|выпуск\w*\s+)*"
+                      r"([А-ЯЁA-Z][^,.«»\n]{2,55}?)\s+(?:на\s+уровне|до\s+уровня)", t, re.I)
+        if not m:
+            return None
+        c = re.split(r"\s+(?:серии|серий|классов?)\b", m.group(1), flags=re.I)[0].strip()
+        return c if c and not re.search(r"\d", c) and len(c.split()) <= 6 else None
+    words = []
+    for w in m.group(1).split():
+        if w.upper() in ("НА", "ДО", "ПО", "И", "С", "В", "ПРОГНОЗ", "СЕРИИ", "СЕРИЯ", "ВЫПУСКА", "ОБЛИГАЦИЙ", "КЛАССА"):
+            break
+        words.append(w)
+    return " ".join(words) or None
+
+
+def name_tokens(s):
+    out = set()
+    for i, t in enumerate(re.findall(r"[a-zа-я0-9]+", (s or "").lower().replace("ё", "е"))):
+        if t in _LEGAL or (i == 0 and t == "банк") or len(t) < 2 or any(ch.isdigit() for ch in t):
+            continue
+        out.add(t[:5])
+    return frozenset(out)
+
+
+def parse_rating_post(text):
+    low = text.lower()
+    head = low[:80]
+    agency = next((a for pat, a in ((r"\bакра\b", "АКРА"), (r"эксперт\s+ра", "Эксперт РА"), (r"\bнкр\b", "НКР"),
+                                    (r"\bнра\b", "НРА")) if re.search(pat, head)), None)
+    if not agency or re.search(r"ожидаем|\.sf|структурир|сфо|\bкласс|esg|\.gq|качеств|надежност|некредитн|\.am", low):
+        return None
+    issuer = _rating_issuer(text)
+    if not issuer:
+        return None
+    level = "bond" if re.search(r"облигаци|выпуск", low) else "issuer"
+    if "отозва" in low:
+        return {"agency": agency, "issuer": issuer, "level": level, "withdrawn": True}
+    v = _rating_token(re.split(r"(?i)\bранее\b", text)[0])
+    if not v:
+        return None
+    om = re.search(r"прогноз.{0,40}?(стабильн|позитивн|негативн|развивающ)", low)
+    return {"agency": agency, "issuer": issuer, "level": level, "rating": v,
+            "outlook": {"стабильн": "стабильный", "позитивн": "позитивный", "негативн": "негативный",
+                        "развивающ": "развивающийся"}.get(om.group(1), "") if om else ""}
+
+
+def tg_page(before=None):
+    s = http_text(RATING_CH + ("?before=%d" % before if before else ""))
+    ids, posts = [], []
+    for blk in s.split("tgme_widget_message_wrap")[1:]:
+        m = re.search(r'data-post="issuerRatings/(\d+)"', blk)
+        if not m:
+            continue
+        ids.append(int(m.group(1)))
+        t = re.search(r'tgme_widget_message_text[^>]*>(.*?)</div>', blk, re.S)
+        d = re.search(r'<time datetime="([^"]+)"', blk)
+        if t and d:
+            import html as _html
+            txt = _html.unescape(re.sub(r"<br/?>", "\n", re.sub(r"<(?!br)[^>]+>", "", t.group(1))))
+            posts.append((int(m.group(1)), d.group(1), txt))
+    return ids, posts
+
+
+def _ratings_run():
+    st = store()
+    try:
+        data = st.get(RT_KEY) or {"items": {}, "max_id": 0, "updated": 0}
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=RT_DAYS)).isoformat()
+        got, before, pages = {}, None, 0
+        while pages < RT_MAX_PAGES:
+            ids, posts = None, None
+            for _ in range(3):
+                try:
+                    ids, posts = tg_page(before)
+                    break
+                except Exception:  # noqa: BLE001
+                    time.sleep(1.5)
+            if ids is None:
+                raise OSError("не удалось загрузить канал рейтингов (нет доступа к t.me)")
+            if not ids:
+                break
+            pages += 1
+            for p in posts:
+                got[p[0]] = p
+            _rt_state["progress"] = "загружено страниц: %d" % pages
+            mn = min(ids)
+            oldest = min((p[1] for p in posts), default="9")
+            if data["max_id"] and mn <= data["max_id"]:
+                break
+            if not data["max_id"] and oldest < cutoff:
+                break
+            if before is not None and mn >= before:
+                break
+            before = mn
+            time.sleep(0.25)
+        items = data["items"]
+        for pid in sorted(got):
+            if pid <= data["max_id"]:
+                continue
+            _, iso, text = got[pid]
+            r = parse_rating_post(text)
+            if not r:
+                continue
+            toks = "".join(sorted(name_tokens(r["issuer"])))
+            if not toks:
+                continue
+            key = "%s|%s|%s" % (toks, r["agency"], r["level"])
+            if r.get("withdrawn"):
+                if r["level"] == "issuer":
+                    items.pop(key, None)
+                continue
+            items[key] = {"issuer": r["issuer"], "agency": r["agency"], "level": r["level"], "rating": r["rating"],
+                          "outlook": r["outlook"], "date": iso[:10], "post": pid}
+        data["max_id"] = max([data["max_id"]] + list(got))
+        data["updated"] = time.time()
+        st.put(RT_KEY, data)
+        _rt_state["error"] = ""
+        _rt_idx.clear()
+    except Exception as e:  # noqa: BLE001
+        _rt_state["error"] = str(e)[:200]
+    finally:
+        _rt_state["running"] = False
+        _rt_state["progress"] = ""
+
+
+def ratings_start(force=False):
+    with _rt_lock:
+        if _rt_state["running"]:
+            return False
+        if not force:
+            d = store().get(RT_KEY)
+            if d and time.time() - d.get("updated", 0) < RT_TTL:
+                return False
+        _rt_state["running"] = True
+    threading.Thread(target=_ratings_run, daemon=True).start()
+    return True
+
+
+def ratings_status():
+    d = store().get(RT_KEY) or {}
+    return {"updated": d.get("updated"), "count": len(d.get("items") or {}), "running": _rt_state["running"],
+            "progress": _rt_state["progress"], "error": _rt_state["error"]}
+
+
+def _rating_index():
+    d = store().get(RT_KEY) or {}
+    if _rt_idx.get("u") != d.get("updated"):
+        old = (date.today() - timedelta(days=RT_OLD)).isoformat()
+        _rt_idx.clear()
+        _rt_idx["u"] = d.get("updated")
+        _rt_idx["items"] = [(it, name_tokens(it["issuer"])) for it in (d.get("items") or {}).values()
+                            if it["date"] >= old]
+    return _rt_idx["items"]
+
+
+def rating_for(name):
+    """Рейтинг эмитента по названию облигации. Точное совпадение названий — надёжно, частичное — approx."""
+    bt = name_tokens(name)
+    if not bt:
+        return None
+    best = {}
+    for it, toks in _rating_index():
+        if not toks:
+            continue
+        if toks == bt:
+            sc = 100.0
+        elif toks <= bt or bt <= toks:
+            sc = float(sum(len(t) for t in toks & bt))
+            if sc < 6 and any(len(t) > 2 for t in (toks | bt) - (toks & bt)):
+                continue
+            if sc < 5:
+                continue
+        else:
+            continue
+        sc += 0.5 if it["level"] == "issuer" else 0
+        if it["agency"] not in best or sc > best[it["agency"]][0]:
+            best[it["agency"]] = (sc, it)
+    if not best:
+        return None
+    allr = [{"agency": a, "rating": it["rating"], "issuer": it["issuer"], "date": it["date"], "outlook": it["outlook"],
+             "approx": sc < 100} for a, (sc, it) in best.items()]
+    low = max(allr, key=lambda x: RATING_SCALE.index(x["rating"]))     # консервативно: худшая из оценок
+    return {"v": low["rating"], "agency": low["agency"], "issuer": low["issuer"], "date": low["date"],
+            "approx": low["approx"], "all": allr}
+
+
+def apply_ratings(rows):
+    dist = defaultdict(float)
+    for r in rows:
+        r["rating"] = rating_for(r.get("name") or "")
+        dist[rating_bucket(r["rating"]["v"] if r["rating"] else None)] += r.get("value_rub") or 0
+    return sorted(dist.items(), key=lambda x: -x[1])
+
+
+def rating_bucket(v):
+    if not v:
+        return "нет рейтинга"
+    i = RATING_SCALE.index(v)
+    return "AAA" if i == 0 else "AA" if i <= 3 else "A" if i <= 6 else "BBB" if i <= 9 else "BB и ниже"
+
+
+# ── ключевая ставка ЦБ и КБД Мосбиржи (доходность 2 года) ──
+
+KBD_KEY, KEY_KEY = "kbd2y_v1", "keyrate_v1"
+_rates_state = {"running": False}
+
+
+def key_rate_series():
+    st = store()
+    hit = st.get(KEY_KEY, ttl=6 * 3600)
+    if hit:
+        return hit
+    frm = (date.today() - timedelta(days=900)).strftime("%d.%m.%Y")
+    to = date.today().strftime("%d.%m.%Y")
+    s = http_text("https://www.cbr.ru/hd_base/KeyRate/?UniDbQuery.Posted=True&UniDbQuery.From=%s&UniDbQuery.To=%s" % (frm, to))
+    rows = []
+    for d, v in re.findall(r"<td>(\d\d\.\d\d\.\d{4})</td>\s*<td>([\d,]+)</td>", s):
+        rows.append([datetime.strptime(d, "%d.%m.%Y").date().isoformat(), float(v.replace(",", "."))])
+    rows.sort()
+    if rows:
+        st.put(KEY_KEY, rows)
+    return rows
+
+
+def _kbd_one(d):
+    j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/zcyc.json?iss.meta=off&iss.only=yearyields&date=" + d))
+    ys = [r for r in j["yearyields"]["data"] if r[2] == 2.0]
+    return d, (ys[0][3] if ys else None)
+
+
+def _rates_run(days):
+    try:
+        st = store()
+        cache = st.get(KBD_KEY) or {}
+        today = date.today()
+        need = []
+        for i in range(days + 1):
+            d = today - timedelta(days=i)
+            if d.weekday() < 5 and d.isoformat() not in cache:
+                need.append(d.isoformat())
+        try:
+            key_rate_series()
+        except Exception:  # noqa: BLE001
+            pass
+        for k in range(0, len(need), 40):
+            part = need[k:k + 40]
+            for d, v in pool_map(lambda x: _safe(_kbd_one, x), part, workers=8):
+                if d is None:
+                    continue
+                if v is not None or d < today.isoformat():
+                    cache[d] = v
+            st.put(KBD_KEY, cache)
+    finally:
+        _rates_state["running"] = False
+
+
+def _safe(fn, x):
+    try:
+        return fn(x)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def rates_start(days):
+    with _rt_lock:
+        if _rates_state["running"]:
+            return
+        _rates_state["running"] = True
+    threading.Thread(target=_rates_run, args=(days,), daemon=True).start()
+
+
+def rates_payload(days):
+    days = max(30, min(int(days or 365), 900))
+    st = store()
+    cache = st.get(KBD_KEY) or {}
+    today = date.today()
+    first = (today - timedelta(days=days)).isoformat()
+    miss = sum(1 for i in range(days + 1) if (today - timedelta(days=i)).weekday() < 5
+               and (today - timedelta(days=i)).isoformat() not in cache)
+    if miss > 0:
+        rates_start(days)
+    try:
+        keys = key_rate_series()
+    except Exception:  # noqa: BLE001
+        keys = st.get(KEY_KEY) or []
+    iso = sorted(d for d, v in cache.items() if v is not None and d >= first)
+    kbd, key, ki, last = [], [], 0, None
+    for d in iso:
+        while ki < len(keys) and keys[ki][0] <= d:
+            last = keys[ki][1]
+            ki += 1
+        kbd.append(round(cache[d], 2))
+        key.append(last)
+    return {"iso": iso, "labels": [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y") for d in iso],
+            "kbd": kbd, "key": key, "loading": _rates_state["running"] or miss > 0,
+            "keys": [k for k in keys if k[0] >= first]}
+
 
 
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
@@ -2076,6 +2440,10 @@ class Handler(BaseHTTPRequestHandler):
                 data = build_summary(cfg, acc, q.get("period", "all"))
                 return self.send(200, operations_csv(data), "text/csv; charset=utf-8",
                                  {"Content-Disposition": 'attachment; filename="operations.csv"'})
+            if u.path == "/api/ratings":
+                return self.send(200, ratings_status())
+            if u.path == "/api/rates":
+                return self.send(200, rates_payload(q.get("days", "365")))
             if u.path == "/api/backup":
                 return self.send(200, make_backup(), "application/zip",
                                  {"Content-Disposition": 'attachment; filename="tinvest_backup_%s.zip"' % date.today().isoformat()})
@@ -2133,6 +2501,8 @@ class Handler(BaseHTTPRequestHandler):
                 save_config(cfg)
                 mem_clear()
                 return self.send(200, {"ok": True})
+            if path == "/api/ratings/refresh":
+                return self.send(200, {"started": ratings_start(force=True), **ratings_status()})
             client = TInvest(cfg)
             if path == "/api/test":
                 return self.send(200, {"ok": True, "accounts": len(client.accounts())})
@@ -2266,6 +2636,10 @@ def main():
                         return srv.shutdown()
             threading.Thread(target=watch, daemon=True).start()
     try:
+        try:
+            ratings_start()
+        except Exception:  # noqa: BLE001
+            pass
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
@@ -2486,6 +2860,18 @@ textarea.in{resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;fo
 .reb-in{width:84px;text-align:right}
 .reb-sum{font-size:12.5px;color:var(--tx2)}
 
+
+.rt{font-weight:600}.rt-AAA,.rt-AA{color:var(--pos)}.rt-A{color:#5aa0f0}.rt-BBB{color:var(--s4)}.rt-BB{color:var(--neg)}
+[data-theme=light] .rt-A{color:#2a6fc4}
+.rates .legend{justify-content:flex-end;margin-bottom:4px}
+.strip{margin-top:14px;padding:12px 16px;border-radius:12px;background:var(--card2);display:flex;gap:22px;flex-wrap:wrap;font-size:14px;color:var(--tx2)}
+.strip b{color:var(--tx);font-weight:650}
+.axt{font-size:12.5px;font-weight:600;color:var(--tx2);margin:6px 0}
+.dwrap{display:flex;align-items:stretch}.dscroll{overflow-x:auto;flex:1;min-width:0}
+.lg2{display:flex;gap:10px 22px;flex-wrap:wrap;margin-top:14px;font-size:13px;color:var(--tx)}
+.lg2 span{display:inline-flex;align-items:center;gap:8px}.lg2 i{width:14px;height:14px;border-radius:4px;flex:none}
+.lg2 em{font-style:normal;font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px;background:#c985001f;color:var(--s4);border:1px solid #c9850055}
+
 /* ── мобильный вид ── */
 @media(max-width:760px){
   html,body{height:auto}
@@ -2580,10 +2966,11 @@ const IC={
  fees:'<path d="M12 2v20M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>',
  tax:'<path d="M9 14l6-6M9.5 8.5h.01M14.5 13.5h.01"/><path d="M5 3h14v18l-3.5-2-3.5 2-3.5-2L5 21z"/>',
  imp:'<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
+ mkt:'<path d="M3 4v16h18"/><path d="M7 14l4-4 3 3 5-6"/>',
  reb:'<path d="M12 3v18M5 7h14M5 7l-2 6a3 3 0 0 0 6 0zM19 7l-2 6a3 3 0 0 0 6 0z"/>',
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const PAGES=[['dash','Обзор'],['ret','Доходность'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],null,['imp','Импорт отчётов'],['set','Настройки']];
+const PAGES=[['dash','Обзор'],['ret','Доходность'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['mkt','Ставки'],null,['imp','Импорт отчётов'],['set','Настройки']];
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
 const PERIOD_PAGES=['dash','ret','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
@@ -2680,7 +3067,7 @@ function line(el,o){
   for(let i=0;i<n-every/2;i+=every)s+=`<text class="ax" x="${X(i)}" y="${H-6}" text-anchor="${i===0?'start':'middle'}">${esc(labels[i])}</text>`;
   const gid='g'+Math.random().toString(36).slice(2,8);
   ser.forEach((se,j)=>{
-    const segs=[];let cur=[];se.v.forEach((v,i)=>{if(v==null||isNaN(v)){if(cur.length)segs.push(cur);cur=[]}else cur.push(X(i).toFixed(1)+','+Y(v).toFixed(1))});if(cur.length)segs.push(cur);
+    const segs=[];let cur=[],pv=null;se.v.forEach((v,i)=>{if(v==null||isNaN(v)){if(cur.length)segs.push(cur);cur=[];pv=null}else{if(se.step&&pv!=null)cur.push(X(i).toFixed(1)+','+Y(pv).toFixed(1));cur.push(X(i).toFixed(1)+','+Y(v).toFixed(1));pv=v}});if(cur.length)segs.push(cur);
     if(j===0&&o.area){const base=Y(Math.max(lo,Math.min(0,hi)));s+=`<defs><linearGradient id="${gid}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="${se.hex||'#3987e5'}" stop-opacity="${o.area==='neg'?0:.28}"/><stop offset="1" stop-color="${se.hex||'#3987e5'}" stop-opacity="${o.area==='neg'?.28:0}"/></linearGradient></defs>`;
       segs.forEach(sg=>{const f=sg[0].split(','),l=sg[sg.length-1].split(',');s+=`<polygon points="${f[0]},${base} ${sg.join(' ')} ${l[0]},${base}" fill="url(#${gid})"/>`})}
     segs.forEach(sg=>s+=`<polyline points="${sg.join(' ')}" fill="none" stroke="${se.c}" stroke-width="${se.w||2}" stroke-linejoin="round" stroke-linecap="round"${se.dash?' stroke-dasharray="5 4"':''}/>`)});
@@ -2690,7 +3077,8 @@ function line(el,o){
   const hv=el.querySelector('.hv');
   el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="#ffffff40" stroke-dasharray="3 3"/>`+
     ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>`<circle cx="${X(i)}" cy="${Y(se.v[i])}" r="4.5" fill="${se.c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
-  bindTip(el,i=>`<b>${esc(tl[i])}</b>`+ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>tipRow(se.c,se.n,ft(se.v[i]))).join(''));
+  bindTip(el,i=>{o.hover&&o.hover(i);return`<b>${esc(tl[i])}</b>`+ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>tipRow(se.c,se.n,ft(se.v[i]))).join('')});
+  if(o.leave){const ol=el.onmouseleave;el.onmouseleave=e=>{ol(e);o.leave()}}
 }
 
 function donut(el,o){
@@ -2792,7 +3180,7 @@ function render(){
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb})[S.page]()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -2980,6 +3368,29 @@ function pPos(){
     <p class="note">P&amp;L по счетам Т-Инвестиций — по данным брокера (FIFO), для облигаций без НКД. По импортированным счетам — расчёт по сделкам из отчёта и текущим ценам биржи.</p>`;
 }
 
+
+/* ── кредитные рейтинги ── */
+const RSC=['AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-','BB+','BB','BB-','B+','B','B-','CCC','CC','C','D'];
+const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
+function ratingTag(r){
+  const t=r.all.map(x=>`${x.agency}: ${x.rating} · ${x.issuer}${x.approx?' (приблизительное совпадение названия)':''} · от ${x.date}${x.outlook?' · '+x.outlook:''}`).join('\n');
+  return`<span class="tag rt rt-${rBucket(r.v).split(' ')[0]}" title="${esc(t)}">${r.approx?'≈ ':''}${esc(r.v)}</span>`;
+}
+function ratingsCard(b){
+  const info=b.ratings_info||{},tot=(b.ratings||[]).reduce((a,x)=>a+x[1],0)||1;
+  const COL={'AAA':S3,'AA':S3,'A':S1,'BBB':S4,'BB и ниже':S8,'нет рейтинга':'#6f7686'};
+  const order=['AAA','AA','A','BBB','BB и ниже','нет рейтинга'],m=Object.fromEntries(b.ratings||[]);
+  const items=order.filter(k=>m[k]).map(k=>({n:k==='нет рейтинга'?'Нет данных':k,v:m[k],c:COL[k],s:pctp(m[k]/tot*100)}));
+  const st=info.running?`Загружаю рейтинги… ${esc(info.progress||'')}`:info.updated?`Обновлено ${new Date(info.updated*1000).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})} · эмитентов в базе: ${info.count}`:'Рейтинги ещё не загружены';
+  if(info.running&&!S._rtTimer)S._rtTimer=setTimeout(async()=>{S._rtTimer=null;if(S.page!=='bonds')return;try{S.bonds=await api('/api/bonds?'+new URLSearchParams({account:S.account}));render()}catch(e){}},5000);
+  return`<div class="card"><h2>Кредитные рейтинги эмитентов<span class="sp">${st}</span></h2>
+    <div class="g g2"><div>${hbars(items,S1,null,0)}</div>
+    <div class="t2" style="font-size:13px;line-height:1.6">Распределение облигаций портфеля по рейтингу по национальной шкале (АКРА, Эксперт РА, НКР, НРА). Если у эмитента несколько оценок, берётся наименьшая.
+      Пометка «≈» — название эмитента совпало не полностью, проверьте по подсказке. Нет данных — рейтинг не найден в базе, это не значит, что он низкий.
+      <div class="row" style="margin-top:12px"><button class="btn ghost" id="rt-ref" ${info.running?'disabled':''}>Обновить рейтинги</button></div></div></div>
+    <p class="note">Источник — публичный канал @issuerRatings (пресс-релизы агентств). Рейтинги обновляются автоматически раз в сутки при открытой программе. Не является инвестиционной рекомендацией.</p></div>`;
+}
+
 /* ── Облигации ── */
 function heatCell(v,mx,rgb,txt){if(bad(v))return'<td class="num mu">—</td>';const a=Math.max(0,Math.min(1,v/(mx||1)));return`<td class="num" style="background:rgba(${rgb},${(0.06+a*0.5).toFixed(3)})">${txt}</td>`}
 function pBonds(){
@@ -2988,10 +3399,10 @@ function pBonds(){
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   const m=b.metrics,tot=S.data.portfolio.total||1;
   if(!m.count)return'<div class="card empty">В портфеле нет облигаций</div>';
-  let rows=b.rows.slice();const{k,d}=S.bsort;
+  let rows=b.rows.slice();rows.forEach(r=>r.rk=r.rating?RSC.indexOf(r.rating.v):null);const{k,d}=S.bsort;
   rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
   const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(...rows.map(r=>r.ytm||0)),mxD=Math.max(...rows.map(r=>r.dur||0));
-  const cols=[['name','Облигация','l'],['qty','Кол-во'],['buy_pct','Покупка, %'],['price_pct','Цена, %'],['value_rub','Стоимость'],['pnl_rub','P&L'],['share','Доля'],['ytm','Доходность'],['dur','Дюрация'],['coupon','Купон'],['next','След. купон'],['maturity','Погашение'],['risk','Риск','l']];
+  const cols=[['name','Облигация','l'],['qty','Кол-во'],['buy_pct','Покупка, %'],['price_pct','Цена, %'],['value_rub','Стоимость'],['pnl_rub','P&L'],['share','Доля'],['ytm','Доходность'],['dur','Дюрация'],['coupon','Купон'],['next','След. купон'],['maturity','Погашение'],['rk','Рейтинг','l'],['risk','Риск','l']];
   const th=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   const body=rows.map(r=>`<tr><td>${ident(r,[r.ticker,r.floating?'флоатер':'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>
     <td class="num">${f0(r.qty)}</td><td class="num">${r.buy_pct!=null?f2(r.buy_pct):'—'}</td><td class="num">${r.price_pct!=null?f2(r.price_pct):'—'}</td>
@@ -3003,6 +3414,7 @@ function pBonds(){
     <td class="num">${r.coupon!=null?pctp(r.coupon,2):'—'}</td>
     <td class="num">${r.next?`${ddm(r.next[0])}<br><small class="mu">${M(r.next[1])}</small>`:'—'}</td>
     <td class="num">${r.maturity?ddm(r.maturity):'—'}${r.call?`<br><small class="mu">оферта ${ddm(r.call)}</small>`:''}</td>
+    <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
     <td class="l">${r.risk?`<span class="tag" style="${r.risk==='высокий'?'color:var(--neg)':r.risk==='низкий'?'color:var(--pos)':''}">${r.risk}</span>`:''}</td></tr>`).join('');
   chart('c-ladder',bars,{h:220,labels:b.ladder.map(x=>x[0]),series:[{n:'Погашается / оферта',c:S1,v:b.ladder.map(x=>x[1])}],legend:false});
   return`<div class="g g6">${kpi('Облигации',M(m.value,'rub',0),`${m.count} выпусков · ${pctp(m.value/tot*100)} портфеля`,null,S1)}
@@ -3015,7 +3427,45 @@ function pBonds(){
     <div class="g g3"><div class="card"><h2>Лестница погашений и оферт, ₽</h2><div id="c-ladder" class="chart"></div></div>
     <div class="card"><h2>Кредитный риск (оценка брокера)</h2>${hbars(b.risk.map(([n,v])=>({n,v,c:n==='высокий'?S8:n==='низкий'?S3:n==='средний'?S4:'#6f7686',s:pctp(v/(m.value||1)*100)})),S1,null,0)}</div>
     <div class="card"><h2>Тип купона, выпусков</h2>${hbars(b.kinds.map(([n,v],i)=>({n,v,c:PAL[i]})),S1,x=>f0(x.v),1)}</div></div>
+    ${ratingsCard(b)}
     <p class="note">Доходность — эффективная годовая к погашению или к ближайшей оферте (пометка «оф.»), по текущей цене с НКД. Для флоатеров будущие купоны приняты равными последнему известному, для облигаций с амортизацией расчёт приблизительный. Дюрация — по Маколею, в годах.</p>`;
+}
+
+
+/* ── Выплаты по дням (столбики с разбивкой по выпускам) ── */
+const colAt=i=>i<HEX.length?HEX[i]:`hsl(${(i*137.5)%360},55%,52%)`;
+function dayBars(el,o){
+  const days=o.days,H=o.h||340,pl=64,pt=26,pb=64,step=62,n=days.length;
+  if(!n)return emptyChart(el,H,'Выплат в выбранном периоде нет');
+  const mx=Math.max(...days.map(d=>d.total)),{lo,hi,step:ys}=nice(0,mx),ph=H-pt-pb,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
+  let ax='',grid='';
+  for(let v=lo;v<=hi+ys/2;v+=ys){const y=Y(v);ax+=`<text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${v===0?'0':short(v)}</text>`;grid+=`<line class="grid-l" x1="0" x2="100000" y1="${y}" y2="${y}"/>`}
+  ax+=`<text class="ax" transform="translate(14 ${pt+ph/2}) rotate(-90)" text-anchor="middle">Сумма выплат, ₽</text>`;
+  const bw=Math.min(40,step*.62);let marks='',lab='',hits='';
+  days.forEach((d,i)=>{const cx=step*i+step/2;let acc=0;
+    d.items.forEach((it,k)=>{const y1=Y(acc+it.amount),y0=Y(acc),h=Math.max(0,y0-y1-(k?1:0));
+      marks+=`<path class="bm" data-g="${i}" d="${k===d.items.length-1?rtop(cx-bw/2,y1,bw,h,4):`M${cx-bw/2},${y1}h${bw}v${h}h${-bw}Z`}" fill="${it.c}"${it.kind==='dividend'?'':''}/>`;acc+=it.amount});
+    lab+=`<text class="ax num" x="${cx}" y="${Y(d.total)-7}" text-anchor="middle" style="fill:var(--tx);font-weight:600">${short(d.total)}</text>`;
+    lab+=`<text class="ax" transform="translate(${cx+4} ${H-pb+14}) rotate(-45)" text-anchor="end">${d.label}</text>`;
+    hits+=`<rect data-i="${i}" x="${step*i}" y="${pt}" width="${step}" height="${ph}" fill="transparent"/>`});
+  const W=Math.max(step*n,el.clientWidth-pl-4);
+  el.innerHTML=`<div class="dwrap"><svg width="${pl}" height="${H}" style="flex:none">${ax}</svg><div class="dscroll"><svg width="${W}" height="${H}">${grid}<g>${marks}</g>${lab}${hits}</svg></div></div>
+    <div class="lg2">${o.legend.map(l=>`<span><i style="background:${l.c}"></i>${esc(l.n)}${l.tag?` <em>${l.tag}</em>`:''}</span>`).join('')}</div>`;
+  const mk=el.querySelectorAll('.bm');el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?1:.35);
+  bindTip(el,i=>{const d=days[i];return`<b>${esc(d.full)}</b>`+d.items.map(it=>tipRow(it.c,it.name+' · '+it.kl,M(it.amount))).join('')+
+    `<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${M(d.total)}</span></div>`});
+}
+function payDays(ps,limit){
+  const to=new Date(Date.now()+limit*864e5).toISOString().slice(0,10),from=new Date().toISOString().slice(0,10);
+  const f=ps.filter(p=>p.date>=from&&p.date<=to);
+  const tot={};f.forEach(p=>tot[p.name]=(tot[p.name]||0)+p.amount);
+  const names=Object.keys(tot).sort((a,b)=>tot[b]-tot[a]),col={};names.forEach((n,i)=>col[n]=colAt(i));
+  const red=new Set(f.filter(p=>p.kind==='redemption').map(p=>p.name));
+  const KL={coupon:'купон',dividend:'дивиденд',redemption:'погашение'},by={};
+  f.forEach(p=>(by[p.date]=by[p.date]||[]).push(p));
+  const days=Object.keys(by).sort().map(dt=>{const items=by[dt].slice().sort((a,b)=>tot[b.name]-tot[a.name]).map(p=>({name:p.name,amount:p.amount,c:col[p.name],kind:p.kind,kl:KL[p.kind]||p.kind}));
+    const [y,m,d]=dt.split('-');return{label:`${d}.${m}.${y}`,full:ddm(dt),total:items.reduce((a,x)=>a+x.amount,0),items}});
+  return{days,legend:names.map(n=>({n,c:col[n],tag:red.has(n)?'погашение':''}))};
 }
 
 /* ── Выплаты ── */
@@ -3026,6 +3476,7 @@ function pPay(){
   const ps=b.payments,now=new Date(),in30=new Date(now.getTime()+30*864e5).toISOString().slice(0,10);
   const sum=f=>ps.filter(f).reduce((a,x)=>a+x.amount,0);
   const pm=payMonths(ps,12);
+  const pdd=payDays(ps,S.payDays);chart('c-days',dayBars,{days:pdd.days,legend:pdd.legend,h:340});
   chart('c-pay',bars,{h:260,labels:pm.labels,tipLabels:pm.tips,stack:true,total:true,skipZero:true,series:pm.series,empty:'Выплат не ожидается'});
   const KIND={coupon:['Купон',S1],dividend:['Дивиденд',S3],redemption:['Погашение',S4]};
   const byM={};ps.forEach(p=>(byM[p.date.slice(0,7)]=byM[p.date.slice(0,7)]||[]).push(p));
@@ -3035,6 +3486,7 @@ function pPay(){
   return`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(sum(()=>1)),'купоны, дивиденды и погашения','pos',S3)}
     ${kpi('Купоны',M(sum(p=>p.kind==='coupon')),ps.filter(p=>p.kind==='coupon').length+' выплат',null,S1)}${kpi('Дивиденды',M(sum(p=>p.kind==='dividend')),'только объявленные, до налога',null,S3)}</div>
     <div class="card"><h2>Календарь выплат по месяцам, ₽</h2><div id="c-pay" class="chart"></div></div>
+    <div class="card"><h2>Выплаты по дням<span class="sp"><span class="seg" id="pdays">${[[30,'30 дней'],[90,'90 дней'],[365,'Год']].map(([d,t])=>`<button data-d="${d}" class="${d===S.payDays?'on':''}">${t}</button>`).join('')}</span></span></h2><div id="c-days" class="chart"></div></div>
     ${list?`<div class="g g2">${list}</div>`:'<div class="card empty">Выплат в ближайший год не ожидается</div>'}
     <p class="note">Купоны — по графику эмитента и текущему количеству бумаг (до НДФЛ). Для флоатеров будущие купоны — оценка по последнему известному. Дивиденды — только уже объявленные, сумма до налога.</p>`;
 }
@@ -3265,8 +3717,39 @@ function notifyUpcoming(){
   }catch(e){}
 }
 
+
+/* ── Ставки: КБД и ключевая ставка ── */
+S.ratesDays=365;S.rates=null;
+const RDAYS=[[90,'3 мес'],[180,'6 мес'],[365,'Год'],[730,'2 года']];
+function loadRates(){
+  const d=S.ratesDays;
+  api('/api/rates?days='+d).then(j=>{if(d!==S.ratesDays)return;S.rates=j;if(S.page==='mkt')render();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays)loadRates()},3000)})
+   .catch(e=>{S.rates={error:e.message,labels:[]};if(S.page==='mkt')render()});
+}
+const pc1=v=>v==null?'—':(+v).toFixed(2).replace(/0$/,'').replace(/\.0$/,'').replace('.',',')+'%';
+function pMkt(){
+  const r=S.rates;
+  if(!r){loadRates();return`<div class="card">${waitBox('Загружаю кривую доходности и ключевую ставку…')}</div>`}
+  if(r.error)return`<div class="msg err">${esc(r.error)}</div>`;
+  const n=r.labels.length,i0=n-1;
+  const seg=`<div class="seg" id="rdays">${RDAYS.map(([d,t])=>`<button data-d="${d}" class="${d===S.ratesDays?'on':''}">${t}</button>`).join('')}</div>`;
+  if(n<2)return`<div class="card">${r.loading?waitBox('Загружаю историю КБД с Мосбиржи — первый раз это занимает до минуты…'):'<div class="empty">Нет данных. Проверьте подключение к интернету.</div>'}</div>`;
+  const lastK=r.kbd[i0],lastC=r.key[i0],first=r.kbd[0];
+  chart('c-rates',line,{h:360,zero:false,labels:r.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc1(v),
+    series:[{n:'КБД · 2 года',c:'#2f6df6',hex:'#2f6df6',v:r.kbd,w:2.2},{n:'Ключевая ставка',c:'#3f7a4f',hex:'#3f7a4f',v:r.key,w:2.4,step:true}],
+    hover:i=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i)},leave:()=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i0)}});
+  return`<div class="g g4">${kpi('КБД · 2 года',pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,'#2f6df6')}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'#3f7a4f')}
+    ${kpi('КБД − ключевая',lastC!=null?((lastK-lastC>0?'+':'')+(lastK-lastC).toFixed(2).replace('.',',')+' п.п.'):'—','рынок закладывает '+(lastK>lastC?'повышение / удержание':'снижение')+' ставки',lastK>lastC?'neg':'pos')}
+    ${kpi('КБД за период',((lastK-first>0?'+':'')+(lastK-first).toFixed(2).replace('.',',')+' п.п.'),'с '+r.labels[0],lastK-first>0?'neg':'pos')}</div>
+  <div class="card rates"><h2>Доходность КБД (2 года) и ключевая ставка<span class="sp">${seg}</span></h2>
+    <div class="axt">Ставка, % годовых</div><div id="c-rates" class="chart"></div><div class="axt" style="text-align:center">Дата</div>
+    <div class="strip" id="rstrip">${stripHtml(r,i0)}</div>${r.loading?'<p class="note">Догружаю историю…</p>':''}</div>
+  <p class="note">КБД — кривая бескупонной доходности ОФЗ Московской биржи (срок 2 года), ключевая ставка — Банка России. Данные берутся с сайтов Мосбиржи и ЦБ при открытой программе и сохраняются локально. Справочная информация, не инвестиционная рекомендация.</p>`;
+}
+function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КБД · 2 года: <b>${pc1(r.kbd[i])}</b></span><span>КС: <b>${pc1(r.key[i])}</b></span>`}
+
 /* ── Ребалансировка ── */
-S.reb={contrib:'',buyOnly:true,draft:null};
+S.reb={contrib:'',buyOnly:true,draft:null};S.payDays=90;
 function pReb(){
   const ps=S.data.portfolio.positions,tot=ps.reduce((a,x)=>a+(x.value_rub||0),0);
   if(!(tot>0))return'<div class="card empty">В портфеле нет активов для расчёта</div>';
@@ -3312,6 +3795,7 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+ ['0.7','10.11.2026',['<b>Кредитные рейтинги</b> эмитентов (АКРА, Эксперт РА, НКР, НРА) в таблице облигаций и распределение портфеля по рейтингам; данные подтягиваются автоматически из канала @issuerRatings раз в сутки','Раздел <b>«Ставки»</b>: доходность КБД (2 года) и ключевая ставка Банка России на одном графике','<b>«Выплаты по дням»</b>: столбики по датам с разбивкой по выпускам, подписями сумм и прокруткой']],
  ['0.6','10.11.2026',['<b>«Ребалансировка»</b> — целевые доли по классам активов, что докупить или продать, распределение нового взноса','<b>Светлая тема</b> (авто / светлая / тёмная) и <b>мобильный вид</b>','<b>Напоминания</b> о купонах, дивидендах, офертах и погашениях — на «Обзоре» и системными уведомлениями','<b>Отчёт в PDF</b> — кнопка «PDF» печатает текущий раздел и период в светлой теме','<b>Резервная копия</b> базы одним файлом (без токена) в «Настройках»']],
  ['0.5','10.11.2026',['В настройках появились <b>«Что нового»</b> и <b>роадмап</b> — сюда вносятся все изменения','Номер версии внизу боковой панели, по клику открывает список обновлений']],
  ['0.4','10.11.2026',['<b>«Все счета»</b> — сводная аналитика по всем счетам, включая импортированные','Переключатель <b>«скрыть пустые»</b> счета','Везде <b>названия бумаг</b> вместо ISIN и <b>логотипы эмитентов</b> (кэшируются локально)',
@@ -3324,12 +3808,14 @@ const CHANGELOG=[
  ['0.1','10.11.2026',['Первая версия: портфель, операции, комиссии, налоги, настройки токена']],
 ];
 const ROADMAP=[
- ['now','Проверка на реальном API','Сверить расчёты с живыми счетами и поправить найденные расхождения'],
+ ['now','Проверка на реальных счетах','Сверка расчётов доходности и налогов с данными брокера'],
  ['next','Готовые форматы брокеров','Пресеты для отчётов Сбера, ВТБ, Альфы, БКС и Финама — без ручной настройки колонок'],
  ['next','Точные амортизации облигаций','График амортизаций из API — для точной доходности и календаря выплат'],
  ['next','Налоги точнее','Перенос убытков прошлых лет, льгота долгосрочного владения (ЛДВ), ИИС, курсовые разницы'],
- ['next','Кредитные рейтинги','Рейтинги АКРА / Эксперт РА рядом с облигациями, распределение портфеля по рейтингам'],
- ['later','Зашифрованная копия в облаке','Автоматическая зашифрованная копия базы (например, в приватном репозитории GitHub)'],
+ ['later','Зашифрованная копия в облаке','Автоматическая зашифрованная копия базы'],
+ ['done','Кредитные рейтинги','Рейтинги АКРА, Эксперт РА, НКР и НРА рядом с облигациями, распределение по рейтингам, автообновление'],
+ ['done','Ставки','График доходности КБД (2 года) и ключевой ставки'],
+ ['done','Выплаты по дням','Столбчатый календарь выплат с разбивкой по выпускам'],
  ['done','Лаунчер с автообновлением','Маленький скрипт сам скачивает свежую версию программы с GitHub и проверяет контрольную сумму'],
  ['done','Целевые доли и ребалансировка','Раздел «Ребалансировка»: целевая структура, что докупить или продать, распределение взноса'],
  ['done','Уведомления','Напоминания о купонах, дивидендах, офертах и погашениях — в приложении и системные'],
@@ -3343,6 +3829,9 @@ function roadmapHtml(){const L={now:['s-now','Сейчас'],next:['s-next','С�
 
 function bindPage(){
   if(S.page==='reb')bindReb();
+  if($('#pdays'))$('#pdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.payDays=+b.dataset.d;render()};
+  if($('#rdays'))$('#rdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.ratesDays=+b.dataset.d;S.rates=null;render()};
+  if($('#rt-ref'))$('#rt-ref').onclick=async e=>{e.currentTarget.disabled=true;try{await post('/api/ratings/refresh');S.bonds=await api('/api/bonds?'+new URLSearchParams({account:S.account}));render()}catch(x){}};
   document.querySelectorAll('#view [data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));
   const sortable=(id,key)=>{const t=$(id);if(t)t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;
     S[key]={k,d:S[key].k===k?-S[key].d:(['name','type','risk','maturity','next'].includes(k)?1:-1)};render()}};
