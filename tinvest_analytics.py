@@ -43,7 +43,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "T-Invest Analytics"
-APP_VERSION = "0.7"
+APP_VERSION = "0.8"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -1103,6 +1103,14 @@ def totals_from_rows(rows):
 
 # ═══════════════════════════════ облигации и выплаты ═══════════════════════════════
 
+def _spread(ytm, dur):
+    try:
+        k = kbd_at(dur) if ytm is not None and dur else None
+        return round(ytm - k, 2) if k is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 RISK_RU = {"RISK_LEVEL_LOW": "низкий", "RISK_LEVEL_MODERATE": "средний", "RISK_LEVEL_HIGH": "высокий"}
 
 
@@ -1129,7 +1137,7 @@ def bonds_report(client, rows):
         m = bond_metrics(b, price, today)
         row.update({"buy_pct": r["avg"] / nominal * 100 if r["avg"] else None, "price_pct": price / nominal * 100 if price else None,
                     "nominal": nominal, "ytm": m["ytm"], "dur": m["dur"], "to": m["to"], "coupon": m["coupon_rate"],
-                    "cur_yield": m["cur_yield"], "next": m["next"], "maturity": b.get("maturity"), "call": b.get("call"),
+                    "cur_yield": m["cur_yield"], "next": m["next"], "spread": _spread(m["ytm"], m["dur"]), "maturity": b.get("maturity"), "call": b.get("call"),
                     "risk": RISK_RU.get(b.get("risk"), ""), "floating": b.get("floating"), "amort": b.get("amort"),
                     "sector": b.get("sector")})
         out.append(row)
@@ -1930,7 +1938,12 @@ def build_bonds(cfg, acc, force=False):
         hit["ratings_info"] = st
         return hit
     s = build_summary(cfg, acc, "all")
-    return mem_put(key, bonds_report(TInvest(cfg), s["portfolio"]["positions"]))
+    rep_ = mem_put(key, bonds_report(TInvest(cfg), s["portfolio"]["positions"]))
+    try:
+        expert_start([r["name"] for r in rep_["rows"]])      # дозапросит рейтинги Эксперт РА по эмитентам портфеля
+    except Exception:  # noqa: BLE001
+        pass
+    return rep_
 
 
 def build_history_for(cfg, acc, force=False):
@@ -2121,6 +2134,10 @@ def tg_page(before=None):
 def _ratings_run():
     st = store()
     try:
+        try:
+            sites_refresh(force=True)         # НКР: полный список эмитентов с сайта
+        except Exception:  # noqa: BLE001
+            pass
         data = st.get(RT_KEY) or {"items": {}, "max_id": 0, "updated": 0}
         cutoff = (datetime.now(timezone.utc) - timedelta(days=RT_DAYS)).isoformat()
         got, before, pages = {}, None, 0
@@ -2201,13 +2218,27 @@ def ratings_status():
 
 def _rating_index():
     d = store().get(RT_KEY) or {}
-    if _rt_idx.get("u") != d.get("updated"):
+    sd = store().get(SITE_KEY) or {}
+    ed = store().get(EXP_KEY) or {}
+    stamp = (d.get("updated"), sd.get("updated"), len(ed.get("items") or {}))
+    if _rt_idx.get("u") != stamp:
         old = (date.today() - timedelta(days=RT_OLD)).isoformat()
+        merged = {}
+        for src in (d.get("items") or {}, sd.get("items") or {}, ed.get("items") or {}):
+            for k, it in src.items():
+                if it["date"] >= old and (k not in merged or it["date"] >= merged[k]["date"]):
+                    merged[k] = it
+        items = [(it, name_tokens(it["issuer"])) for it in merged.values()]
+        exact, inv = {}, {}
+        for it, toks in items:
+            if not toks:
+                continue
+            exact.setdefault(toks, []).append(it)
+            for t in toks:
+                inv.setdefault(t, []).append((it, toks))
         _rt_idx.clear()
-        _rt_idx["u"] = d.get("updated")
-        _rt_idx["items"] = [(it, name_tokens(it["issuer"])) for it in (d.get("items") or {}).values()
-                            if it["date"] >= old]
-    return _rt_idx["items"]
+        _rt_idx.update(u=stamp, items=items, exact=exact, inv=inv)
+    return _rt_idx
 
 
 def rating_for(name):
@@ -2215,23 +2246,30 @@ def rating_for(name):
     bt = name_tokens(name)
     if not bt:
         return None
+    ix = _rating_index()
     best = {}
-    for it, toks in _rating_index():
-        if not toks:
-            continue
-        if toks == bt:
-            sc = 100.0
-        elif toks <= bt or bt <= toks:
-            sc = float(sum(len(t) for t in toks & bt))
-            if sc < 6 and any(len(t) > 2 for t in (toks | bt) - (toks & bt)):
+
+    def put(it, sc):
+        sc += 0.5 if it["level"] == "issuer" else 0
+        cur = best.get(it["agency"])
+        if cur is None or sc > cur[0] or (sc == cur[0] and it["date"] > cur[1]["date"]):
+            best[it["agency"]] = (sc, it)
+    for it in ix.get("exact", {}).get(bt, []):
+        put(it, 100.0)
+    seen = set()
+    for t in bt:
+        for it, toks in ix.get("inv", {}).get(t, []):
+            if id(it) in seen or toks == bt:
+                continue
+            seen.add(id(it))
+            if not (toks <= bt or bt <= toks):
+                continue
+            sc = float(sum(len(x) for x in toks & bt))
+            if sc < 6 and any(len(x) > 2 for x in (toks | bt) - (toks & bt)):
                 continue
             if sc < 5:
                 continue
-        else:
-            continue
-        sc += 0.5 if it["level"] == "issuer" else 0
-        if it["agency"] not in best or sc > best[it["agency"]][0]:
-            best[it["agency"]] = (sc, it)
+            put(it, sc)
     if not best:
         return None
     allr = [{"agency": a, "rating": it["rating"], "issuer": it["issuer"], "date": it["date"], "outlook": it["outlook"],
@@ -2254,6 +2292,275 @@ def rating_bucket(v):
         return "нет рейтинга"
     i = RATING_SCALE.index(v)
     return "AAA" if i == 0 else "AA" if i <= 3 else "A" if i <= 6 else "BBB" if i <= 9 else "BB и ниже"
+
+
+# ── рейтинги напрямую с сайтов агентств (НКР — список эмитентов, Эксперт РА — поиск по эмитенту) ──
+# АКРА и НРА с сайтов недоступны программам (у АКРА сервер отдаёт неполную цепочку сертификатов,
+# у НРА — таймауты), поэтому их рейтинги идут только из канала @issuerRatings.
+
+SITE_KEY, EXP_KEY = "ratings_site_v1", "ratings_expert_v1"
+_exp_state = {"running": False}
+_SERIES_WORDS = {"бо", "бп", "кс", "обл", "серия", "серии", "выпуск"}
+
+
+def _strip(t):
+    import html as _h
+    return re.sub(r"\s+", " ", _h.unescape(re.sub(r"<[^>]+>", " ", t))).strip()
+
+
+def nkr_fetch():
+    s = http_text("https://ratings.ru/ratings/issuers/", timeout=45)
+    items = {}
+    for row in re.findall(r'<tr id="bx_[^"]+".*?</tr>', s, re.S):
+        td = [_strip(x) for x in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
+        if len(td) < 6:
+            continue
+        v = _rating_token(td[1])
+        dm = re.search(r"(\d\d)\.(\d\d)\.(\d{4})", td[5])
+        toks = "".join(sorted(name_tokens(td[0])))
+        if not v or not dm or not toks:
+            continue
+        items["%s|НКР|issuer" % toks] = {"issuer": td[0], "agency": "НКР", "level": "issuer", "rating": v,
+                                         "outlook": td[2], "date": "%s-%s-%s" % (dm.group(3), dm.group(2), dm.group(1))}
+    return items
+
+
+def sites_refresh(force=False):
+    st = store()
+    d = st.get(SITE_KEY)
+    if d and not force and time.time() - d.get("updated", 0) < RT_TTL:
+        return
+    items = nkr_fetch()
+    if items:
+        st.put(SITE_KEY, {"items": items, "updated": time.time()})
+        _rt_idx.clear()
+
+
+def _bond_query(name):
+    words = [w for w in re.split(r"\s+", (name or "").strip())
+             if w and not any(ch.isdigit() for ch in w) and w.lower().replace("ё", "е") not in _SERIES_WORDS]
+    return " ".join(words[:3])
+
+
+def _expert_session():
+    import http.cookiejar
+    cj = http.cookiejar.CookieJar()
+    if not _ext_ctx:
+        _ext_ctx.append(make_ssl_context())
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj),
+                                     urllib.request.HTTPSHandler(context=_ext_ctx[0]))
+    op.addheaders = list(EXT_UA.items())
+    return op
+
+
+def expert_lookup(op, query, tokens):
+    """Поиск эмитента на raexpert.ru, затем чтение страницы компании. Возвращает dict или None."""
+    s = op.open("https://raexpert.ru/", timeout=25).read().decode("utf-8", "replace")
+    tok = re.search(r'name="CSRFToken" value="([^"]+)"', s)
+    if not tok:
+        return None
+    req = urllib.request.Request("https://raexpert.ru/search/", urllib.parse.urlencode(
+        {"CSRFToken": tok.group(1), "search": query}).encode(), {"Referer": "https://raexpert.ru/"})
+    res = op.open(req, timeout=30).read().decode("utf-8", "replace")
+    seen, link = set(), None
+    for href, name in re.findall(r'href="(/database/companies/[^"?]+?)/?"[^>]*>([^<]+)<', res):
+        name = _strip(name)
+        if href in seen or not name:
+            continue
+        seen.add(href)
+        if name_tokens(name) == tokens:
+            link = (href, name)
+            break
+    if not link:
+        return None
+    c = op.open("https://raexpert.ru" + link[0], timeout=30).read().decode("utf-8", "replace")
+    m = re.search(r"(ru[^\s,<]+),\s*([А-Яа-я ]+?),\s*<a href=\"/releases/[^\"]+\">(\d\d)\.(\d\d)\.(\d{4})", c)
+    if not m:
+        return None
+    v = _rating_token(m.group(1))
+    if not v:
+        return None
+    return {"issuer": link[1], "agency": "Эксперт РА", "level": "issuer", "rating": v, "outlook": m.group(2).strip().lower(),
+            "date": "%s-%s-%s" % (m.group(5), m.group(4), m.group(3))}
+
+
+def _expert_run(names):
+    try:
+        st = store()
+        d = st.get(EXP_KEY) or {"items": {}, "queried": {}}
+        op = None
+        now = time.time()
+        for name in names:
+            q = _bond_query(name)
+            tokens = name_tokens(q)
+            if not q or not tokens:
+                continue
+            qk = "".join(sorted(tokens))
+            ts = d["queried"].get(qk)
+            if ts and now - ts < 3 * 86400:
+                continue
+            try:
+                op = op or _expert_session()
+                it = expert_lookup(op, q, tokens)
+            except Exception:  # noqa: BLE001
+                continue
+            d["queried"][qk] = time.time()
+            if it:
+                d["items"]["%s|Эксперт РА|issuer" % qk] = it
+            st.put(EXP_KEY, d)
+            _rt_idx.clear()
+            time.sleep(0.6)
+    finally:
+        _exp_state["running"] = False
+
+
+def expert_start(names):
+    with _rt_lock:
+        if _exp_state["running"]:
+            return
+        d = store().get(EXP_KEY) or {"queried": {}}
+        now = time.time()
+        todo = []
+        for n in names:
+            qk = "".join(sorted(name_tokens(_bond_query(n))))
+            if qk and now - d["queried"].get(qk, 0) > 3 * 86400 and n not in todo:
+                todo.append(n)
+        if not todo:
+            return
+        _exp_state["running"] = True
+    threading.Thread(target=_expert_run, args=(todo[:80],), daemon=True).start()
+
+
+# ── курс КБД сегодня, спред к КБД ──
+
+_kbd_now = {"t": 0, "pts": []}
+
+
+def kbd_curve():
+    if time.time() - _kbd_now["t"] > 1800 or not _kbd_now["pts"]:
+        try:
+            j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/zcyc.json?iss.meta=off&iss.only=yearyields"))
+            pts = sorted((r[2], r[3]) for r in j["yearyields"]["data"])
+            if pts:
+                _kbd_now.update(t=time.time(), pts=pts)
+        except Exception:  # noqa: BLE001
+            pass
+    return _kbd_now["pts"]
+
+
+def kbd_at(years):
+    pts = kbd_curve()
+    if not pts or years is None:
+        return None
+    if years <= pts[0][0]:
+        return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if years <= x1:
+            return y0 + (y1 - y0) * (years - x0) / (x1 - x0)
+    return pts[-1][1]
+
+
+# ── скринер облигаций (Мосбиржа, ISS) ──
+
+_scr = {"t": 0, "rows": []}
+SCR_COLS_S = ("SECID,SHORTNAME,SECNAME,ISIN,FACEVALUE,FACEUNIT,COUPONPERCENT,NEXTCOUPON,MATDATE,OFFERDATE,"
+              "LISTLEVEL,PREVLEGALCLOSEPRICE,YIELDATPREVWAPRICE,COUPONPERIOD,BONDSUBTYPE,ISSUESIZE")
+SCR_COLS_M = "SECID,LAST,YIELD,WAPRICE,DURATION,VALTODAY,NUMTRADES,ZSPREAD,YIELDATWAPRICE"
+
+
+def _iss_table(j, name):
+    t = j[name]
+    return [dict(zip(t["columns"], r)) for r in t["data"]]
+
+
+def screener_rows():
+    if time.time() - _scr["t"] < 600 and _scr["rows"]:
+        return _scr["rows"]
+    out = {}
+    for board, kind in (("TQCB", "corp"), ("TQOB", "ofz")):
+        j = json.loads(http_text(
+            "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/%s/securities.json?iss.meta=off"
+            "&iss.only=securities,marketdata&securities.columns=%s&marketdata.columns=%s" % (board, SCR_COLS_S, SCR_COLS_M),
+            timeout=60))
+        md = {r["SECID"]: r for r in _iss_table(j, "marketdata")}
+        for s in _iss_table(j, "securities"):
+            m = md.get(s["SECID"], {})
+            price = m.get("WAPRICE") or m.get("LAST") or s.get("PREVLEGALCLOSEPRICE")
+            yld = m.get("YIELD") or m.get("YIELDATWAPRICE") or s.get("YIELDATPREVWAPRICE")
+            if not price or not yld or not s.get("MATDATE") or s["MATDATE"].startswith("0000"):
+                continue
+            dur = (m.get("DURATION") or 0) / 365.0 or None
+            end = s["MATDATE"]
+            of = s.get("OFFERDATE")
+            of = of if of and not of.startswith("0000") else None
+            out[s["SECID"]] = {
+                "id": s["SECID"], "isin": s.get("ISIN"), "name": s.get("SHORTNAME"), "full": s.get("SECNAME"),
+                "kind": kind, "cur": (s.get("FACEUNIT") or "SUR").replace("SUR", "RUB"), "nominal": s.get("FACEVALUE"),
+                "price": round(price, 3), "yield": round(float(yld), 2), "dur": round(dur, 2) if dur else None,
+                "coupon": s.get("COUPONPERCENT"), "next": s.get("NEXTCOUPON"), "mat": end, "offer": of,
+                "level": s.get("LISTLEVEL"), "turn": round(m.get("VALTODAY") or 0), "trades": m.get("NUMTRADES") or 0,
+                "zs": m.get("ZSPREAD"), "sub": s.get("BONDSUBTYPE"), "size": s.get("ISSUESIZE")}
+    rows = list(out.values())
+    for r in rows:
+        k = kbd_at(r["dur"]) if r["dur"] else None
+        r["spread"] = round(r["yield"] - k, 2) if k is not None and r["cur"] == "RUB" else None
+        r["rating"] = None
+    _scr.update(t=time.time(), rows=rows)
+    return rows
+
+
+def screener_payload():
+    rows = screener_rows()
+    for r in rows:
+        rt = rating_for(r["name"])
+        r["rating"] = rt["v"] if rt else None
+        r["rt_agency"] = rt["agency"] if rt else None
+        r["rt_approx"] = bool(rt and rt["approx"])
+    return {"rows": rows, "kbd": kbd_curve(), "updated": _scr["t"], "ratings": ratings_status()}
+
+
+# ── первичные размещения (по объявлениям Мосбиржи; сводка investmint.ru) ──
+
+_pri = {"t": 0, "rows": []}
+
+
+def primary_rows():
+    if time.time() - _pri["t"] < 1800 and _pri["rows"]:
+        return _pri["rows"]
+    s = http_text("https://investmint.ru/bond-placements/", timeout=40)
+    rows, seen = [], set()
+    for tr in re.findall(r"<tr>\s*<td class=\"min-w-56.*?</tr>", s, re.S):
+        isin = re.search(r'font-mono text-xs">([A-Z0-9]{12})<', tr)
+        issuer = re.search(r'font-medium">(.*?)</div>', tr, re.S)
+        desc = re.search(r'text-muted-foreground">(.*?)</div>', tr, re.S)
+        start = re.search(r'<time datetime="(\d{4}-\d\d-\d\d)"', tr)
+        if not (issuer and start):
+            continue
+        end = re.search(r"Плановое окончание:\s*([^<]+)<", tr)
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        link = re.search(r'href="(https://www\.moex\.com/[^"]+)"', tr)
+        key = isin.group(1) if isin else _strip(issuer.group(1)) + start.group(1)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = re.sub(r"(?i)\b(общество с ограниченной ответственностью|публичное акционерное общество|акционерное общество)\b", "",
+                      _strip(issuer.group(1))).replace('"', "").strip(" ()")
+        rows.append({"issuer": _strip(issuer.group(1)), "short": name, "desc": _strip(desc.group(1)) if desc else "",
+                     "isin": isin.group(1) if isin else "", "start": start.group(1), "end": _strip(end.group(1)) if end else "",
+                     "book": _strip(tds[2]) if len(tds) > 2 else "", "status": _strip(tds[3]) if len(tds) > 3 else "",
+                     "link": link.group(1) if link else ""})
+    rows.sort(key=lambda r: r["start"])
+    _pri.update(t=time.time(), rows=rows)
+    return rows
+
+
+def primary_payload():
+    rows = primary_rows()
+    for r in rows:
+        rt = rating_for(r["short"])
+        r["rating"] = rt
+    return {"rows": rows, "updated": _pri["t"]}
+
 
 
 # ── ключевая ставка ЦБ и КБД Мосбиржи (доходность 2 года) ──
@@ -2440,6 +2747,10 @@ class Handler(BaseHTTPRequestHandler):
                 data = build_summary(cfg, acc, q.get("period", "all"))
                 return self.send(200, operations_csv(data), "text/csv; charset=utf-8",
                                  {"Content-Disposition": 'attachment; filename="operations.csv"'})
+            if u.path == "/api/screener":
+                return self.send(200, screener_payload())
+            if u.path == "/api/primary":
+                return self.send(200, primary_payload())
             if u.path == "/api/ratings":
                 return self.send(200, ratings_status())
             if u.path == "/api/rates":
@@ -2872,6 +3183,11 @@ textarea.in{resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;fo
 .lg2 span{display:inline-flex;align-items:center;gap:8px}.lg2 i{width:14px;height:14px;border-radius:4px;flex:none}
 .lg2 em{font-style:normal;font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px;background:#c985001f;color:var(--s4);border:1px solid #c9850055}
 
+.ins{display:grid;gap:10px}.ins div{display:grid;grid-template-columns:170px 1fr;gap:14px;font-size:13px;padding:10px 12px;border-radius:10px;background:var(--card2);line-height:1.55}
+.ins b{font-weight:600}.ins span{color:var(--tx2)}.ins span b{color:var(--tx)}
+.flt{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px}.flt .field{min-width:130px}.flt .in{width:100%}
+.pnew{background:#ffdd2d18!important}
+@media(max-width:760px){.ins div{grid-template-columns:1fr}}
 /* ── мобильный вид ── */
 @media(max-width:760px){
   html,body{height:auto}
@@ -2966,11 +3282,13 @@ const IC={
  fees:'<path d="M12 2v20M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>',
  tax:'<path d="M9 14l6-6M9.5 8.5h.01M14.5 13.5h.01"/><path d="M5 3h14v18l-3.5-2-3.5 2-3.5-2L5 21z"/>',
  imp:'<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
+ scr:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/>',
+ pri:'<path d="M12 2l2.6 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.4 6.1 20.1l1.6-6.7L2.5 8.9l6.9-.6z"/>',
  mkt:'<path d="M3 4v16h18"/><path d="M7 14l4-4 3 3 5-6"/>',
  reb:'<path d="M12 3v18M5 7h14M5 7l-2 6a3 3 0 0 0 6 0zM19 7l-2 6a3 3 0 0 0 6 0z"/>',
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const PAGES=[['dash','Обзор'],['ret','Доходность'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['mkt','Ставки'],null,['imp','Импорт отчётов'],['set','Настройки']];
+const PAGES=[['dash','Обзор'],['ret','Доходность'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['mkt','Ставки'],['scr','Скринер облигаций'],['pri','Первичка'],null,['imp','Импорт отчётов'],['set','Настройки']];
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
 const PERIOD_PAGES=['dash','ret','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
@@ -3180,7 +3498,7 @@ function render(){
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt})[S.page]()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,pri:pPri})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -3391,6 +3709,31 @@ function ratingsCard(b){
     <p class="note">Источник — публичный канал @issuerRatings (пресс-релизы агентств). Рейтинги обновляются автоматически раз в сутки при открытой программе. Не является инвестиционной рекомендацией.</p></div>`;
 }
 
+
+function bondInsights(b){
+  const rows=b.rows.filter(r=>r.value_rub>0),tot=rows.reduce((a,r)=>a+r.value_rub,0)||1,out=[];
+  const w=(f)=>rows.filter(f).reduce((a,r)=>a+r.value_rub,0)/tot*100;
+  const sp=rows.filter(r=>r.spread!=null),spv=sp.reduce((a,r)=>a+r.value_rub,0);
+  if(spv)out.push(['Спред к КБД',`В среднем портфель даёт <b>${(sp.reduce((a,r)=>a+r.spread*r.value_rub,0)/spv).toFixed(2).replace('.',',')} п.п.</b> к безрисковой кривой (КБД) при той же дюрации — это ваша плата за кредитный риск и неликвидность.`]);
+  const low=sp.filter(r=>r.spread<0.5).sort((a,c)=>a.spread-c.spread);
+  if(low.length)out.push(['Мало платят за риск',`Выше КБД менее чем на 0,5 п.п.: ${low.slice(0,4).map(r=>`${esc(r.name)} (${r.spread>0?'+':''}${r.spread.toFixed(2).replace('.',',')} п.п.)`).join(', ')}${low.length>4?' и ещё '+(low.length-4):''}. Проверьте, оправдан ли риск эмитента или выгоднее ОФЗ.`]);
+  const nr=w(r=>!r.rating);if(nr>0.5)out.push(['Без рейтинга',`<b>${nr.toFixed(0)}%</b> облигационной части — выпуски без найденного рейтинга агентств (${rows.filter(r=>!r.rating).slice(0,3).map(r=>esc(r.name)).join(', ')}${rows.filter(r=>!r.rating).length>3?'…':''}). Рейтинга нет в базе — это не значит, что он низкий.`]);
+  const weak=rows.filter(r=>r.rating&&RSC.indexOf(r.rating.v)>=7);
+  if(weak.length)out.push(['Рейтинг ниже A−',`${weak.map(r=>`${esc(r.name)} (${esc(r.rating.v)})`).join(', ')} — суммарно <b>${w(r=>r.rating&&RSC.indexOf(r.rating.v)>=7).toFixed(0)}%</b> облигаций.`]);
+  const hy=sp.filter(r=>r.spread>6);if(hy.length)out.push(['Очень высокая доходность',`Спред больше 6 п.п.: ${hy.map(r=>`${esc(r.name)} (+${r.spread.toFixed(1).replace('.',',')})`).join(', ')}. Рынок закладывает повышенный риск — перепроверьте эмитента.`]);
+  const top=rows.slice().sort((a,c)=>c.value_rub-a.value_rub).slice(0,3);
+  out.push(['Концентрация',`Три крупнейшие позиции — <b>${(top.reduce((a,r)=>a+r.value_rub,0)/tot*100).toFixed(0)}%</b> облигаций: ${top.map(r=>esc(r.name)).join(', ')}.`]);
+  const soon=new Date(Date.now()+90*864e5).toISOString().slice(0,10),today=new Date().toISOString().slice(0,10);
+  const ev=rows.filter(r=>(r.call&&r.call>=today&&r.call<=soon)||(r.maturity&&r.maturity>=today&&r.maturity<=soon));
+  if(ev.length)out.push(['Ближайшие 90 дней',`Оферта или погашение: ${ev.map(r=>`${esc(r.name)} — ${ddm(r.call&&r.call>=today&&r.call<=soon?r.call:r.maturity)}${r.call&&r.call>=today&&r.call<=soon?' (оферта)':''}`).join('; ')}.`]);
+  return out;
+}
+function insightsCard(b){
+  const L=bondInsights(b);if(!L.length)return'';
+  return`<div class="card"><h2>Анализ облигаций портфеля</h2><div class="ins">${L.map(([t,h])=>`<div><b>${t}</b><span>${h}</span></div>`).join('')}</div>
+    <p class="note">Автоматические наблюдения по данным портфеля, рейтингов и КБД. Это справочная информация, а не инвестиционная рекомендация.</p></div>`;
+}
+
 /* ── Облигации ── */
 function heatCell(v,mx,rgb,txt){if(bad(v))return'<td class="num mu">—</td>';const a=Math.max(0,Math.min(1,v/(mx||1)));return`<td class="num" style="background:rgba(${rgb},${(0.06+a*0.5).toFixed(3)})">${txt}</td>`}
 function pBonds(){
@@ -3402,7 +3745,7 @@ function pBonds(){
   let rows=b.rows.slice();rows.forEach(r=>r.rk=r.rating?RSC.indexOf(r.rating.v):null);const{k,d}=S.bsort;
   rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
   const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(...rows.map(r=>r.ytm||0)),mxD=Math.max(...rows.map(r=>r.dur||0));
-  const cols=[['name','Облигация','l'],['qty','Кол-во'],['buy_pct','Покупка, %'],['price_pct','Цена, %'],['value_rub','Стоимость'],['pnl_rub','P&L'],['share','Доля'],['ytm','Доходность'],['dur','Дюрация'],['coupon','Купон'],['next','След. купон'],['maturity','Погашение'],['rk','Рейтинг','l'],['risk','Риск','l']];
+  const cols=[['name','Облигация','l'],['qty','Кол-во'],['buy_pct','Покупка, %'],['price_pct','Цена, %'],['value_rub','Стоимость'],['pnl_rub','P&L'],['share','Доля'],['ytm','Доходность'],['spread','Спред к КБД'],['dur','Дюрация'],['coupon','Купон'],['next','След. купон'],['maturity','Погашение'],['rk','Рейтинг','l'],['risk','Риск','l']];
   const th=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   const body=rows.map(r=>`<tr><td>${ident(r,[r.ticker,r.floating?'флоатер':'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>
     <td class="num">${f0(r.qty)}</td><td class="num">${r.buy_pct!=null?f2(r.buy_pct):'—'}</td><td class="num">${r.price_pct!=null?f2(r.price_pct):'—'}</td>
@@ -3410,6 +3753,7 @@ function pBonds(){
     <td class="num ${cls(r.pnl_rub)}"><span class="arr">${r.pnl_rub>0?'▲':r.pnl_rub<0?'▼':''}</span>${r.pnl_pct!=null?pct(r.pnl_pct,1):'—'}</td>
     ${heatCell(r.share,mxS,'201,133,0',pctp(r.share))}
     ${heatCell(r.ytm,mxY,'25,158,112',r.ytm!=null?pctp(r.ytm,2)+(r.to==='offer'?' <small class="mu">оф.</small>':''):'—')}
+    <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread)+' п.п.':'—'}</td>
     ${heatCell(r.dur,mxD,'213,81,129',r.dur!=null?r.dur.toFixed(2).replace('.',',')+' г':'—')}
     <td class="num">${r.coupon!=null?pctp(r.coupon,2):'—'}</td>
     <td class="num">${r.next?`${ddm(r.next[0])}<br><small class="mu">${M(r.next[1])}</small>`:'—'}</td>
@@ -3428,9 +3772,105 @@ function pBonds(){
     <div class="card"><h2>Кредитный риск (оценка брокера)</h2>${hbars(b.risk.map(([n,v])=>({n,v,c:n==='высокий'?S8:n==='низкий'?S3:n==='средний'?S4:'#6f7686',s:pctp(v/(m.value||1)*100)})),S1,null,0)}</div>
     <div class="card"><h2>Тип купона, выпусков</h2>${hbars(b.kinds.map(([n,v],i)=>({n,v,c:PAL[i]})),S1,x=>f0(x.v),1)}</div></div>
     ${ratingsCard(b)}
+    ${insightsCard(b)}
     <p class="note">Доходность — эффективная годовая к погашению или к ближайшей оферте (пометка «оф.»), по текущей цене с НКД. Для флоатеров будущие купоны приняты равными последнему известному, для облигаций с амортизацией расчёт приблизительный. Дюрация — по Маколею, в годах.</p>`;
 }
 
+
+
+/* ── Первичные размещения ── */
+S.pri=null;
+function loadPri(){api('/api/primary').then(j=>{S.pri=j;if(S.page==='pri')render()}).catch(e=>{S.pri={error:e.message,rows:[]};if(S.page==='pri')render()})}
+function pPri(){
+  const d=S.pri;
+  if(!d){loadPri();return`<div class="card">${waitBox('Загружаю календарь первичных размещений…')}</div>`}
+  if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="pri-r">Повторить</button></div>`;
+  const today=new Date().toISOString().slice(0,10),rows=d.rows;
+  const wk=new Date(Date.now()+7*864e5).toISOString().slice(0,10);
+  const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${esc(r.isin)}</small>`:''}</td>
+    <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
+    <td class="num">${ddm(r.start)}${r.start===today?'<br><small class="pos">сегодня</small>':''}</td><td class="num">${esc(r.end.replace(' г.',''))}</td>
+    <td class="l">${esc(r.book)}</td><td class="l">${r.link?`<a class="blue-link" href="${esc(r.link)}" target="_blank" rel="noopener">объявление Мосбиржи ↗</a>`:''}</td></tr>`).join('');
+  return`<div class="g g4">${kpi('Размещений в списке',rows.length,'объявлено Мосбиржей')}${kpi('Сегодня',rows.filter(r=>r.start===today).length,'плановое начало размещения')}
+    ${kpi('На этой неделе',rows.filter(r=>r.start>=today&&r.start<=wk).length,'начало в ближайшие 7 дней')}${kpi('С рейтингом',rows.filter(r=>r.rating).length,'эмитент найден в базе рейтингов')}</div>
+  <div class="card" style="padding:12px 10px 6px"><div class="row" style="padding:0 6px 10px"><b>Календарь первичных размещений</b><button class="btn ghost" id="pri-r" style="margin-left:auto">Обновить</button></div>
+    ${rows.length?`<div class="tbl"><table><thead><tr><th class="l">Эмитент и выпуск</th><th class="l">Рейтинг</th><th>Начало размещения</th><th>Окончание</th><th class="l">Книга заявок</th><th class="l">Источник</th></tr></thead><tbody>${body}</tbody></table></div>`:'<div class="empty">Объявленных размещений нет</div>'}</div>
+  <p class="note">Даты начала размещения — по объявлениям Московской биржи (сводка investmint.ru). Ставку купона эмитент обычно объявляет в день сбора заявок: уточняйте её у брокера. Рейтинг сопоставлен с эмитентом по названию. Справочная информация, не инвестиционная рекомендация.</p>`;
+}
+
+
+/* ── Скринер облигаций ── */
+S.scr=null;S.sf={q:'',cur:'RUB',kind:'all',rmin:'',rated:false,ymin:'',ymax:'60',tmax:'',turn:'',spmin:'',noOffer:false};S.ssort={k:'yield',d:-1};S.sn=150;
+function loadScr(){api('/api/screener').then(j=>{const t=Date.now();j.rows.forEach(r=>{r.years=(new Date(r.mat)-t)/315576e5});S.scr=j;if(S.page==='scr')render()}).catch(e=>{S.scr={error:e.message,rows:[]};if(S.page==='scr')render()})}
+function scrRows(){
+  const f=S.sf,q=f.q.trim().toLowerCase(),ri=f.rmin?RSC.indexOf(f.rmin):-1;
+  const nv=x=>x===''||isNaN(parseFloat(x))?null:parseFloat(String(x).replace(',','.'));
+  const ymin=nv(f.ymin),ymax=nv(f.ymax),tmax=nv(f.tmax),turn=nv(f.turn),spmin=nv(f.spmin);
+  let rs=S.scr.rows.filter(r=>{
+    if(f.cur!=='all'&&r.cur!==f.cur)return false;
+    if(f.kind!=='all'&&r.kind!==f.kind)return false;
+    if(q&&!((r.name||'').toLowerCase().includes(q)||(r.isin||'').toLowerCase().includes(q)||(r.full||'').toLowerCase().includes(q)))return false;
+    if(ri>=0&&!(r.rating&&RSC.indexOf(r.rating)<=ri))return false;
+    if(f.rated&&!r.rating)return false;
+    if(ymin!=null&&r.yield<ymin)return false;if(ymax!=null&&r.yield>ymax)return false;
+    if(tmax!=null&&r.years>tmax)return false;
+    if(turn!=null&&r.turn<turn*1e6)return false;
+    if(spmin!=null&&!(r.spread!=null&&r.spread>=spmin))return false;
+    if(f.noOffer&&r.offer)return false;
+    return r.years>0;
+  });
+  const{k,d}=S.ssort;
+  rs.sort((a,b)=>{let x=a[k],y=b[k];if(k==='rating'){x=x?RSC.indexOf(x):null;y=y?RSC.indexOf(y):null;return -d*((x??99)-(y??99))}
+    if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
+  return rs;
+}
+function drawScr(){
+  const rs=scrRows(),n=Math.min(rs.length,S.sn);
+  const cols=[['name','Выпуск','l'],['rating','Рейтинг','l'],['price','Цена, %'],['yield','Доходность'],['spread','Спред к КБД'],['coupon','Купон, %'],['years','До погашения'],['dur','Дюрация'],['turn','Оборот сегодня']];
+  const {k,d}=S.ssort;
+  $('#scr-head').innerHTML=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
+  $('#scr-body').innerHTML=rs.slice(0,n).map(r=>`<tr><td class="l"><b>${esc(r.name)}</b><br><small class="mu num">${esc(r.isin||r.id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></td>
+    <td class="l">${r.rating?`<span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}" title="${esc(r.rt_agency||'')}${r.rt_approx?' (приблизительное совпадение названия)':''}">${r.rt_approx?'≈ ':''}${esc(r.rating)}</span>`:'<span class="mu">—</span>'}</td>
+    <td class="num">${f2(r.price)}</td><td class="num"><b>${pctp(r.yield,2)}</b></td>
+    <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
+    <td class="num">${r.coupon!=null?f2(r.coupon):'—'}</td><td class="num">${ddm(r.mat)}<br><small class="mu">${r.years.toFixed(1).replace('.',',')} г</small></td>
+    <td class="num">${r.dur!=null?r.dur.toFixed(2).replace('.',','):'—'}</td><td class="num">${r.turn?short(r.turn):'—'}</td></tr>`).join('');
+  $('#scr-cnt').textContent=`Найдено: ${rs.length}${rs.length>n?' · показано '+n:''}`;
+  $('#scr-more').style.display=rs.length>n?'':'none';
+}
+function pScr(){
+  const d=S.scr;
+  if(!d){loadScr();return`<div class="card">${waitBox('Загружаю торги облигациями с Мосбиржи и сопоставляю рейтинги…')}</div>`}
+  if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="scr-r">Повторить</button></div>`;
+  const f=S.sf,opt=(v,t,cur)=>`<option value="${v}" ${cur===v?'selected':''}>${t}</option>`;
+  const rated=d.rows.filter(r=>r.rating).length;
+  return`<div class="card"><h2>Подбор облигаций<span class="sp" id="scr-cnt"></span></h2>
+    <div class="flt">
+    <label class="field"><span>Поиск</span><input class="in" id="f-q" value="${esc(f.q)}" placeholder="название или ISIN"></label>
+    <label class="field"><span>Валюта</span><select class="in" id="f-cur">${opt('RUB','Рубли',f.cur)}${opt('all','Все',f.cur)}${opt('USD','USD',f.cur)}${opt('CNY','CNY',f.cur)}${opt('EUR','EUR',f.cur)}</select></label>
+    <label class="field"><span>Тип</span><select class="in" id="f-kind">${opt('all','Все',f.kind)}${opt('corp','Корпоративные',f.kind)}${opt('ofz','ОФЗ',f.kind)}</select></label>
+    <label class="field"><span>Рейтинг не ниже</span><select class="in" id="f-rmin"><option value="">любой</option>${RSC.slice(0,10).map(x=>opt(x,x,f.rmin)).join('')}</select></label>
+    <label class="field"><span>Доходность от, %</span><input class="in num" id="f-ymin" value="${esc(f.ymin)}" inputmode="decimal"></label>
+    <label class="field"><span>Доходность до, %</span><input class="in num" id="f-ymax" value="${esc(f.ymax)}" inputmode="decimal"></label>
+    <label class="field"><span>Спред к КБД от, п.п.</span><input class="in num" id="f-spmin" value="${esc(f.spmin)}" inputmode="decimal"></label>
+    <label class="field"><span>До погашения, лет не более</span><input class="in num" id="f-tmax" value="${esc(f.tmax)}" inputmode="decimal"></label>
+    <label class="field"><span>Оборот за день от, млн ₽</span><input class="in num" id="f-turn" value="${esc(f.turn)}" inputmode="decimal"></label>
+    <label class="sw"><input type="checkbox" id="f-noffer" ${f.noOffer?'checked':''}><i></i><div><b>Без оферт</b></div></label>
+    <button class="btn ghost" id="f-reset">Сбросить</button></div>
+    <div class="tbl" style="max-height:calc(100vh - 300px)"><table><thead><tr id="scr-head"></tr></thead><tbody id="scr-body"></tbody></table></div>
+    <div class="row" style="margin-top:12px"><button class="btn ghost" id="scr-more">Показать ещё</button></div></div>
+  <p class="note">Данные — Московская биржа (ISS, режимы торгов Т+ для корпоративных облигаций и ОФЗ; с задержкой, как в бесплатном доступе). Доходность — по цене последних торгов, спред — к кривой КБД при той же дюрации. Рейтинг найден у ${rated} из ${d.rows.length} выпусков: эмитенты без рейтинга в базе не обязательно ненадёжны. По умолчанию скрыты выпуски с доходностью выше 60% (обычно это дефолтные или почти не торгуемые бумаги) — поле «Доходность до» можно очистить. Справочная информация, не инвестиционная рекомендация.</p>`;
+}
+function bindScr(){
+  if(!S.scr||S.scr.error){const b=$('#scr-r');if(b)b.onclick=()=>{S.scr=null;render()};return}
+  const map={'f-q':'q','f-cur':'cur','f-kind':'kind','f-rmin':'rmin','f-ymin':'ymin','f-ymax':'ymax','f-spmin':'spmin','f-tmax':'tmax','f-turn':'turn'};
+  let to;Object.entries(map).forEach(([id,k])=>{const e=$('#'+id);e.oninput=e.onchange=()=>{S.sf[k]=e.value;S.sn=150;clearTimeout(to);to=setTimeout(drawScr,150)}});
+  $('#f-noffer').onchange=e=>{S.sf.noOffer=e.target.checked;S.sn=150;drawScr()};
+  $('#f-reset').onclick=()=>{S.sf={q:'',cur:'RUB',kind:'all',rmin:'',rated:false,ymin:'',ymax:'60',tmax:'',turn:'',spmin:'',noOffer:false};render()};
+  $('#scr-more').onclick=()=>{S.sn+=200;drawScr()};
+  $('#scr-head').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;S.ssort={k,d:S.ssort.k===k?-S.ssort.d:(['name'].includes(k)?1:-1)};drawScr()};
+  drawScr();
+}
 
 /* ── Выплаты по дням (столбики с разбивкой по выпускам) ── */
 const colAt=i=>i<HEX.length?HEX[i]:`hsl(${(i*137.5)%360},55%,52%)`;
@@ -3795,6 +4235,7 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+ ['0.8','10.11.2026',['<b>Скринер облигаций</b> — торги Мосбиржи с фильтрами по рейтингу, доходности, спреду к КБД, сроку и обороту','<b>Первичка</b> — календарь объявленных размещений облигаций с рейтингами эмитентов','<b>Анализ облигаций портфеля</b>: спред к КБД по каждому выпуску, наблюдения по риску, концентрации и ближайшим офертам','Рейтинги теперь берутся ещё и напрямую с сайтов НКР и Эксперт РА (по эмитентам портфеля)']],
  ['0.7','10.11.2026',['<b>Кредитные рейтинги</b> эмитентов (АКРА, Эксперт РА, НКР, НРА) в таблице облигаций и распределение портфеля по рейтингам; данные подтягиваются автоматически из канала @issuerRatings раз в сутки','Раздел <b>«Ставки»</b>: доходность КБД (2 года) и ключевая ставка Банка России на одном графике','<b>«Выплаты по дням»</b>: столбики по датам с разбивкой по выпускам, подписями сумм и прокруткой']],
  ['0.6','10.11.2026',['<b>«Ребалансировка»</b> — целевые доли по классам активов, что докупить или продать, распределение нового взноса','<b>Светлая тема</b> (авто / светлая / тёмная) и <b>мобильный вид</b>','<b>Напоминания</b> о купонах, дивидендах, офертах и погашениях — на «Обзоре» и системными уведомлениями','<b>Отчёт в PDF</b> — кнопка «PDF» печатает текущий раздел и период в светлой теме','<b>Резервная копия</b> базы одним файлом (без токена) в «Настройках»']],
  ['0.5','10.11.2026',['В настройках появились <b>«Что нового»</b> и <b>роадмап</b> — сюда вносятся все изменения','Номер версии внизу боковой панели, по клику открывает список обновлений']],
@@ -3813,6 +4254,9 @@ const ROADMAP=[
  ['next','Точные амортизации облигаций','График амортизаций из API — для точной доходности и календаря выплат'],
  ['next','Налоги точнее','Перенос убытков прошлых лет, льгота долгосрочного владения (ЛДВ), ИИС, курсовые разницы'],
  ['later','Зашифрованная копия в облаке','Автоматическая зашифрованная копия базы'],
+ ['done','Скринер облигаций','Подбор выпусков по рейтингу, доходности, спреду к КБД, сроку и ликвидности'],
+ ['done','Первичка','Календарь объявленных размещений облигаций с рейтингами эмитентов'],
+ ['done','Анализ облигаций','Спред к КБД, рейтинги, концентрация и ближайшие оферты по портфелю'],
  ['done','Кредитные рейтинги','Рейтинги АКРА, Эксперт РА, НКР и НРА рядом с облигациями, распределение по рейтингам, автообновление'],
  ['done','Ставки','График доходности КБД (2 года) и ключевой ставки'],
  ['done','Выплаты по дням','Столбчатый календарь выплат с разбивкой по выпускам'],
@@ -3829,6 +4273,8 @@ function roadmapHtml(){const L={now:['s-now','Сейчас'],next:['s-next','С�
 
 function bindPage(){
   if(S.page==='reb')bindReb();
+  if(S.page==='scr')bindScr();
+  if($('#pri-r'))$('#pri-r').onclick=()=>{S.pri=null;render()};
   if($('#pdays'))$('#pdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.payDays=+b.dataset.d;render()};
   if($('#rdays'))$('#rdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.ratesDays=+b.dataset.d;S.rates=null;render()};
   if($('#rt-ref'))$('#rt-ref').onclick=async e=>{e.currentTarget.disabled=true;try{await post('/api/ratings/refresh');S.bonds=await api('/api/bonds?'+new URLSearchParams({account:S.account}));render()}catch(x){}};
