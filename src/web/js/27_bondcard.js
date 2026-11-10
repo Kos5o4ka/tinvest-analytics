@@ -2,6 +2,7 @@
 const BC={stack:[],tok:0,all:false};
 const BC_SEC={financial:'Финансы',industrials:'Промышленность',materials:'Сырьё',energy:'Энергетика',consumer:'Потребительский',government:'Государственные',real_estate:'Недвижимость',telecom:'Телеком',municipal:'Муниципальные',utilities:'Коммунальные',it:'IT',health_care:'Здравоохранение',other:'Прочее'};
 const BC_EV={coupon:'Купон',amort:'Амортизация',offer:'Оферта',redemption:'Погашение'};
+const BC_KR_SRC={cbr:'ключевая ставка по прогнозу ЦБ',survey:'ключевая ставка по опросу аналитиков ЦБ',market:'ключевая ставка по ожиданиям рынка (КБД)',flat:'текущая ключевая ставка'};
 const BC_RISK={RISK_LEVEL_LOW:'низкий',RISK_LEVEL_MODERATE:'средний',RISK_LEVEL_HIGH:'высокий'};
 
 document.addEventListener('click',e=>{
@@ -89,8 +90,9 @@ function bcBody(c){
   h+=`<div class="card bc-sec"><h2>Денежный поток<span class="sp">ближайшие выплаты на 1 облигацию</span></h2>`;
   if(fl.length){
     h+=`<div class="tbl"><table><thead><tr><th>Дата</th><th>Событие</th><th>Сумма</th><th>% номинала / ставка</th></tr></thead><tbody>`
-      +fl.slice(0,lim).map(e=>`<tr><td>${ddm(e.d)}</td><td>${BC_EV[e.t]||esc(e.t)}</td><td class="num">${e.amt==null?'<span class="mu">по ставке</span>':M(e.amt,cur)}</td><td class="num">${e.pct==null?'—':bcN(e.pct,2)+' %'}</td></tr>`).join('')
+      +fl.slice(0,lim).map(e=>`<tr><td>${ddm(e.d)}</td><td>${BC_EV[e.t]||esc(e.t)}</td><td class="num">${e.amt==null?'<span class="mu">по ставке</span>':e.est?`<span class="est" title="${esc(BC_KR_SRC[(c.keyrate||{}).source]||'ключевая ставка по прогнозу')} ${bcN(e.base,2)}% + спред ${bcN(e.spread,2)} п.п.">≈ ${M(e.amt,cur)}</span>`:M(e.amt,cur)}</td><td class="num">${e.pct==null?'—':(e.est?'≈ ':'')+bcN(e.pct,2)+' %'}</td></tr>`).join('')
       +`</tbody></table></div>`;
+    if(c.keyrate)h+=`<p class="note" style="margin-top:8px">≈ — прогноз: ставка купона флоатера ещё не объявлена, принята равной ключевой ставке на начало купонного периода + спред эмитента к ключевой на прошлых купонах. Прогноз ключевой ставки: ${esc(c.keyrate.name)}${c.keyrate.as_of?`, на ${esc(c.keyrate.as_of)}`:''}.</p>`;
     if(fl.length>lim)h+=`<button class="btn ghost bc-more" id="bc-more">Показать все (${fl.length})</button>`;
   }else h+=`<div class="mu" style="font-size:13px">Данных о будущих выплатах нет.</div>`;
   h+=`</div>`;

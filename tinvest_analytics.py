@@ -33,6 +33,7 @@ import urllib.request
 import uuid
 import webbrowser
 import zipfile
+import zlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -43,7 +44,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "T-Invest Analytics"
-APP_VERSION = "0.9"
+APP_VERSION = "0.10"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -65,6 +66,7 @@ DEFAULT_CONFIG = {
     "theme": "auto",        # auto | dark | light
     "targets": {},          # целевые доли по классам активов, %: {"share": 50, "bond": 40, ...}
     "notify_days": 7,       # за сколько дней напоминать о выплатах
+    "keyrate_mode": "cbr",  # источник прогноза ключевой ставки для флоатеров: cbr | survey | market | flat
 }
 
 # Корневой сертификат Минцифры (Russian Trusted Root CA, RSA, до 27.02.2032).
@@ -1115,12 +1117,46 @@ RISK_RU = {"RISK_LEVEL_LOW": "низкий", "RISK_LEVEL_MODERATE": "средн�
 
 
 STRESS_DY = (-3, -2, -1, 1, 2, 3)
-YTM_OUTLIER = 100.0      # доходность выше 100% годовых считаем «distressed»: показываем в строке, но в среднее не берём
+YTM_HIGH = 100.0         # доходность выше 100% годовых — «высокий риск дефолта»: только помечается, из расчётов НЕ исключается
 
 
 def bond_isin(r):
     inst = store().get("inst:" + (r.get("uid") or ""), ttl=30 * DAY) or {}
     return (inst.get("isin") or r.get("ticker") or "").upper()
+
+
+def portfolio_irr(items, today):
+    """Единая доходность облигационного портфеля (IRR): все будущие потоки позиций (потоки на 1 бумагу x количество,
+    в рублях по текущему курсу валюты номинала) против суммарной текущей стоимости с НКД. Одно решение cf_ytm.
+    irr_tax — то же после НДФЛ: потоки каждой бумаги берутся уже за вычетом налога (net_flows), дальше без налога.
+    Бумаги без точных потоков (приближённый расчёт) в IRR не входят: value/count показывают охват.
+    Возвращает {irr, irr_tax, value (в рублях, стоимость с НКД), count}; доходности в %."""
+    gross, net, dirty = defaultdict(float), defaultdict(float), 0.0
+    for ex, qty, fx in items:
+        k = qty * fx
+        dirty += ex["dirty"] * k
+        for d, c, p in ex["flows"]:
+            if d > today:
+                gross[d] += (c + p) * k
+        for d, a in net_flows(ex["flows"], today, ex["basis"]):
+            net[d] += a * k
+    res = {"irr": None, "irr_tax": None, "value": dirty, "count": len(items)}
+    if dirty > 0 and gross:
+        y = cf_ytm(dirty, [(d, a, 0.0) for d, a in sorted(gross.items())], today)
+        yt = cf_ytm(dirty, [(d, a, 0.0) for d, a in sorted(net.items())], today)
+        res["irr"] = y * 100 if y is not None else None
+        res["irr_tax"] = yt * 100 if yt is not None else None
+    return res
+
+
+def keyrate_brief():
+    """Короткая сводка об использованном прогнозе ключевой ставки для UI (без пути)."""
+    try:
+        i = keyrate_forecast_info()
+        return {"source": i["source"], "name": i["source_name"], "as_of": i["as_of"], "key_rate": i["key_rate"],
+                "yearly": i["yearly"], "mode": i["mode"]}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def bond_exact(client, r, b, today, rates):
@@ -1138,7 +1174,8 @@ def bond_exact(client, r, b, today, rates):
     price, avg, aci = bond_price_face(r, b, rates)
     if not price:
         return None
-    flows, kind, end = bond_flows(bz, today, face)
+    est = {}
+    flows, kind, end = bond_flows(bz, today, face, floating=bool(b.get("floating")), est_out=est)
     if not flows or end <= today:
         return None
     if kind == "maturity" and abs((datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(b["maturity"], "%Y-%m-%d")).days) > 45:
@@ -1153,7 +1190,7 @@ def bond_exact(client, r, b, today, rates):
     return {"isin": isin, "ytm": y * 100, "ytm_tax": yt * 100 if yt is not None else None, "dur": mac, "mdur": mod,
             "convexity": conv, "to": kind, "end": end, "stress_pct": {dy: (p / 100.0 * face + aci) / dirty * 100 - 100
                                                                       for dy, p in st.items()},
-            "cf_source": "moex"}
+            "cf_source": "moex", "est_coupons": len(est), "flows": flows, "basis": price, "dirty": dirty}
 
 
 def bond_price_face(r, b, rates):
@@ -1182,7 +1219,7 @@ def bonds_report(client, rows):
     exacts = dict(zip([r["uid"] for r in bonds], pool_map(
         lambda r: bond_exact(client, r, infos[r["uid"]], today, rates) if infos.get(r["uid"]) else None, bonds)))
     stress_rub = defaultdict(float)
-    outliers = []
+    high_yield, irr_items = [], []
     w = defaultdict(float)
     ladder, risk = defaultdict(float), defaultdict(float)
     kinds = defaultdict(int)
@@ -1207,6 +1244,11 @@ def bonds_report(client, rows):
         if ex:
             row.update({k: ex[k] for k in ("ytm", "ytm_tax", "dur", "mdur", "convexity", "to", "cf_source")})
             row["end"] = ex["end"]
+            row["est_coupons"] = ex.get("est_coupons") or 0
+            fc_ = (b.get("cur") or "rub").lower()
+            rf_ = 1.0 if fc_ == "rub" else rates.get(fc_)
+            if rf_:
+                irr_items.append((ex, r["qty"], rf_))
             sp = ex["stress_pct"]
         else:
             if m["ytm"] is not None and m["dur"]:      # приближение: только дюрация
@@ -1220,18 +1262,18 @@ def bonds_report(client, rows):
             stress_rub[dy] += p / 100.0 * v
         m = dict(m, ytm=row["ytm"], dur=row["dur"])
         out.append(row)
-        if row["ytm"] is not None and v and abs(row["ytm"]) > YTM_OUTLIER:
-            outliers.append({"ticker": row["ticker"], "name": row["name"], "ytm": row["ytm"], "value": v})
-        elif row["ytm"] is not None and v:
+        if row["ytm"] is not None and v and row["ytm"] > YTM_HIGH:
+            high_yield.append({"ticker": row["ticker"], "name": row["name"], "ytm": row["ytm"], "value": v})
+        if row["ytm"] is not None and v:
             w["ytm"] += row["ytm"] * v
             w["ytm_v"] += v
             if row.get("ytm_tax") is not None:
                 w["yt"] += row["ytm_tax"] * v
                 w["yt_v"] += v
-        if row.get("mdur") is not None and v and abs(row["ytm"] or 0) <= YTM_OUTLIER:
+        if row.get("mdur") is not None and v:
             w["md"] += row["mdur"] * v
             w["md_v"] += v
-        if m["dur"] is not None and v and abs(row["ytm"] or 0) <= YTM_OUTLIER:
+        if m["dur"] is not None and v:
             w["dur"] += m["dur"] * v
             w["dur_v"] += v
         if m["cur_yield"] is not None and v:
@@ -1274,11 +1316,14 @@ def bonds_report(client, rows):
                 pays.append({"date": d, "kind": "dividend", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
                              "amount": per * r["qty"], "est": False})
     pays.sort(key=lambda p: p["date"])
+    irr = portfolio_irr(irr_items, today)
     metrics = {"count": len(bonds), "value": tot_bonds,
                "ytm": w["ytm"] / w["ytm_v"] if w["ytm_v"] else None,
                "ytm_tax": w["yt"] / w["yt_v"] if w["yt_v"] else None,
                "mdur": w["md"] / w["md_v"] if w["md_v"] else None,
-               "ytm_value": w["ytm_v"], "outliers": outliers, "outliers_value": sum(o["value"] for o in outliers),
+               "ytm_value": w["ytm_v"], "high_yield": high_yield, "high_yield_value": sum(o["value"] for o in high_yield),
+               "irr": irr["irr"], "irr_tax": irr["irr_tax"], "irr_value": irr["value"], "irr_count": irr["count"],
+               "keyrate": keyrate_brief(),
                "approx_count": sum(1 for x in out if x.get("cf_source") == "approx"),
                "stress": {str(dy): {"rub": stress_rub[dy], "pct": stress_rub[dy] / tot_bonds * 100 if tot_bonds else None}
                           for dy in STRESS_DY},
@@ -1336,10 +1381,67 @@ def moex_bondization(isin):
     return out if out.get("ok") else None
 
 
-def bond_flows(bz, today, face, mode="auto"):
+FL_SPREAD_N, FL_SPREAD_RANGE = 4, (-4.0, 25.0)
+
+
+def fl_estimates(bz, today, face, path=None):
+    """Оценка будущих купонов флоатера, ставка которых ещё не объявлена: {дата: {rate, base, spread, amt}}.
+    Спред эмитента = ставка известного купона - ключевая ставка на начало его купонного периода (медиана по последним
+    FL_SPREAD_N известным купонам). Будущая ставка = ключевая на начало купонного периода (факт из ряда ЦБ, если период
+    уже начался, иначе прогноз keyrate_path()) + спред. Сумма = ставка x номинал на начало периода x дни периода / 365.
+    Привязка к RUONIA отдельно не выделяется: RUONIA ~ ключевая - 0,2 п.п., и поправка сокращается:
+    (K' - 0,2) + (r - (K - 0,2)) = K' + (r - K). Если базу вывести нельзя (нет ряда ставок, нет известных купонов,
+    спред вне диапазона) — {}, и вызывающий код оставляет прежнее поведение (последний известный купон)."""
+    cps = sorted((c["coupondate"], c.get("value"), c.get("valueprc")) for c in bz["coupons"] if c.get("coupondate"))
+    unk = [i for i, (d, v, _) in enumerate(cps) if d > today and not v and i > 0]
+    if not unk:
+        return {}
+    try:
+        ser = key_rate_series()
+        path = path if path is not None else keyrate_path()
+    except Exception:  # noqa: BLE001
+        return {}
+    if not ser or not path:
+        return {}
+    am_all = sorted((a["amortdate"], a.get("value")) for a in bz["amort"] if a.get("amortdate") and a.get("value"))
+
+    def face_at(d):
+        return face + sum(v for da, v in am_all if d <= da <= today) - sum(v for da, v in am_all if today < da < d)
+
+    def ndays(a, b):
+        return (datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
+    samples = []
+    for i, (d, v, vp) in enumerate(cps):
+        if not v or i == 0:
+            continue
+        p0 = cps[i - 1][0]
+        k, days = key_rate_on(ser, p0), ndays(p0, d)
+        if k is None or days <= 0:
+            continue
+        samples.append((vp if vp else v / max(face_at(d), 1e-9) * 365.0 / days * 100.0) - k)
+    samples = sorted(samples[-FL_SPREAD_N:])
+    if not samples:
+        return {}
+    n = len(samples)
+    spread = samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2.0
+    if not FL_SPREAD_RANGE[0] <= spread <= FL_SPREAD_RANGE[1]:
+        return {}
+    out = {}
+    for i in unk:
+        d, p0 = cps[i][0], cps[i - 1][0]
+        base = key_rate_on(ser, p0) if p0 <= today else None
+        if base is None:
+            base = keyrate_at(path, p0)
+        rate = max(0.0, base + spread)
+        out[d] = {"rate": rate, "base": base, "spread": spread, "amt": rate / 100.0 * face_at(d) * ndays(p0, d) / 365.0}
+    return out
+
+
+def bond_flows(bz, today, face, mode="auto", floating=False, est_out=None):
     """Будущие потоки на одну облигацию: [(дата, купон, номинал)] и признак окончания ('offer'/'maturity').
-    face — текущий номинал. Неизвестные купоны (флоатеры) = последний известный. Если есть будущая оферта
-    (покупка по цене offer price) и mode != 'maturity', потоки обрываются на дате оферты.
+    face — текущий номинал. Неизвестные купоны флоатера (floating=True) оцениваются по прогнозу ключевой ставки
+    (fl_estimates; детали складываются в словарь est_out), если оценить нельзя — равны последнему известному.
+    Если есть будущая оферта (покупка по цене offer price) и mode != 'maturity', потоки обрываются на дате оферты.
     Возвращает (flows, end_kind, end_date) либо (None, None, None)."""
     cps = sorted((c["coupondate"], c.get("value")) for c in bz["coupons"] if c.get("coupondate"))
     am_all = sorted((a["amortdate"], a.get("value")) for a in bz["amort"] if a.get("amortdate") and a.get("value"))
@@ -1358,6 +1460,7 @@ def bond_flows(bz, today, face, mode="auto"):
             rate = v / max(face_at(d), 1e-9)
         if d > today and v:
             break
+    est = fl_estimates(bz, today, face) if floating else {}
     cpn, last_rate = {}, None
     for d, v in cps:
         if v:
@@ -1365,6 +1468,11 @@ def bond_flows(bz, today, face, mode="auto"):
             if d > today:
                 cpn[d] = v
         elif d > today:
+            if d in est:
+                cpn[d] = est[d]["amt"]              # флоатер: прогноз ключевой ставки + спред эмитента
+                if est_out is not None:
+                    est_out[d] = est[d]
+                continue
             r_ = last_rate if last_rate is not None else rate
             cpn[d] = (r_ or 0.0) * face_at(d)       # неизвестный купон: последняя ставка на текущий остаток номинала
     prin = defaultdict(float)
@@ -1419,6 +1527,16 @@ def _bc_pv(flows, settle, y, tax=False, basis=0.0):
                 a -= BC_TAX * max(0.0, sum(x[2] for x in tl) - basis)
         tot += a / (1 + y) ** t
     return tot
+
+
+def net_flows(flows, settle, basis=0.0):
+    """Потоки после НДФЛ тем же способом, что в _bc_pv(tax=True): [(дата, сумма)]. Налог на разницу погашение - basis
+    берётся в дату последнего потока."""
+    fl = [f for f in flows if f[0] > settle]
+    out = [(d, c * (1 - BC_TAX) + p) for d, c, p in fl]
+    if out:
+        out[-1] = (out[-1][0], out[-1][1] - BC_TAX * max(0.0, sum(x[2] for x in fl) - basis))
+    return out
 
 
 def cf_ytm(dirty, flows, settle, tax=False, basis=0.0):
@@ -3222,6 +3340,21 @@ def _bc_flows(isin):
     return ev
 
 
+def _bc_mark_est(flows, isin, floating, face):
+    """Купоны флоатера без объявленной ставки: подставляем прогноз (ключевая ставка + спред), помечаем est/base/spread."""
+    if not floating or not face or not any(e["t"] == "coupon" and e.get("amt") is None for e in flows):
+        return False
+    bz = moex_bondization(isin)
+    est = fl_estimates(bz, date.today().isoformat(), float(face)) if bz else {}
+    done = False
+    for e in flows:
+        x = est.get(e["d"]) if e["t"] == "coupon" and e.get("amt") is None else None
+        if x:
+            e.update(amt=x["amt"], pct=x["rate"], est=True, base=round(x["base"], 2), spread=round(x["spread"], 2))
+            done = True
+    return done
+
+
 def _bc_issuer_key(r):
     t = name_tokens(_bond_query(r.get("full") or r.get("name") or ""))
     return t
@@ -3355,6 +3488,13 @@ def bond_card(isin):
     card["history"] = hist or {"d": [], "p": [], "y": [], "v": []}
     card["flows"] = flows or []
     try:
+        face = (desc or {}).get("FACEVALUE") or (me or {}).get("nominal")
+        if _bc_mark_est(card["flows"], isin, bool((ci or {}).get("floating")), float(face) if face else 0.0):
+            info = keyrate_forecast_info()
+            card["keyrate"] = {"source": info["source"], "name": info["source_name"], "as_of": info["as_of"]}
+    except Exception as e:  # noqa: BLE001
+        errors.append("прогноз купонов: %s" % str(e)[:120])
+    try:
         rt = (me["_rt"] if me else None) or best_rating(isin, (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or "")
     except Exception as e:  # noqa: BLE001
         rt = None
@@ -3380,6 +3520,528 @@ def bond_card(isin):
     card["name"] = (me or {}).get("full") or (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or isin
     card["short"] = (me or {}).get("name") or (ci or {}).get("name") or isin
     return card
+# ═══════════════════════════════ прогноз ключевой ставки ═══════════════════════════════
+# Нужен для флоатеров: будущие купоны = прогноз ключевой ставки + спред эмитента (см. bond_flows в 08a_bondcalc.py).
+# Источники по убыванию приоритета (первый сработавший):
+#   cbr    — «Среднесрочный прогноз Банка России» (PDF на cbr.ru, строка «Ключевая ставка, в среднем за год»; диапазон -> середина);
+#   survey — макроэкономический опрос Банка России (HTML-таблица, медиана «Ключевая ставка ... в среднем за год»);
+#   market — форвардные ставки КБД Мосбиржи (приближение, см. _kr_market_path);
+#   flat   — текущая ключевая ставка без изменений.
+
+KR_TTL, KR_ERR_TTL = 24 * 3600, 3600
+KR_MODES = ("cbr", "survey", "market", "flat")
+KR_NAMES = {"cbr": "Среднесрочный прогноз Банка России", "survey": "Макроопрос аналитиков (Банк России)",
+            "market": "Рыночные ожидания (форварды КБД)", "flat": "Ключевая ставка без изменений"}
+KR_HORIZON_M = 48
+_kr_mem = {}
+_kr_lock = threading.Lock()
+
+
+def http_bytes(url, timeout=30):
+    if not _ext_ctx:
+        _ext_ctx.append(make_ssl_context())
+    req = urllib.request.Request(url, headers=EXT_UA)
+    with urllib.request.urlopen(req, timeout=timeout, context=_ext_ctx[0]) as r:
+        return r.read()
+
+
+# ── минимальный разбор PDF (stdlib): Flate-потоки, ToUnicode, операторы Tf/Tm/Td/TJ ──
+
+def _pdf_inflate(body):
+    head, _, rest = body.partition(b"stream")
+    if not rest:
+        return b""
+    rest = rest[1:] if rest[:1] == b"\n" else (rest[2:] if rest[:2] == b"\r\n" else rest[1:] if rest[:1] == b"\r" else rest)
+    rest = rest[:rest.rfind(b"endstream")] if b"endstream" in rest else rest
+    if b"FlateDecode" in head:
+        return zlib.decompressobj().decompress(rest)
+    return rest
+
+
+def _pdf_objects(d):
+    objs = {}
+    for m in re.finditer(rb"(?<![0-9])(\d+) 0 obj(.*?)endobj", d, re.S):
+        objs[int(m.group(1))] = m.group(2)
+    for body in list(objs.values()):
+        head = body.partition(b"stream")[0]
+        if b"/ObjStm" not in head:
+            continue
+        n = int(re.search(rb"/N\s+(\d+)", head).group(1))
+        first = int(re.search(rb"/First\s+(\d+)", head).group(1))
+        data = _pdf_inflate(body)
+        nums = [int(x) for x in re.findall(rb"\d+", data[:first])]
+        pairs = list(zip(nums[0:2 * n:2], nums[1:2 * n:2]))
+        for i, (num, off) in enumerate(pairs):
+            end = pairs[i + 1][1] if i + 1 < len(pairs) else len(data) - first
+            objs.setdefault(num, data[first + off:first + end])
+    return objs
+
+
+def _pdf_cmap(data):
+    s = data.decode("latin-1")
+    m = re.search(r"begincodespacerange\s*<([0-9A-Fa-f]+)>", s)
+    width = len(m.group(1)) // 2 if m else 1
+    mp = {}
+
+    def u(h):
+        return bytes.fromhex(h).decode("utf-16-be", "replace")
+    for blk in re.findall(r"beginbfchar(.*?)endbfchar", s, re.S):
+        for a, b in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", blk):
+            mp[int(a, 16)] = u(b)
+    for blk in re.findall(r"beginbfrange(.*?)endbfrange", s, re.S):
+        for a, b, c in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(<[0-9A-Fa-f]+>|\[[^\]]*\])", blk):
+            lo, hi = int(a, 16), int(b, 16)
+            if c.startswith("["):
+                for i, h in enumerate(re.findall(r"<([0-9A-Fa-f]+)>", c)):
+                    mp[lo + i] = u(h)
+            else:
+                base = int(c[1:-1], 16)
+                nb = len(c) - 2
+                for i in range(hi - lo + 1):
+                    mp[lo + i] = u(("%0" + str(nb) + "x") % (base + i))
+    return width, mp
+
+
+def _pdf_tokens(s):
+    i, n = 0, len(s)
+    out = []
+    ws = b" \t\r\n\x00\x0c"
+    delim = b"()<>[]/%"
+    while i < n:
+        c = s[i:i + 1]
+        if c in ws:
+            i += 1
+        elif c == b"%":
+            while i < n and s[i:i + 1] not in b"\r\n":
+                i += 1
+        elif c == b"(":
+            depth, j, buf = 1, i + 1, bytearray()
+            while j < n and depth:
+                ch = s[j:j + 1]
+                if ch == b"\\":
+                    nx = s[j + 1:j + 2]
+                    if nx in b"01234567" and nx:
+                        k = j + 1
+                        while k < j + 4 and s[k:k + 1] and s[k:k + 1] in b"01234567":
+                            k += 1
+                        buf.append(int(s[j + 1:k], 8) & 255)
+                        j = k
+                        continue
+                    buf += {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\x0c"}.get(nx, nx)
+                    j += 2
+                    continue
+                if ch == b"(":
+                    depth += 1
+                elif ch == b")":
+                    depth -= 1
+                    if not depth:
+                        j += 1
+                        break
+                buf += ch
+                j += 1
+            out.append(("s", bytes(buf)))
+            i = j
+        elif c == b"<":
+            if s[i + 1:i + 2] == b"<":
+                out.append(("op", "<<"))
+                i += 2
+            else:
+                j = s.index(b">", i)
+                h = re.sub(rb"\s", b"", s[i + 1:j])
+                if len(h) % 2:
+                    h += b"0"
+                out.append(("s", bytes.fromhex(h.decode())))
+                i = j + 1
+        elif c == b">":
+            out.append(("op", ">>"))
+            i += 2 if s[i + 1:i + 2] == b">" else 1
+        elif c in b"[]":
+            out.append(("op", c.decode()))
+            i += 1
+        elif c == b"/":
+            j = i + 1
+            while j < n and s[j:j + 1] not in ws and s[j:j + 1] not in delim:
+                j += 1
+            out.append(("n", s[i + 1:j].decode("latin-1")))
+            i = j
+        else:
+            j = i
+            while j < n and s[j:j + 1] not in ws and s[j:j + 1] not in delim:
+                j += 1
+            t = s[i:j].decode("latin-1")
+            try:
+                out.append(("num", float(t)))
+            except ValueError:
+                out.append(("op", t))
+            i = max(j, i + 1)
+    return out
+
+
+def pdf_text_fragments(d):
+    """[(x, y, size, text)] из PDF (stdlib: Flate + ToUnicode). Для простых однотипных документов ЦБ."""
+    objs = _pdf_objects(d)
+    fonts = {}
+    for body in objs.values():
+        head = body.partition(b"stream")[0]
+        for m in re.finditer(rb"/Font\s*(?:<<(.*?)>>|(\d+)\s+0\s+R)", head, re.S):
+            blk = m.group(1) if m.group(1) is not None else objs.get(int(m.group(2)), b"")
+            for nm, num in re.findall(rb"/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R", blk):
+                fb = objs.get(int(num), b"")
+                tu = re.search(rb"/ToUnicode\s+(\d+)\s+0\s+R", fb)
+                if tu and nm.decode() not in fonts:
+                    fonts[nm.decode()] = _pdf_cmap(_pdf_inflate(objs.get(int(tu.group(1)), b"")))
+    frags = []
+    for body in objs.values():
+        head = body.partition(b"stream")[0]
+        if b"/Length" not in head or b"/Type" in head and (b"/XObject" in head or b"/ObjStm" in head or b"/XRef" in head):
+            continue
+        try:
+            data = _pdf_inflate(body)
+        except Exception:
+            continue
+        if b"BT" not in data or b" Tf" not in data:
+            continue
+        stack, font, size = [], None, 10.0
+        lm = [0.0, 0.0]
+        for kind, v in _pdf_tokens(data):
+            if kind != "op" or v in ("[", "]", "<<", ">>"):
+                stack.append((kind, v))
+                continue
+            args = stack
+            stack = []
+            if v == "Tf":
+                nm = [a for a in args if a[0] == "n"]
+                nu = [a[1] for a in args if a[0] == "num"]
+                font = nm[-1][1] if nm else font
+                size = nu[-1] if nu else size
+            elif v == "Tm":
+                nu = [a[1] for a in args if a[0] == "num"]
+                if len(nu) >= 6:
+                    lm = [nu[4], nu[5]]
+            elif v in ("Td", "TD"):
+                nu = [a[1] for a in args if a[0] == "num"]
+                if len(nu) >= 2:
+                    lm = [lm[0] + nu[-2], lm[1] + nu[-1]]
+            elif v in ("TJ", "Tj", "'", '"'):
+                width, mp = fonts.get(font, (1, None))
+                txt = ""
+                for k, a in args:
+                    if k != "s":
+                        continue
+                    if mp is None:
+                        txt += a.decode("cp1252", "replace")
+                    else:
+                        w = width if len(a) % width == 0 else 1
+                        for p in range(0, len(a), w):
+                            txt += mp.get(int.from_bytes(a[p:p + w], "big"), "")
+                if txt:
+                    frags.append((lm[0], lm[1], size, txt))
+    return frags
+
+
+# ── источник 1: среднесрочный прогноз Банка России (PDF) ──
+
+KR_CBR_PAGE = "https://www.cbr.ru/dkp/mp_dec/decision_key_rate/"
+
+
+def _kr_num(s):
+    return float(s.replace(",", "."))
+
+
+def _kr_cells(txt):
+    """'19,2 14,6 12,5–13,5 9,0–10,0' -> [(low, high)]. Одиночное значение с двумя знаками (14,61) — сноска, отбрасываем её."""
+    toks = re.findall(r"(\d+(?:,\d+)?)(?:\s*[–-]\s*(\d+(?:,\d+)?))?", txt)
+    cells = []
+    for a, b in toks:
+        if not b and re.fullmatch(r"\d+,\d\d", a):
+            a = a[:-1]
+        cells.append((_kr_num(a), _kr_num(b or a)))
+    return cells
+
+
+def _kr_parse_pdf(data):
+    """Строка «Ключевая ставка, в среднем за год» таблицы основных параметров прогноза -> {год: (low, high)}."""
+    fr = pdf_text_fragments(data)
+    big = [f for f in fr if f[2] >= 8]          # мелкий шрифт — сноски и надстрочные индексы
+
+    def row(y, tol=2.5):
+        rs = sorted((f for f in big if abs(f[1] - y) <= tol), key=lambda f: f[0])
+        return "".join(f[3] for f in rs)
+    lab = [f for f in big if f[3].startswith("Ключевая ставка")]
+    first = [f for f in big if f[3].startswith("Инфляция")]
+    if not lab or not first:
+        raise ValueError("нет строки таблицы")
+    y0 = max(f[1] for f in first)
+    m = re.search(r"годовых(.*)$", row(lab[0][1]))
+    cells = _kr_cells(m.group(1) if m else "")
+    hdr = "".join(f[3] for f in sorted((f for f in big if y0 + 3 < f[1] < y0 + 45 and f[0] > 150), key=lambda f: (f[0], -f[1])))
+    years = sorted({int(y) for y in re.findall(r"20\d\d", hdr)})
+    if len(years) != len(cells) or not years:
+        raise ValueError("не сошлись годы (%d) и значения (%d)" % (len(years), len(cells)))
+    return {y: c for y, c in zip(years, cells)}
+
+
+def _kr_cbr():
+    s = http_text(KR_CBR_PAGE, 30)
+    links = re.findall(r'href="(/Content/Document/File/\d+/forecast_(\d\d)(\d\d)(\d\d)\.pdf)"', s)
+    if not links:
+        raise ValueError("нет ссылки на прогноз")
+    path, yy, mm, dd = max(links, key=lambda x: x[1:])
+    as_of = "20%s-%s-%s" % (yy, mm, dd)
+    st = store()
+    ck = "kr_pdf:" + path
+    pt = st.get(ck)
+    if pt is None:
+        yr = _kr_parse_pdf(http_bytes("https://www.cbr.ru" + path, 40))
+        pt = {str(k): list(v) for k, v in yr.items()}
+        st.put(ck, pt)                     # PDF конкретного заседания не меняется
+    years = {int(k): tuple(v) for k, v in pt.items()}
+    # в таблице первым идёт последний фактический год: он не прогноз
+    return {"as_of": as_of, "url": "https://www.cbr.ru" + path, "years": years}
+
+
+# ── источник 2: макроопрос Банка России (HTML-таблица) ──
+
+KR_SURVEY_PAGE = "https://cbr.ru/statistics/ddkp/mo_br/"
+_MONTHS_RU = ["январ", "феврал", "март", "апрел", "ма", "июн", "июл", "август", "сентябр", "октябр", "ноябр", "декабр"]
+
+
+def _kr_survey():
+    s = http_text(KR_SURVEY_PAGE, 30)
+    i = s.find("Ключевая ставка")
+    j = s.rfind("<table", 0, i)
+    k = s.find("</table>", i)
+    if i < 0 or j < 0 or k < 0:
+        raise ValueError("нет таблицы опроса")
+    rows = []
+    for r in re.findall(r"<tr.*?</tr>", s[j:k], re.S):
+        rows.append([re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", c)).replace("&nbsp;", " ").strip()
+                     for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", r, re.S)])
+    hdr = next(r for r in rows if sum(bool(re.match(r"20\d\d", c)) for c in r) >= 3)
+    kr = next(r for r in rows if r and r[0].startswith("Ключевая ставка"))
+    years = {}
+    for h, v in zip(hdr, kr):
+        m, y = re.match(r"(20\d\d)", h), re.match(r"\s*(\d+,\d+|\d+)", v)
+        if m and y and "факт" not in h:
+            years[int(m.group(1))] = (_kr_num(y.group(1)),) * 2        # медиана; в скобках — прошлый опрос
+    if not years:
+        raise ValueError("нет прогнозных значений")
+    plain = re.sub(r"<[^>]+>", " ", s)
+    m = re.search(r"Результаты опроса:\s*([А-Яа-я]+)\s+(20\d\d)", plain)
+    as_of = ""
+    if m:
+        mo = next((n + 1 for n, p in enumerate(_MONTHS_RU) if m.group(1).lower().startswith(p)), 0)
+        as_of = "%s-%02d" % (m.group(2), mo) if mo else m.group(2)
+    return {"as_of": as_of, "url": KR_SURVEY_PAGE, "years": years}
+
+
+# ── фактическая ключевая ставка ──
+
+def key_rate_on(series, d):
+    """Ключевая ставка, действовавшая на дату d (ISO), по ряду [[дата, %]]; None, если ряд не покрывает дату."""
+    if not series or d < series[0][0]:
+        return None
+    i = bisect.bisect_right([x[0] for x in series], d) - 1
+    return series[i][1]
+
+
+def _kr_current():
+    ser = key_rate_series()
+    if not ser:
+        raise ValueError("нет ключевой ставки")
+    return ser, ser[-1][1]
+
+
+# ── построение месячного пути ──
+
+def _kr_days(a, b):
+    return (datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
+
+
+def _kr_add(d, n):
+    return (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def _kr_interp(knots, t):
+    if t <= knots[0][0]:
+        return knots[0][1]
+    for (x0, y0), (x1, y1) in zip(knots, knots[1:]):
+        if t <= x1:
+            return y0 + (y1 - y0) * (t - x0) / ((x1 - x0) or 1)
+    return knots[-1][1]
+
+
+def _kr_month_starts(today, n):
+    y, m = int(today[:4]), int(today[5:7])
+    out = []
+    for _ in range(n):
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+        out.append("%04d-%02d-01" % (y, m))
+    return out
+
+
+def _kr_path_from_yearly(yearly, k0, today, series):
+    """Путь ставки, у которого среднее за год совпадает со срединным значением прогноза.
+    Узлы: сегодня = текущая ставка; для текущего года — середина оставшейся части (цель = средняя ставка на остаток года,
+    выведенная из годовой средней и уже известной фактической части); для следующих лет — 2 июля.
+    Между узлами линейно, после последнего — плоско. Значения узлов подгоняются итерациями так, чтобы дневное среднее
+    по году (для текущего — по оставшейся его части) равнялось целевому."""
+    cur = int(today[:4])
+    spans = []          # [год, t_от, t_до, цель, t_узла] в днях от сегодня
+    for y in sorted(yearly):
+        if y < cur:
+            continue
+        lo, hi = yearly[y]
+        mid = (lo + hi) / 2.0
+        b = _kr_days(today, "%d-12-31" % y)
+        if y == cur:
+            if b < 20:
+                continue
+            ny = _kr_days("%d-01-01" % y, "%d-12-31" % y) + 1
+            done = _kr_days("%d-01-01" % y, today)
+            tot = 0.0
+            for i in range(done):
+                r = key_rate_on(series, _kr_add("%d-01-01" % y, i))
+                if r is None:
+                    tot = None
+                    break
+                tot += r
+            if tot is not None and ny > done:
+                rest = (mid * ny - tot) / (ny - done)
+                if abs(rest - mid) <= 6 and rest > 0.5:
+                    mid = rest
+            spans.append([y, 0, b, mid, b / 2.0])
+        else:
+            a = _kr_days(today, "%d-01-01" % y)
+            spans.append([y, a, b, mid, float(_kr_days(today, "%d-07-02" % y))])
+    if not spans:
+        raise ValueError("нет прогнозных лет")
+    vals = [s[3] for s in spans]
+    for _ in range(40):
+        knots = [(0.0, k0)] + [(s[4], v) for s, v in zip(spans, vals)]
+        worst = 0.0
+        for n_, s in enumerate(spans):
+            avg = sum(_kr_interp(knots, t) for t in range(int(s[1]), int(s[2]) + 1)) / (s[2] - s[1] + 1)
+            err = s[3] - avg
+            worst = max(worst, abs(err))
+            vals[n_] = max(0.5, vals[n_] + 0.8 * err)
+        if worst < 0.005:
+            break
+    knots = [(0.0, k0)] + [(s[4], v) for s, v in zip(spans, vals)]
+    pts = [(today, round(k0, 3))]
+    for d in _kr_month_starts(today, KR_HORIZON_M):
+        pts.append((d, round(_kr_interp(knots, _kr_days(today, d)), 3)))
+    return pts
+
+
+def _kr_market_path(k0, today):
+    """Путь из форвардных ставок КБД: 3-месячный форвард f(t) на горизонте t (эффективная годовая ставка).
+    Ключевая ставка ~ форвард минус срочная премия: премия принята 0,75 п.п. в год горизонта, но не более 1,5 п.п.
+    Начало привязано к текущей ставке: сдвиг (k0 - f(0)) затухает линейно за 2 года. Это грубая оценка рыночных
+    ожиданий, а не прогноз ЦБ."""
+    if not kbd_curve():
+        raise ValueError("нет КБД")
+
+    def z(t):
+        return (1 + kbd_at(t) / 100.0) ** t
+
+    def fwd(t):
+        h = 0.25
+        return ((z(t + h) / z(t)) ** (1 / h) - 1) * 100.0
+    f0 = fwd(0.0)
+    pts = [(today, round(k0, 3))]
+    for d in _kr_month_starts(today, KR_HORIZON_M):
+        t = _kr_days(today, d) / 365.0
+        pts.append((d, round(max(0.5, fwd(t) + (k0 - f0) * max(0.0, 1 - t / 2.0) - min(1.5, 0.75 * t)), 3)))
+    return pts
+
+
+def _kr_flat_path(k0, today):
+    return [(today, round(k0, 3))] + [(d, round(k0, 3)) for d in _kr_month_starts(today, KR_HORIZON_M)]
+
+
+def _kr_yearly_from_path(path):
+    by = defaultdict(list)
+    for d, v in path:
+        by[int(d[:4])].append(v)
+    return [{"year": y, "low": round(min(v), 2), "high": round(max(v), 2), "mid": round(sum(v) / len(v), 2)} for y, v in sorted(by.items())]
+
+
+def _kr_try(src, today):
+    """Один источник -> dict с path/yearly/as_of либо исключение."""
+    ser, k0 = _kr_current()
+    if src in ("cbr", "survey"):
+        st = store()
+        ck = "kr_src:" + src
+        raw = st.get(ck, ttl=KR_TTL)
+        if raw is None:
+            raw = (_kr_cbr if src == "cbr" else _kr_survey)()
+            st.put(ck, {"as_of": raw["as_of"], "url": raw["url"], "years": {str(k): list(v) for k, v in raw["years"].items()}})
+        years = {int(k): tuple(v) for k, v in raw["years"].items() if int(k) >= int(today[:4])}     # фактические годы не нужны
+        path = _kr_path_from_yearly(years, k0, today, ser)
+        yearly = [{"year": y, "low": lo, "high": hi, "mid": round((lo + hi) / 2.0, 2)} for y, (lo, hi) in sorted(years.items())]
+        return {"as_of": raw["as_of"], "url": raw["url"], "yearly": yearly, "path": path, "key_rate": k0}
+    path = _kr_market_path(k0, today) if src == "market" else _kr_flat_path(k0, today)
+    return {"as_of": today, "url": "", "yearly": _kr_yearly_from_path(path), "path": path, "key_rate": k0}
+
+
+def keyrate_forecast_info(mode=None):
+    """{source, source_name, mode, as_of, yearly:[{year, low, high, mid}], path:[(дата, %)], key_rate, tried:{источник: ошибка}}.
+    mode — из настройки keyrate_mode; пробуем выбранный источник, затем следующие по цепочке cbr -> survey -> market -> flat.
+    Кэш источников 24 часа (в базе), путь на сегодня — в памяти."""
+    if mode is None:
+        try:
+            mode = load_config().get("keyrate_mode")
+        except Exception:  # noqa: BLE001
+            mode = None
+    if mode not in KR_MODES:
+        mode = "cbr"
+    today = date.today().isoformat()
+    ck = (mode, today)
+    with _kr_lock:
+        hit = _kr_mem.get(ck)
+        if hit and time.time() - hit[0] < (KR_TTL if hit[1].get("source") != "none" else KR_ERR_TTL):
+            return hit[1]
+        tried, res = {}, None
+        for src in KR_MODES[KR_MODES.index(mode):]:
+            try:
+                res = _kr_try(src, today)
+                res["source"] = src
+                break
+            except Exception as e:  # noqa: BLE001
+                tried[src] = str(e)[:140] or e.__class__.__name__
+        if res is None:
+            res = {"source": "none", "as_of": today, "url": "", "yearly": [], "path": [], "key_rate": None}
+        res.update(mode=mode, tried=tried, source_name=KR_NAMES.get(res["source"], "нет данных"))
+        _kr_mem.clear()
+        _kr_mem[ck] = (time.time(), res)
+        return res
+
+
+def keyrate_path():
+    """Месячный путь ключевой ставки [(дата ISO, % годовых)] на ~4 года вперёд (первая точка — сегодня).
+    Источник — keyrate_forecast_info(); пусто, если ничего не получилось."""
+    try:
+        return keyrate_forecast_info()["path"]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def keyrate_at(path, d):
+    """Прогнозная ставка на дату d (ISO) по пути (линейная интерполяция между месячными точками)."""
+    if not path:
+        return None
+    if d <= path[0][0]:
+        return path[0][1]
+    ds = [p[0] for p in path]
+    i = bisect.bisect_right(ds, d)
+    if i >= len(path):
+        return path[-1][1]
+    (d0, v0), (d1, v1) = path[i - 1], path[i]
+    w = _kr_days(d0, d) / float(_kr_days(d0, d1) or 1)
+    return v0 + (v1 - v0) * w
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -3474,6 +4136,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, primary_payload())
             if u.path == "/api/ratings":
                 return self.send(200, ratings_status())
+            if u.path == "/api/keyrate":
+                return self.send(200, keyrate_brief() or {"source": "none", "name": "", "yearly": []})
             if u.path == "/api/rates":
                 return self.send(200, rates_payload(q.get("days", "365")))
             if u.path == "/api/backup":
@@ -3518,6 +4182,8 @@ class Handler(BaseHTTPRequestHandler):
                         if 0 < x <= 100:
                             tg[str(k)[:24]] = round(x, 2)
                     cfg["targets"] = tg
+                if body.get("keyrate_mode") in KR_MODES:
+                    cfg["keyrate_mode"] = body["keyrate_mode"]
                 if "notify_days" in body:
                     try:
                         cfg["notify_days"] = max(0, min(60, int(body["notify_days"])))
@@ -3781,7 +4447,7 @@ main{flex:1;min-width:0;display:flex;flex-direction:column}
 .kpi .k i{width:8px;height:8px;border-radius:3px;flex:none}
 .kpi .v{font-size:21px;font-weight:680;letter-spacing:-.02em;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .kpi .s{color:var(--mu);font-size:12px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pos{color:var(--pos)}.neg{color:var(--neg)}.mu{color:var(--mu)}.t2{color:var(--tx2)}
+.pos{color:var(--pos)}.neg{color:var(--neg)}.mu{color:var(--mu)}.est{border-bottom:1px dotted var(--mu);cursor:help}.t2{color:var(--tx2)}
 
 .chart{width:100%;position:relative}
 .chart svg{display:block;overflow:visible}
@@ -4520,7 +5186,7 @@ function pBonds(){
   const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(1,...rows.map(r=>Math.min(r.ytm||0,60))),mxD=Math.max(...rows.map(r=>r.dur||0));
   const cols=[['name','Облигация','l'],['qty','Кол-во'],['buy_pct','Покупка, %'],['price_pct','Цена, %'],['value_rub','Стоимость'],['pnl_rub','P&L'],['share','Доля'],['ytm','Доходность'],['ytm_tax','После НДФЛ'],['spread','Спред к КБД'],['dur','Дюрация'],['coupon','Купон'],['next','След. купон'],['maturity','Погашение'],['rk','Рейтинг','l'],['risk','Риск','l']];
   const th=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
-  const body=rows.map(r=>`<tr data-isin="${esc(r.isin||r.ticker||'')}"><td>${ident(r,[r.ticker,r.floating?'флоатер':'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>
+  const body=rows.map(r=>`<tr data-isin="${esc(r.isin||r.ticker||'')}"><td>${ident(r,[r.ticker,r.floating?(r.est_coupons?'флоатер · прогноз купонов':'флоатер'):'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>
     <td class="num">${f0(r.qty)}</td><td class="num">${r.buy_pct!=null?f2(r.buy_pct):'—'}</td><td class="num">${r.price_pct!=null?f2(r.price_pct):'—'}</td>
     <td class="num">${M(r.value_rub,'rub',0)}</td>
     <td class="num ${cls(r.pnl_rub)}"><span class="arr">${r.pnl_rub>0?'▲':r.pnl_rub<0?'▼':''}</span>${r.pnl_pct!=null?pct(r.pnl_pct,1):'—'}</td>
@@ -4537,16 +5203,16 @@ function pBonds(){
   const sk=['-3','-2','-1','1','2','3'],st=m.stress||{};
   chart('c-stress',bars,{h:220,labels:sk.map(x=>(x>0?'+':'−')+Math.abs(x)+' п.п.'),series:[{n:'Изменение стоимости',c:S3,v:sk.map(x=>(st[x]||{}).rub||0)}],legend:false,
     colorOf:v=>v>=0?'#19a070':'#d5524a',empty:'Нет данных для стресс-теста'});
-  const outs=m.outliers||[];
+  const hy=m.high_yield||[],kr=m.keyrate;
   chart('c-ladder',bars,{h:220,labels:b.ladder.map(x=>x[0]),series:[{n:'Погашается / оферта',c:S1,v:b.ladder.map(x=>x[1])}],legend:false});
-  return`<div class="g g4">${kpi('Облигации',M(m.value,'rub',0),`${m.count} выпусков · ${pctp(m.value/tot*100)} портфеля`,null,S1)}
-    ${kpi('Доходность портфеля',pctp(m.ytm,2),'средневзвешенная к погашению / оферте','pos',S3)}
-    ${kpi('Доходность после НДФЛ',pctp(m.ytm_tax,2),'13% на купоны и разницу к цене; без ЛДВ','pos',S3)}
+  return`<div class="g g4">${kpi('Облигации',M(m.value,'rub',0),`${m.count} выпусков · ${m.issuers} эмитентов · ${pctp(m.value/tot*100)} портфеля`,null,S1)}
+    ${kpi('Доходность портфеля (IRR)',pctp(m.irr,2),'что принесёт весь облигационный портфель, если все бумаги заплатят по графику: один IRR по суммарному денежному потоку к текущей стоимости с НКД','pos',S3)}
+    ${kpi('IRR после НДФЛ',pctp(m.irr_tax,2),'то же после налога 13% на купоны и разницу к цене; без ЛДВ','pos',S3)}
+    ${kpi('Средневзвешенная доходность',pctp(m.ytm,2),`среднее доходностей выпусков по стоимости, включая бумаги с доходностью выше 100%; после НДФЛ ${pctp(m.ytm_tax,2)}`,'pos',S3)}
     ${kpi('Модиф. дюрация',m.mdur!=null?m.mdur.toFixed(2).replace('.',',')+' г':'—','−1% к цене на +1 п.п. ставки ≈ 1 × мод. дюрация',null,S5)}
     ${kpi('Дюрация',m.dur!=null?m.dur.toFixed(2).replace('.',',')+' года':'—','средневзвешенная, по Маколею',null,S5)}
     ${kpi('Текущая купонная доходность',pctp(m.cur_yield,2),'годовой купон / цена',null,S4)}
-    ${kpi('Купоны за 12 месяцев',M(m.coupons_12m,'rub',0),'по графику выплат, до налога','pos',S7)}
-    ${kpi('Эмитентов',m.issuers,'диверсификация по компаниям',null,S2)}</div>
+    ${kpi('Купоны за 12 месяцев',M(m.coupons_12m,'rub',0),'по графику выплат, до налога','pos',S7)}</div>
     <div class="card" style="padding:12px 10px 6px"><div class="tbl" style="max-height:calc(100vh - 200px)"><table id="btab" class="bt"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div></div>
     <div class="g g3"><div class="card"><h2>Лестница погашений и оферт, ₽</h2><div id="c-ladder" class="chart"></div></div>
     <div class="card"><h2>Кредитный риск (оценка брокера)</h2>${hbars(b.risk.map(([n,v])=>({n,v,c:n==='высокий'?S8:n==='низкий'?S3:n==='средний'?S4:'#6f7686',s:pctp(v/(m.value||1)*100)})),S1,null,0)}</div>
@@ -4558,7 +5224,7 @@ function pBonds(){
       <p class="note">Параллельный сдвиг доходностей всех выпусков с полной переоценкой по графику выплат (для выпусков без данных MOEX, помечены ≈, — по модиф. дюрации). Не учитывает изменения кредитных спредов.</p></div>
     ${ratingsCard(b)}
     ${insightsCard(b)}
-    <p class="note">Доходность — эффективная годовая к погашению или к ближайшей оферте (пометка «оф.»), по текущей цене с НКД. Для флоатеров будущие купоны приняты равными последнему известному, для облигаций с амортизацией расчёт приблизительный. Дюрация — по Маколею, в годах. «После НДФЛ» — упрощённо: 13% с купонов и с положительной разницы между погашением и ценой покупки (без прогрессивной ставки 15% и ЛДВ). Пометка ≈ — график выплат MOEX недоступен, расчёт приблизительный.${outs.length?` В средние показатели не включены выпуски с доходностью выше 100% (distressed, ${M(m.outliers_value,'rub',0)}): ${outs.map(o=>esc(o.name)+' '+pctp(o.ytm,0)).join(', ')}.`:''}</p>`;
+    <p class="note">Доходность — эффективная годовая к погашению или к ближайшей оферте (пометка «оф.»), по текущей цене с НКД. Для флоатеров ещё не объявленные купоны оценены как ключевая ставка по прогнозу + спред эмитента (спред взят по последним известным купонам); MOEX считает по неизменному купону, поэтому доходности флоатеров здесь могут отличаться от биржевых. Дюрация — по Маколею, в годах. «После НДФЛ» — упрощённо: 13% с купонов и с положительной разницы между погашением и ценой покупки (без прогрессивной ставки 15% и ЛДВ). Пометка ≈ — график выплат MOEX недоступен, расчёт приблизительный.<br>IRR портфеля — единая ставка дисконтирования всех будущих выплат (купоны, амортизации, погашения и оферты, валютные выпуски по текущему курсу) к стоимости портфеля с НКД; по нему видно, сколько в итоге заработает вся «корзина». Средневзвешенная — просто среднее по выпускам. В обе цифры входят все выпуски без исключений.${hy.length?` Высокий риск дефолта (доходность выше 100%, ${M(m.high_yield_value,'rub',0)}): ${hy.map(o=>esc(o.name)+' '+pctp(o.ytm,0)).join(', ')} — такая ставка показывает цену риска, а не обещанный доход.`:''}${kr&&kr.source!=='none'?`<br>Прогноз ключевой ставки для флоатеров: ${esc(kr.name)}${kr.as_of?`, на ${esc(kr.as_of)}`:''}; сейчас ${kr.key_rate!=null?pctp(kr.key_rate,2):'—'}${(kr.yearly||[]).length?`, средняя по годам: ${kr.yearly.slice(0,4).map(y=>y.year+' — '+pctp(y.mid,1)).join(', ')}`:''}. Источник меняется в «Настройках».`:''}</p>`;
 }
 
 
@@ -4879,6 +5545,11 @@ async function renderSettings(){
     <div class="row"><label class="field" style="max-width:260px"><span>Напоминать о выплатах за, дней (0 — выключить)</span><input class="in num" id="nd" type="number" min="0" max="60" value="${c.notify_days??7}"></label>
       <button class="btn ghost" id="ndsave" style="align-self:flex-end">Сохранить</button><button class="btn ghost" id="ntf" style="align-self:flex-end">Разрешить системные уведомления</button></div>
     <p class="note">Напоминания показываются на «Обзоре» и «Выплатах», а системные уведомления приходят, пока программа открыта. Печать отчёта: кнопка PDF сверху → «Сохранить как PDF» (печатается текущий раздел и период).</p></div></div>
+  <div class="card"><h2>Прогноз ключевой ставки<span class="sp">для флоатеров</span></h2><div style="display:grid;gap:14px">
+    <div class="row"><label class="field" style="max-width:420px"><span>Источник прогноза</span><select class="in" id="krmode">${[['cbr','Прогноз Банка России (по умолчанию)'],['survey','Опрос аналитиков Банка России'],['market','Рынок: форварды КБД'],['flat','Без изменений (текущая ставка)']].map(([k,t])=>`<option value="${k}" ${(c.keyrate_mode||'cbr')===k?'selected':''}>${t}</option>`).join('')}</select></label>
+      <button class="btn ghost" id="krsave" style="align-self:flex-end">Сохранить</button></div>
+    <p class="note" id="krinfo">Загружаю…</p>
+    <p class="note">Ставка ещё не объявленных купонов флоатера = ключевая ставка на начало купонного периода + спред эмитента (по последним известным купонам). «Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.</p></div></div>
   <div class="card" id="whatsnew"><h2>Что нового<span class="sp">версия ${esc(c.version||'')}</span></h2>${changelogHtml()}</div>
   <div class="card"><h2>Роадмап<span class="sp">что планируется</span></h2>${roadmapHtml()}</div>
   <details class="card"><summary style="cursor:pointer;font-weight:600;color:var(--tx2)">Дополнительно</summary><div style="display:grid;gap:18px;margin-top:16px">
@@ -4889,6 +5560,9 @@ async function renderSettings(){
     <div class="row"><button class="btn ghost" id="save2">Сохранить</button></div></div></details></div>`;
   const msg=(t,ok)=>{$('#msg').innerHTML=`<div class="msg ${ok?'ok':'err'}">${esc(t)}</div>`};
   $('#thsel').onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;applyTheme(b.dataset.t);post('/api/config',{theme:b.dataset.t}).catch(()=>{});$('#thsel').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b))};
+  const krShow=async()=>{try{const k=await api('/api/keyrate');$('#krinfo').innerHTML=k.source==='none'?'Прогноз сейчас недоступен: купоны флоатеров считаются по последней известной ставке.':`Сейчас используется: <b>${esc(k.name)}</b>${k.as_of?`, на ${esc(k.as_of)}`:''}${k.mode!==k.source?` (выбранный источник «${esc(k.mode)}» недоступен)`:''}. Ключевая ставка сейчас ${pctp(k.key_rate,2)}; средняя по годам: ${(k.yearly||[]).slice(0,4).map(y=>y.year+' — '+pctp(y.mid,1)).join(', ')}.`}catch(e){$('#krinfo').textContent='Не удалось получить прогноз: '+e.message}};
+  krShow();
+  $('#krsave').onclick=async()=>{try{$('#krinfo').textContent='Загружаю…';await post('/api/config',{keyrate_mode:$('#krmode').value});S.cfg.keyrate_mode=$('#krmode').value;S.bonds=null;msg('Сохранено. Доходности облигаций пересчитаются при следующем открытии раздела.',1);krShow()}catch(e){msg(e.message)}};
   $('#ndsave').onclick=async()=>{try{await post('/api/config',{notify_days:$('#nd').value});S.cfg.notify_days=+$('#nd').value;msg('Сохранено',1)}catch(e){msg(e.message)}};
   $('#ntf').onclick=async()=>{try{if(!('Notification' in window))return msg('Браузер не поддерживает уведомления');const r=await Notification.requestPermission();msg(r==='granted'?'Уведомления разрешены':'Уведомления не разрешены',r==='granted')}catch(e){msg(e.message)}};
   const body=()=>({token:$('#tok').value,sandbox:$('#sb').checked,verify_ssl:$('#vs').checked,ca_file:$('#ca').value,
@@ -5023,6 +5697,7 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+ ['0.10','11.11.2026',['<b>Доходность портфеля (IRR)</b> по всем будущим выплатам всех облигаций — высокорисковые бумаги учитываются, а не исключаются','<b>Флоатеры по прогнозу ключевой ставки</b>: среднесрочный прогноз Банка России (или опрос аналитиков, рынок, текущая ставка — выбор в настройках) плюс спред эмитента']],
  ['0.9','11.11.2026',['<b>Точный расчёт облигаций</b>: денежный поток с Мосбиржи с амортизациями и офертами — доходность совпадает с биржевой; исправлены валютные облигации','<b>Доходность после НДФЛ</b>, модифицированная дюрация, выпуклость и <b>стресс-тест</b> портфеля на ±1–3 п.п.','<b>Карточка облигации</b> по клику: параметры, история цены и доходности, денежный поток, рейтинги и <b>аналоги</b> по рейтингу, отрасли, дюрации и типу купона с оценкой «дешевле/дороже аналогов»','<b>Карта рынка</b>: доходность против дюрации по рейтингам на фоне КБД, медианные спреды по рейтингам, срокам и отраслям','Рейтинги по ISIN из каталога Т-Инвестиций — точнее и для большего числа выпусков; отрасль и фильтр по ней в скринере']],
  ['0.8','10.11.2026',['<b>Скринер облигаций</b> — торги Мосбиржи с фильтрами по рейтингу, доходности, спреду к КБД, сроку и обороту','<b>Первичка</b> — календарь объявленных размещений облигаций с рейтингами эмитентов','<b>Анализ облигаций портфеля</b>: спред к КБД по каждому выпуску, наблюдения по риску, концентрации и ближайшим офертам','Рейтинги теперь берутся ещё и напрямую с сайтов НКР и Эксперт РА (по эмитентам портфеля)']],
  ['0.7','10.11.2026',['<b>Кредитные рейтинги</b> эмитентов (АКРА, Эксперт РА, НКР, НРА) в таблице облигаций и распределение портфеля по рейтингам; данные подтягиваются автоматически из канала @issuerRatings раз в сутки','Раздел <b>«Ставки»</b>: доходность КБД (2 года) и ключевая ставка Банка России на одном графике','<b>«Выплаты по дням»</b>: столбики по датам с разбивкой по выпускам, подписями сумм и прокруткой']],
@@ -5094,6 +5769,7 @@ setInterval(()=>{fetch('/api/ping').catch(()=>{})},20000);fetch('/api/ping').cat
 const BC={stack:[],tok:0,all:false};
 const BC_SEC={financial:'Финансы',industrials:'Промышленность',materials:'Сырьё',energy:'Энергетика',consumer:'Потребительский',government:'Государственные',real_estate:'Недвижимость',telecom:'Телеком',municipal:'Муниципальные',utilities:'Коммунальные',it:'IT',health_care:'Здравоохранение',other:'Прочее'};
 const BC_EV={coupon:'Купон',amort:'Амортизация',offer:'Оферта',redemption:'Погашение'};
+const BC_KR_SRC={cbr:'ключевая ставка по прогнозу ЦБ',survey:'ключевая ставка по опросу аналитиков ЦБ',market:'ключевая ставка по ожиданиям рынка (КБД)',flat:'текущая ключевая ставка'};
 const BC_RISK={RISK_LEVEL_LOW:'низкий',RISK_LEVEL_MODERATE:'средний',RISK_LEVEL_HIGH:'высокий'};
 
 document.addEventListener('click',e=>{
@@ -5181,8 +5857,9 @@ function bcBody(c){
   h+=`<div class="card bc-sec"><h2>Денежный поток<span class="sp">ближайшие выплаты на 1 облигацию</span></h2>`;
   if(fl.length){
     h+=`<div class="tbl"><table><thead><tr><th>Дата</th><th>Событие</th><th>Сумма</th><th>% номинала / ставка</th></tr></thead><tbody>`
-      +fl.slice(0,lim).map(e=>`<tr><td>${ddm(e.d)}</td><td>${BC_EV[e.t]||esc(e.t)}</td><td class="num">${e.amt==null?'<span class="mu">по ставке</span>':M(e.amt,cur)}</td><td class="num">${e.pct==null?'—':bcN(e.pct,2)+' %'}</td></tr>`).join('')
+      +fl.slice(0,lim).map(e=>`<tr><td>${ddm(e.d)}</td><td>${BC_EV[e.t]||esc(e.t)}</td><td class="num">${e.amt==null?'<span class="mu">по ставке</span>':e.est?`<span class="est" title="${esc(BC_KR_SRC[(c.keyrate||{}).source]||'ключевая ставка по прогнозу')} ${bcN(e.base,2)}% + спред ${bcN(e.spread,2)} п.п.">≈ ${M(e.amt,cur)}</span>`:M(e.amt,cur)}</td><td class="num">${e.pct==null?'—':(e.est?'≈ ':'')+bcN(e.pct,2)+' %'}</td></tr>`).join('')
       +`</tbody></table></div>`;
+    if(c.keyrate)h+=`<p class="note" style="margin-top:8px">≈ — прогноз: ставка купона флоатера ещё не объявлена, принята равной ключевой ставке на начало купонного периода + спред эмитента к ключевой на прошлых купонах. Прогноз ключевой ставки: ${esc(c.keyrate.name)}${c.keyrate.as_of?`, на ${esc(c.keyrate.as_of)}`:''}.</p>`;
     if(fl.length>lim)h+=`<button class="btn ghost bc-more" id="bc-more">Показать все (${fl.length})</button>`;
   }else h+=`<div class="mu" style="font-size:13px">Данных о будущих выплатах нет.</div>`;
   h+=`</div>`;

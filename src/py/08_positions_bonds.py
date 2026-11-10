@@ -198,12 +198,46 @@ RISK_RU = {"RISK_LEVEL_LOW": "низкий", "RISK_LEVEL_MODERATE": "средн�
 
 
 STRESS_DY = (-3, -2, -1, 1, 2, 3)
-YTM_OUTLIER = 100.0      # доходность выше 100% годовых считаем «distressed»: показываем в строке, но в среднее не берём
+YTM_HIGH = 100.0         # доходность выше 100% годовых — «высокий риск дефолта»: только помечается, из расчётов НЕ исключается
 
 
 def bond_isin(r):
     inst = store().get("inst:" + (r.get("uid") or ""), ttl=30 * DAY) or {}
     return (inst.get("isin") or r.get("ticker") or "").upper()
+
+
+def portfolio_irr(items, today):
+    """Единая доходность облигационного портфеля (IRR): все будущие потоки позиций (потоки на 1 бумагу x количество,
+    в рублях по текущему курсу валюты номинала) против суммарной текущей стоимости с НКД. Одно решение cf_ytm.
+    irr_tax — то же после НДФЛ: потоки каждой бумаги берутся уже за вычетом налога (net_flows), дальше без налога.
+    Бумаги без точных потоков (приближённый расчёт) в IRR не входят: value/count показывают охват.
+    Возвращает {irr, irr_tax, value (в рублях, стоимость с НКД), count}; доходности в %."""
+    gross, net, dirty = defaultdict(float), defaultdict(float), 0.0
+    for ex, qty, fx in items:
+        k = qty * fx
+        dirty += ex["dirty"] * k
+        for d, c, p in ex["flows"]:
+            if d > today:
+                gross[d] += (c + p) * k
+        for d, a in net_flows(ex["flows"], today, ex["basis"]):
+            net[d] += a * k
+    res = {"irr": None, "irr_tax": None, "value": dirty, "count": len(items)}
+    if dirty > 0 and gross:
+        y = cf_ytm(dirty, [(d, a, 0.0) for d, a in sorted(gross.items())], today)
+        yt = cf_ytm(dirty, [(d, a, 0.0) for d, a in sorted(net.items())], today)
+        res["irr"] = y * 100 if y is not None else None
+        res["irr_tax"] = yt * 100 if yt is not None else None
+    return res
+
+
+def keyrate_brief():
+    """Короткая сводка об использованном прогнозе ключевой ставки для UI (без пути)."""
+    try:
+        i = keyrate_forecast_info()
+        return {"source": i["source"], "name": i["source_name"], "as_of": i["as_of"], "key_rate": i["key_rate"],
+                "yearly": i["yearly"], "mode": i["mode"]}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def bond_exact(client, r, b, today, rates):
@@ -221,7 +255,8 @@ def bond_exact(client, r, b, today, rates):
     price, avg, aci = bond_price_face(r, b, rates)
     if not price:
         return None
-    flows, kind, end = bond_flows(bz, today, face)
+    est = {}
+    flows, kind, end = bond_flows(bz, today, face, floating=bool(b.get("floating")), est_out=est)
     if not flows or end <= today:
         return None
     if kind == "maturity" and abs((datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(b["maturity"], "%Y-%m-%d")).days) > 45:
@@ -236,7 +271,7 @@ def bond_exact(client, r, b, today, rates):
     return {"isin": isin, "ytm": y * 100, "ytm_tax": yt * 100 if yt is not None else None, "dur": mac, "mdur": mod,
             "convexity": conv, "to": kind, "end": end, "stress_pct": {dy: (p / 100.0 * face + aci) / dirty * 100 - 100
                                                                       for dy, p in st.items()},
-            "cf_source": "moex"}
+            "cf_source": "moex", "est_coupons": len(est), "flows": flows, "basis": price, "dirty": dirty}
 
 
 def bond_price_face(r, b, rates):
@@ -265,7 +300,7 @@ def bonds_report(client, rows):
     exacts = dict(zip([r["uid"] for r in bonds], pool_map(
         lambda r: bond_exact(client, r, infos[r["uid"]], today, rates) if infos.get(r["uid"]) else None, bonds)))
     stress_rub = defaultdict(float)
-    outliers = []
+    high_yield, irr_items = [], []
     w = defaultdict(float)
     ladder, risk = defaultdict(float), defaultdict(float)
     kinds = defaultdict(int)
@@ -290,6 +325,11 @@ def bonds_report(client, rows):
         if ex:
             row.update({k: ex[k] for k in ("ytm", "ytm_tax", "dur", "mdur", "convexity", "to", "cf_source")})
             row["end"] = ex["end"]
+            row["est_coupons"] = ex.get("est_coupons") or 0
+            fc_ = (b.get("cur") or "rub").lower()
+            rf_ = 1.0 if fc_ == "rub" else rates.get(fc_)
+            if rf_:
+                irr_items.append((ex, r["qty"], rf_))
             sp = ex["stress_pct"]
         else:
             if m["ytm"] is not None and m["dur"]:      # приближение: только дюрация
@@ -303,18 +343,18 @@ def bonds_report(client, rows):
             stress_rub[dy] += p / 100.0 * v
         m = dict(m, ytm=row["ytm"], dur=row["dur"])
         out.append(row)
-        if row["ytm"] is not None and v and abs(row["ytm"]) > YTM_OUTLIER:
-            outliers.append({"ticker": row["ticker"], "name": row["name"], "ytm": row["ytm"], "value": v})
-        elif row["ytm"] is not None and v:
+        if row["ytm"] is not None and v and row["ytm"] > YTM_HIGH:
+            high_yield.append({"ticker": row["ticker"], "name": row["name"], "ytm": row["ytm"], "value": v})
+        if row["ytm"] is not None and v:
             w["ytm"] += row["ytm"] * v
             w["ytm_v"] += v
             if row.get("ytm_tax") is not None:
                 w["yt"] += row["ytm_tax"] * v
                 w["yt_v"] += v
-        if row.get("mdur") is not None and v and abs(row["ytm"] or 0) <= YTM_OUTLIER:
+        if row.get("mdur") is not None and v:
             w["md"] += row["mdur"] * v
             w["md_v"] += v
-        if m["dur"] is not None and v and abs(row["ytm"] or 0) <= YTM_OUTLIER:
+        if m["dur"] is not None and v:
             w["dur"] += m["dur"] * v
             w["dur_v"] += v
         if m["cur_yield"] is not None and v:
@@ -357,11 +397,14 @@ def bonds_report(client, rows):
                 pays.append({"date": d, "kind": "dividend", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
                              "amount": per * r["qty"], "est": False})
     pays.sort(key=lambda p: p["date"])
+    irr = portfolio_irr(irr_items, today)
     metrics = {"count": len(bonds), "value": tot_bonds,
                "ytm": w["ytm"] / w["ytm_v"] if w["ytm_v"] else None,
                "ytm_tax": w["yt"] / w["yt_v"] if w["yt_v"] else None,
                "mdur": w["md"] / w["md_v"] if w["md_v"] else None,
-               "ytm_value": w["ytm_v"], "outliers": outliers, "outliers_value": sum(o["value"] for o in outliers),
+               "ytm_value": w["ytm_v"], "high_yield": high_yield, "high_yield_value": sum(o["value"] for o in high_yield),
+               "irr": irr["irr"], "irr_tax": irr["irr_tax"], "irr_value": irr["value"], "irr_count": irr["count"],
+               "keyrate": keyrate_brief(),
                "approx_count": sum(1 for x in out if x.get("cf_source") == "approx"),
                "stress": {str(dy): {"rub": stress_rub[dy], "pct": stress_rub[dy] / tot_bonds * 100 if tot_bonds else None}
                           for dy in STRESS_DY},

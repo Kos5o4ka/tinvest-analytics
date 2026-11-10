@@ -33,6 +33,7 @@ import urllib.request
 import uuid
 import webbrowser
 import zipfile
+import zlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -43,7 +44,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "T-Invest Analytics"
-APP_VERSION = "0.9"
+APP_VERSION = "0.10"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -65,5 +66,6 @@ DEFAULT_CONFIG = {
     "theme": "auto",        # auto | dark | light
     "targets": {},          # целевые доли по классам активов, %: {"share": 50, "bond": 40, ...}
     "notify_days": 7,       # за сколько дней напоминать о выплатах
+    "keyrate_mode": "cbr",  # источник прогноза ключевой ставки для флоатеров: cbr | survey | market | flat
 }
 

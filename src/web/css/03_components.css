@@ -24,4 +24,4 @@
 .kpi .k i{width:8px;height:8px;border-radius:3px;flex:none}
 .kpi .v{font-size:21px;font-weight:680;letter-spacing:-.02em;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .kpi .s{color:var(--mu);font-size:12px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pos{color:var(--pos)}.neg{color:var(--neg)}.mu{color:var(--mu)}.t2{color:var(--tx2)}
+.pos{color:var(--pos)}.neg{color:var(--neg)}.mu{color:var(--mu)}.est{border-bottom:1px dotted var(--mu);cursor:help}.t2{color:var(--tx2)}

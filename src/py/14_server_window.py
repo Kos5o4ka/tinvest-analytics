@@ -92,6 +92,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, primary_payload())
             if u.path == "/api/ratings":
                 return self.send(200, ratings_status())
+            if u.path == "/api/keyrate":
+                return self.send(200, keyrate_brief() or {"source": "none", "name": "", "yearly": []})
             if u.path == "/api/rates":
                 return self.send(200, rates_payload(q.get("days", "365")))
             if u.path == "/api/backup":
@@ -136,6 +138,8 @@ class Handler(BaseHTTPRequestHandler):
                         if 0 < x <= 100:
                             tg[str(k)[:24]] = round(x, 2)
                     cfg["targets"] = tg
+                if body.get("keyrate_mode") in KR_MODES:
+                    cfg["keyrate_mode"] = body["keyrate_mode"]
                 if "notify_days" in body:
                     try:
                         cfg["notify_days"] = max(0, min(60, int(body["notify_days"])))

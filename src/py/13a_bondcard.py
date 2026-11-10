@@ -100,6 +100,21 @@ def _bc_flows(isin):
     return ev
 
 
+def _bc_mark_est(flows, isin, floating, face):
+    """Купоны флоатера без объявленной ставки: подставляем прогноз (ключевая ставка + спред), помечаем est/base/spread."""
+    if not floating or not face or not any(e["t"] == "coupon" and e.get("amt") is None for e in flows):
+        return False
+    bz = moex_bondization(isin)
+    est = fl_estimates(bz, date.today().isoformat(), float(face)) if bz else {}
+    done = False
+    for e in flows:
+        x = est.get(e["d"]) if e["t"] == "coupon" and e.get("amt") is None else None
+        if x:
+            e.update(amt=x["amt"], pct=x["rate"], est=True, base=round(x["base"], 2), spread=round(x["spread"], 2))
+            done = True
+    return done
+
+
 def _bc_issuer_key(r):
     t = name_tokens(_bond_query(r.get("full") or r.get("name") or ""))
     return t
@@ -232,6 +247,13 @@ def bond_card(isin):
     card["desc"] = desc or {}
     card["history"] = hist or {"d": [], "p": [], "y": [], "v": []}
     card["flows"] = flows or []
+    try:
+        face = (desc or {}).get("FACEVALUE") or (me or {}).get("nominal")
+        if _bc_mark_est(card["flows"], isin, bool((ci or {}).get("floating")), float(face) if face else 0.0):
+            info = keyrate_forecast_info()
+            card["keyrate"] = {"source": info["source"], "name": info["source_name"], "as_of": info["as_of"]}
+    except Exception as e:  # noqa: BLE001
+        errors.append("прогноз купонов: %s" % str(e)[:120])
     try:
         rt = (me["_rt"] if me else None) or best_rating(isin, (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or "")
     except Exception as e:  # noqa: BLE001
