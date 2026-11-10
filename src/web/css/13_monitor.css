@@ -1,0 +1,15 @@
+.mon-al{display:flex;align-items:center;gap:12px;padding:9px 12px;margin:6px 0;border-radius:10px;background:var(--card2);border-left:3px solid var(--mu);cursor:pointer}
+.mon-al:hover{filter:brightness(1.06)}
+.mon-al.mon-h{border-left-color:var(--neg)}.mon-al.mon-m{border-left-color:var(--s4)}.mon-al.mon-i{border-left-color:var(--s1)}
+.mon-sev{flex:none;width:68px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;color:var(--mu)}
+.mon-h .mon-sev{color:var(--neg)}.mon-m .mon-sev{color:var(--s4)}.mon-i .mon-sev{color:var(--s1)}
+.mon-d{flex:none;width:62px;font-size:12px;color:var(--mu)}
+.mon-b{flex:1;min-width:0;display:grid;gap:1px;font-size:13px}.mon-b b{font-weight:600}.mon-b span{color:var(--tx2);white-space:normal}
+.mon-al>a{flex:none;color:var(--tx2);text-decoration:none;font-size:15px;padding:2px 6px}.mon-al>a:hover{color:var(--ac)}
+.mon-ok{color:var(--pos);font-size:13px;padding:6px 0}
+.mon-card h2{display:flex;align-items:center;gap:10px}
+.mon-sp{display:block;margin-left:auto}
+.mon-w{color:var(--s4)}
+.mon-th{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-top:14px}
+#mon-tab tbody tr{cursor:pointer}
+[data-theme=light] .mon-al{background:#f0f2f6}

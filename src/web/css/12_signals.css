@@ -1,0 +1,24 @@
+/* ── Сигналы ── */
+.sg-t th,.sg-t td{white-space:nowrap}
+.sg-t tbody tr[data-isin]{cursor:pointer}
+.sg-t tbody tr[data-isin]:hover td{background:var(--card2)}
+.sg-t td.l b{font-weight:600}
+.sg-isin{display:block;font-size:11px;font-family:ui-monospace,Menlo,monospace}
+.sg-h{margin:6px 0 10px;font-size:14px;font-weight:600}
+.sg-h.pos{color:var(--pos)}.sg-h.neg{color:var(--neg)}
+.sg-sp{vertical-align:middle;margin-right:2px}
+.sg-tr.pos,.sg-tr.neg{font-weight:500}
+.sg-more{margin-top:10px}
+.sg-pos{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.sg-pos:first-of-type{border-top:0;padding-top:0}
+.sg-ph{cursor:pointer;margin-bottom:8px;display:grid;gap:3px}
+.sg-ph .mu{font-size:12.5px;line-height:1.5}
+.sg-worse{color:var(--neg);border-color:var(--neg)}
+.sg-k{margin-bottom:14px}
+.bc-ic svg{width:100%;height:auto;display:block}
+.bc-ic .ic-pt{cursor:pointer;stroke:var(--card);stroke-width:1.5}
+.bc-ic .ic-pt:hover{stroke:var(--tx)}
+.bc-ic .ic-me{stroke:var(--tx);stroke-width:2.5}
+.bc-ic .ic-ln{fill:none;stroke:#3987e5;stroke-width:1.5;opacity:.55}
+.bc-ic .ic-kbd{fill:none;stroke:var(--tx2);stroke-width:1.5;stroke-dasharray:6 4}
+.sg-g2{display:grid;gap:22px}

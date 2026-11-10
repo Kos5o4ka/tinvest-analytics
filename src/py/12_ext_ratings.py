@@ -103,6 +103,96 @@ def parse_rating_post(text):
                         "развивающ": "развивающийся"}.get(om.group(1), "") if om else ""}
 
 
+RT_LOG_KEY, RT_LOG_DAYS = "ratings_log_v1", 730        # журнал рейтинговых действий: отдельно от ratings_v1
+_RT_D = re.compile(r"(?<![A-Za-zА-Яа-яЁё])(?:ru\s?D(?![A-Za-zА-Яа-я])|D\s?\(RU\)|D\.ru|RD(?![A-Za-z]))")
+_RT_ACTIONS = {"присвоен", "подтверждён", "повышен", "понижен", "отозван", "под наблюдением", "прогноз изменён"}
+
+
+def _rt_tok_d(t):
+    return "D" if _RT_D.search(t or "") else _rating_token(t or "")
+
+
+def parse_rating_action(text):
+    """Рейтинговое действие из поста: {agency, issuer, level, action, rating, prev, outlook, watch, url} или None.
+    Шире parse_rating_post: понимает дефолтные уровни (D/RD), «ранее ...», «с X до Y», статус «под наблюдением»."""
+    r = parse_rating_post(text)
+    low = text.lower()
+    head = low[:80]
+    if not r:
+        agency = next((a for pat, a in ((r"\bакра\b", "АКРА"), (r"эксперт\s+ра", "Эксперт РА"), (r"\bнкр\b", "НКР"),
+                                        (r"\bнра\b", "НРА")) if re.search(pat, head)), None)
+        if not agency or re.search(r"ожидаем|\.sf|структурир|сфо|\bкласс|esg|\.gq|качеств|надежност|некредитн|\.am", low):
+            return None
+        issuer = _rating_issuer(text)
+        if not issuer or not _RT_D.search(re.split(r"(?i)\bранее\b", text)[0]):
+            return None
+        r = {"agency": agency, "issuer": issuer, "level": "bond" if re.search(r"облигаци|выпуск", low) else "issuer",
+             "rating": "D", "outlook": ""}
+    first = re.split(r"\n", text.strip())[0]
+    fl = first.lower()
+    parts = re.split(r"(?i)\bранее\b", first, maxsplit=1)
+    prev = None
+    if len(parts) > 1:
+        prev = _rt_tok_d(parts[1])
+    else:
+        m = re.search(r"(?i)\bс\s+(\S+?)\s+до\s+(\S+)", first)
+        if m:
+            prev = _rt_tok_d(m.group(1))
+            r = dict(r, rating=_rt_tok_d(m.group(2)) or r.get("rating"))     # НКР: «с AA.ru до AA-.ru» — новый уровень второй
+    watch = ""
+    if re.search(r"сн[яя]л\w*\s+статус|снят\w*\s+статус", fl):
+        watch = "removed"
+    elif re.search(r"статус\w*\s+[«\"“]под наблюдением", fl) and re.search(r"присво|продли|установил|ввел|ввело", fl):
+        watch = "set"
+    elif "под наблюдением" in fl and "ранее" not in fl.split("под наблюдением")[0]:
+        watch = "set"
+    if "отозва" in fl:
+        act = "отозван"
+    elif re.search(r"повысил", fl):
+        act = "повышен"
+    elif re.search(r"понизил|снизил", fl):
+        act = "понижен"
+    elif watch == "set" and re.search(r"присво\w+\s+статус|установил\w*\s+статус", fl):
+        act = "под наблюдением"
+    elif re.search(r"изменил\w*\s+прогноз|изменив\s+прогноз|прогноз\w*\s+(?:по рейтингу\s+)?(?:был\s+)?изменен|пересмотрел\w*\s+прогноз", fl):
+        act = "прогноз изменён"
+    elif "подтверд" in fl:
+        act = "подтверждён"
+    elif "присво" in fl:
+        act = "присвоен"
+    elif watch == "set":
+        act = "под наблюдением"
+    else:
+        return None
+    um = re.search(r"https?://\S+", text[len(first):])
+    om = re.search(r"прогноз.{0,60}?\bна\s+[«\"“]?(стабильн|позитивн|негативн|развивающ)", fl)
+    if om:
+        r = dict(r, outlook={"стабильн": "стабильный", "позитивн": "позитивный", "негативн": "негативный",
+                             "развивающ": "развивающийся"}[om.group(1)])
+    out = {"agency": r["agency"], "issuer": r["issuer"], "level": r["level"], "action": act,
+           "rating": r.get("rating"), "prev": prev, "outlook": r.get("outlook") or "", "watch": watch,
+           "url": um.group(0).rstrip(".,)") if um else ""}
+    if act == "понижен" and out["rating"] and prev and out["rating"] == prev:
+        out["action"] = "прогноз изменён"
+    return out
+
+
+def rating_log_add(log, pid, iso, text):
+    a = parse_rating_action(text)
+    if not a:
+        return
+    toks = sorted(name_tokens(a["issuer"]))
+    if not toks:
+        return
+    a.update(post=pid, date=iso[:10], tokens=toks)
+    log["events"].append(a)
+
+
+def rating_log_trim(log):
+    old = (date.today() - timedelta(days=RT_LOG_DAYS)).isoformat()
+    log["events"] = sorted((e for e in log["events"] if e["date"] >= old), key=lambda e: (e["date"], e["post"]))
+
+
 def tg_page(before=None):
     s = http_text(RATING_CH + ("?before=%d" % before if before else ""))
     ids, posts = [], []
@@ -128,6 +218,8 @@ def _ratings_run():
         except Exception:  # noqa: BLE001
             pass
         data = st.get(RT_KEY) or {"items": {}, "max_id": 0, "updated": 0}
+        rlog = st.get(RT_LOG_KEY) or {"events": [], "max_id": 0}
+        base_id = min(data["max_id"], rlog["max_id"])      # пока журнал пуст — догружаем канал до границы RT_DAYS
         cutoff = (datetime.now(timezone.utc) - timedelta(days=RT_DAYS)).isoformat()
         got, before, pages = {}, None, 0
         while pages < RT_MAX_PAGES:
@@ -148,9 +240,9 @@ def _ratings_run():
             _rt_state["progress"] = "загружено страниц: %d" % pages
             mn = min(ids)
             oldest = min((p[1] for p in posts), default="9")
-            if data["max_id"] and mn <= data["max_id"]:
+            if base_id and mn <= base_id:
                 break
-            if not data["max_id"] and oldest < cutoff:
+            if not base_id and oldest < cutoff:
                 break
             if before is not None and mn >= before:
                 break
@@ -158,6 +250,11 @@ def _ratings_run():
             time.sleep(0.25)
         items = data["items"]
         for pid in sorted(got):
+            if pid > rlog["max_id"]:
+                try:
+                    rating_log_add(rlog, pid, got[pid][1], got[pid][2])
+                except Exception:  # noqa: BLE001
+                    pass
             if pid <= data["max_id"]:
                 continue
             _, iso, text = got[pid]
@@ -177,6 +274,9 @@ def _ratings_run():
         data["max_id"] = max([data["max_id"]] + list(got))
         data["updated"] = time.time()
         st.put(RT_KEY, data)
+        rlog["max_id"] = max([rlog["max_id"]] + list(got))
+        rating_log_trim(rlog)
+        st.put(RT_LOG_KEY, rlog)
         _rt_state["error"] = ""
         _rt_idx.clear()
     except Exception as e:  # noqa: BLE001

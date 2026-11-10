@@ -103,6 +103,10 @@ function bcBody(c){
       <div class="mu" style="font-size:12px;margin:12px 0 4px">Доходность, % годовых</div><div class="bc-ch" id="bc-ch-y"></div>`;
   else h+=`<div class="mu" style="font-size:13px">История торгов недоступна.</div>`;
   h+=`</div>`;
+  // кривая эмитента
+  const ic=c.issuer_curve;
+  if(ic&&ic.points&&ic.points.length>1)h+=`<div class="card bc-sec"><h2>Кривая эмитента<span class="sp">${ic.points.length} выпусков в обращении: доходность по сроку</span></h2><div class="bc-ic" id="bc-ic"></div>
+    <div class="mu" style="font-size:12px;margin-top:6px"><span style="color:var(--ac)">●</span> этот выпуск · <span style="color:#3987e5">●</span> другие выпуски эмитента · пунктир — кривая бескупонной доходности (КБД). Клик по точке открывает карточку выпуска.</div></div>`;
   // аналоги
   const an=c.analogs||[];
   h+=`<div class="card bc-sec"><h2>Аналоги<span class="sp">похожий рейтинг, срок и тип</span></h2>`;
@@ -120,7 +124,24 @@ function bcBody(c){
   h+=`</div><p class="note" style="margin-top:14px">Справочная информация на основе открытых данных Мосбиржи, каталога T-Invest и публичных рейтингов. Не является инвестиционной рекомендацией. Аналоги подобраны автоматически по рейтингу, сроку, сектору и типу выпуска; сравнение спреда не учитывает всех различий в риске и ликвидности.</p>`;
   return h;
 }
+function bcIssuerCurve(el,ic){
+  const W=el.clientWidth||560,H=250,pl=44,pr=14,pt=12,pb=30,P=ic.points,K=ic.kbd||[];
+  const xs=P.map(p=>p.dur).concat(K.map(k=>k[0])),ys=P.map(p=>p.yield).concat(K.map(k=>k[1]));
+  const x0=0,x1=Math.max(...xs)*1.05||1,ny=nice(Math.min(...ys)*0.9,Math.max(...ys)*1.05,5),y0=ny.lo,y1=ny.hi,pw=W-pl-pr,ph=H-pt-pb;
+  const X=v=>pl+(v-x0)/(x1-x0)*pw,Y=v=>pt+ph-(v-y0)/(y1-y0)*ph;
+  let g='';
+  for(let v=y0;v<=y1+ny.step/2;v+=ny.step)g+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}"/><text class="ax num" x="${pl-6}" y="${Y(v)+4}" text-anchor="end">${+v.toFixed(1)}%</text>`;
+  const nx=Math.max(2,Math.min(8,Math.round(pw/80))),st=x1/nx;
+  for(let i=0;i<=nx;i++){const v=i*st;g+=`<text class="ax num" x="${X(v)}" y="${H-8}" text-anchor="middle">${bcN(v,1)} г.</text>`}
+  if(K.length>1)g+=`<polyline class="ic-kbd" points="${K.map(k=>X(k[0]).toFixed(1)+','+Y(k[1]).toFixed(1)).join(' ')}"/>`;
+  const fl=P.filter(p=>!p.floating);
+  if(fl.length>1)g+=`<polyline class="ic-ln" points="${fl.map(p=>X(p.dur).toFixed(1)+','+Y(p.yield).toFixed(1)).join(' ')}"/>`;
+  P.slice().sort((a,b)=>a.me-b.me).forEach(p=>{
+    g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'#3987e5'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
+  el.innerHTML=`<svg width="${W}" height="${H}">${g}</svg>`;
+}
 function bcCharts(dr,c){
+  const ice=dr.querySelector('#bc-ic');if(ice&&c.issuer_curve)try{bcIssuerCurve(ice,c.issuer_curve)}catch(e){}
   const hs=c.history;if(!hs||!hs.d||hs.d.length<2)return;
   const labels=hs.d.map(ddm),p=document.getElementById('bc-ch-p'),y=document.getElementById('bc-ch-y');
   {

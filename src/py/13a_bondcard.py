@@ -150,6 +150,42 @@ def _bc_lite(e, base_y):
             "dy": round(e["yield"] - base_y, 2) if base_y is not None else None}
 
 
+def _bc_cost(me, e, ri):
+    """Расстояние между выпусками для подбора аналогов (меньше = ближе); None, если не аналог. ri: индекс рейтинга me или None."""
+    if e["cur"] != "RUB" or not (0 < e["yield"] < 60) or not e.get("dur") or e["dur"] < 0.1:
+        return None
+    if e["kind"] != me["kind"]:
+        return None
+    if me["kind"] == "corp" and me["_iss"] and e["_iss"] and (e["_iss"] == me["_iss"]):
+        return None
+    ert = e["_rt"]
+    d = 0.0
+    if ri is not None:
+        if not ert:
+            return None
+        n = abs(RATING_SCALE.index(ert["v"]) - ri)
+        if n > 2:
+            return None
+        d += n * 1.0
+    elif ert and me["kind"] == "corp":
+        d += 0.5
+    ci, eci = me["_ci"] or {}, e["_ci"] or {}
+    sec, dur = ci.get("sector"), me.get("dur")
+    if sec and eci.get("sector") and sec != eci["sector"]:
+        d += 0.7
+    if dur:
+        rel = abs(e["dur"] - dur) / max(dur, e["dur"], 0.5)
+        if rel > 0.6:
+            return None
+        d += rel * 3
+    if bool(eci.get("floating")) != bool(ci.get("floating")):
+        d += 1.5
+    if bool(eci.get("amort")) != bool(ci.get("amort")):
+        d += 0.5
+    d -= min(1.0, len(str(int(e.get("turn") or 0))) / 9.0) * 0.6
+    return d
+
+
 def _bc_analogs(me, isin):
     """me: запись из _bc_universe (или None). Возвращает (список аналогов, относительная оценка)."""
     uni = _bc_universe()
@@ -157,41 +193,13 @@ def _bc_analogs(me, isin):
         return [], None
     rt = me["_rt"]
     ri = RATING_SCALE.index(rt["v"]) if rt else None
-    ci = me["_ci"] or {}
-    sec, dur = ci.get("sector"), me.get("dur")
     scored = []
     for e in uni:
-        if e["_isin"] == isin or e["cur"] != "RUB" or not (0 < e["yield"] < 60) or not e.get("dur") or e["dur"] < 0.1:
+        if e["_isin"] == isin:
             continue
-        if e["kind"] != me["kind"]:
-            continue
-        if me["kind"] == "corp" and me["_iss"] and e["_iss"] and (e["_iss"] == me["_iss"]):
-            continue
-        ert = e["_rt"]
-        d = 0.0
-        if ri is not None:
-            if not ert:
-                continue
-            n = abs(RATING_SCALE.index(ert["v"]) - ri)
-            if n > 2:
-                continue
-            d += n * 1.0
-        elif ert and me["kind"] == "corp":
-            d += 0.5
-        eci = e["_ci"] or {}
-        if sec and eci.get("sector") and sec != eci["sector"]:
-            d += 0.7
-        if dur:
-            rel = abs(e["dur"] - dur) / max(dur, e["dur"], 0.5)
-            if rel > 0.6:
-                continue
-            d += rel * 3
-        if bool(eci.get("floating")) != bool(ci.get("floating")):
-            d += 1.5
-        if bool(eci.get("amort")) != bool(ci.get("amort")):
-            d += 0.5
-        d -= min(1.0, len(str(int(e.get("turn") or 0))) / 9.0) * 0.6
-        scored.append((d, e))
+        d = _bc_cost(me, e, ri)
+        if d is not None:
+            scored.append((d, e))
     scored.sort(key=lambda x: x[0])
     sps = sorted(e["spread"] for _, e in scored[:30] if e.get("spread") is not None)
     if len(sps) >= 5:      # отсекаем выбросы (дефолтные выпуски, линкеры) относительно медианы ближайших кандидатов
@@ -211,6 +219,30 @@ def _bc_analogs(me, isin):
              ("дешевле" if diff > 0 else "дороже", c2(abs(diff)), "выше" if diff > 0 else "ниже", len(sp)))
         rel = {"median_spread": round(med, 2), "diff": diff, "n": len(sp), "text": txt}
     return top, rel
+
+
+def _bc_issuer_curve(me):
+    """Все торгуемые выпуски того же эмитента (по ключу названия): дюрация -> доходность, плюс КБД для ориентира."""
+    key = me.get("_iss")
+    pts = []
+    if key and me["kind"] == "corp":
+        for e in _bc_universe():
+            if e["_iss"] == key and e["cur"] == "RUB" and e.get("dur") and e["yield"] > 0:
+                rt = e["_rt"]
+                pts.append({"isin": e["_isin"], "name": e["name"], "dur": e["dur"], "yield": e["yield"], "spread": e.get("spread"),
+                            "rating": rt["v"] if rt else None, "turn": e.get("turn"), "me": e["_isin"] == me["_isin"],
+                            "floating": bool((e["_ci"] or {}).get("floating"))})
+    if len(pts) < 2:
+        return None
+    pts.sort(key=lambda p: p["dur"])
+    lo, hi = max(0.0, pts[0]["dur"] - 0.3), pts[-1]["dur"] + 0.5
+    kbd = []
+    for i in range(13):
+        x = lo + (hi - lo) * i / 12
+        k = kbd_at(x)
+        if k is not None:
+            kbd.append([round(x, 2), round(k, 2)])
+    return {"points": pts, "kbd": kbd}
 
 
 def bond_card(isin):
@@ -272,9 +304,15 @@ def bond_card(isin):
         except Exception as e:  # noqa: BLE001
             card["analogs"], card["rel"] = [], None
             errors.append("аналоги: %s" % str(e)[:120])
+        try:
+            card["issuer_curve"] = _bc_issuer_curve(me)
+        except Exception as e:  # noqa: BLE001
+            card["issuer_curve"] = None
+            errors.append("кривая эмитента: %s" % str(e)[:120])
     else:
         card["market"] = None
         card["analogs"], card["rel"] = [], None
+        card["issuer_curve"] = None
         if not errors:
             errors.append("нет торгов на основных режимах Мосбиржи — показаны только справочные данные")
     card["name"] = (me or {}).get("full") or (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or isin

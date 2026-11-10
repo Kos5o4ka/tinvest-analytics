@@ -44,7 +44,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "T-Invest Analytics"
-APP_VERSION = "0.10"
+APP_VERSION = "0.11"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "targets": {},          # целевые доли по классам активов, %: {"share": 50, "bond": 40, ...}
     "notify_days": 7,       # за сколько дней напоминать о выплатах
     "keyrate_mode": "cbr",  # источник прогноза ключевой ставки для флоатеров: cbr | survey | market | flat
+    "mon_drop5": 3.0, "mon_drop30": 7.0, "mon_spread30": 2.0, "mon_sell_days": 5.0, "mon_offer_days": 30,   # пороги тревог «Мониторинга»
 }
 
 # Корневой сертификат Минцифры (Russian Trusted Root CA, RSA, до 27.02.2032).
@@ -1589,6 +1590,268 @@ def stress(price, flows, settle, face, aci=0.0, dy_list=(-3, -2, -1, 1, 2, 3), y
             continue
         out[dy] = (_bc_pv([f for f in flows if f[0] > settle], settle, ny) - aci) / face * 100.0
     return out
+# ═══════════════════ риски и сценарии: рыночная вероятность дефолта, ожидаемая доходность, сценарии ключевой ставки ═══════════════════
+# Упрощённая модель, справочная информация. Все допущения перечислены в RISK_NOTES и отдаются в UI.
+
+RISK_RECOVERY = 25.0       # допущение о доле возврата при дефолте, % (по умолчанию)
+# Историческая однолетняя вероятность дефолта по рейтингу национальной шкалы, %. Опорные точки:
+#  - Московская биржа, «О чём говорят кредитные рейтинги» (частоты дефолтов 2002-2022, горизонт 1 год):
+#    AA 0,23; A 0,75; BBB 1,87; BB 3,88;
+#  - Эксперт РА, «Матрица дефолтов» (январь 2026, 1 год): BBB 1,57; BB 4,27; B 5,5; CCC 13,64; CC 28,57; C 100.
+# Значения по подкатегориям (+/-) интерполированы вручную, AAA и AA+ — экспертная оценка (дефолтов в этих классах практически не было).
+RISK_PD_HIST = {"AAA": 0.05, "AA+": 0.10, "AA": 0.20, "AA-": 0.30, "A+": 0.50, "A": 0.75, "A-": 1.10, "BBB+": 1.40,
+                "BBB": 1.70, "BBB-": 2.30, "BB+": 3.20, "BB": 4.00, "BB-": 4.80, "B+": 5.20, "B": 5.50, "B-": 8.00,
+                "CCC": 13.6, "CC": 28.6, "C": 60.0, "D": 100.0}
+RISK_PD_SRC = ("Исследования дефолтов: Московская биржа («О чём говорят кредитные рейтинги», частоты дефолтов 2002-2022) "
+               "и Эксперт РА («Матрица дефолтов», 2026). Подкатегории интерполированы; значения приблизительные.")
+RISK_REC_SRC = ("Доля возврата для российских корпоративных облигаций в научных оценках (напр. Е. Антонова, НИУ ВШЭ, "
+               "«Корпоративные финансы» 2012, данные Cbonds) обычно лежит в диапазоне 20-40 %, зависит от обеспечения и "
+               "очереди требований. 25 % — рабочее допущение; меняется параметром.")
+RISK_FIX_RATES = (10.0, 18.0)
+RISK_BETA = ((1.0, 1.0), (7.0, 0.5))      # (срок, лет; бета): до 1 года 1,0, далее линейно до 0,5 на 7 годах и дальше
+
+
+def _rexp(x):
+    return 2.718281828459045 ** x
+
+
+def risk_beta(t):
+    (t0, b0), (t1, b1) = RISK_BETA
+    if t is None or t <= t0:
+        return b0
+    if t >= t1:
+        return b1
+    return b0 + (b1 - b0) * (t - t0) / (t1 - t0)
+
+
+def _risk_path(k0, target, today):
+    """Путь ставки: линейно от k0 до target за 12 месяцев, далее ровно. [(дата, %)] помесячно на 4 года."""
+    out = []
+    t0 = datetime.strptime(today, "%Y-%m-%d")
+    for m in range(0, 49):
+        d = (t0 + timedelta(days=round(m * 30.4375))).strftime("%Y-%m-%d")
+        out.append((d, k0 + (target - k0) * min(m, 12) / 12.0))
+    return out
+
+
+def _risk_unit(b, today, hd, scn_paths, def_path, tax):
+    """Результат за 12 месяцев на 1 рубль стоимости по каждому сценарию. b: {flows, y, floating, bz, face, dirty, est, ...}.
+    Возвращает {ключ сценария: (купоны, цена+прочее)} в долях от текущей полной стоимости (с НКД)."""
+    out = {}
+    for key, sc in scn_paths.items():
+        flows = b["flows"]
+        if b["floating"] and b["est"]:
+            e2 = fl_estimates(b["bz"], today, b["face"], sc["path"])
+            flows = [(d, e2[d]["amt"] if d in b["est"] and d in e2 else c, p) for d, c, p in flows]
+        out[key] = _risk_eval(b, flows, today, hd, sc, def_path, tax)
+    return out
+
+
+def _risk_rem(flows, hd):
+    return [f for f in flows if f[0] > hd]
+
+
+def _risk_eval(b, flows, today, hd, sc, def_path, tax, dy_extra=None):
+    y0 = b["y"]
+    rem = _risk_rem(flows, hd)
+    cash = [f for f in flows if today < f[0] <= hd]
+    cpn = sum(c for _, c, _ in cash)
+    prin = sum(p for _, _, p in cash)
+    if dy_extra is not None:
+        dy = dy_extra
+    elif not rem:
+        dy = 0.0
+    elif b["floating"] and b["est"]:
+        ds = [d for d, _, _ in rem]
+        dy = sum(keyrate_at(sc["path"], d) - keyrate_at(def_path, d) for d in ds) / len(ds) / 100.0
+    else:
+        mac, _, _ = cf_risk(rem, hd, y0)
+        dy = risk_beta(mac) * sc["delta"] / 100.0
+    pv = _bc_pv(rem, hd, max(y0 + dy, -0.9)) if rem else 0.0
+    price = pv + prin - b["dirty"]
+    if tax:
+        cpn *= (1 - BC_TAX)
+        if price > 0:
+            price *= (1 - BC_TAX)
+    return cpn / b["dirty"], price / b["dirty"]
+
+
+def _risk_breakeven(b, flows, today, hd, sc, tax):
+    """Рост доходности (п.п.), при котором результат за 12 месяцев (купоны + цена) обнуляется; None, если > 30 п.п."""
+    f = lambda dy: sum(_risk_eval(b, flows, today, hd, sc, None, tax, dy_extra=dy))
+    if f(0.0) <= 0:
+        return 0.0
+    if f(0.30) > 0:
+        return None
+    lo, hi = 0.0, 0.30
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if f(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2 * 100.0
+
+
+def _risk_scenarios(target, today):
+    info = keyrate_forecast_info()
+    try:
+        minfo = keyrate_forecast_info("market")
+    except Exception:  # noqa: BLE001
+        minfo = None
+    k0 = info.get("key_rate")
+    if k0 is None and info.get("path"):
+        k0 = info["path"][0][1]
+    if k0 is None:
+        raise ApiError("Нет данных о ключевой ставке.", 502)
+    hd = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=365)).strftime("%Y-%m-%d")
+    sc = []
+
+    def add(key, name, path, note=""):
+        sc.append({"key": key, "name": name, "path": path, "k12": keyrate_at(path, hd), "note": note})
+    if info.get("path"):
+        add("cbr", "Прогноз ЦБ", info["path"], info.get("source_name") or "")
+    if minfo and minfo.get("path") and minfo.get("source") == "market":
+        add("market", "Рынок", minfo["path"], minfo.get("source_name") or "")
+    add("hold", "Ставка без изменений", _risk_path(k0, k0, today))
+    for r in RISK_FIX_RATES:
+        add("fix%d" % r, "Ставка %d %%" % r, _risk_path(k0, r, today))
+    if target is not None:
+        add("target", "Своя ставка %s %%" % (("%g" % target).replace(".", ",")), _risk_path(k0, target, today))
+    for s in sc:
+        s["delta"] = s["k12"] - k0
+    return k0, hd, sc, (info.get("path") or _risk_path(k0, k0, today))
+
+
+def _fnum(x, lo, hi, dflt):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return dflt
+    return v if lo <= v <= hi else dflt
+
+
+def build_risk(cfg, acc, q=None):
+    q = q or {}
+    rec = _fnum(q.get("recovery"), 0.0, 90.0, RISK_RECOVERY)
+    target = _fnum(q.get("target"), 0.0, 60.0, None) if q.get("target") not in (None, "") else None
+    tax = q.get("tax") == "1"
+    key = ("risk", token_key(cfg), acc, rec, target, tax)
+    hit = mem_get(key, 300)
+    if hit:
+        return hit
+    rep = build_bonds(cfg, acc)
+    today = date.today().isoformat()
+    k0, hd, scs, def_path = _risk_scenarios(target, today)
+    R = rec / 100.0
+    rows, units = [], []
+    for r in rep["rows"]:
+        if r.get("ytm") is None or not r.get("value_rub"):
+            continue
+        v = r["value_rub"]
+        isin = r.get("isin") or r.get("ticker") or ""
+        end = r.get("end") or r.get("maturity") or ""
+        T = max((datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days / 365.0, 0.02) if end else None
+        sp = r.get("spread")
+        lam = max(sp, 0.0) / 100.0 / (1 - R) if sp is not None else None
+        pd1 = 1 - _rexp(-lam * min(1.0, T)) if lam is not None and T else None
+        pdT = 1 - _rexp(-lam * T) if lam is not None and T else None
+        rt = (r.get("rating") or {}).get("v")
+        ph = RISK_PD_HIST.get(rt) / 100.0 if rt in RISK_PD_HIST else None
+        ratio = pd1 / ph if pd1 is not None and ph else None
+        basis_pd = ph if ph is not None else pd1            # без рейтинга — берём рыночную оценку
+        el_pct = (basis_pd or 0.0) * (1 - R) * 100.0
+        row = {"isin": isin, "name": r["name"], "ticker": r.get("ticker"), "uid": r.get("uid"), "value_rub": v,
+               "share": r.get("share"), "rating": r.get("rating"), "ytm": r["ytm"], "spread": sp, "dur": r.get("dur"),
+               "mdur": r.get("mdur"), "floating": bool(r.get("floating")), "years": T,
+               "pd_mkt_1y": pd1, "pd_mkt_T": pdT, "pd_hist_1y": ph, "ratio": ratio,
+               "ey_hist": r["ytm"] - el_pct, "ey_mkt": r["ytm"] - (pd1 or 0.0) * (1 - R) * 100.0,
+               "hist_basis": "rating" if ph is not None else "market", "exact": r.get("cf_source") == "moex", "scn": {}}
+        # потоки для переоценки
+        flows, est, bz, face = None, {}, None, r.get("nominal") or 1000.0
+        if row["exact"]:
+            try:
+                bz = moex_bondization(isin)
+                flows, kind, _e = bond_flows(bz, today, face, floating=bool(r.get("floating")), est_out=est) if bz else (None, None, None)
+            except Exception:  # noqa: BLE001
+                flows = None
+        if flows:
+            y0 = r["ytm"] / 100.0
+            dirty = _bc_pv([f for f in flows if f[0] > today], today, y0)
+            if dirty and dirty > 0:
+                b = {"flows": flows, "y": y0, "floating": bool(r.get("floating")), "bz": bz, "face": face, "dirty": dirty, "est": est}
+                for k, (c, p) in _risk_unit(b, today, hd, {s["key"]: s for s in scs}, def_path, tax).items():
+                    row["scn"][k] = {"coupons": c * v, "price": p * v, "total": (c + p) * v}
+                hs = scs[[s["key"] for s in scs].index("hold")]
+                be = _risk_breakeven(b, flows, today, hd, hs, tax)
+                row["breakeven"] = be
+                row["be_gt"] = be is None
+        if not row["scn"]:
+            # приближение: купоны ~ доходность, цена ~ -mdur x бета x сдвиг
+            md = r.get("mdur") or 0.0
+            for s in scs:
+                dy = 0.0 if r.get("floating") else risk_beta(r.get("dur")) * s["delta"]
+                c = v * r["ytm"] / 100.0 * ((1 - BC_TAX) if tax else 1)
+                p = -md * dy / 100.0 * v
+                row["scn"][s["key"]] = {"coupons": c, "price": p, "total": c + p}
+            row["breakeven"] = r["ytm"] / md if md else None
+            row["be_gt"] = False
+        if "breakeven" not in row or row["breakeven"] is None:
+            row.setdefault("breakeven", None)
+        row["be_approx"] = r["ytm"] / row["mdur"] if row.get("mdur") else None
+        rows.append(row)
+    tot = sum(x["value_rub"] for x in rows) or 0.0
+    out = {"account": acc, "recovery": rec, "tax": tax, "count": len(rows), "value": tot, "today": today, "horizon": hd,
+           "key_rate": k0, "pd_hist_table": RISK_PD_HIST, "sources": {"pd": RISK_PD_SRC, "recovery": RISK_REC_SRC},
+           "beta": [list(x) for x in RISK_BETA], "rows": rows,
+           "scenarios": [{k: s[k] for k in ("key", "name", "k12", "delta", "note")} for s in scs]}
+    if not tot:
+        out.update(portfolio=None, scn_total=[], floaters={}, casino=[])
+        return mem_put(key, out)
+    wy = sum(x["ytm"] * x["value_rub"] for x in rows) / tot
+    el_h = sum(x["value_rub"] * ((x["pd_hist_1y"] if x["pd_hist_1y"] is not None else (x["pd_mkt_1y"] or 0.0))) * (1 - R) for x in rows)
+    el_m = sum(x["value_rub"] * (x["pd_mkt_1y"] or 0.0) * (1 - R) for x in rows)
+    nd = [x for x in rows if x["ytm"] <= YTM_HIGH]
+    wy_ex = sum(x["ytm"] * x["value_rub"] for x in nd) / sum(x["value_rub"] for x in nd) if nd else None
+    out["portfolio"] = {"promised_ex": wy_ex, "distressed_value": tot - sum(x["value_rub"] for x in nd), "promised": wy, "expected": wy - el_h / tot * 100.0, "expected_mkt": wy - el_m / tot * 100.0,
+                        "exp_loss_rub": el_h, "exp_loss_mkt_rub": el_m,
+                        "unrated_value": sum(x["value_rub"] for x in rows if x["hist_basis"] != "rating"),
+                        "approx_count": sum(1 for x in rows if not x["exact"])}
+    # итоги по сценариям и группам
+    def agg(sel):
+        res = {}
+        val = sum(x["value_rub"] for x in sel)
+        for s in scs:
+            c = sum(x["scn"][s["key"]]["coupons"] for x in sel)
+            p = sum(x["scn"][s["key"]]["price"] for x in sel)
+            res[s["key"]] = {"coupons": c, "price": p, "total": c + p, "pct": (c + p) / val * 100.0 if val else None}
+        return res, val
+    out["scn_total"], _ = agg(rows)
+    fl, fx = [x for x in rows if x["floating"]], [x for x in rows if not x["floating"]]
+    fa, fv = agg(fl)
+    xa, xv = agg(fx)
+    out["floaters"] = {"floating": {"value": fv, "count": len(fl), "scn": fa}, "fixed": {"value": xv, "count": len(fx), "scn": xa}}
+    # «казино»: дефолт k самых рискованных эмитентов (по рыночной вероятности дефолта за год)
+    base = out["scn_total"]["hold"]["total"]
+    groups = {}
+    for x in rows:
+        g = groups.setdefault(x["name"].split(" ")[0].lower(), {"name": x["name"], "pd": 0.0, "value": 0.0, "ret": 0.0, "n": 0})
+        g["pd"] = max(g["pd"], x["pd_mkt_1y"] or 0.0)
+        g["value"] += x["value_rub"]
+        g["ret"] += x["scn"]["hold"]["total"]
+        g["n"] += 1
+    ranked = sorted(groups.values(), key=lambda g: (-g["pd"], -g["value"]))
+    casino = []
+    for k in (1, 2, 3):
+        pick = ranked[:k]
+        if len(pick) < k:
+            break
+        res = base - sum(g["ret"] for g in pick) - sum(g["value"] * (1 - R) for g in pick)
+        casino.append({"k": k, "issuers": [{"name": g["name"], "value": g["value"], "pd": g["pd"]} for g in pick],
+                       "result_rub": res, "result_pct": res / tot * 100.0, "lost_rub": sum(g["value"] * (1 - R) for g in pick)})
+    out["casino"] = casino
+    out["base_rub"] = base
+    return mem_put(key, out)
 # ═══════════════════════════════ история стоимости и доходность ═══════════════════════════════
 
 def build_history(client, ops, names, actual_total):
@@ -2505,6 +2768,96 @@ def parse_rating_post(text):
                         "развивающ": "развивающийся"}.get(om.group(1), "") if om else ""}
 
 
+RT_LOG_KEY, RT_LOG_DAYS = "ratings_log_v1", 730        # журнал рейтинговых действий: отдельно от ratings_v1
+_RT_D = re.compile(r"(?<![A-Za-zА-Яа-яЁё])(?:ru\s?D(?![A-Za-zА-Яа-я])|D\s?\(RU\)|D\.ru|RD(?![A-Za-z]))")
+_RT_ACTIONS = {"присвоен", "подтверждён", "повышен", "понижен", "отозван", "под наблюдением", "прогноз изменён"}
+
+
+def _rt_tok_d(t):
+    return "D" if _RT_D.search(t or "") else _rating_token(t or "")
+
+
+def parse_rating_action(text):
+    """Рейтинговое действие из поста: {agency, issuer, level, action, rating, prev, outlook, watch, url} или None.
+    Шире parse_rating_post: понимает дефолтные уровни (D/RD), «ранее ...», «с X до Y», статус «под наблюдением»."""
+    r = parse_rating_post(text)
+    low = text.lower()
+    head = low[:80]
+    if not r:
+        agency = next((a for pat, a in ((r"\bакра\b", "АКРА"), (r"эксперт\s+ра", "Эксперт РА"), (r"\bнкр\b", "НКР"),
+                                        (r"\bнра\b", "НРА")) if re.search(pat, head)), None)
+        if not agency or re.search(r"ожидаем|\.sf|структурир|сфо|\bкласс|esg|\.gq|качеств|надежност|некредитн|\.am", low):
+            return None
+        issuer = _rating_issuer(text)
+        if not issuer or not _RT_D.search(re.split(r"(?i)\bранее\b", text)[0]):
+            return None
+        r = {"agency": agency, "issuer": issuer, "level": "bond" if re.search(r"облигаци|выпуск", low) else "issuer",
+             "rating": "D", "outlook": ""}
+    first = re.split(r"\n", text.strip())[0]
+    fl = first.lower()
+    parts = re.split(r"(?i)\bранее\b", first, maxsplit=1)
+    prev = None
+    if len(parts) > 1:
+        prev = _rt_tok_d(parts[1])
+    else:
+        m = re.search(r"(?i)\bс\s+(\S+?)\s+до\s+(\S+)", first)
+        if m:
+            prev = _rt_tok_d(m.group(1))
+            r = dict(r, rating=_rt_tok_d(m.group(2)) or r.get("rating"))     # НКР: «с AA.ru до AA-.ru» — новый уровень второй
+    watch = ""
+    if re.search(r"сн[яя]л\w*\s+статус|снят\w*\s+статус", fl):
+        watch = "removed"
+    elif re.search(r"статус\w*\s+[«\"“]под наблюдением", fl) and re.search(r"присво|продли|установил|ввел|ввело", fl):
+        watch = "set"
+    elif "под наблюдением" in fl and "ранее" not in fl.split("под наблюдением")[0]:
+        watch = "set"
+    if "отозва" in fl:
+        act = "отозван"
+    elif re.search(r"повысил", fl):
+        act = "повышен"
+    elif re.search(r"понизил|снизил", fl):
+        act = "понижен"
+    elif watch == "set" and re.search(r"присво\w+\s+статус|установил\w*\s+статус", fl):
+        act = "под наблюдением"
+    elif re.search(r"изменил\w*\s+прогноз|изменив\s+прогноз|прогноз\w*\s+(?:по рейтингу\s+)?(?:был\s+)?изменен|пересмотрел\w*\s+прогноз", fl):
+        act = "прогноз изменён"
+    elif "подтверд" in fl:
+        act = "подтверждён"
+    elif "присво" in fl:
+        act = "присвоен"
+    elif watch == "set":
+        act = "под наблюдением"
+    else:
+        return None
+    um = re.search(r"https?://\S+", text[len(first):])
+    om = re.search(r"прогноз.{0,60}?\bна\s+[«\"“]?(стабильн|позитивн|негативн|развивающ)", fl)
+    if om:
+        r = dict(r, outlook={"стабильн": "стабильный", "позитивн": "позитивный", "негативн": "негативный",
+                             "развивающ": "развивающийся"}[om.group(1)])
+    out = {"agency": r["agency"], "issuer": r["issuer"], "level": r["level"], "action": act,
+           "rating": r.get("rating"), "prev": prev, "outlook": r.get("outlook") or "", "watch": watch,
+           "url": um.group(0).rstrip(".,)") if um else ""}
+    if act == "понижен" and out["rating"] and prev and out["rating"] == prev:
+        out["action"] = "прогноз изменён"
+    return out
+
+
+def rating_log_add(log, pid, iso, text):
+    a = parse_rating_action(text)
+    if not a:
+        return
+    toks = sorted(name_tokens(a["issuer"]))
+    if not toks:
+        return
+    a.update(post=pid, date=iso[:10], tokens=toks)
+    log["events"].append(a)
+
+
+def rating_log_trim(log):
+    old = (date.today() - timedelta(days=RT_LOG_DAYS)).isoformat()
+    log["events"] = sorted((e for e in log["events"] if e["date"] >= old), key=lambda e: (e["date"], e["post"]))
+
+
 def tg_page(before=None):
     s = http_text(RATING_CH + ("?before=%d" % before if before else ""))
     ids, posts = [], []
@@ -2530,6 +2883,8 @@ def _ratings_run():
         except Exception:  # noqa: BLE001
             pass
         data = st.get(RT_KEY) or {"items": {}, "max_id": 0, "updated": 0}
+        rlog = st.get(RT_LOG_KEY) or {"events": [], "max_id": 0}
+        base_id = min(data["max_id"], rlog["max_id"])      # пока журнал пуст — догружаем канал до границы RT_DAYS
         cutoff = (datetime.now(timezone.utc) - timedelta(days=RT_DAYS)).isoformat()
         got, before, pages = {}, None, 0
         while pages < RT_MAX_PAGES:
@@ -2550,9 +2905,9 @@ def _ratings_run():
             _rt_state["progress"] = "загружено страниц: %d" % pages
             mn = min(ids)
             oldest = min((p[1] for p in posts), default="9")
-            if data["max_id"] and mn <= data["max_id"]:
+            if base_id and mn <= base_id:
                 break
-            if not data["max_id"] and oldest < cutoff:
+            if not base_id and oldest < cutoff:
                 break
             if before is not None and mn >= before:
                 break
@@ -2560,6 +2915,11 @@ def _ratings_run():
             time.sleep(0.25)
         items = data["items"]
         for pid in sorted(got):
+            if pid > rlog["max_id"]:
+                try:
+                    rating_log_add(rlog, pid, got[pid][1], got[pid][2])
+                except Exception:  # noqa: BLE001
+                    pass
             if pid <= data["max_id"]:
                 continue
             _, iso, text = got[pid]
@@ -2579,6 +2939,9 @@ def _ratings_run():
         data["max_id"] = max([data["max_id"]] + list(got))
         data["updated"] = time.time()
         st.put(RT_KEY, data)
+        rlog["max_id"] = max([rlog["max_id"]] + list(got))
+        rating_log_trim(rlog)
+        st.put(RT_LOG_KEY, rlog)
         _rt_state["error"] = ""
         _rt_idx.clear()
     except Exception as e:  # noqa: BLE001
@@ -3390,6 +3753,42 @@ def _bc_lite(e, base_y):
             "dy": round(e["yield"] - base_y, 2) if base_y is not None else None}
 
 
+def _bc_cost(me, e, ri):
+    """Расстояние между выпусками для подбора аналогов (меньше = ближе); None, если не аналог. ri: индекс рейтинга me или None."""
+    if e["cur"] != "RUB" or not (0 < e["yield"] < 60) or not e.get("dur") or e["dur"] < 0.1:
+        return None
+    if e["kind"] != me["kind"]:
+        return None
+    if me["kind"] == "corp" and me["_iss"] and e["_iss"] and (e["_iss"] == me["_iss"]):
+        return None
+    ert = e["_rt"]
+    d = 0.0
+    if ri is not None:
+        if not ert:
+            return None
+        n = abs(RATING_SCALE.index(ert["v"]) - ri)
+        if n > 2:
+            return None
+        d += n * 1.0
+    elif ert and me["kind"] == "corp":
+        d += 0.5
+    ci, eci = me["_ci"] or {}, e["_ci"] or {}
+    sec, dur = ci.get("sector"), me.get("dur")
+    if sec and eci.get("sector") and sec != eci["sector"]:
+        d += 0.7
+    if dur:
+        rel = abs(e["dur"] - dur) / max(dur, e["dur"], 0.5)
+        if rel > 0.6:
+            return None
+        d += rel * 3
+    if bool(eci.get("floating")) != bool(ci.get("floating")):
+        d += 1.5
+    if bool(eci.get("amort")) != bool(ci.get("amort")):
+        d += 0.5
+    d -= min(1.0, len(str(int(e.get("turn") or 0))) / 9.0) * 0.6
+    return d
+
+
 def _bc_analogs(me, isin):
     """me: запись из _bc_universe (или None). Возвращает (список аналогов, относительная оценка)."""
     uni = _bc_universe()
@@ -3397,41 +3796,13 @@ def _bc_analogs(me, isin):
         return [], None
     rt = me["_rt"]
     ri = RATING_SCALE.index(rt["v"]) if rt else None
-    ci = me["_ci"] or {}
-    sec, dur = ci.get("sector"), me.get("dur")
     scored = []
     for e in uni:
-        if e["_isin"] == isin or e["cur"] != "RUB" or not (0 < e["yield"] < 60) or not e.get("dur") or e["dur"] < 0.1:
+        if e["_isin"] == isin:
             continue
-        if e["kind"] != me["kind"]:
-            continue
-        if me["kind"] == "corp" and me["_iss"] and e["_iss"] and (e["_iss"] == me["_iss"]):
-            continue
-        ert = e["_rt"]
-        d = 0.0
-        if ri is not None:
-            if not ert:
-                continue
-            n = abs(RATING_SCALE.index(ert["v"]) - ri)
-            if n > 2:
-                continue
-            d += n * 1.0
-        elif ert and me["kind"] == "corp":
-            d += 0.5
-        eci = e["_ci"] or {}
-        if sec and eci.get("sector") and sec != eci["sector"]:
-            d += 0.7
-        if dur:
-            rel = abs(e["dur"] - dur) / max(dur, e["dur"], 0.5)
-            if rel > 0.6:
-                continue
-            d += rel * 3
-        if bool(eci.get("floating")) != bool(ci.get("floating")):
-            d += 1.5
-        if bool(eci.get("amort")) != bool(ci.get("amort")):
-            d += 0.5
-        d -= min(1.0, len(str(int(e.get("turn") or 0))) / 9.0) * 0.6
-        scored.append((d, e))
+        d = _bc_cost(me, e, ri)
+        if d is not None:
+            scored.append((d, e))
     scored.sort(key=lambda x: x[0])
     sps = sorted(e["spread"] for _, e in scored[:30] if e.get("spread") is not None)
     if len(sps) >= 5:      # отсекаем выбросы (дефолтные выпуски, линкеры) относительно медианы ближайших кандидатов
@@ -3451,6 +3822,30 @@ def _bc_analogs(me, isin):
              ("дешевле" if diff > 0 else "дороже", c2(abs(diff)), "выше" if diff > 0 else "ниже", len(sp)))
         rel = {"median_spread": round(med, 2), "diff": diff, "n": len(sp), "text": txt}
     return top, rel
+
+
+def _bc_issuer_curve(me):
+    """Все торгуемые выпуски того же эмитента (по ключу названия): дюрация -> доходность, плюс КБД для ориентира."""
+    key = me.get("_iss")
+    pts = []
+    if key and me["kind"] == "corp":
+        for e in _bc_universe():
+            if e["_iss"] == key and e["cur"] == "RUB" and e.get("dur") and e["yield"] > 0:
+                rt = e["_rt"]
+                pts.append({"isin": e["_isin"], "name": e["name"], "dur": e["dur"], "yield": e["yield"], "spread": e.get("spread"),
+                            "rating": rt["v"] if rt else None, "turn": e.get("turn"), "me": e["_isin"] == me["_isin"],
+                            "floating": bool((e["_ci"] or {}).get("floating"))})
+    if len(pts) < 2:
+        return None
+    pts.sort(key=lambda p: p["dur"])
+    lo, hi = max(0.0, pts[0]["dur"] - 0.3), pts[-1]["dur"] + 0.5
+    kbd = []
+    for i in range(13):
+        x = lo + (hi - lo) * i / 12
+        k = kbd_at(x)
+        if k is not None:
+            kbd.append([round(x, 2), round(k, 2)])
+    return {"points": pts, "kbd": kbd}
 
 
 def bond_card(isin):
@@ -3512,9 +3907,15 @@ def bond_card(isin):
         except Exception as e:  # noqa: BLE001
             card["analogs"], card["rel"] = [], None
             errors.append("аналоги: %s" % str(e)[:120])
+        try:
+            card["issuer_curve"] = _bc_issuer_curve(me)
+        except Exception as e:  # noqa: BLE001
+            card["issuer_curve"] = None
+            errors.append("кривая эмитента: %s" % str(e)[:120])
     else:
         card["market"] = None
         card["analogs"], card["rel"] = [], None
+        card["issuer_curve"] = None
         if not errors:
             errors.append("нет торгов на основных режимах Мосбиржи — показаны только справочные данные")
     card["name"] = (me or {}).get("full") or (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or isin
@@ -4042,6 +4443,691 @@ def keyrate_at(path, d):
     (d0, v0), (d1, v1) = path[i - 1], path[i]
     w = _kr_days(d0, d) / float(_kr_days(d0, d1) or 1)
     return v0 + (v1 - v0) * w
+
+# ═══════════════════ сигналы: дороже/дешевле аналогов по всему рынку, история, возможные замены ═══════════════════
+
+SIG_TTL = 900
+SIG_HIST_KEY = "sig_hist_v1"
+SIG_HIST_DAYS = 120
+SIG_EPS = 0.25           # |diff| (п.п.) от которого выпуск считается «дешевле/дороже» аналогов
+SIG_OUTLIER = 8.0        # |diff| больше этого, доходность выше SIG_MAX_YIELD или спред < -6: вероятно дефолтный/«битый» выпуск
+SIG_MAX_YIELD = 40.0
+SIG_MAX_GAIN = 8.0       # разницу доходности больше этого в замены не берём: это уже разница в риске, а не «недооценка»
+SIG_MIN_SIGMA = 0.4      # нижняя граница разброса аналогов (п.п.) для z-оценки
+_sig = {"t": 0, "rows": [], "meta": {}}
+_sig_lock = threading.Lock()
+_sig_hist = {"t": 0, "d": None}
+
+
+def _sig_pool(uni):
+    """Выпуски, участвующие в сравнении: рублёвые корпоративные с рейтингом, без флоатеров и бессрочных."""
+    out = []
+    for e in uni:
+        if e["kind"] != "corp" or e["cur"] != "RUB" or not (0 < e["yield"] < 60) or not e.get("dur") or e["dur"] < 0.1:
+            continue
+        if not e["_rt"] or e.get("spread") is None:
+            continue
+        ci = e["_ci"] or {}
+        if ci.get("floating") or ci.get("perpetual"):
+            continue
+        out.append(e)
+    return out
+
+
+def _sig_index(pool):
+    """Индексы для быстрого перебора кандидатов: по индексу рейтинга, отсортировано по дюрации."""
+    by = defaultdict(list)
+    for e in pool:
+        by[RATING_SCALE.index(e["_rt"]["v"])].append(e)
+    idx = {}
+    for ri, lst in by.items():
+        lst.sort(key=lambda e: e["dur"])
+        idx[ri] = (lst, [e["dur"] for e in lst])
+    return idx
+
+
+def _sig_cands(me, ri, idx, rng=2):
+    """Кандидаты в аналоги (до применения _bc_cost): рейтинг ±rng ступеней и дюрация в допустимом окне."""
+    d = me["dur"]
+    lo, hi = d * 0.4, d * 2.5
+    for r in range(ri - rng, ri + rng + 1):
+        it = idx.get(r)
+        if not it:
+            continue
+        lst, durs = it
+        for e in lst[bisect.bisect_left(durs, lo):bisect.bisect_right(durs, hi)]:
+            yield e
+
+
+def _sig_nearest(me, ri, idx, isin_skip=None):
+    """Ближайшие аналоги так же, как в карточке: 30 лучших -> отсев выбросов по спреду -> 12 лучших. Возвращает [(cost, e)]."""
+    sc = []
+    for e in _sig_cands(me, ri, idx):
+        if e is me or e["_isin"] == isin_skip:
+            continue
+        c = _bc_cost(me, e, ri)
+        if c is not None:
+            sc.append((c, e["_isin"], e))
+    sc.sort(key=lambda x: (x[0], x[1]))
+    sps = sorted(x[2]["spread"] for x in sc[:30])
+    if len(sps) >= 5:
+        m0 = sps[len(sps) // 2]
+        sc = [x for x in sc if abs(x[2]["spread"] - m0) <= 8]
+    return [(c, e) for c, _, e in sc[:12]]
+
+
+def _sig_median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def _sig_row(e, near):
+    sp = [a["spread"] for _, a in near]
+    med = _sig_median(sp)
+    mad = _sig_median([abs(x - med) for x in sp]) * 1.4826
+    diff = e["spread"] - med
+    ci, rt = e["_ci"] or {}, e["_rt"]
+    return {"isin": e["_isin"], "id": e["id"], "name": e["name"], "rating": rt["v"], "rating_approx": bool(rt.get("approx")),
+            "sector": ci.get("sector"), "yield": e["yield"], "spread": e["spread"], "dur": e["dur"], "price": e.get("price"),
+            "mat": e.get("mat"), "med": round(med, 2), "diff": round(diff, 2), "sigma": round(max(mad, SIG_MIN_SIGMA), 2),
+            "z": round(diff / max(mad, SIG_MIN_SIGMA), 2), "n": len(sp), "turn": e.get("turn") or 0, "trades": e.get("trades") or 0,
+            "amort": bool(ci.get("amort")), "sub": bool(ci.get("subordinated")),
+            "outlier": bool(abs(diff) > SIG_OUTLIER or e["yield"] > SIG_MAX_YIELD or e["spread"] < -6),
+            "refs": [{"isin": a["_isin"], "name": a["name"], "spread": a["spread"]} for _, a in near[:3]]}
+
+
+def _sig_hist_load():
+    if _sig_hist["d"] is None or time.time() - _sig_hist["t"] > 60:
+        _sig_hist["d"] = store().get(SIG_HIST_KEY) or {}
+        _sig_hist["t"] = time.time()
+    return _sig_hist["d"]
+
+
+def _sig_snapshot(rows):
+    """Сохраняет сегодняшний снимок diff (по будням; ликвидные выпуски), хранит SIG_HIST_DAYS последних дней."""
+    h = _sig_hist_load()
+    today = date.today()
+    if today.weekday() < 5 and rows:
+        h[today.isoformat()] = {r["isin"]: r["diff"] for r in rows if r["turn"] >= 2e5}
+        for d in sorted(h)[:-SIG_HIST_DAYS]:
+            h.pop(d, None)
+        try:
+            store().put(SIG_HIST_KEY, h)
+        except Exception:  # noqa: BLE001
+            pass
+    return h
+
+
+def _sig_streak(h, isin, diff):
+    """Сколько последних снимков подряд знак и величина diff те же (дешевле/дороже). Возвращает (streak, series[старые..новые])."""
+    days = sorted(h)
+    ser = [h[d].get(isin) for d in days]
+    sgn = 1 if diff >= SIG_EPS else -1 if diff <= -SIG_EPS else 0
+    n = 0
+    if sgn:
+        for v in reversed(ser):
+            if v is not None and v * sgn >= SIG_EPS:
+                n += 1
+            else:
+                break
+    return n, ser
+
+
+def _sig_all(force=False):
+    """Полный расчёт сигналов по рынку; кэш 15 минут. Возвращает (rows, meta)."""
+    if not force and time.time() - _sig["t"] < SIG_TTL and _sig["rows"]:
+        return _sig["rows"], _sig["meta"]
+    with _sig_lock:
+        if not force and time.time() - _sig["t"] < SIG_TTL and _sig["rows"]:
+            return _sig["rows"], _sig["meta"]
+        t0 = time.time()
+        uni = _bc_universe()
+        pool = _sig_pool(uni)
+        idx = _sig_index(pool)
+        rows = []
+        for e in pool:
+            near = _sig_nearest(e, RATING_SCALE.index(e["_rt"]["v"]), idx)
+            if len(near) >= 5:
+                rows.append(_sig_row(e, near))
+        h = _sig_snapshot(rows)
+        days = sorted(h)
+        for r in rows:
+            n, ser = _sig_streak(h, r["isin"], r["diff"])
+            r["streak"] = n
+            vals = [v for v in ser if v is not None]
+            r["trend"] = round(r["diff"] - vals[-6], 2) if len(vals) >= 6 else (round(r["diff"] - vals[0], 2) if len(vals) >= 2 else None)
+            r["hist"] = vals[-30:] if abs(r["z"]) >= 1 and len(vals) >= 2 else None
+        meta = {"pool": len(pool), "scored": len(rows), "hist_days": len(days), "hist_from": days[0] if days else None,
+                "calc_s": round(time.time() - t0, 2), "updated": time.time()}
+        _sig.update(t=time.time(), rows=rows, meta=meta)
+        return rows, meta
+
+
+def _sig_replacements(cfg, acc, pool_idx, rows_by_isin, fee, thr, min_turn, tax_rate):
+    """Для каждой облигации портфеля: возможные замены с большей доходностью (по рыночной доходности) с учётом издержек."""
+    try:
+        pf = build_bonds(cfg, acc, False)["rows"]
+    except Exception:  # noqa: BLE001
+        return [], []
+    uni = {}
+    for e in _bc_universe():
+        uni[e["_isin"]] = e
+        uni[e["id"]] = e
+    pool, idx = pool_idx
+    held = {r.get("ticker") for r in pf}
+    out, skipped = [], []
+    for r in pf:
+        isin = r.get("ticker")
+        V = r.get("value_rub") or 0
+        base = {"isin": isin, "name": r.get("name"), "qty": r.get("qty"), "value": round(V, 2), "rating": (r.get("rating") or {}).get("v")}
+        me = uni.get(isin)
+        if not me or V <= 0 or r.get("cur") not in (None, "rub", "RUB"):
+            skipped.append(dict(base, why="нет рыночных данных или не рублёвая"))
+            continue
+        if me["kind"] != "corp":
+            skipped.append(dict(base, why="ОФЗ: сравнение не применяется"))
+            continue
+        ci = me["_ci"] or {}
+        if ci.get("floating") or r.get("floating"):
+            skipped.append(dict(base, why="флоатер: спред к КБД не сопоставим"))
+            continue
+        if not me["_rt"]:
+            skipped.append(dict(base, why="нет рейтинга"))
+            continue
+        ri = RATING_SCALE.index(me["_rt"]["v"])
+        y0 = me["yield"]
+        mine_sig = rows_by_isin.get(me["_isin"])
+        if not mine_sig or mine_sig["outlier"]:
+            skipped.append(dict(base, why="нет надёжного сравнения с аналогами (нет спреда или аномальные данные)"))
+            continue
+        cands = []
+        for t in _sig_cands(me, ri, idx):
+            if t is me or t["_isin"] in held or t["yield"] <= y0 or (t.get("turn") or 0) < min_turn:
+                continue
+            c = _bc_cost(me, t, ri)
+            if c is None or c > 2.5 or abs(t["dur"] - me["dur"]) / max(t["dur"], me["dur"], 0.5) > 0.35:
+                continue
+            cands.append((c, t))
+        # потолок доходности: цель не должна быть выбросом относительно собственных аналогов
+        price, buy, nom, qty = r.get("price_pct"), r.get("buy_pct"), r.get("nominal") or 1000.0, r.get("qty") or 0
+        tax = 0.0
+        if price and buy and price > buy:
+            tax = tax_rate * (price - buy) / 100.0 * nom * qty
+        cost_rub = 2 * fee * V + tax
+        opts = []
+        for c, t in cands:
+            tr = rows_by_isin.get(t["_isin"])
+            if tr is None or tr["n"] < 5:
+                continue
+            if tr["outlier"]:
+                continue
+            gain = t["yield"] - y0
+            if gain > SIG_MAX_GAIN:
+                continue
+            hz = min(5.0, max(0.5, min(me["dur"], t["dur"])))
+            net = gain - cost_rub / V * 100.0 / hz
+            rt_i = RATING_SCALE.index(t["_rt"]["v"])
+            gain_rub = V * gain / 100.0
+            opts.append({"isin": t["_isin"], "name": t["name"], "rating": t["_rt"]["v"], "rating_worse": rt_i > ri,
+                         "rating_better": rt_i < ri, "sector": (t["_ci"] or {}).get("sector"), "yield": t["yield"], "dur": t["dur"],
+                         "spread": t["spread"], "turn": t.get("turn") or 0, "trades": t.get("trades") or 0, "mat": t.get("mat"),
+                         "diff": tr["diff"], "z": tr["z"], "gain_pp": round(gain, 2), "net_pp": round(net, 2),
+                         "gain_rub_year": round(gain_rub), "net_rub_year": round(V * net / 100.0),
+                         "breakeven_months": round(cost_rub / gain_rub * 12, 1) if gain_rub > 0 else None, "horizon": round(hz, 1)})
+        opts = [o for o in opts if o["net_pp"] >= thr]
+        opts.sort(key=lambda o: -o["net_pp"])
+        better = [o for o in opts if not o["rating_worse"]][:3]
+        worse = [o for o in opts if o["rating_worse"]][:2]
+        if better or worse:
+            out.append(dict(base, yield_=y0, dur=me["dur"], spread=me["spread"], price_pct=price, buy_pct=buy, sector=ci.get("sector"),
+                            turn=me.get("turn") or 0, diff=mine_sig["diff"] if mine_sig else None, z=mine_sig["z"] if mine_sig else None,
+                            cost_rub=round(cost_rub), commission_rub=round(2 * fee * V), tax_rub=round(tax),
+                            cost_pp=round(cost_rub / V * 100, 2), options=better, options_worse=worse))
+    out.sort(key=lambda x: -((x["options"] or x["options_worse"])[0]["net_rub_year"]))
+    return out, skipped
+
+
+def signals_payload(cfg, acc, q=None):
+    q = q or {}
+
+    def num(k, d, lo, hi):
+        try:
+            return min(hi, max(lo, float(q.get(k, d))))
+        except (TypeError, ValueError):
+            return d
+    min_turn = num("min_turn", 1e6, 0, 1e10)
+    fee = num("fee", 0.3, 0, 5) / 100.0
+    thr = num("threshold", 1.0, 0, 20)
+    tax_rate = num("tax", 13, 0, 50) / 100.0
+    rows, meta = _sig_all(q.get("force") == "1")
+    liquid = [r for r in rows if r["turn"] >= min_turn]
+    n_out = sum(1 for r in liquid if r["outlier"])
+    liquid_ok = [r for r in liquid if not r["outlier"]]
+    uni = _bc_universe()
+    pool = _sig_pool(uni)
+    by = {r["isin"]: r for r in rows}
+    repl, skipped = _sig_replacements(cfg, acc, (pool, _sig_index(pool)), by, fee, thr, min_turn, tax_rate)
+    cheap = sorted((r for r in liquid_ok if r["diff"] >= SIG_EPS), key=lambda r: -r["z"])
+    rich = sorted((r for r in liquid_ok if r["diff"] <= -SIG_EPS), key=lambda r: r["z"])
+    outl = [r for r in liquid if r["outlier"]]
+    keep = {r["isin"] for r in cheap[:150]} | {r["isin"] for r in rich[:150]} | {r["isin"] for r in outl[:60]}
+    return {"rows": [r for r in liquid if r["isin"] in keep],
+            "kpis": {"universe": len(liquid), "outliers": n_out, "cheap": len(cheap), "rich": len(rich),
+                     "cheap_strong": sum(1 for r in cheap if r["z"] >= 2), "rich_strong": sum(1 for r in rich if r["z"] <= -2),
+                     "med_diff": round(_sig_median([r["diff"] for r in liquid_ok]), 2) if liquid_ok else None},
+            "meta": meta, "params": {"min_turn": min_turn, "fee": fee * 100, "threshold": thr, "tax": tax_rate * 100},
+            "replacements": repl, "skipped": skipped, "eps": SIG_EPS}
+# ═══════════════════ мониторинг портфеля: тревоги, ликвидность, история спредов ═══════════════════
+# Источники: журнал рейтинговых действий (ratings_log_v1, канал @issuerRatings), рейтинги и статус «под наблюдением»
+# из каталога T-Invest, история торгов и описание выпуска на Мосбирже (ISS), кривая КБД по датам.
+# Чего программа НЕ видит: факт оплаты купона (ISS его не публикует), поэтому «задержка выплаты» определяется
+# только косвенно: флаги дефолта в описании выпуска на Мосбирже, дефолтный рейтинг (D/RD/C), остановка торгов.
+
+MON_DEFAULTS = {"mon_drop5": 3.0, "mon_drop30": 7.0, "mon_spread30": 2.0, "mon_sell_days": 5.0, "mon_offer_days": 30}
+MON_SNAP_KEY, MON_CURVE_KEY = "mon_snap_v1", "kbd_curves_v1"
+MON_RT_DAYS, MON_SPARK_DAYS, MON_PART = 90, 90, 0.2        # окно рейтинговых событий, окно спарклайна, доля оборота
+_mon_lock = threading.Lock()
+_SEV = {"high": 0, "medium": 1, "info": 2}
+
+
+def mon_thresholds(cfg):
+    out = {}
+    for k, d in MON_DEFAULTS.items():
+        try:
+            out[k] = float(cfg.get(k, d))
+        except (TypeError, ValueError):
+            out[k] = d
+    return out
+
+
+def _mon_ymd(n):
+    return (date.today() - timedelta(days=n)).isoformat()
+
+
+def _mon_hist_for(secid):
+    """История торгов выпуска (кэш 6 ч в kv) или None."""
+    try:
+        h = _bc_history(secid)
+        return h if h and h.get("d") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _mon_flags(isin):
+    """Флаги дефолта из описания выпуска на Мосбирже (кэш 12 ч)."""
+    key = "mon_desc_v1_" + isin
+    hit = store().get(key, ttl=12 * 3600)
+    if hit is not None:
+        return hit
+    try:
+        j = json.loads(http_text("https://iss.moex.com/iss/securities/%s.json?iss.meta=off&iss.only=description" % isin, timeout=20))
+        d = {r[0]: r[2] for r in j["description"]["data"]}
+        out = {"default": str(d.get("HASDEFAULT") or "0") == "1", "tech": str(d.get("HASTECHNICALDEFAULT") or "0") == "1",
+               "found": bool(d)}
+    except Exception:  # noqa: BLE001
+        return {"default": False, "tech": False, "found": False}
+    store().put(key, out)
+    return out
+
+
+def _mon_curve_one(d):
+    j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/zcyc.json?iss.meta=off&iss.only=yearyields&date=" + d))
+    return d, [[r[2], round(r[3], 3)] for r in sorted(j["yearyields"]["data"], key=lambda r: r[2])]
+
+
+def _mon_curves(days):
+    """Кривые КБД по датам за последние days дней (кэш в kv навсегда; выходные и праздники хранятся пустыми)."""
+    st = store()
+    cache = st.get(MON_CURVE_KEY) or {}
+    need = [_mon_ymd(i) for i in range(1, days + 1) if (date.today() - timedelta(days=i)).weekday() < 5
+            and _mon_ymd(i) not in cache]
+    if need:
+        for d, pts in pool_map(lambda x: _safe(_mon_curve_one, x), need, workers=8):
+            if d is not None:
+                cache[d] = pts
+        keep = _mon_ymd(800)
+        cache = {k: v for k, v in cache.items() if k >= keep}
+        st.put(MON_CURVE_KEY, cache)
+    return cache
+
+
+def _interp(pts, t):
+    if not pts or t is None:
+        return None
+    if t <= pts[0][0]:
+        return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if t <= x1:
+            return y0 + (y1 - y0) * (t - x0) / (x1 - x0)
+    return pts[-1][1]
+
+
+def _curve_on(curves, sorted_dates, d):
+    """Кривая на дату d: последняя непустая на эту дату или раньше."""
+    import bisect
+    i = bisect.bisect_right(sorted_dates, d)
+    while i > 0:
+        i -= 1
+        c = curves.get(sorted_dates[i])
+        if c:
+            return c
+    return None
+
+
+def _at_or_before(ds, target):
+    """Индекс последней даты <= target либо None."""
+    import bisect
+    i = bisect.bisect_right(ds, target) - 1
+    return i if i >= 0 else None
+
+
+def _mon_match(a, b):
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    lo, hi = (a, b) if len(a) <= len(b) else (b, a)           # «ЛК Европлан» ~ «Европлан», но «Золото Селигдара» != «Селигдар»
+    return lo <= hi and sum(len(x) for x in lo) >= 5 and all(len(x) <= 2 for x in hi - lo)
+
+
+def _mon_issuer_keys(row):
+    keys = [name_tokens(_bond_query(row.get("name") or ""))]
+    b = _tcat_get(row.get("isin") or row.get("ticker"))
+    if b:
+        for s in (b.get("br"), _bond_query(b.get("n") or "")):
+            if s:
+                keys.append(name_tokens(s))
+    return [k for k in keys if k]
+
+
+def _mon_rating_state(row, keys, events):
+    """Рейтинговое состояние для таблицы: лучший рейтинг, прогноз, флаг «под наблюдением»."""
+    rt = row.get("rating")
+    watch, outlook, last = False, "", {}
+    b = _tcat_get(row.get("isin") or row.get("ticker"))
+    if b:
+        for ag, lv, dt, fc, w in b["r"]:
+            if w:
+                watch = True
+            if fc and (ag not in last or dt >= last[ag][0]):
+                last[ag] = (dt, fc)
+    ws = {}
+    for e in events:
+        if any(_mon_match(set(e["tokens"]), k) for k in keys):
+            if e.get("watch") in ("set", "removed"):
+                ws[e["agency"]] = e["watch"] == "set"
+            if e.get("outlook") and e["agency"] not in last:
+                last[e["agency"]] = (e["date"], e["outlook"])
+    if any(ws.values()):
+        watch = True
+    cands = [x for x in (rt or {}).get("all") or []]
+    if cands:
+        w = max(cands, key=lambda x: RATING_SCALE.index(x["rating"]))
+        outlook = (w.get("outlook") or "").split(" · ")[0]
+    if not outlook and last:
+        outlook = sorted(last.values())[-1][1]
+    return {"v": rt["v"] if rt else None, "agency": rt["agency"] if rt else None, "outlook": outlook,
+            "watch": watch, "neg": "негатив" in (outlook or "").lower()}
+
+
+def _mon_rating_alerts(rows_keys, events, cutoff):
+    """Тревоги по журналу рейтинговых действий: одно событие -> одна тревога на все бумаги этого эмитента."""
+    out = []
+    for e in events:
+        if e["date"] < cutoff:
+            continue
+        et = set(e["tokens"])
+        hit = [r for r, keys in rows_keys if any(_mon_match(et, k) for k in keys)]
+        if not hit:
+            continue
+        act, rt, prev = e["action"], e.get("rating"), e.get("prev")
+        sev, msg = None, None
+        who = "%s: " % e["agency"]
+        lvl = "облигации" if e["level"] == "bond" else "эмитент"
+        if rt in ("D", "C", "CC") or (act == "понижен" and rt in ("CCC",)):
+            sev, msg = "high", who + "дефолтный/преддефолтный уровень рейтинга %s (%s)" % (rt, lvl)
+        elif act == "понижен":
+            sev, msg = "high", who + "рейтинг понижен%s до %s (%s)" % (" с " + prev if prev else "", rt, lvl)
+        elif e.get("watch") == "set" or act == "под наблюдением":
+            sev, msg = "medium", who + "рейтинг %s взят «под наблюдение» (%s)" % (rt or "", lvl)
+        elif act == "прогноз изменён" and (e.get("outlook") or "") == "негативный":
+            sev, msg = "medium", who + "прогноз изменён на негативный, рейтинг %s (%s)" % (rt, lvl)
+        elif act == "отозван":
+            sev = "medium" if e["level"] == "issuer" else "info"
+            msg = who + "рейтинг отозван (%s)%s" % (lvl, "; ранее " + prev if prev else "")
+        elif act == "повышен":
+            sev, msg = "info", who + "рейтинг повышен%s до %s (%s)" % (" с " + prev if prev else "", rt, lvl)
+        elif e.get("outlook") == "негативный":
+            sev, msg = "info", who + "рейтинг %s %s, прогноз негативный (%s)" % (rt, act, lvl)
+        if not sev:
+            continue
+        out.append({"id": "rt|%s|%s" % (e["agency"], e["post"]), "severity": sev, "kind": "rating", "date": e["date"],
+                    "isin": hit[0].get("isin"), "isins": [h.get("isin") for h in hit], "name": e["issuer"],
+                    "bonds": [h.get("name") for h in hit], "message": msg, "url": e.get("url") or
+                    "https://t.me/issuerRatings/%s" % e["post"]})
+    return out
+
+
+def _mon_snapshots(rows):
+    """Ежедневный снимок цены/спреда по ISIN (хранится 400 дней): запасной источник истории спреда."""
+    st = store()
+    snap = st.get(MON_SNAP_KEY) or {}
+    today = date.today().isoformat()
+    changed = False
+    for r in rows:
+        isin = r.get("isin")
+        if not isin or r.get("price_pct") is None:
+            continue
+        d = snap.setdefault(isin, {})
+        if today not in d:
+            d[today] = [round(r["price_pct"], 3), r.get("spread")]
+            changed = True
+    keep = _mon_ymd(400)
+    if changed:
+        for isin in snap:
+            snap[isin] = {k: v for k, v in snap[isin].items() if k >= keep}
+        st.put(MON_SNAP_KEY, snap)
+    return snap
+
+
+def build_monitor(cfg, acc):
+    t0 = time.time()
+    th = mon_thresholds(cfg)
+    key = ("monitor", token_key(cfg), acc, tuple(sorted(th.items())))
+    hit = mem_get(key, 300)
+    if hit:
+        return hit
+    with _mon_lock:
+        hit = mem_get(key, 300)
+        if hit:
+            return hit
+        res = _build_monitor(cfg, acc, th, t0)
+        mem_put(key, res)
+        return res
+
+
+def _build_monitor(cfg, acc, th, t0):
+    tm = {}
+    notes = []
+    b = build_bonds(cfg, acc)
+    tm["bonds"] = round(time.time() - t0, 2)
+    rows = [r for r in (b.get("rows") or []) if r.get("isin") and r.get("qty")]
+    today = date.today().isoformat()
+    # соответствие ISIN -> код на Мосбирже
+    t1 = time.time()
+    sec = {}
+    try:
+        for s in screener_rows():
+            if s.get("isin"):
+                sec[s["isin"]] = s
+    except Exception as e:  # noqa: BLE001
+        notes.append("Скринер Мосбиржи недоступен: %s" % str(e)[:80])
+    tm["screener"] = round(time.time() - t1, 2)
+    t1 = time.time()
+    secids = {r["isin"]: (sec.get(r["isin"]) or {}).get("id") or r.get("ticker") or r["isin"] for r in rows}
+    hists = dict(zip([r["isin"] for r in rows], pool_map(lambda r: _mon_hist_for(secids[r["isin"]]), rows, workers=8)))
+    tm["history"] = round(time.time() - t1, 2)
+    t1 = time.time()
+    flags = dict(zip([r["isin"] for r in rows], pool_map(lambda r: _mon_flags(r["isin"]), rows, workers=8)))
+    tm["flags"] = round(time.time() - t1, 2)
+    t1 = time.time()
+    try:
+        curves = _mon_curves(MON_SPARK_DAYS + 40)
+    except Exception as e:  # noqa: BLE001
+        curves = {}
+        notes.append("Кривая КБД по датам недоступна: %s" % str(e)[:80])
+    cdates = sorted(curves)
+    tm["kbd_curves"] = round(time.time() - t1, 2)
+    snap = _mon_snapshots(rows)
+    log = store().get(RT_LOG_KEY) or {"events": []}
+    events = log.get("events") or []
+    if not events:
+        notes.append("Журнал рейтинговых действий пока пуст: он наполняется при синхронизации рейтингов (раздел «Облигации» → обновить рейтинги).")
+    # окно торгового календаря для среднего оборота
+    win_from = _mon_ymd(30)
+    cal = set()
+    for h in hists.values():
+        if h:
+            cal.update(d for d in h["d"] if d > win_from)
+    ndays = max(len(cal), 15)
+    out_rows, alerts = [], []
+    rows_keys = []
+    for r in rows:
+        isin = r["isin"]
+        h = hists.get(isin)
+        keys = _mon_issuer_keys(r)
+        rows_keys.append((r, keys))
+        row = {"isin": isin, "name": r.get("name"), "ticker": r.get("ticker"), "value_rub": r.get("value_rub"),
+               "qty": r.get("qty"), "maturity": r.get("maturity"), "call": r.get("call"),
+               "floating": bool(r.get("floating")), "price_pct": r.get("price_pct"), "flags": []}
+        row["rating"] = _mon_rating_state(r, keys, events)
+        price = chg5 = chg30 = sp_now = sp_chg = None
+        spark = []
+        last_d = None
+        if h:
+            ds, ps, ys, vs = h["d"], h["p"], h["y"], h["v"]
+            last_d = ds[-1]
+            price = ps[-1]
+            for n, nm in ((5, "chg5"), (30, "chg30")):
+                i = _at_or_before(ds, _mon_ymd(n))
+                if i is not None and ds[i] >= _mon_ymd(n + 10) and ps[i]:
+                    v = round((price / ps[i] - 1) * 100, 2)
+                    if nm == "chg5":
+                        chg5 = v
+                    else:
+                        chg30 = v
+            # спред к КБД по датам: доходность дня минус КБД на дюрации бумаги
+            dur = r.get("dur")
+            if dur and not r.get("floating") and cdates:
+                sp = []
+                for d, y in zip(ds, ys):
+                    if y is None or d < _mon_ymd(MON_SPARK_DAYS + 35):
+                        continue
+                    c = _curve_on(curves, cdates, d)
+                    k = _interp(c, dur)
+                    if k is not None and 0 < y < 80:
+                        sp.append((d, round(y - k, 2)))
+                if len(sp) >= 5:
+                    sd = [x[0] for x in sp]
+                    sp_now = sp[-1][1]
+                    i = _at_or_before(sd, _mon_ymd(30))
+                    if i is not None and sd[i] >= _mon_ymd(40):
+                        sp_chg = round(sp_now - sp[i][1], 2)
+                    spark = [[d, v] for d, v in sp if d >= _mon_ymd(MON_SPARK_DAYS)]
+            tov = sum(v for d, v in zip(ds, vs) if d > win_from)
+            avg = tov / ndays
+            row["turnover_avg"] = round(avg)
+            row["days_to_sell"] = round((r.get("value_rub") or 0) / (MON_PART * avg), 2) if avg > 0 else None
+        else:
+            row["turnover_avg"] = None
+            row["days_to_sell"] = None
+        if len(spark) < 5 and isin in snap:        # запасной вариант: накопленные ежедневные снимки
+            sp = sorted((d, v[1]) for d, v in snap[isin].items() if v[1] is not None)
+            if len(sp) >= 2:
+                spark = [[d, v] for d, v in sp if d >= _mon_ymd(MON_SPARK_DAYS)]
+                sp_now = sp[-1][1]
+        row.update(price=price, chg5=chg5, chg30=chg30, spread=sp_now if sp_now is not None else r.get("spread"),
+                   spread_chg30=sp_chg, spark=spark, last_trade=last_d, ytm=r.get("ytm"))
+        row["no_history"] = h is None
+        base = {"isin": isin, "isins": [isin], "name": r.get("name"), "bonds": [r.get("name")]}
+        # --- ценовые тревоги
+        parts, sev = [], None
+        for chg, lim, lab in ((chg5, th["mon_drop5"], "5 дней"), (chg30, th["mon_drop30"], "30 дней")):
+            if chg is not None and chg <= -lim:
+                parts.append("%s %% за %s" % (str(chg).replace(".", ","), lab))
+                s = "high" if chg <= -2 * lim else "medium"
+                sev = s if sev is None or _SEV[s] < _SEV[sev] else sev
+        if parts:
+            alerts.append(dict(base, id="px|%s|%s" % (isin, today), severity=sev, kind="price", date=last_d or today,
+                               message="Цена упала: " + "; ".join(parts) + (" (последняя цена %s %%)" % str(price).replace(".", ",")
+                                                                              if price is not None else ""), url=""))
+        if sp_chg is not None and sp_chg >= th["mon_spread30"]:
+            s = "high" if sp_chg >= 2 * th["mon_spread30"] else "medium"
+            alerts.append(dict(base, id="sp|%s|%s" % (isin, today), severity=s, kind="spread", date=last_d or today,
+                               message="Спред к КБД вырос на %s п.п. за 30 дней (сейчас %s п.п.)" % (
+                                   str(sp_chg).replace(".", ","), str(sp_now).replace(".", ",")), url=""))
+        # --- оферта
+        cl = r.get("call")
+        if cl and today <= cl <= (date.today() + timedelta(days=int(th["mon_offer_days"]))).isoformat():
+            left = (datetime.strptime(cl, "%Y-%m-%d").date() - date.today()).days
+            alerts.append(dict(base, id="of|%s|%s" % (isin, cl), severity="high" if left <= 7 else "medium", kind="offer",
+                               date=cl, message="Оферта %s (через %d дн.): решите, предъявлять ли бумагу к выкупу. Тип оферты (put/call) проверьте в карточке выпуска" % (
+                                   cl[8:] + "." + cl[5:7] + "." + cl[:4], left), url=""))
+        # --- признаки дефолта
+        fl = flags.get(isin) or {}
+        if fl.get("default"):
+            alerts.append(dict(base, id="df|%s" % isin, severity="high", kind="default", date=today,
+                               message="По данным Мосбиржи, по выпуску допущен дефолт", url="https://www.moex.com/ru/issue.aspx?code=" + isin))
+            row["flags"].append("дефолт")
+        elif fl.get("tech"):
+            alerts.append(dict(base, id="td|%s" % isin, severity="high", kind="default", date=today,
+                               message="По данным Мосбиржи, по выпуску был допущен технический дефолт (задержка выплаты). Проверьте, погашена ли задолженность", url="https://www.moex.com/ru/issue.aspx?code=" + isin))
+            row["flags"].append("тех. дефолт")
+        if last_d and last_d < _mon_ymd(10) and not (r.get("maturity") and r["maturity"] < today):
+            alerts.append(dict(base, id="nt|%s|%s" % (isin, last_d), severity="medium", kind="halt", date=last_d,
+                               message="Нет торгов с %s: возможна остановка торгов, проверьте выпуск" % (
+                                   last_d[8:] + "." + last_d[5:7] + "." + last_d[:4]), url=""))
+            row["flags"].append("нет торгов")
+        rts = row["rating"]
+        if rts["v"] in ("D", "C", "CC"):
+            alerts.append(dict(base, id="rd|%s" % isin, severity="high", kind="default", date=today,
+                               message="Дефолтный/преддефолтный рейтинг %s (%s)" % (rts["v"], rts["agency"]), url=""))
+        elif rts["watch"]:
+            alerts.append(dict(base, id="wt|%s" % isin, severity="medium", kind="watch", date=today,
+                               message="Рейтинг эмитента под наблюдением (по данным каталога T-Invest или журнала агентств)", url=""))
+        if rts["neg"] and not rts["watch"]:
+            alerts.append(dict(base, id="ng|%s" % isin, severity="info", kind="outlook", date=today,
+                               message="Негативный прогноз по рейтингу (%s)" % (rts["agency"] or ""), url=""))
+        # --- ликвидность
+        dts = row["days_to_sell"]
+        if h and (dts is None or dts > th["mon_sell_days"]):
+            row["flags"].append("неликвид")
+            alerts.append(dict(base, id="lq|%s|%s" % (isin, today[:7]), severity="info", kind="liquidity", date=today,
+                               message=("Нет оборота за 30 дней: продать позицию быстро не получится" if dts is None else
+                                        "Низкая ликвидность: на продажу позиции нужно ~%s дн. (при 20%% дневного оборота)" % str(dts).replace(".", ",")),
+                               url=""))
+        out_rows.append(row)
+    alerts += _mon_rating_alerts(rows_keys, events, _mon_ymd(MON_RT_DAYS))
+    # дубль «под наблюдением» из каталога не нужен, если журнал уже сообщил о том же эмитенте
+    wt_logged = {i for a in alerts if a["kind"] == "rating" for i in a.get("isins") or []}
+    alerts = [a for a in alerts if not (a["kind"] in ("watch", "outlook") and a["isin"] in wt_logged)]
+    alerts.sort(key=lambda a: (_SEV[a["severity"]], _neg(a["date"])))
+    for a in alerts:
+        for r in out_rows:
+            if r["isin"] in (a.get("isins") or []):
+                r["n_" + a["severity"]] = r.get("n_" + a["severity"], 0) + 1
+    out_rows.sort(key=lambda r: (-(r.get("n_high") or 0), -(r.get("n_medium") or 0), -(r.get("value_rub") or 0)))
+    tm["total"] = round(time.time() - t0, 2)
+    return {"updated": time.time(), "thresholds": th, "alerts": alerts, "rows": out_rows,
+            "summary": {s: sum(1 for a in alerts if a["severity"] == s) for s in _SEV}, "timings": tm, "notes": notes,
+            "log": {"events": len(events), "since": min((e["date"] for e in events), default=None)},
+            "cal_days": ndays}
+
+
+def _neg(d):
+    """Ключ для сортировки дат по убыванию."""
+    return tuple(-ord(c) for c in d or "")
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -4138,6 +5224,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, ratings_status())
             if u.path == "/api/keyrate":
                 return self.send(200, keyrate_brief() or {"source": "none", "name": "", "yearly": []})
+            if u.path == "/api/risk":
+                return self.send(200, build_risk(cfg, acc, q))
+            if u.path == "/api/signals":
+                return self.send(200, signals_payload(cfg, acc, q))
+            if u.path == "/api/monitor":
+                return self.send(200, build_monitor(cfg, acc))
             if u.path == "/api/rates":
                 return self.send(200, rates_payload(q.get("days", "365")))
             if u.path == "/api/backup":
@@ -4189,6 +5281,13 @@ class Handler(BaseHTTPRequestHandler):
                         cfg["notify_days"] = max(0, min(60, int(body["notify_days"])))
                     except (TypeError, ValueError):
                         pass
+                for k, lo, hi in (("mon_drop5", 0.1, 50), ("mon_drop30", 0.1, 90), ("mon_spread30", 0.1, 50),
+                                  ("mon_sell_days", 0.5, 365), ("mon_offer_days", 1, 365)):
+                    if k in body:
+                        try:
+                            cfg[k] = max(lo, min(hi, float(body[k])))
+                        except (TypeError, ValueError):
+                            pass
                 for k in ("hosts_prod", "hosts_sandbox"):
                     if isinstance(body.get(k), list):
                         hosts = [str(h).strip() for h in body[k] if str(h).strip()]
@@ -4657,6 +5756,50 @@ body.bc-open{overflow:hidden}
 .mp-hm th{text-align:center}.mp-hm th.l,.mp-hm td.l{text-align:left}
 .mp-g{align-items:start}
 @media(max-width:760px){.mp-chips button{padding:4px 10px}.mp-hm td small{white-space:normal}}
+.rk-ctl{align-items:end}.rk-ctl .in{width:190px}
+.rk-g{align-items:start}
+.rk-tbl{max-height:640px}
+#rk-tab tbody tr{cursor:pointer}
+#rk-tab td small.neg{color:var(--neg);font-size:11px;line-height:1.3;display:inline-block;max-width:190px;white-space:normal}
+/* ── Сигналы ── */
+.sg-t th,.sg-t td{white-space:nowrap}
+.sg-t tbody tr[data-isin]{cursor:pointer}
+.sg-t tbody tr[data-isin]:hover td{background:var(--card2)}
+.sg-t td.l b{font-weight:600}
+.sg-isin{display:block;font-size:11px;font-family:ui-monospace,Menlo,monospace}
+.sg-h{margin:6px 0 10px;font-size:14px;font-weight:600}
+.sg-h.pos{color:var(--pos)}.sg-h.neg{color:var(--neg)}
+.sg-sp{vertical-align:middle;margin-right:2px}
+.sg-tr.pos,.sg-tr.neg{font-weight:500}
+.sg-more{margin-top:10px}
+.sg-pos{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.sg-pos:first-of-type{border-top:0;padding-top:0}
+.sg-ph{cursor:pointer;margin-bottom:8px;display:grid;gap:3px}
+.sg-ph .mu{font-size:12.5px;line-height:1.5}
+.sg-worse{color:var(--neg);border-color:var(--neg)}
+.sg-k{margin-bottom:14px}
+.bc-ic svg{width:100%;height:auto;display:block}
+.bc-ic .ic-pt{cursor:pointer;stroke:var(--card);stroke-width:1.5}
+.bc-ic .ic-pt:hover{stroke:var(--tx)}
+.bc-ic .ic-me{stroke:var(--tx);stroke-width:2.5}
+.bc-ic .ic-ln{fill:none;stroke:#3987e5;stroke-width:1.5;opacity:.55}
+.bc-ic .ic-kbd{fill:none;stroke:var(--tx2);stroke-width:1.5;stroke-dasharray:6 4}
+.sg-g2{display:grid;gap:22px}
+.mon-al{display:flex;align-items:center;gap:12px;padding:9px 12px;margin:6px 0;border-radius:10px;background:var(--card2);border-left:3px solid var(--mu);cursor:pointer}
+.mon-al:hover{filter:brightness(1.06)}
+.mon-al.mon-h{border-left-color:var(--neg)}.mon-al.mon-m{border-left-color:var(--s4)}.mon-al.mon-i{border-left-color:var(--s1)}
+.mon-sev{flex:none;width:68px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;color:var(--mu)}
+.mon-h .mon-sev{color:var(--neg)}.mon-m .mon-sev{color:var(--s4)}.mon-i .mon-sev{color:var(--s1)}
+.mon-d{flex:none;width:62px;font-size:12px;color:var(--mu)}
+.mon-b{flex:1;min-width:0;display:grid;gap:1px;font-size:13px}.mon-b b{font-weight:600}.mon-b span{color:var(--tx2);white-space:normal}
+.mon-al>a{flex:none;color:var(--tx2);text-decoration:none;font-size:15px;padding:2px 6px}.mon-al>a:hover{color:var(--ac)}
+.mon-ok{color:var(--pos);font-size:13px;padding:6px 0}
+.mon-card h2{display:flex;align-items:center;gap:10px}
+.mon-sp{display:block;margin-left:auto}
+.mon-w{color:var(--s4)}
+.mon-th{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-top:14px}
+#mon-tab tbody tr{cursor:pointer}
+[data-theme=light] .mon-al{background:#f0f2f6}
 </style></head>
 <body>
 <aside>
@@ -4721,13 +5864,16 @@ const IC={
  tax:'<path d="M9 14l6-6M9.5 8.5h.01M14.5 13.5h.01"/><path d="M5 3h14v18l-3.5-2-3.5 2-3.5-2L5 21z"/>',
  imp:'<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
  scr:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/>',
+ risk:'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
+ sig:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+ mon:'<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/>',
  map:'<circle cx="7" cy="16" r="2"/><circle cx="12" cy="9" r="2.5"/><circle cx="18" cy="13" r="1.6"/><path d="M3 3v18h18"/>',
  pri:'<path d="M12 2l2.6 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.4 6.1 20.1l1.6-6.7L2.5 8.9l6.9-.6z"/>',
  mkt:'<path d="M3 4v16h18"/><path d="M7 14l4-4 3 3 5-6"/>',
  reb:'<path d="M12 3v18M5 7h14M5 7l-2 6a3 3 0 0 0 6 0zM19 7l-2 6a3 3 0 0 0 6 0z"/>',
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const PAGES=[['dash','Обзор'],['ret','Доходность'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['mkt','Ставки'],['scr','Скринер облигаций'],['map','Карта рынка'],['pri','Первичка'],null,['imp','Импорт отчётов'],['set','Настройки']];
+const PAGES=[['dash','Обзор'],['ret','Доходность'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['mkt','Ставки'],['scr','Скринер облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['pri','Первичка'],null,['imp','Импорт отчётов'],['set','Настройки']];
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
 const PERIOD_PAGES=['dash','ret','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
@@ -4937,7 +6083,7 @@ function render(){
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,map:pMap,pri:pPri})[S.page]()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -5032,7 +6178,7 @@ function pDash(){
     ${[['Ликвидный портфель','liquidPortfolio'],['Начальная маржа','startingMargin'],['Минимальная маржа','minimalMargin'],['Скорр. маржа','correctedMargin'],['Не хватает средств','amountOfMissingFunds']]
       .map(([n,k])=>`<div><div class="mu" style="font-size:12px">${n}</div><div class="num" style="font-weight:650;font-size:16px;margin-top:4px">${M(d.margin[k])}</div></div>`).join('')}
     <div><div class="mu" style="font-size:12px">Уровень достаточности</div><div class="num ${d.margin.fundsSufficiencyLevel<1.1&&d.margin.fundsSufficiencyLevel>0?'neg':''}" style="font-weight:650;font-size:16px;margin-top:4px">${f2(d.margin.fundsSufficiencyLevel)}</div></div></div></div>`:'';
-  return hero+kpis+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
+  return hero+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
     <div class="card"><h2>Структура портфеля</h2><div id="c-alloc" class="chart"></div></div></div>
     <div class="g g2"><div class="card"><h2>Доходность по месяцам<span class="sp">последние 12 мес</span></h2>${mret}</div>
     <div class="card"><h2>Ближайшие выплаты<span class="sp">купоны · дивиденды · погашения</span></h2>${pays}</div></div>
@@ -5610,6 +6756,7 @@ function remindHtml(){
     ${ev.length>6?`<small>…и ещё ${ev.length-6}</small>`:''}</div></div>`;
 }
 function notifyUpcoming(){
+  try{monEnsure()}catch(e){}
   try{
     if(!('Notification' in window)||Notification.permission!=='granted')return;
     const seen=new Set(JSON.parse(lsGet('ta_notified')||'[]'));
@@ -5620,6 +6767,15 @@ function notifyUpcoming(){
 }
 
 
+function notifyMon(d){
+  try{
+    if(!('Notification' in window)||Notification.permission!=='granted')return;
+    const seen=new Set(JSON.parse(lsGet('ta_notified')||'[]'));
+    (d.alerts||[]).filter(a=>a.severity==='high').forEach(a=>{const k='mon|'+a.id;if(seen.has(k))return;seen.add(k);
+      new Notification('T-Invest: тревога по '+(a.name||'облигации'),{body:a.message})});
+    localStorage.setItem('ta_notified',JSON.stringify([...seen].slice(-300)));
+  }catch(e){}
+}
 /* ── Ставки: КБД и ключевая ставка ── */
 S.ratesDays=365;S.rates=null;
 const RDAYS=[[90,'3 мес'],[180,'6 мес'],[365,'Год'],[730,'2 года']];
@@ -5697,6 +6853,7 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+ ['0.11','11.11.2026',['<b>«Риски и сценарии»</b>: вероятность дефолта по рынку и по рейтингу, ожидаемая доходность с учётом дефолтов, «казино» — что если не заплатят 1–3 самых рискованных эмитента, сценарии ключевой ставки на год, флоатеры против фикса, точка безубыточности','<b>«Сигналы»</b>: что на рынке дешевле и дороже аналогов (z-оценка, дни подряд) и возможные замены бумаг портфеля с учётом комиссии и налога','<b>«Мониторинг»</b>: тревоги по понижениям рейтингов, «под наблюдением», техническим дефолтам, падению цены, расширению спреда и офертам; журнал рейтинговых действий; ликвидность позиций; тревоги на «Обзоре» и в уведомлениях','<b>Кривая эмитента</b> в карточке облигации — все выпуски эмитента на одном графике']],
  ['0.10','11.11.2026',['<b>Доходность портфеля (IRR)</b> по всем будущим выплатам всех облигаций — высокорисковые бумаги учитываются, а не исключаются','<b>Флоатеры по прогнозу ключевой ставки</b>: среднесрочный прогноз Банка России (или опрос аналитиков, рынок, текущая ставка — выбор в настройках) плюс спред эмитента']],
  ['0.9','11.11.2026',['<b>Точный расчёт облигаций</b>: денежный поток с Мосбиржи с амортизациями и офертами — доходность совпадает с биржевой; исправлены валютные облигации','<b>Доходность после НДФЛ</b>, модифицированная дюрация, выпуклость и <b>стресс-тест</b> портфеля на ±1–3 п.п.','<b>Карточка облигации</b> по клику: параметры, история цены и доходности, денежный поток, рейтинги и <b>аналоги</b> по рейтингу, отрасли, дюрации и типу купона с оценкой «дешевле/дороже аналогов»','<b>Карта рынка</b>: доходность против дюрации по рейтингам на фоне КБД, медианные спреды по рейтингам, срокам и отраслям','Рейтинги по ISIN из каталога Т-Инвестиций — точнее и для большего числа выпусков; отрасль и фильтр по ней в скринере']],
  ['0.8','10.11.2026',['<b>Скринер облигаций</b> — торги Мосбиржи с фильтрами по рейтингу, доходности, спреду к КБД, сроку и обороту','<b>Первичка</b> — календарь объявленных размещений облигаций с рейтингами эмитентов','<b>Анализ облигаций портфеля</b>: спред к КБД по каждому выпуску, наблюдения по риску, концентрации и ближайшим офертам','Рейтинги теперь берутся ещё и напрямую с сайтов НКР и Эксперт РА (по эмитентам портфеля)']],
@@ -5716,7 +6873,16 @@ const ROADMAP=[
  ['now','Проверка на реальных счетах','Сверка расчётов доходности и налогов с данными брокера'],
  ['next','Готовые форматы брокеров','Пресеты для отчётов Сбера, ВТБ, Альфы, БКС и Финама — без ручной настройки колонок'],
  ['next','Налоги точнее','Перенос убытков прошлых лет, льгота долгосрочного владения (ЛДВ), ИИС, курсовые разницы'],
+ ['next','Решение по оферте','Держать или предъявить к выкупу: новый купон против цен аналогов'],
+ ['next','Флоатеры в календаре выплат','Купоны флоатеров в «Выплатах» по прогнозу ключевой ставки'],
+ ['later','Первичка против вторички','Как новые выпуски торгуются после размещения — статистика копится с установки'],
+ ['later','Конструктор облигационной лестницы','Подбор бумаг под цель: ежемесячный доход при рейтинге не ниже заданного'],
+ ['later','Реальная доходность и дюрационный разрыв','Доходность за вычетом инфляции по прогнозу ЦБ; совпадение сроков возврата денег с вашими целями'],
  ['later','Зашифрованная копия в облаке','Автоматическая зашифрованная копия базы'],
+ ['done','Риски и сценарии','Вероятность дефолта, ожидаемая доходность, сценарии ключевой ставки, флоатеры против фикса'],
+ ['done','Сигналы и замены','Дешевле и дороже аналогов по всему рынку, возможные замены в портфеле'],
+ ['done','Мониторинг и тревоги','Рейтинговые действия, технические дефолты, падение цены, спред, оферты, ликвидность'],
+ ['done','Доходность портфеля и флоатеры','IRR по всем бумагам, купоны флоатеров по прогнозу ЦБ'],
  ['done','Точный расчёт и амортизации','Денежный поток с Мосбиржи, доходность после НДФЛ, стресс-тест ставок'],
  ['done','Карточка облигации и аналоги','Параметры, история, денежный поток и похожие выпуски по рейтингу, отрасли и сроку'],
  ['done','Карта рынка','Доходность против дюрации по рейтингам и медианные спреды к КБД'],
@@ -5740,6 +6906,8 @@ function roadmapHtml(){const L={now:['s-now','Сейчас'],next:['s-next','С�
 function bindPage(){
   if(S.page==='reb')bindReb();
   if(S.page==='scr')bindScr();
+  if(S.page==='risk')bindRisk();
+  if(S.page==='mon')bindMon();
   if($('#pri-r'))$('#pri-r').onclick=()=>{S.pri=null;render()};
   if($('#pdays'))$('#pdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.payDays=+b.dataset.d;render()};
   if($('#rdays'))$('#rdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.ratesDays=+b.dataset.d;S.rates=null;render()};
@@ -5870,6 +7038,10 @@ function bcBody(c){
       <div class="mu" style="font-size:12px;margin:12px 0 4px">Доходность, % годовых</div><div class="bc-ch" id="bc-ch-y"></div>`;
   else h+=`<div class="mu" style="font-size:13px">История торгов недоступна.</div>`;
   h+=`</div>`;
+  // кривая эмитента
+  const ic=c.issuer_curve;
+  if(ic&&ic.points&&ic.points.length>1)h+=`<div class="card bc-sec"><h2>Кривая эмитента<span class="sp">${ic.points.length} выпусков в обращении: доходность по сроку</span></h2><div class="bc-ic" id="bc-ic"></div>
+    <div class="mu" style="font-size:12px;margin-top:6px"><span style="color:var(--ac)">●</span> этот выпуск · <span style="color:#3987e5">●</span> другие выпуски эмитента · пунктир — кривая бескупонной доходности (КБД). Клик по точке открывает карточку выпуска.</div></div>`;
   // аналоги
   const an=c.analogs||[];
   h+=`<div class="card bc-sec"><h2>Аналоги<span class="sp">похожий рейтинг, срок и тип</span></h2>`;
@@ -5887,7 +7059,24 @@ function bcBody(c){
   h+=`</div><p class="note" style="margin-top:14px">Справочная информация на основе открытых данных Мосбиржи, каталога T-Invest и публичных рейтингов. Не является инвестиционной рекомендацией. Аналоги подобраны автоматически по рейтингу, сроку, сектору и типу выпуска; сравнение спреда не учитывает всех различий в риске и ликвидности.</p>`;
   return h;
 }
+function bcIssuerCurve(el,ic){
+  const W=el.clientWidth||560,H=250,pl=44,pr=14,pt=12,pb=30,P=ic.points,K=ic.kbd||[];
+  const xs=P.map(p=>p.dur).concat(K.map(k=>k[0])),ys=P.map(p=>p.yield).concat(K.map(k=>k[1]));
+  const x0=0,x1=Math.max(...xs)*1.05||1,ny=nice(Math.min(...ys)*0.9,Math.max(...ys)*1.05,5),y0=ny.lo,y1=ny.hi,pw=W-pl-pr,ph=H-pt-pb;
+  const X=v=>pl+(v-x0)/(x1-x0)*pw,Y=v=>pt+ph-(v-y0)/(y1-y0)*ph;
+  let g='';
+  for(let v=y0;v<=y1+ny.step/2;v+=ny.step)g+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}"/><text class="ax num" x="${pl-6}" y="${Y(v)+4}" text-anchor="end">${+v.toFixed(1)}%</text>`;
+  const nx=Math.max(2,Math.min(8,Math.round(pw/80))),st=x1/nx;
+  for(let i=0;i<=nx;i++){const v=i*st;g+=`<text class="ax num" x="${X(v)}" y="${H-8}" text-anchor="middle">${bcN(v,1)} г.</text>`}
+  if(K.length>1)g+=`<polyline class="ic-kbd" points="${K.map(k=>X(k[0]).toFixed(1)+','+Y(k[1]).toFixed(1)).join(' ')}"/>`;
+  const fl=P.filter(p=>!p.floating);
+  if(fl.length>1)g+=`<polyline class="ic-ln" points="${fl.map(p=>X(p.dur).toFixed(1)+','+Y(p.yield).toFixed(1)).join(' ')}"/>`;
+  P.slice().sort((a,b)=>a.me-b.me).forEach(p=>{
+    g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'#3987e5'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
+  el.innerHTML=`<svg width="${W}" height="${H}">${g}</svg>`;
+}
 function bcCharts(dr,c){
+  const ice=dr.querySelector('#bc-ic');if(ice&&c.issuer_curve)try{bcIssuerCurve(ice,c.issuer_curve)}catch(e){}
   const hs=c.history;if(!hs||!hs.d||hs.d.length<2)return;
   const labels=hs.d.map(ddm),p=document.getElementById('bc-ch-p'),y=document.getElementById('bc-ch-y');
   {
@@ -6002,6 +7191,276 @@ function bindMap(){
   $('#mp-all').onchange=e=>{f.all=e.target.checked;redraw()};
   const r=$('#scr-r');if(r)r.onclick=()=>{S.scr=null;render()};
   if(!window._mpRs){window._mpRs=1;let t;addEventListener('resize',()=>{clearTimeout(t);t=setTimeout(()=>{if(S.page==='map'){const e=$('#map-sc');if(e&&S.scr&&!S.scr.error)mpScatter(e);const h=$('#map-hist');if(h&&S.scr&&!S.scr.error)mpHist(h)}},200)})}
+}
+/* ── Риски и сценарии: вероятность дефолта, ожидаемая доходность, сценарии ключевой ставки ── */
+S.riskQ={rec:'25',target:'',tax:false};S.rsort={k:'value_rub',d:-1};
+function loadRisk(){
+  if(S._riskLoading)return;S._riskLoading=1;const acc=S.account,q=S.riskQ;
+  const p=new URLSearchParams({account:acc,recovery:q.rec||'25'});if(q.target!=='')p.set('target',q.target.replace(',','.'));if(q.tax)p.set('tax','1');
+  api('/api/risk?'+p).then(j=>{S._riskLoading=0;if(S.account!==acc)return;S.risk=j;S.riskAcc=acc;if(S.page==='risk')render()})
+   .catch(e=>{S._riskLoading=0;S.risk={error:e.message};S.riskAcc=acc;if(S.page==='risk')render()});
+}
+const rkPd=x=>x==null?'—':x*100<0.1?'&lt;0,1 %':pctp(x*100,x*100<10?1:0);
+const rkRub=(v,d=0)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+NF0.format(Math.abs(v))+' ₽';
+const rkPct=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' %';
+function rkScnChart(el){
+  const d=S.risk;if(!d||!d.scenarios)return;
+  bars(el,{h:260,stack:true,labels:d.scenarios.map(s=>s.name),series:[{n:'Купоны (получено за год)',c:'#3987e5',v:d.scenarios.map(s=>d.scn_total[s.key].coupons)},
+    {n:'Изменение цены (переоценка, подтягивание к номиналу)',c:'#19a070',v:d.scenarios.map(s=>d.scn_total[s.key].price)}],total:true,fa:short,ft:v=>rkRub(v),empty:'Нет данных'});
+}
+function rkFloatText(d){
+  const f=d.floaters.floating,x=d.floaters.fixed;
+  if(!f.count||!x.count)return f.count?'В портфеле только флоатеры.':'В портфеле нет флоатеров: все выпуски с фиксированным купоном.';
+  const fw=[],xw=[];d.scenarios.forEach(s=>{const a=f.scn[s.key].pct,b=x.scn[s.key].pct;(a>=b?fw:xw).push(s.name)});
+  let t='';if(fw.length)t+=`Флоатеры выигрывают в сценариях: ${fw.join(', ')}. `;if(xw.length)t+=`Фиксированный купон выигрывает в сценариях: ${xw.join(', ')}. `;
+  return t+'Логика: при росте ставки купон флоатера растёт вместе с ней, а цена фиксированных бумаг падает; при снижении ставки фиксированные дорожают, а купон флоатера уменьшается.';
+}
+function rkRows(d){
+  const g={name:r=>r.name,value_rub:r=>r.value_rub,rating:r=>r.rating?RSC.indexOf(r.rating.v):null,ytm:r=>r.ytm,pd_mkt_1y:r=>r.pd_mkt_1y,pd_mkt_T:r=>r.pd_mkt_T,pd_hist_1y:r=>r.pd_hist_1y,
+    ratio:r=>r.ratio,ey_hist:r=>r.ey_hist,breakeven:r=>r.breakeven==null&&r.be_gt?99:r.breakeven}[S.rsort.k]||(r=>r.value_rub);
+  return d.rows.slice().sort((a,b)=>{const x=g(a),y=g(b);if(typeof x==='string'||typeof y==='string')return S.rsort.d*String(x||'').localeCompare(String(y||''));return S.rsort.d*((x??-Infinity)-(y??-Infinity))});
+}
+function pRisk(){
+  if(S.risk&&S.riskAcc!==S.account)S.risk=null;
+  if(!S.risk){loadRisk();return`<div class="card">${waitBox('Считаю вероятности дефолта и сценарии ставки (потоки по каждому выпуску)…')}</div>`}
+  const d=S.risk,q=S.riskQ;
+  if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="rk-apply">Повторить</button></div>`;
+  const ctl=`<div class="card"><h2>Параметры</h2><div class="flt rk-ctl">
+    <label class="field"><span>Доля возврата при дефолте, %</span><input class="in" id="rk-rec" type="number" min="0" max="90" step="5" value="${esc(q.rec)}"></label>
+    <label class="field"><span>Своя ключевая ставка через 12 мес., %</span><input class="in" id="rk-tgt" type="number" min="0" max="60" step="0.5" placeholder="например 12" value="${esc(q.target)}"></label>
+    <label class="sw"><input type="checkbox" id="rk-tax" ${q.tax?'checked':''}><i></i><div><b>Учесть НДФЛ 13 %</b><small>на купоны и прирост цены</small></div></label>
+    <button class="btn" id="rk-apply">Пересчитать</button></div></div>`;
+  if(!d.portfolio)return ctl+'<div class="card empty">В портфеле нет облигаций с рассчитанной доходностью</div>';
+  const p=d.portfolio,sc=d.scenarios,tt=d.scn_total;
+  const worst=sc.reduce((a,s)=>tt[s.key].total<tt[a.key].total?s:a,sc[0]);
+  const hasEx=p.promised_ex!=null&&p.distressed_value>0;
+  const kp=`<div class="g g4">${kpi('Обещанная доходность',pctp(p.promised,1),hasEx?`без выпусков с доходностью &gt;100 %: ${pctp(p.promised_ex,1)}`:'средневзвешенная к погашению',null,S1)}
+    ${kpi('Ожидаемая с учётом дефолтов',pctp(p.expected,1),`по рейтингу: −${f2(p.promised-p.expected)} п.п. · по рынку: ${pctp(p.expected_mkt,1)}`,null,S3)}
+    ${kpi('Ожидаемые потери за год',M(-p.exp_loss_rub,'rub',0),`по рынку: ${M(-p.exp_loss_mkt_rub,'rub',0)}`,'neg',S8)}
+    ${kpi('Худший сценарий ставки',rkRub(tt[worst.key].total),`${esc(worst.name)} · ${rkPct(tt[worst.key].pct)} за год`,tt[worst.key].total<0?'neg':'',S4)}</div>`;
+  const hd=d.horizon?ddm(d.horizon):'';
+  const scT=`<div class="tbl"><table><thead><tr><th class="l">Сценарий</th><th>Ставка через 12 мес.</th><th>Δ к текущей</th><th>Купоны</th><th>Цена</th><th>Итого, ₽</th><th>Итого, %</th></tr></thead><tbody>${
+    sc.map(s=>{const t=tt[s.key];return`<tr><td class="l">${esc(s.name)}${s.note?`<br><small class="mu">${esc(s.note)}</small>`:''}</td><td class="num">${pctp(s.k12,1)}</td><td class="num ${cls(-s.delta)}">${s.delta>0?'+':s.delta<0?'−':''}${Math.abs(s.delta).toFixed(1).replace('.',',')} п.п.</td>
+      <td class="num">${rkRub(t.coupons)}</td><td class="num ${cls(t.price)}">${rkRub(t.price)}</td><td class="num ${cls(t.total)}"><b>${rkRub(t.total)}</b></td><td class="num ${cls(t.pct)}">${rkPct(t.pct)}</td></tr>`}).join('')}</tbody></table></div>`;
+  const fl=d.floaters,fT=`<div class="tbl"><table><thead><tr><th class="l">Сценарий</th><th>Флоатеры (${fl.floating.count})</th><th>Фиксированный купон (${fl.fixed.count})</th><th>Победитель</th></tr></thead><tbody>${
+    sc.map(s=>{const a=fl.floating.scn[s.key].pct,b=fl.fixed.scn[s.key].pct,w=fl.floating.count&&fl.fixed.count?(a>=b?'флоатеры':'фиксированные'):'—';
+      return`<tr><td class="l">${esc(s.name)}</td><td class="num ${cls(a)}">${rkPct(a)}</td><td class="num ${cls(b)}">${rkPct(b)}</td><td class="num">${w}</td></tr>`}).join('')}</tbody></table></div>`;
+  const cs=d.casino.length?`<div class="tbl"><table><thead><tr><th class="l">Дефолт k самых рискованных эмитентов</th><th>Потеряно на дефолте</th><th>Итог за год, ₽</th><th>Итог за год, %</th></tr></thead><tbody>${
+    d.casino.map(c=>`<tr><td class="l"><b>k = ${c.k}</b><br><small class="mu">${c.issuers.map(i=>esc(i.name)+' ('+M(i.value,'rub',0)+')').join('; ')}</small></td><td class="num neg">${rkRub(-c.lost_rub)}</td>
+      <td class="num ${cls(c.result_rub)}"><b>${rkRub(c.result_rub)}</b></td><td class="num ${cls(c.result_pct)}">${rkPct(c.result_pct)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">Недостаточно эмитентов</div>';
+  const cols=[['name','Облигация','l'],['value_rub','Стоимость'],['rating','Рейтинг','l'],['ytm','Доходность'],['pd_mkt_1y','PD рынка, 1 год'],['pd_mkt_T','PD рынка, до погашения'],['pd_hist_1y','PD по рейтингу, 1 год'],['ratio','Рынок / рейтинг'],['ey_hist','Ожидаемая доходность'],['breakeven','Запас по росту доходности']];
+  const th=cols.map(([k,t,c])=>`<th class="s ${c||''}" data-s="${k}">${t} <span>${S.rsort.k===k?(S.rsort.d>0?'↑':'↓'):''}</span></th>`).join('');
+  const body=rkRows(d).map(r=>{
+    const flag=r.ratio!=null&&r.ratio>=3?`<br><small class="neg" title="Рыночный спред закладывает вероятность дефолта заметно выше, чем следует из рейтинга: сигнал проблем у эмитента либо возможность">рынок закладывает риск в ${r.ratio>=10?Math.round(r.ratio):f2(r.ratio).replace(',0','')} раз выше рейтинга</small>`:'';
+    const be=r.breakeven!=null?f2(r.breakeven)+' п.п.':(r.be_gt?'&gt; 30 п.п.':'—');
+    return`<tr data-isin="${esc(r.isin||r.ticker||'')}"><td class="l">${esc(r.name)}<br><small class="mu">${esc(r.isin||'')}${r.floating?' · флоатер':''}${r.exact?'':' · приближённо'}</small></td>
+      <td class="num">${M(r.value_rub,'rub',0)}</td><td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td><td class="num">${pctp(r.ytm,1)}</td>
+      <td class="num">${rkPd(r.pd_mkt_1y)}</td><td class="num">${rkPd(r.pd_mkt_T)}</td><td class="num">${r.pd_hist_1y!=null?rkPd(r.pd_hist_1y):'<span class="mu">нет рейтинга</span>'}</td>
+      <td class="num">${r.ratio!=null?(r.ratio>=10?Math.round(r.ratio):f2(r.ratio))+' ×':'—'}${flag}</td>
+      <td class="num ${r.ey_hist<0?'neg':''}">${pctp(r.ey_hist,1)}${r.hist_basis==='market'?' <small class="mu" title="Нет рейтинга: использована рыночная вероятность дефолта">*</small>':''}</td><td class="num" title="${r.be_approx!=null?'Грубая оценка доходность / модифицированная дюрация сегодня: '+f2(r.be_approx)+' п.п. Точный расчёт учитывает, что через год дюрация короче.':''}">${be}</td></tr>`}).join('');
+  chart('rk-scn',rkScnChart);
+  return ctl+kp+`<div class="card"><h2>Сценарии ключевой ставки<span class="sp">доход за 12 месяцев (до ${hd}), без реинвестирования купонов</span></h2><div class="chart" id="rk-scn"></div>${scT}
+    <p class="note" style="margin-top:10px">Сдвиг кривой доходности = Δ ключевой ставки × β: β = 1,0 для срока до 1 года и линейно снижается до 0,5 на сроке 7 лет и дольше (длинные ставки реагируют слабее). Кредитные спреды не меняются. Выпуск переоценивается через 12 месяцев: оставшиеся потоки дисконтируются по текущей доходности со сдвигом на дюрации остатка. Купоны флоатеров следуют траектории ставки сценария плюс спред эмитента; ставка идёт линейно к целевой за 12 месяцев. Сценарий «Рынок» доступен, если получен рыночный путь ставки.</p></div>
+  <div class="g c-2-1 rk-g"><div class="card"><h2>Флоатеры против фиксированного купона<span class="sp">доходность подпортфелей за 12 месяцев</span></h2>${fT}<p class="note" style="margin-top:10px">${esc(rkFloatText(d))}</p></div>
+  <div class="card"><h2>«Казино»: если эмитенты не вернут долг</h2>${cs}<p class="note" style="margin-top:10px">Дефолтят самые рискованные эмитенты по рыночной вероятности. Потеря = (1 − возврат ${d.recovery.toFixed(0)} %) × стоимость позиций эмитента; купоны по ним за год не учитываются. База — сценарий «ставка без изменений» (${rkRub(d.base_rub)}).</p></div></div>
+  <div class="card"><h2>Выпуски: риск дефолта и запас прочности<span class="sp">нажмите на строку — карточка выпуска; заголовок — сортировка</span></h2><div class="tbl rk-tbl"><table id="rk-tab"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div>
+    <p class="note" style="margin-top:10px">PD рынка: из спреда к КБД s и доли возврата R: λ = s / (1 − R), PD(T) = 1 − e<sup>−λT</sup>. Ожидаемая доходность = доходность − PD по рейтингу (1 год) × (1 − R). Без рейтинга (*) берётся рыночная PD. Запас — на сколько п.п. должна вырасти доходность, чтобы убрать результат года (купоны + переоценка) в ноль; для коротких и плавающих бумаг запас велик.</p></div>
+  <div class="card"><h2>Допущения и источники</h2><p class="note">${esc(d.sources.pd)}<br><br>${esc(d.sources.recovery)}<br><br>Таблица PD по рейтингу, % за год: ${Object.entries(d.pd_hist_table).map(([k,v])=>k+' '+String(v).replace('.',',')).join(' · ')}.
+    <br><br>Оценки по упрощённой модели, справочная информация, не инвестиционная рекомендация. Рыночная PD включает премию за ликвидность и риск, поэтому её завышенное значение не всегда означает близкий дефолт.</p></div>`;
+}
+function bindRisk(){
+  const a=$('#rk-apply');
+  if(a)a.onclick=()=>{const q=S.riskQ;if($('#rk-rec'))q.rec=$('#rk-rec').value||'25';if($('#rk-tgt'))q.target=$('#rk-tgt').value;if($('#rk-tax'))q.tax=$('#rk-tax').checked;S.risk=null;render()};
+  ['#rk-rec','#rk-tgt'].forEach(i=>{const e=$(i);if(e)e.onkeydown=ev=>{if(ev.key==='Enter')a.click()}});
+  const t=$('#rk-tab');if(t)t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;S.rsort={k,d:S.rsort.k===k?-S.rsort.d:(k==='name'?1:-1)};render()};
+}
+/* ── Сигналы: дешевле/дороже аналогов, история сигналов, возможные замены в портфеле ── */
+S.sig={d:null,key:'',err:null,loading:false,f:{rmin:'',sector:'',dmax:'all',turn:'1000000',sort:'z',outl:false,worse:false,more:{c:false,r:false}},fee:'0.3',thr:'1'};
+const SG_NOTE='Сравнение с аналогами не учитывает все риски; справочная информация, не инвестиционная рекомендация.';
+function sigKey(){const f=S.sig.f;return[S.account,f.turn,S.sig.fee,S.sig.thr].join('|')}
+function loadSig(force){
+  const k=sigKey();if(S.sig.loading&&!force)return;
+  S.sig.loading=true;S.sig.err=null;
+  const p=new URLSearchParams({account:S.account,min_turn:S.sig.f.turn,fee:S.sig.fee,threshold:S.sig.thr});if(force)p.set('force','1');
+  api('/api/signals?'+p).then(j=>{S.sig.loading=false;S.sig.d=j;S.sig.key=k;if(S.page==='sig')render()})
+    .catch(e=>{S.sig.loading=false;S.sig.err=e.message||String(e);S.sig.key=k;if(S.page==='sig')render()});
+}
+const sgN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
+const sgS=(v,d=2)=>v==null||isNaN(v)?'—':(v>0?'+':'')+sgN(v,d);
+function sgSpark(h){
+  if(!h||h.length<2)return'';
+  const w=64,hh=18,mn=Math.min(...h),mx=Math.max(...h),r=(mx-mn)||1;
+  const pts=h.map((v,i)=>(i/(h.length-1)*w).toFixed(1)+','+(hh-2-(v-mn)/r*(hh-4)).toFixed(1)).join(' ');
+  return`<svg class="sg-sp" width="${w}" height="${hh}" viewBox="0 0 ${w} ${hh}"><polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>`;
+}
+function sgRows(side){
+  const f=S.sig.f,d=S.sig.d,dm=f.dmax==='all'?1e9:+f.dmax,ri=f.rmin?RSC.indexOf(f.rmin):99;
+  const rs=d.rows.filter(r=>(side>0?r.diff>=d.eps:r.diff<=-d.eps)&&(f.outl||!r.outlier)&&RSC.indexOf(r.rating)<=ri&&r.dur<=dm&&(!f.sector||r.sector===f.sector)&&r.turn>=+f.turn);
+  const k={z:r=>Math.abs(r.z),diff:r=>Math.abs(r.diff),streak:r=>r.streak*1e3+Math.abs(r.z),turn:r=>r.turn}[f.sort]||(r=>Math.abs(r.z));
+  return rs.sort((a,b)=>k(b)-k(a));
+}
+function sgTable(side){
+  const rs=sgRows(side),d=S.sig.d,key=side>0?'c':'r',more=S.sig.f.more[key],lim=more?60:15,hasH=d.meta.hist_days>=2;
+  if(!rs.length)return`<div class="empty" style="padding:26px">Нет выпусков под выбранные фильтры</div>`;
+  return`<div class="tbl"><table class="sg-t"><thead><tr><th class="l">Выпуск</th><th>Рейтинг</th><th class="l">Сектор</th><th>Дюр., г.</th><th>Дох., %</th><th>Спред</th><th>Медиана аналогов</th><th>Δ п.п.</th><th title="Отклонение в единицах разброса аналогов (MAD)">z</th><th>Оборот</th>${hasH?'<th title="Сколько снимков подряд выпуск был дешевле/дороже аналогов (снимок раз в день)">Дней подряд</th><th>Тренд</th>':''}</tr></thead><tbody>`
+    +rs.slice(0,lim).map(r=>`<tr data-isin="${esc(r.isin)}" title="Аналоги: ${esc(r.refs.map(a=>a.name).join(', '))}"><td class="l"><b>${esc(r.name)}</b>${r.outlier?' <span class="tag" title="Отклонение или доходность аномально велики: возможен дефолтный выпуск или некорректные данные">выброс</span>':''}${r.amort?' <span class="tag">аморт</span>':''}${r.sub?' <span class="tag">суборд</span>':''}<small class="mu sg-isin">${esc(r.isin)}</small></td>
+      <td><span class="tag rt rt-${esc(rBucket(r.rating).split(' ')[0])}">${esc(r.rating)}</span></td><td class="l">${esc(SECT[r.sector]||r.sector||'—')}</td>
+      <td class="num">${sgN(r.dur)}</td><td class="num">${sgN(r.yield)}</td><td class="num">${sgS(r.spread)}</td><td class="num">${sgS(r.med)}</td>
+      <td class="num ${side>0?'pos':'neg'}"><b>${sgS(r.diff)}</b></td><td class="num">${sgS(r.z,1)}</td><td class="num">${short(r.turn)}</td>
+      ${hasH?`<td class="num">${r.streak?r.streak:'—'}</td><td class="num sg-tr ${r.trend==null?'':r.trend>0.05?'pos':r.trend<-0.05?'neg':''}">${r.hist?sgSpark(r.hist):''}${r.trend==null?'':' '+sgS(r.trend,1)}</td>`:''}</tr>`).join('')
+    +`</tbody></table></div>`+(rs.length>lim?`<button class="btn ghost sg-more" data-m="${key}">Показать больше (${rs.length-lim})</button>`:'')
+    +(more&&rs.length>60?'':'');
+}
+function sgOpt(o,pos){
+  const w=o.rating_worse;
+  return`<tr data-isin="${esc(o.isin)}"><td class="l"><b>${esc(o.name)}</b>${w?' <span class="tag sg-worse" title="Рейтинг ниже, чем у текущей бумаги: более высокая доходность во многом плата за риск">рейтинг ниже</span>':''}<small class="mu sg-isin">${esc(o.isin)}</small></td>
+    <td><span class="tag rt rt-${esc(rBucket(o.rating).split(' ')[0])}">${esc(o.rating)}</span></td><td class="num">${sgN(o.dur)}</td><td class="num">${sgN(o.yield)}</td>
+    <td class="num ${o.diff>=0.25?'pos':o.diff<=-0.25?'neg':''}">${sgS(o.diff)}</td><td class="num">${short(o.turn)}</td>
+    <td class="num">${sgS(o.gain_pp)}</td><td class="num pos"><b>${sgS(o.net_pp)}</b></td><td class="num">${M(o.gain_rub_year,'rub')}</td><td class="num">${o.breakeven_months==null?'—':sgN(o.breakeven_months,1)}</td></tr>`;
+}
+function sgRepl(){
+  const d=S.sig.d,f=S.sig.f;let h='';
+  const rep=d.replacements.map(p=>({p,o:f.worse?p.options.concat(p.options_worse):p.options})).filter(x=>x.o.length);
+  if(!rep.length)return`<div class="empty" style="padding:26px">${(S.bonds&&S.bonds.rows&&S.bonds.rows.length)||d.skipped.length?'При заданных порогах и издержках явных вариантов для изучения нет.':'В выбранном портфеле нет облигаций.'}</div>`;
+  rep.forEach(({p,o})=>{
+    h+=`<div class="sg-pos"><div class="sg-ph" data-isin="${esc(p.isin)}"><div><b>${esc(p.name)}</b> <span class="tag rt rt-${esc(rBucket(p.rating).split(' ')[0])}">${esc(p.rating||'—')}</span></div>
+      <div class="mu">позиция ${M(p.value,'rub')} · доходность ${sgN(p.yield_)} % · дюрация ${sgN(p.dur)} г. · ${p.diff==null?'':`к аналогам ${sgS(p.diff)} п.п. · `}издержки перехода ≈ ${M(p.cost_rub,'rub')} (${sgN(p.cost_pp)} % позиции: комиссии ${M(p.commission_rub,'rub')}${p.tax_rub?`, налог с прибыли ${M(p.tax_rub,'rub')}`:''})</div></div>
+      <div class="tbl"><table class="sg-t"><thead><tr><th class="l">Возможная замена для изучения</th><th>Рейтинг</th><th>Дюр., г.</th><th>Дох., %</th><th>Δ к аналогам</th><th>Оборот</th><th title="Разница доходностей, п.п. в год">Разница, п.п.</th><th title="Разница за вычетом издержек, размазанных на срок до погашения более короткой из бумаг (не более 5 лет)">После издержек, п.п./год</th><th>₽ в год на позицию</th><th title="За сколько месяцев разница в доходности покроет издержки перехода">Окупаемость, мес.</th></tr></thead><tbody>${o.map(sgOpt).join('')}</tbody></table></div></div>`});
+  return h;
+}
+function pSig(){
+  const s=S.sig,f=s.f;
+  if(s.key!==sigKey()&&!s.loading){s.d=null;s.err=null}
+  if(!s.d){
+    if(!s.loading&&!s.err)loadSig();
+    chart('sg-root',bindSig);
+    return`<div id="sg-root"><div class="card">${s.err?`<div class="msg err">${esc(s.err)} <button class="btn ghost" id="sg-ref">Повторить</button></div>`:waitBox('Сравниваю выпуски с аналогами (первый расчёт может занять до минуты: загружается рынок)…')}</div></div>`}
+  const d=s.d,k=d.kpis,m=d.meta;
+  const sectors=[...new Set(d.rows.map(r=>r.sector).filter(Boolean))].sort((a,b)=>(SECT[a]||a).localeCompare(SECT[b]||b));
+  const opt=(v,t,c)=>`<option value="${v}" ${String(c)===String(v)?'selected':''}>${t}</option>`;
+  const nrep=d.replacements.length;
+  chart('sg-root',bindSig);
+  return`<div id="sg-root">${s.err?`<div class="msg err">${esc(s.err)}</div>`:''}
+  <div class="g g4 sg-k">${kpi('Выпусков сравнено',k.universe,`ликвидных, оборот от ${short(d.params.min_turn)} ₽`)}
+    ${kpi('Дешевле аналогов',k.cheap,`из них заметно (z ≥ 2): ${k.cheap_strong}`,'pos')}
+    ${kpi('Дороже аналогов',k.rich,`из них заметно (z ≤ −2): ${k.rich_strong}`,'neg')}
+    ${kpi('Возможных замен в портфеле',nrep,`пороги: от ${sgN(d.params.threshold,1)} п.п. после издержек`)}</div>
+  <div class="card"><h2>Дешевле и дороже аналогов<span class="sp">спред к КБД против медианы 12 похожих выпусков</span></h2>
+    <p class="note" style="margin-bottom:12px">Для каждой рублёвой корпоративной облигации с рейтингом (без флоатеров и бессрочных) подбираются ближайшие аналоги: рейтинг в пределах двух ступеней, сопоставимая дюрация, сектор, тип выпуска — так же, как в карточке облигации. «Дешевле» — спред к КБД выше медианы аналогов (доходность выше при сопоставимом риске), «дороже» — ниже. z — отклонение в единицах разброса аналогов (робастная оценка по MAD): чем больше |z|, тем заметнее выпуск выделяется на фоне аналогов. Расхождение часто объясняется рисками, которых нет в рейтинге.</p>
+    <div class="flt">
+      <label class="field"><span>Рейтинг не ниже</span><select class="in" id="sg-r"><option value="">любой</option>${RSC.slice(0,16).map(x=>opt(x,x,f.rmin)).join('')}</select></label>
+      <label class="field"><span>Сектор</span><select class="in" id="sg-s"><option value="">любой</option>${sectors.map(x=>opt(x,SECT[x]||x,f.sector)).join('')}</select></label>
+      <label class="field"><span>Дюрация не более</span><select class="in" id="sg-d">${[['1','1 года'],['2','2 лет'],['3','3 лет'],['5','5 лет'],['all','любая']].map(([v,t])=>opt(v,t,f.dmax)).join('')}</select></label>
+      <label class="field"><span>Оборот за день от</span><select class="in" id="sg-t">${[['0','любой'],['300000','0,3 млн ₽'],['1000000','1 млн ₽'],['5000000','5 млн ₽'],['20000000','20 млн ₽']].map(([v,t])=>opt(v,t,f.turn)).join('')}</select></label>
+      <label class="field"><span>Сортировать по</span><select class="in" id="sg-o">${[['z','z-оценке'],['diff','отклонению, п.п.'],['streak','дням подряд'],['turn','обороту']].map(([v,t])=>opt(v,t,f.sort)).join('')}</select></label>
+      <label class="sw"><input type="checkbox" id="sg-x" ${f.outl?'checked':''}><i></i><div><b>Показывать выбросы</b><small>${k.outliers} выпусков с аномалиями</small></div></label>
+    </div>
+    <div class="sg-g2">
+      <div><h3 class="sg-h pos">Дешевле аналогов</h3>${sgTable(1)}</div>
+      <div><h3 class="sg-h neg">Дороже аналогов</h3>${sgTable(-1)}</div></div>
+    <p class="note" style="margin-top:12px">${m.hist_days>=2?`История сигналов копится ежедневно по будним дням (снимок при расчёте): накоплено дней — ${m.hist_days}, с ${ddm(m.hist_from)}. «Дней подряд» — число последних снимков подряд, в которых выпуск оставался дешевле/дороже аналогов не менее чем на ${sgN(d.eps,2)} п.п.; «Тренд» — изменение отклонения за ≈ 5 снимков.`:`История сигналов копится ежедневно по будним дням, начиная с сегодняшнего дня: сейчас накоплено дней — ${m.hist_days}. Колонки «Дней подряд» и «Тренд» появятся, когда снимков будет хотя бы два.`}
+    Расчёт: ${sgN(m.calc_s,1)} с, выпусков в сравнении ${m.pool}. Выбросы (отклонение более 8 п.п., доходность выше 40 % или спред ниже −6 п.п.) скрыты по умолчанию.</p></div>
+  <div class="card sg-rep"><h2>Возможные замены в вашем портфеле<span class="sp">для изучения, не рекомендация</span></h2>
+    <p class="note" style="margin-bottom:12px">Для каждой рублёвой корпоративной облигации портфеля ищутся похожие выпуски (близкие рейтинг, срок, сектор) с более высокой рыночной доходностью. Учитываются комиссия за продажу и покупку, налог ${sgN(d.params.tax,0)} % с прибыли при продаже выше цены покупки (НКД не учитывается), ликвидность целевого выпуска. Издержки равномерно относятся на срок до погашения более короткой из двух бумаг (не более 5 лет). Показываются варианты, где разница после издержек не меньше порога; выпуски с более низким рейтингом показываются только по отдельному переключателю. Бóльшая доходность обычно отражает бóльший риск, а не недооценку.</p>
+    <div class="flt">
+      <label class="field"><span>Комиссия за сделку, %</span><input class="in" id="sg-fee" type="number" min="0" max="5" step="0.05" value="${esc(s.fee)}"></label>
+      <label class="field"><span>Порог после издержек, п.п./год</span><input class="in" id="sg-thr" type="number" min="0" max="20" step="0.5" value="${esc(s.thr)}"></label>
+      <label class="sw"><input type="checkbox" id="sg-w" ${f.worse?'checked':''}><i></i><div><b>Показывать с более низким рейтингом</b><small>помечаются отдельно</small></div></label>
+      <button class="btn ghost" id="sg-ref">Пересчитать</button>
+    </div>
+    ${sgRepl()}
+    ${d.skipped.length?`<p class="note" style="margin-top:10px">Не сравнивались: ${d.skipped.map(x=>esc(x.name)+' ('+esc(x.why)+')').join('; ')}.</p>`:''}</div>
+  <p class="note">${SG_NOTE} Данные: Мосбиржа (ISS), каталог T-Invest, публичные рейтинги; КБД — кривая бескупонной доходности Мосбиржи.</p></div>`;
+}
+function bindSig(){
+  const f=S.sig.f,again=()=>render();
+  const on=(id,fn)=>{const e=$(id);if(e)e.onchange=fn};
+  on('#sg-r',e=>{f.rmin=e.target.value;again()});on('#sg-s',e=>{f.sector=e.target.value;again()});on('#sg-d',e=>{f.dmax=e.target.value;again()});
+  on('#sg-o',e=>{f.sort=e.target.value;again()});on('#sg-x',e=>{f.outl=e.target.checked;again()});on('#sg-w',e=>{f.worse=e.target.checked;again()});
+  on('#sg-t',e=>{f.turn=e.target.value;S.sig.d=null;again()});
+  const fee=$('#sg-fee'),thr=$('#sg-thr');
+  const apply=()=>{S.sig.fee=fee.value||'0.3';S.sig.thr=thr.value||'1';S.sig.d=null;render()};
+  if(fee)fee.onchange=apply;if(thr)thr.onchange=apply;
+  const r=$('#sg-ref');if(r)r.onclick=()=>{S.sig.d=null;S.sig.err=null;S.sig.key=sigKey();loadSig(true);render()};
+  document.querySelectorAll('#sg-root .sg-more').forEach(b=>b.onclick=()=>{f.more[b.dataset.m]=true;render()});
+}
+/* ── Мониторинг: тревоги по портфелю, ликвидность, спреды ── */
+const MON_SEV={high:['Высокая','mon-h'],medium:['Средняя','mon-m'],info:['Инфо','mon-i']};
+function monEnsure(){
+  const acc=S.account,m=S.mon;
+  if(m&&m.acc===acc&&(m.loading||m.error||(m.data&&Date.now()-m.t<6e5)))return;
+  S.mon={acc,loading:true,t:Date.now()};
+  api('/api/monitor?'+new URLSearchParams({account:acc})).then(d=>{if(S.account!==acc)return;S.mon={acc,data:d,t:Date.now()};
+    try{notifyMon(d)}catch(e){}
+    if(['mon','dash'].includes(S.page))render()}).catch(e=>{if(S.account!==acc)return;S.mon={acc,error:e.message,t:Date.now()};if(S.page==='mon')render()});
+}
+function monSpark(sp,w=96,h=26){
+  if(!sp||sp.length<3)return'<span class="mu">—</span>';
+  const v=sp.map(p=>p[1]),mn=Math.min(...v),mx=Math.max(...v),r=mx-mn||1;
+  const pts=v.map((y,i)=>(i/(v.length-1)*(w-2)+1).toFixed(1)+','+(h-3-(y-mn)/r*(h-6)).toFixed(1)).join(' ');
+  const up=v[v.length-1]-v[0],c=up>0.3?'var(--neg)':up<-0.3?'var(--pos)':'var(--tx2)';
+  return`<svg class="mon-sp" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><title>Спред к КБД за ${sp.length} торг. дней: ${f2(v[0])} → ${f2(v[v.length-1])} п.п.</title><polyline fill="none" stroke="${c}" stroke-width="1.6" stroke-linejoin="round" points="${pts}"/></svg>`;
+}
+function monAlertHtml(a){
+  const[s,c]=MON_SEV[a.severity]||MON_SEV.info,n=(a.isins||[]).length;
+  const nm=a.kind==='rating'?`${esc(a.name)}${n?` <small class="mu">· ${esc((a.bonds||[]).slice(0,2).join(', '))}${n>2?' и ещё '+(n-2):''}</small>`:''}`:esc(a.name||'');
+  return`<div class="mon-al ${c}" ${a.isin?`data-isin="${esc(a.isin)}"`:''}><span class="mon-sev">${s}</span><span class="mon-d num">${a.date?ddm(a.date):''}</span>
+    <div class="mon-b"><b>${nm}</b><span>${esc(a.message)}</span></div>${a.url?`<a href="${esc(a.url)}" target="_blank" rel="noopener" title="Источник">↗</a>`:''}</div>`;
+}
+function monCard(){
+  if(!(S.bonds&&S.bonds.rows&&S.bonds.rows.length))return'';
+  monEnsure();
+  const m=S.mon;
+  if(!m||m.loading)return`<div class="card mon-card noprint"><h2>Тревоги<span class="sp">загружаю…</span></h2><div class="mu" style="font-size:12.5px">Проверяю рейтинги, цены и спреды облигаций портфеля</div></div>`;
+  if(m.error||!m.data)return'';
+  const al=m.data.alerts.filter(a=>a.severity!=='info'),top=al.slice(0,3);
+  return`<div class="card mon-card noprint"><h2>Тревоги<span class="sp">${m.data.summary.high} высоких · ${m.data.summary.medium} средних</span>
+    <button class="btn ghost" data-go="mon" style="margin-left:auto;padding:4px 12px;font-size:12px">Мониторинг</button></h2>
+    ${top.length?top.map(monAlertHtml).join('')+(al.length>3?`<div class="mu" style="font-size:12px;margin-top:6px">…и ещё ${al.length-3}</div>`:''):'<div class="mon-ok">Значимых тревог по облигациям портфеля нет</div>'}</div>`;
+}
+function monRatingTag(r){
+  if(!r||!r.v)return'<span class="mu">—</span>';
+  return`<span class="tag rt rt-${rBucket(r.v).split(' ')[0]}" title="${esc(r.agency||'')}">${esc(r.v)}</span>`
+    +(r.outlook?` <small class="${r.neg?'neg':'mu'}">${esc(r.outlook)}</small>`:'')+(r.watch?' <span class="tag mon-w" title="Рейтинг под наблюдением">набл.</span>':'');
+}
+function pMon(){
+  monEnsure();
+  const m=S.mon;
+  if(!m||m.loading)return`<div class="card">${waitBox('Собираю рейтинговые события, историю цен и спредов… При первом запуске до минуты.')}</div>`;
+  if(m.error)return`<div class="msg err">${esc(m.error)} <button class="btn ghost" id="mon-r">Повторить</button></div>`;
+  const d=m.data,th=d.thresholds,sm=d.summary;
+  const rows=d.rows.map(r=>`<tr data-isin="${esc(r.isin)}" title="Открыть карточку"><td class="l"><b style="font-weight:600">${esc(r.name)}</b><br><small class="mu">${esc(r.ticker||r.isin)}${r.call?' · оферта '+ddm(r.call):''}</small></td>
+    <td class="num">${M(r.value_rub,'rub',0)}</td><td class="l">${monRatingTag(r.rating)}</td>
+    <td class="num">${r.price!=null?f2(r.price):'—'}</td>
+    <td class="num ${cls(r.chg5)}">${r.chg5!=null?pct(r.chg5,1):'—'}</td><td class="num ${cls(r.chg30)}">${r.chg30!=null?pct(r.chg30,1):'—'}</td>
+    <td class="num">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
+    <td class="num ${r.spread_chg30>0?'neg':r.spread_chg30<0?'pos':''}">${r.spread_chg30!=null?(r.spread_chg30>0?'+':'')+f2(r.spread_chg30):'—'}</td>
+    <td>${r.floating?'<small class="mu">флоатер</small>':monSpark(r.spark)}</td>
+    <td class="num">${r.turnover_avg!=null?short(r.turnover_avg)+' ₽':'—'}</td>
+    <td class="num ${r.days_to_sell==null?(r.no_history?'mu':'neg'):r.days_to_sell>th.mon_sell_days?'neg':''}">${r.no_history?'—':r.days_to_sell==null?'∞':(r.days_to_sell<0.01?'<0,01':f2(r.days_to_sell))}</td>
+    <td class="l">${(r.flags||[]).map(f=>`<span class="tag" style="color:var(--neg)">${esc(f)}</span>`).join(' ')}</td></tr>`).join('');
+  const fld=(k,t,min,step)=>`<label class="field"><span>${t}</span><input class="in num" id="mt-${k}" type="number" min="${min}" step="${step}" value="${th[k]}"></label>`;
+  return`<div class="g g4">${kpi('Высокие',sm.high,'понижение рейтинга, дефолт, сильное падение','neg',S8)}${kpi('Средние',sm.medium,'наблюдение, оферты, умеренное падение','',S4)}
+    ${kpi('Информационные',sm.info,'повышения, неликвидность, прогнозы',null,S1)}${kpi('Журнал рейтингов',d.log.events,d.log.since?'событий с '+ddm(d.log.since):'пока пуст',null,S2)}</div>
+  ${(d.notes||[]).map(n=>`<div class="msg">${esc(n)}</div>`).join('')}
+  <div class="card"><h2>Тревоги<span class="sp">рейтинги — за 90 дней, рынок — на сегодня</span><button class="btn ghost" id="mon-r" style="margin-left:auto;padding:4px 12px;font-size:12px">Обновить</button></h2>
+    ${d.alerts.length?d.alerts.slice(0,S.monAll?999:12).map(monAlertHtml).join('')+(d.alerts.length>12?`<button class="btn ghost" id="mon-all" style="margin-top:6px">${S.monAll?'Свернуть':'Показать все ('+d.alerts.length+')'}</button>`:''):'<div class="mon-ok">Тревог нет</div>'}</div>
+  <div class="card"><h2>Облигации портфеля<span class="sp">цены Мосбиржи, спред — доходность минус КБД на дюрации бумаги</span></h2>
+    <div class="tbl"><table id="mon-tab"><thead><tr><th class="l">Облигация</th><th>Стоимость</th><th class="l">Рейтинг · прогноз</th><th>Цена, %</th><th>Δ 5 дн.</th><th>Δ 30 дн.</th>
+    <th>Спред, п.п.</th><th>Δ спреда 30 дн.</th><th>Спред 90 дн.</th><th>Оборот в день</th><th title="Стоимость позиции / (20 % среднего дневного оборота за 30 дней)">Дней на продажу</th><th class="l">Признаки</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <p class="note" style="margin-top:10px">Оборот — среднее за 30 дней по торговым дням (${d.cal_days} дн.). «Дней на продажу» — сколько дней потребуется, чтобы продать позицию, забирая не более 20 % дневного оборота. Время расчёта: ${d.timings.total} с.</p></div>
+  <details class="card"><summary style="cursor:pointer;font-weight:600;color:var(--tx2)">Пороги тревог</summary><div class="mon-th">
+    ${fld('mon_drop5','Падение цены за 5 дней, %',0.1,0.5)}${fld('mon_drop30','Падение цены за 30 дней, %',0.1,0.5)}${fld('mon_spread30','Рост спреда за 30 дней, п.п.',0.1,0.5)}
+    ${fld('mon_sell_days','Неликвид: дней на продажу более',0.5,0.5)}${fld('mon_offer_days','Оферта: за сколько дней предупреждать',1,1)}
+    <button class="btn" id="mon-save" style="align-self:flex-end">Сохранить</button></div>
+    <p class="note" style="margin-top:10px">Вдвое превышенный порог даёт высокую важность. Что программа не видит: факт оплаты купона (биржа его не публикует). Дефолт определяется по флагам Мосбиржи, дефолтному рейтингу (D, C) и остановке торгов.</p></details>`;
+}
+function bindMon(){
+  const r=$('#mon-r');if(r)r.onclick=()=>{S.mon=null;render()};
+  const al=$('#mon-all');if(al)al.onclick=()=>{S.monAll=!S.monAll;render()};
+  const sv=$('#mon-save');
+  if(sv)sv.onclick=async()=>{const b={};['mon_drop5','mon_drop30','mon_spread30','mon_sell_days','mon_offer_days'].forEach(k=>b[k]=$('#mt-'+k).value);
+    sv.disabled=true;try{await post('/api/config',b);S.cfg=await api('/api/config')}catch(e){}S.mon=null;render()};
 }
 </script></body></html>
 '''

@@ -14,6 +14,7 @@ function remindHtml(){
     ${ev.length>6?`<small>…и ещё ${ev.length-6}</small>`:''}</div></div>`;
 }
 function notifyUpcoming(){
+  try{monEnsure()}catch(e){}
   try{
     if(!('Notification' in window)||Notification.permission!=='granted')return;
     const seen=new Set(JSON.parse(lsGet('ta_notified')||'[]'));
@@ -24,3 +25,12 @@ function notifyUpcoming(){
 }
 
 
+function notifyMon(d){
+  try{
+    if(!('Notification' in window)||Notification.permission!=='granted')return;
+    const seen=new Set(JSON.parse(lsGet('ta_notified')||'[]'));
+    (d.alerts||[]).filter(a=>a.severity==='high').forEach(a=>{const k='mon|'+a.id;if(seen.has(k))return;seen.add(k);
+      new Notification('T-Invest: тревога по '+(a.name||'облигации'),{body:a.message})});
+    localStorage.setItem('ta_notified',JSON.stringify([...seen].slice(-300)));
+  }catch(e){}
+}

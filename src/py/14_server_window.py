@@ -94,6 +94,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, ratings_status())
             if u.path == "/api/keyrate":
                 return self.send(200, keyrate_brief() or {"source": "none", "name": "", "yearly": []})
+            if u.path == "/api/risk":
+                return self.send(200, build_risk(cfg, acc, q))
+            if u.path == "/api/signals":
+                return self.send(200, signals_payload(cfg, acc, q))
+            if u.path == "/api/monitor":
+                return self.send(200, build_monitor(cfg, acc))
             if u.path == "/api/rates":
                 return self.send(200, rates_payload(q.get("days", "365")))
             if u.path == "/api/backup":
@@ -145,6 +151,13 @@ class Handler(BaseHTTPRequestHandler):
                         cfg["notify_days"] = max(0, min(60, int(body["notify_days"])))
                     except (TypeError, ValueError):
                         pass
+                for k, lo, hi in (("mon_drop5", 0.1, 50), ("mon_drop30", 0.1, 90), ("mon_spread30", 0.1, 50),
+                                  ("mon_sell_days", 0.5, 365), ("mon_offer_days", 1, 365)):
+                    if k in body:
+                        try:
+                            cfg[k] = max(lo, min(hi, float(body[k])))
+                        except (TypeError, ValueError):
+                            pass
                 for k in ("hosts_prod", "hosts_sandbox"):
                     if isinstance(body.get(k), list):
                         hosts = [str(h).strip() for h in body[k] if str(h).strip()]
