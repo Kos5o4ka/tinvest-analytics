@@ -7,7 +7,7 @@
 import hashlib, json, os, subprocess, sys, urllib.request
 from urllib.parse import urlparse
 
-REPO = "Kos5o4ka/tinvest-analytics"                      # TODO: заменить на свой репозиторий GitHub (owner/name)
+REPO = "Kos5o4ka/tinvest-analytics"                    
 FILE = "tinvest_analytics.py"            # файл программы в релизе
 HOME = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 APP_DIR = os.path.join(HOME, "app")
