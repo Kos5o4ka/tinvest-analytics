@@ -76,14 +76,97 @@ def screener_rows():
     return rows
 
 
+MKT_BUCKETS = ["AAA", "AA", "A", "BBB", "BB и ниже"]
+MKT_DUR = [(0, 1, "0–1"), (1, 2, "1–2"), (2, 3, "2–3"), (3, 99, "3+")]
+MKT_HIST_KEY = "mkt_stats_hist_v1"
+
+
+def _med(xs):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    n = len(xs)
+    return round(xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2, 2)
+
+
+def _cell(rs):
+    return {"n": len(rs), "yield": _med([r["yield"] for r in rs]), "spread": _med([r["spread"] for r in rs if r.get("spread") is not None])}
+
+
+def market_stats(rows):
+    """Медианы доходности и спреда к КБД: рейтинг x дюрация, по секторам. Вселенная: рублёвые корпоративные с рейтингом."""
+    now = time.time()
+    uni = []
+    for r in rows:
+        if r.get("kind") != "corp" or r.get("cur") != "RUB" or not r.get("rating"):
+            continue
+        if not (0 < r["yield"] < 60):
+            continue
+        try:
+            yrs = (datetime.strptime(r["mat"], "%Y-%m-%d").timestamp() - now) / 31557600.0
+        except Exception:  # noqa: BLE001
+            continue
+        if yrs <= 0.1:
+            continue
+        d = r.get("dur") if r.get("dur") else yrs
+        uni.append((rating_bucket(r["rating"]), d, r))
+    grid = []
+    for bk in MKT_BUCKETS:
+        row = {"bucket": bk, "all": _cell([r for b, d, r in uni if b == bk]), "cells": []}
+        for lo, hi, lab in MKT_DUR:
+            row["cells"].append(dict(_cell([r for b, d, r in uni if b == bk and lo <= d < hi]), dur=lab))
+        grid.append(row)
+    sectors = {}
+    for b, d, r in uni:
+        if r.get("sector"):
+            sectors.setdefault(r["sector"], []).append(r)
+    sec = sorted(({"sector": k, **_cell(v)} for k, v in sectors.items()), key=lambda x: -x["n"])
+    return {"grid": grid, "sectors": sec, "dur": [m[2] for m in MKT_DUR], "n": len(uni)}
+
+
+def _stats_history(stats):
+    st = store()
+    hist = st.get(MKT_HIST_KEY) or {}
+    snap = {g["bucket"]: g["all"]["spread"] for g in stats["grid"] if g["all"]["spread"] is not None and g["all"]["n"] >= 3}
+    if snap:
+        hist[date.today().isoformat()] = snap
+        for k in sorted(hist)[:-400]:
+            hist.pop(k, None)
+        st.put(MKT_HIST_KEY, hist)
+    return hist
+
+
 def screener_payload():
     rows = screener_rows()
+    br, ti = globals().get("best_rating"), globals().get("tcat_info")
     for r in rows:
-        rt = rating_for(r["name"])
+        rt = None
+        if br:
+            try:
+                ci0 = ti(r.get("isin")) if ti and r.get("isin") else None
+                rt = br(r.get("isin"), (ci0 or {}).get("name") or r["name"])
+            except Exception:  # noqa: BLE001
+                rt = None
+        if rt is None and not br:
+            rt = rating_for(r["name"])
         r["rating"] = rt["v"] if rt else None
         r["rt_agency"] = rt["agency"] if rt else None
         r["rt_approx"] = bool(rt and rt["approx"])
-    return {"rows": rows, "kbd": kbd_curve(), "updated": _scr["t"], "ratings": ratings_status()}
+        info = None
+        if ti and r.get("isin"):
+            try:
+                info = ti(r["isin"])
+            except Exception:  # noqa: BLE001
+                info = None
+        r["sector"] = info.get("sector") if info else None
+        r["floating"] = info.get("floating") if info else None
+        r["amort"] = info.get("amort") if info else None
+    stats = market_stats(rows)
+    try:
+        hist = _stats_history(stats)
+    except Exception:  # noqa: BLE001
+        hist = {}
+    return {"rows": rows, "kbd": kbd_curve(), "updated": _scr["t"], "ratings": ratings_status(), "stats": stats, "stats_hist": hist}
 
 
 # ── первичные размещения (по объявлениям Мосбиржи; сводка investmint.ru) ──

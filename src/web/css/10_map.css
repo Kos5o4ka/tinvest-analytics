@@ -1,0 +1,15 @@
+.mp-chips{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 14px}
+.mp-chips button{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:7px;padding:5px 12px;border-radius:999px;border:1px solid var(--line2);color:var(--mu);font-size:12.5px;font-weight:500;transition:.15s}
+.mp-chips button i{width:9px;height:9px;border-radius:50%;opacity:.45}
+.mp-chips button.on{color:var(--tx);background:var(--card2);border-color:var(--tx2)}.mp-chips button.on i{opacity:1}
+.mp-d{cursor:pointer;stroke-opacity:.95;stroke-width:1}.mp-d:hover{fill-opacity:1;stroke:var(--tx);stroke-width:1.5}
+.mp-ring{fill:none;stroke:var(--ac);stroke-width:2}
+.mp-kbd{stroke:var(--tx2);stroke-width:1.6;stroke-dasharray:6 4;opacity:.85}
+[data-theme=light] .mp-ring{stroke:#c98500}
+.legend i.mp-lk{width:16px;height:0;border-top:2px dashed var(--tx2);border-radius:0;background:none}
+.legend i.mp-lr{width:10px;height:10px;border-radius:50%;background:none;border:2px solid var(--ac)}
+.mp-hm td{text-align:center;padding:8px 6px;border:2px solid var(--card);border-radius:6px;font-size:13px}
+.mp-hm td small{display:block;color:var(--mu);font-size:11px;white-space:nowrap}
+.mp-hm th{text-align:center}.mp-hm th.l,.mp-hm td.l{text-align:left}
+.mp-g{align-items:start}
+@media(max-width:760px){.mp-chips button{padding:4px 10px}.mp-hm td small{white-space:normal}}

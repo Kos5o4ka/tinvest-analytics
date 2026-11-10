@@ -197,6 +197,63 @@ def _spread(ytm, dur):
 RISK_RU = {"RISK_LEVEL_LOW": "низкий", "RISK_LEVEL_MODERATE": "средний", "RISK_LEVEL_HIGH": "высокий"}
 
 
+STRESS_DY = (-3, -2, -1, 1, 2, 3)
+YTM_OUTLIER = 100.0      # доходность выше 100% годовых считаем «distressed»: показываем в строке, но в среднее не берём
+
+
+def bond_isin(r):
+    inst = store().get("inst:" + (r.get("uid") or ""), ttl=30 * DAY) or {}
+    return (inst.get("isin") or r.get("ticker") or "").upper()
+
+
+def bond_exact(client, r, b, today, rates):
+    """Точный расчёт по потокам MOEX. Возвращает словарь полей строки либо None (тогда — приближение)."""
+    if b.get("perpetual") or not b.get("maturity"):
+        return None
+    isin = bond_isin(r)
+    try:
+        bz = moex_bondization(isin)
+    except Exception:  # noqa: BLE001
+        return None
+    if not bz:
+        return None
+    face = b.get("nominal") or 1000.0
+    price, avg, aci = bond_price_face(r, b, rates)
+    if not price:
+        return None
+    flows, kind, end = bond_flows(bz, today, face)
+    if not flows or end <= today:
+        return None
+    if kind == "maturity" and abs((datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(b["maturity"], "%Y-%m-%d")).days) > 45:
+        return None                      # график MOEX не сходится с данными брокера
+    dirty = price + aci
+    y = cf_ytm(dirty, flows, today)
+    if y is None:
+        return None
+    yt = cf_ytm(dirty, flows, today, tax=True, basis=price)
+    mac, mod, conv = cf_risk(flows, today, y)
+    st = stress(price / face * 100.0, flows, today, face, aci, STRESS_DY, y)
+    return {"isin": isin, "ytm": y * 100, "ytm_tax": yt * 100 if yt is not None else None, "dur": mac, "mdur": mod,
+            "convexity": conv, "to": kind, "end": end, "stress_pct": {dy: (p / 100.0 * face + aci) / dirty * 100 - 100
+                                                                      for dy, p in st.items()},
+            "cf_source": "moex"}
+
+
+def bond_price_face(r, b, rates):
+    """(чистая цена, средняя цена покупки, НКД) на одну облигацию в ВАЛЮТЕ НОМИНАЛА. Цена позиции приходит в валюте
+    r['cur'] (для валютных облигаций T-Invest отдаёт её в рублях, номинал — в USD/EUR), поэтому конвертируем."""
+    fc = (b.get("cur") or "rub").lower()
+    k = 1.0
+    if r["cur"] != fc:
+        rp = 1.0 if r["cur"] == "rub" else (r["value_rub"] / r["value"] if r.get("value") and r.get("value_rub") else rates.get(r["cur"]))
+        rf = 1.0 if fc == "rub" else rates.get(fc)
+        if not rp or not rf:
+            return 0.0, 0.0, 0.0
+        k = rp / rf
+    aci = b.get("aci")
+    return (r["price"] or 0.0) * k, (r["avg"] or 0.0) * k, aci if aci is not None else 0.0
+
+
 def bonds_report(client, rows):
     today = date.today().isoformat()
     horizon = (date.today() + timedelta(days=365)).isoformat()
@@ -204,6 +261,11 @@ def bonds_report(client, rows):
     infos = dict(zip([r["uid"] for r in bonds], pool_map(lambda r: bond_info(client, r["uid"]), bonds)))
     out, pays = [], []
     tot_bonds = sum((r["value_rub"] or 0) for r in bonds) or 0.0
+    rates = fx_now(client, {(infos.get(r["uid"]) or {}).get("cur", "rub") for r in bonds} | {r["cur"] for r in bonds})
+    exacts = dict(zip([r["uid"] for r in bonds], pool_map(
+        lambda r: bond_exact(client, r, infos[r["uid"]], today, rates) if infos.get(r["uid"]) else None, bonds)))
+    stress_rub = defaultdict(float)
+    outliers = []
     w = defaultdict(float)
     ladder, risk = defaultdict(float), defaultdict(float)
     kinds = defaultdict(int)
@@ -216,18 +278,43 @@ def bonds_report(client, rows):
             out.append(row)
             continue
         nominal = b.get("nominal") or 1000.0
-        price = r["price"] if r["price"] else 0.0
+        price, avg, _aci = bond_price_face(r, b, rates)
         m = bond_metrics(b, price, today)
-        row.update({"buy_pct": r["avg"] / nominal * 100 if r["avg"] else None, "price_pct": price / nominal * 100 if price else None,
-                    "nominal": nominal, "ytm": m["ytm"], "dur": m["dur"], "to": m["to"], "coupon": m["coupon_rate"],
-                    "cur_yield": m["cur_yield"], "next": m["next"], "spread": _spread(m["ytm"], m["dur"]), "maturity": b.get("maturity"), "call": b.get("call"),
-                    "risk": RISK_RU.get(b.get("risk"), ""), "floating": b.get("floating"), "amort": b.get("amort"),
-                    "sector": b.get("sector")})
+        ex = exacts.get(r["uid"])
+        row.update({"buy_pct": avg / nominal * 100 if avg else None, "price_pct": price / nominal * 100 if price else None,
+                    "nominal": nominal, "face_cur": b.get("cur") or "rub", "isin": (ex or {}).get("isin") or bond_isin(r),
+                    "ytm": m["ytm"], "ytm_tax": None, "dur": m["dur"], "mdur": None, "convexity": None, "to": m["to"],
+                    "coupon": m["coupon_rate"], "cur_yield": m["cur_yield"], "next": m["next"], "maturity": b.get("maturity"),
+                    "call": b.get("call"), "risk": RISK_RU.get(b.get("risk"), ""), "floating": b.get("floating"),
+                    "amort": b.get("amort"), "sector": b.get("sector"), "cf_source": "approx"})
+        if ex:
+            row.update({k: ex[k] for k in ("ytm", "ytm_tax", "dur", "mdur", "convexity", "to", "cf_source")})
+            row["end"] = ex["end"]
+            sp = ex["stress_pct"]
+        else:
+            if m["ytm"] is not None and m["dur"]:      # приближение: только дюрация
+                row["mdur"] = m["dur"] / (1 + m["ytm"] / 100)
+                sp = {dy: -row["mdur"] * dy for dy in STRESS_DY}
+            else:
+                sp = {}
+        row["spread"] = _spread(row["ytm"], row["dur"])
+        row["stress"] = {str(dy): {"pct": p, "rub": p / 100.0 * v} for dy, p in sp.items()}
+        for dy, p in sp.items():
+            stress_rub[dy] += p / 100.0 * v
+        m = dict(m, ytm=row["ytm"], dur=row["dur"])
         out.append(row)
-        if m["ytm"] is not None and v:
-            w["ytm"] += m["ytm"] * v
+        if row["ytm"] is not None and v and abs(row["ytm"]) > YTM_OUTLIER:
+            outliers.append({"ticker": row["ticker"], "name": row["name"], "ytm": row["ytm"], "value": v})
+        elif row["ytm"] is not None and v:
+            w["ytm"] += row["ytm"] * v
             w["ytm_v"] += v
-        if m["dur"] is not None and v:
+            if row.get("ytm_tax") is not None:
+                w["yt"] += row["ytm_tax"] * v
+                w["yt_v"] += v
+        if row.get("mdur") is not None and v and abs(row["ytm"] or 0) <= YTM_OUTLIER:
+            w["md"] += row["mdur"] * v
+            w["md_v"] += v
+        if m["dur"] is not None and v and abs(row["ytm"] or 0) <= YTM_OUTLIER:
             w["dur"] += m["dur"] * v
             w["dur_v"] += v
         if m["cur_yield"] is not None and v:
@@ -271,7 +358,14 @@ def bonds_report(client, rows):
                              "amount": per * r["qty"], "est": False})
     pays.sort(key=lambda p: p["date"])
     metrics = {"count": len(bonds), "value": tot_bonds,
-               "ytm": w["ytm"] / w["ytm_v"] if w["ytm_v"] else None, "dur": w["dur"] / w["dur_v"] if w["dur_v"] else None,
+               "ytm": w["ytm"] / w["ytm_v"] if w["ytm_v"] else None,
+               "ytm_tax": w["yt"] / w["yt_v"] if w["yt_v"] else None,
+               "mdur": w["md"] / w["md_v"] if w["md_v"] else None,
+               "ytm_value": w["ytm_v"], "outliers": outliers, "outliers_value": sum(o["value"] for o in outliers),
+               "approx_count": sum(1 for x in out if x.get("cf_source") == "approx"),
+               "stress": {str(dy): {"rub": stress_rub[dy], "pct": stress_rub[dy] / tot_bonds * 100 if tot_bonds else None}
+                          for dy in STRESS_DY},
+               "dur": w["dur"] / w["dur_v"] if w["dur_v"] else None,
                "cur_yield": w["cy"] / w["cy_v"] if w["cy_v"] else None,
                "coupons_12m": sum(p["amount"] for p in pays if p["kind"] == "coupon"),
                "issuers": len({r["name"].split(" ")[0] for r in bonds})}

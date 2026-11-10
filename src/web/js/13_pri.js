@@ -7,7 +7,7 @@ function pPri(){
   if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="pri-r">Повторить</button></div>`;
   const today=new Date().toISOString().slice(0,10),rows=d.rows;
   const wk=new Date(Date.now()+7*864e5).toISOString().slice(0,10);
-  const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${esc(r.isin)}</small>`:''}</td>
+  const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${esc(r.isin)}</small>`:''}</td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
     <td class="num">${ddm(r.start)}${r.start===today?'<br><small class="pos">сегодня</small>':''}</td><td class="num">${esc(r.end.replace(' г.',''))}</td>
     <td class="l">${esc(r.book)}</td><td class="l">${r.link?`<a class="blue-link" href="${esc(r.link)}" target="_blank" rel="noopener">объявление Мосбиржи ↗</a>`:''}</td></tr>`).join('');

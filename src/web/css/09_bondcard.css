@@ -1,0 +1,36 @@
+[data-isin]{cursor:pointer}
+#bc-ov{position:fixed;inset:0;z-index:40;display:flex;justify-content:flex-end;background:#0009;backdrop-filter:blur(2px)}
+#bc-ov .bc-dr{width:min(780px,100%);height:100%;background:var(--bg);border-left:1px solid var(--line2);overflow:auto;padding:18px 20px 32px;
+  box-shadow:-14px 0 40px #0006;animation:bcin .18s ease-out}
+@keyframes bcin{from{transform:translateX(30px);opacity:0}to{transform:none;opacity:1}}
+.bc-bar{display:flex;gap:8px;align-items:center;margin-bottom:14px}
+.bc-bar .sp{flex:1}
+.bc-bar .btn{padding:7px 12px;font-size:13px}
+.bc-h h1{font-size:19px;font-weight:700;letter-spacing:-.01em;line-height:1.3;margin-bottom:6px}
+.bc-h .row2{display:flex;flex-wrap:wrap;gap:8px;align-items:center;color:var(--tx2);font-size:12.5px}
+.bc-h code{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--tx2);background:var(--card2);padding:1px 6px;border-radius:5px}
+.bc-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:14px 0}
+.bc-kpis .card{padding:12px 14px}
+.bc-kpis .k{color:var(--tx2);font-size:12px}
+.bc-kpis .v{font-size:19px;font-weight:680;margin-top:5px;letter-spacing:-.02em;white-space:nowrap}
+.bc-kpis .s{color:var(--mu);font-size:11.5px;margin-top:2px}
+.bc-sec{margin-top:14px}
+.bc-sec h2{display:flex;align-items:center}
+.bc-par{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 28px}
+.bc-par div{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+.bc-par div span:first-child{color:var(--mu)}
+.bc-par div span:last-child{text-align:right;color:var(--tx);min-width:0;overflow-wrap:anywhere}
+.bc-rel{padding:11px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;margin-bottom:12px;line-height:1.5}
+.bc-rel b.pos{color:var(--pos)}.bc-rel b.neg{color:var(--neg)}
+.bc-load{padding:60px 0;text-align:center;color:var(--mu)}
+.bc-warn{margin:10px 0;padding:9px 12px;border-radius:10px;border:1px solid #c9850055;background:#c985001a;color:var(--tx2);font-size:12.5px}
+.bc-ch{width:100%}
+.bc-more{margin-top:8px}
+#bc-ov .tbl{max-height:360px}
+#bc-ov tr[data-isin]:hover td{background:var(--card2)}
+body.bc-open{overflow:hidden}
+@media(max-width:760px){
+  #bc-ov .bc-dr{width:100%;border-left:0;padding:14px 14px 28px}
+  .bc-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .bc-par{grid-template-columns:1fr}
+}

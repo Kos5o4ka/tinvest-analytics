@@ -8,15 +8,16 @@ function pBonds(){
   if(!m.count)return'<div class="card empty">В портфеле нет облигаций</div>';
   let rows=b.rows.slice();rows.forEach(r=>r.rk=r.rating?RSC.indexOf(r.rating.v):null);const{k,d}=S.bsort;
   rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
-  const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(...rows.map(r=>r.ytm||0)),mxD=Math.max(...rows.map(r=>r.dur||0));
-  const cols=[['name','Облигация','l'],['qty','Кол-во'],['buy_pct','Покупка, %'],['price_pct','Цена, %'],['value_rub','Стоимость'],['pnl_rub','P&L'],['share','Доля'],['ytm','Доходность'],['spread','Спред к КБД'],['dur','Дюрация'],['coupon','Купон'],['next','След. купон'],['maturity','Погашение'],['rk','Рейтинг','l'],['risk','Риск','l']];
+  const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(1,...rows.map(r=>Math.min(r.ytm||0,60))),mxD=Math.max(...rows.map(r=>r.dur||0));
+  const cols=[['name','Облигация','l'],['qty','Кол-во'],['buy_pct','Покупка, %'],['price_pct','Цена, %'],['value_rub','Стоимость'],['pnl_rub','P&L'],['share','Доля'],['ytm','Доходность'],['ytm_tax','После НДФЛ'],['spread','Спред к КБД'],['dur','Дюрация'],['coupon','Купон'],['next','След. купон'],['maturity','Погашение'],['rk','Рейтинг','l'],['risk','Риск','l']];
   const th=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
-  const body=rows.map(r=>`<tr><td>${ident(r,[r.ticker,r.floating?'флоатер':'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>
+  const body=rows.map(r=>`<tr data-isin="${esc(r.isin||r.ticker||'')}"><td>${ident(r,[r.ticker,r.floating?'флоатер':'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>
     <td class="num">${f0(r.qty)}</td><td class="num">${r.buy_pct!=null?f2(r.buy_pct):'—'}</td><td class="num">${r.price_pct!=null?f2(r.price_pct):'—'}</td>
     <td class="num">${M(r.value_rub,'rub',0)}</td>
     <td class="num ${cls(r.pnl_rub)}"><span class="arr">${r.pnl_rub>0?'▲':r.pnl_rub<0?'▼':''}</span>${r.pnl_pct!=null?pct(r.pnl_pct,1):'—'}</td>
     ${heatCell(r.share,mxS,'201,133,0',pctp(r.share))}
-    ${heatCell(r.ytm,mxY,'25,158,112',r.ytm!=null?pctp(r.ytm,2)+(r.to==='offer'?' <small class="mu">оф.</small>':''):'—')}
+    ${heatCell(r.ytm,mxY,'25,158,112',r.ytm!=null?pctp(r.ytm,2)+(r.to==='offer'?' <small class="mu">оф.</small>':'')+(r.cf_source==='approx'?' <small class="mu" title="Приблизительный расчёт: нет графика выплат MOEX">≈</small>':''):'—')}
+    ${heatCell(r.ytm_tax,mxY,'25,158,112',r.ytm_tax!=null?pctp(r.ytm_tax,2):'—')}
     <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread)+' п.п.':'—'}</td>
     ${heatCell(r.dur,mxD,'213,81,129',r.dur!=null?r.dur.toFixed(2).replace('.',',')+' г':'—')}
     <td class="num">${r.coupon!=null?pctp(r.coupon,2):'—'}</td>
@@ -24,9 +25,15 @@ function pBonds(){
     <td class="num">${r.maturity?ddm(r.maturity):'—'}${r.call?`<br><small class="mu">оферта ${ddm(r.call)}</small>`:''}</td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
     <td class="l">${r.risk?`<span class="tag" style="${r.risk==='высокий'?'color:var(--neg)':r.risk==='низкий'?'color:var(--pos)':''}">${r.risk}</span>`:''}</td></tr>`).join('');
+  const sk=['-3','-2','-1','1','2','3'],st=m.stress||{};
+  chart('c-stress',bars,{h:220,labels:sk.map(x=>(x>0?'+':'−')+Math.abs(x)+' п.п.'),series:[{n:'Изменение стоимости',c:S3,v:sk.map(x=>(st[x]||{}).rub||0)}],legend:false,
+    colorOf:v=>v>=0?'#19a070':'#d5524a',empty:'Нет данных для стресс-теста'});
+  const outs=m.outliers||[];
   chart('c-ladder',bars,{h:220,labels:b.ladder.map(x=>x[0]),series:[{n:'Погашается / оферта',c:S1,v:b.ladder.map(x=>x[1])}],legend:false});
-  return`<div class="g g6">${kpi('Облигации',M(m.value,'rub',0),`${m.count} выпусков · ${pctp(m.value/tot*100)} портфеля`,null,S1)}
+  return`<div class="g g4">${kpi('Облигации',M(m.value,'rub',0),`${m.count} выпусков · ${pctp(m.value/tot*100)} портфеля`,null,S1)}
     ${kpi('Доходность портфеля',pctp(m.ytm,2),'средневзвешенная к погашению / оферте','pos',S3)}
+    ${kpi('Доходность после НДФЛ',pctp(m.ytm_tax,2),'13% на купоны и разницу к цене; без ЛДВ','pos',S3)}
+    ${kpi('Модиф. дюрация',m.mdur!=null?m.mdur.toFixed(2).replace('.',',')+' г':'—','−1% к цене на +1 п.п. ставки ≈ 1 × мод. дюрация',null,S5)}
     ${kpi('Дюрация',m.dur!=null?m.dur.toFixed(2).replace('.',',')+' года':'—','средневзвешенная, по Маколею',null,S5)}
     ${kpi('Текущая купонная доходность',pctp(m.cur_yield,2),'годовой купон / цена',null,S4)}
     ${kpi('Купоны за 12 месяцев',M(m.coupons_12m,'rub',0),'по графику выплат, до налога','pos',S7)}
@@ -35,9 +42,14 @@ function pBonds(){
     <div class="g g3"><div class="card"><h2>Лестница погашений и оферт, ₽</h2><div id="c-ladder" class="chart"></div></div>
     <div class="card"><h2>Кредитный риск (оценка брокера)</h2>${hbars(b.risk.map(([n,v])=>({n,v,c:n==='высокий'?S8:n==='низкий'?S3:n==='средний'?S4:'#6f7686',s:pctp(v/(m.value||1)*100)})),S1,null,0)}</div>
     <div class="card"><h2>Тип купона, выпусков</h2>${hbars(b.kinds.map(([n,v],i)=>({n,v,c:PAL[i]})),S1,x=>f0(x.v),1)}</div></div>
+    <div class="card"><h2>Стресс-тест ставок: изменение стоимости портфеля облигаций, ₽</h2><div id="c-stress" class="chart"></div>
+      <div class="tbl"><table class="bt"><thead><tr><th class="l">Сдвиг ставок</th>${sk.map(x=>`<th>${x>0?'+':'−'}${Math.abs(x)} п.п.</th>`).join('')}</tr></thead><tbody>
+      <tr><td class="l">Изменение, ₽</td>${sk.map(x=>`<td class="num ${cls((st[x]||{}).rub)}">${(st[x]||{}).rub!=null?M(st[x].rub,'rub',0):'—'}</td>`).join('')}</tr>
+      <tr><td class="l">Изменение, %</td>${sk.map(x=>`<td class="num ${cls((st[x]||{}).pct)}">${(st[x]||{}).pct!=null?pct((st[x]||{}).pct,2):'—'}</td>`).join('')}</tr></tbody></table></div>
+      <p class="note">Параллельный сдвиг доходностей всех выпусков с полной переоценкой по графику выплат (для выпусков без данных MOEX, помечены ≈, — по модиф. дюрации). Не учитывает изменения кредитных спредов.</p></div>
     ${ratingsCard(b)}
     ${insightsCard(b)}
-    <p class="note">Доходность — эффективная годовая к погашению или к ближайшей оферте (пометка «оф.»), по текущей цене с НКД. Для флоатеров будущие купоны приняты равными последнему известному, для облигаций с амортизацией расчёт приблизительный. Дюрация — по Маколею, в годах.</p>`;
+    <p class="note">Доходность — эффективная годовая к погашению или к ближайшей оферте (пометка «оф.»), по текущей цене с НКД. Для флоатеров будущие купоны приняты равными последнему известному, для облигаций с амортизацией расчёт приблизительный. Дюрация — по Маколею, в годах. «После НДФЛ» — упрощённо: 13% с купонов и с положительной разницы между погашением и ценой покупки (без прогрессивной ставки 15% и ЛДВ). Пометка ≈ — график выплат MOEX недоступен, расчёт приблизительный.${outs.length?` В средние показатели не включены выпуски с доходностью выше 100% (distressed, ${M(m.outliers_value,'rub',0)}): ${outs.map(o=>esc(o.name)+' '+pctp(o.ytm,0)).join(', ')}.`:''}</p>`;
 }
 
 

@@ -271,7 +271,7 @@ def rating_for(name):
 def apply_ratings(rows):
     dist = defaultdict(float)
     for r in rows:
-        r["rating"] = rating_for(r.get("name") or "")
+        r["rating"] = best_rating(r.get("isin") or r.get("ticker"), r.get("name") or "")
         dist[rating_bucket(r["rating"]["v"] if r["rating"] else None)] += r.get("value_rub") or 0
     return sorted(dist.items(), key=lambda x: -x[1])
 

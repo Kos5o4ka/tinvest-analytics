@@ -86,6 +86,8 @@ class Handler(BaseHTTPRequestHandler):
                                  {"Content-Disposition": 'attachment; filename="operations.csv"'})
             if u.path == "/api/screener":
                 return self.send(200, screener_payload())
+            if u.path == "/api/bond":
+                return self.send(200, bond_card(q.get("isin", "")))
             if u.path == "/api/primary":
                 return self.send(200, primary_payload())
             if u.path == "/api/ratings":
