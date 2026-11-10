@@ -43,7 +43,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "T-Invest Analytics"
-APP_VERSION = "0.5"
+APP_VERSION = "0.6"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -62,6 +62,9 @@ DEFAULT_CONFIG = {
     "verify_ssl": True,
     "ca_file": "",
     "port": 8765,
+    "theme": "auto",        # auto | dark | light
+    "targets": {},          # целевые доли по классам активов, %: {"share": 50, "bond": 40, ...}
+    "notify_days": 7,       # за сколько дней напоминать о выплатах
 }
 
 # Корневой сертификат Минцифры (Russian Trusted Root CA, RSA, до 27.02.2032).
@@ -151,6 +154,31 @@ def load_config():
     if os.environ.get("TINVEST_TOKEN"):
         cfg["token"] = os.environ["TINVEST_TOKEN"]
     return cfg
+
+
+def make_backup():
+    """Zip с согласованной копией базы и настройками БЕЗ токена."""
+    tmp = os.path.join(APP_DIR, "backup.%d.tmp" % threading.get_ident())
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        cfg = {k: v for k, v in load_config().items() if k != "token"}
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(tmp, "data.db")
+            z.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
+            z.writestr("README.txt", "Резервная копия T-Invest Analytics. Токен API в копию не входит.\n"
+                       "Восстановление: закройте программу и положите data.db в папку данных (%s).\n" % APP_DIR)
+        return buf.getvalue()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def save_config(cfg):
@@ -2048,6 +2076,9 @@ class Handler(BaseHTTPRequestHandler):
                 data = build_summary(cfg, acc, q.get("period", "all"))
                 return self.send(200, operations_csv(data), "text/csv; charset=utf-8",
                                  {"Content-Disposition": 'attachment; filename="operations.csv"'})
+            if u.path == "/api/backup":
+                return self.send(200, make_backup(), "application/zip",
+                                 {"Content-Disposition": 'attachment; filename="tinvest_backup_%s.zip"' % date.today().isoformat()})
             if u.path == "/api/import/template.csv":
                 return self.send(200, TEMPLATE_CSV.encode("utf-8-sig"), "text/csv; charset=utf-8",
                                  {"Content-Disposition": 'attachment; filename="import_template.csv"'})
@@ -2075,6 +2106,23 @@ class Handler(BaseHTTPRequestHandler):
                         cfg[k] = bool(body[k])
                 if "ca_file" in body:
                     cfg["ca_file"] = str(body["ca_file"]).strip()
+                if body.get("theme") in ("auto", "dark", "light"):
+                    cfg["theme"] = body["theme"]
+                if isinstance(body.get("targets"), dict):
+                    tg = {}
+                    for k, v in body["targets"].items():
+                        try:
+                            x = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 < x <= 100:
+                            tg[str(k)[:24]] = round(x, 2)
+                    cfg["targets"] = tg
+                if "notify_days" in body:
+                    try:
+                        cfg["notify_days"] = max(0, min(60, int(body["notify_days"])))
+                    except (TypeError, ValueError):
+                        pass
                 for k in ("hosts_prod", "hosts_sandbox"):
                     if isinstance(body.get(k), list):
                         hosts = [str(h).strip() for h in body[k] if str(h).strip()]
@@ -2230,6 +2278,7 @@ def main():
 PAGE = r'''<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>T-Invest Analytics</title>
+<script>(function(){try{var t=localStorage.getItem('ta_theme')||'auto';document.documentElement.dataset.theme=t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}catch(e){document.documentElement.dataset.theme='dark'}})()</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffdd2d'/%3E%3Cpath d='M8 21l5-6 4 3 7-8' stroke='%23111' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
 :root{
@@ -2411,6 +2460,63 @@ textarea.in{resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;fo
 .drop:hover,.drop.over{border-color:var(--ac);background:#ffdd2d08;color:var(--tx)}
 .map{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+
+/* ── светлая тема ── */
+:root[data-theme=light]{--bg:#f3f4f7;--side:#fff;--card:#fff;--card2:#f0f2f6;--line:#e4e7ed;--line2:#d2d7e0;
+  --tx:#15171c;--tx2:#4a515f;--mu:#7a8292;--pos:#0f8f5c;--neg:#d23b3b;color-scheme:light}
+[data-theme=light] ::-webkit-scrollbar-thumb{background:#cdd2dc}
+[data-theme=light] .nav button:hover,[data-theme=light] .acl button:hover{background:#eff1f5}
+[data-theme=light] .nav button.on,[data-theme=light] .acl button.on,[data-theme=light] .seg button.on{background:#eceff4}
+[data-theme=light] .msw i,[data-theme=light] .av{background:#cdd2dc}
+[data-theme=light] .hero{background:linear-gradient(135deg,#fff 0%,#fff 55%,#fff7cc 100%)}
+[data-theme=light] .pill{background:#0000000a}
+[data-theme=light] .grid-l{stroke:#0000001a}
+[data-theme=light] .hb .tr,[data-theme=light] .li .bar{background:#0000000d}
+[data-theme=light] .li .it:hover,[data-theme=light] tr:hover td{background:#00000006}
+[data-theme=light] td{border-bottom-color:#0000000d}
+[data-theme=light] .tag,[data-theme=light] .acl small em,[data-theme=light] .rm .s-later{background:#0000000d}
+[data-theme=light] .rm div{background:#00000005}
+[data-theme=light] .rm .s-next{color:#2a6fc4}
+[data-theme=light] #tip{background:#fffffff2;box-shadow:0 10px 30px #0002}
+[data-theme=light] .btn.ghost{background:#fff}
+.rm .s-done{background:#3ecf8e1f;color:var(--pos)}
+.pronly{display:none}
+.remind{display:flex;gap:12px;align-items:flex-start;border-color:#ffdd2d66;background:linear-gradient(135deg,var(--card),#ffdd2d10)}
+.remind b{font-weight:600}.remind small{display:block;color:var(--mu);font-size:12px;margin-top:2px}
+.reb-in{width:84px;text-align:right}
+.reb-sum{font-size:12.5px;color:var(--tx2)}
+
+/* ── мобильный вид ── */
+@media(max-width:760px){
+  html,body{height:auto}
+  body{display:block;overflow:auto}
+  aside{width:100%;border-right:0;border-bottom:1px solid var(--line);padding:10px 10px 8px;overflow:visible}
+  .logo{padding:0 6px 8px}
+  .nav{flex-direction:row;overflow-x:auto;gap:4px;padding-bottom:4px}
+  .nav button{white-space:nowrap;padding:7px 10px}.nav .sep{display:none}
+  .accs{margin-top:8px;padding-top:8px}
+  .acl{flex-direction:row;overflow-x:auto;gap:6px;padding-bottom:4px}
+  .acl button{min-width:150px;border:1px solid var(--line)}
+  .side-foot{padding-top:6px}
+  main{display:block}
+  #view{overflow:visible;padding:14px 12px 40px}
+  .top{padding:12px}
+  .top h1{font-size:17px;width:100%}
+  .g4,.g6,.g2,.g3,.c-1-2,.c-2-1{grid-template-columns:1fr}
+  .hero .val{font-size:30px}.hero .meta{margin-left:0;gap:18px}
+  .tbl{max-height:none!important}
+}
+
+/* ── печать / PDF ── */
+@media print{
+  aside,.top .btn,.top .seg,.upd,#tip,.noprint{display:none!important}
+  html,body{height:auto;overflow:visible;display:block;background:#fff!important}
+  main{display:block}#view{overflow:visible;padding:0}
+  .top{padding:0 0 10px;border:0}.pronly{display:block;color:#666;font-size:12px;width:100%}
+  .card{break-inside:avoid;box-shadow:none}.tbl{max-height:none!important;overflow:visible!important}
+  .wrap{max-width:none}
+  @page{margin:12mm}
+}
 </style></head>
 <body>
 <aside>
@@ -2428,6 +2534,9 @@ textarea.in{resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;fo
     <h1 id="title">Обзор</h1>
     <div class="seg" id="period"></div>
     <span class="upd" id="upd"></span>
+    <span class="pronly" id="prinfo"></span>
+    <button class="btn ghost" id="thm" title="Сменить тему">◐</button>
+    <button class="btn ghost" id="pdf" title="Печать / сохранить как PDF">PDF</button>
     <button class="btn ghost" id="refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></svg>Обновить</button>
   </div>
   <div id="view"></div>
@@ -2471,9 +2580,10 @@ const IC={
  fees:'<path d="M12 2v20M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>',
  tax:'<path d="M9 14l6-6M9.5 8.5h.01M14.5 13.5h.01"/><path d="M5 3h14v18l-3.5-2-3.5 2-3.5-2L5 21z"/>',
  imp:'<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
+ reb:'<path d="M12 3v18M5 7h14M5 7l-2 6a3 3 0 0 0 6 0zM19 7l-2 6a3 3 0 0 0 6 0z"/>',
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const PAGES=[['dash','Обзор'],['ret','Доходность'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],null,['imp','Импорт отчётов'],['set','Настройки']];
+const PAGES=[['dash','Обзор'],['ret','Доходность'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],null,['imp','Импорт отчётов'],['set','Настройки']];
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
 const PERIOD_PAGES=['dash','ret','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
@@ -2664,7 +2774,7 @@ async function load(force,periodOnly){
 function loadExtra(force){
   const acc=S.account,p=new URLSearchParams({account:acc});if(force)p.set('force','1');
   if(force){S.bonds=null;S.hist=null}
-  if(!S.bonds)api('/api/bonds?'+p).then(b=>{if(S.account!==acc)return;S.bonds=b;if(['dash','bonds','pay'].includes(S.page))render()}).catch(e=>{if(S.account!==acc)return;S.bonds={error:e.message};if(['bonds','pay'].includes(S.page))render()});
+  if(!S.bonds)api('/api/bonds?'+p).then(b=>{if(S.account!==acc)return;S.bonds=b;notifyUpcoming();if(['dash','bonds','pay'].includes(S.page))render()}).catch(e=>{if(S.account!==acc)return;S.bonds={error:e.message};if(['bonds','pay'].includes(S.page))render()});
   if(!S.hist)api('/api/history?'+p).then(h=>{if(S.account!==acc)return;S.hist=h;if(['dash','ret'].includes(S.page))render()}).catch(e=>{if(S.account!==acc)return;S.hist={error:e.message,days:[]};if(['dash','ret'].includes(S.page))render()});
 }
 function skeleton(){
@@ -2672,7 +2782,7 @@ function skeleton(){
   <div class="g c-2-1"><div class="sk" style="height:320px"></div><div class="sk" style="height:320px"></div></div></div>`;
 }
 function render(){
-  S.charts=[];hideTip();
+  S.charts=[];hideTip();prInfo();
   const v=$('#view');
   if(S.page==='set')return renderSettings();
   if(S.page==='imp')return renderImport();
@@ -2682,7 +2792,7 @@ function render(){
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax})[S.page]()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -3082,7 +3192,13 @@ async function renderSettings(){
     <input class="in num" type="number" id="amt" value="1000000" min="1" step="1000" style="width:160px"><button class="btn ghost" id="sbpay">Пополнить выбранный счёт, ₽</button></div>
     <p class="note">Песочница — виртуальный счёт без реальных данных: сначала он пуст.</p></div></div>`:''}
   <div class="card"><h2>Локальные данные</h2><p class="note" style="margin-bottom:12px">Операции, история цен, справочник бумаг и логотипы хранятся в базе на этом компьютере: <span class="mono">${esc(c.data_dir)}</span>. При обновлении догружаются только новые данные.</p>
-    <div class="row"><button class="btn ghost" id="cache">Перезагрузить всё из API</button></div></div>
+    <div class="row"><button class="btn ghost" id="cache">Перезагрузить всё из API</button><a class="btn ghost" href="/api/backup" download>Скачать резервную копию</a></div>
+    <p class="note" style="margin-top:10px">Резервная копия — zip с базой и настройками. Токен в неё не входит.</p></div>
+  <div class="card"><h2>Оформление и напоминания</h2><div style="display:grid;gap:16px">
+    <div class="row"><div class="seg" id="thsel">${[['auto','Авто'],['light','Светлая'],['dark','Тёмная']].map(([k,t])=>`<button data-t="${k}" class="${curTheme()===k?'on':''}">${t}</button>`).join('')}</div></div>
+    <div class="row"><label class="field" style="max-width:260px"><span>Напоминать о выплатах за, дней (0 — выключить)</span><input class="in num" id="nd" type="number" min="0" max="60" value="${c.notify_days??7}"></label>
+      <button class="btn ghost" id="ndsave" style="align-self:flex-end">Сохранить</button><button class="btn ghost" id="ntf" style="align-self:flex-end">Разрешить системные уведомления</button></div>
+    <p class="note">Напоминания показываются на «Обзоре» и «Выплатах», а системные уведомления приходят, пока программа открыта. Печать отчёта: кнопка PDF сверху → «Сохранить как PDF» (печатается текущий раздел и период).</p></div></div>
   <div class="card" id="whatsnew"><h2>Что нового<span class="sp">версия ${esc(c.version||'')}</span></h2>${changelogHtml()}</div>
   <div class="card"><h2>Роадмап<span class="sp">что планируется</span></h2>${roadmapHtml()}</div>
   <details class="card"><summary style="cursor:pointer;font-weight:600;color:var(--tx2)">Дополнительно</summary><div style="display:grid;gap:18px;margin-top:16px">
@@ -3092,6 +3208,9 @@ async function renderSettings(){
     <label class="sw"><input type="checkbox" id="vs" ${c.verify_ssl?'checked':''}><i></i><div><b>Проверять SSL-сертификат</b><small>Отключайте только для отладки</small></div></label>
     <div class="row"><button class="btn ghost" id="save2">Сохранить</button></div></div></details></div>`;
   const msg=(t,ok)=>{$('#msg').innerHTML=`<div class="msg ${ok?'ok':'err'}">${esc(t)}</div>`};
+  $('#thsel').onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;applyTheme(b.dataset.t);post('/api/config',{theme:b.dataset.t}).catch(()=>{});$('#thsel').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b))};
+  $('#ndsave').onclick=async()=>{try{await post('/api/config',{notify_days:$('#nd').value});S.cfg.notify_days=+$('#nd').value;msg('Сохранено',1)}catch(e){msg(e.message)}};
+  $('#ntf').onclick=async()=>{try{if(!('Notification' in window))return msg('Браузер не поддерживает уведомления');const r=await Notification.requestPermission();msg(r==='granted'?'Уведомления разрешены':'Уведомления не разрешены',r==='granted')}catch(e){msg(e.message)}};
   const body=()=>({token:$('#tok').value,sandbox:$('#sb').checked,verify_ssl:$('#vs').checked,ca_file:$('#ca').value,
     hosts_prod:$('#hp').value.split('\n'),hosts_sandbox:$('#hs').value.split('\n')});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
@@ -3107,8 +3226,93 @@ async function renderSettings(){
 }
 
 
+
+/* ── тема, печать ── */
+function themeNow(t){return t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}
+function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}document.documentElement.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t}
+function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
+$('#thm').onclick=()=>{const n={auto:'light',light:'dark',dark:'auto'}[curTheme()]||'auto';applyTheme(n);post('/api/config',{theme:n}).catch(()=>{});if(S.data)render()};
+$('#pdf').onclick=()=>window.print();
+let _prevTheme=null;
+window.addEventListener('beforeprint',()=>{_prevTheme=document.documentElement.dataset.theme;document.documentElement.dataset.theme='light'});
+window.addEventListener('afterprint',()=>{if(_prevTheme)document.documentElement.dataset.theme=_prevTheme});
+function prInfo(){const a=S.accounts.find(x=>x.id===S.account),pg=(PAGES.find(p=>p&&p[0]===S.page)||[])[1]||'';
+  const per=PAGES&&PERIOD_PAGES.includes(S.page)?((PERIODS.find(x=>x[0]===S.period)||[])[1]||''):'';
+  $('#prinfo').textContent=['T-Invest Analytics',pg,S.account==='all'?'все счета':(a?a.name:''),per,new Date().toLocaleDateString('ru-RU')].filter(Boolean).join(' · ')}
+
+/* ── напоминания о выплатах ── */
+function upcoming(){
+  const n=S.cfg&&S.cfg.notify_days!=null?+S.cfg.notify_days:7,b=S.bonds;if(!n||!b||b.error)return[];
+  const from=new Date().toISOString().slice(0,10),to=new Date(Date.now()+n*864e5).toISOString().slice(0,10);
+  const ev=(b.payments||[]).filter(p=>p.date>=from&&p.date<=to).map(p=>({date:p.date,name:p.name,kind:p.kind,amount:p.amount}));
+  (b.rows||[]).forEach(r=>{if(r.call&&r.call>=from&&r.call<=to)ev.push({date:r.call,name:r.name,kind:'offer',amount:null})});
+  return ev.sort((a,c)=>a.date.localeCompare(c.date));
+}
+const EVK={coupon:'купон',dividend:'дивиденд',redemption:'погашение',offer:'оферта'};
+function remindHtml(){
+  const ev=upcoming();if(!ev.length)return'';
+  return`<div class="card remind noprint"><div>${svgI(IC.pay,1.8).replace('<svg','<svg width="22" height="22"')}</div><div><b>Ближайшие события (${ev.length})</b>
+    ${ev.slice(0,6).map(e=>`<small>${ddm(e.date)} · ${EVK[e.kind]||e.kind} · ${esc(e.name)}${e.amount!=null?' · '+M(e.amount):''}</small>`).join('')}
+    ${ev.length>6?`<small>…и ещё ${ev.length-6}</small>`:''}</div></div>`;
+}
+function notifyUpcoming(){
+  try{
+    if(!('Notification' in window)||Notification.permission!=='granted')return;
+    const seen=new Set(JSON.parse(lsGet('ta_notified')||'[]'));
+    upcoming().forEach(e=>{const k=e.date+'|'+e.kind+'|'+e.name;if(seen.has(k))return;seen.add(k);
+      new Notification('T-Invest: '+(EVK[e.kind]||e.kind)+' '+ddm(e.date),{body:e.name+(e.amount!=null?' · '+M(e.amount):'')})});
+    localStorage.setItem('ta_notified',JSON.stringify([...seen].slice(-300)));
+  }catch(e){}
+}
+
+/* ── Ребалансировка ── */
+S.reb={contrib:'',buyOnly:true,draft:null};
+function pReb(){
+  const ps=S.data.portfolio.positions,tot=ps.reduce((a,x)=>a+(x.value_rub||0),0);
+  if(!(tot>0))return'<div class="card empty">В портфеле нет активов для расчёта</div>';
+  const cur={};ps.forEach(x=>{const t=x.type||'other';cur[t]=(cur[t]||0)+(x.value_rub||0)});
+  if(!S.reb.draft)S.reb.draft=Object.assign({},(S.cfg&&S.cfg.targets)||{});
+  const tg=S.reb.draft;
+  const keys=[...new Set([...Object.keys(cur),...Object.keys(tg)])].sort((a,b)=>(cur[b]||0)-(cur[a]||0));
+  const sumT=keys.reduce((a,k)=>a+(+tg[k]||0),0),has=sumT>0;
+  const C=Math.max(0,+S.reb.contrib||0),T2=tot+C,buyOnly=S.reb.buyOnly;
+  const w=k=>has?(+tg[k]||0)/sumT:0;
+  let act={};
+  if(has){
+    if(buyOnly){const need={};keys.forEach(k=>{need[k]=Math.max(0,T2*w(k)-(cur[k]||0))});const sp=keys.reduce((a,k)=>a+need[k],0);
+      keys.forEach(k=>{act[k]=C>0&&sp>0?need[k]*C/sp:0})}
+    else keys.forEach(k=>{act[k]=T2*w(k)-(cur[k]||0)});
+  }
+  const need0=has?Math.max(0,Math.max(...keys.filter(k=>w(k)>0).map(k=>(cur[k]||0)/w(k)))-tot):0;
+  const after=k=>((cur[k]||0)+(act[k]||0))/(buyOnly?T2:T2);
+  const rows=keys.map(k=>{const cp=(cur[k]||0)/tot*100,tp=has?w(k)*100:0,dv=cp-tp,a=act[k]||0;
+    return`<tr><td class="l"><b>${esc(TYPES[k]||(k==='other'?'Прочее':k))}</b></td><td class="num">${M(cur[k]||0)}</td><td class="num">${pctp(cp)}</td>
+      <td class="num"><input class="in num reb-in" data-k="${esc(k)}" type="number" min="0" max="100" step="0.5" value="${tg[k]!=null?tg[k]:''}" placeholder="0"> %</td>
+      <td class="num ${has?(Math.abs(dv)<0.5?'mu':dv>0?'neg':'pos'):'mu'}">${has?(dv>0?'+':'')+dv.toFixed(1).replace('.',',')+' п.п.':'—'}</td>
+      <td class="num ${a>0.5?'pos':a<-0.5?'neg':'mu'}">${Math.abs(a)<1?'—':(a>0?'Докупить ':'Продать ')+M(Math.abs(a))}</td>
+      <td class="num">${has?pctp(after(k)*100):'—'}</td></tr>`}).join('');
+  const dev=has?keys.reduce((a,k)=>a+Math.abs((cur[k]||0)/tot-w(k)),0)/2*100:0;
+  return`<div class="g g4">${kpi('Стоимость портфеля',M(tot),'по текущим ценам')}${kpi('Сумма целей',`<span class="${!has?'mu':Math.abs(sumT-100)<0.05?'pos':'neg'}">${sumT.toFixed(1).replace('.',',')} %</span>`,!has?'введите целевые доли ниже':Math.abs(sumT-100)<0.05?'цели заданы':'расчёт нормирован к 100%')}
+    ${kpi('Отклонение от целей',has?pctp(dev):'—','сколько % портфеля стоит «не там»',has&&dev>5?'neg':'')}${kpi('Без продаж нужно внести',has?M(need0):'—','чтобы выйти на цели одними покупками')}</div>
+  <div class="card"><h2>Целевая структура по классам активов</h2>
+    <div class="row" style="margin-bottom:14px;gap:18px;flex-wrap:wrap"><label class="field" style="max-width:240px"><span>Новый взнос, ₽ (необязательно)</span><input class="in num" id="rb-c" type="number" min="0" step="1000" value="${S.reb.contrib}" placeholder="0"></label>
+      <label class="sw"><input type="checkbox" id="rb-b" ${buyOnly?'checked':''}><i></i><div><b>Только докупать</b><small>Ничего не продавать, распределить взнос</small></div></label></div>
+    <div class="tbl"><table><thead><tr><th class="l">Класс</th><th>Сейчас, ₽</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>Действие</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="row" style="margin-top:14px"><button class="btn" id="rb-s">Сохранить цели</button><button class="btn ghost" id="rb-r">Сбросить</button><span class="reb-sum" id="rb-sum"></span></div></div>
+  <p class="note">Расчёт по классам активов (акции, облигации, фонды, валюта…) на уровне портфеля, без учёта комиссий, налогов и лотности. Это справочный расчёт, а не инвестиционная рекомендация. Цели сохраняются локально.</p>`;
+}
+function bindReb(){
+  const d=S.reb.draft;
+  $('#view').querySelectorAll('.reb-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)d[i.dataset.k]=Math.min(100,v);else delete d[i.dataset.k];render()});
+  $('#rb-c').onchange=e=>{S.reb.contrib=e.target.value;render()};
+  $('#rb-b').onchange=e=>{S.reb.buyOnly=e.target.checked;render()};
+  $('#rb-r').onclick=()=>{S.reb.draft=null;S.reb.contrib='';render()};
+  $('#rb-s').onclick=async e=>{e.currentTarget.disabled=true;try{await post('/api/config',{targets:d});S.cfg.targets=Object.assign({},d);$('#rb-sum').textContent='Сохранено'}catch(x){$('#rb-sum').textContent=x.message}finally{e.currentTarget.disabled=false}};
+}
+
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+ ['0.6','10.11.2026',['<b>«Ребалансировка»</b> — целевые доли по классам активов, что докупить или продать, распределение нового взноса','<b>Светлая тема</b> (авто / светлая / тёмная) и <b>мобильный вид</b>','<b>Напоминания</b> о купонах, дивидендах, офертах и погашениях — на «Обзоре» и системными уведомлениями','<b>Отчёт в PDF</b> — кнопка «PDF» печатает текущий раздел и период в светлой теме','<b>Резервная копия</b> базы одним файлом (без токена) в «Настройках»']],
  ['0.5','10.11.2026',['В настройках появились <b>«Что нового»</b> и <b>роадмап</b> — сюда вносятся все изменения','Номер версии внизу боковой панели, по клику открывает список обновлений']],
  ['0.4','10.11.2026',['<b>«Все счета»</b> — сводная аналитика по всем счетам, включая импортированные','Переключатель <b>«скрыть пустые»</b> счета','Везде <b>названия бумаг</b> вместо ISIN и <b>логотипы эмитентов</b> (кэшируются локально)',
    'Раздел <b>«Доходность»</b>: история стоимости по дням, доходность без влияния пополнений, сравнение с LQDT и индексом МосБиржи (TMOS), просадка, таблица «год × месяц»',
@@ -3121,22 +3325,24 @@ const CHANGELOG=[
 ];
 const ROADMAP=[
  ['now','Проверка на реальном API','Сверить расчёты с живыми счетами и поправить найденные расхождения'],
- ['now','Лаунчер с автообновлением','Маленький скрипт, который сам скачивает свежую версию программы с GitHub'],
  ['next','Готовые форматы брокеров','Пресеты для отчётов Сбера, ВТБ, Альфы, БКС и Финама — без ручной настройки колонок'],
  ['next','Точные амортизации облигаций','График амортизаций из API — для точной доходности и календаря выплат'],
  ['next','Налоги точнее','Перенос убытков прошлых лет, льгота долгосрочного владения (ЛДВ), ИИС, курсовые разницы'],
  ['next','Кредитные рейтинги','Рейтинги АКРА / Эксперт РА рядом с облигациями, распределение портфеля по рейтингам'],
- ['later','Целевые доли и ребалансировка','Задать желаемую структуру портфеля и видеть, что докупить или продать'],
- ['later','Уведомления','Напоминания о купонах, офертах и погашениях'],
- ['later','Отчёт в PDF','Красивый отчёт по портфелю за период — для себя или чтобы поделиться'],
- ['later','Резервная копия базы','Зашифрованная копия базы в облаке (например, приватный репозиторий GitHub)'],
- ['later','Светлая тема и мобильный вид','Удобная работа с телефона'],
+ ['later','Зашифрованная копия в облаке','Автоматическая зашифрованная копия базы (например, в приватном репозитории GitHub)'],
+ ['done','Лаунчер с автообновлением','Маленький скрипт сам скачивает свежую версию программы с GitHub и проверяет контрольную сумму'],
+ ['done','Целевые доли и ребалансировка','Раздел «Ребалансировка»: целевая структура, что докупить или продать, распределение взноса'],
+ ['done','Уведомления','Напоминания о купонах, дивидендах, офертах и погашениях — в приложении и системные'],
+ ['done','Отчёт в PDF','Кнопка «PDF»: печать текущего раздела и периода в светлой теме'],
+ ['done','Резервная копия базы','Файл-архив с базой и настройками (без токена) в «Настройках»'],
+ ['done','Светлая тема и мобильный вид','Авто / светлая / тёмная тема и адаптивная вёрстка для телефона'],
 ];
 function changelogHtml(){return`<div class="cl">${CHANGELOG.map(([v,d,items])=>`<div><div class="vh"><b>Версия ${v}</b><span>${d}</span></div><ul>${items.map(i=>`<li>${i}</li>`).join('')}</ul></div>`).join('')}</div>`}
-function roadmapHtml(){const L={now:['s-now','Сейчас'],next:['s-next','Следующее'],later:['s-later','Позже']};
+function roadmapHtml(){const L={now:['s-now','Сейчас'],next:['s-next','Следующее'],later:['s-later','Позже'],done:['s-done','Готово']};
   return`<div class="rm">${ROADMAP.map(([s,t,d])=>`<div><em class="${L[s][0]}">${L[s][1]}</em><span><b style="font-weight:600">${t}</b><small>${d}</small></span></div>`).join('')}</div>`}
 
 function bindPage(){
+  if(S.page==='reb')bindReb();
   document.querySelectorAll('#view [data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));
   const sortable=(id,key)=>{const t=$(id);if(t)t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;
     S[key]={k,d:S[key].k===k?-S[key].d:(['name','type','risk','maturity','next'].includes(k)?1:-1)};render()}};
