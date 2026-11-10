@@ -1,0 +1,19 @@
+# Секреты и личные данные — никогда не коммитить
+.env
+*.env
+config.json
+*.db
+*.sqlite
+tinvest_data/
+.tinvest_analytics/
+# Отчёты брокеров и выгрузки
+*.csv
+*.xlsx
+*.xls
+*.pdf
+# Служебное
+__pycache__/
+*.pyc
+*.bak
+*.tmp
+.DS_Store
