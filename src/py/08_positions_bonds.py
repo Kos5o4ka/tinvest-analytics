@@ -1,0 +1,283 @@
+# ═══════════════════════════════ позиции ═══════════════════════════════
+
+def pos_row(info, **kw):
+    info = info or {}
+    r = {"uid": info.get("uid") or kw.get("uid") or "", "ticker": info.get("ticker") or kw.get("ticker") or "",
+         "name": info.get("name") or kw.get("name") or info.get("ticker") or kw.get("ticker") or "",
+         "logo": info.get("logo") or "", "color": info.get("color") or "", "sector": info.get("sector") or "",
+         "type": kw.get("type") or info.get("type") or "", "qty": 0.0, "avg": 0.0, "price": 0.0, "cur": "rub",
+         "value": 0.0, "value_rub": None, "cost_rub": 0.0, "pnl": 0.0, "pnl_rub": None, "pnl_pct": None,
+         "daily": None, "blocked": False, "nkd": 0.0}
+    r.update({k: v for k, v in kw.items() if k not in ("uid", "ticker", "name") or v})
+    return r
+
+
+CUR_TICKERS = {"usd": "USD000UTSTOM", "eur": "EUR_RUB__TOM", "cny": "CNYRUB_TOM", "hkd": "HKDRUB_TOM",
+               "gbp": "GBPRUB_TOM", "chf": "CHFRUB_TOM", "jpy": "JPYRUB_TOM", "try": "TRYRUB_TOM",
+               "kzt": "KZTRUB_TOM", "byn": "BYNRUB_TOM", "amd": "AMDRUB_TOM"}
+
+
+def fx_uid(client, cur):
+    st = store()
+    v = st.get("fxuid:" + cur, ttl=30 * DAY)
+    if v or cur not in CUR_TICKERS or not client.ready:
+        return v
+    try:
+        found = client.find(CUR_TICKERS[cur])
+    except ApiError:
+        return None
+    for i in found:
+        if (i.get("ticker") or "").upper() == CUR_TICKERS[cur] and i.get("uid"):
+            st.put("fxuid:" + cur, i["uid"])
+            return i["uid"]
+    return None
+
+
+def fx_now(client, curs):
+    out = {"rub": 1.0}
+    need = {c: fx_uid(client, c) for c in curs if c != "rub"}
+    uids = [u for u in need.values() if u]
+    lp = {}
+    if uids and client.ready:
+        try:
+            lp = client.last_prices(uids)
+        except ApiError:
+            lp = {}
+    for c, u in need.items():
+        if u and lp.get(u):
+            out[c] = lp[u]
+    return out
+
+
+def tinvest_positions(port, names):
+    raw = port.get("positions") or []
+    fx = {"rub": 1.0}
+    for x in raw:
+        if x.get("instrumentType") == "currency":
+            info = names.get(x.get("instrumentUid") or x.get("figi")) or {}
+            iso = (x.get("ticker") or info.get("ticker") or "")[:3].lower()
+            if iso and iso != "rub" and qf(x.get("currentPrice")) > 0:
+                fx[iso] = qf(x.get("currentPrice"))
+    out = []
+    for x in raw:
+        info = names.get(x.get("instrumentUid") or x.get("figi")) or {}
+        qty = qf(x.get("quantity"))
+        avg = qf(x.get("averagePositionPriceFifo")) or qf(x.get("averagePositionPrice"))
+        price = qf(x.get("currentPrice"))
+        nkd = qf(x.get("currentNkd"))
+        cur = cur_of(x.get("currentPrice"))
+        itype = x.get("instrumentType") or info.get("type") or ""
+        if itype == "futures":
+            value, cost = qf(x.get("varMargin")), 0.0
+        else:
+            value, cost = qty * (price + nkd), qty * avg
+        if x.get("expectedYieldFifo") or x.get("expectedYield"):
+            pnl = qf(x.get("expectedYieldFifo")) or qf(x.get("expectedYield"))
+        else:
+            pnl = qty * (price - avg) if avg else 0.0
+        rate = fx.get(cur)
+        tk = x.get("ticker") or info.get("ticker") or (x.get("figi") or "")[:12]
+        if itype == "currency":
+            tk = tk[:3].upper()
+            info = dict(info, name=CUR_NAMES.get(tk, info.get("name") or tk), ticker=tk)
+        out.append(pos_row(info, uid=x.get("instrumentUid") or info.get("uid") or x.get("figi") or "", ticker=tk,
+                           type=itype, qty=qty, avg=avg, price=price, cur=cur, nkd=nkd, value=value,
+                           value_rub=value * rate if rate is not None else None,
+                           cost_rub=cost * rate if rate is not None else 0.0, pnl=pnl,
+                           pnl_rub=pnl * rate if rate is not None else None,
+                           pnl_pct=pnl / cost * 100 if cost else None,
+                           daily=qf(x.get("dailyYield")) if x.get("dailyYield") else None, blocked=bool(x.get("blocked"))))
+    return out
+
+
+CUR_NAMES = {"RUB": "Рубли", "USD": "Доллар США", "EUR": "Евро", "CNY": "Китайский юань", "HKD": "Гонконгский доллар",
+             "GBP": "Фунт стерлингов", "CHF": "Швейцарский франк", "KZT": "Тенге", "TRY": "Турецкая лира",
+             "AMD": "Армянский драм", "BYN": "Белорусский рубль", "JPY": "Японская иена"}
+
+
+def imported_positions(client, ops, names):
+    f = fifo(ops)
+    real = [u for u in f if not u.startswith("imp:")]
+    lp = {}
+    if real and client.ready:
+        try:
+            lp = client.last_prices(real)
+        except ApiError:
+            lp = {}
+    curs = {(names.get(u) or {}).get("cur", "rub") for u in f}
+    cash = defaultdict(float)
+    for o in ops:
+        cash[cur_of(o.get("payment"))] += qf(o.get("payment"))
+    fx = fx_now(client, curs | set(cash))
+    out = []
+    for uid, p in f.items():
+        info = names.get(uid) or {"name": next((o.get("name") for o in ops if (o.get("instrumentUid") or o.get("figi")) == uid), uid),
+                                  "ticker": uid.replace("imp:", "")[:14]}
+        itype = info.get("type") or next((TYPE_FROM_KIND.get(o.get("instrumentKind")) for o in ops
+                                          if (o.get("instrumentUid") or o.get("figi")) == uid and o.get("instrumentKind")), "") or ""
+        qty, cost = p["qty"], p["cost"]
+        cur = info.get("cur") or "rub"
+        nkd, unit = 0.0, None
+        if uid in lp:
+            unit = lp[uid]
+            if itype == "bond":
+                b = bond_info(client, uid)
+                nominal = (b or {}).get("nominal") or 1000.0
+                unit = unit / 100.0 * nominal
+                nkd = (b or {}).get("aci") or 0.0
+        if unit is None:
+            unit = p["last_unit"]
+        value = qty * (unit + nkd)
+        rate = fx.get(cur)
+        pnl = qty * unit - cost
+        out.append(pos_row(info, uid=uid, type=itype, qty=qty, avg=cost / qty if qty else 0.0, price=unit, cur=cur, nkd=nkd,
+                           value=value, value_rub=value * rate if rate else None, cost_rub=cost * (rate or 1.0),
+                           pnl=pnl, pnl_rub=pnl * rate if rate else None, pnl_pct=pnl / cost * 100 if cost else None))
+    for c, v in cash.items():
+        if abs(v) >= 0.01:
+            rate = fx.get(c)
+            iso = c.upper()
+            out.append(pos_row({"name": CUR_NAMES.get(iso, iso), "ticker": iso}, uid="cash:" + c, type="currency",
+                               qty=v, price=rate or 0.0, avg=0.0, cur="rub", value=v * (rate or 0.0),
+                               value_rub=v * rate if rate else None, pnl=0.0, pnl_rub=0.0))
+    return out
+
+
+def merge_positions(lists):
+    acc = {}
+    for rows in lists:
+        for r in rows:
+            k = r["uid"] or r["ticker"]
+            if r["type"] == "currency":
+                k = "cur:" + (r["ticker"] or "")[:3].upper()
+            if k not in acc:
+                acc[k] = dict(r)
+                continue
+            a = acc[k]
+            for f in ("qty", "value", "cost_rub", "pnl"):
+                a[f] = (a.get(f) or 0.0) + (r.get(f) or 0.0)
+            for f in ("value_rub", "pnl_rub", "daily"):
+                if a.get(f) is not None or r.get(f) is not None:
+                    a[f] = (a.get(f) or 0.0) + (r.get(f) or 0.0)
+            a["blocked"] = a["blocked"] or r["blocked"]
+    out = list(acc.values())
+    for r in out:
+        if r["type"] != "currency" and r["qty"]:
+            if r.get("cost_rub") and r.get("value_rub") is not None and r["cur"] == "rub":
+                r["avg"] = r["cost_rub"] / r["qty"]
+            if r.get("cost_rub") and r.get("pnl_rub") is not None:
+                r["pnl_pct"] = r["pnl_rub"] / r["cost_rub"] * 100
+    total = sum((r["value_rub"] or 0) for r in out if r["type"] != "futures") or 1
+    for r in out:
+        r["share"] = (r["value_rub"] or 0) / total * 100 if r["type"] != "futures" else 0
+    out.sort(key=lambda r: -(r["value_rub"] if r["value_rub"] is not None else r["value"]))
+    return out
+
+
+def totals_from_rows(rows):
+    t = defaultdict(float)
+    for r in rows:
+        v = r["value_rub"] or 0.0
+        t[{"share": "shares", "bond": "bonds", "etf": "etf", "currency": "currencies", "futures": "futures",
+           "option": "options", "sp": "sp"}.get(r["type"], "other")] += v
+    t["total"] = sum(v for k, v in t.items() if k != "futures")
+    return t
+
+
+# ═══════════════════════════════ облигации и выплаты ═══════════════════════════════
+
+def _spread(ytm, dur):
+    try:
+        k = kbd_at(dur) if ytm is not None and dur else None
+        return round(ytm - k, 2) if k is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+RISK_RU = {"RISK_LEVEL_LOW": "низкий", "RISK_LEVEL_MODERATE": "средний", "RISK_LEVEL_HIGH": "высокий"}
+
+
+def bonds_report(client, rows):
+    today = date.today().isoformat()
+    horizon = (date.today() + timedelta(days=365)).isoformat()
+    bonds = [r for r in rows if r["type"] == "bond" and r["uid"] and r["qty"] > 0]
+    infos = dict(zip([r["uid"] for r in bonds], pool_map(lambda r: bond_info(client, r["uid"]), bonds)))
+    out, pays = [], []
+    tot_bonds = sum((r["value_rub"] or 0) for r in bonds) or 0.0
+    w = defaultdict(float)
+    ladder, risk = defaultdict(float), defaultdict(float)
+    kinds = defaultdict(int)
+    for r in bonds:
+        b = infos.get(r["uid"])
+        v = r["value_rub"] or 0.0
+        row = {k: r.get(k) for k in ("uid", "name", "ticker", "logo", "color", "qty", "value_rub", "pnl_rub", "pnl_pct", "cur")}
+        row["share"] = v / tot_bonds * 100 if tot_bonds else 0
+        if not b:
+            out.append(row)
+            continue
+        nominal = b.get("nominal") or 1000.0
+        price = r["price"] if r["price"] else 0.0
+        m = bond_metrics(b, price, today)
+        row.update({"buy_pct": r["avg"] / nominal * 100 if r["avg"] else None, "price_pct": price / nominal * 100 if price else None,
+                    "nominal": nominal, "ytm": m["ytm"], "dur": m["dur"], "to": m["to"], "coupon": m["coupon_rate"],
+                    "cur_yield": m["cur_yield"], "next": m["next"], "spread": _spread(m["ytm"], m["dur"]), "maturity": b.get("maturity"), "call": b.get("call"),
+                    "risk": RISK_RU.get(b.get("risk"), ""), "floating": b.get("floating"), "amort": b.get("amort"),
+                    "sector": b.get("sector")})
+        out.append(row)
+        if m["ytm"] is not None and v:
+            w["ytm"] += m["ytm"] * v
+            w["ytm_v"] += v
+        if m["dur"] is not None and v:
+            w["dur"] += m["dur"] * v
+            w["dur_v"] += v
+        if m["cur_yield"] is not None and v:
+            w["cy"] += m["cur_yield"] * v
+            w["cy_v"] += v
+        end = (b.get("call") if b.get("call") and b["call"] > today else b.get("maturity")) or ""
+        ladder[end[:4] or "бессрочные"] += v
+        risk[RISK_RU.get(b.get("risk"), "нет данных")] += v
+        kinds["Флоатер" if b.get("floating") else "Фиксированный купон"] += 1
+        if b.get("amort"):
+            kinds["С амортизацией"] += 1
+        known = [p for _, p in b.get("coupons") or [] if p]
+        for d, p in b.get("coupons") or []:
+            if today < d <= horizon:
+                amt = (p or (known[-1] if known else 0.0)) * r["qty"]
+                if amt:
+                    pays.append({"date": d, "kind": "coupon", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
+                                 "amount": amt, "est": not p})
+        if b.get("maturity") and today < b["maturity"] <= horizon:
+            pays.append({"date": b["maturity"], "kind": "redemption", "name": r["name"], "ticker": r["ticker"],
+                         "logo": r["logo"], "amount": nominal * r["qty"], "est": False})
+    # дивиденды по акциям (объявленные)
+    shares = [r for r in rows if r["type"] in ("share",) and r["uid"] and r["qty"] > 0 and not r["uid"].startswith("imp:")]
+
+    def divs(r):
+        st = store()
+        v = st.get("div:" + r["uid"], ttl=DAY)
+        if v is None and client.ready:
+            try:
+                ds = client.dividends(r["uid"], today + "T00:00:00Z", horizon + "T00:00:00Z")
+                v = [[iso_date(d.get("paymentDate")) or iso_date(d.get("recordDate")), qf(d.get("dividendNet"))] for d in ds]
+                st.put("div:" + r["uid"], v)
+            except ApiError:
+                v = []
+        return r, v or []
+
+    for r, ds in pool_map(divs, shares):
+        for d, per in ds:
+            if d and today < d <= horizon and per:
+                pays.append({"date": d, "kind": "dividend", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
+                             "amount": per * r["qty"], "est": False})
+    pays.sort(key=lambda p: p["date"])
+    metrics = {"count": len(bonds), "value": tot_bonds,
+               "ytm": w["ytm"] / w["ytm_v"] if w["ytm_v"] else None, "dur": w["dur"] / w["dur_v"] if w["dur_v"] else None,
+               "cur_yield": w["cy"] / w["cy_v"] if w["cy_v"] else None,
+               "coupons_12m": sum(p["amount"] for p in pays if p["kind"] == "coupon"),
+               "issuers": len({r["name"].split(" ")[0] for r in bonds})}
+    out.sort(key=lambda x: -(x.get("value_rub") or 0))
+    return {"rows": out, "metrics": metrics, "ladder": sorted(ladder.items()), "risk": sorted(risk.items(), key=lambda x: -x[1]),
+            "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays,
+            "ratings": apply_ratings(out), "ratings_info": ratings_status()}
+
+

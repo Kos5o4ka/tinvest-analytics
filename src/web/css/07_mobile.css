@@ -1,0 +1,21 @@
+/* ── мобильный вид ── */
+@media(max-width:760px){
+  html,body{height:auto}
+  body{display:block;overflow:auto}
+  aside{width:100%;border-right:0;border-bottom:1px solid var(--line);padding:10px 10px 8px;overflow:visible}
+  .logo{padding:0 6px 8px}
+  .nav{flex-direction:row;overflow-x:auto;gap:4px;padding-bottom:4px}
+  .nav button{white-space:nowrap;padding:7px 10px}.nav .sep{display:none}
+  .accs{margin-top:8px;padding-top:8px}
+  .acl{flex-direction:row;overflow-x:auto;gap:6px;padding-bottom:4px}
+  .acl button{min-width:150px;border:1px solid var(--line)}
+  .side-foot{padding-top:6px}
+  main{display:block}
+  #view{overflow:visible;padding:14px 12px 40px}
+  .top{padding:12px}
+  .top h1{font-size:17px;width:100%}
+  .g4,.g6,.g2,.g3,.c-1-2,.c-2-1{grid-template-columns:1fr}
+  .hero .val{font-size:30px}.hero .meta{margin-left:0;gap:18px}
+  .tbl{max-height:none!important}
+}
+

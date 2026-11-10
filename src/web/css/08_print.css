@@ -1,0 +1,10 @@
+/* ── печать / PDF ── */
+@media print{
+  aside,.top .btn,.top .seg,.upd,#tip,.noprint{display:none!important}
+  html,body{height:auto;overflow:visible;display:block;background:#fff!important}
+  main{display:block}#view{overflow:visible;padding:0}
+  .top{padding:0 0 10px;border:0}.pronly{display:block;color:#666;font-size:12px;width:100%}
+  .card{break-inside:avoid;box-shadow:none}.tbl{max-height:none!important;overflow:visible!important}
+  .wrap{max-width:none}
+  @page{margin:12mm}
+}

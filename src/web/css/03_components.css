@@ -1,0 +1,27 @@
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:18px 20px;min-width:0}
+.card h2{font-size:13px;font-weight:600;color:var(--tx2);margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.card h2 .sp{margin-left:auto;font-weight:500;color:var(--mu);font-size:12px}
+.g{display:grid;gap:16px}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.g4{grid-template-columns:repeat(4,minmax(0,1fr))}.g6{grid-template-columns:repeat(3,minmax(0,1fr))}
+@media(min-width:1640px){.g6{grid-template-columns:repeat(6,minmax(0,1fr))}}
+.c-1-2{grid-template-columns:minmax(0,1fr) minmax(0,2fr)}.c-2-1{grid-template-columns:minmax(0,2fr) minmax(0,1fr)}
+@media(max-width:1180px){.c-1-2,.c-2-1,.g2,.g3{grid-template-columns:1fr}.g4{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:860px){aside{width:200px}.g4,.g6{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+.hero{display:flex;gap:28px;align-items:flex-end;flex-wrap:wrap;background:linear-gradient(135deg,#1a1c22 0%,#16181d 55%,#1b1a14 100%);position:relative;overflow:hidden}
+.hero:after{content:"";position:absolute;right:-80px;top:-120px;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,#ffdd2d14,transparent 70%);pointer-events:none}
+.hero .lbl{color:var(--tx2);font-size:13px;font-weight:500}
+.hero .val{font-size:40px;font-weight:700;letter-spacing:-.03em;line-height:1.1;margin-top:6px}
+.hero .val small{font-size:24px;color:var(--tx2);font-weight:600}
+.pill{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:999px;font-size:12.5px;font-weight:600;background:#ffffff0d}
+.pill.pos{color:var(--pos);background:#3ecf8e17}.pill.neg{color:var(--neg);background:#ff6b6b17}
+.hero .meta{display:flex;gap:28px;margin-left:auto;flex-wrap:wrap;position:relative;z-index:1}
+.hero .meta div span{display:block;color:var(--mu);font-size:12px;margin-bottom:3px}
+.hero .meta div b{font-size:17px;font-weight:650}
+.kpi{padding:16px 18px}
+.kpi .k{color:var(--tx2);font-size:12.5px;font-weight:500;display:flex;gap:7px;align-items:center}
+.kpi .k i{width:8px;height:8px;border-radius:3px;flex:none}
+.kpi .v{font-size:21px;font-weight:680;letter-spacing:-.02em;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi .s{color:var(--mu);font-size:12px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pos{color:var(--pos)}.neg{color:var(--neg)}.mu{color:var(--mu)}.t2{color:var(--tx2)}
