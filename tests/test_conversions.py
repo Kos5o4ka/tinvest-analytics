@@ -138,6 +138,20 @@ class History(unittest.TestCase):
         self.assertEqual(h["invested"][cd], h["invested"][cd - 1])
         self.assertEqual(h["glitches"], 0)
 
+    def test_zero_priced_old_converted_no_jump(self):
+        # старая бумага числится в портфеле с нулевой ценой (остаток после обмена), но по операциям обменяна:
+        # обнулять её через 30 дней после последней свечи нельзя — стоимость переедет в новую бумагу без скачка
+        M.store().candles_put("zg", [(day(i), 100.0) for i in range(0, 40)])
+        M.store().candles_put("zn", [(day(i), 100.0) for i in range(200, 400)])
+        names = {"zg": {"isin": "NL0009805522", "ticker": "YNDX", "type": "share", "cur": "rub"},
+                 "zn": {"isin": "RU000A107T19", "ticker": "YDEX", "type": "share", "cur": "rub"}}
+        ops = [op(day(0), "INPUT", None, 0, 100000), buy(day(1), "zg", 10, 100, ticker="YNDX"), sell(day(300), "zn", 10, 100, ticker="YDEX")]
+        ops[0].pop("instrumentUid"), ops[0].pop("positionUid")
+        h = M.build_history(Offline(), ops, names, 0, None, {"zg"})
+        rets = [h["twr"][i] / h["twr"][i - 1] - 1 for i in range(1, len(h["twr"]))]
+        self.assertLess(max(abs(r) for r in rets), 0.001)
+        self.assertAlmostEqual(h["value"][100], 100000, delta=1)
+
 
 if __name__ == "__main__":
     unittest.main()
