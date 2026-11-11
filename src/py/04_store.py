@@ -1,5 +1,30 @@
 # ═══════════════════════════════ локальная база ═══════════════════════════════
 
+def apply_pending_restore(path):
+    """Восстановление из резервной копии: подготовленная база (data.db.restore-pending) подменяет текущую при открытии.
+    Прежняя база сохраняется рядом как data.db.before-restore."""
+    pend = path + ".restore-pending"
+    if not os.path.exists(pend):
+        return False
+    try:
+        if os.path.exists(path):
+            src = sqlite3.connect(path)
+            dst = sqlite3.connect(path + ".before-restore")
+            with dst:
+                src.backup(dst)
+            dst.close()
+            src.close()
+        for ext in ("-wal", "-shm"):
+            try:
+                os.remove(path + ext)
+            except OSError:
+                pass
+        os.replace(pend, path)
+        return True
+    except (OSError, sqlite3.Error):
+        return False
+
+
 class Store:
     """SQLite в ~/.tinvest_analytics/data.db: операции, свечи, справочники, импорт."""
 
@@ -8,6 +33,7 @@ class Store:
         self.local = threading.local()
         self.wlock = threading.Lock()
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        apply_pending_restore(path)
         if not os.path.exists(path):
             os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
         c = self.conn()

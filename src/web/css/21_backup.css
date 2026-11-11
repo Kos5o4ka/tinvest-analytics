@@ -1,1 +1,7 @@
-/* резервная копия */
+/* резервная копия и экспорт */
+.bk-warn{background:rgba(255,170,60,.12);border:1px solid rgba(255,170,60,.45);border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.45}
+.bk-sug{font-size:12.5px;color:var(--tx2);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.bk-chip{padding:4px 10px;font-size:12px}
+.bk-ex{display:flex;align-items:center;gap:10px}
+.bk-ex span{flex:1}
+.bk-ex .btn{min-width:72px;text-align:center}
