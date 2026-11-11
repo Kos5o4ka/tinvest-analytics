@@ -8,6 +8,7 @@ const IC={
  fees:'<path d="M12 2v20M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>',
  tax:'<path d="M9 14l6-6M9.5 8.5h.01M14.5 13.5h.01"/><path d="M5 3h14v18l-3.5-2-3.5 2-3.5-2L5 21z"/>',
  imp:'<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
+ cmp:'<path d="M8 4v16M16 4v16M4 8h8M12 16h8"/>',
  scr:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/>',
  risk:'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
  sig:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
@@ -26,10 +27,10 @@ const IC={
  kb:'<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5M9 8h6M9 12h4"/>',
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['pri','Первичка'],['cal','Календарь событий'],null,['kb','База знаний'],['imp','Импорт отчётов'],['set','Настройки']];
+const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['cmp','Сравнение облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['pri','Первичка'],['cal','Календарь событий'],null,['kb','База знаний'],['imp','Импорт отчётов'],['set','Настройки']];
 /* группы меню: ключи страниц остаются прежними, PAGES — плоский список для поиска названий */
 const NAV_GROUPS=[['Портфель',['dash','ret','bench','pos','bonds','pay','off','ops','fees']],['Учёт и планы',['tax','reb','calc','lad']],
-  ['Рынок',['mkt','scr','map','sig','pri','cal']],['Риски и контроль',['risk','mon','watch','iss']]];
+  ['Рынок',['mkt','scr','cmp','map','sig','pri','cal']],['Риски и контроль',['risk','mon','watch','iss']]];
 const NAV_FIXED=['imp','kb','set'],NAV_PINNED=['dash','set'];
 function lsJson(k,d){try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}}
 function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}

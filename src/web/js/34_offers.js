@@ -19,8 +19,19 @@ function ofPeriod(x){
   return x.period_status==='open'?`<b class="pos">${t}</b><br><small class="${x.urgent?'neg':'mu'}">открыт, до конца ${x.period_days_left===0?'сегодня':ofDays(x.period_days_left).replace('через ','')}</small>`
     :x.period_status==='closed'?`${t}<br><small class="mu">закончился</small>`:`${t}<br><small class="${x.urgent?'neg':'mu'}">${x.period_days_left!=null?'закроется '+ofDays(x.period_days_left):''}</small>`;
 }
+const OF_HELP_CHIP={pending:['Подождать','of-wait'],formula:['По формуле','of-wait'],closed:['Поздно','of-wait'],below:['Предъявить','of-warn'],fair:['Оставить','of-ok'],above:['Оставить','of-ok'],none:['Оценить','of-wait']};
+function ofHelper(x){
+  const p=x.helper;if(!p)return null;
+  const chip=(x.hint&&x.hint.code==='sell_market')?OF_HINT.sell_market:OF_HELP_CHIP[p.outcome||p.status]||OF_HELP_CHIP.none;
+  const body=`<b>${esc(p.title)}</b><p>${esc(p.text)}</p>${p.numbers?`<p class="mu">${esc(p.numbers)}.</p>`:''}
+    ${p.apply?`<p class="of-do"><b>Когда подавать.</b> ${esc(p.apply)} ${kbLink('offers','Как подать заявку на оферту')}</p>`:''}
+    ${p.risk_notes&&p.risk_notes.length?`<p class="neg">Кредитные риски: ${esc(p.risk_notes.join('; '))}.</p>`:''}
+    <p class="mu"><small>${esc(p.disclaimer)}</small></p>`;
+  return{chip,body};
+}
 function ofCard(x){
-  const h=x.hint||{},[lab,hc]=OF_HINT[h.code]||['','of-wait'],k=OF_KIND[x.kind]||OF_KIND.unknown,put=x.kind==='put';
+  const hp=x.kind==='put'?ofHelper(x):null;
+  const h=x.hint||{},[lab,hc]=hp?hp.chip:(OF_HINT[h.code]||['','of-wait']),k=OF_KIND[x.kind]||OF_KIND.unknown,put=x.kind==='put';
   const yo=x.yield_to_offer!=null&&x.yield_to_offer<=100?pctp(x.yield_to_offer,1):x.yield_to_offer!=null?'&gt; 100 %':'—';
   const cpn=!put?'—':x.coupon_known?`<b>${pctp(x.new_rate,1)}</b> годовых<br><small class="mu">доходность ${x.hold_yield!=null?pctp(x.hold_yield,1):'—'}</small>`:'<span class="mu">не объявлен</span>';
   const peers=x.peer_median!=null?`${pctp(x.peer_median,1)}<br><small class="mu">${x.peers_n} похожих выпусков</small>`:'<span class="mu">нет данных</span>';
@@ -39,7 +50,7 @@ function ofCard(x){
       <div><span class="k">${put?'Доходность к оферте':x.kind==='call'?'Доходность к колл':'Доходность к дате'}</span><span class="num">${yo}</span></div>
       <div><span class="k">Купон после оферты</span>${cpn}</div>
       <div><span class="k">Аналоги, доходность</span>${put?peers:'—'}</div></div>
-    <div class="of-hint ${hc}"><span class="of-lab">${esc(lab)}</span><div><b>${esc(h.title||'')}</b><p>${esc(h.text||'')}</p>${what}${x.risk_notes&&x.risk_notes.length&&h.code!=='put'?`<p class="neg">Обратите внимание: ${esc(x.risk_notes.join('; '))}.</p>`:''}${x.inferred?'<p class="mu"><small>Тип определён по формулировке Мосбиржи («Оферта» = право держателя); отдельного подтверждения даты нет.</small></p>':''}</div></div></div>`;
+    <div class="of-hint ${hc}"><span class="of-lab">${esc(lab)}</span>${hp?`<div><span class="mu"><small>Помощник по оферте</small></span><br>${hp.body}${x.inferred?'<p class="mu"><small>Тип определён по формулировке Мосбиржи («Оферта» = право держателя); отдельного подтверждения даты нет.</small></p>':''}</div>`:`<div><b>${esc(h.title||'')}</b><p>${esc(h.text||'')}</p>${what}${x.risk_notes&&x.risk_notes.length&&h.code!=='put'?`<p class="neg">Обратите внимание: ${esc(x.risk_notes.join('; '))}.</p>`:''}${x.inferred?'<p class="mu"><small>Тип определён по формулировке Мосбиржи («Оферта» = право держателя); отдельного подтверждения даты нет.</small></p>':''}</div>`}</div></div>`;
 }
 function ofFiltered(d){
   const hz=S.offH==='all'?null:+S.offH;
@@ -60,7 +71,7 @@ function pOff(){
   const bar=`<div class="row" style="padding:0 0 10px;gap:12px;flex-wrap:wrap;align-items:center"><span class="mu">Горизонт</span>${seg('of-h',OF_HOR,S.offH)}<span class="mu">Тип</span>${seg('of-t',OF_TYP,S.offT)}<span style="margin-left:auto">${ofKbLink()}</span></div>`;
   const list=L.length?L.map(ofCard).join(''):`<div class="card empty">${esc(d.items.length?'В выбранном горизонте и типе оферт нет: расширьте горизонт или смените тип.':d.empty_text)}</div>`;
   return kp+bar+(d.errors&&d.errors.length?`<div class="msg">Не удалось разобрать часть выпусков: ${esc(d.errors.slice(0,3).join('; '))}</div>`:'')+list+
-   `<div class="card"><h2>Как это читать</h2><p class="note">${(d.notes||[]).map(esc).join('<br><br>')}<br><br>Правило подсказки для put: если на бирже бумага стоит дороже цены выкупа — выгоднее продать на бирже; если новый купон известен и доходность после оферты ниже медианы похожих выпусков (тот же рейтинг ±1 ступень, близкий срок) больше чем на 0,5 п. п. — предъявление выглядит разумнее; если купон ещё не объявлен, показан порог ставки, ниже которого предъявление выглядит разумнее. Подсказки справочные, это не индивидуальная инвестиционная рекомендация: условия оферты проверяйте в документах выпуска и у брокера. ${ofKbLink()}.</p></div>`;
+   `<div class="card"><h2>Как это читать</h2><p class="note">${(d.notes||[]).map(esc).join('<br><br>')}<br><br>Правило подсказки для put: если на бирже бумага стоит дороже цены выкупа — выгоднее продать на бирже; подсказка появляется только после того, как эмитент объявил купон на период после оферты (обычно за день до открытия приёма заявок). Тогда доходность бумаги при текущей цене с новым купоном сравнивается с медианой похожих выпусков (тот же рейтинг ±1 ступень, близкий срок): ниже больше чем на 0,5 п. п. — предъявление выглядит разумнее; выше больше чем на 0,5 п. п. — оставить выгоднее; иначе купон в рынке. У плавающего купона размер считается по формуле, сравнение не строится. Подсказки справочные, это не индивидуальная инвестиционная рекомендация: условия оферты проверяйте в документах выпуска и у брокера. ${ofKbLink()}.</p></div>`;
 }
 function bindOff(){
   const r=$('#of-r');if(r)r.onclick=()=>{S.off=null;render()};

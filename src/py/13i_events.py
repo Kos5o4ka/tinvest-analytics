@@ -47,6 +47,50 @@ def _ev(d, kind, title, isin=None, amount=None, note="", **kw):
     return e
 
 
+EV_BADGE = {"put": "PUT", "call": "CALL", "unknown": "тип не указан"}
+
+
+def _ru_pct(x):
+    return str(x).replace(".", ",")
+
+
+def offer_events(offs, name, isin, frm, to, pref=""):
+    """События по офертам выпуска (offs — результат offer_kinds) в окне [frm, to]. У каждого есть badge (PUT / CALL / тип не указан)
+    и label. PUT: открытие приёма заявок, последний день подачи, дата выкупа; CALL: возможное досрочное погашение; тип неизвестен: оферта."""
+    out = []
+    kind = pref + "offer"
+    for o in offs:
+        if o.get("status") == "cancelled":
+            continue
+        k, d = o["kind"], o["date"]
+        badge = EV_BADGE.get(k, EV_BADGE["unknown"])
+        price = (" по цене %s%% от номинала" % _ru_pct(o["price"])) if o.get("price") else ""
+        ps, pe = o.get("period_start"), o.get("period_end")
+        win = ("; приём заявок %s – %s" % (_dmy(ps), _dmy(pe))) if ps and pe else ""
+        if k == "put":
+            if ps and frm <= ps <= to:
+                out.append(_ev(ps, kind, name, isin, None, "Открыт приём заявок по пут-оферте; выкуп %s%s" % (_dmy(d), price),
+                               badge=badge, label="Открыт приём заявок по пут-оферте", sub="put_open"))
+            if pe and frm <= pe <= to:
+                out.append(_ev(pe, kind, name, isin, None, "Последний день подачи заявки (через брокера); выкуп %s%s" % (_dmy(d), price),
+                               badge=badge, label="Последний день подачи заявки", sub="put_close"))
+            if frm <= d <= to:
+                out.append(_ev(d, kind, name, isin, None, "Дата выкупа по оферте%s%s" % (price, win),
+                               badge=badge, label="Дата выкупа по оферте", sub="put_buyback"))
+        elif frm <= d <= to:
+            if k == "call":
+                out.append(_ev(d, kind, name, isin, None, "Возможное досрочное погашение (колл): решает эмитент, заявку подавать не нужно%s" % price,
+                               badge=badge, label="Возможное досрочное погашение (колл)", sub="call"))
+            else:
+                out.append(_ev(d, kind, name, isin, None, "Оферта%s: тип не указан, проверьте условия в документах выпуска%s" % (price, win),
+                               badge=badge, label="Оферта (тип не указан)", sub="unknown"))
+    return out
+
+
+def _dmy(d):
+    return "%s.%s.%s" % (d[8:10], d[5:7], d[:4]) if d and len(d) == 10 else (d or "")
+
+
 def _bz_events(isin, name, today, horizon, pref, held=None):
     """События выпуска из данных Мосбиржи: купоны, амортизации, погашение (последняя выплата), оферты."""
     bz = moex_bondization(isin)
@@ -73,13 +117,11 @@ def _bz_events(isin, name, today, horizon, pref, held=None):
                 out.append(_ev(d, "amort", name, isin, (v * held) if (v and held) else None, "частичное погашение номинала"))
     if mat and today <= mat <= horizon and mat not in [d for d, _ in am]:
         out.append(_ev(mat, pref + "redemption", name, isin, None, "погашение выпуска"))
-    for o in bz.get("offers") or []:
-        d = o.get("offerdate")
-        if d and today <= d <= horizon:
-            note = "оферта" + (" по цене %s%% от номинала" % str(o["price"]).replace(".", ",") if o.get("price") else "")
-            if o.get("offerdatestart") and o.get("offerdateend"):
-                note += "; приём заявок %s – %s" % (o["offerdatestart"], o["offerdateend"])
-            out.append(_ev(d, ("w_offer" if pref else "offer"), name, isin, None, note))
+    try:
+        opt = moex_bond_options(isin)
+    except Exception:  # noqa: BLE001
+        opt = None
+    out += offer_events(offer_kinds(bz, opt, None, _day_add(today, -1), with_done=True), name, isin, today, horizon, pref)
     return out
 
 
@@ -125,14 +167,12 @@ def events_payload(cfg, acc, q):
         def one(r):
             try:
                 bz = moex_bondization(r["isin"])
-                out = []
-                for o in (bz or {}).get("offers") or []:
-                    d = o.get("offerdate")
-                    if d and frm <= d <= to:
-                        note = "оферта" + (" по цене %s%% от номинала" % str(o["price"]).replace(".", ",") if o.get("price") else "")
-                        if o.get("offerdatestart") and o.get("offerdateend"):
-                            note += "; приём заявок %s – %s" % (o["offerdatestart"], o["offerdateend"])
-                        out.append(_ev(d, "offer", r["name"], r["isin"], None, note))
+                try:
+                    opt = moex_bond_options(r["isin"])
+                except Exception:  # noqa: BLE001
+                    opt = None
+                offs = offer_kinds(bz or {}, opt, r.get("call"), _day_add(frm, -1), with_done=True)
+                out = offer_events(offs, r["name"], r["isin"], frm, to)
                 for a in (bz or {}).get("amort") or []:
                     d = a.get("amortdate")
                     if d and frm <= d <= to and a.get("value") and d != max([x.get("amortdate") or "" for x in bz["amort"]] + [""]):
@@ -191,7 +231,7 @@ def events_payload(cfg, acc, q):
         events = [e for e in events if e["kind"] in kinds]
     seen, uniq = {}, []
     for e in sorted(events, key=lambda e: (e["date"], e["kind"], e["title"])):
-        k = (e["date"], e["kind"], e["title"], e.get("isin"))
+        k = (e["date"], e["kind"], e["title"], e.get("isin"), e.get("sub"))
         if k in seen:
             if e.get("amount") is not None and seen[k]["amount"] is not None and e["kind"] in ("coupon", "dividend", "redemption", "amort"):
                 seen[k]["amount"] = round(seen[k]["amount"] + e["amount"], 2)
@@ -234,8 +274,10 @@ def build_ics(events):
         except ValueError:
             continue
         d1 = d0 + timedelta(days=1)
-        uid = hashlib.sha1(("%s|%s|%s|%s" % (e["date"], e["kind"], e.get("isin") or "", e["title"])).encode("utf-8")).hexdigest()[:24] + "@tinvest-analytics"
-        summ = "%s: %s" % (EV_KINDS.get(e["kind"], e["kind"]), e["title"])
+        uid = hashlib.sha1(("%s|%s|%s|%s%s" % (e["date"], e["kind"], e.get("isin") or "", e["title"], ("|" + e["sub"]) if e.get("sub") else "")).encode("utf-8")).hexdigest()[:24] + "@tinvest-analytics"
+        summ = "%s: %s" % (e.get("label") or EV_KINDS.get(e["kind"], e["kind"]), e["title"])
+        if e.get("badge"):
+            summ += " [%s]" % e["badge"]
         desc = e.get("note") or ""
         if e.get("amount") is not None:
             desc += ("; " if desc else "") + "сумма ≈ %s ₽" % ("{:,.2f}".format(e["amount"]).replace(",", " ").replace(".", ","))

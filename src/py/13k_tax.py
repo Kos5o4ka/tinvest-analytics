@@ -731,6 +731,105 @@ def tx_hints(st, settings):
     return out
 
 
+def tx_last_sale_day(year, holidays=()):
+    """Последний день года, когда сделка ещё рассчитается в этом году при T+1: последний торговый день минус один торговый день.
+    Торговым считаем будний день, не равный 31 декабря (на практике 31.12 — выходной на бирже) и не из holidays (набор date).
+    Точный календарь торгов определяет биржа."""
+    hol = set(holidays or ())
+
+    def trading(d):
+        return d.weekday() < 5 and not (d.month == 12 and d.day == 31) and d not in hol
+    d = date(year, 12, 31)
+    while not trading(d):
+        d -= timedelta(days=1)
+    last = d
+    d = last - timedelta(days=1)
+    while not trading(d):
+        d -= timedelta(days=1)
+    return d, last
+
+
+def tx_forecast(st, settings, pays=None, holidays=()):
+    """Прогноз налога на конец года по обычным (не ИИС) счетам и подсказки по сбору убытков. pays — прогноз выплат (как на странице «Выплаты»)."""
+    today, cy = st["today"], st["today"].year
+    end = date(cy, 12, 31).isoformat()
+    sale_day, last_day = tx_last_sale_day(cy, holidays)
+    gen = [g for g in st["groups"] if g["kind"] == "gen"]
+    iis = [g["name"] for g in st["groups"] if g["kind"] == "iis"]
+    out = {"year": cy, "available": bool(gen), "iis_excluded": iis, "sale_day": sale_day.isoformat(), "last_trading_day": last_day.isoformat(),
+           "days_to_sale": (sale_day - today).days, "pays_known": pays is not None, "harvest": [], "skipped": [], "harvest_saving": 0.0}
+    if not gen:
+        return out
+    g = gen[0]
+    row = next((r for r in g["rows"] if r["year"] == cy), None) or {}
+    f = lambda k: float(row.get(k, 0.0) or 0.0)
+    ec = ed = 0.0
+    n = 0
+    for p in pays or []:
+        if today.isoformat() < (p.get("date") or "") <= end and p.get("kind") in ("coupon", "dividend") and p.get("amount"):
+            if p["kind"] == "coupon":
+                ec += p["amount"]
+            else:
+                ed += p["amount"]
+            n += 1
+    base = f("base")
+    tax_now = tx_ndfl(base, cy)[0]
+    tax_end, lo, hi = tx_ndfl(base + ec + ed, cy)
+    thr = 5000000.0 if cy < 2025 else 2400000.0
+    out["forecast"] = {
+        "trade": f("trade"), "ldv_exempt": f("ldv_exempt"), "carry_used": f("carry_used"), "trade_base": f("trade_base"), "dividends": f("dividends"),
+        "coupons": f("coupons"), "other": f("overnight") + max(0.0, f("deriv")), "base": base, "tax_now": tax_now, "withheld": f("withheld"),
+        "exp_coupons": ec, "exp_dividends": ed, "exp_n": n, "base_end": base + ec + ed, "tax_end": tax_end, "tax13": lo * 0.13, "tax15": hi * 0.15,
+        "to_withhold": max(0.0, tax_end - f("withheld")), "refund": max(0.0, f("withheld") - tax_end), "threshold": thr,
+        "rate": 0.15 if base + ec + ed > thr else 0.13}
+    # сбор убытков: позиции обычных счетов с нереализованным убытком
+    fee_rate = st["eng"]["fee_rate"]
+    t0, _ = tx_cur_tax(g, [], cy, settings)
+    cands, skipped = [], []
+    for uid, lots in tx_group_open(st, g).items():
+        pr = tx_pos_price(st["pos"].get(uid))
+        if not pr or lots[0]["type"] in TAX_SKIP_TYPES:
+            continue
+        q = sum(l["qty"] for l in lots)
+        base_r = {"acc": lots[0]["acc"], "uid": uid, "name": lots[0]["name"], "ticker": lots[0]["ticker"], "type": lots[0]["type"],
+                  "bucket": "deriv" if lots[0]["type"] == "option" else "sec", "kind": "sell", "bdate": None}
+        rows = tx_fee_sim(lots, q, pr, fee_rate, today, base_r)
+        res = sum(r["result"] for r in rows)
+        if res >= -50:
+            continue
+        t1, _ = tx_cur_tax(g, rows, cy, settings)
+        # лоты с прибылью, которым скоро исполнится 3 года (ЛДВ): продажа всей позиции лишит их льготы
+        soon = None
+        if lots[0]["type"] in TAX_LDV_TYPES:
+            for l in lots:
+                if l.get("blind") or not l["date"] or l["date"] < TAX_LDV_FROM or l["unit"] >= pr:
+                    continue
+                dd = (tx_add_years(l["date"], 3) + timedelta(days=1) - today).days
+                if 0 < dd <= 365 and (soon is None or dd < soon):
+                    soon = dd
+        c = {"uid": uid, "name": base_r["name"], "ticker": base_r["ticker"], "qty": q, "value": q * pr, "loss": -res, "saving": t0 - t1,
+             "cost": q * pr * (fee_rate + TAX_SPREAD), "ldv_days": soon, "rows": rows}
+        c["net"] = c["saving"] - c["cost"]
+        if soon is not None and soon <= 180:
+            c["reason"] = "через %d дн. часть лотов получит ЛДВ, продавать невыгодно" % soon
+            skipped.append(c)
+        elif c["net"] > 1:
+            cands.append(c)
+    cands.sort(key=lambda c: -c["saving"])
+    extra = []
+    for c in cands:        # накопительный эффект: каждая следующая продажа уменьшает налог меньше, когда прибыль уже покрыта
+        tp, _ = tx_cur_tax(g, extra, cy, settings)
+        extra = extra + c["rows"]
+        tn, _ = tx_cur_tax(g, extra, cy, settings)
+        c["saving_marginal"] = tp - tn
+    for c in cands + skipped:
+        c.pop("rows", None)
+    out["harvest"], out["skipped"] = cands[:25], skipped[:10]
+    out["harvest_saving"] = sum(c["saving_marginal"] for c in cands)
+    out["base_tax"] = t0
+    return out
+
+
 def tx_decl(st):
     decl = {}
     for g in st["groups"]:
@@ -763,7 +862,7 @@ def tx_iis_table(st, settings):
     return out
 
 
-def tax_payload_from(st, settings):
+def tax_payload_from(st, settings, pays=None):
     gen = [g for g in st["groups"] if g["kind"] == "gen"]
     cy = st["today"].year
     up, rd, rate = tx_ldv_tables(st)
@@ -787,7 +886,7 @@ def tax_payload_from(st, settings):
         "groups": [strip(g) for g in st["groups"]], "years": st["years"],
         "ldv": {"upcoming": up[:80], "ready": rd[:40], "years": [ldv_years[y] for y in sorted(ldv_years)],
                 "saved_total": sum(e["saved"] for e in ldv_years.values()), "rate": rate, "limit": TAX_LDV_LIMIT},
-        "iis": tx_iis_table(st, settings), "hints": tx_hints(st, settings), "decl": tx_decl(st),
+        "iis": tx_iis_table(st, settings), "hints": tx_hints(st, settings), "forecast": tx_forecast(st, settings, pays), "decl": tx_decl(st),
         "carry_suggest": sugg, "warnings": st["eng"]["warnings"], "conversions": st.get("conversions") or [],
         "assumptions": [
             "Счета без ИИС объединены в одну налоговую базу (сальдирование прибылей и убытков между счетами одного налогоплательщика); каждый ИИС считается отдельно.",
@@ -822,7 +921,13 @@ def tax_state(cfg, acc, force=False):
 
 def tax_get(cfg, acc, q, force):
     st, settings = tax_state(cfg, acc, force)
-    return tax_payload_from(st, settings)
+    pays = None
+    if cfg.get("token"):
+        try:
+            pays = build_bonds(cfg, acc).get("payments") or []
+        except Exception:  # noqa: BLE001
+            pays = None
+    return tax_payload_from(st, settings, pays)
 
 
 def tax_post_settings(cfg, body):

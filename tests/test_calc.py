@@ -3,6 +3,7 @@ import ast
 import os
 import sys
 import unittest
+from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _load import ROOT, load  # noqa: E402
@@ -263,3 +264,51 @@ class Compat(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IncomeGoal(unittest.TestCase):
+    def test_capital_needed(self):
+        r = M.goal_calc(50000, 120, 13.0, 0.0, 0.0, False)           # доходность 13 % до налога = 11,31 % после
+        self.assertAlmostEqual(r["capital_today"], 50000 * 12 / (0.13 * 0.87), places=4)
+        self.assertAlmostEqual(r["capital_end"], r["capital_today"])
+
+    def test_contribution_reaches_target(self):
+        r = M.goal_calc(50000, 120, 13.0, 1000000.0, 0.0, False)
+        yn, n = 0.13 * 0.87, 120
+        rm = (1 + yn) ** (1 / 12.0) - 1
+        fv = 1000000.0 * (1 + rm) ** n + r["contribution"] * ((1 + rm) ** n - 1) / rm
+        self.assertAlmostEqual(fv, r["capital_end"], places=3)
+        self.assertAlmostEqual(r["chart"]["capital"][-1], r["capital_end"], places=3)
+        self.assertGreater(r["contribution"], 0)
+        self.assertEqual(r["chart"]["labels"][0], date.today().strftime("%Y-%m"))
+
+    def test_already_reached(self):
+        r = M.goal_calc(10000, 60, 12.0, 5000000.0, 0.0, False)
+        self.assertTrue(r["reached"])
+        self.assertEqual(r["contribution"], 0.0)
+
+    def test_inflation_adjustment(self):
+        a = M.goal_calc(50000, 120, 13.0, 0.0, 8.0, True)
+        b = M.goal_calc(50000, 120, 13.0, 0.0, 8.0, False)
+        self.assertAlmostEqual(a["goal_end"], 50000 * 1.08 ** 10, places=4)
+        self.assertAlmostEqual(a["capital_end"], a["capital_today"] * 1.08 ** 10, places=3)
+        self.assertAlmostEqual(b["capital_end"], b["capital_today"])
+        self.assertGreater(a["contribution"], b["contribution"])
+
+    def test_coverage_and_validation(self):
+        r = M.goal_calc(100000, 60, 14.0, 0.0, 0.0, False, income_now=25000.0)
+        self.assertAlmostEqual(r["coverage"]["pct"], 25.0)
+        with self.assertRaises(ValueError):
+            M.goal_calc(1000, 0, 10.0)
+        with self.assertRaises(ValueError):
+            M.goal_calc(1000, 12, 0.0)
+
+    def test_months_and_endpoint_without_token(self):
+        self.assertEqual(M.goal_months({"years": "2.5"}), 30)
+        with self.assertRaises(ValueError):
+            M.goal_months({"date": "2000-01-01"})
+        out = M.calc_goal_get({}, "all", {"monthly": "80000", "years": "8", "yield": "14", "value": "300000", "real": "0"})
+        self.assertIsNone(out["error"])
+        self.assertAlmostEqual(out["result"]["capital_today"], 80000 * 12 / (0.14 * 0.87), places=3)
+        self.assertEqual(M.calc_goal_get({}, "all", {"monthly": "80000", "years": "8"})["result"], None)
+        self.assertIn("доходность", M.calc_goal_get({}, "all", {"monthly": "80000", "years": "8"})["error"])

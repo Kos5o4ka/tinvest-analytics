@@ -74,9 +74,10 @@ def _of_text_kind(t, has_period):
     return "unknown", False
 
 
-def offer_kinds(bz, opt, broker_call=None, today=None):
+def offer_kinds(bz, opt, broker_call=None, today=None, with_done=False):
     """Все БУДУЩИЕ оферты выпуска из всех источников, без дублей по (дата, тип).
     Запись: {date, kind: put|call|unknown, source, price, period_start, period_end, status: scheduled|cancelled, inferred}.
+    with_done=True добавляет и состоявшиеся оферты из bondization (status 'done'; нужно календарю за прошлые месяцы).
     Приоритет: явные поля PUTOPTIONDATE/CALLOPTIONDATE, затем тип записи bondization, затем дата брокера (присоединяется к близкой дате
     Мосбиржи, иначе 'unknown'). Одна дата может быть и put, и call — тогда две записи. Неопределимый тип — 'unknown'."""
     today = today or date.today().isoformat()
@@ -106,12 +107,13 @@ def offer_kinds(bz, opt, broker_call=None, today=None):
         t = o.get("offertype") or ""
         d = _of_date(o.get("offerdate"))
         tl = t.lower()
-        if not d or "оферт" not in tl or ("состоял" in tl and "не состоял" not in tl):
+        done = "состоял" in tl and "не состоял" not in tl
+        if not d or "оферт" not in tl or (done and not with_done):
             continue
         ps, pe = _of_date(o.get("offerdatestart")), _of_date(o.get("offerdateend"))
         kind, weak = _of_text_kind(t, bool(ps and pe))
         cancelled = "отмен" in tl or "не состоял" in tl
-        add(d, kind, "moex_offertype", o.get("price"), ps, pe, "cancelled" if cancelled else "scheduled", weak)
+        add(d, kind, "moex_offertype", o.get("price"), ps, pe, "cancelled" if cancelled else ("done" if done else "scheduled"), weak)
     bc = _of_date(broker_call)
     if bc and bc > today:
         # Брокер отдаёт одну дату без типа и нередко на несколько дней раньше даты Мосбиржи (например, 09.02 вместо пута 12.02):
@@ -245,6 +247,85 @@ def _of_pct(x):
     return ("%.1f" % x).replace(".", ",")
 
 
+def of_new_coupon(coupons, od, face, floating=False):
+    """Купон на период после пут-оферты od по купонам Мосбиржи. Объявленным считается первый купон с датой ПОСЛЕ оферты,
+    у которого указан размер (value или valueprc).
+    -> {'status': 'announced'|'pending'|'formula', 'date', 'rate' (% годовых), 'value'};
+    'pending' — эмитент ещё не объявил ставку; 'formula' — у флоатера размера нет: купон считается по формуле (ключевая ставка + спред)."""
+    cps = sorted(((c.get("coupondate"), c.get("value"), c.get("valueprc")) for c in coupons or [] if c.get("coupondate")),
+                 key=lambda x: x[0])
+    nxt = next(((d, v, vp) for d, v, vp in cps if d > od), None)
+    if nxt and (nxt[1] or nxt[2]):
+        prev = max([d for d, _, _ in cps if d <= od] or [od])
+        rate = nxt[2] if nxt[2] else nxt[1] / max(face, 1e-9) * 365.0 / max(_of_days(prev, nxt[0]), 1) * 100.0
+        return {"status": "announced", "date": nxt[0], "rate": rate, "value": nxt[1]}
+    return {"status": "formula" if floating else "pending", "date": nxt[0] if nxt else None, "rate": None, "value": None}
+
+
+def of_outcome(hold_yield, peer_median, margin=None):
+    """Сравнение доходности бумаги с новым купоном и медианы аналогов -> ('below'|'fair'|'above', разница в п. п.) или (None, None).
+    below: ниже рынка больше чем на margin; above: выше рынка больше чем на margin; иначе fair (граница включается в fair)."""
+    if hold_yield is None or peer_median is None:
+        return None, None
+    m = OF_MARGIN if margin is None else margin
+    gap = hold_yield - peer_median
+    return ("below" if gap < -m else "above" if gap > m else "fair"), gap
+
+
+def _of_dm(d):
+    return "%s.%s" % (d[8:10], d[5:7])
+
+
+def of_helper(rec):
+    """Помощник по пут-оферте (справочно): статус купона, итог сравнения с рынком, даты подачи заявки. rec — запись _of_one.
+    Рекомендация появляется только когда эмитент объявил купон на период после оферты."""
+    if rec.get("kind") != "put":
+        return None
+    ps, pe = rec.get("period_start"), rec.get("period_end")
+    window = ("с %s по %s" % (_of_dm(ps), _of_dm(pe))) if ps and pe else None
+    h = {"status": rec.get("coupon_status") or "pending", "outcome": None, "gap": None, "window": window, "title": "", "text": "",
+         "numbers": "", "apply": "", "risk_notes": list(rec.get("risk_notes") or []), "kb": "offers",
+         "disclaimer": "Справочная информация, не инвестиционная рекомендация."}
+    if rec.get("period_status") == "closed":
+        h.update(status="closed", title="Приём заявок закончился", text="Подать заявку уже нельзя: бумага останется у вас.")
+        return h
+    h["apply"] = ("Подать заявку через брокера %s (дата выкупа %s)." % (window, _of_dm(rec["date"]))) if window else \
+        ("Период приёма заявок пока не опубликован. Дата выкупа по оферте: %s." % _of_dm(rec["date"]))
+    if h["status"] == "pending":
+        h.update(title="Новый купон ещё не объявлен",
+                 text="Новый купон ещё не объявлен. Обычно его публикуют примерно за день до открытия приёма заявок — тогда здесь появится подсказка.")
+        if window:
+            h["text"] += " Ожидаемый приём заявок: %s." % window
+        return h
+    if h["status"] == "formula":
+        h.update(title="Купон по формуле",
+                 text="Купон по формуле: плавающая ставка зависит от ключевой ставки, отдельного объявления нет. Сравнение с рынком здесь "
+                      "не строится; решайте по условиям выпуска и своим целям.")
+        return h
+    nr, hy, med = rec.get("new_rate"), rec.get("hold_yield"), rec.get("peer_median")
+    h["numbers"] = "Новый купон %s %% годовых" % _of_pct(nr or 0)
+    if hy is not None:
+        h["numbers"] += "; доходность при текущей цене %s %%" % _of_pct(hy)
+    if med is not None:
+        h["numbers"] += "; медиана похожих выпусков %s %% (%d шт.)" % (_of_pct(med), rec.get("peers_n") or 0)
+    code, gap = of_outcome(hy, med)
+    h["outcome"], h["gap"] = code, gap
+    if code == "below":
+        h.update(title="Купон ниже рынка на %s п. п. — разумно предъявить к оферте" % _of_pct(-gap),
+                 text="Деньги по оферте (%s %% номинала) можно вложить в бумагу с более высокой доходностью." % _of_pct(rec["offer_price"]))
+    elif code == "above":
+        h.update(title="Купон выше рынка — оставить выгоднее",
+                 text="Доходность выше медианы похожих выпусков на %s п. п.: предъявлять нет смысла, если деньги не нужны." % _of_pct(gap))
+    elif code == "fair":
+        h.update(title="Купон в рынке — можно оставить", text="Доходность в пределах %s п. п. от медианы похожих выпусков." % _of_pct(OF_MARGIN))
+    else:
+        h.update(title="Купон объявлен", text="Сравнить с рынком не с чем: подходящих аналогов мало. Оцените ставку сами.")
+    if rec.get("price") is not None and rec["price"] > rec["offer_price"] + OF_PRICE_EPS:
+        h["text"] += " Но рыночная цена (%s %%) выше цены выкупа (%s %%): на бирже получите больше, чем по оферте." % (
+            _of_pct(rec["price"]), _of_pct(rec["offer_price"]))
+    return h
+
+
 def _of_one(r, bz, offs, today, flags):
     """Оферты одной позиции (все будущие, put и call отдельными записями) -> список записей для страницы."""
     face = r.get("nominal") or 1000.0
@@ -291,7 +372,7 @@ def _of_one(r, bz, offs, today, flags):
                "period_status": status, "period_days_left": days_left, "urgent": urgent, "offer_price": price,
                "price_known": bool(o.get("price")),
                "price": price_pct, "ytm_now": r.get("ytm"), "to_offer_rub": (r.get("qty") or 0) * face * price / 100.0,
-               "risk_notes": risk_notes, "yield_to_offer": None, "coupon_known": False, "new_rate": None,
+               "risk_notes": risk_notes, "yield_to_offer": None, "coupon_known": False, "coupon_status": None, "new_rate": None,
                "hold_yield": None, "peer_median": None, "peers_n": 0, "threshold": None}
         if kind != "put":
             rec["to_offer_rub"] = None
@@ -313,13 +394,9 @@ def _of_one(r, bz, offs, today, flags):
             rec["hint"] = _of_hint_other(rec)
             out.append(rec)
             continue
-        nxt = next(((d, v, vp) for d, v, vp in cps if d > od), None)
-        known = bool(nxt and (nxt[1] or nxt[2]))
-        rec["coupon_known"] = known
-        if known:
-            nd = nxt[0]
-            prev = max([d for d, _, _ in cps if d <= od] or [""])
-            rec["new_rate"] = nxt[2] if nxt[2] else (nxt[1] / max(face, 1e-9) * 365.0 / max(_of_days(prev or today, nd), 1) * 100.0)
+        nc = of_new_coupon(bz["coupons"], od, face, fl_)
+        known = nc["status"] == "announced"
+        rec["coupon_known"], rec["coupon_status"], rec["new_rate"] = known, nc["status"], nc["rate"]
         mac = None
         if after_cut:
             after, remain, aci_od = after_cut
@@ -327,11 +404,19 @@ def _of_one(r, bz, offs, today, flags):
             if y2 is not None:
                 mac, _m, _c = cf_risk(after, od, y2)
                 if known:
-                    rec["hold_yield"] = y2 * 100
+                    rec["hold_yield"] = y2 * 100          # запасной вариант: если оставить бумагу, а деньги по оферте вложить по номиналу
+        if known and flows and price_pct:
+            try:                                           # основной: доходность к погашению при ТЕКУЩЕЙ цене с новым купоном
+                yn = cf_ytm(price_pct / 100.0 * face + _of_aci(bz, flows, today), flows, today)
+                if yn is not None and 0 < yn * 100 < 100:
+                    rec["hold_yield"] = yn * 100
+            except Exception:  # noqa: BLE001
+                pass
         med, n = _of_peers(me, rv, fl_, mac)
         if med is not None:
             rec["peer_median"], rec["peers_n"], rec["threshold"] = med, n, med - OF_MARGIN
         rec["hint"] = _of_hint(rec, risk_notes)
+        rec["helper"] = of_helper(rec)
         out.append(rec)
     return out
 
@@ -381,7 +466,8 @@ def _of_hint(rec, risk_notes):
                 "text": "Купон плавающий и следует за ключевой ставкой, поэтому после оферты он обычно остаётся на уровне рынка. "
                         "Предъявлять нужно, только если вам нужны деньги."}
     if rec["coupon_known"] and hy is not None:
-        if med is not None and hy < med - OF_MARGIN:
+        code = of_outcome(hy, med)[0]
+        if code == "below":
             return {"code": "put", "title": "Рассмотрите предъявление",
                     "text": "Новый купон (%s %% годовых) даёт доходность %s %% против %s %% у похожих выпусков (%d шт.): ниже "
                             "рынка больше чем на 0,5 п. п. Деньги по оферте (%s %%) можно вложить в бумагу с более высокой "
@@ -392,13 +478,10 @@ def _of_hint(rec, risk_notes):
                     "text": "Новый купон известен (%s %% годовых), доходность после оферты %s %%. Сравнить с рынком не с чем: "
                             "подходящих аналогов мало. Оцените ставку сами." % (_of_pct(rec["new_rate"] or 0), _of_pct(hy))}
         return {"code": "hold", "title": "Можно держать",
-                "text": "Новый купон (%s %% годовых) даёт доходность %s %% против %s %% у похожих выпусков (%d шт.): на уровне "
-                        "рынка. Предъявлять нет смысла, если деньги не нужны." % (_of_pct(rec["new_rate"] or 0), _of_pct(hy),
-                                                                                   _of_pct(med), rec["peers_n"])}
-    t = "Ставка нового купона ещё не объявлена: дождитесь объявления."
-    if thr is not None:
-        t += " Если ставка будет ниже ≈%s %% (медиана похожих выпусков %s %% минус 0,5 п. п.), предъявление выглядит разумнее." \
-             % (_of_pct(thr), _of_pct(med))
+                "text": "Новый купон (%s %% годовых) даёт доходность %s %% против %s %% у похожих выпусков (%d шт.): %s. "
+                        "Предъявлять нет смысла, если деньги не нужны." % (_of_pct(rec["new_rate"] or 0), _of_pct(hy), _of_pct(med),
+                                                                            rec["peers_n"], "выше рынка" if code == "above" else "на уровне рынка")}
+    t = "Новый купон ещё не объявлен: дождитесь объявления ставки."
     if rec["urgent"]:
         t += " Срок предъявления близко. " + how
     return {"code": "wait", "title": "Дождитесь объявления ставки", "text": t}
@@ -504,11 +587,37 @@ def _ld_cands(q_min_rating, floaters, amort, min_turn, today):
         rv = rt["v"] if rt else ("AAA" if e["kind"] == "ofz" else None)
         if rv not in RATING_SCALE or RATING_SCALE.index(rv) > mi:
             continue
-        end, kind = e["mat"], "maturity"
-        if e.get("offer") and today < e["offer"] < end:
-            end, kind = e["offer"], "offer"
-        out.append({"e": e, "rv": rv, "end": end, "kind": kind, "t": _of_days(today, end) / 365.25})
+        out.append({"e": e, "rv": rv, "end": e["mat"], "kind": "maturity", "t": _of_days(today, e["mat"]) / 365.25, "offs": []})
+    # Срок до даты оферты только для ПУТ (решает держатель). Колл (решает эмитент) и «тип не указан» срок не меняют:
+    # ступень стоит на погашении, а доходность считается к худшему (см. _ld_eval).
+    wo = [c for c in out if c["e"].get("offer") and today < c["e"]["offer"] < c["e"]["mat"]]
+    for c, offs in zip(wo, pool_map(lambda c: _safe_call(offers_of_isin, c["e"]["_isin"], c["e"]["offer"], today) or [], wo, workers=8)):
+        c["offs"] = [o for o in offs if o["status"] != "cancelled"]
+        pd = min([o["date"] for o in c["offs"] if o["kind"] == "put" and today < o["date"] < c["e"]["mat"]] or [""])
+        if pd:
+            c["end"], c["kind"], c["t"] = pd, "offer", _of_days(today, pd) / 365.25
     return out
+
+
+def _ld_eval(c, bz, today):
+    """Потоки и доходности кандидата с учётом типа оферты. None, если графика выплат нет.
+    flows — потоки лесенки: до пут-оферты для пута, иначе до погашения; ytm (%) — доходность для отбора и показа:
+    YTP для пута, YTW для колла, для «тип не указан» — меньшая из доходности к дате оферты и к погашению."""
+    e = c["e"]
+    fl_ = bool((e.get("_ci") or {}).get("floating"))
+    face = float(e.get("nominal") or 1000.0)
+    full = (_safe_call(bond_flows, bz, today, face, "maturity", fl_) or (None,))[0] if bz else None
+    if not full:
+        return None
+    dirty = e["price"] / 100.0 * face + _of_aci(bz, full, today)
+    yk = yields_by_kind(bz, today, face, dirty, c.get("offs") or [], floating=fl_)
+    if not yk:
+        return None
+    b = yk["basis"]
+    y = {"put": yk["ytp"], "call": yk["ytw"], "unknown": min([v for v in (yk["yto"], yk["ytm"]) if v is not None], default=None)}.get(b, yk["ytm"])
+    put = b == "put"
+    return {"face": face, "dirty": dirty, "yk": yk, "basis": b, "y": y, "flows": yk["flows"] if put else full,
+            "end": yk["end"] if put else yk["maturity"], "kind": "offer" if put else "maturity"}
 
 
 def ladder_payload(cfg, q=None):
@@ -561,6 +670,17 @@ def ladder_payload(cfg, q=None):
         want = [c["e"]["_isin"] for pl in pools for c in pl[:10]]
         for isin, bz in zip(want, pool_map(lambda x: _ld_bz(x), want, workers=8)):
             bzs[isin] = bz
+    # колл и «тип не указан»: для отбора берём доходность к худшему, а не доходность Мосбиржи (она может быть к дате колла)
+    risky = [c for pl in pools for c in pl[:12] if c["offs"] and c["kind"] != "offer"]
+    need_ = sorted({c["e"]["_isin"] for c in risky if c["e"]["_isin"] not in bzs})
+    for isin, bz in zip(need_, pool_map(lambda x: _ld_bz(x), need_, workers=8)):
+        bzs[isin] = bz
+    for c in risky:
+        ev = _ld_eval(c, bzs.get(c["e"]["_isin"]), today)
+        if ev and ev["y"] is not None:
+            c["score"] += ev["y"] * 100.0 - c["e"]["yield"]
+    for pl in pools:
+        pl.sort(key=lambda c: -c["score"])
     chosen = [[] for _ in range(rungs_n)]
     used_iss, iss_share, covered = set(), defaultdict(float), set()
 
@@ -627,20 +747,18 @@ def ladder_payload(cfg, q=None):
         bz = bzs.get(e["_isin"])
         if bz is None and e["_isin"] not in bzs:
             bz = bzs[e["_isin"]] = _ld_bz(e["_isin"])
-        face = float(e.get("nominal") or 1000.0)
-        try:
-            fl, kind, end = bond_flows(bz, today, face, floating=bool((e["_ci"] or {}).get("floating"))) if bz else (None, None, None)
-        except Exception:  # noqa: BLE001
-            fl = None
-        if not fl:
+        ev = _ld_eval(c, bz, today)
+        if not ev:
             return "%s пропущена: нет данных о графике выплат." % e["name"]
-        aci = _of_aci(bz, fl, today)
-        dirty = e["price"] / 100.0 * face + aci
-        y = cf_ytm(dirty, fl, today)
+        yk, y = ev["yk"], ev["y"]
         if y is not None and y * 100.0 > LD_YTM_MAX:
             return "%s пропущена: расчётная доходность выглядит аномальной." % e["name"]
-        c.update(flows=fl, face=face, dirty=dirty, ytm=(y * 100.0 if y is not None else e["yield"]), end=end, kind=kind,
-                 months=_ld_months(bz, today))
+        live = [o for o in c["offs"] if o["status"] != "cancelled"]
+        c.update(flows=ev["flows"], face=ev["face"], dirty=ev["dirty"], ytm=(y * 100.0 if y is not None else e["yield"]),
+                 end=ev["end"], kind=ev["kind"], months=_ld_months(bz, today), ybasis=ev["basis"],
+                 ytm_mat=yk["ytm"] * 100.0 if yk["ytm"] is not None else None,
+                 call_dates=sorted({o["date"] for o in live if o["kind"] == "call" and o["date"] < yk["maturity"]}),
+                 unk_date=min([o["date"] for o in live if o["kind"] == "unknown" and o["date"] < yk["maturity"]] or [None], key=lambda x: x or "9"))
         return None
     for i in range(rungs_n):
         keep = []
@@ -734,7 +852,8 @@ def ladder_payload(cfg, q=None):
                 continue
             e = c["e"]
             bl.append({"isin": e["_isin"], "name": e["name"], "rating": c["rv"], "ytm": c["ytm"], "end_date": c["end"],
-                       "end_kind": c["kind"], "price": e["price"], "price_dirty": c["dirty"], "lots": c["lots"],
+                       "end_kind": c["kind"], "yield_basis": c.get("ybasis"), "ytm_mat": c.get("ytm_mat"),
+                       "call_dates": c.get("call_dates") or [], "unk_date": c.get("unk_date"), "price": e["price"], "price_dirty": c["dirty"], "lots": c["lots"],
                        "cost": c["lots"] * c["dirty"], "coupon_months": c["months"], "floating": bool((e["_ci"] or {}).get("floating")),
                        "amort": bool((e["_ci"] or {}).get("amort")), "share": c["lots"] * c["dirty"] / total * 100.0})
         rows.append({"target_date": _ld_add(today, win[i][2]), "target_years": win[i][2], "window": [_ld_add(today, win[i][0]), _ld_add(today, win[i][1])],
@@ -745,8 +864,16 @@ def ladder_payload(cfg, q=None):
         warnings.append("Доля крупнейшего эмитента %s %% выше лимита %s %%: не хватило разных эмитентов." %
                         (("%.1f" % big).replace(".", ","), ("%g" % cap).replace(".", ",")))
     if any(c["kind"] == "offer" for c in allc):
-        notes.append("Если у выпуска есть оферта, срок считается до неё: к этой дате вы предъявляете бумагу эмитенту по цене выкупа "
-                     "(обычно 100 %). Заявку подаёт брокер.")
+        notes.append("Если у выпуска есть пут-оферта, срок считается до неё: к этой дате вы предъявляете бумагу эмитенту по цене выкупа "
+                     "(обычно 100 %). Заявку подаёт брокер. Доходность таких бумаг — к пут-оферте.")
+    callable_ = [c for c in allc if c.get("call_dates") or c.get("unk_date")]
+    if any(c.get("call_dates") for c in callable_):
+        notes.append("У части выпусков есть колл-опцион: эмитент может досрочно погасить бумагу. Ступень стоит на дате погашения, "
+                     "а доходность показана к худшему (меньшая из доходности к погашению и к дате колла): если выпуск погасят раньше, "
+                     "деньги вернутся раньше и их придётся реинвестировать.")
+    if any(c.get("unk_date") and not c.get("call_dates") for c in callable_):
+        notes.append("У части выпусков есть оферта, тип которой не указан. Консервативно ступень стоит на погашении, "
+                     "доходность — меньшая из доходности к дате оферты и к погашению.")
     notes.append("Бумаги гасятся по очереди: деньги возвращаются каждый год, и их можно вложить по новой ставке. Если ставки "
                  "вырастут, вы реинвестируете дороже, если упадут, длинные ступени уже зафиксировали высокую доходность.")
     if monthly:
@@ -759,6 +886,9 @@ def ladder_payload(cfg, q=None):
     return {"params": par, "today": today, "rungs": rows,
             "totals": {"invested": invested, "free": total - invested, "ytm": yld, "dur": dur, "bonds": len(allc),
                        "issuers": len(issuers), "rungs_filled": sum(1 for r_ in rows if r_["bonds"]),
+                       "callable_cost": sum(c["lots"] * c["dirty"] for c in callable_),
+                       "callable_share": sum(c["lots"] * c["dirty"] for c in callable_) / invested * 100.0 if invested > 0 else 0.0,
+                       "callable_bonds": len(callable_),
                        "coupon_12m": cp12, "monthly_avg": cp12 / 12.0, "max_issuer": big,
                        "months_with_coupon": sum(1 for m in cfm[:12] if m["coupons"] > 0)},
             "cashflow_by_month": cfm, "notes": notes, "warnings": warnings}
@@ -828,11 +958,15 @@ def ld_buckets(items, today, gran="year"):
     grand = sum(ev["amount"] for v in grp.values() for _, ev in v)
     periods = []
     for key in _ld_pspan(today, gran, list(grp)):
-        rows, by = {}, {"redemption": 0.0, "offer": 0.0, "amort": 0.0}
+        rows, by, called = {}, {"redemption": 0.0, "offer": 0.0, "amort": 0.0}, 0.0
         for it, ev in grp.get(key, []):
             r = rows.setdefault((it["isin"], ev["type"]), {"isin": it["isin"], "name": it["name"], "date": ev["date"], "type": ev["type"],
-                                                           "amount": 0.0, "n": 0, "ytm": it.get("ytm")})
+                                                           "amount": 0.0, "n": 0, "ytm": it.get("ytm"), "call": None, "call_kind": None, "call_amount": 0.0})
             r["amount"] += ev["amount"]
+            if ev.get("call"):                       # возможен досрочный возврат по колл (решает эмитент)
+                r["call"], r["call_kind"] = ev["call"], ev.get("call_kind")
+                r["call_amount"] += ev["amount"]
+                called += ev["amount"]
             r["n"] += 1
             r["date"] = min(r["date"], ev["date"])
             by[ev["type"]] += ev["amount"]
@@ -841,7 +975,7 @@ def ld_buckets(items, today, gran="year"):
         for r in lst:
             r["pct"] = r["amount"] / grand * 100.0 if grand else 0.0
         periods.append({"key": key, "label": _ld_plabel(key), "kind": "q" if "-Q" in key else "y", "total": tot,
-                        "share": tot / grand * 100.0 if grand else 0.0, "flag": None, "by_type": by, "items": lst})
+                        "share": tot / grand * 100.0 if grand else 0.0, "flag": None, "by_type": by, "callable": called, "items": lst})
     first_any = next((i for i, p in enumerate(periods) if p["total"] > 0), len(periods))
     for kind in ("q", "y"):
         ps = [p for p in periods if p["kind"] == kind]
@@ -869,13 +1003,18 @@ def ld_summary(items, today, years):
         d0 = min(d for d, _, _ in evs)
         nxt = {"date": d0, "amount": sum(a for d, a, _ in evs if d == d0), "names": sorted({n for d, _, n in evs if d == d0})}
     heavy = max([p for p in years if p["total"] > 0], key=lambda p: p["total"], default=None)
-    return {"total": tot, "avg_years": avg, "next": nxt,
+    cal = [(ev["amount"], ev.get("call_kind")) for it in items for ev in it["events"] if ev["date"] > today and ev["amount"] > 0 and ev.get("call")]
+    callable_ = {"amount": sum(a for a, _ in cal), "share": sum(a for a, _ in cal) / tot * 100.0 if tot else 0.0,
+                 "count": len({it["isin"] for it in items for ev in it["events"] if ev["date"] > today and ev.get("call")}),
+                 "unknown_amount": sum(a for a, k in cal if k == "unknown")}
+    return {"total": tot, "avg_years": avg, "next": nxt, "callable": callable_,
             "heavy": {"label": heavy["label"], "share": heavy["share"], "total": heavy["total"], "flag": heavy["flag"]} if heavy else None,
             "gaps": [p["label"] for p in years if p["flag"] == "gap"]}
 
 
 def ld_events(maturity, call, nominal, qty, k, amort, today, use_offer):
-    """События возврата денег по одной бумаге: амортизации + погашение, либо + оферта вместо погашения. Суммы в рублях."""
+    """События возврата денег по одной бумаге: амортизации + погашение, либо + оферта вместо погашения. Суммы в рублях.
+    call — дата ПУТ-оферты (колл сюда не передаётся: эмитент может не воспользоваться правом, ступень стоит на погашении)."""
     cut = call if use_offer and call and today < call and (not maturity or call < maturity) else None
     end = cut or maturity
     if not end or end <= today:
@@ -896,12 +1035,12 @@ def ladder_portfolio(cfg, acc="all"):
     rows = [r for r in rep.get("rows", []) if r.get("qty") and r.get("nominal") and (r.get("maturity") or r.get("call"))]
     value = sum(r.get("value_rub") or 0.0 for r in rep.get("rows", []))
     if not rows:
-        return {"today": today, "empty": True, "value": value, "variants": {}, "has_offers": False, "undated": []}
+        return {"today": today, "empty": True, "value": value, "variants": {}, "has_offers": False, "has_calls": False, "undated": []}
 
     def bz_of(r):
         return _safe_call(moex_bondization, r["isin"]) if r.get("isin") else None
     bzs = pool_map(bz_of, rows, workers=8)
-    has_offers, undated, built = False, [], {"offer": [], "maturity": []}
+    has_offers, has_calls, undated, built = False, False, [], {"offer": [], "maturity": []}
     for r, bz in zip(rows, bzs):
         k = 1.0
         if (r.get("face_cur") or "rub") != "rub":                     # номинал в валюте -> рубли по курсу, выведенному из оценки позиции
@@ -910,15 +1049,20 @@ def ladder_portfolio(cfg, acc="all"):
             if k <= 0:
                 continue
         am = [(a.get("amortdate"), a.get("value")) for a in (bz or {}).get("amort") or []]
-        call = r.get("call") if r.get("call") and r["call"] > today else None
+        call = r.get("put_date") if r.get("put_date") and r["put_date"] > today else None       # срок до оферты — только пут
         if call and r.get("maturity") and call < r["maturity"]:
             has_offers = True
+        cds = sorted(d for d in r.get("call_dates") or [] if d > today and (not r.get("maturity") or d < r["maturity"]))
+        cflag = (cds[0], "call") if cds else ((r["unk_date"], "unknown") if r.get("unk_date") and r["unk_date"] > today else None)
         for v, use in (("offer", True), ("maturity", False)):
             if not use and not r.get("maturity"):
                 if v == "maturity":
                     undated.append(r["name"])
                 continue
             ev = ld_events(r.get("maturity"), call, r["nominal"], r["qty"], k, am, today, use)
+            if ev and cflag and ev[-1]["date"] > cflag[0]:
+                ev[-1]["call"], ev[-1]["call_kind"] = cflag
+                has_calls = True
             if ev:
                 built[v].append({"isin": r.get("isin") or r.get("ticker") or "", "name": r["name"], "ytm": r.get("ytm"), "events": ev})
     variants = {}
@@ -926,4 +1070,4 @@ def ladder_portfolio(cfg, acc="all"):
         yr = ld_buckets(its, today, "year")
         variants[v] = {"year": yr, "quarter": ld_buckets(its, today, "quarter"), "summary": ld_summary(its, today, yr), "bonds": len(its)}
     return {"today": today, "empty": not any(built.values()), "value": value, "variants": variants, "has_offers": has_offers,
-            "undated": sorted(set(undated))}
+            "has_calls": has_calls, "undated": sorted(set(undated))}

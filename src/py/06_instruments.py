@@ -189,7 +189,7 @@ def nkd_at(b, day):
     return pay * max(0, (dd - d0).days) / span if span > 0 else 0.0
 
 
-def bond_metrics(b, price_rub, today=None):
+def bond_metrics(b, price_rub, today=None, ignore_call=False):
     """Доходность к погашению/оферте (эффективная), дюрация Маколея, купонная доходность."""
     today = today or date.today().isoformat()
     nominal = b.get("nominal") or 1000.0
@@ -204,7 +204,7 @@ def bond_metrics(b, price_rub, today=None):
     annual = (nxt[1] if nxt else last_pay) * cpy if cpy else 0.0
     res = {"next": nxt, "coupon_rate": annual / nominal * 100 if nominal else None,
            "cur_yield": annual / price_rub * 100 if price_rub else None, "ytm": None, "dur": None, "to": None}
-    end = b.get("call") if b.get("call") and b["call"] > today else b.get("maturity")
+    end = b.get("call") if b.get("call") and b["call"] > today and not ignore_call else b.get("maturity")
     if not end or b.get("perpetual") or not price_rub or end <= today:
         return res
     res["to"] = "offer" if end == b.get("call") else "maturity"

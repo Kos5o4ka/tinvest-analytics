@@ -20,5 +20,6 @@
 .cal-ev[data-isin]{cursor:pointer}.cal-ev[data-isin]:hover{background:var(--card2)}
 .cal-ev>i{width:8px;height:8px;border-radius:50%;flex:none}
 .cal-et{display:flex;flex-direction:column;min-width:0;flex:1}.cal-et b{font-weight:600;font-size:13.5px}.cal-et small{white-space:normal}
+.cal-bd{font-size:10.5px;margin-left:6px;vertical-align:1px}
 .cal-am{margin-left:auto;white-space:nowrap}
 @media(max-width:700px){.cal-c{min-height:50px;padding:4px}.cal-n{display:none}}

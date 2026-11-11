@@ -304,7 +304,7 @@ def bond_card(isin):
         card["found"] = True
         card["market"] = {k: me.get(k) for k in ("id", "isin", "name", "full", "kind", "cur", "nominal", "price", "yield",
                                                  "dur", "coupon", "next", "mat", "offer", "level", "turn", "trades",
-                                                 "zs", "spread", "size")}
+                                                 "zs", "spread", "size", "nkd")}
         k = kbd_at(me["dur"]) if me.get("dur") else None
         card["kbd"] = round(k, 2) if k is not None else None
         try:
@@ -323,6 +323,7 @@ def bond_card(isin):
         card["issuer_curve"] = None
         if not errors:
             errors.append("нет торгов на основных режимах Мосбиржи — показаны только справочные данные")
+    card["docs"] = bond_doc_links(isin, (me or {}).get("id") or isin, (desc or {}).get("EMITTER_INN"))
     card["name"] = (me or {}).get("full") or (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or isin
     card["short"] = (me or {}).get("name") or (ci or {}).get("name") or isin
     return card

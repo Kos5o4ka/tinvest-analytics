@@ -316,3 +316,78 @@ class FifoAmort(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Forecast(unittest.TestCase):
+    """Прогноз налога на 31.12 и сбор убытков."""
+
+    def setUp(self):
+        self.sel = [{"id": "A", "name": "A", "type": ""}]
+        self.s = {"iis": {}, "loss_carry": {}}
+        self.pos = [{"uid": "l", "type": "share", "qty": 10, "price": 60.0, "value": 600.0, "value_rub": 600.0, "name": "l", "ticker": "L"},
+                    {"uid": "m", "type": "share", "qty": 10, "price": 80.0, "value": 800.0, "value_rub": 800.0, "name": "m", "ticker": "M"},
+                    ]
+        self.ops = [buy("2026-01-10", 10, 100, uid="g"), sell("2026-03-10", 10, 300, uid="g"),         # прибыль 2000
+                    buy("2026-02-01", 10, 100, uid="l"), buy("2026-02-01", 10, 110, uid="m"),         # убытки 400 и 300
+                    ]
+        self.today = date(2026, 11, 12)
+
+    def st(self):
+        return M.tax_compute(self.ops, {}, self.pos, self.sel, self.s, today=self.today)
+
+    def test_last_sale_day(self):
+        self.assertEqual(M.tx_last_sale_day(2026), (date(2026, 12, 29), date(2026, 12, 30)))
+        self.assertEqual(M.tx_last_sale_day(2025), (date(2025, 12, 29), date(2025, 12, 30)))
+        # 2027: 31.12 — пятница, но считается выходным; 30.12 четверг; продавать до 29.12
+        self.assertEqual(M.tx_last_sale_day(2027), (date(2027, 12, 29), date(2027, 12, 30)))
+        # праздничный день из внешнего календаря сдвигает дату
+        self.assertEqual(M.tx_last_sale_day(2026, {date(2026, 12, 30)})[1], date(2026, 12, 29))
+
+    def test_forecast_numbers(self):
+        f = M.tx_forecast(self.st(), self.s, [
+            {"date": "2026-12-05", "kind": "coupon", "amount": 1000.0}, {"date": "2026-12-20", "kind": "dividend", "amount": 500.0},
+            {"date": "2026-10-01", "kind": "coupon", "amount": 99999.0}, {"date": "2027-01-10", "kind": "coupon", "amount": 99999.0},
+            {"date": "2026-12-25", "kind": "redemption", "amount": 99999.0}])
+        r = f["forecast"]
+        self.assertAlmostEqual(r["trade"], 2000.0)
+        self.assertAlmostEqual(r["base"], 2000.0)
+        self.assertAlmostEqual(r["exp_coupons"], 1000.0)
+        self.assertAlmostEqual(r["exp_dividends"], 500.0)
+        self.assertAlmostEqual(r["tax_end"], 3500 * 0.13)
+        self.assertAlmostEqual(r["to_withhold"], 3500 * 0.13)
+        self.assertEqual(f["sale_day"], "2026-12-29")
+
+    def test_forecast_progressive_rate(self):
+        f = M.tx_forecast(self.st(), self.s, [{"date": "2026-12-05", "kind": "coupon", "amount": 2500000.0}])
+        r = f["forecast"]
+        self.assertAlmostEqual(r["tax_end"], 2400000 * 0.13 + 102000 * 0.15)
+        self.assertAlmostEqual(r["tax13"], 2400000 * 0.13)
+
+    def test_forecast_without_payments_and_without_gen_accounts(self):
+        f = M.tx_forecast(self.st(), self.s, None)
+        self.assertFalse(f["pays_known"])
+        self.assertAlmostEqual(f["forecast"]["tax_end"], 260.0)
+        iis = [{"id": "A", "name": "A", "type": "iis"}]
+        st = M.tax_compute(self.ops, {}, self.pos, iis, {"iis": {"A": {"type": "A"}}, "loss_carry": {}}, today=self.today)
+        f = M.tx_forecast(st, self.s, [])
+        if not f["available"]:
+            self.assertEqual(f["harvest"], [])
+
+    def test_harvest_order_and_ldv_flag(self):
+        f = M.tx_forecast(self.st(), self.s, [])
+        self.assertEqual([c["uid"] for c in f["harvest"]], ["l", "m"])                  # сначала больший убыток
+        self.assertAlmostEqual(f["harvest"][0]["saving"], 400 * 0.13, places=1)
+        self.assertAlmostEqual(f["harvest"][1]["saving_marginal"], 300 * 0.13, places=1)
+        self.assertAlmostEqual(f["harvest_saving"], 700 * 0.13, places=1)
+        self.assertEqual([c["uid"] for c in f["skipped"]], [])
+
+    def test_ldv_soon_is_skipped(self):
+        # w: лот 2023 года куплен по 100 (в прибыли, ЛДВ через 20 дней), лот 2026 года по 400 (убыток 2500): продажа всей позиции лишит ЛДВ
+        self.pos.append({"uid": "w", "type": "share", "qty": 20, "price": 150.0, "value": 3000.0, "value_rub": 3000.0, "name": "w", "ticker": "W"})
+        self.ops += [buy("2023-11-22", 10, 100, uid="w"), buy("2026-07-01", 10, 400, uid="w")]
+        f = M.tx_forecast(self.st(), self.s, [])
+        sk = [c for c in f["skipped"] if c["uid"] == "w"]
+        self.assertEqual(len(sk), 1)
+        self.assertEqual(sk[0]["ldv_days"], 11)
+        self.assertIn("ЛДВ", sk[0]["reason"])
+        self.assertNotIn("w", [c["uid"] for c in f["harvest"]])

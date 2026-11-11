@@ -31,12 +31,15 @@ function bcMount(){
 function bcBar(){
   const back=BC.stack.length>1?'<button class="btn ghost" id="bc-back">← Назад</button>':'';
   const wt=typeof watchToggle==='function'?'<button class="btn ghost" id="bc-watch" title="Добавить выпуск в список наблюдения">★ В наблюдение</button>':'';
-  return`<div class="bc-bar">${back}<span class="sp"></span>${wt}<button class="btn ghost" id="bc-x" aria-label="Закрыть">✕ Закрыть</button></div>`;
+  const cm=typeof cmpHas==='function'?`<button class="btn ghost" id="bc-cmp" title="Добавить выпуск в сравнение облигаций">${cmpHas(BC.stack[BC.stack.length-1])?'✓ В сравнении':'⇄ Сравнить'}</button>`:'';
+  return`<div class="bc-bar">${back}<span class="sp"></span>${cm}${wt}<button class="btn ghost" id="bc-x" aria-label="Закрыть">✕ Закрыть</button></div>`;
 }
 function bcBind(dr){
   const x=dr.querySelector('#bc-x');if(x)x.onclick=closeBond;
   const w=dr.querySelector('#bc-watch');
   if(w)w.onclick=()=>{try{watchToggle(BC.stack[BC.stack.length-1])}catch(e){}};
+  const cb=dr.querySelector('#bc-cmp');
+  if(cb)cb.onclick=()=>{const i=BC.stack[BC.stack.length-1];if(cmpHas(i)){closeBond();go('cmp')}else if(cmpAdd(i))cb.textContent='✓ В сравнении'};
   const b=dr.querySelector('#bc-back');
   if(b)b.onclick=()=>{BC.stack.pop();const p=BC.stack.pop();openBond(p)};
 }
@@ -52,6 +55,14 @@ async function openBond(isin){
   dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);
   const mr=dr.querySelector('#bc-more');
   if(mr)mr.onclick=()=>{BC.all=true;dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);BC.all=false};
+}
+/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, поэтому ведём на поиск по ИНН (или ISIN). */
+function bcDocLinks(isin,inn,secid){
+  isin=String(isin||'').trim().toUpperCase();inn=String(inn||'').replace(/\D/g,'');if(inn.length!==10&&inn.length!==12)inn='';
+  const q=inn||isin,code=String(secid||isin||'').trim();
+  const a=(u,t)=>`<a class="btn ghost" href="${esc(u)}" target="_blank" rel="noopener">${t} ↗</a>`;
+  return`<div class="bc-docs">${q?a('https://www.e-disclosure.ru/poisk-po-kompaniyam?query='+encodeURIComponent(q),'Раскрытие информации эмитента (e-disclosure)'):''}${code?a('https://www.moex.com/ru/issue.aspx?code='+encodeURIComponent(code),'Страница выпуска на Мосбирже'):''}</div>`
+    +`<p class="note" style="margin-top:8px">Условия оферт (put/call), купонов и досрочного погашения — в решении о выпуске и проспекте.${inn?'':' ИНН эмитента не определён — поиск по ISIN может ничего не найти, тогда введите название эмитента на сайте.'}</p>`;
 }
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
 function bcKpi(k,v,s,cls){return`<div class="card"><div class="k">${k}</div><div class="v num ${cls||''}">${v}</div>${s?`<div class="s">${s}</div>`:''}</div>`}
@@ -90,6 +101,7 @@ function bcBody(c){
   add('Дефолт',d.HASDEFAULT==='1'?'<b class="neg">допущен</b>':d.HASTECHNICALDEFAULT==='1'?'<b class="neg">технический</b>':(d.HASDEFAULT==='0'?'нет':''));
   add('Госномер выпуска',esc(d.REGNUMBER||''));
   h+=`<div class="card bc-sec"><h2>Ключевые параметры</h2><div class="bc-par">${rows.join('')||'<span class="mu">Нет данных</span>'}</div></div>`;
+  h+=`<div class="card bc-sec"><h2>Документы выпуска</h2>${bcDocLinks(c.isin,(c.docs||{}).inn||d.EMITTER_INN,(m&&m.id)||c.isin)}</div>`;
   h+=`<div class="card bc-sec" id="bc-iss"><h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2><div class="mu" style="font-size:13px">Загружаю отчётность эмитента…</div></div>`;
   // денежный поток
   const fl=c.flows||[],lim=BC.all?fl.length:12;

@@ -23,3 +23,6 @@
 .ld-car{display:inline-block;width:12px;color:var(--mu)}
 [data-theme=light] .ld-fl.heavy{color:#a86d00}[data-theme=light] .ldb-row.heavy{background:#c985001a}
 @media(max-width:700px){.ldb-row{grid-template-columns:62px 1fr 84px;gap:8px}.ld-leg .mu{margin-left:0}}
+.ld-call{font-size:10.5px;font-weight:600;background:#e6676722;color:var(--neg);white-space:nowrap}
+.ld-call-sum{margin-left:14px;color:var(--s4)}
+[data-theme=light] .ld-call-sum{color:#a86d00}

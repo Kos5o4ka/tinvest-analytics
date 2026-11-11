@@ -256,21 +256,34 @@ def bond_exact(client, r, b, today, rates):
     if not price:
         return None
     est = {}
-    flows, kind, end = bond_flows(bz, today, face, floating=bool(b.get("floating")), est_out=est)
-    if not flows or end <= today:
-        return None
-    if kind == "maturity" and abs((datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(b["maturity"], "%Y-%m-%d")).days) > 45:
-        return None                      # график MOEX не сходится с данными брокера
     dirty = price + aci
-    y = cf_ytm(dirty, flows, today)
+    try:
+        opt = moex_bond_options(isin)
+    except Exception:  # noqa: BLE001
+        opt = None
+    offs = offer_kinds(bz, opt, b.get("call"), today)
+    yk = yields_by_kind(bz, today, face, dirty, offs, floating=bool(b.get("floating")), est_out=est, price=price)
+    if not yk or not yk["flows"] or yk["end"] <= today:
+        return None
+    flows, kind, end, y = yk["flows"], yk["end_kind"], yk["end"], yk["y"]
+    if yk["basis"] in ("maturity", "call") and abs((datetime.strptime(yk["maturity"], "%Y-%m-%d") - datetime.strptime(b["maturity"], "%Y-%m-%d")).days) > 45:
+        return None                      # график MOEX не сходится с данными брокера
     if y is None:
         return None
     yt = cf_ytm(dirty, flows, today, tax=True, basis=price)
     mac, mod, conv = cf_risk(flows, today, y)
     st = stress(price / face * 100.0, flows, today, face, aci, STRESS_DY, y)
+    live = [o for o in offs if o["status"] != "cancelled" and today < o["date"] < yk["maturity"]]
+    pc = lambda v: v * 100 if v is not None else None
+    ykp = {"basis": yk["basis"], "ytm": pc(yk["ytm"]), "ytp": pc(yk["ytp"]), "ytp_date": yk["ytp_date"],
+           "yto": pc(yk["yto"]), "yto_date": yk["yto_date"], "ytc": [[d, pc(v)] for d, v in yk["ytc_list"]],
+           "ytw": pc(yk["ytw"]), "ytw_date": yk["ytw_date"], "ytw_kind": yk["ytw_kind"]}
     return {"isin": isin, "ytm": y * 100, "ytm_tax": yt * 100 if yt is not None else None, "dur": mac, "mdur": mod,
-            "convexity": conv, "to": kind, "end": end, "stress_pct": {dy: (p / 100.0 * face + aci) / dirty * 100 - 100
-                                                                      for dy, p in st.items()},
+            "convexity": conv, "to": kind, "to_kind": yk["to_kind"], "ybasis": yk["basis"], "yk": ykp, "end": end,
+            "put_date": min([o["date"] for o in live if o["kind"] == "put"] or [None], key=lambda x: x or "9"),
+            "call_dates": sorted({o["date"] for o in live if o["kind"] == "call"}),
+            "unk_date": min([o["date"] for o in live if o["kind"] == "unknown"] or [None], key=lambda x: x or "9"),
+            "stress_pct": {dy: (p / 100.0 * face + aci) / dirty * 100 - 100 for dy, p in st.items()},
             "cf_source": "moex", "est_coupons": len(est), "est_detail": est, "bz": bz, "flows": flows, "basis": price, "dirty": dirty}
 
 
@@ -308,6 +321,10 @@ def bonds_report(client, rows):
     rates = fx_now(client, {(infos.get(r["uid"]) or {}).get("cur", "rub") for r in bonds} | {r["cur"] for r in bonds})
     exacts = dict(zip([r["uid"] for r in bonds], pool_map(
         lambda r: bond_exact(client, r, infos[r["uid"]], today, rates) if infos.get(r["uid"]) else None, bonds)))
+    ckinds = [{"uid": r["uid"], "isin": bond_isin(r), "call": infos[r["uid"]]["call"]} for r in bonds
+              if infos.get(r["uid"]) and infos[r["uid"]].get("call") and infos[r["uid"]]["call"] > today]
+    annotate_offer_kinds(ckinds, today)       # put/call у даты оферты брокера (из кэша Мосбиржи)
+    ckind = {x["uid"]: x.get("call_kind") for x in ckinds}
     stress_rub = defaultdict(float)
     high_yield, irr_items = [], []
     w = defaultdict(float)
@@ -323,16 +340,22 @@ def bonds_report(client, rows):
             continue
         nominal = b.get("nominal") or 1000.0
         price, avg, _aci = bond_price_face(r, b, rates)
-        m = bond_metrics(b, price, today)
+        ck = ckind.get(r["uid"])
+        m = bond_metrics(b, price, today, ignore_call=(ck == "call"))      # колл — право эмитента: без точных потоков считаем к погашению
         ex = exacts.get(r["uid"])
         row.update({"buy_pct": avg / nominal * 100 if avg else None, "price_pct": price / nominal * 100 if price else None,
                     "nominal": nominal, "face_cur": b.get("cur") or "rub", "isin": (ex or {}).get("isin") or bond_isin(r),
                     "ytm": m["ytm"], "ytm_tax": None, "dur": m["dur"], "mdur": None, "convexity": None, "to": m["to"],
                     "coupon": m["coupon_rate"], "cur_yield": m["cur_yield"], "next": m["next"], "maturity": b.get("maturity"),
                     "call": b.get("call"), "risk": RISK_RU.get(b.get("risk"), ""), "floating": b.get("floating"),
-                    "amort": b.get("amort"), "sector": b.get("sector"), "cf_source": "approx"})
+                    "amort": b.get("amort"), "sector": b.get("sector"), "cf_source": "approx", "call_kind": ck,
+                    "to_kind": (("put" if ck == "both" else ck) if m["to"] == "offer" else None), "ybasis": "put" if m["to"] == "offer" and ck in ("put", "both") else ("unknown" if m["to"] == "offer" else ("call" if ck == "call" else "maturity")),
+                    "yk": None, "put_date": b["call"] if m["to"] == "offer" and ck in ("put", "both") else None,
+                    "call_dates": [b["call"]] if ck in ("call", "both") else [], "unk_date": b["call"] if m["to"] == "offer" and ck not in ("put", "both") else None})
         if ex:
             row.update({k: ex[k] for k in ("ytm", "ytm_tax", "dur", "mdur", "convexity", "to", "cf_source")})
+            row.update({k: ex.get(k) for k in ("to_kind", "yk", "put_date", "unk_date")})
+            row.update(ybasis=ex.get("ybasis") or "maturity", call_dates=ex.get("call_dates") or [])
             row["end"] = ex["end"]
             row["est_coupons"] = ex.get("est_coupons") or 0
             fc_ = (b.get("cur") or "rub").lower()
@@ -369,7 +392,8 @@ def bonds_report(client, rows):
         if m["cur_yield"] is not None and v:
             w["cy"] += m["cur_yield"] * v
             w["cy_v"] += v
-        end = (b.get("call") if b.get("call") and b["call"] > today else b.get("maturity")) or ""
+        end = (row.get("put_date") or b.get("maturity") or "") if ex else (
+            (b["call"] if row["ybasis"] == "put" and b.get("call") and b["call"] > today else b.get("maturity")) or "")      # лесенка: оферта — только пут
         ladder[end[:4] or "бессрочные"] += v
         risk[RISK_RU.get(b.get("risk"), "нет данных")] += v
         kinds["Флоатер" if b.get("floating") else "Фиксированный купон"] += 1
@@ -453,9 +477,9 @@ def bonds_report(client, rows):
                "coupons_12m": sum(p["amount"] for p in pays if p["kind"] == "coupon"),
                "issuers": len({issuer_group_key(r["name"]) for r in bonds})}
     out.sort(key=lambda x: -(x.get("value_rub") or 0))
-    annotate_offer_kinds(out, today)       # put/call у даты оферты (из кэша Мосбиржи)
     for x in out:
-        x["to_kind"] = x.get("call_kind") if x.get("to") == "offer" else None
+        if x.get("call") and x.get("call") > today and "call_kind" not in x:
+            x["call_kind"] = ckind.get(x.get("uid"))
     return {"rows": out, "metrics": metrics, "ladder": sorted(ladder.items()), "risk": sorted(risk.items(), key=lambda x: -x[1]),
             "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays,
             "ratings": apply_ratings(out), "ratings_info": ratings_status()}

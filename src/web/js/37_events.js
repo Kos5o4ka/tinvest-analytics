@@ -23,6 +23,8 @@ function loadCal(){
    .catch(e=>{S.cal.cache[key]={error:e.message};if(S.page==='cal')renderSoon()});
 }
 const calP2=n=>String(n).padStart(2,'0');
+const CAL_BADGE={PUT:'of-t-put','CALL':'of-t-call'};
+function calBadge(e){return e.badge?` <span class="tag ${CAL_BADGE[e.badge]||'of-t-unk'} cal-bd">${esc(e.badge)}</span>`:''}
 function calMoney(e){return e.amount!=null?M(e.amount,'rub',2):''}
 function pCal(){
   loadCal();
@@ -50,7 +52,7 @@ function pCal(){
   const sum={};evs.forEach(e=>{if(e.amount!=null&&['coupon','redemption','amort','dividend'].includes(e.kind))sum[e.kind]=(sum[e.kind]||0)+e.amount});
   const total=Object.values(sum).reduce((a,b)=>a+b,0);
   const list=ds.length?ds.map(dt=>`<div class="cal-day" id="cal-d-${dt}"><div class="cal-dh"><b>${dlabel(dt)}</b><span class="mu">${['вс','пн','вт','ср','чт','пт','сб'][new Date(dt+'T00:00:00').getDay()]}${dt===today?' · сегодня':''}</span></div>
-    ${by[dt].map(e=>`<div class="cal-ev"${e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:''}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}</b><small class="mu">${esc(CAL_NAME[e.kind]||e.kind)}${e.note?' · '+esc(e.note):''}</small></div>
+    ${by[dt].map(e=>`<div class="cal-ev"${e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:''}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}${calBadge(e)}</b><small class="mu">${esc(e.label||CAL_NAME[e.kind]||e.kind)}${e.note&&!e.label?' · '+esc(e.note):''}</small>${e.label&&e.note?`<small class="mu">${esc(e.note)}</small>`:''}</div>
       <span class="num cal-am">${calMoney(e)}</span></div>`).join('')}</div>`).join(''):'<div class="empty" style="padding:24px">В этом месяце событий нет'+(Object.keys(S.cal.off).some(k=>S.cal.off[k])?' (часть типов скрыта фильтрами)':'')+'</div>';
   const warn=(d.warnings||[]).map(w=>`<div class="msg err" style="margin:8px 0">${esc(w)}</div>`).join('');
   return`<div class="g g4">${kpi('Событий в месяце',evs.length,MONF[m].toLowerCase()+' '+y)}${kpi('Выплаты по портфелю',total?M(total,'rub',0):'—','купоны, погашения, амортизации, дивиденды')}

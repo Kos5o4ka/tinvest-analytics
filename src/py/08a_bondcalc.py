@@ -98,11 +98,14 @@ def fl_estimates(bz, today, face, path=None):
     return out
 
 
-def bond_flows(bz, today, face, mode="auto", floating=False, est_out=None):
+def bond_flows(bz, today, face, mode="auto", floating=False, est_out=None, cut=None):
     """Будущие потоки на одну облигацию: [(дата, купон, номинал)] и признак окончания ('offer'/'maturity').
     face — текущий номинал. Неизвестные купоны флоатера (floating=True) оцениваются по прогнозу ключевой ставки
     (fl_estimates; детали складываются в словарь est_out), если оценить нельзя — равны последнему известному.
-    Если есть будущая оферта (покупка по цене offer price) и mode != 'maturity', потоки обрываются на дате оферты.
+    Если есть будущая оферта (покупка по цене offer price) и mode != 'maturity', потоки обрываются на дате оферты
+    (старое поведение: без разбора пут/колл — тип оферты разбирает yields_by_kind).
+    cut=(дата, цена в % номинала) обрывает потоки на этой дате по этой цене независимо от записей оферт и mode
+    (если дата не раньше погашения или уже прошла — игнорируется).
     Возвращает (flows, end_kind, end_date) либо (None, None, None)."""
     cps = sorted((c["coupondate"], c.get("value")) for c in bz["coupons"] if c.get("coupondate"))
     am_all = sorted((a["amortdate"], a.get("value")) for a in bz["amort"] if a.get("amortdate") and a.get("value"))
@@ -146,7 +149,10 @@ def bond_flows(bz, today, face, mode="auto", floating=False, est_out=None):
     elif rest < -0.0001 * face:
         return None, None, None          # данные не сходятся с номиналом
     end_kind, end = "maturity", mat
-    if mode != "maturity":
+    off_d = off_p = None
+    if cut:
+        off_d, off_p = cut
+    elif mode != "maturity":
         offs = []
         for o in bz.get("offers") or []:
             t = (o.get("offertype") or "")
@@ -154,20 +160,21 @@ def bond_flows(bz, today, face, mode="auto", floating=False, est_out=None):
                 offs.append(o)
         if offs:
             o = min(offs, key=lambda x: x["offerdate"])
-            if o["offerdate"] < mat or not mat:
-                end_kind, end = "offer", o["offerdate"]
-                op = (o.get("price") or 100.0) / 100.0
-                remain = face - sum(v for d, v in prin.items() if d < end)
-                prin = {d: v for d, v in prin.items() if d < end}
-                prin[end] = prin.get(end, 0.0) + remain * op
-                # покупатель по оферте получает и НКД на дату оферты (линейно внутри купонного периода)
-                allc = sorted(cpn)
-                nx = [d for d in allc if d > end]
-                pv_ = [d for d in allc if d <= end] or [d for d, _ in cps if d <= end][-1:]
-                if nx and pv_:
-                    d0, d1, de = (datetime.strptime(x, "%Y-%m-%d") for x in (pv_[-1], nx[0], end))
-                    if (d1 - d0).days > 0 and end not in cpn:
-                        cpn[end] = cpn[nx[0]] * (de - d0).days / (d1 - d0).days
+            off_d, off_p = o["offerdate"], o.get("price")
+    if off_d and off_d > today and (off_d < mat or not mat):
+        end_kind, end = "offer", off_d
+        op = (off_p or 100.0) / 100.0
+        remain = face - sum(v for d, v in prin.items() if d < end)
+        prin = {d: v for d, v in prin.items() if d < end}
+        prin[end] = prin.get(end, 0.0) + remain * op
+        # покупатель по оферте получает и НКД на дату оферты (линейно внутри купонного периода)
+        allc = sorted(cpn)
+        nx = [d for d in allc if d > end]
+        pv_ = [d for d in allc if d <= end] or [d for d, _ in cps if d <= end][-1:]
+        if nx and pv_:
+            d0, d1, de = (datetime.strptime(x, "%Y-%m-%d") for x in (pv_[-1], nx[0], end))
+            if (d1 - d0).days > 0 and end not in cpn:
+                cpn[end] = cpn[nx[0]] * (de - d0).days / (d1 - d0).days
     days = sorted(set(d for d in list(cpn) + list(prin) if d <= end))
     flows = [(d, cpn.get(d, 0.0), prin.get(d, 0.0)) for d in days]
     return flows, end_kind, end
@@ -250,3 +257,61 @@ def stress(price, flows, settle, face, aci=0.0, dy_list=(-3, -2, -1, 1, 2, 3), y
             continue
         out[dy] = (_bc_pv([f for f in flows if f[0] > settle], settle, ny) - aci) / face * 100.0
     return out
+
+
+def yields_by_kind(bz, today, face, dirty, offers, floating=False, est_out=None, price=None):
+    """Доходности позиции с учётом ТИПА оферты. Доходности — дробью (0.12 = 12 %), dirty — цена с НКД на одну бумагу.
+    offers — записи offer_kinds ({date, kind: put|call|unknown, price, status}); отменённые и даты не раньше погашения игнорируются.
+    Правила:
+      * put — решение держателя: основная метрика — доходность к ближайшей пут-оферте (YTP), потоки обрываются на ней;
+      * call — решает эмитент: основная метрика — YTW = min(YTM, YTC по всем будущим колл-датам), потоки обрываются на дате,
+        где доходность минимальна (при равенстве выигрывает погашение);
+      * если колл наступает раньше ближайшего пута, пут не гарантирован: базис call;
+      * unknown — тип не указан: основная метрика — доходность к этой дате (как раньше), YTM показывается рядом;
+      * без оферт — только YTM (числа те же, что у bond_flows).
+    price — чистая цена на одну бумагу (база для налога), по умолчанию dirty.
+    Возвращает None, если потоков нет, иначе {basis: put|call|unknown|maturity, ytm, ytp, ytp_date, yto, yto_date,
+    ytc_list [(дата, y)], ytw, ytw_date, ytw_kind ('maturity'|'call'), flows (основные, по ним считаются дюрация/IRR), end,
+    end_kind ('maturity'|'offer'), to_kind (None|'put'|'call'|'unknown'), y (основная доходность), full_flows, maturity}."""
+    full, _, mat = bond_flows(bz, today, face, mode="maturity", floating=floating, est_out=est_out)
+    if not full:
+        return None
+    ytm = cf_ytm(dirty, full, today)
+    live = [o for o in offers or [] if o.get("status") != "cancelled" and o.get("date") and today < o["date"] < mat]
+
+    def at(o):
+        fl = bond_flows(bz, today, face, floating=floating, cut=(o["date"], o.get("price") or 100.0))[0]
+        return (cf_ytm(dirty, fl, today), fl) if fl else (None, None)
+    puts, calls, unk = ([o for o in sorted(live, key=lambda x: x["date"]) if o.get("kind") == k] for k in ("put", "call", "unknown"))
+    res = {"basis": "maturity", "ytm": ytm, "ytp": None, "ytp_date": None, "yto": None, "yto_date": None, "ytc_list": [],
+           "ytw": ytm, "ytw_date": mat, "ytw_kind": "maturity", "flows": full, "end": mat, "end_kind": "maturity",
+           "to_kind": None, "y": ytm, "full_flows": full, "maturity": mat}
+    call_fl = {}
+    for o in calls:
+        y, fl = at(o)
+        if y is not None:
+            res["ytc_list"].append((o["date"], y))
+            call_fl[o["date"]] = fl
+    if res["ytc_list"]:
+        wd, wy = min(res["ytc_list"], key=lambda x: x[1])
+        if ytm is None or wy < ytm:
+            res.update(ytw=wy, ytw_date=wd, ytw_kind="call")
+    for o in puts[:1]:
+        y, fl = at(o)
+        if y is not None:
+            res.update(ytp=y, ytp_date=o["date"], _ytp_fl=fl)
+    for o in unk[:1]:
+        y, fl = at(o)
+        if y is not None:
+            res.update(yto=y, yto_date=o["date"], _yto_fl=fl)
+    first_call = res["ytc_list"][0][0] if res["ytc_list"] else None
+    pf, uf = res.pop("_ytp_fl", None), res.pop("_yto_fl", None)
+    if res["ytp"] is not None and (not first_call or res["ytp_date"] <= first_call):
+        res.update(basis="put", flows=pf, end=res["ytp_date"], end_kind="offer", to_kind="put", y=res["ytp"])
+    elif res["ytc_list"]:
+        k = res["ytw_kind"]
+        res.update(basis="call", y=res["ytw"], to_kind="call" if k == "call" else None,
+                   flows=call_fl[res["ytw_date"]] if k == "call" else full, end=res["ytw_date"], end_kind="offer" if k == "call" else "maturity")
+    elif res["yto"] is not None:
+        res.update(basis="unknown", flows=uf, end=res["yto_date"], end_kind="offer", to_kind="unknown", y=res["yto"])
+    return res

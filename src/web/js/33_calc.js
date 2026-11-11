@@ -241,7 +241,7 @@ function clGoalHtml(F,P,run){
     `Чтобы через ${clYM(run.N)} получать ${clRub(F.goalAmt)} в месяц (в сегодняшних деньгах, после налога) на стратегии «${esc(s[1])}», нужно пополнять примерно <b>${clRub(g.monthly)}</b> в месяц (с ежегодной индексацией ${f2(F.idx)} %).`;
   return`<div class="card cl-goal"><h2>Цель: пассивный доход</h2><div class="cl-ans">${t}</div><div class="note" style="margin-top:8px">Пассивный доход — это проценты или купоны, которые приносит накопленный капитал в год, делённые на 12, после налога. Пересчитывается в сегодняшние деньги по прогнозу инфляции.</div></div>`;
 }
-function pCalc(){
+function pCalcInv(){
   const F=clLoadF();
   const ld=S.calcAcc!==S.account;if(ld)clLoad();
   const P=(!ld&&S.calcP)||clDefaultParams(),pf=P.portfolio,fb=!ld&&!S.calcP;
@@ -289,7 +289,7 @@ function clUpdate(){
   const g=$('#cl-goalStrat');if(g){const F=clLoadF(),P=(S.calcAcc===S.account&&S.calcP)||clDefaultParams(),opts=clAvail(P).filter(s=>F.strat[s[0]]);
     g.innerHTML=opts.map(s=>`<option value="${s[0]}" ${s[0]===F.goalStrat?'selected':''}>${s[1]}</option>`).join('')}
 }
-function bindCalc(){
+function bindCalcInv(){
   const form=$('#cl-form');if(!form)return;const F=clLoadF(),P=(S.calcAcc===S.account&&S.calcP)||clDefaultParams();
   const rn=(id,d,lo,hi)=>{const e=$('#cl-'+id);if(!e)return d;let v=parseFloat(String(e.value).replace(',','.'));if(!isFinite(v))v=d;if(lo!=null)v=Math.max(lo,v);if(hi!=null)v=Math.min(hi,v);return v};
   const read=()=>{
@@ -307,3 +307,88 @@ function bindCalc(){
     s.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));fn(b.dataset.v);read()}});
   const b=$('#cl-pf');if(b)b.onclick=()=>{const pf=P.portfolio;if(!pf)return;if(pf.value!=null)F.start=Math.round(pf.value);if(pf.monthly!=null)F.monthly=Math.round(pf.monthly);F.strat.pf=1;clSave();render()};
 }
+
+/* ── Режим «Цель по пассивному доходу»: математика на сервере (/api/calc/goal), здесь только ввод и вывод ── */
+const CG_DEF={monthly:100000,hz:'years',years:10,date:'',yield:'',value:'',real:true,infl:''};
+let CG_F=null,CG_T=0;
+function cgLoad(){
+  if(CG_F)return CG_F;const s=lsJson('ta_calc_goal',{}),F=Object.assign({},CG_DEF);
+  if(s&&typeof s==='object')for(const k in F){if(s[k]!==undefined&&typeof s[k]===typeof F[k])F[k]=s[k]}
+  return CG_F=F;
+}
+function cgMode(){return lsJson('ta_calc_mode','inv')==='goal'?'goal':'inv'}
+function cgSetMode(m){lsSet('ta_calc_mode',JSON.stringify(m));render()}
+function cgQuery(F){
+  const q={account:S.account,monthly:F.monthly,real:F.real?'1':'0'};
+  if(F.hz==='date'&&F.date)q.date=F.date;else q.years=F.years;
+  if(F.yield!=='')q.yield=F.yield;if(F.value!=='')q.value=F.value;if(F.infl!=='')q.infl=F.infl;
+  return new URLSearchParams(q).toString();
+}
+function cgFetch(){
+  const F=cgLoad(),acc=S.account,n=++CG_T;
+  api('/api/calc/goal?'+cgQuery(F)).then(j=>{if(n!==CG_T)return;S.cgData=j;S.cgAcc=acc;cgPaint()}).catch(e=>{if(n!==CG_T)return;S.cgData={error:e.message};cgPaint()});
+}
+function cgPaint(){const o=$('#cg-out');if(!o)return;S.charts=[];o.innerHTML=cgOut();mountCharts();cgHints()}
+function cgHints(){
+  const d=S.cgData&&S.cgData.defaults;if(!d)return;
+  const set=(id,v,suf)=>{const e=$('#cg-'+id);if(e&&e.value==='')e.placeholder=v==null?'':(String(v)+(suf||''))};
+  set('yield',d.yield==null?'':d.yield);set('value',d.value==null?'':Math.round(d.value));set('infl',S.cgData.infl?S.cgData.infl.value:'');
+}
+function cgOut(){
+  const j=S.cgData,F=cgLoad();
+  if(!j)return`<div class="card">${waitBox('Считаю…')}</div>`;
+  if(j.error&&!j.result)return`<div class="msg err">${esc(j.error)}</div>`;
+  const r=j.result;if(!r)return`<div class="card empty">Введите желаемый доход в месяц</div>`;
+  const d=j.defaults||{},src=[];
+  if(F.yield===''&&d.yield!=null)src.push(`доходность ${f2(r.yield_pct)} % взята из облигаций вашего портфеля`);
+  if(F.value==='' &&d.value!=null)src.push(`текущая стоимость ${clRub(r.value)} взята из портфеля`);
+  const ym=clYM(r.months);
+  chart('cg-chart',line,{h:300,labels:r.chart.labels.map(l=>l.slice(5)+'.'+l.slice(0,4)),fa:short,ft:v=>clRub(v),empty:'Нет данных',
+    series:[{n:'Капитал при нужном пополнении',c:'#19a070',v:r.chart.capital},{n:'Без пополнений',c:'#8a93a6',dash:1,w:1.6,v:r.chart.no_contrib},{n:'Нужный капитал',c:'#d95926',dash:1,w:1.8,v:r.chart.target}]});
+  const cv=r.coverage;
+  const cov=cv&&cv.pct!=null?`<div class="card cl-goal"><h2>Где вы сейчас</h2><div class="cl-ans">Сейчас купоны и дивиденды дают около <b>${clRub(cv.income)}</b> в месяц${d.income_src&&F.value===''?` (${esc(d.income_src)})`:''} — это <b>${f2(cv.pct)} %</b> цели. Оценка до налога и без учёта будущих изменений портфеля.</div></div>`:
+    `<div class="card"><div class="note">Данных о текущем доходе нет: подключите токен или укажите стоимость портфеля.</div></div>`;
+  return`<div class="g g4">${kpi('Нужный капитал сегодня',clRub(r.capital_today),`${clRub(r.monthly)} в мес. после налога`,null,S1)}
+    ${kpi(r.real&&r.inflation_factor>1.001?'Нужный капитал на дату цели':'Нужный капитал к цели',clRub(r.capital_end),r.real&&r.inflation_factor>1.001?`цель с инфляцией: ${clRub(r.goal_end)} в мес.`:'без поправки на инфляцию',null,S4)}
+    ${kpi('Пополнение в месяц',r.reached?'не требуется':clRub(r.contribution),r.reached?'текущего капитала достаточно':`за ${ym} внесёте ${short(r.contribution_total)} ₽`,r.reached?'pos':'',S3)}
+    ${kpi('Доходность после налога',f2(r.yield_net)+' %',`ставка ${f2(r.yield_pct)} % за вычетом 13 %`,null,S2)}</div>
+  ${cov}
+  <div class="card"><h2>Рост капитала и цель<span class="sp">через ${ym}</span></h2><div id="cg-chart" class="chart"></div>
+   <div class="note" style="margin-top:10px">${src.length?esc(src.join('; '))+'. ':''}${r.real?`Цель задана в сегодняшних деньгах: при инфляции ${f2(r.infl_pct)} % в год к дате цели нужно ${clRub(r.goal_end)} в месяц.`:'Цель задана в номинальных рублях, без поправки на инфляцию.'}</div></div>
+  <div class="card"><h2>Как это считается</h2><div class="note">Нужный капитал = доход в месяц × 12 ÷ (доходность × (1 − 13 %)). Капитал растёт на доходность после налога, доход реинвестируется; пополнения вносятся в конце месяца и не индексируются. Ставка и налог принимаются постоянными (шкалу НДФЛ с 15 % свыше 2,4 млн ₽ дохода в год расчёт не учитывает), риски и дефолты не заложены. Расчёт информационный и не является инвестиционной рекомендацией; налоги уточняйте у брокера и в ФНС.</div></div>`;
+}
+function pCalcGoal(){
+  const F=cgLoad();
+  const num=(id,l,v,o)=>`<label class="field"><span>${l}</span><input class="in" id="cg-${id}" type="number" inputmode="decimal" value="${esc(v)}" ${o||''}></label>`;
+  if(S.cgAcc!==S.account||!S.cgData){S.cgData=null;setTimeout(cgFetch,0)}
+  return`<div class="card"><h2>Цель по пассивному доходу<span class="sp">сколько нужно накопить</span></h2><div id="cg-form">
+    <div class="cl-grid">${num('monthly','Желаемый доход в месяц после налога, ₽',F.monthly,'min="0" step="5000"')}
+     <label class="field"><span>Горизонт</span><select class="in" id="cg-hz"><option value="years" ${F.hz==='years'?'selected':''}>Через N лет</option><option value="date" ${F.hz==='date'?'selected':''}>К дате</option></select></label>
+     <div id="cg-yearsbox" style="${F.hz==='years'?'':'display:none'}">${num('years','Лет',F.years,'min="1" max="50" step="1"')}</div>
+     <div id="cg-datebox" style="${F.hz==='date'?'':'display:none'}">${num('date','Дата цели',F.date,'').replace('type="number" inputmode="decimal"','type="date"')}</div>
+     ${num('yield','Ожидаемая доходность портфеля до налога, % годовых',F.yield,'min="0" max="99" step="0.5" placeholder="из портфеля"')}
+     ${num('value','Текущая стоимость портфеля, ₽',F.value,'min="0" step="10000" placeholder="из портфеля"')}
+     <label class="sw"><input type="checkbox" id="cg-real" ${F.real?'checked':''}><i></i><div><b>Цель в сегодняшних деньгах</b><small>учесть инфляцию до даты цели</small></div></label>
+     ${num('infl','Инфляция, % в год',F.infl,'min="0" max="50" step="0.5" placeholder="прогноз ЦБ"')}</div>
+    <div class="note">Пустые поля заполняются данными портфеля (нужен токен); без токена введите значения вручную.</div></div></div>
+   <div id="cg-out">${cgOut()}</div>`;
+}
+function bindCalcGoal(){
+  const form=$('#cg-form');if(!form)return;const F=cgLoad();
+  const rd=id=>{const e=$('#cg-'+id);return e?e.value.trim():''};
+  const nm=(id,d)=>{const v=parseFloat(rd(id).replace(',','.'));return isFinite(v)&&v>=0?v:d};
+  const read=()=>{
+    F.monthly=nm('monthly',0);F.hz=rd('hz')==='date'?'date':'years';F.years=nm('years',10);F.date=rd('date');
+    F.yield=rd('yield')===''?'':nm('yield','');F.value=rd('value')===''?'':nm('value','');F.real=$('#cg-real').checked;F.infl=rd('infl')===''?'':nm('infl','');
+    $('#cg-yearsbox').style.display=F.hz==='years'?'':'none';$('#cg-datebox').style.display=F.hz==='date'?'':'none';
+    lsSet('ta_calc_goal',JSON.stringify(F));clearTimeout(bindCalcGoal.t);bindCalcGoal.t=setTimeout(cgFetch,250);
+  };
+  form.addEventListener('input',read);form.addEventListener('change',read);
+  if(S.cgData)cgHints();
+}
+function pCalc(){
+  const m=cgMode();
+  const sw=`<div class="row noprint" style="margin-bottom:14px"><div class="seg">${[['inv','Инвестиционный калькулятор'],['goal','Цель по пассивному доходу']].map(([k,t])=>`<button class="${k===m?'on':''}" onclick="cgSetMode('${k}')">${t}</button>`).join('')}</div></div>`;
+  return`<div class="cl-page">${sw}${m==='goal'?pCalcGoal():pCalcInv().replace(/^<div class="cl-page">/,'').replace(/<\/div>$/,'')}</div>`;
+}
+function bindCalc(){if(cgMode()==='goal')bindCalcGoal();else bindCalcInv()}

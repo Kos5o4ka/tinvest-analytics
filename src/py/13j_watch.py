@@ -378,6 +378,68 @@ def _tg_dispatch(cfg, title, alerts, sent, now):
     return sent_n
 
 
+TG_OFR_CALL_DAYS, TG_OFR_CLOSE_DAYS, TG_OFR_PUT_HORIZON = 14, 2, 120
+
+
+def _tg_dmy(d):
+    return "%s.%s.%s" % (d[8:10], d[5:7], d[:4])
+
+
+def tg_offer_due(items, today):
+    """Напоминания по офертам портфеля -> [(ключ_дедупликации, текст)]. Чистая функция (today передаётся).
+    items: [{isin, name, kind, date, period_start, period_end, coupon_status, new_rate}].
+    Ключ 'ofr|isin|дата_оферты|тип', тип: coupon (новый купон после пут-оферты объявлен), open (приём заявок открыт),
+    close (осталось <= 2 дней до конца приёма), call (до колла <= 14 дней). Каждый ключ уходит один раз (хранилище TG_SENT_KEY)."""
+    out = []
+    for it in items:
+        isin, kind, od = it.get("isin"), it.get("kind"), it.get("date")
+        if not isin or not od or od <= today:
+            continue
+        nm = _tg_esc(it.get("name") or isin)
+        ps, pe = it.get("period_start"), it.get("period_end")
+        base = "ofr|%s|%s|" % (isin, od)
+        if kind == "put":
+            if it.get("coupon_status") == "announced" and it.get("new_rate") is not None and (not pe or today <= pe):
+                out.append((base + "coupon", "🔔 <b>%s</b>: эмитент объявил купон после пут-оферты (%s): %s %% годовых. Можно решать, предъявлять ли бумагу."
+                            % (nm, _tg_dmy(od), _f2(it["new_rate"]))))
+            if ps and pe and ps <= today <= pe:
+                out.append((base + "open", "🔔 <b>%s</b>: открыт приём заявок по пут-оферте, с %s по %s (выкуп %s). Заявку подаёт брокер."
+                            % (nm, _tg_dmy(ps), _tg_dmy(pe), _tg_dmy(od))))
+            if pe:
+                left = _of_days(today, pe)
+                if 0 <= left <= TG_OFR_CLOSE_DAYS and (not ps or ps <= today):
+                    t = ("осталось %d дня подать заявку" % left if left >= 2 else "остался 1 день, чтобы подать заявку" if left == 1
+                         else "сегодня последний день подачи заявки")
+                    out.append((base + "close", "⏰ <b>%s</b>: %s на пут-оферту (последний день %s, выкуп %s)." % (nm, t, _tg_dmy(pe), _tg_dmy(od))))
+        elif kind == "call":
+            left = _of_days(today, od)
+            if 0 < left <= TG_OFR_CALL_DAYS:
+                out.append((base + "call", "🔔 <b>%s</b>: возможное досрочное погашение (колл) %s, через %d дн. Решает эмитент, заявку подавать не нужно."
+                            % (nm, _tg_dmy(od), left)))
+    return out
+
+
+def _tg_offer_items(cfg, today):
+    """Оферты облигаций портфеля для напоминаний: ближайшие put (до TG_OFR_PUT_HORIZON дней) и call (до TG_OFR_CALL_DAYS)."""
+    rows = [r for r in build_bonds(cfg, "all")["rows"] if r.get("isin") and r.get("qty")]
+    lim = _day_add(today, TG_OFR_PUT_HORIZON)
+
+    def one(r):
+        try:
+            bz = moex_bondization(r["isin"])
+            res = []
+            for o in offer_kinds(bz or {}, moex_bond_options(r["isin"]), r.get("call"), today):
+                if o["status"] == "cancelled" or o["kind"] == "unknown" or o["date"] > lim:
+                    continue
+                nc = of_new_coupon((bz or {}).get("coupons") or [], o["date"], r.get("nominal") or 1000.0, bool(r.get("floating")))
+                res.append({"isin": r["isin"], "name": r.get("name"), "kind": o["kind"], "date": o["date"], "period_start": o.get("period_start"),
+                            "period_end": o.get("period_end"), "coupon_status": nc["status"], "new_rate": nc["rate"]})
+            return res
+        except Exception:  # noqa: BLE001
+            return []
+    return [x for lst in pool_map(one, rows, workers=8) for x in lst]
+
+
 def _tg_payments(cfg, days):
     b = build_bonds(cfg, "all")
     end = (date.today() + timedelta(days=days)).isoformat()
@@ -450,6 +512,17 @@ def tg_tick(force_digest=False, manual=False):
             if cfg.get("tg_on_mon", True) and cfg.get("token"):
                 al = [a for a in build_monitor(cfg, "all")["alerts"] if a["severity"] == "high"]
                 n += _tg_dispatch(cfg, "Тревоги по портфелю", al, sent, now)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if cfg.get("tg_on_mon", True) and cfg.get("token"):
+                today_ = date.today().isoformat()
+                due = [(k, t) for k, t in tg_offer_due(_tg_offer_items(cfg, today_), today_) if k not in sent][:10]
+                if due:
+                    tg_send(cfg, "<b>Оферты по портфелю</b>\n\n" + "\n\n".join(t for _k, t in due))
+                    for k, _t in due:
+                        sent[k] = now
+                    n += len(due)
         except Exception:  # noqa: BLE001
             pass
         try:

@@ -71,6 +71,7 @@ function roadmapHtml(){const L={now:['s-now','Сейчас'],next:['s-next','С�
 function bindPage(){
   if(S.page==='reb')bindReb();
   if(S.page==='scr')bindScr();
+  if(S.page==='cmp')bindCmp();
   if(S.page==='risk')bindRisk();
   if(S.page==='mon')bindMon();
   if(S.page==='bench')bindBench();

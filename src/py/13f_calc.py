@@ -139,3 +139,145 @@ def calc_params(cfg, acc):
     res["updated"] = datetime.now().strftime("%H:%M")
     _calc_mem[key] = (time.time(), res)
     return res
+
+
+# ═══════════════════ цель по пассивному доходу: сколько капитала и какое пополнение нужны ═══════════════════
+# Упрощённая модель: весь капитал приносит доход по одной ставке, налог 13 % удерживается с дохода (реинвестируется остаток),
+# взносы вносятся в конце каждого месяца и не индексируются. Не прогноз и не рекомендация.
+
+GOAL_TAX = 0.13
+GOAL_MAX_YEARS = 50
+
+
+def goal_calc(monthly, months, yield_pct, value=0.0, infl_pct=0.0, real=False, income_now=None, tax=GOAL_TAX):
+    """monthly — желаемый доход в месяц после налога, ₽; months — срок; yield_pct — доходность портфеля до налога, % годовых;
+    value — текущий капитал; infl_pct — инфляция, % в год; real=True — цель задана в сегодняшних деньгах (к дате цели её нужно умножить на инфляцию).
+    income_now — текущий доход в месяц (купоны и дивиденды) для оценки покрытия. Возвращает словарь с результатами."""
+    monthly, value, months = max(0.0, float(monthly)), max(0.0, float(value)), int(months)
+    if months < 1 or months > GOAL_MAX_YEARS * 12:
+        raise ValueError("срок должен быть от 1 месяца до %d лет" % GOAL_MAX_YEARS)
+    if not (0 < yield_pct < 100):
+        raise ValueError("доходность должна быть больше 0 и меньше 100 %")
+    y_net = yield_pct / 100.0 * (1.0 - tax)
+    infl = infl_pct / 100.0 if real else 0.0
+    f_inf = (1.0 + infl) ** (months / 12.0)
+    goal_end = monthly * f_inf                         # желаемый доход в месяц в рублях на дату цели
+    cap_today = monthly * 12.0 / y_net                # капитал, который даёт цель в сегодняшних ценах
+    cap_end = goal_end * 12.0 / y_net                 # капитал на дату цели с учётом инфляции цели
+    r = (1.0 + y_net) ** (1.0 / 12.0) - 1.0           # месячная ставка после налога с реинвестированием
+    g = (1.0 + r) ** months
+    grown = value * g
+    need = max(0.0, cap_end - grown)
+    contrib = need * r / (g - 1.0) if need > 0 else 0.0
+    fv = lambda k, c: value * (1.0 + r) ** k + c * (((1.0 + r) ** k - 1.0) / r)
+    step = 1 if months <= 60 else 3 if months <= 180 else 6
+    ks = list(range(0, months + 1, step))
+    if ks[-1] != months:
+        ks.append(months)
+    today = date.today()
+    labels = []
+    for k in ks:
+        mm = today.month - 1 + k
+        labels.append("%04d-%02d" % (today.year + mm // 12, mm % 12 + 1))
+    out = {"months": months, "yield_net": round(y_net * 100.0, 3), "capital_today": cap_today, "capital_end": cap_end, "goal_end": goal_end,
+           "inflation_factor": f_inf, "value": value, "value_grown": grown, "contribution": contrib, "contribution_total": contrib * months,
+           "reached": need <= 0, "gap": need,
+           "chart": {"labels": labels, "capital": [fv(k, contrib) for k in ks], "no_contrib": [fv(k, 0.0) for k in ks],
+                     "target": [cap_today * (1.0 + infl) ** (k / 12.0) for k in ks]},
+           "income_from_value": value * y_net / 12.0}
+    if income_now is not None:
+        out["coverage"] = {"income": income_now, "pct": (income_now / monthly * 100.0) if monthly > 0 else None}
+    return out
+
+
+def goal_months(q, today=None):
+    """Срок в месяцах из параметров: date=ГГГГ-ММ-ДД или years (допустимы дробные)."""
+    today = today or date.today()
+    d = (q.get("date") or "").strip()
+    if d:
+        t = datetime.strptime(d, "%Y-%m-%d").date()
+        if t <= today:
+            raise ValueError("дата цели должна быть в будущем")
+        return max(1, int(round((t - today).days / 30.4375)))
+    return max(1, int(round(float(q.get("years") or 10) * 12)))
+
+
+def _goal_float(q, k):
+    v = (q.get(k) or "").strip().replace(",", ".")
+    return float(v) if v != "" else None
+
+
+def _goal_infl():
+    hit = _calc_mem.get("goal_infl")
+    if hit and time.time() - hit[0] < CALC_TTL:
+        return hit[1]
+    v = {"value": 4.0, "estimate": True, "source": "условное значение"}
+    try:
+        i = inflation_forecast()
+        if i.get("source") != "none" and i.get("yearly"):
+            v = {"value": i["yearly"][-1]["mid"], "estimate": False, "source": "прогноз Банка России"}
+    except Exception:  # noqa: BLE001
+        pass
+    _calc_mem["goal_infl"] = (time.time(), v)
+    return v
+
+
+def goal_defaults(cfg, acc):
+    """Что известно о портфеле: стоимость, средневзвешенная доходность облигаций, текущий доход в месяц (купоны и дивиденды за 12 мес.)."""
+    d = {"value": None, "yield": None, "income_month": None, "income_src": None, "portfolio": False}
+    if not cfg.get("token"):
+        return d
+    key = ("goal_pf", token_key(cfg), acc)
+    hit = _calc_mem.get(key)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    try:
+        pf = _calc_portfolio(cfg, acc)
+    except Exception:  # noqa: BLE001
+        pf = None
+    if pf:
+        d["portfolio"] = True
+        d["value"] = pf.get("value")
+        d["yield"] = pf.get("irr")
+        if pf.get("coupons_12m"):
+            d["income_month"], d["income_src"] = round(pf["coupons_12m"] / 12.0, 2), "купоны облигаций за 12 месяцев"
+    try:
+        end = (date.today() + timedelta(days=365)).isoformat()
+        pays = [p for p in (build_bonds(cfg, acc).get("payments") or []) if p.get("kind") in ("coupon", "dividend") and p.get("date", "") <= end]
+        if pays:
+            d["income_month"], d["income_src"] = round(sum(p["amount"] for p in pays) / 12.0, 2), "купоны и дивиденды по графику на 12 месяцев"
+    except Exception:  # noqa: BLE001
+        pass
+    _calc_mem[key] = (time.time(), d)
+    return d
+
+
+def calc_goal_get(cfg, acc, q, force=False):
+    """GET /api/calc/goal?monthly=&years=|date=&yield=&value=&real=1&infl=  Ручные значения важнее данных портфеля; без токена работают только они."""
+    out = {"defaults": goal_defaults(cfg, acc), "infl": _goal_infl(), "tax": GOAL_TAX, "result": None, "error": None}
+    try:
+        monthly = _goal_float(q, "monthly")
+        if monthly is None or monthly <= 0:
+            return out
+        dfl = out["defaults"]
+        y = _goal_float(q, "yield")
+        y = dfl["yield"] if y is None else y
+        if y is None:
+            out["error"] = "Укажите ожидаемую доходность портфеля: данных по облигациям портфеля нет."
+            return out
+        v = _goal_float(q, "value")
+        v = (dfl["value"] or 0.0) if v is None else v
+        i = _goal_float(q, "infl")
+        i = out["infl"]["value"] if i is None else i
+        inc = _goal_float(q, "income")
+        if inc is None:
+            inc = dfl["income_month"] if dfl["income_month"] is not None else (v * y / 100.0 * (1 - GOAL_TAX) / 12.0 if v else None)
+        real = (q.get("real") or "1") not in ("0", "false", "")
+        out["result"] = goal_calc(monthly, goal_months(q), y, v, i, real, inc)
+        out["result"].update(yield_pct=y, infl_pct=i, real=real, monthly=monthly)
+    except (ValueError, TypeError) as e:
+        out["error"] = str(e)
+    return out
+
+
+API_GET["/api/calc/goal"] = calc_goal_get

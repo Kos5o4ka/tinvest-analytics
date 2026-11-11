@@ -1,7 +1,7 @@
 /* ── Налоги: обзор, расчёт по лотам (FIFO), ЛДВ, ИИС, подсказки, данные для 3-НДФЛ, настройки ── */
 S.tx={tab:'ov',data:null,acc:null,busy:0,err:null,year:null,draft:null,msg:''};
-try{const t=localStorage.getItem('tx_tab');if(t&&['ov','yr','ldv','iis','hint','decl','set'].includes(t))S.tx.tab=t}catch(e){}
-const TXTABS=[['ov','Обзор'],['yr','Налог по годам'],['ldv','ЛДВ'],['iis','ИИС'],['hint','Подсказки'],['decl','Для декларации'],['set','Настройки налогов']];
+try{const t=localStorage.getItem('tx_tab');if(t&&['ov','fc','yr','ldv','iis','hint','decl','set'].includes(t))S.tx.tab=t}catch(e){}
+const TXTABS=[['ov','Обзор'],['fc','Прогноз на 31.12'],['yr','Налог по годам'],['ldv','ЛДВ'],['iis','ИИС'],['hint','Подсказки'],['decl','Для декларации'],['set','Настройки налогов']];
 const tR=n=>bad(n)?'—':M(n,'rub',0),tS=n=>bad(n)?'—':(n>0?'+':'')+M(n,'rub',0);
 const tDt=s=>s?ddm(s):'—';
 function txGo(t){S.tx.tab=t;try{localStorage.setItem('tx_tab',t)}catch(e){}render()}
@@ -22,7 +22,7 @@ function pTax(){
   if(tx.tab==='ov')body=txOv();
   else if(tx.err&&tx.acc===S.account)body=`<div class="msg err">${esc(tx.err)} <button class="btn ghost" onclick="S.tx.err=null;S.tx.acc=null;render()">Повторить</button></div>`;
   else if(!tx.data||tx.acc!==S.account){loadTax();body=`<div class="card">${waitBox('Считаю налоги по лотам: покупки, продажи, ЛДВ, убытки…')}</div>`}
-  else body=({yr:txYr,ldv:txLdv,iis:txIis,hint:txHint,decl:txDecl,set:txSet})[tx.tab](tx.data)+txNote;
+  else body=({fc:txFc,yr:txYr,ldv:txLdv,iis:txIis,hint:txHint,decl:txDecl,set:txSet})[tx.tab](tx.data)+txNote;
   return`<div class="tx"><div class="row" style="margin-bottom:14px">${tabs}</div>${body}</div>`;
 }
 
@@ -131,6 +131,42 @@ function txHint(d){
     h.ldv_warn.length?h.ldv_warn.map(e=>`<tr><td class="l"><b>${esc(e.name)}</b><br><small class="mu">${esc(e.ticker)}</small></td><td class="num">${tDt(e.date)}</td><td class="num">через ${e.days} дн.</td><td class="num pos">${tS(e.gain)}</td><td class="num neg"><b>${tR(e.tax_now)}</b></td></tr>`).join(''):'<tr><td colspan="5" class="l mu">Нет таких бумаг</td></tr>'}</tbody></table></div>
     ${h.ldv_warn.length?`<p class="note" style="padding:0 10px">Через указанное число дней по этим бумагам наступит ЛДВ: продавать раньше невыгодно, если есть прибыль.</p>`:''}</div>`;
   if(d.carry_suggest.length)out+=`<div class="card"><h2>Убытки прошлых лет</h2><p class="note">По расчёту у вас были убытки, которые можно перенести на будущие доходы (до 10 лет): ${d.carry_suggest.map(s=>`${s.year} — ${tR(s.loss)}`).join('; ')}. Проверьте суммы по декларациям и внесите в «Настройки налогов».</p></div>`;
+  return out;
+}
+
+/* ── Прогноз налога на конец года и сбор убытков (информационный расчёт) ── */
+function txFc(d){
+  const f=d.forecast;
+  if(!f||!f.available)return`<div class="card empty">Нет обычных (не ИИС) брокерских счетов в выбранной выборке — прогноз не построен.${f&&f.iis_excluded.length?` ИИС (${f.iis_excluded.map(esc).join(', ')}) в этот прогноз не входят.`:''}</div>`;
+  const r=f.forecast,sd=f.sale_day,dd=f.days_to_sale;
+  const row=(a,b,c)=>`<tr><td class="l">${a}</td><td class="num">${b}</td><td class="l mu"><small>${c||''}</small></td></tr>`;
+  let out=`<div class="g g4">${kpi(`Налог на 31.12.${f.year} (прогноз)`,tR(r.tax_end),`ставка на вершине ${Math.round(r.rate*100)} %`,null,S1)}
+    ${kpi('Уже удержано брокером',tR(r.withheld),'по операциям этого года',null,S3)}
+    ${kpi('Брокер удержит дополнительно',tR(r.to_withhold),r.refund>0?`удержано больше на ${tR(r.refund)}`:'в конце года или при выводе средств',r.to_withhold>0?'neg':'',S2)}
+    ${kpi('Ожидаемые купоны и дивиденды',tR(r.exp_coupons+r.exp_dividends),f.pays_known?`выплат до конца года: ${r.exp_n}`:'прогноз выплат недоступен',null,S4)}</div>`;
+  out+=`<div class="card"><h2>Прогноз налога на 31 декабря<span class="sp">обычные брокерские счета, ${f.year}</span></h2><div class="tbl"><table><tbody>
+    ${row('Результат продаж (с учётом комиссий)',tS(r.trade),'FIFO по лотам')}
+    ${row('Освобождение по ЛДВ и зачёт убытков прошлых лет',(r.ldv_exempt>0.5||r.carry_used>0.5)?'−'+tR(r.ldv_exempt+r.carry_used):'—')}
+    ${row('Полученные купоны (с учётом НКД) и дивиденды',tR(r.coupons+r.dividends),'уже выплачены в этом году')}
+    ${r.other>0.5?row('РЕПО, фьючерсы и опционы',tR(r.other)):''}
+    ${row('Налоговая база на сегодня',`<b>${tR(r.base)}</b>`,`налог на сегодня: ${tR(r.tax_now)}`)}
+    ${row('Ожидаемые купоны до конца года',tR(r.exp_coupons),'по графику выплат из «Выплат»; оценки не гарантированы')}
+    ${row('Ожидаемые дивиденды до конца года',tR(r.exp_dividends),'только объявленные')}
+    ${row('База на конец года',`<b>${tR(r.base_end)}</b>`,`13 % до ${short(r.threshold)} ₽ и 15 % выше`)}
+    ${row('Налог 13 % / 15 %',`${tR(r.tax13)} / ${tR(r.tax15)}`)}
+    ${row('Налог по расчёту на 31.12',`<b>${tR(r.tax_end)}</b>`)}
+    ${row('Удержано брокером',tR(r.withheld))}
+    ${row('Будет удержано дополнительно',`<b class="${r.to_withhold>0?'neg':''}">${tR(r.to_withhold)}</b>`,'обычно брокер удерживает налог за год в конце декабря или в январе, либо при выводе денег')}
+  </tbody></table></div>
+  <p class="note">${f.iis_excluded.length?`ИИС (${f.iis_excluded.map(esc).join(', ')}) в расчёт не входят: у них своя налоговая база и льготы. `:''}Прогноз выплат берётся по всему портфелю без разбивки по счетам, поэтому при смешанной выборке с ИИС ожидаемые купоны могут быть завышены. Расчёт информационный: итоговую сумму определяет брокер и декларация, сверяйтесь с брокером и ФНС.</p></div>`;
+  const ha=f.harvest;
+  out+=`<div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Как уменьшить налог до конца года<span class="sp">информационный расчёт, не рекомендация</span></h2>
+    <p class="note" style="padding:0 10px">Позиции с нереализованным убытком: если продать их в этом году, убыток уменьшит налогооблагаемую прибыль. Экономия — меньшее из убытка и прибыли года, умноженное на ставку (с учётом уже зачтённых льгот и убытков). ${dd>=0?`Чтобы сделка рассчиталась в ${f.year} году при расчётах T+1, продавать нужно не позже <b>${tDt(sd)}</b> (осталось ${dd} дн.; последний торговый день — ${tDt(f.last_trading_day)}, точная дата зависит от календаря биржи).`:`Расчётная дата ${tDt(sd)} уже прошла: новые продажи рассчитаются в следующем году.`}</p>
+    <div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Кол-во</th><th>Стоимость</th><th>Убыток</th><th>Экономия налога</th><th>Комиссия + спред</th><th>Выгода</th></tr></thead><tbody>${
+      ha.length?ha.map(c=>`<tr><td class="l"><b>${esc(c.name)}</b><br><small class="mu">${esc(c.ticker)}${c.ldv_days?` · <span class="neg">через ${c.ldv_days} дн. часть лотов получит ЛДВ</span>`:''}</small></td><td class="num">${NF0.format(c.qty)}</td><td class="num">${tR(c.value)}</td><td class="num neg">−${tR(c.loss)}</td><td class="num pos">${tR(c.saving)}</td><td class="num">${tR(c.cost)}</td><td class="num ${c.net>0?'pos':'neg'}"><b>${tS(c.net)}</b></td></tr>`).join(''):'<tr><td colspan="7" class="l mu">Подходящих позиций нет: либо убытков нет, либо налог за год ещё не начислен.</td></tr>'}</tbody></table></div>
+    ${ha.length?`<p class="note" style="padding:0 10px">Общая экономия при продаже всего списка: около ${tR(f.harvest_saving)} (до комиссий): каждая следующая продажа экономит меньше, когда прибыль уже покрыта.</p>`:''}
+    ${f.skipped.length?`<p class="note" style="padding:0 10px"><b>Не включены:</b> ${f.skipped.map(c=>`${esc(c.ticker||c.name)} — ${esc(c.reason)}`).join('; ')}.</p>`:''}
+    <p class="note" style="padding:0 10px">Откупить ту же бумагу сразу после продажи законом не запрещено, но срок владения для ЛДВ начнётся заново, а средняя цена покупки изменится. Для ИИС подсказки не строятся. Оцените комиссии, спред и последствия сами и сверьтесь с брокером и ФНС.</p></div>`;
   return out;
 }
 
