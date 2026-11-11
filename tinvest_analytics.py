@@ -54,6 +54,13 @@ LOGO_CDN = "https://invest-brands.cdn-tinkoff.ru/"
 D0 = Decimal(0)
 DAY = 86400
 
+# Реестр дополнительных маршрутов: модули регистрируют обработчики, сервер вызывает их.
+#   API_GET["/api/x"] = fn(cfg, acc, q, force)  -> dict (JSON) или кортеж (код, тело, content-type, заголовки)
+#   API_POST["/api/x"] = fn(cfg, body)           -> dict (JSON) или такой же кортеж
+API_GET, API_POST = {}, {}
+# Ключи настроек, которые никогда не отдаются в интерфейс через /api/config (секреты).
+SECRET_KEYS = {"token"}
+
 DEFAULT_CONFIG = {
     "token": "",
     "sandbox": True,
@@ -6402,6 +6409,11 @@ def _safe_call(fn, *a):
         return fn(*a)
     except Exception:  # noqa: BLE001
         return None
+# ═══════════════════════════════ эмитенты: отчётность, скоринг ═══════════════════════════════
+# ═══════════════════════════════ календарь событий, первичка против вторички, история спредов ═══════════════════════════════
+# ═══════════════════════════════ список наблюдения, заметки, уведомления в Telegram ═══════════════════════════════
+# ═══════════════════════════════ налоги по лотам: ЛДВ, ИИС, перенос убытков, подсказки ═══════════════════════════════
+# ═══════════════════════════════ зашифрованная резервная копия и экспорт ═══════════════════════════════
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -6455,6 +6467,13 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.send(500, {"error": "%s: %s" % (type(e).__name__, e)})
 
+    def _reply(self, res):
+        if isinstance(res, tuple):
+            code, body = res[0], res[1]
+            ctype = res[2] if len(res) > 2 and res[2] else "application/json; charset=utf-8"
+            return self.send(code, body, ctype, res[3] if len(res) > 3 else None)
+        return self.send(200, res)
+
     def do_GET(self):
         if not self.ok_host():
             return self.send(403, {"error": "forbidden"})
@@ -6474,7 +6493,8 @@ class Handler(BaseHTTPRequestHandler):
             f = q.get("force") == "1"
             acc = q.get("account", "all") or "all"
             if u.path == "/api/config":
-                pub = {k: v for k, v in cfg.items() if k != "token"}
+                pub = {k: v for k, v in cfg.items() if k not in SECRET_KEYS}
+                pub["secret_set"] = {k: bool(cfg.get(k)) for k in SECRET_KEYS if k != "token"}
                 pub.update(token_set=bool(cfg["token"]), token_hint=("…" + cfg["token"][-4:]) if cfg["token"] else "",
                            imports=imports_list(), data_dir=APP_DIR, version=APP_VERSION)
                 return self.send(200, pub)
@@ -6520,6 +6540,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/import/template.csv":
                 return self.send(200, TEMPLATE_CSV.encode("utf-8-sig"), "text/csv; charset=utf-8",
                                  {"Content-Disposition": 'attachment; filename="import_template.csv"'})
+            fn = API_GET.get(u.path)
+            if fn:
+                return self._reply(fn(cfg, acc, q, f))
             self.send(404, {"error": "not found"})
         self.guard(run)
 
@@ -6644,6 +6667,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not acc or acc == "all" or str(acc).startswith("imp-"):
                     raise ApiError("Выберите счёт песочницы в списке слева.", 400)
                 return self.send(200, client.call("SandboxService", "SandboxPayIn", {"accountId": acc, "amount": to_money(amount)}))
+            fn = API_POST.get(path)
+            if fn:
+                return self._reply(fn(cfg, body))
             self.send(404, {"error": "not found"})
         self.guard(run)
 
@@ -7155,6 +7181,11 @@ tr.scr-low td{opacity:.5}
 .ld-tbl tbody tr[data-isin]{cursor:pointer}
 .ld-mon{font-size:11px;color:var(--mu);letter-spacing:.02em}
 .ld-notes p{margin:0 0 8px}
+/* эмитенты */
+/* календарь событий */
+/* наблюдение */
+/* налоги */
+/* резервная копия */
 </style></head>
 <body>
 <aside>
@@ -7230,9 +7261,12 @@ const IC={
  calc:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2M12 11h2M16 11h0M8 15h2M12 15h2M8 18h2M12 18h4"/>',
  off:'<path d="M4 12h12M12 7l5 5-5 5"/><path d="M20 4v16"/>',
  lad:'<path d="M7 3v18M17 3v18M7 7h10M7 12h10M7 17h10"/>',
+ iss:'<path d="M4 21V8l8-5 8 5v13"/><path d="M9 21v-6h6v6M8 11h.01M12 11h.01M16 11h.01"/>',
+ cal:'<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M12 14l1.2 2.4 2.6.4-1.9 1.8.5 2.6-2.4-1.3-2.4 1.3.5-2.6-1.9-1.8 2.6-.4z"/>',
+ watch:'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['pri','Первичка'],null,['imp','Импорт отчётов'],['set','Настройки']];
+const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['pri','Первичка'],['cal','Календарь событий'],null,['imp','Импорт отчётов'],['set','Настройки']];
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
 const PERIOD_PAGES=['dash','ret','bench','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
@@ -7442,7 +7476,7 @@ function render(){
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,bench:pBench,calc:pCalc,off:pOff,lad:pLad})[S.page]()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,cal:pCal,watch:pWatch})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -8057,6 +8091,7 @@ async function renderSettings(){
       <button class="btn ghost" id="krsave" style="align-self:flex-end">Сохранить</button></div>
     <p class="note" id="krinfo">Загружаю…</p>
     <p class="note">Ставка ещё не объявленных купонов флоатера = ключевая ставка на начало купонного периода + спред эмитента (по последним известным купонам). «Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.</p></div></div>
+  ${setTgHtml(c)}${setBackupHtml(c)}
   <div class="card" id="whatsnew"><h2>Что нового<span class="sp">версия ${esc(c.version||'')}</span></h2>${changelogHtml()}</div>
   <div class="card"><h2>Роадмап<span class="sp">что планируется</span></h2>${roadmapHtml()}</div>
   <details class="card"><summary style="cursor:pointer;font-weight:600;color:var(--tx2)">Дополнительно</summary><div style="display:grid;gap:18px;margin-top:16px">
@@ -8072,6 +8107,8 @@ async function renderSettings(){
   $('#krsave').onclick=async()=>{try{$('#krinfo').textContent='Загружаю…';await post('/api/config',{keyrate_mode:$('#krmode').value});S.cfg.keyrate_mode=$('#krmode').value;S.bonds=null;msg('Сохранено. Доходности облигаций пересчитаются при следующем открытии раздела.',1);krShow()}catch(e){msg(e.message)}};
   $('#ndsave').onclick=async()=>{try{await post('/api/config',{notify_days:$('#nd').value});S.cfg.notify_days=+$('#nd').value;msg('Сохранено',1)}catch(e){msg(e.message)}};
   $('#ntf').onclick=async()=>{try{if(!('Notification' in window))return msg('Браузер не поддерживает уведомления');const r=await Notification.requestPermission();msg(r==='granted'?'Уведомления разрешены':'Уведомления не разрешены',r==='granted')}catch(e){msg(e.message)}};
+  try{bindSetTg(c,msg)}catch(e){}
+  try{bindSetBackup(c,msg)}catch(e){}
   const body=()=>({token:$('#tok').value,sandbox:$('#sb').checked,verify_ssl:$('#vs').checked,ca_file:$('#ca').value,
     hosts_prod:$('#hp').value.split('\n'),hosts_sandbox:$('#hs').value.split('\n')});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
@@ -8277,6 +8314,9 @@ function bindPage(){
   if(S.page==='calc')bindCalc();
   if(S.page==='off')bindOff();
   if(S.page==='lad')bindLad();
+  if(S.page==='iss')bindIss();
+  if(S.page==='cal')bindCal();
+  if(S.page==='watch')bindWatch();
   if($('#pri-r'))$('#pri-r').onclick=()=>{S.pri=null;render()};
   if($('#pdays'))$('#pdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.payDays=+b.dataset.d;render()};
   if($('#rdays'))$('#rdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.ratesDays=+b.dataset.d;S.rates=null;render()};
@@ -9393,6 +9433,20 @@ function bindLad(){
     q.floaters=$('#ld-fl').checked;q.amort=$('#ld-am').checked;q.monthly=$('#ld-mo').checked;ladRun()};
   ['#ld-sum','#ld-years','#ld-rungs'].forEach(i=>{const e=$(i);if(e)e.onkeydown=ev=>{if(ev.key==='Enter')g.click()}});
 }
+/* ── Эмитенты: отчётность и скоринг ── */
+function pIss(){return`<div class="card empty">Раздел в разработке</div>`}
+function bindIss(){}
+/* ── Календарь событий ── */
+function pCal(){return`<div class="card empty">Раздел в разработке</div>`}
+function bindCal(){}
+/* ── Наблюдение, заметки, Telegram ── */
+function pWatch(){return`<div class="card empty">Раздел в разработке</div>`}
+function bindWatch(){}
+function setTgHtml(c){return''}
+function bindSetTg(c,msg){}
+/* ── Зашифрованная резервная копия и экспорт ── */
+function setBackupHtml(c){return''}
+function bindSetBackup(c,msg){}
 </script></body></html>
 '''
 

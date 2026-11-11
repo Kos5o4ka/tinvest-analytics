@@ -54,6 +54,13 @@ LOGO_CDN = "https://invest-brands.cdn-tinkoff.ru/"
 D0 = Decimal(0)
 DAY = 86400
 
+# Реестр дополнительных маршрутов: модули регистрируют обработчики, сервер вызывает их.
+#   API_GET["/api/x"] = fn(cfg, acc, q, force)  -> dict (JSON) или кортеж (код, тело, content-type, заголовки)
+#   API_POST["/api/x"] = fn(cfg, body)           -> dict (JSON) или такой же кортеж
+API_GET, API_POST = {}, {}
+# Ключи настроек, которые никогда не отдаются в интерфейс через /api/config (секреты).
+SECRET_KEYS = {"token"}
+
 DEFAULT_CONFIG = {
     "token": "",
     "sandbox": True,

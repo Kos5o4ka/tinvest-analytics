@@ -61,7 +61,7 @@ function render(){
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,bench:pBench,calc:pCalc,off:pOff,lad:pLad})[S.page]()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,cal:pCal,watch:pWatch})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }

@@ -63,6 +63,9 @@ function bindPage(){
   if(S.page==='calc')bindCalc();
   if(S.page==='off')bindOff();
   if(S.page==='lad')bindLad();
+  if(S.page==='iss')bindIss();
+  if(S.page==='cal')bindCal();
+  if(S.page==='watch')bindWatch();
   if($('#pri-r'))$('#pri-r').onclick=()=>{S.pri=null;render()};
   if($('#pdays'))$('#pdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.payDays=+b.dataset.d;render()};
   if($('#rdays'))$('#rdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.ratesDays=+b.dataset.d;S.rates=null;render()};

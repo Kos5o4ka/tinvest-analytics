@@ -51,6 +51,13 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.send(500, {"error": "%s: %s" % (type(e).__name__, e)})
 
+    def _reply(self, res):
+        if isinstance(res, tuple):
+            code, body = res[0], res[1]
+            ctype = res[2] if len(res) > 2 and res[2] else "application/json; charset=utf-8"
+            return self.send(code, body, ctype, res[3] if len(res) > 3 else None)
+        return self.send(200, res)
+
     def do_GET(self):
         if not self.ok_host():
             return self.send(403, {"error": "forbidden"})
@@ -70,7 +77,8 @@ class Handler(BaseHTTPRequestHandler):
             f = q.get("force") == "1"
             acc = q.get("account", "all") or "all"
             if u.path == "/api/config":
-                pub = {k: v for k, v in cfg.items() if k != "token"}
+                pub = {k: v for k, v in cfg.items() if k not in SECRET_KEYS}
+                pub["secret_set"] = {k: bool(cfg.get(k)) for k in SECRET_KEYS if k != "token"}
                 pub.update(token_set=bool(cfg["token"]), token_hint=("…" + cfg["token"][-4:]) if cfg["token"] else "",
                            imports=imports_list(), data_dir=APP_DIR, version=APP_VERSION)
                 return self.send(200, pub)
@@ -116,6 +124,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/import/template.csv":
                 return self.send(200, TEMPLATE_CSV.encode("utf-8-sig"), "text/csv; charset=utf-8",
                                  {"Content-Disposition": 'attachment; filename="import_template.csv"'})
+            fn = API_GET.get(u.path)
+            if fn:
+                return self._reply(fn(cfg, acc, q, f))
             self.send(404, {"error": "not found"})
         self.guard(run)
 
@@ -240,6 +251,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not acc or acc == "all" or str(acc).startswith("imp-"):
                     raise ApiError("Выберите счёт песочницы в списке слева.", 400)
                 return self.send(200, client.call("SandboxService", "SandboxPayIn", {"accountId": acc, "amount": to_money(amount)}))
+            fn = API_POST.get(path)
+            if fn:
+                return self._reply(fn(cfg, body))
             self.send(404, {"error": "not found"})
         self.guard(run)
 
