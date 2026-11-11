@@ -3605,8 +3605,7 @@ def kbd_curve():
     return _kbd_now["pts"]
 
 
-def kbd_at(years):
-    pts = kbd_curve()
+def _interp(pts, years):
     if not pts or years is None:
         return None
     if years <= pts[0][0]:
@@ -3615,6 +3614,10 @@ def kbd_at(years):
         if years <= x1:
             return y0 + (y1 - y0) * (years - x0) / (x1 - x0)
     return pts[-1][1]
+
+
+def kbd_at(years):
+    return _interp(kbd_curve(), years)
 
 
 # ── скринер облигаций (Мосбиржа, ISS) ──
@@ -3714,15 +3717,32 @@ def market_stats(rows):
     return {"grid": grid, "sectors": sec, "dur": [m[2] for m in MKT_DUR], "n": len(uni)}
 
 
+MKT_HIST2_KEY = "mkt_stats_hist_v2"
+_hist_lock = threading.Lock()
+
+
 def _stats_history(stats):
     st = store()
     hist = st.get(MKT_HIST_KEY) or {}
-    snap = {g["bucket"]: g["all"]["spread"] for g in stats["grid"] if g["all"]["spread"] is not None and g["all"]["n"] >= 3}
+    ok = [g for g in stats["grid"] if g["all"]["spread"] is not None and g["all"]["n"] >= 3]
+    snap = {g["bucket"]: g["all"]["spread"] for g in ok}
     if snap:
         hist[date.today().isoformat()] = snap
         for k in sorted(hist)[:-400]:
             hist.pop(k, None)
         st.put(MKT_HIST_KEY, hist)
+        # расширенная история (формат v1 не меняем): спред, доходность и число выпусков по корзинам + точки кривой КБД
+        try:
+            with _hist_lock:
+                h2 = st.get(MKT_HIST2_KEY) or {}
+                h2[date.today().isoformat()] = {
+                    "sp": snap, "y": {g["bucket"]: g["all"]["yield"] for g in ok}, "n": {g["bucket"]: g["all"]["n"] for g in ok},
+                    "k": {str(t): (round(kbd_at(t), 2) if kbd_at(t) is not None else None) for t in (1, 2, 5, 10)}}
+                for k in sorted(h2)[:-800]:
+                    h2.pop(k, None)
+                st.put(MKT_HIST2_KEY, h2)
+        except Exception:  # noqa: BLE001
+            pass
     return hist
 
 
@@ -3804,6 +3824,10 @@ def primary_payload():
     for r in rows:
         rt = rating_for(r["short"])
         r["rating"] = rt
+    try:
+        primary_snapshot(rows)
+    except Exception:  # noqa: BLE001
+        pass
     return {"rows": rows, "updated": _pri["t"]}
 
 
@@ -3906,6 +3930,487 @@ def rates_payload(days):
 
 
 
+
+# ── снимки объявленных размещений (накопление: позже можно сравнить ориентир и итог) ──
+
+PRI_SNAP_KEY = "pri_snap_v1"
+_snap_lock = threading.Lock()
+
+
+def primary_snapshot(rows):
+    """Раз в день сохраняет список объявленных размещений; если состав и статусы не изменились — только отмечает проверку."""
+    slim = [{"isin": r.get("isin"), "short": r.get("short"), "desc": r.get("desc"), "start": r.get("start"), "end": r.get("end"),
+             "book": r.get("book"), "status": r.get("status"), "rating": (r.get("rating") or {}).get("v")} for r in rows]
+    if not slim:
+        return
+    st = store()
+    today = date.today().isoformat()
+    with _snap_lock:
+        d = st.get(PRI_SNAP_KEY) or {"days": {}}
+        days = d.setdefault("days", {})
+        last = days[max(days)] if days else None
+        if last == slim and d.get("checked") == today:
+            return
+        if last != slim:
+            days[today] = slim
+        d["checked"] = today
+        for k in sorted(days)[:-400]:
+            days.pop(k, None)
+        st.put(PRI_SNAP_KEY, d)
+
+
+# ── первичка против вторички: как торгуются выпуски, размещённые за последние 12 месяцев ──
+
+PRI_ISS_KEY, PRI_H_PREFIX, PRI_MAX, PRI_DAYS = "pri_issue_v1", "prih1:", 700, 365
+_pri_h = {"running": False, "phase": "", "done": 0, "total": 0, "fin": 0, "err": None, "memo": (0, None)}
+HIST_URL = ("https://iss.moex.com/iss/history/engines/stock/markets/bonds/securities/%s.json?iss.meta=off"
+            "&iss.only=history,history.cursor&history.columns=BOARDID,TRADEDATE,VALUE,NUMTRADES,WAPRICE,LEGALCLOSEPRICE,CLOSE,"
+            "YIELDCLOSE,YIELDATWAP&from=%s&till=%s&start=%d")
+
+
+def _pri_dates(secid):
+    j = json.loads(http_text("https://iss.moex.com/iss/securities/%s.json?iss.meta=off&iss.only=description"
+                             "&description.columns=name,value" % secid, timeout=25))
+    m = {r[0]: r[1] for r in j["description"]["data"]}
+    ok = lambda v: v if v and re.match(r"^\d{4}-\d\d-\d\d$", v) and not v.startswith("0000") else ""  # noqa: E731
+    return [ok(m.get("ISSUEDATE")), ok(m.get("STARTDATEMOEX"))]
+
+
+def _day_add(d, n):
+    return (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def _pri_history(secid, d0, today):
+    """Цена и доходность в 1-й день торгов, через 7 и 30 дней. Цена — % от номинала (средневзвешенная по основной площадке дня)."""
+    till = min(today, _day_add(d0, 50))
+    rows, start = [], 0
+    while start < 400:
+        j = json.loads(http_text(HIST_URL % (secid, d0, till, start), timeout=30))
+        t = j["history"]
+        part = [dict(zip(t["columns"], r)) for r in t["data"]]
+        rows += part
+        if len(part) < 100:
+            break
+        start += 100
+    best = {}
+    for r in rows:
+        px = r.get("WAPRICE") or r.get("LEGALCLOSEPRICE") or r.get("CLOSE")
+        if not px or not r.get("TRADEDATE"):
+            continue
+        cur = best.get(r["TRADEDATE"])
+        if cur is None or (r.get("VALUE") or 0) > (cur.get("VALUE") or 0):
+            best[r["TRADEDATE"]] = dict(r, px=px)
+    days = sorted(best)
+    out = {"d0": None, "p0": None, "y0": None, "p7": None, "y7": None, "p30": None, "y30": None, "t": time.time()}
+    if days:
+        f = days[0]
+        if f <= _day_add(d0, 14):
+            out.update(d0=f, p0=round(best[f]["px"], 2), y0=best[f].get("YIELDCLOSE") or best[f].get("YIELDATWAP"))
+            for k, n in (("7", 7), ("30", 30)):
+                lo, hi = _day_add(f, n), _day_add(f, n + 7)
+                c = [x for x in days if lo <= x <= hi]
+                if c:
+                    out["p" + k] = round(best[c[0]]["px"], 2)
+                    out["y" + k] = best[c[0]].get("YIELDCLOSE") or best[c[0]].get("YIELDATWAP")
+            out["done"] = today >= _day_add(f, 40)
+    out["n_days"] = len(days)
+    # выпуск без сделок вообще (ещё не торговался) — перепроверим позже
+    out["done"] = bool(out.get("done"))
+    return out
+
+
+def _pri_candidates():
+    st = store()
+    iss = st.get(PRI_ISS_KEY) or {}
+    cut = _day_add(date.today().isoformat(), -PRI_DAYS)
+    c = []
+    for sid, (a, b) in iss.items():
+        ref = b or a
+        if ref and ref >= cut:
+            c.append((ref, sid))
+    c.sort(reverse=True)
+    return iss, [(sid, ref) for ref, sid in c[:PRI_MAX]]
+
+
+def _pri_run():
+    try:
+        st = store()
+        st_rows = _scr["rows"] or screener_rows()
+        uni = {r["id"]: r for r in st_rows}
+        iss = st.get(PRI_ISS_KEY) or {}
+        miss = [s for s in uni if s not in iss]
+        _pri_h.update(phase="Узнаю даты размещения выпусков", done=0, total=len(miss))
+        for k in range(0, len(miss), 200):
+            part = miss[k:k + 200]
+
+            def one(s):
+                try:
+                    return s, _pri_dates(s)
+                except Exception:  # noqa: BLE001
+                    return s, None
+            for s, v in pool_map(one, part, workers=8):
+                if v is not None:
+                    iss[s] = v
+            st.put(PRI_ISS_KEY, iss)
+            _pri_h["done"] = min(len(miss), k + 200)
+        iss, cand = _pri_candidates()
+        cand = [(s, ref) for s, ref in cand if s in uni]
+        today = date.today().isoformat()
+        todo = []
+        for s, ref in cand:
+            e = st.get(PRI_H_PREFIX + s)
+            if e and (e.get("done") or time.time() - e.get("t", 0) < 12 * 3600):
+                continue
+            todo.append((s, ref))
+        _pri_h.update(phase="Загружаю историю торгов новых выпусков", done=0, total=len(todo))
+
+        def hist(x):
+            try:
+                return x[0], _pri_history(x[0], x[1], today)
+            except Exception:  # noqa: BLE001
+                return x[0], None
+        for k in range(0, len(todo), 40):
+            res = pool_map(hist, todo[k:k + 40], workers=8)
+            st.put_many([(PRI_H_PREFIX + s, v) for s, v in res if v is not None])
+            _pri_h["done"] = min(len(todo), k + 40)
+        _pri_h["fin"] = time.time()
+        _pri_h["err"] = None
+    except Exception as e:  # noqa: BLE001
+        _pri_h["err"] = str(e)[:200]
+    finally:
+        _pri_h.update(running=False, phase="", memo=(0, None))
+
+
+def primary_stats_start(force=False):
+    with _rt_lock:
+        if _pri_h["running"]:
+            return
+        if not force and time.time() - _pri_h["fin"] < 6 * 3600:
+            return
+        _pri_h["running"] = True
+    threading.Thread(target=_pri_run, daemon=True).start()
+
+
+def _grp_stats(items):
+    p0 = [x["p0"] for x in items if x["p0"] is not None]
+    p7 = [x["p7"] for x in items if x["p7"] is not None]
+    p30 = [x["p30"] for x in items if x["p30"] is not None]
+    dn = [x["now"] - x["p0"] for x in items if x["now"] is not None and x["p0"] is not None]
+    return {"n": len(items), "p0": _med(p0), "p7": _med(p7), "p30": _med(p30), "n30": len(p30),
+            "below30": round(100.0 * sum(1 for v in p30 if v < 100) / len(p30), 1) if p30 else None,
+            "d_now": _med(dn)}
+
+
+def primary_stats_payload():
+    memo = _pri_h["memo"]
+    if memo[1] is not None and time.time() - memo[0] < 120 and not _pri_h["running"]:
+        return dict(memo[1], loading=False)
+    primary_stats_start()
+    st = store()
+    iss, cand = _pri_candidates()
+    uni = {r["id"]: r for r in _scr["rows"]}
+    items = []
+    for sid, ref in cand:
+        e = st.get(PRI_H_PREFIX + sid)
+        r = uni.get(sid)
+        if not e or not r or e.get("p0") is None:
+            continue
+        rt, ci = None, None
+        try:
+            ti = globals().get("tcat_info")
+            ci = ti(r.get("isin")) if ti and r.get("isin") else None
+            rt = best_rating(r.get("isin"), (ci or {}).get("name") or r["name"]) if r["kind"] == "corp" else None
+        except Exception:  # noqa: BLE001
+            rt = None
+        sector = (ci or {}).get("sector") if r["kind"] == "corp" else None
+        sane = lambda v, lo, hi: v if v is not None and lo <= v <= hi else None  # noqa: E731
+        now_ok = r.get("price") if (r.get("yield") or 0) > 0 else None       # без доходности цена ненадёжна (индексируемый номинал и т. п.)
+        if not (80 <= e["p0"] <= 120):
+            continue
+        items.append({"secid": sid, "isin": r.get("isin"), "name": r["name"], "kind": r["kind"], "d0": e["d0"], "p0": e["p0"], "y0": e.get("y0"),
+                      "p7": sane(e.get("p7"), 50, 150), "p30": sane(e.get("p30"), 50, 150), "y30": e.get("y30"),
+                      "now": sane(now_ok, 10, 150), "ynow": r.get("yield"),
+                      "rating": rt["v"] if rt else None, "bucket": "ОФЗ" if r["kind"] == "ofz" else rating_bucket(rt["v"] if rt else None),
+                      "sector": sector})
+    by_b, by_s = {}, {}
+    for x in items:
+        by_b.setdefault(x["bucket"], []).append(x)
+        if x["sector"]:
+            by_s.setdefault(x["sector"], []).append(x)
+    order = ["ОФЗ"] + MKT_BUCKETS + ["нет рейтинга"]
+    buckets = [dict(_grp_stats(by_b[b]), bucket=b) for b in order if b in by_b]
+    sectors = sorted((dict(_grp_stats(v), sector=k) for k, v in by_s.items() if len(v) >= 3), key=lambda g: -g["n"])[:12]
+    aged = [x for x in items if x["now"] is not None and x["d0"] <= _day_add(date.today().isoformat(), -7)]
+    aged.sort(key=lambda x: x["now"] - x["p0"])
+    trim = lambda x: dict(x, delta=round(x["now"] - x["p0"], 2))  # noqa: E731
+    by_m = {}
+    for x in items:
+        by_m.setdefault(x["d0"][:7], []).append(x)
+    months = [dict(_grp_stats(v), m=k) for k, v in sorted(by_m.items())]
+    snaps = (st.get(PRI_SNAP_KEY) or {}).get("days") or {}
+    res = {"all": _grp_stats(items), "buckets": buckets, "sectors": sectors, "months": months,
+           "worst": [trim(x) for x in aged[:8]], "best": [trim(x) for x in aged[::-1][:8]],
+           "universe": len(cand), "ready": len(items), "snap_days": len(snaps), "updated": _pri_h["fin"], "err": _pri_h["err"]}
+    if not _pri_h["running"]:
+        _pri_h["memo"] = (time.time(), res)
+    return dict(res, loading=_pri_h["running"], phase=_pri_h["phase"], done=_pri_h["done"], total=_pri_h["total"])
+
+
+def _api_primary_stats(cfg, acc, q, force):
+    return primary_stats_payload()
+
+
+API_GET["/api/primary/stats"] = _api_primary_stats
+
+
+# ── кривая КБД на прошлые даты ──
+
+def kbd_curve_on(d):
+    """Кривая КБД на дату d (ISO; при выходном берётся ближайший прошлый торговый день). Кэш для прошлых дат навсегда."""
+    st = store()
+    key = "kbdc1:" + d
+    v = st.get(key)
+    if v:
+        return v
+    if d >= date.today().isoformat():
+        return [list(p) for p in kbd_curve()]
+    for k in range(0, 6):
+        dd = _day_add(d, -k)
+        j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/zcyc.json?iss.meta=off&iss.only=yearyields&date=" + dd))
+        pts = sorted((r[2], r[3]) for r in j["yearyields"]["data"])
+        if pts:
+            v = [list(p) for p in pts]
+            st.put(key, v)
+            return v
+    return None
+
+
+CURVE_TERMS = [0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20]
+CURVE_AGO = [(0, "Сегодня"), (30, "1 мес. назад"), (91, "3 мес. назад"), (182, "6 мес. назад"), (365, "12 мес. назад")]
+
+
+def _term_lab(t):
+    return "%d мес" % round(t * 12) if t < 1 else "%d г." % t
+
+
+def kbd_curves_payload():
+    today = date.today().isoformat()
+    ds = [(_day_add(today, -n), lab) for n, lab in CURVE_AGO]
+
+    def one(x):
+        try:
+            return kbd_curve_on(x[0])
+        except Exception:  # noqa: BLE001
+            return None
+    res = pool_map(one, ds, workers=5)
+    items = []
+    for (d, lab), pts in zip(ds, res):
+        if pts:
+            items.append({"date": d, "label": lab, "y": [round(_interp(pts, t), 2) for t in CURVE_TERMS]})
+    return {"terms": CURVE_TERMS, "labels": [_term_lab(t) for t in CURVE_TERMS], "items": items}
+
+
+def _fmt_pp(v):
+    return ("%.2f" % abs(v)).replace(".", ",")
+
+
+def _curve_notes(cv):
+    out = []
+    its = cv.get("items") or []
+    if len(its) < 2:
+        return out
+    now = its[0]
+    i2, i10, i1 = CURVE_TERMS.index(2), CURVE_TERMS.index(10), CURVE_TERMS.index(1)
+    for it in its[1:]:
+        if it["label"] != "3 мес. назад":
+            continue
+        s0, s1 = it["y"][i10] - it["y"][i2], now["y"][i10] - now["y"][i2]
+        if abs(s1 - s0) < 0.15:
+            out.append("Форма кривой за 3 месяца почти не изменилась: разница между 10-летними и 2-летними ставками %s п.п." % _fmt_pp(s1))
+        else:
+            out.append("За 3 месяца кривая КБД стала %s: разница между 10-летними и 2-летними ставками %s с %s до %s п.п." % (
+                "круче (длинные ставки выше коротких сильнее)" if s1 > s0 else "положе (длинные и короткие ставки сближаются)",
+                "выросла" if s1 > s0 else "сократилась", ("-" if s0 < 0 else "") + _fmt_pp(s0), ("-" if s1 < 0 else "") + _fmt_pp(s1)))
+        d1 = now["y"][i1] - it["y"][i1]
+        if abs(d1) >= 0.1:
+            out.append("Доходность 1-летних гособлигаций %s на %s п.п. (с %s до %s %%)." % (
+                "выросла" if d1 > 0 else "снизилась", _fmt_pp(d1), _fmt_pp(it["y"][i1]), _fmt_pp(now["y"][i1])))
+    yr = [it for it in its if it["label"] == "12 мес. назад"]
+    if yr:
+        d2 = now["y"][i2] - yr[0]["y"][i2]
+        out.append("За год 2-летняя доходность КБД %s на %s п.п." % ("выросла" if d2 > 0 else "снизилась", _fmt_pp(d2)))
+    return out
+
+
+# ── история медианных спредов к КБД по рейтингам: накопленные снимки + разовое восстановление по истории торгов ──
+
+BF_KEY = "mkt_bf_v1"
+_bf = {"running": False, "last": 0}
+
+
+def _bf_dates():
+    t = date.today()
+    ds = set()
+    for n in [7 * k for k in range(1, 9)] + [91, 119, 147, 182]:
+        d = t - timedelta(days=n)
+        while d.weekday() > 4:
+            d -= timedelta(days=1)
+        ds.add(d.isoformat())
+    return sorted(ds)
+
+
+HB_URL = ("https://iss.moex.com/iss/history/engines/stock/markets/bonds/boards/TQCB/securities.json?iss.meta=off&date=%s&start=%d"
+          "&iss.only=history,history.cursor&history.columns=SECID,YIELDCLOSE,YIELDATWAP,DURATION,MATDATE,NUMTRADES,VALUE,CURRENCYID")
+
+
+def _bf_day(d, bucket_of):
+    pts = kbd_curve_on(d)
+    if not pts:
+        return None
+
+    def page(s):
+        j = json.loads(http_text(HB_URL % (d, s), timeout=40))
+        t = j["history"]
+        return [dict(zip(t["columns"], r)) for r in t["data"]], j["history.cursor"]["data"][0][1]
+    rows, total = page(0)
+    starts = list(range(100, min(total, 6000), 100))
+    for part, _ in pool_map(lambda s: _safe_pg(page, s), starts, workers=6):
+        rows += part
+    by = {}
+    for r in rows:
+        b = bucket_of.get(r["SECID"])
+        y = r.get("YIELDCLOSE") or r.get("YIELDATWAP")
+        if not b or not y or not r.get("DURATION") or not (r.get("NUMTRADES") or 0) or r.get("CURRENCYID") not in ("SUR", "RUB", None):
+            continue
+        if not (0 < y < 60) or not r.get("MATDATE") or r["MATDATE"] <= _day_add(d, 40):
+            continue
+        by.setdefault(b, []).append(y - _interp(pts, r["DURATION"] / 365.0))
+    sp, nn = {}, {}
+    for b, v in by.items():
+        if len(v) >= 3:
+            sp[b], nn[b] = _med(v), len(v)
+    return {"sp": sp, "n": nn, "bf": True} if sp else None
+
+
+def _safe_pg(fn, s):
+    try:
+        return fn(s)
+    except Exception:  # noqa: BLE001
+        return [], 0
+
+
+def _bf_run():
+    try:
+        rows = _scr["rows"]
+        if not rows or not any(r.get("rating") for r in rows):
+            screener_payload()
+            rows = _scr["rows"]
+        bucket_of = {r["id"]: rating_bucket(r["rating"]) for r in rows if r.get("kind") == "corp" and r.get("cur") == "RUB" and r.get("rating")}
+        st = store()
+        bf = st.get(BF_KEY) or {}
+        for d in _bf_dates():
+            if d in bf:
+                continue
+            try:
+                v = _bf_day(d, bucket_of)
+            except Exception:  # noqa: BLE001
+                v = None
+            if v:
+                bf[d] = v
+                st.put(BF_KEY, bf)
+        _bf["last"] = time.time()
+    except Exception:  # noqa: BLE001
+        _bf["last"] = time.time() - 3600 * 5
+    finally:
+        _bf["running"] = False
+
+
+def spreads_backfill_start():
+    with _rt_lock:
+        if _bf["running"] or time.time() - _bf["last"] < 6 * 3600:
+            return
+        _bf["running"] = True
+    threading.Thread(target=_bf_run, daemon=True).start()
+
+
+def spreads_history_payload():
+    st = store()
+    live = st.get(MKT_HIST2_KEY) or {}
+    old = st.get(MKT_HIST_KEY) or {}
+    allh = dict(st.get(BF_KEY) or {})
+    for d, sp in old.items():           # v1 (только спреды), если нет v2
+        if d not in live:
+            allh[d] = {"sp": sp}
+    allh.update(live)
+    days = sorted(allh)[-400:]
+    series = {b: [(allh[d].get("sp") or {}).get(b) for d in days] for b in MKT_BUCKETS}
+    series = {b: v for b, v in series.items() if any(x is not None for x in v)}
+    return {"dates": days, "series": series, "bf": [d for d in days if allh[d].get("bf")]}
+
+
+def _spread_notes(h):
+    out = []
+    ds = h["dates"]
+    if len(ds) < 2:
+        return ["История спредов накапливается: каждый день работы программы добавляет точку."]
+    last = ds[-1]
+    for b in ("AAA", "AA", "A", "BBB"):
+        v = h["series"].get(b)
+        if not v or v[-1] is None:
+            continue
+        tgt = _day_add(last, -30)
+        cand = [i for i, d in enumerate(ds[:-1]) if d <= tgt and v[i] is not None]
+        if not cand:
+            cand = [i for i, d in enumerate(ds[:-1]) if v[i] is not None and d <= _day_add(last, -7)]
+        if not cand:
+            continue
+        i = cand[-1]
+        diff = v[-1] - v[i]
+        days = (datetime.strptime(last, "%Y-%m-%d") - datetime.strptime(ds[i], "%Y-%m-%d")).days
+        per = "за месяц" if 25 <= days <= 40 else "за %d дн." % days
+        if abs(diff) < 0.1:
+            out.append("Спред %s почти не изменился %s: %s п.п." % (b, per, _fmt_pp(v[-1])))
+        else:
+            out.append("Спред %s %s на %s п.п. %s (с %s до %s п.п.)." % (
+                b, "расширился" if diff > 0 else "сузился", _fmt_pp(diff), per, _fmt_pp(v[i]), _fmt_pp(v[-1])))
+    return out or ["Для вывода о динамике пока мало данных по спредам."]
+
+
+def rates_extra_payload():
+    spreads_backfill_start()
+    h = spreads_history_payload()
+    cv = kbd_curves_payload()
+    return {"spreads": h, "curves": cv, "notes": _curve_notes(cv), "spread_notes": _spread_notes(h), "loading": _bf["running"]}
+
+
+API_GET["/api/rates/extra"] = lambda cfg, acc, q, force: rates_extra_payload()
+
+
+# ── ежедневная фоновая работа: снимок размещений и спреды (история копится, даже если разделы не открывали) ──
+
+def _market_daily_loop():
+    time.sleep(20)
+    while True:
+        try:
+            primary_payload()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            h = store().get(MKT_HIST2_KEY) or {}
+            if date.today().isoformat() not in h:
+                screener_payload()
+            spreads_backfill_start()
+            # статистика первички (тысячи запросов к ISS при первом расчёте) — только по открытию раздела «Первичка»
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(6 * 3600)
+
+
+def _market_daily_start():
+    threading.Thread(target=_market_daily_loop, daemon=True).start()
+
+
+STARTUP_HOOKS.append(_market_daily_start)
 # ═══════════════════ карточка облигации: описание, история, денежный поток, аналоги ═══════════════════
 
 _bc_univ = {"t": 0, "rows": []}
@@ -6681,7 +7186,272 @@ def _safe_call(fn, *a):
     except Exception:  # noqa: BLE001
         return None
 # ═══════════════════════════════ эмитенты: отчётность, скоринг ═══════════════════════════════
-# ═══════════════════════════════ календарь событий, первичка против вторички, история спредов ═══════════════════════════════
+# ═══════════════════════════════ календарь событий ═══════════════════════════════
+
+EV_KINDS = {"cbr": "Заседание ЦБ", "coupon": "Купон", "redemption": "Погашение", "amort": "Амортизация", "dividend": "Дивиденд",
+            "offer": "Оферта", "primary": "Размещение", "w_coupon": "Купон (наблюдение)", "w_redemption": "Погашение (наблюдение)",
+            "w_offer": "Оферта (наблюдение)"}
+CBR_CAL_URL = "https://www.cbr.ru/dkp/cal_mp/"
+CBR_CAL_KEY = "cbr_cal_v1"
+_RU_MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6, "июля": 7, "августа": 8, "сентября": 9,
+              "октября": 10, "ноября": 11, "декабря": 12}
+
+
+def cbr_meetings():
+    """Даты заседаний Совета директоров Банка России по ключевой ставке: {"dates": [...], "ok": bool, "error": str}. Кэш 1 день."""
+    st = store()
+    hit = st.get(CBR_CAL_KEY, ttl=DAY)
+    if hit and hit.get("dates"):
+        return hit
+    try:
+        s = http_text(CBR_CAL_URL, timeout=30)
+        s = s.replace("&nbsp;", " ").replace("\xa0", " ")
+        parts = re.split(r'<div class="date[^"]*">', s)
+        dates = set()
+        for p in parts[1:]:
+            m = re.match(r"\s*(\d{1,2})\s+([а-яё]+)\s+(\d{4})", p)
+            if not m or m.group(2) not in _RU_MONTHS:
+                continue
+            head = p[:1500]
+            nxt = head.find('class="date')
+            body = head if nxt < 0 else head[:nxt]
+            if re.search(r"Заседание Совета директоров", body):
+                dates.add(date(int(m.group(3)), _RU_MONTHS[m.group(2)], int(m.group(1))).isoformat())
+        if not dates:
+            raise ValueError("на странице ЦБ не найдено заседаний")
+        out = {"dates": sorted(dates), "ok": True}
+        st.put(CBR_CAL_KEY, out)
+        return out
+    except Exception as e:  # noqa: BLE001
+        old = st.get(CBR_CAL_KEY)
+        if old and old.get("dates"):
+            return dict(old, stale=True)
+        return {"dates": [], "ok": False, "error": str(e)[:160]}
+
+
+def _ev(d, kind, title, isin=None, amount=None, note="", **kw):
+    e = {"date": d, "kind": kind, "title": title, "isin": isin or None, "amount": amount, "note": note}
+    e.update(kw)
+    return e
+
+
+def _bz_events(isin, name, today, horizon, pref, held=None):
+    """События выпуска из данных Мосбиржи: купоны, амортизации, погашение (последняя выплата), оферты."""
+    bz = moex_bondization(isin)
+    if not bz:
+        return []
+    out = []
+    pay = [(c["coupondate"], c) for c in bz.get("coupons") or [] if c.get("coupondate")]
+    am = [(a["amortdate"], a) for a in bz.get("amort") or [] if a.get("amortdate")]
+    last_am = max([d for d, _ in am] or [""])
+    last_cp = max([d for d, _ in pay] or [""])
+    mat = max(last_am, last_cp)
+    for d, c in pay:
+        if today <= d <= horizon:
+            v = c.get("value")
+            out.append(_ev(d, pref + "coupon", name, isin, (v * held) if (v and held) else None,
+                           ("купон %s на бумагу" % ("%.2f" % v).replace(".", ",") + " " + ("₽" if (c.get("faceunit") or "SUR") in ("SUR", "RUB") else c.get("faceunit") or "")) if v
+                           else "размер купона ещё не объявлен"))
+    for d, a in am:
+        if today <= d <= horizon:
+            if d == mat:
+                out.append(_ev(d, pref + "redemption", name, isin, None, "погашение выпуска"))
+            elif not pref:
+                v = a.get("value")
+                out.append(_ev(d, "amort", name, isin, (v * held) if (v and held) else None, "частичное погашение номинала"))
+    if mat and today <= mat <= horizon and mat not in [d for d, _ in am]:
+        out.append(_ev(mat, pref + "redemption", name, isin, None, "погашение выпуска"))
+    for o in bz.get("offers") or []:
+        d = o.get("offerdate")
+        if d and today <= d <= horizon:
+            note = "оферта" + (" по цене %s%% от номинала" % str(o["price"]).replace(".", ",") if o.get("price") else "")
+            if o.get("offerdatestart") and o.get("offerdateend"):
+                note += "; приём заявок %s – %s" % (o["offerdatestart"], o["offerdateend"])
+            out.append(_ev(d, ("w_offer" if pref else "offer"), name, isin, None, note))
+    return out
+
+
+def events_payload(cfg, acc, q):
+    today = date.today().isoformat()
+    frm = (q.get("from") or "").strip() or today[:8] + "01"
+    if not re.match(r"^\d{4}-\d\d-\d\d$", frm):
+        raise ApiError("Даты нужно указывать в формате ГГГГ-ММ-ДД.", 400)
+    to = (q.get("to") or "").strip() or _day_add(frm, 92)
+    if not re.match(r"^\d{4}-\d\d-\d\d$", to):
+        raise ApiError("Даты нужно указывать в формате ГГГГ-ММ-ДД.", 400)
+    kinds = [k for k in (q.get("kinds") or "").split(",") if k]
+    events, warn, src = [], [], {}
+    # 1. заседания Банка России
+    cb = cbr_meetings()
+    src["cbr"] = bool(cb.get("ok"))
+    if not cb.get("ok"):
+        warn.append("Календарь заседаний Банка России не удалось получить с сайта cbr.ru (%s). Остальные события показаны." % cb.get("error", "нет связи"))
+    for d in cb.get("dates") or []:
+        if frm <= d <= to:
+            events.append(_ev(d, "cbr", "Заседание Банка России по ключевой ставке", None, None,
+                              "решение по ключевой ставке объявляется в 13:30 по Москве"))
+    # 2. выплаты и оферты по портфелю
+    held = set()
+    try:
+        rep = build_bonds(cfg, acc)
+        src["portfolio"] = True
+        by_tk = {r.get("ticker"): r for r in rep["rows"] if r.get("ticker")}
+        for p in rep.get("payments") or []:
+            if not (frm <= p["date"] <= to):
+                continue
+            r = by_tk.get(p.get("ticker")) or {}
+            isin = r.get("isin") if p["kind"] != "dividend" else None
+            note = {"coupon": "купонная выплата", "redemption": "погашение облигации", "dividend": "дивиденд"}.get(p["kind"], p["kind"])
+            if p.get("est"):
+                note += " (оценка)"
+            events.append(_ev(p["date"], p["kind"], p["name"], isin, round(p["amount"], 2), note))
+        for r in rep["rows"]:
+            if r.get("isin") and r.get("qty"):
+                held.add(r["isin"])
+        rows = [r for r in rep["rows"] if r.get("isin") and r.get("qty")]
+
+        def one(r):
+            try:
+                bz = moex_bondization(r["isin"])
+                out = []
+                for o in (bz or {}).get("offers") or []:
+                    d = o.get("offerdate")
+                    if d and frm <= d <= to:
+                        note = "оферта" + (" по цене %s%% от номинала" % str(o["price"]).replace(".", ",") if o.get("price") else "")
+                        if o.get("offerdatestart") and o.get("offerdateend"):
+                            note += "; приём заявок %s – %s" % (o["offerdatestart"], o["offerdateend"])
+                        out.append(_ev(d, "offer", r["name"], r["isin"], None, note))
+                for a in (bz or {}).get("amort") or []:
+                    d = a.get("amortdate")
+                    if d and frm <= d <= to and a.get("value") and d != max([x.get("amortdate") or "" for x in bz["amort"]] + [""]):
+                        out.append(_ev(d, "amort", r["name"], r["isin"], round(a["value"] * r["qty"], 2), "частичное погашение номинала"))
+                return out
+            except Exception:  # noqa: BLE001
+                return []
+        have_am = {(e["isin"], e["date"]) for e in events if e["kind"] == "amort"}
+        for lst in pool_map(one, rows, workers=8):
+            for e in lst:
+                if e["kind"] == "amort" and (e["isin"], e["date"]) in have_am:
+                    continue
+                events.append(e)
+    except Exception as e:  # noqa: BLE001
+        src["portfolio"] = False
+        warn.append("Выплаты и оферты по портфелю не загружены: %s" % str(e)[:140])
+    # 3. объявленные размещения
+    try:
+        for r in primary_rows():
+            d = r.get("start")
+            if d and frm <= d <= to:
+                events.append(_ev(d, "primary", r.get("short") or r.get("issuer"), r.get("isin") or None, None,
+                                  ((r.get("desc") or "") + ((" · книга заявок: " + r["book"]) if r.get("book") else "")).strip(" ·") or "начало размещения"))
+        src["primary"] = True
+    except Exception as e:  # noqa: BLE001
+        src["primary"] = False
+        warn.append("Размещения не загружены: %s" % str(e)[:100])
+    # 4. список наблюдения
+    fn = globals().get("watch_isins")
+    if fn:
+        try:
+            ws = [x for x in (fn() or []) if x]
+            items = []
+            for x in ws:
+                if isinstance(x, dict):
+                    items.append((x.get("isin"), x.get("name") or x.get("isin")))
+                else:
+                    items.append((str(x), str(x)))
+            items = [(i, n) for i, n in items if i and i not in held][:60]
+
+            def wone(it):
+                try:
+                    nm = it[1]
+                    if nm == it[0]:
+                        ci = tcat_info(it[0]) if globals().get("tcat_info") else None
+                        nm = (ci or {}).get("name") or it[0]
+                    return _bz_events(it[0], nm, frm, to, "w_")
+                except Exception:  # noqa: BLE001
+                    return []
+            for lst in pool_map(wone, items, workers=8):
+                events += lst
+            src["watch"] = len(items)
+        except Exception as e:  # noqa: BLE001
+            warn.append("Список наблюдения не загружен: %s" % str(e)[:100])
+    if kinds:
+        events = [e for e in events if e["kind"] in kinds]
+    seen, uniq = {}, []
+    for e in sorted(events, key=lambda e: (e["date"], e["kind"], e["title"])):
+        k = (e["date"], e["kind"], e["title"], e.get("isin"))
+        if k in seen:
+            if e.get("amount") is not None and seen[k]["amount"] is not None and e["kind"] in ("coupon", "dividend", "redemption", "amort"):
+                seen[k]["amount"] = round(seen[k]["amount"] + e["amount"], 2)
+            continue
+        seen[k] = e
+        uniq.append(e)
+    return {"account": acc, "from": frm, "to": to, "events": uniq, "kinds": EV_KINDS, "warnings": warn, "sources": src, "today": today}
+
+
+# ── iCalendar (RFC 5545) ──
+
+def _ics_esc(t):
+    return str(t if t is not None else "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+
+
+def _ics_fold(line):
+    """Строки длиннее 75 октетов переносятся (CRLF + пробел), многобайтные символы не режутся."""
+    b = line.encode("utf-8")
+    if len(b) <= 75:
+        return line
+    out, cur, n = [], "", 0
+    for ch in line:
+        w = len(ch.encode("utf-8"))
+        if n + w > (75 if not out else 74):
+            out.append(cur)
+            cur, n = "", 0
+        cur += ch
+        n += w
+    out.append(cur)
+    return "\r\n ".join(out)
+
+
+def build_ics(events):
+    now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//T-Invest Analytics//Calendar//RU", "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+             "X-WR-CALNAME:T-Invest Analytics: события", "X-WR-TIMEZONE:Europe/Moscow"]
+    for e in events:
+        try:
+            d0 = datetime.strptime(e["date"], "%Y-%m-%d")
+        except ValueError:
+            continue
+        d1 = d0 + timedelta(days=1)
+        uid = hashlib.sha1(("%s|%s|%s|%s" % (e["date"], e["kind"], e.get("isin") or "", e["title"])).encode("utf-8")).hexdigest()[:24] + "@tinvest-analytics"
+        summ = "%s: %s" % (EV_KINDS.get(e["kind"], e["kind"]), e["title"])
+        desc = e.get("note") or ""
+        if e.get("amount") is not None:
+            desc += ("; " if desc else "") + "сумма ≈ %s ₽" % ("{:,.2f}".format(e["amount"]).replace(",", " ").replace(".", ","))
+        if e.get("isin"):
+            desc += ("; " if desc else "") + "ISIN " + e["isin"]
+        lines += ["BEGIN:VEVENT", "UID:" + uid, "DTSTAMP:" + now, "DTSTART;VALUE=DATE:" + d0.strftime("%Y%m%d"),
+                  "DTEND;VALUE=DATE:" + d1.strftime("%Y%m%d"), "SUMMARY:" + _ics_esc(summ), "DESCRIPTION:" + _ics_esc(desc),
+                  "TRANSP:TRANSPARENT", "END:VEVENT"]
+    lines.append("END:VCALENDAR")
+    return ("\r\n".join(_ics_fold(l) for l in lines) + "\r\n").encode("utf-8")
+
+
+def _api_events(cfg, acc, q, force):
+    return events_payload(cfg, acc, q)
+
+
+def _api_events_ics(cfg, acc, q, force):
+    q = dict(q)
+    q.setdefault("from", date.today().isoformat())
+    q.setdefault("to", _day_add(q["from"], 366))
+    q["kinds"] = q.get("kinds", "")
+    p = events_payload(cfg, acc, q)
+    return (200, build_ics(p["events"]), "text/calendar; charset=utf-8",
+            {"Content-Disposition": 'attachment; filename="tinvest_events.ics"'})
+
+
+API_GET["/api/events"] = _api_events
+API_GET["/api/events.ics"] = _api_events_ics
 # ═══════════════════════════════ список наблюдения, заметки, уведомления в Telegram ═══════════════════════════════
 # Список наблюдения и дневник хранятся только в локальной базе. Telegram: личный бот пользователя; наружу (на серверы
 # Telegram) уходят только тексты уведомлений. Токен бота — секрет (SECRET_KEYS), в журнал и в ответы API не попадает.
@@ -8581,6 +9351,29 @@ tr.scr-low td{opacity:.5}
 .ld-notes p{margin:0 0 8px}
 /* эмитенты */
 /* календарь событий */
+.cal-nav{gap:8px;align-items:center;padding:0 2px 12px;flex-wrap:wrap}
+.cal-title{font-size:17px;min-width:150px;text-align:center}
+.cal-chips{display:flex;gap:8px;flex-wrap:wrap;padding:0 2px 12px}
+.cal-chip{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;border:1px solid var(--line2);color:var(--mu);font-size:12.5px;font-weight:500}
+.cal-chip i{width:9px;height:9px;border-radius:50%;opacity:.35}
+.cal-chip.on{color:var(--tx);background:var(--card2)}.cal-chip.on i{opacity:1}
+.cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
+.cal-h{text-align:center;color:var(--mu);font-size:12px;padding:4px 0}
+.cal-c{min-height:68px;border:1px solid var(--line);border-radius:10px;padding:6px 8px;position:relative;background:var(--card)}
+.cal-c.off{border-color:transparent;background:none}
+.cal-c.has{cursor:pointer;background:var(--card2)}.cal-c.has:hover{border-color:var(--line2)}
+.cal-c.today{border-color:var(--ac)}.cal-c.sel{outline:2px solid var(--ac2)}
+.cal-d{font-size:13px;font-weight:600;color:var(--tx2)}.cal-c.today .cal-d{color:var(--ac)}
+.cal-dots{display:flex;gap:3px;flex-wrap:wrap;margin-top:8px}.cal-dots i{width:8px;height:8px;border-radius:50%}
+.cal-n{position:absolute;right:8px;top:6px;font-size:11px;color:var(--mu)}
+.cal-day{margin-bottom:12px}
+.cal-dh{display:flex;gap:10px;align-items:baseline;padding:6px 4px;border-bottom:1px solid var(--line)}
+.cal-ev{display:flex;gap:10px;align-items:center;padding:8px 6px;border-radius:8px}
+.cal-ev[data-isin]{cursor:pointer}.cal-ev[data-isin]:hover{background:var(--card2)}
+.cal-ev>i{width:8px;height:8px;border-radius:50%;flex:none}
+.cal-et{display:flex;flex-direction:column;min-width:0;flex:1}.cal-et b{font-weight:600;font-size:13.5px}.cal-et small{white-space:normal}
+.cal-am{margin-left:auto;white-space:nowrap}
+@media(max-width:700px){.cal-c{min-height:50px;padding:4px}.cal-n{display:none}}
 /* наблюдение */
 .wt-star{background:none;border:0;cursor:pointer;font-size:18px;line-height:1;color:var(--mu);padding:2px 6px;border-radius:6px}
 .wt-star:hover{color:var(--s4)}.wt-star.on{color:var(--s4)}
@@ -9231,10 +10024,56 @@ function pPri(){
     ${kpi('На этой неделе',rows.filter(r=>r.start>=today&&r.start<=wk).length,'начало в ближайшие 7 дней')}${kpi('С рейтингом',rows.filter(r=>r.rating).length,'эмитент найден в базе рейтингов')}</div>
   <div class="card" style="padding:12px 10px 6px"><div class="row" style="padding:0 6px 10px"><b>Календарь первичных размещений</b><button class="btn ghost" id="pri-r" style="margin-left:auto">Обновить</button></div>
     ${rows.length?`<div class="tbl"><table><thead><tr><th class="l">Эмитент и выпуск</th><th class="l">Рейтинг</th><th>Начало размещения</th><th>Окончание</th><th class="l">Книга заявок</th><th class="l">Источник</th></tr></thead><tbody>${body}</tbody></table></div>`:'<div class="empty">Объявленных размещений нет</div>'}</div>
+  ${priStatsHtml()}
   <p class="note">Даты начала размещения — по объявлениям Московской биржи (сводка investmint.ru). Ставку купона эмитент обычно объявляет в день сбора заявок: уточняйте её у брокера. Рейтинг сопоставлен с эмитентом по названию. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
 
 
+
+/* ── Как торгуются новые выпуски: цена в 1-й день, через 7 и 30 дней и сейчас ── */
+S.priSt=null;
+function loadPriSt(force){
+  if(S._priStL&&!force)return;S._priStL=1;
+  api('/api/primary/stats').then(j=>{S._priStL=0;S.priSt=j;if(S.page==='pri'){render();if(j.loading)setTimeout(()=>{if(S.page==='pri')loadPriSt(true)},4000)}})
+   .catch(e=>{S._priStL=0;S.priSt={error:e.message}})
+}
+const ppd=(v,d=2)=>v==null||isNaN(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' п.п.';
+const pp1=v=>v==null||isNaN(v)?'—':(+v).toFixed(2).replace('.',',')+' %';
+function priStTable(list,title){
+  if(!list.length)return'';
+  return`<h3 style="font-size:13px;margin:14px 6px 6px;color:var(--tx2)">${title}</h3><div class="tbl"><table><thead><tr><th class="l">Выпуск</th><th class="l">Рейтинг</th><th>Размещён</th><th>Цена 1-й день</th><th>Через 30 дн.</th><th>Сейчас</th><th>Изменение</th><th>Доходность</th></tr></thead><tbody>`+
+  list.map(x=>`<tr data-isin="${esc(x.isin||'')}" title="Открыть карточку выпуска"><td class="l"><b>${esc(x.name)}</b>${x.kind==='ofz'?' <span class="tag">ОФЗ</span>':''}</td>
+    <td class="l">${x.rating?`<span class="tag rt rt-${esc(rBucket(x.rating).split(' ')[0])}">${esc(x.rating)}</span>`:'<span class="mu">—</span>'}</td>
+    <td class="num">${ddm(x.d0)}</td><td class="num">${pp1(x.p0)}</td><td class="num">${pp1(x.p30)}</td><td class="num">${pp1(x.now)}</td>
+    <td class="num ${x.delta>0?'pos':x.delta<0?'neg':''}">${ppd(x.delta)}</td><td class="num">${x.ynow!=null?pp1(x.ynow):'—'}</td></tr>`).join('')+`</tbody></table></div>`;
+}
+function priStatsHtml(){
+  if(!S.priSt)loadPriSt();
+  const d=S.priSt;
+  const head='<div class="card" style="margin-top:16px"><h2>Как торгуются новые выпуски</h2>';
+  if(!d)return head+waitBox('Считаю статистику по размещениям за последние 12 месяцев…')+'</div>';
+  if(d.error)return head+`<div class="msg err">${esc(d.error)}</div></div>`;
+  const a=d.all||{};
+  if(!a.n)return head+(d.loading?waitBox((d.phase||'Готовлю данные')+(d.total?` — ${d.done} из ${d.total}`:'')+'. Первый расчёт занимает 2–3 минуты, потом данные хранятся на компьютере.'):'<div class="empty">Пока нет данных по размещённым выпускам. Проверьте подключение к интернету.</div>')+'</div>';
+  const bk=(d.buckets||[]).filter(b=>b.n>=3);
+  chart('c-pri-b',bars,{h:260,labels:bk.map(b=>b.bucket+' ('+b.n+')'),zero:true,
+    series:[{n:'1-й день, цена − номинал',c:'#3987e5',v:bk.map(b=>b.p0==null?null:+(b.p0-100).toFixed(2))},{n:'Через 30 дней, цена − номинал',c:'#19a070',v:bk.map(b=>b.p30==null?null:+(b.p30-100).toFixed(2))}],
+    fa:v=>(+v).toFixed(1).replace('.',','),ft:v=>ppd(v),empty:'Мало данных для графика'});
+  const dv=a.p30==null?null:a.p30-100;
+  const verdict=a.p30==null?'Через 30 дней данных пока мало.':
+    `В первый день новые выпуски торгуются в среднем около ${pp1(a.p0)} от номинала, через 30 дней — около ${pp1(a.p30)}. ${a.below30>50?'Больше половины выпусков через месяц стоят ниже номинала: покупка на размещении чаще оказывалась невыгодной, чем покупка позже.':a.below30<30?'Большинство выпусков через месяц стоят не ниже номинала: покупка на размещении обычно не проигрывала.':'Примерно половина выпусков через месяц стоит ниже номинала, половина — выше: явного преимущества у размещения или вторички нет.'}`;
+  return head+`<div class="g g4">${kpi('Выпусков в расчёте',a.n,'размещены за 12 месяцев')}${kpi('Медиана через 7 дней',pp1(a.p7),'от номинала')}
+    ${kpi('Медиана через 30 дней',pp1(a.p30),dv==null?'':ppd(dv)+' к номиналу',dv==null?'':dv<0?'neg':'pos')}${kpi('Ниже номинала через 30 дней',a.below30==null?'—':pctp(a.below30,0),'доля выпусков')}</div>
+  <p style="margin:12px 6px;color:var(--tx2)">${esc(verdict)}</p>
+  <div class="g g2" style="margin-top:6px"><div><div class="axt">Отклонение цены от номинала по рейтингам, п.п.</div><div id="c-pri-b" class="chart"></div></div>
+  <div><div class="tbl"><table><thead><tr><th class="l">Группа</th><th>Выпусков</th><th>Цена 1-й день</th><th>Через 30 дн.</th><th>Ниже номинала</th><th>Сейчас к 1-му дню</th></tr></thead><tbody>
+    ${(d.buckets||[]).map(b=>`<tr><td class="l">${esc(b.bucket)}</td><td class="num">${b.n}</td><td class="num">${pp1(b.p0)}</td><td class="num">${pp1(b.p30)}</td><td class="num">${b.below30==null?'—':pctp(b.below30,0)}</td><td class="num ${b.d_now>0?'pos':b.d_now<0?'neg':''}">${ppd(b.d_now)}</td></tr>`).join('')}</tbody></table></div>
+    ${(d.sectors||[]).length?`<div class="tbl" style="margin-top:12px"><table><thead><tr><th class="l">Сектор</th><th>Выпусков</th><th>Через 30 дн.</th><th>Ниже номинала</th></tr></thead><tbody>
+    ${d.sectors.map(b=>`<tr><td class="l">${esc(SECT[b.sector]||b.sector)}</td><td class="num">${b.n}</td><td class="num">${pp1(b.p30)}</td><td class="num">${b.below30==null?'—':pctp(b.below30,0)}</td></tr>`).join('')}</tbody></table></div>`:''}</div></div>
+  ${priStTable(d.best||[],'Лучшие размещения: сильнее всего выросли в цене с 1-го дня')}${priStTable(d.worst||[],'Худшие размещения: сильнее всего подешевели')}
+  ${d.loading?`<p class="note">Догружаю данные: ${esc(d.phase||'')} ${d.total?d.done+' из '+d.total:''}…</p>`:''}
+  <p class="note">Считаются корпоративные облигации и ОФЗ, размещённые за последние 12 месяцев и торгуемые сейчас (досрочно погашенные в расчёт не попали, поэтому картина может быть чуть лучше реальной). Цена — средневзвешенная, в процентах от номинала; «Сейчас» — последняя рыночная цена, у части выпусков она меняется из-за купонов и амортизации. Рейтинг сопоставлен по названию эмитента. Ежедневные снимки объявленных размещений сохраняются на компьютере (накоплено дней: ${d.snap_days}) — позже по ним можно сравнить ориентир купона и итог. Справочная информация, не инвестиционная рекомендация.</p></div>`;
+}
 /* ── Скринер облигаций ── */
 S.scr=null;S.sf={q:'',cur:'RUB',kind:'all',sector:'',rmin:'',rated:false,ymin:'',ymax:'60',tmax:'',turn:'',spmin:'',noOffer:false};S.ssort={k:'yield',d:-1};S.sn=150;
 function loadScr(){api('/api/screener').then(j=>{const t=Date.now();j.rows.forEach(r=>{r.years=(new Date(r.mat)-t)/315576e5});S.scr=j;if(S.page==='scr'||S.page==='map')render()}).catch(e=>{S.scr={error:e.message,rows:[]};if(S.page==='scr'||S.page==='map')render()})}
@@ -9646,10 +10485,45 @@ function pMkt(){
   <div class="card rates"><h2>Доходность КБД (2 года) и ключевая ставка<span class="sp">${seg}</span></h2>
     <div class="axt">Ставка, % годовых</div><div id="c-rates" class="chart"></div><div class="axt" style="text-align:center">Дата</div>
     <div class="strip" id="rstrip">${stripHtml(r,i0)}</div>${r.loading?'<p class="note">Догружаю историю…</p>':''}</div>
+  ${ratesXHtml()}
   <p class="note">КБД — кривая бескупонной доходности ОФЗ Московской биржи (срок 2 года), ключевая ставка — Банка России. Данные берутся с сайтов Мосбиржи и ЦБ при открытой программе и сохраняются локально. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
 function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КБД · 2 года: <b>${pc1(r.kbd[i])}</b></span><span>КС: <b>${pc1(r.key[i])}</b></span>`}
 
+
+/* ── Кривая КБД: сегодня против прошлых дат; история спредов к КБД по рейтингам ── */
+S.ratesX=null;
+function loadRatesX(force){
+  if(S._rxL&&!force)return;S._rxL=1;
+  api('/api/rates/extra').then(j=>{S._rxL=0;S.ratesX=j;if(S.page==='mkt'){render();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
+   .catch(e=>{S._rxL=0;S.ratesX={error:e.message}})
+}
+const RX_COL=['#ffdd2d','#3987e5','#19a070','#d95926','#9085e9'];
+const RX_BCOL={'AAA':'#3987e5','AA':'#19a070','A':'#ffdd2d','BBB':'#d95926','BB и ниже':'#e66767'};
+function ratesXHtml(){
+  if(!S.ratesX)loadRatesX();
+  const x=S.ratesX;
+  if(!x)return`<div class="card rates">${waitBox('Загружаю кривую КБД за прошлые даты и историю спредов…')}</div>`;
+  if(x.error)return`<div class="msg err">${esc(x.error)}</div>`;
+  const cv=x.curves||{},its=cv.items||[],sp=x.spreads||{dates:[],series:{}};
+  let h='';
+  if(its.length>1){
+    chart('c-rx-curve',line,{h:320,zero:false,labels:cv.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc1(v),
+      series:its.map((it,i)=>({n:it.label+' ('+ddm(it.date)+')',c:RX_COL[i%5],hex:RX_COL[i%5],v:it.y,w:i===0?3:1.8,dash:i>0&&i>2}))});
+    h+=`<div class="card rates"><h2>Кривая КБД: сегодня и раньше</h2><div class="axt">Доходность, % годовых</div><div id="c-rx-curve" class="chart"></div><div class="axt" style="text-align:center">Срок до погашения</div>
+      ${(x.notes||[]).map(t=>`<p style="margin:6px 4px;color:var(--tx2)">${esc(t)}</p>`).join('')}</div>`;
+  }
+  const names=Object.keys(sp.series||{});
+  if(sp.dates.length>=2&&names.length){
+    chart('c-rx-spr',line,{h:300,zero:false,labels:sp.dates.map(ddm),tipLabels:sp.dates.map(dlabel),fa:v=>(+v).toFixed(1).replace('.',',')+' п.п.',ft:v=>(+v).toFixed(2).replace('.',',')+' п.п.',
+      series:names.map(b=>({n:b,c:RX_BCOL[b]||'#a8aebb',hex:RX_BCOL[b]||'#a8aebb',v:sp.series[b],w:2}))});
+    h+=`<div class="card rates"><h2>Спреды к КБД по рейтингам во времени<span class="sp">медиана по рублёвым корпоративным облигациям</span></h2>
+      <div class="axt">Спред к КБД, п.п.</div><div id="c-rx-spr" class="chart"></div>
+      ${(x.spread_notes||[]).map(t=>`<p style="margin:6px 4px;color:var(--tx2)">${esc(t)}</p>`).join('')}
+      <p class="note">Спред — на сколько доходность выпуска выше доходности гособлигаций того же срока (КБД). Даты по горизонтали идут неравномерно: свежие точки накоплены программой, ${sp.bf&&sp.bf.length?'более ранние ('+sp.bf.length+') восстановлены по истории торгов Мосбиржи с сегодняшними рейтингами, поэтому они приблизительные':'история продолжает накапливаться'}.${x.loading?' Догружаю историю…':''}</p></div>`;
+  }else h+=`<div class="card rates"><h2>Спреды к КБД по рейтингам во времени</h2>${x.loading?waitBox('Восстанавливаю историю спредов по торгам Мосбиржи — это занимает пару минут…'):'<div class="empty">История спредов накапливается: каждый день работы программы добавляет точку.</div>'}</div>`;
+  return h;
+}
 /* ── Ребалансировка ── */
 S.reb={contrib:'',buyOnly:true,draft:null};S.payDays=90;
 function pReb(){
@@ -10884,8 +11758,76 @@ function bindLad(){
 function pIss(){return`<div class="card empty">Раздел в разработке</div>`}
 function bindIss(){}
 /* ── Календарь событий ── */
-function pCal(){return`<div class="card empty">Раздел в разработке</div>`}
-function bindCal(){}
+const CAL_KINDS=[['cbr','Заседания ЦБ','#ffdd2d',['cbr']],['coupon','Купоны','#19a070',['coupon']],['redemption','Погашения','#d95926',['redemption']],
+  ['amort','Амортизации','#c98500',['amort']],['dividend','Дивиденды','#9085e9',['dividend']],['offer','Оферты','#e66767',['offer']],
+  ['primary','Размещения','#3987e5',['primary']],['watch','Наблюдение','#8d94a3',['w_coupon','w_redemption','w_offer']]];
+const CAL_NAME={cbr:'Заседание ЦБ',coupon:'Купон',redemption:'Погашение',amort:'Амортизация',dividend:'Дивиденд',offer:'Оферта',primary:'Размещение',
+  w_coupon:'Купон · наблюдение',w_redemption:'Погашение · наблюдение',w_offer:'Оферта · наблюдение'};
+const calGroup=k=>(CAL_KINDS.find(g=>g[3].includes(k))||[])[0]||k;
+const calCol=k=>(CAL_KINDS.find(g=>g[0]===calGroup(k))||[])[2]||'#8d94a3';
+(function(){const n=new Date();S.cal={y:n.getFullYear(),m:n.getMonth(),off:{},cache:{},sel:null}})();
+try{const v=JSON.parse(localStorage.getItem('cal_off')||'null');if(v&&typeof v==='object')S.cal.off=v}catch(e){}
+const calYm=()=>S.cal.y+'-'+String(S.cal.m+1).padStart(2,'0');
+function calRange(){
+  const y=S.cal.y,m=S.cal.m,p=n=>String(n).padStart(2,'0');
+  const last=new Date(y,m+1,0).getDate();
+  return[`${y}-${p(m+1)}-01`,`${y}-${p(m+1)}-${p(last)}`];
+}
+function loadCal(){
+  const key=S.account+'|'+calYm(),c=S.cal.cache[key];
+  if(c&&(c.loading||c.data||c.error))return;
+  const [from,to]=calRange();
+  S.cal.cache[key]={loading:true};
+  api('/api/events?'+new URLSearchParams({account:S.account,from,to})).then(d=>{S.cal.cache[key]={data:d};if(S.page==='cal')render()})
+   .catch(e=>{S.cal.cache[key]={error:e.message};if(S.page==='cal')render()});
+}
+const calP2=n=>String(n).padStart(2,'0');
+function calMoney(e){return e.amount!=null?M(e.amount,'rub',2):''}
+function pCal(){
+  loadCal();
+  const key=S.account+'|'+calYm(),c=S.cal.cache[key]||{loading:true};
+  const y=S.cal.y,m=S.cal.m,today=new Date().toISOString().slice(0,10);
+  const nav=`<div class="row cal-nav"><button class="btn ghost" id="cal-prev" title="Предыдущий месяц">‹</button><b class="cal-title">${MONF[m]} ${y}</b><button class="btn ghost" id="cal-next" title="Следующий месяц">›</button>
+    <button class="btn ghost" id="cal-today">Сегодня</button><a class="btn" id="cal-ics" href="/api/events.ics?${new URLSearchParams({account:S.account})}" download="tinvest_events.ics" style="margin-left:auto">Скачать .ics</a></div>`;
+  const chips=`<div class="cal-chips">${CAL_KINDS.map(g=>`<button class="cal-chip ${S.cal.off[g[0]]?'':'on'}" data-k="${g[0]}"><i style="background:${g[2]}"></i>${g[1]}</button>`).join('')}</div>`;
+  const help=`<p class="note" style="margin:4px 4px 12px">Кнопка «Скачать .ics» сохраняет файл с событиями на год вперёд (все типы, без учёта фильтров). Его можно импортировать в Календарь Google (Настройки → Импорт) или открыть в Календаре Apple двойным щелчком. Файл формируется на вашем компьютере и никуда не отправляется.</p>`;
+  if(c.loading)return`<div class="card">${nav}${waitBox('Собираю события: заседания ЦБ, выплаты, оферты, размещения…')}</div>`;
+  if(c.error)return`<div class="card">${nav}<div class="msg err">${esc(c.error)} <button class="btn ghost" id="cal-r">Повторить</button></div></div>`;
+  const d=c.data,evs=(d.events||[]).filter(e=>!S.cal.off[calGroup(e.kind)]);
+  const by={};evs.forEach(e=>(by[e.date]=by[e.date]||[]).push(e));
+  const first=new Date(y,m,1),lead=(first.getDay()+6)%7,days=new Date(y,m+1,0).getDate();
+  let cells='';
+  for(let i=0;i<lead;i++)cells+='<div class="cal-c off"></div>';
+  for(let dd=1;dd<=days;dd++){
+    const ds=`${y}-${calP2(m+1)}-${calP2(dd)}`,l=by[ds]||[];
+    const kinds=[...new Set(l.map(e=>calGroup(e.kind)))];
+    cells+=`<div class="cal-c ${ds===today?'today':''} ${l.length?'has':''} ${S.cal.sel===ds?'sel':''}" data-day="${ds}"><span class="cal-d">${dd}</span>
+      ${l.length?`<span class="cal-dots">${kinds.slice(0,6).map(k=>`<i style="background:${(CAL_KINDS.find(g=>g[0]===k)||[])[2]||'#8d94a3'}"></i>`).join('')}</span><span class="cal-n">${l.length}</span>`:''}</div>`;
+  }
+  const grid=`<div class="cal-grid"><div class="cal-h">Пн</div><div class="cal-h">Вт</div><div class="cal-h">Ср</div><div class="cal-h">Чт</div><div class="cal-h">Пт</div><div class="cal-h">Сб</div><div class="cal-h">Вс</div>${cells}</div>`;
+  const ds=Object.keys(by).filter(x=>!S.cal.sel||x===S.cal.sel).sort();
+  const sum={};evs.forEach(e=>{if(e.amount!=null&&['coupon','redemption','amort','dividend'].includes(e.kind))sum[e.kind]=(sum[e.kind]||0)+e.amount});
+  const total=Object.values(sum).reduce((a,b)=>a+b,0);
+  const list=ds.length?ds.map(dt=>`<div class="cal-day" id="cal-d-${dt}"><div class="cal-dh"><b>${dlabel(dt)}</b><span class="mu">${['вс','пн','вт','ср','чт','пт','сб'][new Date(dt+'T00:00:00').getDay()]}${dt===today?' · сегодня':''}</span></div>
+    ${by[dt].map(e=>`<div class="cal-ev"${e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:''}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}</b><small class="mu">${esc(CAL_NAME[e.kind]||e.kind)}${e.note?' · '+esc(e.note):''}</small></div>
+      <span class="num cal-am">${calMoney(e)}</span></div>`).join('')}</div>`).join(''):'<div class="empty" style="padding:24px">В этом месяце событий нет'+(Object.keys(S.cal.off).some(k=>S.cal.off[k])?' (часть типов скрыта фильтрами)':'')+'</div>';
+  const warn=(d.warnings||[]).map(w=>`<div class="msg err" style="margin:8px 0">${esc(w)}</div>`).join('');
+  return`<div class="g g4">${kpi('Событий в месяце',evs.length,MONF[m].toLowerCase()+' '+y)}${kpi('Выплаты по портфелю',total?M(total,'rub',0):'—','купоны, погашения, амортизации, дивиденды')}
+    ${kpi('Заседаний ЦБ',evs.filter(e=>e.kind==='cbr').length,'по ключевой ставке')}${kpi('Размещений',evs.filter(e=>e.kind==='primary').length,'начало по объявлениям Мосбиржи')}</div>
+  <div class="card" style="margin-top:16px">${nav}${chips}${warn}${grid}${S.cal.sel?`<div class="row" style="margin:10px 4px 0"><span class="mu">Показан день ${dlabel(S.cal.sel)}</span><button class="btn ghost" id="cal-all">Показать весь месяц</button></div>`:''}</div>
+  <div class="card" style="margin-top:16px"><h2>События ${S.cal.sel?'за день':'месяца'}</h2>${list}</div>${help}
+  <p class="note">Источники: сайт Банка России (календарь заседаний), Московская биржа (купоны, оферты, размещения), ваш портфель${(d.sources||{}).watch!=null?', список наблюдения':''}. Даты выплат, размеры будущих купонов и оферт могут измениться — сверяйтесь с решением эмитента. Справочная информация, не инвестиционная рекомендация.</p>`;
+}
+function bindCal(){
+  const go=n=>{const d=new Date(S.cal.y,S.cal.m+n,1);S.cal.y=d.getFullYear();S.cal.m=d.getMonth();S.cal.sel=null;render()};
+  const b=(id,f)=>{const e=$(id);if(e)e.onclick=f};
+  b('#cal-prev',()=>go(-1));b('#cal-next',()=>go(1));
+  b('#cal-today',()=>{const n=new Date();S.cal.y=n.getFullYear();S.cal.m=n.getMonth();S.cal.sel=null;render()});
+  b('#cal-r',()=>{delete S.cal.cache[S.account+'|'+calYm()];render()});
+  b('#cal-all',()=>{S.cal.sel=null;render()});
+  document.querySelectorAll('.cal-chip').forEach(e=>e.onclick=()=>{const k=e.dataset.k;S.cal.off[k]=!S.cal.off[k];try{localStorage.setItem('cal_off',JSON.stringify(S.cal.off))}catch(x){}render()});
+  document.querySelectorAll('.cal-c[data-day]').forEach(e=>e.onclick=()=>{const d=e.dataset.day;S.cal.sel=S.cal.sel===d?null:d;render()});
+}
 /* ── Наблюдение: список бумаг с целями и тревогами, дневник, уведомления в Telegram ── */
 S.wset=null;S.watch=null;S.wnotes=null;S.wfilter='';S.wsug=[];
 const WT_REMIND=[['','без напоминания'],['7','через 7 дней'],['30','через 30 дней'],['90','через 3 месяца'],['180','через полгода'],['365','через год']];

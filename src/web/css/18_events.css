@@ -1,1 +1,24 @@
 /* календарь событий */
+.cal-nav{gap:8px;align-items:center;padding:0 2px 12px;flex-wrap:wrap}
+.cal-title{font-size:17px;min-width:150px;text-align:center}
+.cal-chips{display:flex;gap:8px;flex-wrap:wrap;padding:0 2px 12px}
+.cal-chip{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;border:1px solid var(--line2);color:var(--mu);font-size:12.5px;font-weight:500}
+.cal-chip i{width:9px;height:9px;border-radius:50%;opacity:.35}
+.cal-chip.on{color:var(--tx);background:var(--card2)}.cal-chip.on i{opacity:1}
+.cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
+.cal-h{text-align:center;color:var(--mu);font-size:12px;padding:4px 0}
+.cal-c{min-height:68px;border:1px solid var(--line);border-radius:10px;padding:6px 8px;position:relative;background:var(--card)}
+.cal-c.off{border-color:transparent;background:none}
+.cal-c.has{cursor:pointer;background:var(--card2)}.cal-c.has:hover{border-color:var(--line2)}
+.cal-c.today{border-color:var(--ac)}.cal-c.sel{outline:2px solid var(--ac2)}
+.cal-d{font-size:13px;font-weight:600;color:var(--tx2)}.cal-c.today .cal-d{color:var(--ac)}
+.cal-dots{display:flex;gap:3px;flex-wrap:wrap;margin-top:8px}.cal-dots i{width:8px;height:8px;border-radius:50%}
+.cal-n{position:absolute;right:8px;top:6px;font-size:11px;color:var(--mu)}
+.cal-day{margin-bottom:12px}
+.cal-dh{display:flex;gap:10px;align-items:baseline;padding:6px 4px;border-bottom:1px solid var(--line)}
+.cal-ev{display:flex;gap:10px;align-items:center;padding:8px 6px;border-radius:8px}
+.cal-ev[data-isin]{cursor:pointer}.cal-ev[data-isin]:hover{background:var(--card2)}
+.cal-ev>i{width:8px;height:8px;border-radius:50%;flex:none}
+.cal-et{display:flex;flex-direction:column;min-width:0;flex:1}.cal-et b{font-weight:600;font-size:13.5px}.cal-et small{white-space:normal}
+.cal-am{margin-left:auto;white-space:nowrap}
+@media(max-width:700px){.cal-c{min-height:50px;padding:4px}.cal-n{display:none}}

@@ -24,7 +24,42 @@ function pMkt(){
   <div class="card rates"><h2>Доходность КБД (2 года) и ключевая ставка<span class="sp">${seg}</span></h2>
     <div class="axt">Ставка, % годовых</div><div id="c-rates" class="chart"></div><div class="axt" style="text-align:center">Дата</div>
     <div class="strip" id="rstrip">${stripHtml(r,i0)}</div>${r.loading?'<p class="note">Догружаю историю…</p>':''}</div>
+  ${ratesXHtml()}
   <p class="note">КБД — кривая бескупонной доходности ОФЗ Московской биржи (срок 2 года), ключевая ставка — Банка России. Данные берутся с сайтов Мосбиржи и ЦБ при открытой программе и сохраняются локально. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
 function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КБД · 2 года: <b>${pc1(r.kbd[i])}</b></span><span>КС: <b>${pc1(r.key[i])}</b></span>`}
 
+
+/* ── Кривая КБД: сегодня против прошлых дат; история спредов к КБД по рейтингам ── */
+S.ratesX=null;
+function loadRatesX(force){
+  if(S._rxL&&!force)return;S._rxL=1;
+  api('/api/rates/extra').then(j=>{S._rxL=0;S.ratesX=j;if(S.page==='mkt'){render();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
+   .catch(e=>{S._rxL=0;S.ratesX={error:e.message}})
+}
+const RX_COL=['#ffdd2d','#3987e5','#19a070','#d95926','#9085e9'];
+const RX_BCOL={'AAA':'#3987e5','AA':'#19a070','A':'#ffdd2d','BBB':'#d95926','BB и ниже':'#e66767'};
+function ratesXHtml(){
+  if(!S.ratesX)loadRatesX();
+  const x=S.ratesX;
+  if(!x)return`<div class="card rates">${waitBox('Загружаю кривую КБД за прошлые даты и историю спредов…')}</div>`;
+  if(x.error)return`<div class="msg err">${esc(x.error)}</div>`;
+  const cv=x.curves||{},its=cv.items||[],sp=x.spreads||{dates:[],series:{}};
+  let h='';
+  if(its.length>1){
+    chart('c-rx-curve',line,{h:320,zero:false,labels:cv.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc1(v),
+      series:its.map((it,i)=>({n:it.label+' ('+ddm(it.date)+')',c:RX_COL[i%5],hex:RX_COL[i%5],v:it.y,w:i===0?3:1.8,dash:i>0&&i>2}))});
+    h+=`<div class="card rates"><h2>Кривая КБД: сегодня и раньше</h2><div class="axt">Доходность, % годовых</div><div id="c-rx-curve" class="chart"></div><div class="axt" style="text-align:center">Срок до погашения</div>
+      ${(x.notes||[]).map(t=>`<p style="margin:6px 4px;color:var(--tx2)">${esc(t)}</p>`).join('')}</div>`;
+  }
+  const names=Object.keys(sp.series||{});
+  if(sp.dates.length>=2&&names.length){
+    chart('c-rx-spr',line,{h:300,zero:false,labels:sp.dates.map(ddm),tipLabels:sp.dates.map(dlabel),fa:v=>(+v).toFixed(1).replace('.',',')+' п.п.',ft:v=>(+v).toFixed(2).replace('.',',')+' п.п.',
+      series:names.map(b=>({n:b,c:RX_BCOL[b]||'#a8aebb',hex:RX_BCOL[b]||'#a8aebb',v:sp.series[b],w:2}))});
+    h+=`<div class="card rates"><h2>Спреды к КБД по рейтингам во времени<span class="sp">медиана по рублёвым корпоративным облигациям</span></h2>
+      <div class="axt">Спред к КБД, п.п.</div><div id="c-rx-spr" class="chart"></div>
+      ${(x.spread_notes||[]).map(t=>`<p style="margin:6px 4px;color:var(--tx2)">${esc(t)}</p>`).join('')}
+      <p class="note">Спред — на сколько доходность выпуска выше доходности гособлигаций того же срока (КБД). Даты по горизонтали идут неравномерно: свежие точки накоплены программой, ${sp.bf&&sp.bf.length?'более ранние ('+sp.bf.length+') восстановлены по истории торгов Мосбиржи с сегодняшними рейтингами, поэтому они приблизительные':'история продолжает накапливаться'}.${x.loading?' Догружаю историю…':''}</p></div>`;
+  }else h+=`<div class="card rates"><h2>Спреды к КБД по рейтингам во времени</h2>${x.loading?waitBox('Восстанавливаю историю спредов по торгам Мосбиржи — это занимает пару минут…'):'<div class="empty">История спредов накапливается: каждый день работы программы добавляет точку.</div>'}</div>`;
+  return h;
+}
