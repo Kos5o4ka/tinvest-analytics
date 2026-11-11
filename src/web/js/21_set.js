@@ -14,6 +14,33 @@ function navToggle(k,on){
   lsSet('ta_nav_hidden',JSON.stringify(S.navHidden));renderNav();
 }
 function navShowAll(){S.navHidden=[];lsSet('ta_nav_hidden','[]');renderNav();renderSettings()}
+/* ── Сервер данных ── */
+function setDsHtml(c){
+  const keySet=c.secret_set&&c.secret_set.data_key;
+  return`<div class="card" id="ds-card"><h2>Сервер данных<span class="sp">по желанию</span></h2><div style="display:grid;gap:14px">
+    <p class="note">Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через ваш сервер — быстрее и без лишних запросов к источникам. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.</p>
+    <label class="field"><span>Адрес сервера (пусто — запросы идут напрямую к источникам)</span><input class="in" id="ds-url" value="${esc(c.data_server||'')}" placeholder="https://data.example.ru" autocomplete="off" spellcheck="false"></label>
+    <label class="field"><span>Ключ доступа ${keySet?'<span class="pos">· сохранён. Оставьте пустым, чтобы не менять</span>':'(если сервер его требует)'}</span><input class="in" type="password" id="ds-key" autocomplete="off" spellcheck="false"></label>
+    <div class="row"><button class="btn" id="ds-save">Сохранить</button><button class="btn ghost" id="ds-test">Проверить</button>${keySet?'<button class="btn danger" id="ds-clr">Удалить ключ</button>':''}</div>
+    <p class="note" id="ds-st">Загружаю…</p></div></div>`;
+}
+async function dsStatus(){
+  const el=document.getElementById('ds-st');if(!el)return;
+  try{const d=await api('/api/dataserver');
+    const cnt=`Ответов с сервера с начала работы: из кэша ${d.hit}, свежих ${d.miss}${d.stale?`, устаревших ${d.stale}`:''}; напрямую: ${d.direct}.`;
+    el.innerHTML=d.mode==='direct'?`Режим: <b>напрямую</b> к источникам. ${esc(cnt)}`:d.mode==='server'?`Режим: <b>через сервер</b> ${esc(d.url)}. ${esc(cnt)}`:`Режим: <b>временно напрямую</b> — сервер недоступен (${esc(d.error)}), повтор через ${d.retry_in} с. ${esc(cnt)}`}
+  catch(e){el.textContent=''}
+}
+function bindSetDs(c,msg){
+  const g=id=>document.getElementById(id);
+  dsStatus();
+  const save=async()=>{const b={data_server:g('ds-url').value};if(g('ds-key').value)b.data_key=g('ds-key').value;await post('/api/config',b);
+    c.data_server=g('ds-url').value.trim();if(g('ds-key').value)c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
+  g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Сохранено. Новые запросы пойдут '+(c.data_server?'через сервер.':'напрямую.'),1);renderSettings()}catch(x){msg(x.message)}finally{b.disabled=false}};
+  g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{url:g('ds-url').value,key:g('ds-key').value});
+    msg(`Сервер работает: версия ${r.version}, записей в кэше ${r.cache_items}.`,1)}catch(x){msg(x.message)}finally{b.disabled=false}};
+  if(g('ds-clr'))g('ds-clr').onclick=async()=>{try{if(!confirm('Удалить сохранённый ключ сервера данных?'))return;await post('/api/config',{clear_data_key:true});c.secret_set=Object.assign({},c.secret_set,{data_key:false});renderSettings()}catch(x){msg(x.message)}};
+}
 async function renderSettings(){
   S.charts=[];
   try{S.cfg=await api('/api/config')}catch(e){$('#view').innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
@@ -49,6 +76,7 @@ async function renderSettings(){
       <button class="btn ghost" id="krsave" style="align-self:flex-end">Сохранить</button></div>
     <p class="note" id="krinfo">Загружаю…</p>
     <p class="note">Ставка ещё не объявленных купонов флоатера = ключевая ставка на начало купонного периода + спред эмитента (по последним известным купонам). «Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.</p></div></div>
+  ${setDsHtml(c)}
   ${setTgHtml(c)}${setBackupHtml(c)}
   <div class="card" id="whatsnew"><h2>Что нового<span class="sp">версия ${esc(c.version||'')}</span></h2>${changelogHtml()}</div>
   <div class="card"><h2>Роадмап<span class="sp">что планируется</span></h2>${roadmapHtml()}</div>
@@ -65,6 +93,7 @@ async function renderSettings(){
   $('#krsave').onclick=async()=>{try{$('#krinfo').textContent='Загружаю…';await post('/api/config',{keyrate_mode:$('#krmode').value});S.cfg.keyrate_mode=$('#krmode').value;S.bonds=null;msg('Сохранено. Доходности облигаций пересчитаются при следующем открытии раздела.',1);krShow()}catch(e){msg(e.message)}};
   $('#ndsave').onclick=async()=>{try{await post('/api/config',{notify_days:$('#nd').value});S.cfg.notify_days=+$('#nd').value;msg('Сохранено',1)}catch(e){msg(e.message)}};
   $('#ntf').onclick=async()=>{try{if(!('Notification' in window))return msg('Браузер не поддерживает уведомления');const r=await Notification.requestPermission();msg(r==='granted'?'Уведомления разрешены':'Уведомления не разрешены',r==='granted')}catch(e){msg(e.message)}};
+  try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
   const body=()=>({token:$('#tok').value,sandbox:$('#sb').checked,verify_ssl:$('#vs').checked,ca_file:$('#ca').value,

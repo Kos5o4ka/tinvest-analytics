@@ -2,17 +2,6 @@
 # Наружу уходят только обезличенные GET-запросы к публичным страницам (t.me, cbr.ru, moex.com):
 # ни токен, ни состав портфеля никуда не передаются.
 
-EXT_UA = {"User-Agent": "Mozilla/5.0 (compatible; tinvest-analytics)"}
-_ext_ctx = []
-
-
-def http_text(url, timeout=25):
-    if not _ext_ctx:
-        _ext_ctx.append(make_ssl_context())
-    req = urllib.request.Request(url, headers=EXT_UA)
-    with urllib.request.urlopen(req, timeout=timeout, context=_ext_ctx[0]) as r:
-        return r.read().decode("utf-8", "replace")
-
 
 # ── кредитные рейтинги (канал @issuerRatings: АКРА, Эксперт РА, НКР, НРА) ──
 
@@ -432,25 +421,18 @@ def _bond_query(name):
 
 
 def _expert_session():
-    import http.cookiejar
-    cj = http.cookiejar.CookieJar()
-    if not _ext_ctx:
-        _ext_ctx.append(make_ssl_context())
-    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj),
-                                     urllib.request.HTTPSHandler(context=_ext_ctx[0]))
-    op.addheaders = list(EXT_UA.items())
-    return op
+    return {}                                           # cookie сессии raexpert (CSRF-токен привязан к ней)
 
 
 def expert_lookup(op, query, tokens):
     """Поиск эмитента на raexpert.ru, затем чтение страницы компании. Возвращает dict или None."""
-    s = op.open("https://raexpert.ru/", timeout=25).read().decode("utf-8", "replace")
+    s = ext_open("https://raexpert.ru/", timeout=25, jar=op)[1].decode("utf-8", "replace")
     tok = re.search(r'name="CSRFToken" value="([^"]+)"', s)
     if not tok:
         return None
-    req = urllib.request.Request("https://raexpert.ru/search/", urllib.parse.urlencode(
-        {"CSRFToken": tok.group(1), "search": query}).encode(), {"Referer": "https://raexpert.ru/"})
-    res = op.open(req, timeout=30).read().decode("utf-8", "replace")
+    res = ext_open("https://raexpert.ru/search/", urllib.parse.urlencode({"CSRFToken": tok.group(1), "search": query}).encode(),
+                   {"Referer": "https://raexpert.ru/", "Content-Type": "application/x-www-form-urlencoded"},
+                   timeout=30, jar=op)[1].decode("utf-8", "replace")
     seen, link = set(), None
     for href, name in re.findall(r'href="(/database/companies/[^"?]+?)/?"[^>]*>([^<]+)<', res):
         name = _strip(name)
@@ -462,7 +444,7 @@ def expert_lookup(op, query, tokens):
             break
     if not link:
         return None
-    c = op.open("https://raexpert.ru" + link[0], timeout=30).read().decode("utf-8", "replace")
+    c = ext_open("https://raexpert.ru" + link[0], timeout=30, jar=op)[1].decode("utf-8", "replace")
     m = re.search(r"(ru[^\s,<]+),\s*([А-Яа-я ]+?),\s*<a href=\"/releases/[^\"]+\">(\d\d)\.(\d\d)\.(\d{4})", c)
     if not m:
         return None

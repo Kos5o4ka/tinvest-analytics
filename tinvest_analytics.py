@@ -3401,12 +3401,8 @@ def logo_bytes(name):
             return f.read()
     if os.path.exists(miss) and time.time() - os.path.getmtime(miss) < 3 * DAY:
         return None
-    cfg = load_config()
-    ctx = TInvest(cfg).ctx
     try:
-        req = urllib.request.Request(LOGO_CDN + base + "x160.png", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
-            data = r.read()
+        data = ext_open(LOGO_CDN + base + "x160.png", headers={"User-Agent": "Mozilla/5.0"}, timeout=15)[1]
         if not data.startswith(b"\x89PNG"):
             raise OSError("not png")
         with _logo_lock:
@@ -3439,20 +3435,179 @@ def warmup_start():
         except Exception:  # noqa: BLE001
             pass
     threading.Thread(target=job, daemon=True, name="warmup").start()
-# ═══════════════════ внешние данные: кредитные рейтинги, КБД, ключевая ставка ═══════════════════
-# Наружу уходят только обезличенные GET-запросы к публичным страницам (t.me, cbr.ru, moex.com):
-# ни токен, ни состав портфеля никуда не передаются.
+# ═══════════════ единая точка исходящих запросов за ПУБЛИЧНЫМИ данными (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО, логотипы) ═══════════════
+# Если задан «сервер данных» (настройки или TINVEST_DATA_SERVER / TINVEST_DATA_KEY), запрос идёт через него:
+# GET|POST {сервер}/v1/fetch?url=... Сервер кэширует ответы и сам ходит к источникам. При любой неудаче сервера
+# (нет связи, таймаут, 5xx, 401/403) запрос выполняется напрямую, а сервер на 5 минут считается недоступным.
+# API Т-Инвестиций и Telegram сюда НЕ входят: они всегда идут напрямую, токен на сервер данных не передаётся.
 
 EXT_UA = {"User-Agent": "Mozilla/5.0 (compatible; tinvest-analytics)"}
 _ext_ctx = []
+DS_DOWN_SECS = 300
+SECRET_KEYS.add("data_key")
+DEFAULT_CONFIG.setdefault("data_server", "")
+DEFAULT_CONFIG.setdefault("data_key", "")
+_ds_state = {"down_until": 0.0, "error": "", "hit": 0, "miss": 0, "stale": 0, "direct": 0}
+_ds_lock = threading.Lock()
+_ds_conf_cache = [0.0, ("", "")]
+
+
+def ds_conf():
+    """(адрес сервера без «/», ключ). Настройки приложения важнее переменных окружения. Короткий кэш: вызывается на каждый запрос."""
+    now = time.time()
+    if now - _ds_conf_cache[0] < 2.0:
+        return _ds_conf_cache[1]
+    try:
+        cfg = load_config()
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    url = str(cfg.get("data_server") or os.environ.get("TINVEST_DATA_SERVER") or "").strip().rstrip("/")
+    key = str(cfg.get("data_key") or os.environ.get("TINVEST_DATA_KEY") or "").strip()
+    if not re.match(r"https?://[^/\s]+", url):
+        url = ""
+    _ds_conf_cache[:] = [now, (url, key)]
+    return url, key
+
+
+def ds_reset():
+    _ds_conf_cache[0] = 0.0
+    with _ds_lock:
+        _ds_state["down_until"] = 0.0
+        _ds_state["error"] = ""
+
+
+def _ds_down(msg):
+    with _ds_lock:
+        _ds_state["down_until"] = time.time() + DS_DOWN_SECS
+        _ds_state["error"] = msg
+
+
+def _ssl():
+    if not _ext_ctx:
+        _ext_ctx.append(make_ssl_context())
+    return _ext_ctx[0]
+
+
+def _cookie_header(jar):
+    return "; ".join("%s=%s" % kv for kv in jar.items()) if jar else ""
+
+
+def _jar_update(jar, set_cookies):
+    for c in set_cookies or []:
+        nv = c.split(";", 1)[0]
+        if "=" in nv:
+            k, v = nv.split("=", 1)
+            jar[k.strip()] = v.strip()
+
+
+def _ds_request(srv, key, url, data, headers, timeout):
+    """Запрос через сервер данных. Возвращает (статус, тело, content-type, set-cookie[], X-Cache) либо None (нужен прямой запрос).
+    Ответ источника (в т.ч. 404) приходит с заголовком X-Cache; его отсутствие значит, что ответил сам сервер (ошибка)."""
+    hd = {"User-Agent": EXT_UA["User-Agent"]}
+    if key:
+        hd["X-Client-Key"] = key
+    for k, v in (headers or {}).items():
+        if k.lower() in ("referer", "cookie", "accept", "accept-language"):
+            hd["X-Up-" + k.title()] = v
+        elif k.lower() == "content-type":
+            hd["Content-Type"] = v
+    req = urllib.request.Request(srv + "/v1/fetch?url=" + urllib.parse.quote(url, safe=""), data=data, headers=hd,
+                                 method="POST" if data is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout + 5, context=_ssl()) as r:
+            body = r.read()
+            return (r.status, body, r.headers.get("Content-Type") or "", r.headers.get_all("X-Set-Cookie") or [],
+                    r.headers.get("X-Cache") or "miss")
+    except urllib.error.HTTPError as e:
+        if e.headers.get("X-Cache"):                   # настоящий ответ источника (404 и т.п.): повторять напрямую не нужно
+            return e.code, e.read(), e.headers.get("Content-Type") or "", [], e.headers.get("X-Cache")
+        if e.headers.get("X-Upstream-Error"):         # сервер жив, но источник не ответил: пробуем напрямую, сервер не «роняем»
+            return None
+        _ds_down("сервер ответил %d%s" % (e.code, " (неверный ключ)" if e.code in (401, 403) else ""))
+        return None
+    except Exception as e:  # noqa: BLE001
+        _ds_down("нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
+        return None
+
+
+def ext_open(url, data=None, headers=None, timeout=25, jar=None):
+    """Запрос публичных данных -> (статус, байты, content-type). При HTTP-ошибке источника бросает urllib.error.HTTPError
+    (как и прежний urlopen). jar — dict с cookie сессии (обновляется из ответа), нужен, например, raexpert (CSRF)."""
+    headers = dict(headers or {})
+    if jar:
+        headers["Cookie"] = _cookie_header(jar)
+    srv, key = ds_conf()
+    if srv and time.time() >= _ds_state["down_until"]:
+        res = _ds_request(srv, key, url, data, headers, timeout)
+        if res is not None:
+            status, body, ct, cookies, xc = res
+            with _ds_lock:
+                _ds_state[xc if xc in ("hit", "stale") else "miss"] += 1
+            if jar is not None:
+                _jar_update(jar, cookies)
+            if status >= 400:
+                raise urllib.error.HTTPError(url, status, "HTTP %d" % status, {"Content-Type": ct}, io.BytesIO(body))
+            return status, body, ct
+    with _ds_lock:
+        _ds_state["direct"] += 1
+    hd = dict(EXT_UA)
+    hd.update(headers)
+    req = urllib.request.Request(url, data=data, headers=hd)
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+        body = r.read()
+        if jar is not None:
+            _jar_update(jar, r.headers.get_all("Set-Cookie"))
+        return r.status, body, r.headers.get("Content-Type") or ""
+
+
+def ds_status():
+    srv, key = ds_conf()
+    with _ds_lock:
+        st = dict(_ds_state)
+    down = bool(srv) and time.time() < st["down_until"]
+    return {"mode": "direct" if not srv else ("down" if down else "server"), "url": srv, "key_set": bool(key),
+            "hit": st["hit"], "miss": st["miss"], "stale": st["stale"], "direct": st["direct"],
+            "error": st["error"] if down else "", "retry_in": max(0, int(st["down_until"] - time.time())) if down else 0}
+
+
+def ds_get(cfg, acc, q, force):
+    return ds_status()
+
+
+def ds_test(cfg, body):
+    """Проверка сервера: GET /v1/health. Поля url/key из формы; пустой ключ = сохранённый."""
+    url = str(body.get("url") or "").strip().rstrip("/") or ds_conf()[0]
+    key = str(body.get("key") or "").strip() or ds_conf()[1]
+    if not re.match(r"https?://[^/\s]+", url):
+        raise ApiError("Укажите адрес сервера, например https://data.example.ru", 400)
+    hd = {"User-Agent": EXT_UA["User-Agent"]}
+    if key:
+        hd["X-Client-Key"] = key
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url + "/v1/health", headers=hd), timeout=10, context=_ssl()) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        raise ApiError("Сервер ответил %d%s" % (e.code, ": неверный или отсутствующий ключ" if e.code in (401, 403) else ""), 400)
+    except Exception as e:  # noqa: BLE001
+        raise ApiError("Не удалось подключиться: %s" % (getattr(e, "reason", None) or type(e).__name__), 400)
+    if not isinstance(j, dict) or not j.get("ok"):
+        raise ApiError("Это не сервер данных T-Invest Analytics.", 400)
+    return {"ok": True, "version": j.get("version", ""), "uptime": j.get("uptime", 0), "cache_items": j.get("cache_items", 0)}
+
+
+API_GET["/api/dataserver"] = ds_get
+API_POST["/api/dataserver/test"] = ds_test
+
+
+def http_bytes(url, timeout=30):
+    return ext_open(url, timeout=timeout)[1]
 
 
 def http_text(url, timeout=25):
-    if not _ext_ctx:
-        _ext_ctx.append(make_ssl_context())
-    req = urllib.request.Request(url, headers=EXT_UA)
-    with urllib.request.urlopen(req, timeout=timeout, context=_ext_ctx[0]) as r:
-        return r.read().decode("utf-8", "replace")
+    return ext_open(url, timeout=timeout)[1].decode("utf-8", "replace")
+# ═══════════════════ внешние данные: кредитные рейтинги, КБД, ключевая ставка ═══════════════════
+# Наружу уходят только обезличенные GET-запросы к публичным страницам (t.me, cbr.ru, moex.com):
+# ни токен, ни состав портфеля никуда не передаются.
 
 
 # ── кредитные рейтинги (канал @issuerRatings: АКРА, Эксперт РА, НКР, НРА) ──
@@ -3873,25 +4028,18 @@ def _bond_query(name):
 
 
 def _expert_session():
-    import http.cookiejar
-    cj = http.cookiejar.CookieJar()
-    if not _ext_ctx:
-        _ext_ctx.append(make_ssl_context())
-    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj),
-                                     urllib.request.HTTPSHandler(context=_ext_ctx[0]))
-    op.addheaders = list(EXT_UA.items())
-    return op
+    return {}                                           # cookie сессии raexpert (CSRF-токен привязан к ней)
 
 
 def expert_lookup(op, query, tokens):
     """Поиск эмитента на raexpert.ru, затем чтение страницы компании. Возвращает dict или None."""
-    s = op.open("https://raexpert.ru/", timeout=25).read().decode("utf-8", "replace")
+    s = ext_open("https://raexpert.ru/", timeout=25, jar=op)[1].decode("utf-8", "replace")
     tok = re.search(r'name="CSRFToken" value="([^"]+)"', s)
     if not tok:
         return None
-    req = urllib.request.Request("https://raexpert.ru/search/", urllib.parse.urlencode(
-        {"CSRFToken": tok.group(1), "search": query}).encode(), {"Referer": "https://raexpert.ru/"})
-    res = op.open(req, timeout=30).read().decode("utf-8", "replace")
+    res = ext_open("https://raexpert.ru/search/", urllib.parse.urlencode({"CSRFToken": tok.group(1), "search": query}).encode(),
+                   {"Referer": "https://raexpert.ru/", "Content-Type": "application/x-www-form-urlencoded"},
+                   timeout=30, jar=op)[1].decode("utf-8", "replace")
     seen, link = set(), None
     for href, name in re.findall(r'href="(/database/companies/[^"?]+?)/?"[^>]*>([^<]+)<', res):
         name = _strip(name)
@@ -3903,7 +4051,7 @@ def expert_lookup(op, query, tokens):
             break
     if not link:
         return None
-    c = op.open("https://raexpert.ru" + link[0], timeout=30).read().decode("utf-8", "replace")
+    c = ext_open("https://raexpert.ru" + link[0], timeout=30, jar=op)[1].decode("utf-8", "replace")
     m = re.search(r"(ru[^\s,<]+),\s*([А-Яа-я ]+?),\s*<a href=\"/releases/[^\"]+\">(\d\d)\.(\d\d)\.(\d{4})", c)
     if not m:
         return None
@@ -5222,14 +5370,6 @@ KR_NAMES = {"cbr": "Среднесрочный прогноз Банка Рос�
 KR_HORIZON_M = 48
 _kr_mem = {}
 _kr_lock = threading.Lock()
-
-
-def http_bytes(url, timeout=30):
-    if not _ext_ctx:
-        _ext_ctx.append(make_ssl_context())
-    req = urllib.request.Request(url, headers=EXT_UA)
-    with urllib.request.urlopen(req, timeout=timeout, context=_ext_ctx[0]) as r:
-        return r.read()
 
 
 # ── минимальный разбор PDF (stdlib): Flate-потоки, ToUnicode, операторы Tf/Tm/Td/TJ ──
@@ -10812,11 +10952,7 @@ def _ifrs_http(url):
         if wait > 0:
             time.sleep(wait)
         _ifrs_last[0] = time.time()
-    if not _ext_ctx:
-        _ext_ctx.append(make_ssl_context())
-    req = urllib.request.Request(url, headers=IFRS_UA)
-    with urllib.request.urlopen(req, timeout=20, context=_ext_ctx[0]) as r:
-        return r.read().decode("utf-8", "replace")
+    return ext_open(url, headers=IFRS_UA, timeout=20)[1].decode("utf-8", "replace")
 
 
 _ifrs_fetch_lock = threading.Lock()
@@ -11210,9 +11346,19 @@ class Handler(BaseHTTPRequestHandler):
                         hosts = [str(h).strip() for h in body[k] if str(h).strip()]
                         if hosts:
                             cfg[k] = hosts
+                if "data_server" in body:
+                    u = str(body["data_server"]).strip().rstrip("/")
+                    if u and not re.fullmatch(r"https?://[^/\s]+(/[^\s]*)?", u):
+                        raise ApiError("Адрес сервера данных должен начинаться с http:// или https://", 400)
+                    cfg["data_server"] = u
+                if body.get("data_key"):
+                    cfg["data_key"] = "".join(str(body["data_key"]).split())
+                if body.get("clear_data_key"):
+                    cfg["data_key"] = ""
                 if cfg["ca_file"] and not os.path.isfile(cfg["ca_file"]):
                     raise ApiError("Файл сертификата не найден: " + cfg["ca_file"], 400)
                 save_config(cfg)
+                ds_reset()
                 mem_clear()
                 return self.send(200, {"ok": True})
             if path == "/api/ratings/refresh":
@@ -13149,6 +13295,33 @@ function navToggle(k,on){
   lsSet('ta_nav_hidden',JSON.stringify(S.navHidden));renderNav();
 }
 function navShowAll(){S.navHidden=[];lsSet('ta_nav_hidden','[]');renderNav();renderSettings()}
+/* ── Сервер данных ── */
+function setDsHtml(c){
+  const keySet=c.secret_set&&c.secret_set.data_key;
+  return`<div class="card" id="ds-card"><h2>Сервер данных<span class="sp">по желанию</span></h2><div style="display:grid;gap:14px">
+    <p class="note">Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через ваш сервер — быстрее и без лишних запросов к источникам. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.</p>
+    <label class="field"><span>Адрес сервера (пусто — запросы идут напрямую к источникам)</span><input class="in" id="ds-url" value="${esc(c.data_server||'')}" placeholder="https://data.example.ru" autocomplete="off" spellcheck="false"></label>
+    <label class="field"><span>Ключ доступа ${keySet?'<span class="pos">· сохранён. Оставьте пустым, чтобы не менять</span>':'(если сервер его требует)'}</span><input class="in" type="password" id="ds-key" autocomplete="off" spellcheck="false"></label>
+    <div class="row"><button class="btn" id="ds-save">Сохранить</button><button class="btn ghost" id="ds-test">Проверить</button>${keySet?'<button class="btn danger" id="ds-clr">Удалить ключ</button>':''}</div>
+    <p class="note" id="ds-st">Загружаю…</p></div></div>`;
+}
+async function dsStatus(){
+  const el=document.getElementById('ds-st');if(!el)return;
+  try{const d=await api('/api/dataserver');
+    const cnt=`Ответов с сервера с начала работы: из кэша ${d.hit}, свежих ${d.miss}${d.stale?`, устаревших ${d.stale}`:''}; напрямую: ${d.direct}.`;
+    el.innerHTML=d.mode==='direct'?`Режим: <b>напрямую</b> к источникам. ${esc(cnt)}`:d.mode==='server'?`Режим: <b>через сервер</b> ${esc(d.url)}. ${esc(cnt)}`:`Режим: <b>временно напрямую</b> — сервер недоступен (${esc(d.error)}), повтор через ${d.retry_in} с. ${esc(cnt)}`}
+  catch(e){el.textContent=''}
+}
+function bindSetDs(c,msg){
+  const g=id=>document.getElementById(id);
+  dsStatus();
+  const save=async()=>{const b={data_server:g('ds-url').value};if(g('ds-key').value)b.data_key=g('ds-key').value;await post('/api/config',b);
+    c.data_server=g('ds-url').value.trim();if(g('ds-key').value)c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
+  g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Сохранено. Новые запросы пойдут '+(c.data_server?'через сервер.':'напрямую.'),1);renderSettings()}catch(x){msg(x.message)}finally{b.disabled=false}};
+  g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{url:g('ds-url').value,key:g('ds-key').value});
+    msg(`Сервер работает: версия ${r.version}, записей в кэше ${r.cache_items}.`,1)}catch(x){msg(x.message)}finally{b.disabled=false}};
+  if(g('ds-clr'))g('ds-clr').onclick=async()=>{try{if(!confirm('Удалить сохранённый ключ сервера данных?'))return;await post('/api/config',{clear_data_key:true});c.secret_set=Object.assign({},c.secret_set,{data_key:false});renderSettings()}catch(x){msg(x.message)}};
+}
 async function renderSettings(){
   S.charts=[];
   try{S.cfg=await api('/api/config')}catch(e){$('#view').innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
@@ -13184,6 +13357,7 @@ async function renderSettings(){
       <button class="btn ghost" id="krsave" style="align-self:flex-end">Сохранить</button></div>
     <p class="note" id="krinfo">Загружаю…</p>
     <p class="note">Ставка ещё не объявленных купонов флоатера = ключевая ставка на начало купонного периода + спред эмитента (по последним известным купонам). «Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.</p></div></div>
+  ${setDsHtml(c)}
   ${setTgHtml(c)}${setBackupHtml(c)}
   <div class="card" id="whatsnew"><h2>Что нового<span class="sp">версия ${esc(c.version||'')}</span></h2>${changelogHtml()}</div>
   <div class="card"><h2>Роадмап<span class="sp">что планируется</span></h2>${roadmapHtml()}</div>
@@ -13200,6 +13374,7 @@ async function renderSettings(){
   $('#krsave').onclick=async()=>{try{$('#krinfo').textContent='Загружаю…';await post('/api/config',{keyrate_mode:$('#krmode').value});S.cfg.keyrate_mode=$('#krmode').value;S.bonds=null;msg('Сохранено. Доходности облигаций пересчитаются при следующем открытии раздела.',1);krShow()}catch(e){msg(e.message)}};
   $('#ndsave').onclick=async()=>{try{await post('/api/config',{notify_days:$('#nd').value});S.cfg.notify_days=+$('#nd').value;msg('Сохранено',1)}catch(e){msg(e.message)}};
   $('#ntf').onclick=async()=>{try{if(!('Notification' in window))return msg('Браузер не поддерживает уведомления');const r=await Notification.requestPermission();msg(r==='granted'?'Уведомления разрешены':'Уведомления не разрешены',r==='granted')}catch(e){msg(e.message)}};
+  try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
   const body=()=>({token:$('#tok').value,sandbox:$('#sb').checked,verify_ssl:$('#vs').checked,ca_file:$('#ca').value,
@@ -13429,6 +13604,9 @@ const CHANGELOG=[
 const ROADMAP=[
  ['now','Проверка на реальных счетах','Сверка расчётов доходности и налогов с данными брокера'],
  ['next','Готовые форматы брокеров','Пресеты для отчётов ВТБ, Альфы и других брокеров'],
+ ['next','Вход через Telegram','Необязательная учётная запись: общий бот, серверные уведомления, синхронизация настроек между устройствами'],
+ ['next','Синхронизация на сервере','Необязательное хранение токена только для чтения на сервере — фоновые обновления и уведомления, пока компьютер выключен'],
+ ['done','Сервер данных','Необязательный общий сервер (server/): кэширует Мосбиржу, ФНС, ЦБ и рейтинги для всех клиентов; портфель и токен на него не уходят'],
  ['done','Конвертации бумаг','Обмены ГДР/АДР на акции (Яндекс, ИКС 5, Хэдхантер, Циан, Эталон, ВК, Т-Технологии) и похожие случаи учитываются в истории стоимости, налоговых лотах и FIFO: количество и стоимость переносятся без продажи, даты покупки сохраняются'],
  ['done','Финансы эмитентов по МСФО','Скоринг по отчётности групп (smart-lab): ЧД/EBITDA, покрытие процентов, FCF; для SPV и «дочек» — по материнской компании, РСБУ остаётся рядом'],
  ['done','Налоги по лотам','ЛДВ, ИИС, перенос убытков, курсовые разницы, подсказки, сводка для 3-НДФЛ'],

@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Сервер данных T-Invest Analytics: общий кэширующий прокси к публичным источникам.
+
+Клиент -> этот сервер -> MOEX ISS, ФНС ГИР БО, ЦБ, smart-lab, рейтинговые агентства.
+Сервер ходит к источникам один раз, кэширует ответ в SQLite и отдаёт всем клиентам, соблюдая лимиты запросов.
+Токены Т-Инвестиций и портфели сюда не попадают. Только стандартная библиотека, Python 3.8+.
+
+    python3 tinvest_server.py [--host 127.0.0.1] [--port 8780] [--data DIR] [--key KEY] [--verbose]
+"""
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import re
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+VERSION = "1.0.0"
+MIN, HOUR, DAY = 60, 3600, 86400
+
+# ───────────────────────── разрешённые источники ─────────────────────────
+# host -> префикс пути (None = любой). Только публичные данные. Хосты T-Invest API и Telegram Bot API сюда не входят:
+# портфель и токены идут напрямую, через сервер не проходят.
+ALLOWED_HOSTS = {
+    "iss.moex.com": None, "www.moex.com": None,
+    "bo.nalog.gov.ru": None,
+    "www.cbr.ru": None, "cbr.ru": None,
+    "smart-lab.ru": None,
+    "raexpert.ru": None, "ratings.ru": None, "investmint.ru": None,
+    "invest-brands.cdn-tinkoff.ru": None,
+    "t.me": "/s/",                      # публичное зеркало канала с рейтингами (только страницы /s/...)
+}
+
+# Окно торгов Мосбиржи по Москве (UTC+3), будни: в это время рыночные данные устаревают быстро.
+MSK = timezone(timedelta(hours=3))
+
+
+def _trading_now(now):
+    t = datetime.fromtimestamp(now, MSK)
+    return t.weekday() < 5 and 9 <= t.hour < 24
+
+
+def _moex_market_ttl(now):
+    return 5 * MIN if _trading_now(now) else HOUR
+
+
+# ───────────────────────── правила TTL ─────────────────────────
+# Один список: первое совпадение (host, regex пути+запроса) решает. ttl — секунды или функция(now) -> секунды.
+# post_ttl — разрешено ли кэшировать POST (только явные правила; ключ = url + хэш тела). 404 кэшируется на NOT_FOUND_TTL.
+RULES = [
+    # (хост,               регэксп пути+query,                        ttl,                post_ttl)
+    ("iss.moex.com",       r"/iss/engines/stock/zcyc",                HOUR,               None),    # кривая КБД: раз в час
+    ("iss.moex.com",       r"/iss/engines/.*/securities\.json",       _moex_market_ttl,   None),    # списки/marketdata: 5 мин в торги
+    ("iss.moex.com",       r"/iss/history/",                          DAY,                None),    # история торгов
+    ("iss.moex.com",       r"/iss/securities/[^/]+/bondization",      3 * DAY,            None),    # график выплат
+    ("iss.moex.com",       r"/iss/securities",                        3 * DAY,            None),    # описание/поиск
+    ("iss.moex.com",       r"/iss/emitters",                          7 * DAY,            None),    # эмитенты
+    ("www.moex.com",       r".*",                                     DAY,                None),
+    ("bo.nalog.gov.ru",    r".*",                                     7 * DAY,            None),    # ФНС: отчётность годовая
+    ("smart-lab.ru",       r".*",                                     5 * DAY,            None),    # МСФО: страницы обновляются редко
+    ("www.cbr.ru",         r"/dkp/|/statistics/|\.pdf",               12 * HOUR,          None),    # прогнозы, календарь, опросы
+    ("www.cbr.ru",         r".*",                                     6 * HOUR,           None),    # курсы, ключевая ставка
+    ("cbr.ru",             r".*",                                     12 * HOUR,          None),
+    ("raexpert.ru",        r"/search/",                               12 * HOUR,          12 * HOUR),   # поиск эмитента (форма POST)
+    ("raexpert.ru",        r".*",                                     12 * HOUR,          None),
+    ("ratings.ru",         r".*",                                     12 * HOUR,          None),
+    ("t.me",               r".*",                                     12 * HOUR,          None),    # канал рейтингов
+    ("investmint.ru",      r".*",                                     6 * HOUR,           None),
+    ("invest-brands.cdn-tinkoff.ru", r".*",                           30 * DAY,           None),    # логотипы
+]
+DEFAULT_TTL = HOUR
+NOT_FOUND_TTL = 10 * MIN
+
+# Вежливость к источникам: минимальный интервал между запросами к одному хосту (запросов в секунду).
+RATES = {"iss.moex.com": 8.0, "www.moex.com": 4.0, "bo.nalog.gov.ru": 2.0, "smart-lab.ru": 1.0}
+DEFAULT_RATE = 2.0
+
+# Хосты, где cookie связаны с сессией (CSRF): GET с Set-Cookie не кэшируется, cookie передаются клиенту (X-Set-Cookie).
+# Для остальных (например, MOEX ISS ставит служебные cookie) cookie отбрасываются, ответ кэшируется.
+SESSION_HOSTS = {"raexpert.ru"}
+
+UA_DEFAULT = "Mozilla/5.0 (compatible; tinvest-analytics)"
+UA_BROWSER = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/120.0 Safari/537.36")
+UA_BY_HOST = {"smart-lab.ru": UA_BROWSER, "invest-brands.cdn-tinkoff.ru": "Mozilla/5.0"}
+# Заголовки клиента X-Up-<Имя>, которые передаются источнику.
+FORWARD_HEADERS = ("Referer", "Cookie", "Accept", "Accept-Language")
+
+MAX_BODY_IN = 1024 * 1024
+MAX_BODY_OUT = 25 * 1024 * 1024
+UPSTREAM_TIMEOUT = 30
+
+
+class UpstreamError(Exception):
+    pass
+
+
+# ───────────────────────── авторизация ─────────────────────────
+def authorize(server, headers):
+    """Единая точка проверки доступа. Возвращает идентификатор клиента или None.
+    Сейчас: общий ключ (X-Client-Key). Позже сюда подключается вход через Telegram (токен сессии -> пользователь)."""
+    if not server.key:
+        return "anon"
+    got = headers.get("X-Client-Key") or ""
+    return "key" if hmac.compare_digest(got.encode("utf-8"), server.key.encode("utf-8")) else None
+
+
+# ───────────────────────── кэш (SQLite, WAL) ─────────────────────────
+class Cache:
+    def __init__(self, path, max_bytes):
+        self.max_bytes = max_bytes
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, status INTEGER, ctype TEXT, "
+                        "body BLOB, fetched REAL, expires REAL, accessed REAL, size INTEGER)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS cache_acc ON cache(accessed)")
+        self.total = self.db.execute("SELECT COALESCE(SUM(size),0) FROM cache").fetchone()[0]
+
+    def count(self):
+        with self.lock:
+            return self.db.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+
+    def get(self, key, now):
+        with self.lock:
+            row = self.db.execute("SELECT status, ctype, body, fetched, expires FROM cache WHERE key=?", (key,)).fetchone()
+            if row:
+                self.db.execute("UPDATE cache SET accessed=? WHERE key=?", (now, key))
+        return row
+
+    def put(self, key, status, ctype, body, fetched, expires):
+        size = len(body) + 200
+        with self.lock:
+            old = self.db.execute("SELECT size FROM cache WHERE key=?", (key,)).fetchone()
+            self.db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?,?,?,?,?,?)",
+                            (key, status, ctype, sqlite3.Binary(body), fetched, expires, fetched, size))
+            self.total += size - (old[0] if old else 0)
+            if self.total > self.max_bytes:
+                self._evict()
+
+    def _evict(self):
+        """Удаляем самые давно использованные записи, пока не станет 90% лимита."""
+        goal = int(self.max_bytes * 0.9)
+        rows = self.db.execute("SELECT key, size FROM cache ORDER BY accessed ASC").fetchall()
+        for key, size in rows:
+            if self.total <= goal:
+                break
+            self.db.execute("DELETE FROM cache WHERE key=?", (key,))
+            self.total -= size
+
+
+# ───────────────────────── ядро ─────────────────────────
+class Result:
+    __slots__ = ("status", "ctype", "body", "xcache", "age", "cookies", "error")
+
+    def __init__(self, status, ctype, body, xcache="miss", age=0, cookies=(), error=None):
+        self.status, self.ctype, self.body, self.xcache, self.age = status, ctype, body, xcache, age
+        self.cookies, self.error = list(cookies), error
+
+
+class _NoRedirectCheck(urllib.request.HTTPRedirectHandler):
+    """Редирект разрешён только на разрешённые хосты (защита от SSRF через редиректы)."""
+    def __init__(self, check):
+        self.check = check
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not self.check(newurl):
+            raise urllib.error.HTTPError(newurl, 403, "redirect to a host that is not allowed", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class DataServer:
+    def __init__(self, data_dir, key="", max_mb=1024, clock=time.time, extra_allow=(), rates=None, verbose=False,
+                 upstream=None, rules=None):
+        os.makedirs(data_dir, exist_ok=True)
+        self.key, self.clock, self.verbose = key or "", clock, verbose
+        self.allowed = dict(ALLOWED_HOSTS)
+        for h in extra_allow:                       # для тестов: "127.0.0.1:PORT"
+            self.allowed[h] = None
+        self.rates = dict(RATES if rates is None else rates)
+        self.default_rate = DEFAULT_RATE if rates is None else rates.get("*", DEFAULT_RATE)
+        self.rules = [(h, re.compile(p), t, pt) for h, p, t, pt in (RULES if rules is None else rules)]
+        self.cache = Cache(os.path.join(data_dir, "cache.sqlite"), int(max_mb * 1024 * 1024))
+        self.started = time.time()
+        self.upstream = upstream or self._http_upstream
+        self._flights, self._flock = {}, threading.Lock()
+        self._rate_lock, self._next_slot = threading.Lock(), {}
+        self._stats_lock, self._stats = threading.Lock(), {}
+
+    # --- разрешённость URL ---
+    def url_allowed(self, url):
+        try:
+            u = urlparse(url)
+            host, port = (u.hostname or "").lower(), u.port
+        except ValueError:
+            return False
+        if u.scheme not in ("http", "https") or not host or u.username or u.password:
+            return False
+        if u.netloc.lower() in self.allowed:        # запись вида host:port (тесты)
+            prefix = self.allowed[u.netloc.lower()]
+        elif host in self.allowed and port in (None, 80, 443):
+            prefix = self.allowed[host]
+        else:
+            return False
+        return prefix is None or (u.path or "/").startswith(prefix)
+
+    # --- статистика (без IP клиентов) ---
+    def _stat(self, host, field):
+        with self._stats_lock:
+            s = self._stats.setdefault(host, {"requests": 0, "hit": 0, "miss": 0, "stale": 0, "upstream_errors": 0})
+            s[field] += 1
+
+    def stats(self):
+        with self._stats_lock:
+            hosts = {h: dict(v) for h, v in self._stats.items()}
+        hit = sum(v["hit"] for v in hosts.values())
+        miss = sum(v["miss"] for v in hosts.values())
+        return {"hosts": hosts, "hit": hit, "miss": miss, "stale": sum(v["stale"] for v in hosts.values()),
+                "hit_ratio": round(hit / (hit + miss), 4) if hit + miss else 0.0,
+                "upstream_errors": sum(v["upstream_errors"] for v in hosts.values())}
+
+    # --- TTL ---
+    def ttl_for(self, host, url, method, now):
+        u = urlparse(url)
+        path = u.path + ("?" + u.query if u.query else "")
+        netloc = u.netloc.lower()
+        for h, rx, ttl, post_ttl in self.rules:
+            if h in (host, netloc) and rx.match(path):
+                if method == "POST":
+                    return post_ttl
+                return ttl(now) if callable(ttl) else ttl
+        return None if method == "POST" else DEFAULT_TTL
+
+    # --- вежливость к источнику ---
+    def _throttle(self, host):
+        rate = self.rates.get(host, self.default_rate)
+        gap = 1.0 / rate if rate > 0 else 0
+        with self._rate_lock:
+            t = time.monotonic()
+            slot = max(t, self._next_slot.get(host, 0))
+            self._next_slot[host] = slot + gap
+        if slot > t:
+            time.sleep(slot - t)
+
+    def _http_upstream(self, method, url, body, ctype, headers):
+        host = (urlparse(url).hostname or "").lower()
+        hd = {"User-Agent": UA_BY_HOST.get(host, UA_DEFAULT)}
+        hd.update(headers)
+        if body is not None and ctype:
+            hd["Content-Type"] = ctype
+        req = urllib.request.Request(url, data=body, headers=hd, method=method)
+        opener = urllib.request.build_opener(_NoRedirectCheck(self.url_allowed))
+        try:
+            r = opener.open(req, timeout=UPSTREAM_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            r = e
+        try:
+            data = r.read(MAX_BODY_OUT + 1)
+            if len(data) > MAX_BODY_OUT:
+                raise UpstreamError("response too large")
+            cookies = r.headers.get_all("Set-Cookie") or []
+            return r.status if hasattr(r, "status") else r.code, r.headers.get("Content-Type") or "application/octet-stream", data, cookies
+        finally:
+            r.close()
+
+    # --- основной запрос ---
+    def fetch(self, method, url, body=None, ctype="", headers=None):
+        headers = headers or {}
+        host = (urlparse(url).netloc.lower() if urlparse(url).netloc.lower() in self.allowed else urlparse(url).hostname)
+        self._stat(host, "requests")
+        now = self.clock()
+        ttl = self.ttl_for(host, url, method, now)
+        has_cookie = any(k.lower() == "cookie" for k in headers)
+        # GET с куками сессии не кэшируем: ответ зависит от сессии. POST — только по явному правилу.
+        cacheable = ttl is not None and (method == "POST" or not has_cookie)
+        key = hashlib.sha256((method + " " + url + " " + hashlib.sha256(body or b"").hexdigest()).encode()).hexdigest()
+        row = self.cache.get(key, now) if cacheable else None
+        if row and row[4] > now:
+            self._stat(host, "hit")
+            return Result(row[0], row[1], row[2], "hit", int(now - row[3]))
+        res = self._single_flight(key, lambda: self._do_upstream(method, url, body, ctype, headers, host, key, ttl, cacheable))
+        if res.error and row:                                   # источник недоступен: отдаём устаревшее
+            self._stat(host, "stale")
+            return Result(row[0], row[1], row[2], "stale", int(now - row[3]))
+        if res.error:
+            return res
+        self._stat(host, "miss")
+        return res
+
+    def _single_flight(self, key, fn):
+        with self._flock:
+            fl = self._flights.get(key)
+            leader = fl is None
+            if leader:
+                fl = self._flights[key] = {"ev": threading.Event(), "res": None}
+        if not leader:
+            fl["ev"].wait(UPSTREAM_TIMEOUT * 2)
+            return fl["res"] or Result(502, "text/plain", b"upstream timeout", error="timeout")
+        try:
+            fl["res"] = fn()
+        except Exception as e:  # noqa: BLE001
+            fl["res"] = Result(502, "text/plain", ("upstream error: %s" % type(e).__name__).encode(), error=str(e))
+        finally:
+            with self._flock:
+                self._flights.pop(key, None)
+            fl["ev"].set()
+        return fl["res"]
+
+    def _do_upstream(self, method, url, body, ctype, headers, host, key, ttl, cacheable):
+        self._throttle(host)
+        try:
+            status, ct, data, cookies = self.upstream(method, url, body, ctype, headers)
+        except Exception as e:  # noqa: BLE001
+            self._stat(host, "upstream_errors")
+            return Result(502, "text/plain", ("upstream error: %s" % type(e).__name__).encode(), error=str(e))
+        if status >= 500:
+            self._stat(host, "upstream_errors")
+            return Result(502, "text/plain", b"upstream status %d" % status, error="status %d" % status)
+        if host not in SESSION_HOSTS:
+            cookies = []
+        if cacheable and not (cookies and method == "GET"):
+            now = self.clock()
+            if 200 <= status < 300:
+                self.cache.put(key, status, ct, data, now, now + ttl)
+            elif status == 404:
+                self.cache.put(key, status, ct, data, now, now + min(ttl, NOT_FOUND_TTL))
+        return Result(status, ct, data, "miss", 0, cookies)
+
+
+# ───────────────────────── HTTP ─────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    server_version = "tinvest-data/" + VERSION
+    protocol_version = "HTTP/1.1"
+    app = None   # DataServer
+
+    def log_message(self, fmt, *args):
+        if self.app.verbose:
+            sys.stderr.write("%s %s\n" % (self.command, self.path))
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
+        if not isinstance(body, (bytes, bytearray)):
+            body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or []):
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _handle(self):
+        app = self.app
+        u = urlparse(self.path)
+        body = b""
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_BODY_IN:
+            return self._send(413, {"error": "body too large"})
+        if n:
+            body = self.rfile.read(n)
+        if authorize(app, self.headers) is None:
+            return self._send(401, {"error": "invalid or missing X-Client-Key"})
+        if u.path == "/v1/health":
+            return self._send(200, {"ok": True, "version": VERSION, "uptime": int(time.time() - app.started),
+                                    "cache_items": app.cache.count()})
+        if u.path == "/v1/stats":
+            return self._send(200, app.stats())
+        if u.path == "/v1/fetch":
+            url = (parse_qs(u.query).get("url") or [""])[0]
+            if not app.url_allowed(url):
+                return self._send(403, {"error": "host not allowed"})
+            method = "POST" if self.command == "POST" else "GET"
+            hdrs = {}
+            for name in FORWARD_HEADERS:
+                v = self.headers.get("X-Up-" + name)
+                if v:
+                    hdrs[name] = v
+            r = app.fetch(method, url, body if method == "POST" else None, self.headers.get("Content-Type") or "", hdrs)
+            if r.error:
+                return self._send(502, {"error": "upstream failed"}, extra=[("X-Upstream-Error", "1")])
+            extra = [("X-Cache", r.xcache), ("X-Age", str(r.age))] + [("X-Set-Cookie", c) for c in r.cookies]
+            return self._send(r.status, r.body, r.ctype, extra)
+        self._send(404, {"error": "not found"})
+
+    def do_GET(self):
+        self._handle()
+
+    def do_POST(self):
+        self._handle()
+
+
+def make_http_server(app, host="127.0.0.1", port=8780):
+    handler = type("BoundHandler", (Handler,), {"app": app})
+    ThreadingHTTPServer.request_queue_size = 128
+    srv = ThreadingHTTPServer((host, port), handler)
+    srv.daemon_threads = True
+    return srv
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Сервер данных T-Invest Analytics")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8780)
+    ap.add_argument("--data", default=os.path.join(os.path.expanduser("~"), ".tinvest_server"))
+    ap.add_argument("--key", default=os.environ.get("TINVEST_SERVER_KEY", ""))
+    ap.add_argument("--max-mb", type=int, default=1024, help="лимит размера кэша, МБ")
+    ap.add_argument("--allow", action="append", default=[], help="дополнительный разрешённый host[:port] (для тестов)")
+    ap.add_argument("--verbose", action="store_true", help="писать в журнал строки запросов (по умолчанию не пишется)")
+    ap.add_argument("--version", action="store_true")
+    a = ap.parse_args(argv)
+    if a.version:
+        print(VERSION)
+        return 0
+    app = DataServer(a.data, a.key, a.max_mb, extra_allow=a.allow, verbose=a.verbose)
+    srv = make_http_server(app, a.host, a.port)
+    print("tinvest-data %s: http://%s:%d, кэш %s%s" % (VERSION, a.host, a.port, a.data, ", ключ включён" if a.key else ""), flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

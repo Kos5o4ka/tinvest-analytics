@@ -182,9 +182,19 @@ class Handler(BaseHTTPRequestHandler):
                         hosts = [str(h).strip() for h in body[k] if str(h).strip()]
                         if hosts:
                             cfg[k] = hosts
+                if "data_server" in body:
+                    u = str(body["data_server"]).strip().rstrip("/")
+                    if u and not re.fullmatch(r"https?://[^/\s]+(/[^\s]*)?", u):
+                        raise ApiError("Адрес сервера данных должен начинаться с http:// или https://", 400)
+                    cfg["data_server"] = u
+                if body.get("data_key"):
+                    cfg["data_key"] = "".join(str(body["data_key"]).split())
+                if body.get("clear_data_key"):
+                    cfg["data_key"] = ""
                 if cfg["ca_file"] and not os.path.isfile(cfg["ca_file"]):
                     raise ApiError("Файл сертификата не найден: " + cfg["ca_file"], 400)
                 save_config(cfg)
+                ds_reset()
                 mem_clear()
                 return self.send(200, {"ok": True})
             if path == "/api/ratings/refresh":

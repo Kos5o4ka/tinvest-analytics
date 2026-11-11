@@ -183,11 +183,7 @@ def _ifrs_http(url):
         if wait > 0:
             time.sleep(wait)
         _ifrs_last[0] = time.time()
-    if not _ext_ctx:
-        _ext_ctx.append(make_ssl_context())
-    req = urllib.request.Request(url, headers=IFRS_UA)
-    with urllib.request.urlopen(req, timeout=20, context=_ext_ctx[0]) as r:
-        return r.read().decode("utf-8", "replace")
+    return ext_open(url, headers=IFRS_UA, timeout=20)[1].decode("utf-8", "replace")
 
 
 _ifrs_fetch_lock = threading.Lock()

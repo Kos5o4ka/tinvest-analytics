@@ -15,14 +15,6 @@ _kr_mem = {}
 _kr_lock = threading.Lock()
 
 
-def http_bytes(url, timeout=30):
-    if not _ext_ctx:
-        _ext_ctx.append(make_ssl_context())
-    req = urllib.request.Request(url, headers=EXT_UA)
-    with urllib.request.urlopen(req, timeout=timeout, context=_ext_ctx[0]) as r:
-        return r.read()
-
-
 # ── минимальный разбор PDF (stdlib): Flate-потоки, ToUnicode, операторы Tf/Tm/Td/TJ ──
 
 def _pdf_inflate(body):

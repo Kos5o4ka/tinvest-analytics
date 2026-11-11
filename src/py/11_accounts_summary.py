@@ -293,12 +293,8 @@ def logo_bytes(name):
             return f.read()
     if os.path.exists(miss) and time.time() - os.path.getmtime(miss) < 3 * DAY:
         return None
-    cfg = load_config()
-    ctx = TInvest(cfg).ctx
     try:
-        req = urllib.request.Request(LOGO_CDN + base + "x160.png", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
-            data = r.read()
+        data = ext_open(LOGO_CDN + base + "x160.png", headers={"User-Agent": "Mozilla/5.0"}, timeout=15)[1]
         if not data.startswith(b"\x89PNG"):
             raise OSError("not png")
         with _logo_lock:
