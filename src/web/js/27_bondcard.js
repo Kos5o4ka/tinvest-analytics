@@ -1,5 +1,5 @@
 // ── карточка облигации (боковая панель): клик по любому элементу с data-isin ──
-const BC={stack:[],tok:0,all:false};
+const BC={stack:[],tok:0,all:false,iss:{}};
 const BC_SEC={financial:'Финансы',industrials:'Промышленность',materials:'Сырьё',energy:'Энергетика',consumer:'Потребительский',government:'Государственные',real_estate:'Недвижимость',telecom:'Телеком',municipal:'Муниципальные',utilities:'Коммунальные',it:'IT',health_care:'Здравоохранение',other:'Прочее'};
 const BC_EV={coupon:'Купон',amort:'Амортизация',offer:'Оферта',redemption:'Погашение'};
 const BC_KR_SRC={cbr:'ключевая ставка по прогнозу ЦБ',survey:'ключевая ставка по опросу аналитиков ЦБ',market:'ключевая ставка по ожиданиям рынка (КБД)',flat:'текущая ключевая ставка'};
@@ -28,10 +28,13 @@ function bcMount(){
 }
 function bcBar(){
   const back=BC.stack.length>1?'<button class="btn ghost" id="bc-back">← Назад</button>':'';
-  return`<div class="bc-bar">${back}<span class="sp"></span><button class="btn ghost" id="bc-x" aria-label="Закрыть">✕ Закрыть</button></div>`;
+  const wt=typeof watchToggle==='function'?'<button class="btn ghost" id="bc-watch" title="Добавить выпуск в список наблюдения">★ В наблюдение</button>':'';
+  return`<div class="bc-bar">${back}<span class="sp"></span>${wt}<button class="btn ghost" id="bc-x" aria-label="Закрыть">✕ Закрыть</button></div>`;
 }
 function bcBind(dr){
   const x=dr.querySelector('#bc-x');if(x)x.onclick=closeBond;
+  const w=dr.querySelector('#bc-watch');
+  if(w)w.onclick=()=>{try{watchToggle(BC.stack[BC.stack.length-1])}catch(e){}};
   const b=dr.querySelector('#bc-back');
   if(b)b.onclick=()=>{BC.stack.pop();const p=BC.stack.pop();openBond(p)};
 }
@@ -44,9 +47,9 @@ async function openBond(isin){
   try{c=await api('/api/bond?isin='+encodeURIComponent(isin))}
   catch(e){if(tok!==BC.tok)return;dr.innerHTML=bcBar()+`<div class="bc-warn">Не удалось загрузить карточку: ${esc(e.message||e)}</div>`;bcBind(dr);return}
   if(tok!==BC.tok)return;
-  dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);
+  dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);
   const mr=dr.querySelector('#bc-more');
-  if(mr)mr.onclick=()=>{BC.all=true;dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);BC.all=false};
+  if(mr)mr.onclick=()=>{BC.all=true;dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);BC.all=false};
 }
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
 function bcKpi(k,v,s,cls){return`<div class="card"><div class="k">${k}</div><div class="v num ${cls||''}">${v}</div>${s?`<div class="s">${s}</div>`:''}</div>`}
@@ -85,6 +88,7 @@ function bcBody(c){
   add('Дефолт',d.HASDEFAULT==='1'?'<b class="neg">допущен</b>':d.HASTECHNICALDEFAULT==='1'?'<b class="neg">технический</b>':(d.HASDEFAULT==='0'?'нет':''));
   add('Госномер выпуска',esc(d.REGNUMBER||''));
   h+=`<div class="card bc-sec"><h2>Ключевые параметры</h2><div class="bc-par">${rows.join('')||'<span class="mu">Нет данных</span>'}</div></div>`;
+  h+=`<div class="card bc-sec" id="bc-iss"><h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2><div class="mu" style="font-size:13px">Загружаю отчётность эмитента…</div></div>`;
   // денежный поток
   const fl=c.flows||[],lim=BC.all?fl.length:12;
   h+=`<div class="card bc-sec"><h2>Денежный поток<span class="sp">ближайшие выплаты на 1 облигацию</span></h2>`;
@@ -139,6 +143,31 @@ function bcIssuerCurve(el,ic){
   P.slice().sort((a,b)=>a.me-b.me).forEach(p=>{
     g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'#3987e5'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
   el.innerHTML=`<svg width="${W}" height="${H}">${g}</svg>`;
+}
+function bcIssHtml(j,isin){
+  const s=j.score||{},f=j.fin||{years:[]},m=j.market||{},is=j.issuer||{};
+  if(!j.ok)return`<div class="mu" style="font-size:13px">${esc((j.errors||['Не удалось загрузить данные об эмитенте.'])[0])}</div>`;
+  if(!s.ok)return`<div class="mu" style="font-size:13px">${esc(s.reason||f.note||'Нет данных по РСБУ.')}</div>${j.history?`<div class="bc-rel" style="margin-top:8px">${esc(j.history.verdict)}</div>`:''}<button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button>`;
+  const y=f.years[f.years.length-1]||{},fm=s.fin_mode,X=(v,d)=>v==null?'—':bcN(v,d)+'×';
+  const nd=y.net_debt!=null&&y.net_debt<=0?'нет':X(y.nd_ebit,1);
+  let h=`<div class="bc-iss-top"><span class="iss-sc iss-${esc(s.key)}"><b>${s.score}</b> ${esc(s.label)}</span><span class="mu" style="font-size:12.5px">${esc(is.short||'')} · по отчётности за ${s.year} г.</span></div>
+    <div class="bc-kpis">${bcKpi('Покрытие процентов',X(y.cover,1),'EBIT / проценты; норма от 3–4')}
+    ${fm?bcKpi('Долг / капитал',X(y.debt_eq,1),'для лизинга до 5–8'):bcKpi('Чистый долг / EBIT',nd,'норма до 2–3 лет')}
+    ${bcKpi('Капитал / активы',y.eq_ratio==null?'—':bcN(y.eq_ratio*100,0)+' %','норма от 20–30 %')}
+    ${fm?bcKpi('Рентабельность EBIT',y.margin==null||y.margin>1?'—':bcN(y.margin*100,1)+' %','доля прибыли в выручке'):bcKpi('Текущая ликвидность',X(y.cur_liq,2),'норма от 1,2')}</div>`;
+  if(m.key)h+=`<div class="bc-rel"><b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b></div>`;
+  if(j.history&&(j.history.defaults||j.history.tech))h+=`<div class="bc-warn">${esc(j.history.verdict)}</div>`;
+  h+=`<button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button><p class="note" style="margin-top:8px">Скоринг от 0 до 100 по открытой отчётности отдельной компании (РСБУ): может не отражать положение группы. Не инвестиционная рекомендация.</p>`;
+  return h;
+}
+function bcIssuer(dr,c,tok){
+  const box=dr.querySelector('#bc-iss');if(!box)return;
+  const isin=c.isin,put=j=>{if(tok!==BC.tok||!document.body.contains(box))return;
+    box.innerHTML=`<h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2>`+bcIssHtml(j,isin);
+    const mb=box.querySelector('#bc-iss-more');if(mb)mb.onclick=()=>issOpen(isin)};
+  if(c.market&&c.market.kind==='ofz'){box.innerHTML=`<h2>Финансы эмитента</h2><div class="mu" style="font-size:13px">Государственная облигация: оценка по отчётности не применяется.</div>`;return}
+  if(BC.iss[isin]){put(BC.iss[isin]);return}
+  api('/api/issuer?isin='+encodeURIComponent(isin)).then(j=>{BC.iss[isin]=j;put(j)}).catch(e=>put({ok:false,errors:['Не удалось загрузить данные: '+(e.message||e)]}));
 }
 function bcCharts(dr,c){
   const ice=dr.querySelector('#bc-ic');if(ice&&c.issuer_curve)try{bcIssuerCurve(ice,c.issuer_curve)}catch(e){}
