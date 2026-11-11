@@ -507,10 +507,15 @@ def tx_iis_info(a, setting, first_date, today):
             "exempt": eff in ("B", "3") and bool(term and today >= term)}
 
 
-def tx_sum_rows(per_group):
-    tot = {}
-    for rows in per_group:
+def tx_sum_rows(per_group, exempt=None):
+    """Итоги по годам. exempt — флаги групп, освобождённых от налога (ИИС с соблюдённым сроком): их база в общую не входит.
+    Порог 15 % относится к совокупной базе налогоплательщика, а группы считаются по отдельности, поэтому налог по
+    совокупной базе пересчитывается заново; превышение над суммой налогов групп — extra_progressive."""
+    tot, comb = {}, defaultdict(float)
+    for gi, rows in enumerate(per_group):
         for r in rows:
+            if not (exempt and exempt[gi]):
+                comb[r["year"]] += r["base"]
             t = tot.setdefault(r["year"], {"year": r["year"], "w": defaultdict(float)})
             for k in TAX_SUM_KEYS:
                 t[k] = t.get(k, 0.0) + r[k]
@@ -520,6 +525,8 @@ def tx_sum_rows(per_group):
     for y in sorted(tot):
         t = tot[y]
         t["w"] = dict(t["w"])
+        extra = tx_ndfl(comb[y], y)[0] - t["tax"]
+        t["extra_progressive"] = extra if extra > 0.5 else 0.0
         t["diff"] = t["tax"] - t["withheld"]
         t["diff_pct"] = (t["diff"] / t["withheld"] * 100.0) if t["withheld"] > 1 else None
         out.append(t)
@@ -572,7 +579,7 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resol
         k = o.get("_acc") or ""
         if k not in first_by_acc or d < first_by_acc[k]:
             first_by_acc[k] = d
-    out_groups, per_rows, iis_list = [], [], []
+    out_groups, per_rows, iis_list, per_exempt = [], [], [], []
     off = settings.get("offset_coupons", False)
     for gk, g in groups.items():
         ids = set(g["accounts"])
@@ -598,8 +605,9 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resol
         rows, pool = tax_group_years(sales, inc, settings["loss_carry"] if gk == "gen" else None, exempt, None, off)
         g["rows"], g["pool"], g["sales"], g["inc"] = rows, pool, sales, inc
         per_rows.append(rows)
+        per_exempt.append(exempt)
         out_groups.append(g)
-    return {"eng": eng, "groups": out_groups, "years": tx_sum_rows(per_rows), "iis": iis_list, "pos": pos, "today": today, "accs": accs,
+    return {"eng": eng, "groups": out_groups, "years": tx_sum_rows(per_rows, per_exempt), "iis": iis_list, "pos": pos, "today": today, "accs": accs,
             "conversions": conversions_view(events)}
 
 

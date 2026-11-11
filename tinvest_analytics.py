@@ -952,6 +952,14 @@ def fifo(ops):
                     pos[uid]["lots"].append([t, lu / r])
                     left -= t
             continue
+        if k == "repayments" and uid and op_type(o) == "BOND_REPAYMENT":
+            # частичное погашение (амортизация): стоимость открытых лотов уменьшается на выплаченный номинал на бумагу
+            tq = sum(l[0] for l in pos[uid]["lots"]) if uid in pos else 0
+            red = abs(qf(o.get("payment"))) / tq if tq else 0.0
+            if red:
+                for l in pos[uid]["lots"]:
+                    l[1] = max(0.0, l[1] - red)
+            continue
         if not uid or k not in ("buy", "sell", "sec_in", "sec_out", "repayments") or not q:
             if k == "repayments" and uid and op_type(o) == "BOND_REPAYMENT_FULL":
                 pos[uid]["lots"] = []
@@ -2387,7 +2395,7 @@ def amort_events(bz, ops_ev, today):
     return sorted(ev)
 
 
-def build_history(client, ops, names, actual_total, held_qty=None):
+def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=None):
     ops = sorted([o for o in ops if o.get("date")], key=lambda o: o["date"])
     if not ops:
         return None
@@ -2530,6 +2538,13 @@ def build_history(client, ops, names, actual_total, held_qty=None):
     for u in extra:
         closes[u] = dict(series.get(u) or ())
 
+    # бумага числится в портфеле с нулевой ценой (ГДР после делистинга и т.п.), а свечи кончились: через месяц после
+    # последней свечи она стоит 0, а не держит последнюю цену вечно
+    dead_from = {}
+    for g in real:
+        if zero_priced and types[g] not in ("bond", "currency") and closes.get(g) and any(i in zero_priced for i in [g] + (members.get(g) or [])):
+            dead_from[g] = (datetime.strptime(max(closes[g]), "%Y-%m-%d") + timedelta(days=30)).strftime("%Y-%m-%d")
+
     last_close, fallback, cash, scale = {}, {}, defaultdict(float), {}
     qty = defaultdict(float)          # количество в «единицах свечи» (с учётом сплитов)
     out_days, vals, inv, rets = [], [], [], []
@@ -2549,6 +2564,8 @@ def build_history(client, ops, names, actual_total, held_qty=None):
         return nom + sum(a for da, a in amort.get(u, ()) if da > day)
 
     def unit(u, day):
+        if u in dead_from and day > dead_from[u]:
+            return 0.0
         c = last_close.get(u)
         t = types.get(u)
         if c is None:
@@ -2573,8 +2590,13 @@ def build_history(client, ops, names, actual_total, held_qty=None):
             uid = pos_key(o)
             # сделки с фьючерсами/опционами: payment — условная стоимость контракта, деньги движутся через
             # вариационную маржу (отдельные операции); считать payment деньгами — значит выдумать скачки на ±цену контракта
-            if not (k in ("buy", "sell") and uid and types.get(uid) in ("futures", "option")):
+            # дивиденды «на карту» (DIV_EXT) на счёт не поступают: это доход и сразу вывод. Покупка с карты (BUY_CARD)
+            # в операциях сопровождается пополнением на ту же сумму, поэтому идёт как обычная покупка
+            ext = op_type(o) == "DIV_EXT"
+            if not ext and not (k in ("buy", "sell") and uid and types.get(uid) in ("futures", "option")):
                 cash[c] += pay
+            if ext:
+                flow -= pay * (fx(c) or 0.0)
             q = op_qty(o)
             sc = scale.get(uid, 1.0)
             if uid and q and k in ("buy", "sell") and pay:
@@ -3316,14 +3338,17 @@ def build_history_for(cfg, acc, force=False):
         total = sum(qf((d["port"] or {}).get("totalAmountPortfolio")) for d in data if d["port"] is not None)
         if any(d["port"] is None for d in data):
             total += sum(sum((r["value_rub"] or 0) for r in imported_positions(client, d["ops"], names)) for d in data if d["port"] is None)
-        held = None
+        held, zero = None, set()
         if all(d["port"] is not None for d in data):     # текущие позиции — для проверки обменов бумаг
             held = defaultdict(float)
             for d in data:
                 for x in d["port"].get("positions") or []:
-                    for i in {x.get("instrumentUid"), x.get("positionUid"), x.get("figi")} - {None, ""}:
+                    ids = {x.get("instrumentUid"), x.get("positionUid"), x.get("figi")} - {None, ""}
+                    for i in ids:
                         held[i] += qf(x.get("quantity"))
-        return build_history(client, ops, names, total, held) or {"days": []}
+                    if qf(x.get("quantity")) > 0 and x.get("currentPrice") and not qf(x.get("currentPrice")) and not qf(x.get("currentNkd")):
+                        zero |= ids
+        return build_history(client, ops, names, total, held, zero) or {"days": []}
     return cached_result("hist", cfg, acc, HIST_TTL, compute, force)
 
 
@@ -9529,10 +9554,15 @@ def tx_iis_info(a, setting, first_date, today):
             "exempt": eff in ("B", "3") and bool(term and today >= term)}
 
 
-def tx_sum_rows(per_group):
-    tot = {}
-    for rows in per_group:
+def tx_sum_rows(per_group, exempt=None):
+    """Итоги по годам. exempt — флаги групп, освобождённых от налога (ИИС с соблюдённым сроком): их база в общую не входит.
+    Порог 15 % относится к совокупной базе налогоплательщика, а группы считаются по отдельности, поэтому налог по
+    совокупной базе пересчитывается заново; превышение над суммой налогов групп — extra_progressive."""
+    tot, comb = {}, defaultdict(float)
+    for gi, rows in enumerate(per_group):
         for r in rows:
+            if not (exempt and exempt[gi]):
+                comb[r["year"]] += r["base"]
             t = tot.setdefault(r["year"], {"year": r["year"], "w": defaultdict(float)})
             for k in TAX_SUM_KEYS:
                 t[k] = t.get(k, 0.0) + r[k]
@@ -9542,6 +9572,8 @@ def tx_sum_rows(per_group):
     for y in sorted(tot):
         t = tot[y]
         t["w"] = dict(t["w"])
+        extra = tx_ndfl(comb[y], y)[0] - t["tax"]
+        t["extra_progressive"] = extra if extra > 0.5 else 0.0
         t["diff"] = t["tax"] - t["withheld"]
         t["diff_pct"] = (t["diff"] / t["withheld"] * 100.0) if t["withheld"] > 1 else None
         out.append(t)
@@ -9594,7 +9626,7 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resol
         k = o.get("_acc") or ""
         if k not in first_by_acc or d < first_by_acc[k]:
             first_by_acc[k] = d
-    out_groups, per_rows, iis_list = [], [], []
+    out_groups, per_rows, iis_list, per_exempt = [], [], [], []
     off = settings.get("offset_coupons", False)
     for gk, g in groups.items():
         ids = set(g["accounts"])
@@ -9620,8 +9652,9 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resol
         rows, pool = tax_group_years(sales, inc, settings["loss_carry"] if gk == "gen" else None, exempt, None, off)
         g["rows"], g["pool"], g["sales"], g["inc"] = rows, pool, sales, inc
         per_rows.append(rows)
+        per_exempt.append(exempt)
         out_groups.append(g)
-    return {"eng": eng, "groups": out_groups, "years": tx_sum_rows(per_rows), "iis": iis_list, "pos": pos, "today": today, "accs": accs,
+    return {"eng": eng, "groups": out_groups, "years": tx_sum_rows(per_rows, per_exempt), "iis": iis_list, "pos": pos, "today": today, "accs": accs,
             "conversions": conversions_view(events)}
 
 
@@ -12326,7 +12359,7 @@ function txYr(d){
     ${kpi('Сэкономлено за счёт ЛДВ',tR(tot.ldv),'за все годы',tot.ldv>0?'pos':'',S3)}
     ${kpi('Налог по расчёту за всё время',tR(tot.tax),`удержано ${tR(tot.wh)}`,null,S4)}</div>
     <div class="card"><h2>Расчёт и удержанный налог по годам, ₽</h2><div id="c-txy" class="chart"></div></div>
-    <div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Все выбранные счета вместе</h2>${txRowsTable(ys)}</div>`;
+    <div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Все выбранные счета вместе</h2>${txRowsTable(ys)}${ys.filter(r=>r.extra_progressive>0.5).reverse().map(r=>`<p class="note" style="padding:0 10px">${r.year}: <b>Ожидаемая доплата по прогрессивной шкале (совокупность счетов) ${tR(r.extra_progressive)}</b>. Порог 15 % относится к совокупному доходу налогоплательщика, а счета и ИИС считаются отдельно: если вместе база превысила порог, ФНС доначислит разницу.</p>`).join('')}</div>`;
   if(d.groups.length>1)out+=d.groups.map(g=>`<div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">${esc(g.name)}${g.kind==='iis'?`<span class="sp">${g.iis.exempt?'доход освобождён от налога (срок соблюдён)':'ИИС тип '+({A:'А',B:'Б','3':'3'})[g.iis.type]}</span>`:''}</h2>${txRowsTable(g.rows)}</div>`).join('');
   const cmp=ys.filter(r=>r.diff_pct!=null&&Math.abs(r.diff_pct)>25);
   out+=`<div class="card"><h2>Почему расчёт и удержание могут расходиться</h2><ul class="tx-ul">

@@ -286,5 +286,33 @@ class Settings(unittest.TestCase):
         json.dumps(p)
 
 
+class Progressive(unittest.TestCase):
+    def _row(self, base, year=2025):
+        r = {k: 0.0 for k in M.TAX_SUM_KEYS}
+        r.update(year=year, base=base, tax=M.tx_ndfl(base, year)[0], w={})
+        return r
+
+    def test_extra_progressive_on_combined_base(self):
+        # два отдельных расчёта по 2 млн каждый (порог 2,4 млн) в сумме дают 4 млн: часть вместе облагается по 15 %
+        rows = M.tx_sum_rows([[self._row(2000000.0)], [self._row(2000000.0)]])
+        t = rows[0]
+        self.assertAlmostEqual(t["tax"], 2 * 2000000 * 0.13)
+        self.assertAlmostEqual(t["extra_progressive"], (4000000 - 2400000) * 0.02)
+
+    def test_no_extra_when_below_threshold_or_exempt(self):
+        self.assertEqual(M.tx_sum_rows([[self._row(1000000.0)], [self._row(1000000.0)]])[0]["extra_progressive"], 0.0)
+        r = M.tx_sum_rows([[self._row(2000000.0)], [self._row(2000000.0)]], [False, True])[0]
+        self.assertEqual(r["extra_progressive"], 0.0)       # освобождённый ИИС в совокупную базу не входит
+
+
+class FifoAmort(unittest.TestCase):
+    def test_partial_repayment_reduces_cost(self):
+        ops = [buy("2024-01-10", 10, 1000, uid="b1", itype="bond"),
+               op("2024-06-10", "BOND_REPAYMENT", pay=2500, uid="b1", itype="bond")]
+        f = M.fifo(ops)
+        self.assertAlmostEqual(f["b1"]["qty"], 10)
+        self.assertAlmostEqual(f["b1"]["cost"], 10 * 1000 - 2500)
+
+
 if __name__ == "__main__":
     unittest.main()

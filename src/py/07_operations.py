@@ -139,6 +139,14 @@ def fifo(ops):
                     pos[uid]["lots"].append([t, lu / r])
                     left -= t
             continue
+        if k == "repayments" and uid and op_type(o) == "BOND_REPAYMENT":
+            # частичное погашение (амортизация): стоимость открытых лотов уменьшается на выплаченный номинал на бумагу
+            tq = sum(l[0] for l in pos[uid]["lots"]) if uid in pos else 0
+            red = abs(qf(o.get("payment"))) / tq if tq else 0.0
+            if red:
+                for l in pos[uid]["lots"]:
+                    l[1] = max(0.0, l[1] - red)
+            continue
         if not uid or k not in ("buy", "sell", "sec_in", "sec_out", "repayments") or not q:
             if k == "repayments" and uid and op_type(o) == "BOND_REPAYMENT_FULL":
                 pos[uid]["lots"] = []

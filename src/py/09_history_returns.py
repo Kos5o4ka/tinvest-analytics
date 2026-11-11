@@ -66,7 +66,7 @@ def amort_events(bz, ops_ev, today):
     return sorted(ev)
 
 
-def build_history(client, ops, names, actual_total, held_qty=None):
+def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=None):
     ops = sorted([o for o in ops if o.get("date")], key=lambda o: o["date"])
     if not ops:
         return None
@@ -209,6 +209,13 @@ def build_history(client, ops, names, actual_total, held_qty=None):
     for u in extra:
         closes[u] = dict(series.get(u) or ())
 
+    # бумага числится в портфеле с нулевой ценой (ГДР после делистинга и т.п.), а свечи кончились: через месяц после
+    # последней свечи она стоит 0, а не держит последнюю цену вечно
+    dead_from = {}
+    for g in real:
+        if zero_priced and types[g] not in ("bond", "currency") and closes.get(g) and any(i in zero_priced for i in [g] + (members.get(g) or [])):
+            dead_from[g] = (datetime.strptime(max(closes[g]), "%Y-%m-%d") + timedelta(days=30)).strftime("%Y-%m-%d")
+
     last_close, fallback, cash, scale = {}, {}, defaultdict(float), {}
     qty = defaultdict(float)          # количество в «единицах свечи» (с учётом сплитов)
     out_days, vals, inv, rets = [], [], [], []
@@ -228,6 +235,8 @@ def build_history(client, ops, names, actual_total, held_qty=None):
         return nom + sum(a for da, a in amort.get(u, ()) if da > day)
 
     def unit(u, day):
+        if u in dead_from and day > dead_from[u]:
+            return 0.0
         c = last_close.get(u)
         t = types.get(u)
         if c is None:
@@ -252,8 +261,13 @@ def build_history(client, ops, names, actual_total, held_qty=None):
             uid = pos_key(o)
             # сделки с фьючерсами/опционами: payment — условная стоимость контракта, деньги движутся через
             # вариационную маржу (отдельные операции); считать payment деньгами — значит выдумать скачки на ±цену контракта
-            if not (k in ("buy", "sell") and uid and types.get(uid) in ("futures", "option")):
+            # дивиденды «на карту» (DIV_EXT) на счёт не поступают: это доход и сразу вывод. Покупка с карты (BUY_CARD)
+            # в операциях сопровождается пополнением на ту же сумму, поэтому идёт как обычная покупка
+            ext = op_type(o) == "DIV_EXT"
+            if not ext and not (k in ("buy", "sell") and uid and types.get(uid) in ("futures", "option")):
                 cash[c] += pay
+            if ext:
+                flow -= pay * (fx(c) or 0.0)
             q = op_qty(o)
             sc = scale.get(uid, 1.0)
             if uid and q and k in ("buy", "sell") and pay:
