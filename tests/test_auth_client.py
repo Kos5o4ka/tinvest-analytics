@@ -17,7 +17,7 @@ class Stub:
         self.mode = "keys"          # keys | none | down | 5xx | old
         self.keys = {"TIA-AAAA-AAAA-AAAA": ("ok", 4_000_000_000), "TIA-OLD0-OLD0-OLD0": ("expired", 1), "TIA-BAN0-BAN0-BAN0": ("banned", 5)}
         self.calls = []
-        self.plan = {"plan": "free"}
+        self.plan = {"plan": "free", "pro_until": None}
         me = self
 
         class H(BaseHTTPRequestHandler):
@@ -99,6 +99,8 @@ class AuthClientTests(unittest.TestCase):
         self.set_cfg(self.st.base, "TIA-AAAA-AAAA-AAAA")
         r = self.m.auth_status(True)
         self.assertEqual((r["plan"], r["pro_until"]), ("free", None))
+        self.st.plan = {"plan": "free"}                                     # сервер до тарифов: заглушка plan без pro_until -> pro
+        self.assertEqual(self.m.auth_status(True)["plan"], "pro")
         self.st.plan = {"plan": "pro", "pro_until": 4_000_000_001, "trial": True}
         r = self.m.auth_status(True)
         self.assertEqual((r["plan"], r["pro_until"], r["trial"]), ("pro", 4_000_000_001, True))

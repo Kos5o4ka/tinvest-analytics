@@ -66,7 +66,7 @@ SECRET_KEYS = {"token"}
 
 DEFAULT_CONFIG = {
     "token": "",
-    "sandbox": True,
+    "sandbox": False,
     "hosts_prod": ["https://invest-public-api.tbank.ru/rest", "https://invest-public-api.tinkoff.ru/rest"],
     "hosts_sandbox": ["https://sandbox-invest-public-api.tbank.ru/rest",
                       "https://sandbox-invest-public-api.tinkoff.ru/rest"],
@@ -3750,6 +3750,8 @@ def _auth_eval(srv, key):
         base["bot"] = str(j["bot"])
     if code == 200 and j.get("ok", True):
         plan = str(j.get("plan") or "")
+        if "pro_until" not in j:            # старый сервер отдавал заглушку plan="free" без тарифов — всё доступно
+            plan = "pro"
         pu = j.get("pro_until")
         return dict(base, expires=j.get("expires"), username=str(j.get("username") or ""),
                     plan="free" if plan == "free" else "pro",
@@ -18667,7 +18669,7 @@ function obRender(){
     if(!tok){ob.err='Вставьте токен в поле.';$('#ob-msg').innerHTML=`<div class="msg err">${esc(ob.err)}</div>`;input.focus();return}
     ob.busy=true;ob.err='';b.disabled=true;b.textContent='Проверяю…';
     try{
-      await post('/api/config',{token:tok});
+      await post('/api/config',{token:tok,sandbox:false});
       const r=await post('/api/test');
       ob.done=true;ob.help=false;
       try{S.cfg=await api('/api/config')}catch(e){}

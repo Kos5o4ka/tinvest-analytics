@@ -66,7 +66,7 @@ SECRET_KEYS = {"token"}
 
 DEFAULT_CONFIG = {
     "token": "",
-    "sandbox": True,
+    "sandbox": False,
     "hosts_prod": ["https://invest-public-api.tbank.ru/rest", "https://invest-public-api.tinkoff.ru/rest"],
     "hosts_sandbox": ["https://sandbox-invest-public-api.tbank.ru/rest",
                       "https://sandbox-invest-public-api.tinkoff.ru/rest"],

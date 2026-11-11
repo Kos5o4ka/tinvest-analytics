@@ -220,6 +220,8 @@ def _auth_eval(srv, key):
         base["bot"] = str(j["bot"])
     if code == 200 and j.get("ok", True):
         plan = str(j.get("plan") or "")
+        if "pro_until" not in j:            # старый сервер отдавал заглушку plan="free" без тарифов — всё доступно
+            plan = "pro"
         pu = j.get("pro_until")
         return dict(base, expires=j.get("expires"), username=str(j.get("username") or ""),
                     plan="free" if plan == "free" else "pro",

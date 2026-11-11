@@ -43,7 +43,7 @@ function obRender(){
     if(!tok){ob.err='Вставьте токен в поле.';$('#ob-msg').innerHTML=`<div class="msg err">${esc(ob.err)}</div>`;input.focus();return}
     ob.busy=true;ob.err='';b.disabled=true;b.textContent='Проверяю…';
     try{
-      await post('/api/config',{token:tok});
+      await post('/api/config',{token:tok,sandbox:false});
       const r=await post('/api/test');
       ob.done=true;ob.help=false;
       try{S.cfg=await api('/api/config')}catch(e){}
