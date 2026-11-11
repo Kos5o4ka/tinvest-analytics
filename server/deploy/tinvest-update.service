@@ -1,0 +1,8 @@
+[Unit]
+Description=Обновление сервера данных и бота T-Invest Analytics из GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tinvest-analytics/server/deploy/tinvest-update.sh

@@ -10,6 +10,23 @@ const rbot=(x,y,w,h,r)=>{r=Math.min(r,w/2,h);if(h<=0)return'';return`M${x},${y}H
 const legend=ser=>ser.length>1?`<div class="legend">${ser.map(s=>`<span><i style="background:${s.c}"></i>${esc(s.n)}</span>`).join('')}</div>`:'';
 function emptyChart(el,h,t){el.innerHTML=`<div class="empty" style="min-height:${h}px;padding:20px">${svgI('<path d="M3 3v18h18M7 15l4-4 3 3 5-6"/>')}<div>${t||'Нет данных за период'}</div></div>`}
 
+let _axc;
+/* подписи оси X: шаг подбирается по ширине текста, пересекающиеся подписи отбрасываются (первую/последнюю принудительно не добавляем) */
+function axisTicks(labels,X,x0,x1,gap=12){
+  const n=labels.length;if(!n)return[];
+  if(!_axc)_axc=document.createElement('canvas').getContext('2d');
+  _axc.font='11px Inter,"SF Pro Text",-apple-system,"Segoe UI",Roboto,system-ui,sans-serif';
+  const ws=labels.map(l=>_axc.measureText(String(l)).width),mw=Math.max(...ws);
+  const pitch=n>1?Math.abs(X(n-1)-X(0))/(n-1):x1-x0,every=Math.max(1,Math.ceil((mw+gap)/Math.max(pitch,1)));
+  const out=[];let last=-1e9;
+  for(let i=0;i<n;i+=every){
+    const w=ws[i];let c=X(i);c=Math.max(x0+w/2,Math.min(x1-w/2,c));
+    if(c-w/2<last+gap)continue;
+    out.push([i,c]);last=c+w/2;
+  }
+  return out;
+}
+
 function bars(el,o){
   const W=el.clientWidth,H=o.h||240,pl=58,pr=6,pt=8,pb=26,n=o.labels.length;
   if(!n||W<50)return emptyChart(el,H,o.empty);
@@ -22,11 +39,10 @@ function bars(el,o){
   const cols=stack?1:k,gap=2,bw=Math.max(2,Math.min(30,(gw*.72-(cols-1)*gap)/cols));
   let s='';
   for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"${Math.abs(v)<step/1e6?' style="stroke:#ffffff26"':''}/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(Math.abs(v)<step/1e6?0:v)}</text>`}
-  const every=Math.max(1,Math.ceil(n/Math.max(1,Math.floor(pw/62))));
+  const bx=i=>pl+gw*i+gw/2,bt=axisTicks(o.labels,bx,pl-4,W-pr+4);
   let marks='',hits='';
   for(let i=0;i<n;i++){
     const gx=pl+gw*i,x0=gx+(gw-(cols*bw+(cols-1)*gap))/2;
-    if(i%every===0)s+=`<text class="ax" x="${gx+gw/2}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`;
     let pp=0,nn=0;const pos=[],neg=[];
     ser.forEach((se,j)=>{const v=se.v[i]||0;if(!v)return;
       if(stack){if(v>0){pos.push([j,pp,pp+v]);pp+=v}else{neg.push([j,nn+v,nn]);nn+=v}}
@@ -39,6 +55,7 @@ function bars(el,o){
     if(o.labelsOn){const v=ser[0].v[i];if(v)s+=`<text class="ax num" x="${gx+gw/2}" y="${v>0?Y(v)-5:Y(v)+12}" text-anchor="middle" style="fill:var(--tx2)">${fa(v)}</text>`}
     hits+=`<rect data-i="${i}" x="${gx}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
   }
+  bt.forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
   el.innerHTML=(o.legend===false?'':legend(ser))+`<svg width="${W}" height="${H}">${s}<g>${marks}</g>${hits}</svg>`;
   const mk=el.querySelectorAll('.bm');
   el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?1:.35);
@@ -60,9 +77,13 @@ function line(el,o){
   const{lo,hi,step}=nice(mn,mx),pw=W-pl-pr,ph=H-pt-pb,X=i=>pl+i/(n-1)*pw,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
   let s='';
   for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"${Math.abs(v)<step/1e6?' style="stroke:#ffffff26"':''}/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(Math.abs(v)<step/1e6?0:v)}</text>`}
-  const every=Math.max(1,Math.ceil(n/Math.max(1,Math.floor(pw/80))));
-  for(let i=0;i<n-every/2;i+=every)s+=`<text class="ax" x="${X(i)}" y="${H-6}" text-anchor="${i===0?'start':'middle'}">${esc(labels[i])}</text>`;
+  axisTicks(labels,X,pl-4,W-pr+4).forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(labels[i])}</text>`);
   const gid='g'+Math.random().toString(36).slice(2,8);
+  if(o.band){const A=ser[o.band.a].v,B=ser[o.band.b].v,poly=(pts,up)=>{if(pts.length>2)s+=`<polygon points="${pts.map(q=>q[0].toFixed(1)+','+q[1].toFixed(1)).join(' ')}" fill="${up?'#ff6b6b':'#3ecf8e'}" fill-opacity=".22"/>`};
+    for(let i=0;i<n-1;i++){const a0=A[i],a1=A[i+1],b0=B[i],b1=B[i+1];if([a0,a1,b0,b1].some(v=>v==null||isNaN(v)))continue;
+      const d0=a0-b0,d1=a1-b1,x0=X(i),x1=X(i+1);
+      if(d0*d1>=0)poly([[x0,Y(a0)],[x1,Y(a1)],[x1,Y(b1)],[x0,Y(b0)]],d0+d1>0);
+      else{const t=d0/(d0-d1),xc=x0+(x1-x0)*t,yc=Y(a0+(a1-a0)*t);poly([[x0,Y(a0)],[xc,yc],[x0,Y(b0)]],d0>0);poly([[xc,yc],[x1,Y(a1)],[x1,Y(b1)]],d1>0)}}}
   ser.forEach((se,j)=>{
     const segs=[];let cur=[],pv=null;se.v.forEach((v,i)=>{if(v==null||isNaN(v)){if(cur.length)segs.push(cur);cur=[];pv=null}else{if(se.step&&pv!=null)cur.push(X(i).toFixed(1)+','+Y(pv).toFixed(1));cur.push(X(i).toFixed(1)+','+Y(v).toFixed(1));pv=v}});if(cur.length)segs.push(cur);
     if(j===0&&o.area){const base=Y(Math.max(lo,Math.min(0,hi)));s+=`<defs><linearGradient id="${gid}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="${se.hex||'#3987e5'}" stop-opacity="${o.area==='neg'?0:.28}"/><stop offset="1" stop-color="${se.hex||'#3987e5'}" stop-opacity="${o.area==='neg'?.28:0}"/></linearGradient></defs>`;
@@ -72,9 +93,9 @@ function line(el,o){
   for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${X(i)-cw/2}" y="${pt}" width="${cw}" height="${ph}" fill="transparent"/>`;
   el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}">${s}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
-  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="#ffffff40" stroke-dasharray="3 3"/>`+
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`+
     ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>`<circle cx="${X(i)}" cy="${Y(se.v[i])}" r="4.5" fill="${se.c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
-  bindTip(el,i=>{o.hover&&o.hover(i);return`<b>${esc(tl[i])}</b>`+ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>tipRow(se.c,se.n,ft(se.v[i]))).join('')});
+  bindTip(el,i=>{o.hover&&o.hover(i);if(o.tip)return o.tip(i);return`<b>${esc(tl[i])}</b>`+ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>tipRow(se.c,se.n,ft(se.v[i]))).join('')});
   if(o.leave){const ol=el.onmouseleave;el.onmouseleave=e=>{ol(e);o.leave()}}
 }
 

@@ -6,7 +6,7 @@
 Сервер ходит к источникам один раз, кэширует ответ в SQLite и отдаёт всем клиентам, соблюдая лимиты запросов.
 Токены Т-Инвестиций и портфели сюда не попадают. Только стандартная библиотека, Python 3.8+.
 
-    python3 tinvest_server.py [--host 127.0.0.1] [--port 8780] [--data DIR] [--key KEY] [--verbose]
+    python3 tinvest_server.py [--host 127.0.0.1] [--port 8780] [--data DIR] [--key KEY] [--keys-db PATH --bot NAME] [--verbose]
 """
 import argparse
 import hashlib
@@ -22,7 +22,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 VERSION = "1.0.0"
 MIN, HOUR, DAY = 60, 3600, 86400
@@ -105,13 +105,120 @@ class UpstreamError(Exception):
 
 
 # ───────────────────────── авторизация ─────────────────────────
-def authorize(server, headers):
-    """Единая точка проверки доступа. Возвращает идентификатор клиента или None.
-    Сейчас: общий ключ (X-Client-Key). Позже сюда подключается вход через Telegram (токен сессии -> пользователь)."""
-    if not server.key:
-        return "anon"
+def normalize_key(k):
+    return (k or "").strip().upper().replace(" ", "")
+
+
+def key_hash(k):
+    return hashlib.sha256(normalize_key(k).encode("utf-8")).hexdigest()
+
+
+class KeyStore:
+    """Ключи доступа, выданные Telegram-ботом. База принадлежит боту (общий файл SQLite, WAL): здесь она только читается,
+    пишется лишь keys.last_used (не чаще раза в минуту на ключ, ошибки блокировки игнорируются).
+    Результаты проверки кэшируются в памяти: положительный — на POS_TTL, но не дольше срока действия ключа; отрицательный — на NEG_TTL."""
+    POS_TTL, NEG_TTL, USED_EVERY, MAX_CACHE = 60, 10, 60, 10000
+
+    def __init__(self, path, clock=time.time):
+        self.path, self.clock = path, clock
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._cache, self._used = {}, {}
+        self._warned = False
+
+    def _conn(self):
+        c = getattr(self._local, "c", None)
+        if c is None:
+            c = sqlite3.connect("file:%s?mode=rw" % quote(self.path.replace("\\", "/"), safe="/:"),
+                                uri=True, timeout=2, isolation_level=None)
+            c.execute("PRAGMA busy_timeout=2000")
+            self._local.c = c
+        return c
+
+    def _warn(self, e):
+        if not self._warned:
+            self._warned = True
+            sys.stderr.write("keys-db: %s: %s (запросы будут отклонены, пока база недоступна)\n" % (type(e).__name__, e))
+
+    def lookup(self, key):
+        """-> (статус, инфо). Статус: ok | invalid | expired | banned | error."""
+        h = key_hash(key)
+        now = self.clock()
+        with self._lock:
+            hit = self._cache.get(h)
+        if hit and hit[0] > now:
+            res = hit[1]
+        else:
+            res = self._query(h, now)
+            if res[0] == "error":
+                return res
+            ttl = self.POS_TTL if res[0] == "ok" else self.NEG_TTL
+            until = now + ttl
+            if res[0] == "ok":
+                until = min(until, res[1]["expires"])
+            with self._lock:
+                if len(self._cache) > self.MAX_CACHE:
+                    self._cache.clear()
+                self._cache[h] = (until, res)
+        if res[0] == "ok":
+            self._touch(h, now)
+        return res
+
+    def _query(self, h, now):
+        try:
+            row = self._conn().execute(
+                "SELECT k.tg_id, k.expires, k.revoked, u.banned, u.username, u.plan FROM keys k "
+                "LEFT JOIN users u ON u.tg_id = k.tg_id WHERE k.key_hash = ?", (h,)).fetchone()
+        except (sqlite3.Error, OSError) as e:
+            self._local.c = None
+            self._warn(e)
+            return "error", None
+        if not row:
+            return "invalid", None
+        tg_id, expires, revoked, banned, username, plan = row
+        info = {"tg_id": tg_id, "expires": expires, "username": username or "", "plan": plan or "free"}
+        if banned:
+            return "banned", info
+        if revoked or expires is None or expires <= now:
+            return "expired", info
+        return "ok", info
+
+    def _touch(self, h, now):
+        with self._lock:
+            if now - self._used.get(h, 0) < self.USED_EVERY:
+                return
+            self._used[h] = now
+            if len(self._used) > self.MAX_CACHE:
+                self._used.clear()
+        try:
+            self._conn().execute("UPDATE keys SET last_used = ? WHERE key_hash = ?", (now, h))
+        except (sqlite3.Error, OSError):
+            pass
+
+
+def auth_mode(server):
+    return "keys" if server.keystore else ("key" if server.key else "none")
+
+
+def authorize_ex(server, headers):
+    """-> (client_id | None, причина, инфо). Причина при отказе: invalid | expired | banned.
+    Принимается либо общий ключ (--key), либо личный ключ из бота (--keys-db); если не настроено ничего — открытый доступ."""
+    if not server.key and not server.keystore:
+        return "anon", None, None
     got = headers.get("X-Client-Key") or ""
-    return "key" if hmac.compare_digest(got.encode("utf-8"), server.key.encode("utf-8")) else None
+    if server.key and hmac.compare_digest(got.encode("utf-8"), server.key.encode("utf-8")):
+        return "key", None, None
+    if server.keystore and got.strip():
+        st, info = server.keystore.lookup(got)
+        if st == "ok":
+            return "tg:%s" % info["tg_id"], None, info
+        return None, (st if st in ("expired", "banned") else "invalid"), info
+    return None, "invalid", None
+
+
+def authorize(server, headers):
+    """Идентификатор клиента или None."""
+    return authorize_ex(server, headers)[0]
 
 
 # ───────────────────────── кэш (SQLite, WAL) ─────────────────────────
@@ -181,9 +288,11 @@ class _NoRedirectCheck(urllib.request.HTTPRedirectHandler):
 
 class DataServer:
     def __init__(self, data_dir, key="", max_mb=1024, clock=time.time, extra_allow=(), rates=None, verbose=False,
-                 upstream=None, rules=None):
+                 upstream=None, rules=None, keys_db="", bot="tanalyticbot"):
         os.makedirs(data_dir, exist_ok=True)
         self.key, self.clock, self.verbose = key or "", clock, verbose
+        self.bot = (bot or "tanalyticbot").strip().lstrip("@")
+        self.keystore = KeyStore(keys_db, clock) if keys_db else None
         self.allowed = dict(ALLOWED_HOSTS)
         for h in extra_allow:                       # для тестов: "127.0.0.1:PORT"
             self.allowed[h] = None
@@ -368,11 +477,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(413, {"error": "body too large"})
         if n:
             body = self.rfile.read(n)
-        if authorize(app, self.headers) is None:
-            return self._send(401, {"error": "invalid or missing X-Client-Key"})
         if u.path == "/v1/health":
             return self._send(200, {"ok": True, "version": VERSION, "uptime": int(time.time() - app.started),
-                                    "cache_items": app.cache.count()})
+                                    "cache_items": app.cache.count(), "auth": auth_mode(app), "bot": app.bot})
+        client, reason, info = authorize_ex(app, self.headers)
+        if client is None:
+            return self._send(401, {"ok": False, "error": reason or "invalid", "bot": app.bot})
+        if u.path == "/v1/auth/check":
+            return self._send(200, {"ok": True, "expires": info["expires"] if info else None,
+                                    "username": info["username"] if info else "", "plan": info["plan"] if info else "",
+                                    "bot": app.bot})
         if u.path == "/v1/stats":
             return self._send(200, app.stats())
         if u.path == "/v1/fetch":
@@ -413,6 +527,9 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--data", default=os.path.join(os.path.expanduser("~"), ".tinvest_server"))
     ap.add_argument("--key", default=os.environ.get("TINVEST_SERVER_KEY", ""))
+    ap.add_argument("--keys-db", default=os.environ.get("TINVEST_KEYS_DB", ""),
+                    help="SQLite-база Telegram-бота с личными ключами (users, keys); включает вход по ключу из бота")
+    ap.add_argument("--bot", default=os.environ.get("TINVEST_BOT", "tanalyticbot"), help="имя бота, которое сообщается клиентам")
     ap.add_argument("--max-mb", type=int, default=1024, help="лимит размера кэша, МБ")
     ap.add_argument("--allow", action="append", default=[], help="дополнительный разрешённый host[:port] (для тестов)")
     ap.add_argument("--verbose", action="store_true", help="писать в журнал строки запросов (по умолчанию не пишется)")
@@ -421,9 +538,9 @@ def main(argv=None):
     if a.version:
         print(VERSION)
         return 0
-    app = DataServer(a.data, a.key, a.max_mb, extra_allow=a.allow, verbose=a.verbose)
+    app = DataServer(a.data, a.key, a.max_mb, extra_allow=a.allow, verbose=a.verbose, keys_db=a.keys_db, bot=a.bot)
     srv = make_http_server(app, a.host, a.port)
-    print("tinvest-data %s: http://%s:%d, кэш %s%s" % (VERSION, a.host, a.port, a.data, ", ключ включён" if a.key else ""), flush=True)
+    print("tinvest-data %s: http://%s:%d, кэш %s%s" % (VERSION, a.host, a.port, a.data, (", ключ включён" if a.key else "") + (", вход по ключам бота @%s" % app.bot if app.keystore else "")), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

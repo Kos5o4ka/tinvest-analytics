@@ -184,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
                             cfg[k] = hosts
                 if "data_server" in body:
                     u = str(body["data_server"]).strip().rstrip("/")
-                    if u and not re.fullmatch(r"https?://[^/\s]+(/[^\s]*)?", u):
+                    if u and u.lower() != "off" and not re.fullmatch(r"https?://[^/\s]+(/[^\s]*)?", u):
                         raise ApiError("Адрес сервера данных должен начинаться с http:// или https://", 400)
                     cfg["data_server"] = u
                 if body.get("data_key"):

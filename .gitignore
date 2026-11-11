@@ -17,3 +17,9 @@ __pycache__/
 *.bak
 *.tmp
 .DS_Store
+
+# Сборка нативных приложений (PyInstaller)
+build/
+dist/
+packaging/icon.*
+packaging/hidden_imports.txt

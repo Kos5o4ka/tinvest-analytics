@@ -1,0 +1,25 @@
+/* ── лесенка облигаций: портфель ── */
+.ld-ctl{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+.ld-ctl2{display:flex;gap:8px;margin-bottom:10px}.ld-ctl2 .btn{padding:5px 12px;font-size:12px}
+.ld-leg{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--tx2);margin-bottom:10px;align-items:center}
+.ld-leg i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:6px}.ld-leg .mu{margin-left:auto}
+.ldb{display:flex;flex-direction:column;gap:6px}
+.ldb-row{display:grid;grid-template-columns:78px 1fr 118px;gap:12px;align-items:center;padding:4px 8px;border-radius:9px;border:1px solid transparent}
+.ldb-row:hover{background:var(--card2)}
+.ldb-l{font-size:12.5px;color:var(--tx2);font-variant-numeric:tabular-nums;white-space:nowrap}
+.ldb-tr{position:relative;height:24px;border-radius:7px;background:var(--card2)}
+.ldb-bar{display:flex;height:100%;border-radius:7px;overflow:hidden;min-width:2px}.ldb-bar i{display:block;min-width:2px}
+.ldb-avg{position:absolute;top:-3px;bottom:-3px;width:0;border-left:2px dashed var(--mu);opacity:.8;text-decoration:none}
+.ldb-v{font-size:12.5px;text-align:right;display:flex;gap:6px;justify-content:flex-end;align-items:center;white-space:nowrap}
+.ldb-row.heavy{border-color:#c9850066;background:#c985000d}
+.ldb-row.gap{border-color:var(--line2);border-style:dashed}.ldb-row.gap .ldb-tr{background:repeating-linear-gradient(135deg,transparent 0 6px,var(--line) 6px 7px)}
+.ldb-row.z:not(.gap) .ldb-v{color:var(--mu)}
+.ld-fl{font-size:10.5px;padding:1px 6px;border-radius:5px;font-weight:600}
+.ld-fl.heavy{background:#c9850026;color:var(--s4)}.ld-fl.gap{background:var(--card2);color:var(--mu)}
+.ld-how{margin-top:16px;border-top:1px solid var(--line);padding-top:12px;font-size:13px;color:var(--tx2)}
+.ld-how summary{cursor:pointer;font-weight:600;color:var(--tx);margin-bottom:8px}
+.ld-how ul{margin:0;padding-left:18px;display:grid;gap:6px;line-height:1.5}
+.ld-tbl .ld-gh td{background:var(--card2);cursor:pointer}.ld-tbl .ld-gh:hover td{filter:brightness(1.08)}
+.ld-car{display:inline-block;width:12px;color:var(--mu)}
+[data-theme=light] .ld-fl.heavy{color:#a86d00}[data-theme=light] .ldb-row.heavy{background:#c985001a}
+@media(max-width:700px){.ldb-row{grid-template-columns:62px 1fr 84px;gap:8px}.ld-leg .mu{margin-left:0}}

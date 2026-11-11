@@ -1,0 +1,20 @@
+[Unit]
+Description=T-Invest Analytics data server
+After=network-online.target tinvest-bot.service
+Wants=network-online.target
+
+[Service]
+User=tinvest
+Group=tinvest
+EnvironmentFile=-/etc/tinvest-server.env
+ExecStart=/usr/bin/python3 /opt/tinvest-analytics/server/tinvest_server.py --host 127.0.0.1 --port 8780 --data /var/lib/tinvest-server --keys-db /var/lib/tinvest-bot/keys.sqlite --bot tanalyticbot
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tinvest-server /var/lib/tinvest-bot
+
+[Install]
+WantedBy=multi-user.target

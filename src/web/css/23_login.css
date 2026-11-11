@@ -1,0 +1,14 @@
+/* ── вход по ключу из Telegram-бота ── */
+#login-ov{position:fixed;inset:0;z-index:500;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:20px;overflow:auto}
+.lg-box{width:min(420px,100%);background:var(--card);border:1px solid var(--line2);border-radius:var(--r);padding:28px 28px 22px;display:flex;flex-direction:column;gap:16px;box-shadow:0 20px 60px #0006}
+.lg-box .logo{padding:0;margin:0 0 4px}
+.lg-t{color:var(--tx2);font-size:14px}
+.lg-box #lg-bot{justify-content:center;padding:11px 16px;text-decoration:none}
+#lg-form{display:flex;flex-direction:column;gap:10px}
+#lg-key{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.04em;text-align:center}
+#lg-go{justify-content:center;padding:10px 16px}
+.lg-err{color:var(--neg);font-size:13px}
+.lg-n{color:var(--mu);font-size:12px}
+.who{display:inline-flex;align-items:center;gap:8px;color:var(--mu);font-size:12px;white-space:nowrap}
+.who button{all:unset;cursor:pointer;color:var(--mu);font-size:12px;text-decoration:underline dotted}
+.who button:hover{color:var(--tx)}
