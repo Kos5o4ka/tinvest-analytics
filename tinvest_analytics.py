@@ -14352,7 +14352,10 @@ const S={navHidden:lsJson('ta_nav_hidden',[]),navShut:lsJson('ta_nav_shut',{}),p
 function persist(){try{localStorage.setItem('ta_state',JSON.stringify({page:S.page,period:S.period,account:S.account,hideEmpty:S.hideEmpty}))}catch(e){}}
 
 async function api(path,opt){
-  const r=await fetch(path,opt);let j={};
+  let r;
+  try{r=await fetch(path,opt)}
+  catch(e){throw new Error('Программа не отвечает: похоже, её локальный сервер остановлен. Закройте окно программы и откройте её снова.')}
+  let j={};
   try{j=await r.json()}catch(e){}
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
   if(j&&j.stale&&/^\/api\/(bonds|history)\?/.test(path))staleRefresh(path,j);
@@ -18672,7 +18675,7 @@ function obRender(){
       obRender();
       S.data=S.bonds=S.hist=S.today=null;S.account='all';S.page='dash';persist();renderNav();load(true);
     }catch(e){
-      ob.err=(e&&e.message?e.message:'Не удалось подключиться')+'. Проверьте, что токен скопирован целиком и имеет доступ «только чтение».';
+      {const m=e&&e.message?e.message:'Не удалось подключиться';ob.err=/^Программа не отвечает/.test(m)?m:m+'. Проверьте, что токен скопирован целиком и имеет доступ «только чтение».'}
       ob.help=true;ob.busy=false;obRender();
     }
   };

@@ -44,7 +44,10 @@ const S={navHidden:lsJson('ta_nav_hidden',[]),navShut:lsJson('ta_nav_shut',{}),p
 function persist(){try{localStorage.setItem('ta_state',JSON.stringify({page:S.page,period:S.period,account:S.account,hideEmpty:S.hideEmpty}))}catch(e){}}
 
 async function api(path,opt){
-  const r=await fetch(path,opt);let j={};
+  let r;
+  try{r=await fetch(path,opt)}
+  catch(e){throw new Error('Программа не отвечает: похоже, её локальный сервер остановлен. Закройте окно программы и откройте её снова.')}
+  let j={};
   try{j=await r.json()}catch(e){}
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
   if(j&&j.stale&&/^\/api\/(bonds|history)\?/.test(path))staleRefresh(path,j);

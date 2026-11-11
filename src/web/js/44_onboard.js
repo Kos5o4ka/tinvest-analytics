@@ -51,7 +51,7 @@ function obRender(){
       obRender();
       S.data=S.bonds=S.hist=S.today=null;S.account='all';S.page='dash';persist();renderNav();load(true);
     }catch(e){
-      ob.err=(e&&e.message?e.message:'Не удалось подключиться')+'. Проверьте, что токен скопирован целиком и имеет доступ «только чтение».';
+      {const m=e&&e.message?e.message:'Не удалось подключиться';ob.err=/^Программа не отвечает/.test(m)?m:m+'. Проверьте, что токен скопирован целиком и имеет доступ «только чтение».'}
       ob.help=true;ob.busy=false;obRender();
     }
   };
