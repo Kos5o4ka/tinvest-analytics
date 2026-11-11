@@ -12,7 +12,7 @@ sys.path.insert(0, HERE)
 from gen_hidden_imports import hidden_imports
 
 APP_SRC = os.environ.get("TINVEST_APP_SRC") or os.path.join(ROOT, "tinvest_analytics.py")
-ICON_DIR = os.environ.get("TINVEST_ICON_DIR") or HERE
+ICON_DIR = os.path.abspath(os.environ.get("TINVEST_ICON_DIR") or HERE)   # PyInstaller ищет относительные пути от папки spec
 
 hidden = hidden_imports(APP_SRC) + ["certifi"] + collect_submodules("encodings")
 datas = collect_data_files("certifi")           # корневые сертификаты: у Python с python.org их нет
