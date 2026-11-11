@@ -221,6 +221,70 @@ def authorize(server, headers):
     return authorize_ex(server, headers)[0]
 
 
+# ───────────────────────── уведомления через бота ─────────────────────────
+NOTIFY_MAX_CHARS, NOTIFY_PER_HOUR, NOTIFY_PER_DAY = 3500, 30, 200
+
+
+class NotifyError(Exception):
+    def __init__(self, code, error):
+        Exception.__init__(self, error)
+        self.code, self.error = code, error
+
+
+class Notifier:
+    """Очередь уведомлений: кладёт сообщения пользователя в таблицу outbox общей базы бота, откуда их забирает и
+    отправляет бот (после отправки строка удаляется). Текст сообщений нигде не логируется. Лимиты на пользователя
+    считаются по таблице notify_log (tg_id, время), поэтому переживают перезапуск сервера."""
+
+    def __init__(self, keystore, clock=time.time, per_hour=NOTIFY_PER_HOUR, per_day=NOTIFY_PER_DAY):
+        self.ks, self.clock = keystore, clock
+        self.per_hour, self.per_day = per_hour, per_day
+        self._lock = threading.Lock()
+        self._last_purge = 0.0
+
+    def enqueue(self, tg_id, text):
+        """-> id строки outbox. Бросает NotifyError(409 notify_off | 429 rate_limit | 503 unavailable)."""
+        now = self.clock()
+        with self._lock:
+            c = self.ks._conn()
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                try:
+                    c.execute("CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER NOT NULL, "
+                              "text TEXT NOT NULL, created REAL NOT NULL, tries INTEGER NOT NULL DEFAULT 0)")
+                    c.execute("CREATE TABLE IF NOT EXISTS notify_log(tg_id INTEGER NOT NULL, created REAL NOT NULL)")
+                    c.execute("CREATE INDEX IF NOT EXISTS notify_log_tg ON notify_log(tg_id, created)")
+                    try:
+                        row = c.execute("SELECT notify FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+                    except sqlite3.OperationalError:         # бот ещё не мигрировал базу: колонки notify нет, значит включено
+                        row = c.execute("SELECT 1 FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+                    if not row:
+                        raise NotifyError(403, "unknown_user")
+                    if not row[0]:
+                        raise NotifyError(409, "notify_off")
+                    h = c.execute("SELECT COUNT(*) FROM notify_log WHERE tg_id=? AND created>?", (tg_id, now - HOUR)).fetchone()[0]
+                    d = c.execute("SELECT COUNT(*) FROM notify_log WHERE tg_id=? AND created>?", (tg_id, now - DAY)).fetchone()[0]
+                    if h >= self.per_hour or d >= self.per_day:
+                        raise NotifyError(429, "rate_limit")
+                    cur = c.execute("INSERT INTO outbox(tg_id, text, created) VALUES(?,?,?)", (tg_id, text, now))
+                    c.execute("INSERT INTO notify_log(tg_id, created) VALUES(?,?)", (tg_id, now))
+                    if now - self._last_purge > HOUR:
+                        self._last_purge = now
+                        c.execute("DELETE FROM notify_log WHERE created<?", (now - DAY,))
+                    c.execute("COMMIT")
+                    return cur.lastrowid
+                except BaseException:
+                    try:
+                        c.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+            except (sqlite3.Error, OSError) as e:
+                self.ks._local.c = None
+                self.ks._warn(e)
+                raise NotifyError(503, "unavailable")
+
+
 # ───────────────────────── кэш (SQLite, WAL) ─────────────────────────
 class Cache:
     def __init__(self, path, max_bytes):
@@ -293,6 +357,7 @@ class DataServer:
         self.key, self.clock, self.verbose = key or "", clock, verbose
         self.bot = (bot or "tanalyticbot").strip().lstrip("@")
         self.keystore = KeyStore(keys_db, clock) if keys_db else None
+        self.notifier = Notifier(self.keystore, clock) if self.keystore else None
         self.allowed = dict(ALLOWED_HOSTS)
         for h in extra_allow:                       # для тестов: "127.0.0.1:PORT"
             self.allowed[h] = None
@@ -487,6 +552,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "expires": info["expires"] if info else None,
                                     "username": info["username"] if info else "", "plan": info["plan"] if info else "",
                                     "bot": app.bot})
+        if u.path == "/v1/notify":
+            return self._notify(client, info, body)
         if u.path == "/v1/stats":
             return self._send(200, app.stats())
         if u.path == "/v1/fetch":
@@ -505,6 +572,25 @@ class Handler(BaseHTTPRequestHandler):
             extra = [("X-Cache", r.xcache), ("X-Age", str(r.age))] + [("X-Set-Cookie", c) for c in r.cookies]
             return self._send(r.status, r.body, r.ctype, extra)
         self._send(404, {"error": "not found"})
+
+    def _notify(self, client, info, body):
+        if self.command != "POST":
+            return self._send(405, {"error": "method not allowed"}, extra=[("Allow", "POST")])
+        if not self.app.notifier or not info:
+            return self._send(403, {"error": "уведомления доступны только по ключу из бота"})
+        try:
+            text = json.loads(body.decode("utf-8")).get("text")
+        except (ValueError, AttributeError, UnicodeDecodeError):
+            text = None
+        if not isinstance(text, str) or not text.strip():
+            return self._send(400, {"error": "empty_text"})
+        if len(text) > NOTIFY_MAX_CHARS:
+            return self._send(400, {"error": "text_too_long", "max": NOTIFY_MAX_CHARS})
+        try:
+            qid = self.app.notifier.enqueue(info["tg_id"], text)
+        except NotifyError as e:
+            return self._send(e.code, {"ok": False, "error": e.error})
+        self._send(200, {"ok": True, "queued": qid})
 
     def do_GET(self):
         self._handle()

@@ -17,6 +17,4 @@
 .wt-nh{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .wt-nt{margin-top:6px;white-space:pre-wrap;font-size:13.5px;color:var(--tx2)}
 .wt-due{color:var(--s4)}
-.tg-steps{margin:0;padding-left:20px;display:grid;gap:6px;font-size:13px;color:var(--tx2)}
-.tg-steps code{background:var(--card2);padding:1px 6px;border-radius:6px;font-size:12px}
 [data-theme=light] .wt-s,[data-theme=light] .wt-note-i{background:#f0f2f6}

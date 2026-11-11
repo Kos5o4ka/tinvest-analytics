@@ -3442,7 +3442,7 @@ def warmup_start():
 # (нет связи, таймаут, 5xx, 401/403) запрос выполняется напрямую, а сервер на 5 минут считается недоступным.
 # Сервер по умолчанию — DS_DEFAULT; он требует личный ключ из Telegram-бота (24 часа), см. «вход по ключу» ниже
 # (/api/auth/*). «off» в настройках или в TINVEST_DATA_SERVER отключает сервер совсем (запросы идут напрямую).
-# API Т-Инвестиций и Telegram сюда НЕ входят: они всегда идут напрямую, токен на сервер данных не передаётся.
+# API Т-Инвестиций сюда НЕ входит: он всегда идёт напрямую, токен на сервер данных не передаётся. Уведомления Telegram — отдельный вызов POST /v1/notify (13j_watch.py).
 
 EXT_UA = {"User-Agent": "Mozilla/5.0 (compatible; tinvest-analytics)"}
 _ext_ctx = []
@@ -9543,12 +9543,13 @@ def _api_events_ics(cfg, acc, q, force):
 API_GET["/api/events"] = _api_events
 API_GET["/api/events.ics"] = _api_events_ics
 # ═══════════════════════════════ список наблюдения, заметки, уведомления в Telegram ═══════════════════════════════
-# Список наблюдения и дневник хранятся только в локальной базе. Telegram: личный бот пользователя; наружу (на серверы
-# Telegram) уходят только тексты уведомлений. Токен бота — секрет (SECRET_KEYS), в журнал и в ответы API не попадает.
+# Список наблюдения и дневник хранятся только в локальной базе. Уведомления в Telegram идут через сервер данных
+# (POST /v1/notify с ключом из бота) и общий бот: наружу уходят только тексты уведомлений, токен Т-Инвестиций — никогда.
+# Прежний «личный бот» (tg_token, tg_chat) удалён; старые значения стираются из настроек при запуске.
 
 WATCH_KEY, NOTES_KEY, TG_SENT_KEY, TG_STATE_KEY = "watch_v1", "notes_v1", "tg_sent_v1", "tg_state_v1"
-TG_DEFAULTS = {"tg_chat": "", "tg_on_mon": True, "tg_on_watch": True, "tg_pay_days": 0, "tg_digest": False, "tg_digest_time": "10:00"}
-SECRET_KEYS.add("tg_token")
+TG_DEFAULTS = {"tg_enabled": False, "tg_on_mon": True, "tg_on_watch": True, "tg_pay_days": 0, "tg_digest": False, "tg_digest_time": "10:00"}
+TG_LEGACY_KEYS = ("tg_token", "tg_chat")
 _watch_lock = threading.Lock()
 _tg_lock = threading.Lock()
 
@@ -9774,45 +9775,33 @@ API_POST["/api/notes"] = notes_post
 
 # ═══════════════════════════ Telegram ═══════════════════════════
 
-def _tg_base():
-    return (os.environ.get("TINVEST_TG_API") or "https://api.telegram.org").rstrip("/")
-
-
-def _tg_scrub(msg, token):
-    msg = str(msg)
-    if token:
-        msg = msg.replace(token, "***")
-    return re.sub(r"bot\d+:[A-Za-z0-9_\-]+", "bot***", msg)[:200]
-
-
-def tg_call(token, method, params=None, timeout=15):
-    """Вызов Bot API. Любые ошибки превращаются в ApiError без токена в тексте."""
-    if not token:
-        raise ApiError("Токен бота не задан.", 400)
-    url = "%s/bot%s/%s" % (_tg_base(), token, method)
-    data = json.dumps(params or {}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    ctx = None
-    if url.startswith("https://"):
-        import ssl
-        ctx = ssl.create_default_context()
+def _tg_cleanup():
+    """Одноразово стирает значения прежнего личного бота (токен, chat id) из файла настроек."""
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-            j = json.loads(r.read().decode("utf-8", "replace"))
+        cfg = load_config()
+        if any(k in cfg for k in TG_LEGACY_KEYS):
+            for k in TG_LEGACY_KEYS:
+                cfg.pop(k, None)
+            save_config(cfg)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def tg_post_notify(srv, key, text, timeout=15):
+    """POST {srv}/v1/notify -> (код, dict). Бросает исключение при сетевой ошибке."""
+    req = urllib.request.Request(srv.rstrip("/") + "/v1/notify", data=json.dumps({"text": text}).encode("utf-8"),
+                                 headers={"Content-Type": "application/json", "X-Client-Key": key,
+                                          "User-Agent": EXT_UA["User-Agent"]}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+            code, raw = r.status, r.read()
     except urllib.error.HTTPError as e:
-        try:
-            j = json.loads(e.read().decode("utf-8", "replace"))
-        except Exception:  # noqa: BLE001
-            j = {}
-        if e.code in (401, 404):
-            raise ApiError("Telegram не принял токен бота. Проверьте, что он скопирован целиком.", 400)
-        raise ApiError("Telegram ответил ошибкой: %s" % _tg_scrub(j.get("description") or e.code, token), 502)
-    except Exception as e:  # noqa: BLE001
-        raise ApiError("Не удалось связаться с Telegram (%s). Если api.telegram.org недоступен из вашей сети, понадобится VPN или прокси."
-                       % _tg_scrub(getattr(e, "reason", e), token), 502)
-    if not j.get("ok"):
-        raise ApiError("Telegram: %s" % _tg_scrub(j.get("description") or "ошибка", token), 502)
-    return j.get("result")
+        code, raw = e.code, e.read()
+    try:
+        j = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        j = None
+    return code, (j if isinstance(j, dict) else {})
 
 
 def _tg_esc(s):
@@ -9823,11 +9812,30 @@ TG_DISCLAIMER = "\n\n<i>Не является ИИР.</i>"
 
 
 def tg_send(cfg, text):
-    chat = str(cfg.get("tg_chat") or "").strip()
-    if not chat:
-        raise ApiError("Не указан chat id.", 400)
-    return tg_call(cfg.get("tg_token"), "sendMessage", {"chat_id": chat, "text": text[:3970] + TG_DISCLAIMER, "parse_mode": "HTML",
-                                                         "disable_web_page_preview": True})
+    """Ставит сообщение в очередь бота через сервер данных. Ошибки — ApiError с понятным текстом."""
+    srv, key = ds_conf()
+    if not srv:
+        raise ApiError("Уведомления работают через сервер данных, а он выключен («off»). Включите сервер данных в настройках.", 400)
+    if not key:
+        raise ApiError("Войдите по ключу из бота.", 400)
+    if len(text) > 3400:
+        text = text[:3400].rsplit("\n", 1)[0] if "\n" in text[:3400] else text[:3400]
+    try:
+        code, j = tg_post_notify(srv, key, text + TG_DISCLAIMER)
+    except Exception:  # noqa: BLE001
+        raise ApiError("Сервер недоступен.", 502)
+    if code == 200 and j.get("ok"):
+        return j.get("queued")
+    err = str(j.get("error") or "")
+    if code == 409 or err == "notify_off":
+        raise ApiError("Уведомления выключены в боте: отправьте ему /notify_on.", 409)
+    if code == 429:
+        raise ApiError("Слишком много сообщений, попробуйте позже.", 429)
+    if code == 401:
+        raise ApiError("Войдите по ключу из бота.", 400)
+    if code == 403:
+        raise ApiError("Уведомления доступны только по ключу из бота. Войдите по ключу.", 400)
+    raise ApiError("Сервер недоступен." if code >= 500 or code == 404 else "Не удалось отправить уведомление (код %s)." % code, 502)
 
 
 def tg_public(cfg):
@@ -9836,19 +9844,7 @@ def tg_public(cfg):
 
 def tg_save(cfg, body):
     cfg = load_config()
-    if body.get("token"):
-        tok = "".join(str(body["token"]).split())
-        if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_\-]{20,}", tok):
-            raise ApiError("Токен бота выглядит неверно: он должен быть вида 123456789:AAH… (его выдаёт @BotFather).", 400)
-        cfg["tg_token"] = tok
-    if body.get("clear_token"):
-        cfg["tg_token"] = ""
-    if "chat" in body:
-        c = str(body["chat"]).strip()
-        if c and not re.fullmatch(r"-?\d{1,20}|@[A-Za-z0-9_]{3,64}", c):
-            raise ApiError("Chat id — это число (например 123456789). Нажмите «Найти мой chat id».", 400)
-        cfg["tg_chat"] = c
-    for k in ("tg_on_mon", "tg_on_watch", "tg_digest"):
+    for k in ("tg_enabled", "tg_on_mon", "tg_on_watch", "tg_digest"):
         if k in body:
             cfg[k] = bool(body[k])
     if "tg_pay_days" in body:
@@ -9859,40 +9855,31 @@ def tg_save(cfg, body):
         if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t):
             raise ApiError("Время сводки — в формате ЧЧ:ММ, например 10:00.", 400)
         cfg["tg_digest_time"] = t
+    for k in TG_LEGACY_KEYS:
+        cfg.pop(k, None)
     save_config(cfg)
-    return {"ok": True, "token_set": bool(cfg.get("tg_token")), "settings": tg_public(cfg)}
+    return {"ok": True, "settings": tg_public(cfg)}
 
 
-def tg_find_chat(cfg, body):
-    cfg = load_config()
-    ups = tg_call(cfg.get("tg_token"), "getUpdates", {"limit": 50, "timeout": 0}) or []
-    best = None
-    for u in ups:
-        m = u.get("message") or u.get("edited_message") or u.get("channel_post")
-        if m and m.get("chat") and m["chat"].get("id") is not None:
-            if m["chat"].get("type", "private") == "private" or best is None:
-                best = m["chat"]
-    if not best:
-        raise ApiError("Сообщений боту пока нет. Откройте своего бота в Telegram, нажмите «Запустить» (/start) или напишите ему любое сообщение и повторите.", 404)
-    name = " ".join(x for x in (best.get("first_name"), best.get("last_name")) if x) or best.get("title") or best.get("username") or ""
-    cfg["tg_chat"] = str(best["id"])
-    save_config(cfg)
-    return {"ok": True, "chat": str(best["id"]), "name": name}
+def tg_info(cfg, acc, q, force):
+    """Для карточки настроек: имя общего бота, включён ли сервер данных, выполнен ли вход по ключу."""
+    srv, key = ds_conf()
+    st = auth_status() if srv else {"state": "off", "bot": _auth["bot"]}
+    return {"bot": st.get("bot") or DS_BOT_DEFAULT, "server": bool(srv), "state": st.get("state"), "key_set": bool(key)}
 
 
 def tg_test(cfg, body):
-    cfg = load_config()
-    tg_send(cfg, "✅ <b>T-Invest Analytics</b>: тестовое сообщение. Уведомления подключены.")
+    tg_send(load_config(), "✅ <b>T-Invest Analytics</b>: тестовое сообщение. Уведомления подключены.")
     return {"ok": True}
 
 
 def tg_run_now(cfg, body):
-    n = tg_tick(force_digest=bool(body.get("digest")))
+    n = tg_tick(force_digest=bool(body.get("digest")), manual=True)
     return {"ok": True, "sent": n}
 
 
 API_POST["/api/tg/save"] = tg_save
-API_POST["/api/tg/find_chat"] = tg_find_chat
+API_GET["/api/tg/info"] = tg_info
 API_POST["/api/tg/test"] = tg_test
 API_POST["/api/tg/run"] = tg_run_now
 
@@ -9989,13 +9976,15 @@ def tg_digest_text(cfg):
     return "\n\n".join(parts)
 
 
-def tg_tick(force_digest=False):
+def tg_tick(force_digest=False, manual=False):
     """Одна проверка: новые тревоги, выплаты, ежедневная сводка. Возвращает число отправленных пунктов."""
     if not _tg_lock.acquire(False):
         return 0
     try:
         cfg = load_config()
-        if not cfg.get("tg_token") or not str(cfg.get("tg_chat") or "").strip():
+        if not manual and not force_digest and not cfg.get("tg_enabled"):
+            return 0
+        if not all(ds_conf()):                  # нужен сервер данных и вход по ключу из бота
             return 0
         st = store()
         now = time.time()
@@ -10062,6 +10051,7 @@ def _tg_loop():
 
 
 def tg_start():
+    _tg_cleanup()
     threading.Thread(target=_tg_loop, daemon=True, name="tg-notify").start()
 
 
@@ -12853,8 +12843,6 @@ tr.scr-low td{opacity:.5}
 .wt-nh{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .wt-nt{margin-top:6px;white-space:pre-wrap;font-size:13.5px;color:var(--tx2)}
 .wt-due{color:var(--s4)}
-.tg-steps{margin:0;padding-left:20px;display:grid;gap:6px;font-size:13px;color:var(--tx2)}
-.tg-steps code{background:var(--card2);padding:1px 6px;border-radius:6px;font-size:12px}
 [data-theme=light] .wt-s,[data-theme=light] .wt-note-i{background:#f0f2f6}
 /* налоги */
 .tx .tx-tabs{max-width:100%}
@@ -14647,7 +14635,7 @@ const ROADMAP=[
  ['done','Точная история стоимости','Без ложных скачков: фьючерсы, сплиты, дубли бумаг, амортизация'],
  ['done','Ребалансировка с учётом налогов','Сначала продаются лоты с убытком или с наступившей ЛДВ'],
  ['done','Эмитенты','Отчётность ФНС, скоринг, сравнение с рынком, кредитная история'],
- ['done','Наблюдение и Telegram','Список наблюдения с тревогами и целями, дневник, уведомления в личный бот'],
+ ['done','Наблюдение и Telegram','Список наблюдения с тревогами и целями, дневник, уведомления в Telegram'],
  ['done','Календарь событий','Заседания ЦБ, выплаты, оферты, размещения; экспорт в календарь'],
  ['done','Первичка против вторички','Как торгуются новые выпуски после размещения'],
  ['done','История спредов и кривой КБД','Сравнение кривой с прошлыми датами, спреды по рейтингам во времени'],
@@ -16388,38 +16376,36 @@ document.addEventListener('click',async e=>{
   try{await watchToggle(b.dataset.wstar)}catch(er){alert(er.message)}finally{b.disabled=false}
 },true);
 
-/* ── Telegram: карточка в «Настройках» ── */
+/* ── Telegram: карточка в «Настройках» (уведомления идут через сервер данных и общего бота) ── */
 function setTgHtml(c){
-  const set=c.secret_set&&c.secret_set.tg_token,on=(k,d)=>c[k]==null?d:!!c[k];
-  return`<div class="card" id="tg-card"><h2>Уведомления в Telegram<span class="sp">по желанию, через ваш личный бот</span></h2>
+  const on=(k,d)=>c[k]==null?d:!!c[k];
+  return`<div class="card" id="tg-card"><h2>Уведомления в Telegram<span class="sp">по желанию</span></h2>
     <div style="display:grid;gap:16px">
-    <ol class="tg-steps"><li>В Telegram откройте <b>@BotFather</b>, отправьте <code>/newbot</code> и придумайте имя бота. BotFather пришлёт токен вида <code>123456789:AAH…</code></li>
-      <li>Вставьте токен ниже и нажмите «Сохранить».</li><li>Откройте своего бота в Telegram и отправьте ему <code>/start</code>.</li>
-      <li>Нажмите «Найти мой chat id», затем «Отправить тестовое сообщение».</li></ol>
-    <label class="field"><span>Токен бота ${set?`<span class="pos">· сохранён. Оставьте пустым, чтобы не менять</span>`:''}</span>
-      <input class="in" type="password" id="tg-tok" placeholder="123456789:AAH…" autocomplete="off" spellcheck="false"></label>
-    <div class="row"><label class="field" style="max-width:260px"><span>Chat id</span><input class="in num" id="tg-chat" value="${esc(c.tg_chat||'')}" placeholder="например, 123456789" inputmode="numeric"></label>
-      <button class="btn ghost" id="tg-find" style="align-self:flex-end">Найти мой chat id</button></div>
+    <p class="note" style="margin:0">Уведомления приходят от <b id="tg-bot">@tanalyticbot</b> — того же бота, который выдаёт ключ входа. Ничего настраивать не нужно.</p>
+    <p class="note" id="tg-state" style="margin:0"></p>
+    <label class="sw"><input type="checkbox" id="tg-en" ${on('tg_enabled',false)?'checked':''}><i></i><div><b>Присылать уведомления</b><small>Главный выключатель; отключить можно и в самом боте командой <code>/notify_off</code></small></div></label>
     <label class="sw"><input type="checkbox" id="tg-mon" ${on('tg_on_mon',true)?'checked':''}><i></i><div><b>Тревоги мониторинга</b><small>Только высокой важности: дефолт, понижение рейтинга, сильное падение цены</small></div></label>
     <label class="sw"><input type="checkbox" id="tg-wat" ${on('tg_on_watch',true)?'checked':''}><i></i><div><b>Наблюдение и цели</b><small>Тревоги по списку наблюдения, достигнутые цели и напоминания из дневника</small></div></label>
     <div class="row"><label class="field" style="max-width:300px"><span>Ближайшие выплаты: за сколько дней сообщать (0 — выключить)</span><input class="in num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}"></label></div>
     <div class="row"><label class="sw"><input type="checkbox" id="tg-dg" ${on('tg_digest',false)?'checked':''}><i></i><div><b>Ежедневная сводка</b><small>Портфель, выплаты на неделю, тревоги</small></div></label>
       <label class="field" style="max-width:130px"><span>Время</span><input class="in num" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}"></label></div>
-    <div class="row"><button class="btn" id="tg-save">Сохранить</button><button class="btn ghost" id="tg-test">Отправить тестовое сообщение</button><button class="btn ghost" id="tg-run" title="Проверить тревоги и отправить новые прямо сейчас">Проверить сейчас</button>
-      ${set?'<button class="btn danger" id="tg-clr">Удалить токен бота</button>':''}</div>
-    <p class="note"><b>Что нужно знать.</b> Сообщения проходят через серверы Telegram и содержат названия бумаг и суммы — отправляйте их только в свой личный чат. Токен бота хранится только на этом компьютере (в файле настроек с ограниченным доступом) и в резервную копию не входит. Уведомления приходят, <b>только пока программа запущена</b>; проверка выполняется раз в 10–15 минут, одна и та же тревога повторно не отправляется. Если Telegram не открывается из вашей сети, понадобится VPN или прокси.</p></div></div>`;
+    <div class="row"><button class="btn" id="tg-save">Сохранить</button><button class="btn ghost" id="tg-test">Отправить тестовое сообщение</button><button class="btn ghost" id="tg-run" title="Проверить тревоги и отправить новые прямо сейчас">Проверить сейчас</button></div>
+    <p class="note"><b>Что нужно знать.</b> Текст уведомлений (названия бумаг и суммы) проходит через сервер данных и бот @tanalyticbot и удаляется сразу после отправки; токен Т-Инвестиций никуда не передаётся. Уведомления приходят, <b>только пока программа запущена</b>; проверка выполняется раз в 10–15 минут, одна и та же тревога повторно не отправляется. Нужен вход по ключу из бота (раздел «Сервер данных»).</p></div></div>`;
 }
 function bindSetTg(c,msg){
   const g=id=>document.getElementById(id);if(!g('tg-card'))return;
-  const body=()=>({token:g('tg-tok').value,chat:g('tg-chat').value,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
+  const body=()=>({tg_enabled:g('tg-en').checked,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
     tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00'});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
-  const save=async()=>{const r=await post('/api/tg/save',body());g('tg-tok').value='';c.secret_set=Object.assign({},c.secret_set,{tg_token:!!r.token_set});Object.assign(c,r.settings);return r};
-  g('tg-save').onclick=e=>busy(e.currentTarget,async()=>{await save();msg('Настройки Telegram сохранены.',1);if(!document.getElementById('tg-clr')&&c.secret_set.tg_token)renderSettings()});
-  g('tg-find').onclick=e=>busy(e.currentTarget,async()=>{await save();const r=await post('/api/tg/find_chat');g('tg-chat').value=r.chat;c.tg_chat=r.chat;msg('Chat id найден: '+r.chat+(r.name?' ('+r.name+')':'')+'. Теперь отправьте тестовое сообщение.',1)});
+  const save=async()=>{const r=await post('/api/tg/save',body());Object.assign(c,r.settings);return r};
+  api('/api/tg/info').then(i=>{
+    g('tg-bot').textContent='@'+String(i.bot||'tanalyticbot').replace(/^@/,'');
+    g('tg-state').textContent=!i.server?'Сервер данных выключен («off»): уведомления работают через него. Включите сервер данных в настройках.':
+      i.state==='need_login'?'Войдите по ключу из бота — иначе уведомления отправить нельзя.':i.state==='offline'?'Сервер недоступен.':'';
+  }).catch(()=>{});
+  g('tg-save').onclick=e=>busy(e.currentTarget,async()=>{await save();msg('Настройки уведомлений сохранены.',1)});
   g('tg-test').onclick=e=>busy(e.currentTarget,async()=>{await save();await post('/api/tg/test');msg('Тестовое сообщение отправлено — проверьте Telegram.',1)});
   g('tg-run').onclick=e=>busy(e.currentTarget,async()=>{await save();const r=await post('/api/tg/run');msg(r.sent?'Отправлено новых пунктов: '+r.sent+'.':'Новых тревог для отправки нет.',1)});
-  const cl=g('tg-clr');if(cl)cl.onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить токен бота из настроек?'))return;await post('/api/tg/save',{clear_token:true});c.secret_set=Object.assign({},c.secret_set,{tg_token:false});renderSettings()});
 }
 /* ── Зашифрованная резервная копия и экспорт ── */
 /* постоянная плашка: копия принята, но применится только при следующем запуске */

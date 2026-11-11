@@ -165,36 +165,34 @@ document.addEventListener('click',async e=>{
   try{await watchToggle(b.dataset.wstar)}catch(er){alert(er.message)}finally{b.disabled=false}
 },true);
 
-/* ── Telegram: карточка в «Настройках» ── */
+/* ── Telegram: карточка в «Настройках» (уведомления идут через сервер данных и общего бота) ── */
 function setTgHtml(c){
-  const set=c.secret_set&&c.secret_set.tg_token,on=(k,d)=>c[k]==null?d:!!c[k];
-  return`<div class="card" id="tg-card"><h2>Уведомления в Telegram<span class="sp">по желанию, через ваш личный бот</span></h2>
+  const on=(k,d)=>c[k]==null?d:!!c[k];
+  return`<div class="card" id="tg-card"><h2>Уведомления в Telegram<span class="sp">по желанию</span></h2>
     <div style="display:grid;gap:16px">
-    <ol class="tg-steps"><li>В Telegram откройте <b>@BotFather</b>, отправьте <code>/newbot</code> и придумайте имя бота. BotFather пришлёт токен вида <code>123456789:AAH…</code></li>
-      <li>Вставьте токен ниже и нажмите «Сохранить».</li><li>Откройте своего бота в Telegram и отправьте ему <code>/start</code>.</li>
-      <li>Нажмите «Найти мой chat id», затем «Отправить тестовое сообщение».</li></ol>
-    <label class="field"><span>Токен бота ${set?`<span class="pos">· сохранён. Оставьте пустым, чтобы не менять</span>`:''}</span>
-      <input class="in" type="password" id="tg-tok" placeholder="123456789:AAH…" autocomplete="off" spellcheck="false"></label>
-    <div class="row"><label class="field" style="max-width:260px"><span>Chat id</span><input class="in num" id="tg-chat" value="${esc(c.tg_chat||'')}" placeholder="например, 123456789" inputmode="numeric"></label>
-      <button class="btn ghost" id="tg-find" style="align-self:flex-end">Найти мой chat id</button></div>
+    <p class="note" style="margin:0">Уведомления приходят от <b id="tg-bot">@tanalyticbot</b> — того же бота, который выдаёт ключ входа. Ничего настраивать не нужно.</p>
+    <p class="note" id="tg-state" style="margin:0"></p>
+    <label class="sw"><input type="checkbox" id="tg-en" ${on('tg_enabled',false)?'checked':''}><i></i><div><b>Присылать уведомления</b><small>Главный выключатель; отключить можно и в самом боте командой <code>/notify_off</code></small></div></label>
     <label class="sw"><input type="checkbox" id="tg-mon" ${on('tg_on_mon',true)?'checked':''}><i></i><div><b>Тревоги мониторинга</b><small>Только высокой важности: дефолт, понижение рейтинга, сильное падение цены</small></div></label>
     <label class="sw"><input type="checkbox" id="tg-wat" ${on('tg_on_watch',true)?'checked':''}><i></i><div><b>Наблюдение и цели</b><small>Тревоги по списку наблюдения, достигнутые цели и напоминания из дневника</small></div></label>
     <div class="row"><label class="field" style="max-width:300px"><span>Ближайшие выплаты: за сколько дней сообщать (0 — выключить)</span><input class="in num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}"></label></div>
     <div class="row"><label class="sw"><input type="checkbox" id="tg-dg" ${on('tg_digest',false)?'checked':''}><i></i><div><b>Ежедневная сводка</b><small>Портфель, выплаты на неделю, тревоги</small></div></label>
       <label class="field" style="max-width:130px"><span>Время</span><input class="in num" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}"></label></div>
-    <div class="row"><button class="btn" id="tg-save">Сохранить</button><button class="btn ghost" id="tg-test">Отправить тестовое сообщение</button><button class="btn ghost" id="tg-run" title="Проверить тревоги и отправить новые прямо сейчас">Проверить сейчас</button>
-      ${set?'<button class="btn danger" id="tg-clr">Удалить токен бота</button>':''}</div>
-    <p class="note"><b>Что нужно знать.</b> Сообщения проходят через серверы Telegram и содержат названия бумаг и суммы — отправляйте их только в свой личный чат. Токен бота хранится только на этом компьютере (в файле настроек с ограниченным доступом) и в резервную копию не входит. Уведомления приходят, <b>только пока программа запущена</b>; проверка выполняется раз в 10–15 минут, одна и та же тревога повторно не отправляется. Если Telegram не открывается из вашей сети, понадобится VPN или прокси.</p></div></div>`;
+    <div class="row"><button class="btn" id="tg-save">Сохранить</button><button class="btn ghost" id="tg-test">Отправить тестовое сообщение</button><button class="btn ghost" id="tg-run" title="Проверить тревоги и отправить новые прямо сейчас">Проверить сейчас</button></div>
+    <p class="note"><b>Что нужно знать.</b> Текст уведомлений (названия бумаг и суммы) проходит через сервер данных и бот @tanalyticbot и удаляется сразу после отправки; токен Т-Инвестиций никуда не передаётся. Уведомления приходят, <b>только пока программа запущена</b>; проверка выполняется раз в 10–15 минут, одна и та же тревога повторно не отправляется. Нужен вход по ключу из бота (раздел «Сервер данных»).</p></div></div>`;
 }
 function bindSetTg(c,msg){
   const g=id=>document.getElementById(id);if(!g('tg-card'))return;
-  const body=()=>({token:g('tg-tok').value,chat:g('tg-chat').value,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
+  const body=()=>({tg_enabled:g('tg-en').checked,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
     tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00'});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
-  const save=async()=>{const r=await post('/api/tg/save',body());g('tg-tok').value='';c.secret_set=Object.assign({},c.secret_set,{tg_token:!!r.token_set});Object.assign(c,r.settings);return r};
-  g('tg-save').onclick=e=>busy(e.currentTarget,async()=>{await save();msg('Настройки Telegram сохранены.',1);if(!document.getElementById('tg-clr')&&c.secret_set.tg_token)renderSettings()});
-  g('tg-find').onclick=e=>busy(e.currentTarget,async()=>{await save();const r=await post('/api/tg/find_chat');g('tg-chat').value=r.chat;c.tg_chat=r.chat;msg('Chat id найден: '+r.chat+(r.name?' ('+r.name+')':'')+'. Теперь отправьте тестовое сообщение.',1)});
+  const save=async()=>{const r=await post('/api/tg/save',body());Object.assign(c,r.settings);return r};
+  api('/api/tg/info').then(i=>{
+    g('tg-bot').textContent='@'+String(i.bot||'tanalyticbot').replace(/^@/,'');
+    g('tg-state').textContent=!i.server?'Сервер данных выключен («off»): уведомления работают через него. Включите сервер данных в настройках.':
+      i.state==='need_login'?'Войдите по ключу из бота — иначе уведомления отправить нельзя.':i.state==='offline'?'Сервер недоступен.':'';
+  }).catch(()=>{});
+  g('tg-save').onclick=e=>busy(e.currentTarget,async()=>{await save();msg('Настройки уведомлений сохранены.',1)});
   g('tg-test').onclick=e=>busy(e.currentTarget,async()=>{await save();await post('/api/tg/test');msg('Тестовое сообщение отправлено — проверьте Telegram.',1)});
   g('tg-run').onclick=e=>busy(e.currentTarget,async()=>{await save();const r=await post('/api/tg/run');msg(r.sent?'Отправлено новых пунктов: '+r.sent+'.':'Новых тревог для отправки нет.',1)});
-  const cl=g('tg-clr');if(cl)cl.onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить токен бота из настроек?'))return;await post('/api/tg/save',{clear_token:true});c.secret_set=Object.assign({},c.secret_set,{tg_token:false});renderSettings()});
 }

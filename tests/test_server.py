@@ -375,5 +375,116 @@ class TgKeyTests(unittest.TestCase):
             f.close()
 
 
+class NotifyTests(unittest.TestCase):
+    NOW = 1_000_000.0
+    KEY = "TIA-AAAA-AAAA-AAAA"
+
+    def setUp(self):
+        self.dbp = os.path.join(tempfile.mkdtemp(prefix="tnot_"), "bot.sqlite")
+        self.db = make_keys_db(self.dbp)
+        self.db.execute("INSERT INTO users(tg_id, username) VALUES (1,'alice'),(2,'bob')")
+        for k, tg in ((self.KEY, 1), ("TIA-BBBB-BBBB-BBBB", 2)):
+            self.db.execute("INSERT INTO keys(key_hash, tg_id, created, expires) VALUES (?,?,?,?)",
+                            (ts.key_hash(k), tg, self.NOW - 100, self.NOW + 10 * 86400))
+        self.db.commit()
+        self.f = Fx(keys_db=self.dbp)
+
+    def tearDown(self):
+        self.f.close()
+        self.db.close()
+
+    def post(self, body, key=KEY, raw=None, path="/v1/notify"):
+        hd = {"Content-Type": "application/json"}
+        if key is not None:
+            hd["X-Client-Key"] = key
+        data = raw if raw is not None else json.dumps(body).encode("utf-8")
+        st, b, _ = self.f.call(None, data=data, headers=hd, path=path)
+        return st, json.loads(b)
+
+    def rows(self):
+        try:
+            return self.db.execute("SELECT tg_id, text, tries FROM outbox ORDER BY id").fetchall()
+        except sqlite3.OperationalError:          # таблицы нет — ничего не ставилось в очередь
+            return []
+
+    def test_queue_even_if_bot_not_migrated(self):
+        st, j = self.post({"text": "<b>Привет</b>"})
+        self.assertEqual((st, j["ok"]), (200, True))
+        self.assertEqual(self.rows(), [(1, "<b>Привет</b>", 0)])
+        self.assertEqual(self.db.execute("SELECT id FROM outbox").fetchone()[0], j["queued"])
+
+    def test_notify_flag(self):
+        self.db.execute("ALTER TABLE users ADD COLUMN notify INTEGER NOT NULL DEFAULT 1")
+        self.db.execute("UPDATE users SET notify=0 WHERE tg_id=1")
+        self.db.commit()
+        self.assertEqual(self.post({"text": "x"}), (409, {"ok": False, "error": "notify_off"}))
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.post({"text": "x"}, key="TIA-BBBB-BBBB-BBBB")[0], 200)      # у другого включено
+        self.assertEqual(self.rows()[0][0], 2)
+        self.db.execute("UPDATE users SET notify=1 WHERE tg_id=1")
+        self.db.commit()
+        self.assertEqual(self.post({"text": "x"})[0], 200)
+
+    def test_validation(self):
+        self.assertEqual(self.post({"text": ""})[0], 400)
+        self.assertEqual(self.post({"text": "  \n"})[0], 400)
+        self.assertEqual(self.post({"text": 5})[0], 400)
+        self.assertEqual(self.post(None, raw=b"not json")[0], 400)
+        self.assertEqual(self.post({})[0], 400)
+        self.assertEqual(self.post({"text": "я" * 3501})[0], 400)
+        self.assertEqual(self.post({"text": "я" * 3500})[0], 200)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_get_not_allowed(self):
+        st, b, _ = self.f.call(None, headers={"X-Client-Key": self.KEY}, path="/v1/notify")
+        self.assertEqual(st, 405)
+
+    def test_auth_required(self):
+        self.assertEqual(self.post({"text": "x"}, key=None)[0], 401)
+        self.assertEqual(self.post({"text": "x"}, key="TIA-ZZZZ-ZZZZ-ZZZZ")[0], 401)
+        self.assertEqual(self.rows(), [])
+
+    def test_limits_hour_and_day(self):
+        for i in range(30):
+            self.assertEqual(self.post({"text": "m%d" % i})[0], 200, i)
+        self.assertEqual(self.post({"text": "x"}), (429, {"ok": False, "error": "rate_limit"}))
+        self.assertEqual(self.post({"text": "x"}, key="TIA-BBBB-BBBB-BBBB")[0], 200)     # лимит на пользователя
+        self.f.now[0] = self.NOW + 3601                                                 # через час снова можно
+        self.assertEqual(self.post({"text": "x"})[0], 200)
+
+    def test_day_limit(self):
+        n = 0
+        for h in range(9):
+            self.f.now[0] = self.NOW + h * 3601 + 1
+            for i in range(30):
+                st, j = self.post({"text": "m"})
+                if st == 429:
+                    break
+                n += 1
+        self.assertEqual(n, 200)
+        self.assertEqual(self.post({"text": "m"})[0], 429)
+        self.f.now[0] = self.NOW + 86400 + 9 * 3601
+        self.assertEqual(self.post({"text": "m"})[0], 200)
+
+    def test_shared_key_and_anon_forbidden(self):
+        self.f.close()
+        self.f = Fx(key="s3cret", keys_db=self.dbp)
+        st, j = self.post({"text": "x"}, key="s3cret")
+        self.assertEqual((st, j["error"]), (403, "уведомления доступны только по ключу из бота"))
+        self.f.close()
+        self.f = Fx()
+        self.assertEqual(self.post({"text": "x"}, key=None)[0], 403)
+        self.assertEqual(self.rows(), [])
+
+    def test_text_not_in_stderr(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        self.f.app.verbose = True
+        with contextlib.redirect_stderr(buf):
+            self.post({"text": "СЕКРЕТНЫЙ-ТЕКСТ"})
+        self.assertNotIn("СЕКРЕТНЫЙ", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
