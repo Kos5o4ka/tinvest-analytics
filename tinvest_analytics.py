@@ -39,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from html.parser import HTMLParser
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
@@ -12290,6 +12291,17 @@ def open_window(url):
     return None
 
 
+class LocalHTTPServer(ThreadingHTTPServer):
+    """Сервер только на 127.0.0.1. Стандартный server_bind вызывает socket.getfqdn(): обратный DNS-запрос
+    по адресу машины на macOS идёт через mDNS и вызывает запрос «разрешить находить устройства в локальной сети»,
+    а до ответа на него запуск зависает. Имя хоста серверу не нужно."""
+    daemon_threads = True
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+
 def main():
     cfg = load_config()
     port = int(os.environ.get("TINVEST_PORT") or cfg["port"])
@@ -12298,9 +12310,9 @@ def main():
             port = int(sys.argv[i + 1])
     store()
     try:
-        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        srv = LocalHTTPServer(("127.0.0.1", port), Handler)
     except OSError:
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        srv = LocalHTTPServer(("127.0.0.1", 0), Handler)
     srv.daemon_threads = True
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
     print("%s → %s   (Ctrl+C — выход)\nДанные: %s" % (APP_NAME, url, APP_DIR))
