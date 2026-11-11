@@ -2556,10 +2556,11 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
         closes[u] = dict(series.get(u) or ())
 
     # бумага числится в портфеле с нулевой ценой (ГДР после делистинга и т.п.), а свечи кончились: через месяц после
-    # последней свечи она стоит 0, а не держит последнюю цену вечно
+    # последней свечи она стоит 0, а не держит последнюю цену вечно (только если по операциям она и осталась в позиции:
+    # обменянная на другую бумагу уже списана конвертацией, и «обнуление» дало бы ложный скачок)
     dead_from = {}
     for g in real:
-        if zero_priced and types[g] not in ("bond", "currency") and closes.get(g) and any(i in zero_priced for i in [g] + (members.get(g) or [])):
+        if zero_priced and qty.get(g) and types[g] not in ("bond", "currency") and closes.get(g) and any(i in zero_priced for i in [g] + (members.get(g) or [])):
             dead_from[g] = (datetime.strptime(max(closes[g]), "%Y-%m-%d") + timedelta(days=30)).strftime("%Y-%m-%d")
 
     last_close, fallback, cash, scale = {}, {}, defaultdict(float), {}
