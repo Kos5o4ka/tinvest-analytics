@@ -1,6 +1,6 @@
 /* ── Сравнение с рынком: индексы облигаций, фонды ликвидности и облигационные БПИФ ── */
 S.bn={};S.bnSel=new Set(['LQDT','RUCBTRNS']);S.bnLoad=null;
-const BN_COL={RGBITR:[S2],RUCBTRNS:[S4],RUCBTRBBBNS:[S5],RUCBHYTR:[S8],LQDT:[S3],TMON:[S6],SBMM:[S7],AKMM:[S2,1],SBRB:[S4,1],AKMB:[S5,1],TBRU:[S7,1],RUSFAR:[S6,1]};
+const BN_COL={RGBITR:[S2],RUCBTRNS:[S4],RUCBHYTR:[S8],LQDT:[S3],TMON:[S6],SBMM:[S7],AKMM:[S2,1],SBRB:[S4,1],AKMB:[S5,1],TBRU:[S7,1],RUSFAR:[S6,1]};
 const BN_LC={d1:'#19a070',d5:'#e3a21a',dm:'#e66767',na:'#8a90a0'};
 const bnRub=v=>bad(v)?'—':(v>0?'+':v<0?'−':'')+NF0.format(Math.abs(v))+' ₽';
 const bnPct=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' %';
