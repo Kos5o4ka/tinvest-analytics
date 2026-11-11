@@ -364,5 +364,10 @@ def main():
         pass
     finally:
         srv.server_close()
+    # окно закрыто или Ctrl+C: фоновые расчёты (пулы потоков) прерываем сразу, иначе они падают с трассировкой
+    # «cannot schedule new futures after interpreter shutdown». База SQLite транзакционная, данные не теряются.
+    if not getattr(sys, "frozen", False):        # в собранном приложении выходом управляет лаунчер
+        sys.stdout.flush()
+        os._exit(0)
 
 
