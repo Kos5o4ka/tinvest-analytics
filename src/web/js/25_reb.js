@@ -1,5 +1,31 @@
 /* ── Ребалансировка ── */
-S.reb={contrib:'',buyOnly:true,draft:null};S.payDays=90;
+S.reb={contrib:'',buyOnly:true,draft:null,tax:null};S.payDays=90;
+/* налог при продаже (маршрут /api/tax/reb): сначала продаём бумаги с убытком и с наступившей ЛДВ */
+function rebTaxHtml(act,keys){
+  if(S.reb.buyOnly)return'';
+  const sells=keys.filter(k=>(act[k]||0)<-1&&!['currency','other'].includes(k)).map(k=>k+':'+Math.round(-act[k]));
+  if(!sells.length)return'';
+  const key=S.account+'|'+sells.join(','),t=S.reb.tax;
+  if(!t||t.key!==key){
+    const cur=S.reb.tax={key,data:null,err:0};
+    api('/api/tax/reb?'+new URLSearchParams({account:S.account,sells:sells.join(',')}))
+      .then(j=>{if(S.reb.tax===cur){cur.data=j;if(S.page==='reb')render()}})
+      .catch(e=>{if(S.reb.tax===cur){cur.err=1;if(S.page==='reb')render()}});
+    return`<div class="card">${waitBox('Считаю налог с продаж…')}</div>`;
+  }
+  if(t.err)return'';
+  if(!t.data)return`<div class="card">${waitBox('Считаю налог с продаж…')}</div>`;
+  const it=t.data.items.filter(x=>x.tax_plan!=null);
+  if(!it.length)return'';
+  const tot=it.reduce((a,x)=>a+x.tax_plan,0),nv=it.reduce((a,x)=>a+x.tax_naive,0);
+  const why=w=>w==='убыток'?'<span class="pos">убыток: налог не возникает</span>':w==='есть налог'?'<span class="neg">есть налог</span>':'<span class="pos">ЛДВ: прибыль освобождена</span>';
+  return`<div class="card"><h2>Налог при продаже<span class="sp">оценка НДФЛ за текущий год с учётом уже полученной прибыли</span></h2>
+    <div class="g g4">${kpi('Налог по плану',M(tot,'rub',0),'сначала лоты с убытком и с наступившей ЛДВ',tot>0?'neg':'pos')}${kpi('Если продавать пропорционально',M(nv,'rub',0),'всем бумагам класса поровну')}${kpi('Выгода порядка продаж',M(Math.max(0,nv-tot),'rub',0),'меньше налога',nv>tot?'pos':'')}</div>
+    ${it.map(x=>`<h3 style="margin:14px 0 6px;font-size:13px">${esc(TYPES[x.cls]||x.cls)}: продать на ${M(x.covered,'rub',0)}${x.covered<x.amount-1?` (из ${M(x.amount,'rub',0)} — не хватает бумаг с известной ценой)`:''} · налог ${M(x.tax_plan,'rub',0)}</h3>
+      <div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Продать</th><th>Результат продажи</th><th class="l">Почему</th></tr></thead><tbody>${x.plan.map(p=>`<tr><td class="l"><b>${esc(p.name)}</b><br><small class="mu">${esc(p.ticker)}</small></td><td class="num">${M(p.sell_rub,'rub',0)}<br><small class="mu">${NF0.format(p.qty)} шт.</small></td><td class="num ${cls(p.result)}">${SM(p.result)}</td>
+        <td class="l">${why(p.why)}${p.ldv_soon?'<br><small class="neg">ЛДВ наступит меньше чем через полгода — лучше подождать</small>':''}</td></tr>`).join('')||'<tr><td colspan="4" class="l mu">Нет данных о лотах</td></tr>'}</tbody></table></div>`).join('')}
+    <p class="note">Справочная оценка: порядок бумаг подбирается по ожидаемому налогу, продажа идёт по FIFO внутри каждой бумаги. Брокер как налоговый агент считает сам; это не налоговая консультация.</p></div>`;
+}
 function pReb(){
   const ps=S.data.portfolio.positions,tot=ps.reduce((a,x)=>a+(x.value_rub||0),0);
   if(!(tot>0))return'<div class="card empty">В портфеле нет активов для расчёта</div>';
@@ -32,7 +58,8 @@ function pReb(){
       <label class="sw"><input type="checkbox" id="rb-b" ${buyOnly?'checked':''}><i></i><div><b>Только докупать</b><small>Ничего не продавать, распределить взнос</small></div></label></div>
     <div class="tbl"><table><thead><tr><th class="l">Класс</th><th>Сейчас, ₽</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>Действие</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="row" style="margin-top:14px"><button class="btn" id="rb-s">Сохранить цели</button><button class="btn ghost" id="rb-r">Сбросить</button><span class="reb-sum" id="rb-sum"></span></div></div>
-  <p class="note">Расчёт по классам активов (акции, облигации, фонды, валюта…) на уровне портфеля, без учёта комиссий, налогов и лотности. Это справочный расчёт, а не инвестиционная рекомендация. Цели сохраняются локально.</p>`;
+  ${rebTaxHtml(act,keys)}
+  <p class="note">Расчёт по классам активов (акции, облигации, фонды, валюта…) на уровне портфеля, без учёта комиссий и лотности; налог при продаже оценивается отдельно (в режиме с продажами). Это справочный расчёт, а не инвестиционная рекомендация. Цели сохраняются локально.</p>`;
 }
 function bindReb(){
   const d=S.reb.draft;

@@ -8592,6 +8592,875 @@ def tg_start():
 
 STARTUP_HOOKS.append(tg_start)
 # ═══════════════════════════════ налоги по лотам: ЛДВ, ИИС, перенос убытков, подсказки ═══════════════════════════════
+# Справочный расчёт. Брокер как налоговый агент считает сам; это не налоговая консультация.
+# Лоты покупок по каждой бумаге и счёту, продажи списываются FIFO; комиссии входят в расходы; НКД при покупке/продаже
+# учитывается отдельно (уменьшает/увеличивает купонный доход); частичные погашения (амортизация) уменьшают стоимость лотов.
+
+TAX_LDV_TYPES = ("share", "bond", "etf")
+TAX_SKIP_TYPES = ("currency", "futures", "dfa")
+TAX_LDV_FROM = date(2014, 1, 1)
+TAX_LDV_LIMIT = 3000000.0
+TAX_IIS_LIMIT = 400000.0
+TAX_SETTINGS_KEY = "tax:settings"
+TAX_SPREAD = 0.001
+
+
+def tx_add_years(d, n):
+    try:
+        return d.replace(year=d.year + n)
+    except ValueError:
+        return date(d.year + n, 3, 1)
+
+
+def tx_full_years(d0, d1):
+    y = d1.year - d0.year
+    if (d1.month, d1.day) < (d0.month, d0.day):
+        y -= 1
+    return max(0, y)
+
+
+def tx_ldv_ok(bd, sd):
+    """ЛДВ: куплено с 01.01.2014 и продано строго позже третьей годовщины покупки."""
+    return bd is not None and bd >= TAX_LDV_FROM and sd > tx_add_years(bd, 3)
+
+
+def tx_ndfl(base, year):
+    """(налог, часть по 13 %, часть по 15 %): до 2021 — 13 %; 2021–2024 — 15 % свыше 5 млн; с 2025 — 15 % свыше 2,4 млн."""
+    base = max(0.0, base)
+    if year < 2021:
+        return base * 0.13, base, 0.0
+    thr = 5000000.0 if year < 2025 else 2400000.0
+    lo, hi = min(base, thr), max(0.0, base - thr)
+    return lo * 0.13 + hi * 0.15, lo, hi
+
+
+# ── курсы ЦБ ──
+
+_cbr_mem = {}
+
+
+def tax_cbr_rate(cur, iso):
+    """Курс ЦБ РФ за 1 единицу валюты на дату (ISO). Прошлые даты кэшируются навсегда. None — курс недоступен."""
+    cur = (cur or "").upper()
+    if cur in ("", "RUB"):
+        return 1.0
+    key = "cbr:" + iso
+    tab = _cbr_mem.get(key)
+    if tab is None:
+        try:
+            tab = store().get(key)
+        except Exception:  # noqa: BLE001
+            tab = None
+    if tab is None:
+        try:
+            d = datetime.strptime(iso, "%Y-%m-%d")
+            raw = http_bytes("https://www.cbr.ru/scripts/XML_daily.asp?date_req=" + d.strftime("%d/%m/%Y"), 20).decode("windows-1251", "replace")
+        except Exception:  # noqa: BLE001
+            return None
+        tab = {}
+        for m in re.finditer(r"<CharCode>([A-Z]{3})</CharCode>\s*<Nominal>(\d+)</Nominal>\s*<Name>.*?</Name>\s*<Value>([\d,]+)</Value>", raw, re.S):
+            try:
+                tab[m.group(1)] = float(m.group(3).replace(",", ".")) / int(m.group(2))
+            except ValueError:
+                pass
+        if not tab:
+            return None
+        _cbr_mem[key] = tab
+        if iso < date.today().isoformat():
+            try:
+                store().put(key, tab)
+            except Exception:  # noqa: BLE001
+                pass
+    return tab.get(cur)
+
+
+# ── настройки ──
+
+def tax_settings():
+    s = {}
+    try:
+        s = store().get(TAX_SETTINGS_KEY) or {}
+    except Exception:  # noqa: BLE001
+        pass
+    iis = {}
+    for k, v in (s.get("iis") or {}).items():
+        if isinstance(v, dict):
+            iis[str(k)] = {"type": v.get("type") if v.get("type") in ("A", "B", "3") else "", "opened": str(v.get("opened") or "")[:10]}
+    carry = {}
+    for k, v in (s.get("loss_carry") or {}).items():
+        try:
+            if int(k) > 1990 and float(v) > 0:
+                carry[str(int(k))] = round(float(v), 2)
+        except (TypeError, ValueError):
+            pass
+    return {"iis": iis, "loss_carry": carry, "offset_coupons": bool(s.get("offset_coupons"))}
+
+
+def mem_clear_tax():
+    with _mem_lock:
+        for k in [k for k in _mem if isinstance(k, tuple) and k and k[0] == "taxst"]:
+            _mem.pop(k, None)
+
+
+def tax_settings_save(cfg, body):
+    cur = tax_settings()
+    if isinstance(body.get("iis"), dict):
+        for k, v in body["iis"].items():
+            if isinstance(v, dict):
+                op = str(v.get("opened") or "")[:10]
+                if op:
+                    try:
+                        datetime.strptime(op, "%Y-%m-%d")
+                    except ValueError:
+                        raise ApiError("Дата открытия ИИС должна быть в формате ГГГГ-ММ-ДД", 400)
+                cur["iis"][str(k)] = {"type": v.get("type") if v.get("type") in ("A", "B", "3") else "", "opened": op}
+    if "offset_coupons" in body:
+        cur["offset_coupons"] = bool(body["offset_coupons"])
+    if isinstance(body.get("loss_carry"), dict):
+        cur["loss_carry"] = {}
+        for k, v in body["loss_carry"].items():
+            try:
+                y, a = int(k), float(str(v).replace(",", ".").replace(" ", ""))
+            except (TypeError, ValueError):
+                raise ApiError("Убытки прошлых лет: год и сумма должны быть числами", 400)
+            if y < 1990 or y > 2100 or a < 0:
+                raise ApiError("Некорректный год или сумма убытка", 400)
+            if a > 0:
+                cur["loss_carry"][str(y)] = round(a, 2)
+    store().put(TAX_SETTINGS_KEY, cur)
+    mem_clear_tax()
+    return tax_settings()
+
+
+# ── движок лотов ──
+
+def tx_sell(lots, q, proceeds, fee, sd, base):
+    """Списывает q штук из lots по FIFO (мутирует lots). Возвращает (строки продаж, непокрытый остаток)."""
+    rows, left = [], float(q)
+    up = proceeds / q if q else 0.0
+    uf = fee / q if q else 0.0
+    can_ldv = base.get("bucket") == "sec" and base.get("type") in TAX_LDV_TYPES
+    while left > 1e-9 and lots:
+        lot = lots[0]
+        t = min(left, lot["qty"])
+        r = dict(base)
+        r.update(qty=t, bdate=lot["date"], proceeds=t * up, cost=t * lot["unit"], fee=t * uf)
+        r["result"] = r["proceeds"] - r["cost"] - r["fee"]
+        ok = can_ldv and not lot.get("blind") and tx_ldv_ok(lot["date"], sd)
+        r["ldv"] = bool(ok)
+        r["yrs"] = tx_full_years(lot["date"], sd) if ok else 0
+        rows.append(r)
+        lot["qty"] -= t
+        left -= t
+        if lot["qty"] <= 1e-9:
+            lots.pop(0)
+    return rows, left
+
+
+def tx_inc_new():
+    return defaultdict(float)
+
+
+def tax_engine(ops, types=None, fx=None, held=None):
+    """ops — операции (с полем _acc). types — {uid: info} (type), fx(cur, iso_day) -> курс или None, held — {uid: кол-во}
+    из текущих позиций (для сверки лотов). Возвращает продажи, остатки лотов и денежные потоки по (счёт, год)."""
+    types = types or {}
+    warns = {}
+    fx = fx or (lambda cur, day: 1.0 if cur == "rub" else None)
+
+    def rate(cur, d):
+        if cur in ("", "rub"):
+            return 1.0
+        r = fx(cur, d.isoformat())
+        if not r:
+            warns["fx_" + cur] = "Нет курса ЦБ для %s на часть дат — взят курс 1." % cur.upper()
+            return 1.0
+        return r
+
+    ops = sorted([o for o in ops if not str(o.get("state") or "").endswith("CANCELED")], key=lambda o: o.get("date") or "")
+    fee_parent, fee_key = defaultdict(float), defaultdict(float)
+    for o in ops:
+        if classify(o.get("type")) == "fee_broker":
+            dt = parse_dt(o.get("date"))
+            amt = abs(qf(o.get("payment"))) * rate(cur_of(o.get("payment")), dt.date())
+            if o.get("parentOperationId"):
+                fee_parent[o["parentOperationId"]] += amt
+            fee_key[(o.get("_acc") or "", (o.get("date") or "")[:19], o.get("instrumentUid") or o.get("figi") or "")] += amt
+
+    def fee_of(o, dt):
+        c = o.get("commission")
+        if c and qf(c):
+            return abs(qf(c)) * rate(cur_of(c), dt.date())
+        if o.get("id") and o["id"] in fee_parent:
+            return fee_parent[o["id"]]
+        return fee_key.get((o.get("_acc") or "", (o.get("date") or "")[:19], o.get("instrumentUid") or o.get("figi") or ""), 0.0)
+
+    books, sales, meta = {}, [], {}
+    inc = defaultdict(tx_inc_new)
+    turn = [0.0, 0.0]
+    for o in ops:
+        kind = classify(o.get("type"))
+        acc = o.get("_acc") or ""
+        dt = parse_dt(o.get("date"))
+        d = dt.date()
+        uid = o.get("instrumentUid") or o.get("figi") or o.get("_ident") or ""
+        info = types.get(uid) or {}
+        itype = o.get("instrumentType") or info.get("type") or ""
+        itype = {"bonds": "bond", "shares": "share"}.get(itype, itype) or "share"
+        pay = qf(o.get("payment"))
+        cur = cur_of(o.get("payment"))
+        r = rate(cur, d)
+        I = inc[(acc, d.year)]
+        if uid and kind in ("buy", "sell", "sec_in", "repayments") and uid not in meta:
+            meta[uid] = {"name": info.get("name") or o.get("name") or o.get("ticker") or uid, "ticker": info.get("ticker") or o.get("ticker") or "", "type": itype}
+        if kind == "dividends":
+            I["div"] += pay * r
+        elif kind == "coupons":
+            I["coupon"] += pay * r
+        elif kind == "overnight":
+            I["over"] += pay * r
+        elif kind in TAXES:
+            I["withheld"] += -pay * r
+            I["w_" + kind] += -pay * r
+        elif kind == "deposits":
+            I["dep"] += abs(pay) * r
+        elif kind == "withdrawals":
+            I["wd"] += abs(pay) * r
+        elif kind == "varmargin":
+            I["deriv"] += pay * r
+        elif kind in ("buy", "sell"):
+            q = op_qty(o)
+            fee = fee_of(o, dt)
+            if itype == "futures":
+                I["deriv_fee"] += fee
+                continue
+            if itype in TAX_SKIP_TYPES or not uid or not q:
+                continue
+            bucket = "deriv" if itype == "option" else "sec"
+            nkd = abs(qf(o.get("accruedInt"))) if o.get("accruedInt") else 0.0
+            gross = abs(pay)
+            clean = gross - nkd
+            if clean < 0:
+                clean, nkd = gross, 0.0
+            bk = books.setdefault((acc, uid), {"lots": [], "shorts": [], "last_repay": None, "last_unit": 0.0})
+            base = {"acc": acc, "uid": uid, "name": meta[uid]["name"], "ticker": meta[uid]["ticker"], "type": itype, "bucket": bucket,
+                    "kind": "sell", "sdate": d, "bdate": None}
+            turn[0] += gross * r
+            turn[1] += fee
+            if kind == "buy":
+                I["nkd_paid"] += nkd * r
+                left = float(q)
+                unit_buy = (clean * r + fee) / q
+                bk["last_unit"] = unit_buy
+                sh = bk["shorts"]
+                while left > 1e-9 and sh:
+                    s = sh[0]
+                    t = min(left, s["qty"])
+                    row = dict(base, kind="short", qty=t, bdate=s["date"], sdate=d, proceeds=t * s["up"], cost=t * unit_buy, fee=t * s["uf"], ldv=False, yrs=0)
+                    row["result"] = row["proceeds"] - row["cost"] - row["fee"]
+                    sales.append(row)
+                    s["qty"] -= t
+                    left -= t
+                    if s["qty"] <= 1e-9:
+                        sh.pop(0)
+                if left > 1e-9:
+                    bk["lots"].append({"qty": left, "unit": unit_buy, "date": d, "cur": cur})
+            else:
+                I["nkd_recv"] += nkd * r
+                yv = o.get("yield")
+                if yv and itype != "option":
+                    I["bk_yield"] += qf(yv) * rate(cur_of(yv, cur), d)
+                rows, left = tx_sell(bk["lots"], q, clean * r, fee, d, base)
+                sales.extend(rows)
+                if left > 1e-9:
+                    warns["short"] = "Есть продажи без покупок в истории (короткие позиции или переводы): учтены упрощённо."
+                    bk["shorts"].append({"qty": left, "up": clean * r / q, "uf": fee / q, "date": d})
+        elif kind == "sec_in":
+            q = op_qty(o)
+            if not uid or not q or itype in TAX_SKIP_TYPES:
+                continue
+            bk = books.setdefault((acc, uid), {"lots": [], "shorts": [], "last_repay": None, "last_unit": 0.0})
+            unit = qf(o.get("price")) * rate(cur_of(o.get("price"), cur), d) if o.get("price") and qf(o.get("price")) else (abs(pay) * r / q if pay else bk["last_unit"])
+            if not unit:
+                warns["unk_cost"] = "У бумаг, зачисленных переводом, нет цены: стоимость принята нулевой (прибыль завышена)."
+            bk["lots"].append({"qty": float(q), "unit": unit, "date": d, "cur": cur, "blind": True})
+        elif kind == "sec_out":
+            q = op_qty(o)
+            bk = books.get((acc, uid))
+            if bk and q:
+                tx_sell(bk["lots"], q, 0.0, 0.0, d, {"bucket": "none"})
+        elif kind == "repayments":
+            bk = books.get((acc, uid))
+            amount = abs(pay) * r
+            if not bk or not bk["lots"] or itype in TAX_SKIP_TYPES:
+                if amount:
+                    warns["repay_nolots"] = "Погашение/амортизация по бумаге без покупок в истории — не учтено в расходах."
+                continue
+            base = {"acc": acc, "uid": uid, "name": meta.get(uid, {}).get("name", ""), "ticker": meta.get(uid, {}).get("ticker", ""),
+                    "type": itype, "bucket": "sec", "kind": "repay", "sdate": d, "bdate": None}
+            tq = sum(l["qty"] for l in bk["lots"])
+            if op_type(o) == "BOND_REPAYMENT_FULL":
+                rows, _ = tx_sell(bk["lots"], tq, amount, 0.0, d, base)
+                sales.extend(rows)
+            else:
+                bk["last_repay"] = d
+                red = amount / tq if tq else 0.0
+                excess = 0.0
+                for l in bk["lots"]:
+                    if l["unit"] >= red:
+                        l["unit"] -= red
+                    else:
+                        excess += (red - l["unit"]) * l["qty"]
+                        l["unit"] = 0.0
+                if excess > 0.005:
+                    sales.append(dict(base, kind="amort", qty=0.0, proceeds=excess, cost=0.0, fee=0.0, result=excess, ldv=False, yrs=0))
+    # сверка с текущими позициями: лишние лоты (проданные/погашенные вне истории) списываются
+    if held is not None:
+        by_uid = defaultdict(list)
+        for (acc, uid), bk in books.items():
+            by_uid[uid].append((acc, bk))
+        for uid, lst in by_uid.items():
+            have = held.get(uid, 0.0)
+            tot = sum(l["qty"] for _, bk in lst for l in bk["lots"])
+            if tot <= have + 0.5:
+                if have - tot > 0.5:
+                    warns["more_pos"] = "В позициях бумаг больше, чем в истории покупок: часть бумаг без даты и цены покупки."
+                continue
+            extra = tot - have
+            for acc, bk in lst:
+                if extra <= 1e-9:
+                    break
+                lr = bk["last_repay"]
+                if have <= 0.5 and lr is not None and bk["lots"]:
+                    cost = sum(l["qty"] * l["unit"] for l in bk["lots"])
+                    qq = sum(l["qty"] for l in bk["lots"])
+                    mt = meta.get(uid, {})
+                    if cost > 0.005:
+                        sales.append({"acc": acc, "uid": uid, "name": mt.get("name", ""), "ticker": mt.get("ticker", ""), "type": mt.get("type", "bond"),
+                                      "bucket": "sec", "kind": "writeoff", "sdate": lr, "bdate": None, "qty": qq, "proceeds": 0.0, "cost": cost,
+                                      "fee": 0.0, "result": -cost, "ldv": False, "yrs": 0})
+                    extra -= qq
+                    bk["lots"] = []
+                else:
+                    n = min(extra, sum(l["qty"] for l in bk["lots"]))
+                    tx_sell(bk["lots"], n, 0.0, 0.0, date.today(), {"bucket": "none"})
+                    extra -= n
+                    warns["gap"] = "Часть бумаг исчезла из позиций без операций продажи (например, конвертация или перевод) — лоты списаны без финрезультата."
+    opens = []
+    for (acc, uid), bk in books.items():
+        for l in bk["lots"]:
+            if l["qty"] > 1e-9:
+                mt = meta.get(uid, {})
+                opens.append({"acc": acc, "uid": uid, "name": mt.get("name", ""), "ticker": mt.get("ticker", ""), "type": mt.get("type", "share"),
+                              "qty": l["qty"], "unit": l["unit"], "date": l["date"], "blind": bool(l.get("blind")), "cur": l.get("cur", "rub")})
+    return {"sales": sales, "open": opens, "inc": dict(inc), "meta": meta, "warnings": sorted(warns.values()),
+            "fee_rate": (turn[1] / turn[0]) if turn[0] > 0 else 0.003}
+
+
+# ── налоговая база по годам для группы счетов ──
+
+def tx_apply_carry(pool, trade_t, year=9999):
+    """Погашает положительный результат убытками прошлых лет (старые — первыми). Возвращает (использовано, остаток базы)."""
+    used = 0.0
+    if trade_t > 0:
+        for p in sorted([p for p in pool if p[0] < year], key=lambda p: p[0]):
+            u = min(p[1], trade_t - used)
+            if u > 0:
+                p[1] -= u
+                used += u
+    return used, max(0.0, trade_t - used)
+
+
+def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, offset_coupons=False):
+    """sales — строки продаж группы; inc — {год: суммы}; carry_user — {"2023": сумма} убытки прошлых лет из деклараций.
+    Возвращает (строки по годам, остатки убытков [[год, сумма]])."""
+    sales = list(sales) + list(extra or [])
+    carry_user = carry_user or {}
+    ys = set(r["sdate"].year for r in sales) | set(inc)
+    pool = []
+    for k, v in carry_user.items():
+        if int(k) not in ys:
+            pool.append([int(k), float(v)])
+    rows, nkd_pool = [], 0.0
+    for y in sorted(ys):
+        i = inc.get(y, {})
+        sec = [s for s in sales if s["bucket"] == "sec" and s["sdate"].year == y]
+        dv = [s for s in sales if s["bucket"] == "deriv" and s["sdate"].year == y]
+        trade = sum(s["result"] for s in sec)
+        elig = [s for s in sec if s["ldv"]]
+        elig_res = sum(s["result"] for s in elig)
+        wc = sum(max(s["cost"], 0.0) for s in elig)
+        wy = (sum(max(s["cost"], 0.0) * s["yrs"] for s in elig) / wc) if wc > 0 else (sum(s["yrs"] for s in elig) / len(elig) if elig else 0.0)
+        limit = TAX_LDV_LIMIT * wy
+        exempt = min(max(0.0, elig_res), limit)
+        pool = [p for p in pool if y - p[0] <= 10 and p[1] > 0.005]
+        pool_before = [list(p) for p in pool]
+        div = i.get("div", 0.0)
+        cg = i.get("coupon", 0.0) + i.get("nkd_recv", 0.0)
+        avail = nkd_pool + i.get("nkd_paid", 0.0)
+        un = min(avail, max(0.0, cg))
+        coupon_net = cg - un
+        nkd_pool = avail - un
+        trade_t = trade - exempt
+        coff = 0.0
+        if offset_coupons and trade_t < 0 and coupon_net > 0:
+            coff = min(coupon_net, -trade_t)
+            coupon_net -= coff
+            trade_t += coff
+        used, trade_base = tx_apply_carry(pool, trade_t, y)
+        new_loss = -trade_t if trade_t < 0 else 0.0
+        if str(y) in carry_user:
+            new_loss = float(carry_user[str(y)])
+        if new_loss > 0.005:
+            pool.append([y, new_loss])
+        over = i.get("over", 0.0)
+        deriv = sum(s["result"] for s in dv) + i.get("deriv", 0.0) - i.get("deriv_fee", 0.0)
+        base = trade_base + div + coupon_net + over + max(0.0, deriv)
+        tax, lo, hi = tx_ndfl(base, y)
+        if iis_exempt:
+            tax = 0.0
+        saved = 0.0
+        if exempt > 0.005 and not iis_exempt:
+            tb0 = tx_apply_carry(pool_before, trade, y)[1]
+            saved = max(0.0, tx_ndfl(tb0 + div + coupon_net + over + max(0.0, deriv), y)[0] - tax)
+        withheld = i.get("withheld", 0.0)
+        rows.append({
+            "year": y, "proceeds": sum(s["proceeds"] for s in sec), "cost": sum(s["cost"] for s in sec), "fees": sum(s["fee"] for s in sec),
+            "trade": trade, "ldv_exempt": exempt, "ldv_limit": limit if elig else 0.0, "ldv_saved": saved, "ldv_n": len(elig),
+            "carry_used": used, "loss_new": new_loss, "trade_base": trade_base,
+            "dividends": div, "coupons": coupon_net, "coupons_gross": i.get("coupon", 0.0), "nkd_adj": i.get("nkd_recv", 0.0) - un, "coupon_offset": coff,
+            "overnight": over, "deriv": deriv, "base": base, "tax": tax, "tax13": lo * 0.13, "tax15": hi * 0.15,
+            "withheld": withheld, "w": {k[2:]: v for k, v in i.items() if k.startswith("w_")},
+            "diff": tax - withheld, "diff_pct": ((tax - withheld) / withheld * 100.0) if withheld > 1 else None,
+            "broker_trade": i.get("bk_yield", 0.0), "deposits": i.get("dep", 0.0), "withdrawals": i.get("wd", 0.0)})
+    return rows, [[p[0], p[1]] for p in pool if p[1] > 0.005]
+
+
+# ── состояние: группы счетов, ИИС, ЛДВ, подсказки ──
+
+TAX_SUM_KEYS = ("proceeds", "cost", "fees", "trade", "ldv_exempt", "ldv_saved", "carry_used", "loss_new", "trade_base", "dividends", "coupons",
+                "overnight", "deriv", "base", "tax", "tax13", "tax15", "withheld", "broker_trade", "deposits", "withdrawals")
+
+
+def tx_gkey(a):
+    return "iis:" + a["id"] if a.get("type") == "ИИС" else "gen"
+
+
+def tx_iis_info(a, setting, first_date, today):
+    typ = setting.get("type") or ""
+    opened = None
+    for s in (setting.get("opened"), (a.get("opened") or "")[:10]):
+        if s:
+            try:
+                opened = datetime.strptime(s[:10], "%Y-%m-%d").date()
+                break
+            except ValueError:
+                pass
+    if opened is None:
+        opened = first_date
+    eff = typ or "A"
+    term = tx_add_years(opened, 5 if eff == "3" else 3) if opened else None
+    return {"id": a["id"], "name": a["name"], "type": eff, "type_set": bool(typ), "opened": opened.isoformat() if opened else "",
+            "term": term.isoformat() if term else "", "term_ok": bool(term and today >= term),
+            "exempt": eff in ("B", "3") and bool(term and today >= term)}
+
+
+def tx_sum_rows(per_group):
+    tot = {}
+    for rows in per_group:
+        for r in rows:
+            t = tot.setdefault(r["year"], {"year": r["year"], "w": defaultdict(float)})
+            for k in TAX_SUM_KEYS:
+                t[k] = t.get(k, 0.0) + r[k]
+            for k, v in r["w"].items():
+                t["w"][k] += v
+    out = []
+    for y in sorted(tot):
+        t = tot[y]
+        t["w"] = dict(t["w"])
+        t["diff"] = t["tax"] - t["withheld"]
+        t["diff_pct"] = (t["diff"] / t["withheld"] * 100.0) if t["withheld"] > 1 else None
+        out.append(t)
+    return out
+
+
+def tx_lines(sales, year):
+    agg = {}
+    for s in sales:
+        if s["bucket"] != "sec" or s["sdate"].year != year:
+            continue
+        k = (s["uid"], s["kind"])
+        a = agg.setdefault(k, {"name": s["name"], "ticker": s["ticker"], "type": s["type"], "kind": s["kind"], "qty": 0.0, "proceeds": 0.0,
+                               "cost": 0.0, "fee": 0.0, "result": 0.0, "ldv_result": 0.0})
+        for f in ("qty", "proceeds", "cost", "fee", "result"):
+            a[f] += s[f]
+        if s["ldv"]:
+            a["ldv_result"] += s["result"]
+    return sorted(agg.values(), key=lambda a: -abs(a["result"]))[:80]
+
+
+def tx_pos_price(r):
+    if not r or not r.get("qty"):
+        return None
+    p = r.get("price") or 0.0
+    if r.get("value") and r.get("value_rub") is not None:
+        p = p * r["value_rub"] / r["value"]
+    return p or None
+
+
+def tax_compute(ops, names, positions, sel, settings, fx=None, today=None):
+    """Чистая часть расчёта (без сети): ops + позиции + выбранные счета -> структура состояния."""
+    today = today or date.today()
+    pos = {}
+    for r in positions or []:
+        if r.get("type") not in ("currency", "futures") and r.get("uid"):
+            pos[r["uid"]] = r
+    held = {u: r["qty"] for u, r in pos.items()} if pos else None
+    eng = tax_engine(ops, names, fx, held)
+    accs = {a["id"]: a for a in sel}
+    groups = {}
+    for a in sel:
+        g = groups.setdefault(tx_gkey(a), {"key": tx_gkey(a), "accounts": []})
+        g["accounts"].append(a["id"])
+    first_by_acc = {}
+    for o in ops:
+        d = parse_dt(o.get("date")).date()
+        k = o.get("_acc") or ""
+        if k not in first_by_acc or d < first_by_acc[k]:
+            first_by_acc[k] = d
+    out_groups, per_rows, iis_list = [], [], []
+    off = settings.get("offset_coupons", False)
+    for gk, g in groups.items():
+        ids = set(g["accounts"])
+        sales = [s for s in eng["sales"] if s["acc"] in ids]
+        inc = defaultdict(lambda: defaultdict(float))
+        for (acc, y), v in eng["inc"].items():
+            if acc in ids:
+                for k, x in v.items():
+                    inc[y][k] += x
+        exempt = False
+        if gk == "gen":
+            g["name"] = "Обычные счета" if len(ids) > 1 else accs[g["accounts"][0]]["name"]
+            g["kind"] = "gen"
+        else:
+            a = accs[g["accounts"][0]]
+            iinfo = tx_iis_info(a, settings["iis"].get(a["id"]) or {}, first_by_acc.get(a["id"]), today)
+            iis_list.append(iinfo)
+            exempt = iinfo["exempt"]
+            g["name"] = "ИИС: " + a["name"]
+            g["kind"] = "iis"
+            g["iis"] = iinfo
+            sales = [dict(s, ldv=False, yrs=0) for s in sales]
+        rows, pool = tax_group_years(sales, inc, settings["loss_carry"] if gk == "gen" else None, exempt, None, off)
+        g["rows"], g["pool"], g["sales"], g["inc"] = rows, pool, sales, inc
+        per_rows.append(rows)
+        out_groups.append(g)
+    return {"eng": eng, "groups": out_groups, "years": tx_sum_rows(per_rows), "iis": iis_list, "pos": pos, "today": today, "accs": accs}
+
+
+def tx_ldv_tables(st):
+    """Будущие и уже наступившие ЛДВ по открытым лотам (только обычные счета: на ИИС ЛДВ не применяется)."""
+    today = st["today"]
+    gen_ids = set(a for g in st["groups"] if g["kind"] == "gen" for a in g["accounts"])
+    cy = today.year
+    cur_base = 0.0
+    for g in st["groups"]:
+        if g["kind"] == "gen":
+            for r in g["rows"]:
+                if r["year"] == cy:
+                    cur_base = r["base"]
+    rate = 0.15 if cur_base > (2400000.0 if cy >= 2025 else 5000000.0) else 0.13
+    groups, ready = {}, {}
+    for l in st["eng"]["open"]:
+        if l["acc"] not in gen_ids or l["type"] not in TAX_LDV_TYPES or l["blind"] or not l["date"] or l["date"] < TAX_LDV_FROM:
+            continue
+        pr = tx_pos_price(st["pos"].get(l["uid"]))
+        value = l["qty"] * pr if pr else None
+        cost = l["qty"] * l["unit"]
+        frm = tx_add_years(l["date"], 3) + timedelta(days=1)
+        days = (frm - today).days
+        tgt = ready if days <= 0 else groups
+        k = l["uid"] if days <= 0 else (l["uid"], frm)
+        e = tgt.setdefault(k, {"uid": l["uid"], "name": l["name"], "ticker": l["ticker"], "type": l["type"], "date": frm.isoformat(), "days": days,
+                               "qty": 0.0, "cost": 0.0, "value": 0.0, "gain": 0.0, "known": True})
+        e["qty"] += l["qty"]
+        e["cost"] += cost
+        if value is None:
+            e["known"] = False
+        else:
+            e["value"] += value
+            e["gain"] += value - cost
+    up = sorted(groups.values(), key=lambda e: e["days"])
+    for e in up + list(ready.values()):
+        e["tax_now"] = max(0.0, e["gain"]) * rate if e["known"] else None
+    return up, sorted(ready.values(), key=lambda e: -e["gain"]), rate
+
+
+def tx_fee_sim(lots, qty, price, fee_rate, today, base):
+    cp = [dict(l) for l in sorted(lots, key=lambda l: l["date"] or date(1970, 1, 1))]
+    rows, _ = tx_sell(cp, qty, qty * price, qty * price * fee_rate, today, dict(base, sdate=today))
+    return rows
+
+
+def tx_group_open(st, g):
+    ids = set(g["accounts"])
+    by = defaultdict(list)
+    for l in st["eng"]["open"]:
+        if l["acc"] in ids:
+            by[l["uid"]].append(l)
+    return by
+
+
+def tx_cur_tax(g, extra, cy, settings):
+    """Налог текущего года по группе с дополнительными (гипотетическими) продажами."""
+    exempt = g["kind"] == "iis" and g["iis"]["exempt"]
+    rows, _ = tax_group_years(g["sales"], g["inc"], settings["loss_carry"] if g["kind"] == "gen" else None, exempt, extra, settings.get("offset_coupons", False))
+    for r in rows:
+        if r["year"] == cy:
+            return r["tax"], r
+    return 0.0, None
+
+
+def tx_hints(st, settings):
+    today, cy = st["today"], st["today"].year
+    fee_rate = st["eng"]["fee_rate"]
+    up, rd, rate = tx_ldv_tables(st)
+    out = {"year": cy, "days_left": (date(cy, 12, 31) - today).days, "harvest": [], "harvest_total": 0.0, "ldv_warn": [], "notes": [],
+           "spread": TAX_SPREAD, "fee_rate": fee_rate}
+    for e in up:
+        if e["days"] <= 365 and e["known"] and e["gain"] > 0 and e["tax_now"] and e["tax_now"] > 50:
+            out["ldv_warn"].append(e)
+    for g in st["groups"]:
+        if g["kind"] == "iis" and g["iis"]["type"] != "A":
+            continue
+        t0, row0 = tx_cur_tax(g, [], cy, settings)
+        if not row0 or t0 <= 1:
+            continue
+        cands = []
+        for uid, lots in tx_group_open(st, g).items():
+            pr = tx_pos_price(st["pos"].get(uid))
+            if not pr or lots[0]["type"] in TAX_SKIP_TYPES:
+                continue
+            q = sum(l["qty"] for l in lots)
+            base = {"acc": lots[0]["acc"], "uid": uid, "name": lots[0]["name"], "ticker": lots[0]["ticker"], "type": lots[0]["type"],
+                    "bucket": "deriv" if lots[0]["type"] == "option" else "sec", "kind": "sell", "bdate": None}
+            rows = tx_fee_sim(lots, q, pr, fee_rate, today, base)
+            res = sum(r["result"] for r in rows)
+            if res >= -50:
+                continue
+            value = q * pr
+            t1, _ = tx_cur_tax(g, rows, cy, settings)
+            cost = value * (fee_rate + TAX_SPREAD)
+            cands.append({"uid": uid, "name": base["name"], "ticker": base["ticker"], "type": base["type"], "group": g["key"], "gname": g["name"],
+                          "qty": q, "value": value, "loss": -res, "saving": t0 - t1, "cost": cost, "net": t0 - t1 - cost, "rows": rows,
+                          "ldv_lost": any(r["ldv"] for r in rows) or any(l["date"] and (tx_add_years(l["date"], 3) - today).days < 120 for l in lots if not l.get("blind"))})
+        cands.sort(key=lambda c: -c["net"])
+        chosen, extra = [], []
+        for c in cands:
+            if c["net"] <= 1:
+                continue
+            t_prev, _ = tx_cur_tax(g, extra, cy, settings)
+            t_new, _ = tx_cur_tax(g, extra + c["rows"], cy, settings)
+            if (t_prev - t_new) - c["cost"] > 1:
+                extra = extra + c["rows"]
+                chosen.append(c)
+        if chosen:
+            t_all, _ = tx_cur_tax(g, extra, cy, settings)
+            out["harvest_total"] += (t0 - t_all) - sum(c["cost"] for c in chosen)
+        for c in cands:
+            c.pop("rows", None)
+            if c["net"] > 1:
+                out["harvest"].append(c)
+    out["harvest"].sort(key=lambda c: -c["net"])
+    out["harvest"] = out["harvest"][:25]
+    if not out["harvest"]:
+        out["notes"].append("Позиций с убытком, продажа которых уменьшила бы налог текущего года, не найдено (или налога за этот год пока нет).")
+    return out
+
+
+def tx_decl(st):
+    decl = {}
+    for g in st["groups"]:
+        for r in g["rows"]:
+            d = decl.setdefault(r["year"], {"year": r["year"], "groups": []})
+            e = dict(r)
+            e.update(key=g["key"], name=g["name"], kind=g["kind"], lines=tx_lines(g["sales"], r["year"]))
+            d["groups"].append(e)
+    return decl
+
+
+def tx_iis_table(st, settings):
+    out = []
+    for g in st["groups"]:
+        if g["kind"] != "iis":
+            continue
+        i = g["iis"]
+        ded = i["type"] in ("A", "3")
+        ys = []
+        for r in g["rows"]:
+            if r["deposits"] > 0 or r["withdrawals"] > 0:
+                b = min(r["deposits"], TAX_IIS_LIMIT)
+                ys.append({"year": r["year"], "deposits": r["deposits"], "withdrawals": r["withdrawals"], "deduct_base": b if ded else 0.0,
+                           "deduct": b * 0.13 if ded else 0.0, "over": max(0.0, r["deposits"] - TAX_IIS_LIMIT)})
+        e = dict(i)
+        e.update(years=ys, deduct_total=sum(y["deduct"] for y in ys),
+                 tax_if_closed=sum(r["tax"] for r in g["rows"]) if not i["exempt"] else 0.0,
+                 trade_total=sum(r["trade"] for r in g["rows"]), income_total=sum(r["dividends"] + r["coupons"] for r in g["rows"]))
+        out.append(e)
+    return out
+
+
+def tax_payload_from(st, settings):
+    gen = [g for g in st["groups"] if g["kind"] == "gen"]
+    cy = st["today"].year
+    up, rd, rate = tx_ldv_tables(st)
+    sugg = []
+    for g in gen:
+        for r in g["rows"]:
+            if r["year"] < cy and r["loss_new"] > 0.005 and str(r["year"]) not in settings["loss_carry"]:
+                sugg.append({"year": r["year"], "loss": r["loss_new"]})
+    ldv_years = {}
+    for g in gen:
+        for r in g["rows"]:
+            if r["ldv_exempt"] > 0 or r["ldv_n"]:
+                e = ldv_years.setdefault(r["year"], {"year": r["year"], "exempt": 0.0, "saved": 0.0, "n": 0, "limit": 0.0})
+                e["exempt"] += r["ldv_exempt"]
+                e["saved"] += r["ldv_saved"]
+                e["n"] += r["ldv_n"]
+                e["limit"] = max(e["limit"], r["ldv_limit"])
+    strip = lambda g: {k: v for k, v in g.items() if k not in ("sales", "inc")}
+    return {
+        "today": st["today"].isoformat(), "settings": settings,
+        "groups": [strip(g) for g in st["groups"]], "years": st["years"],
+        "ldv": {"upcoming": up[:80], "ready": rd[:40], "years": [ldv_years[y] for y in sorted(ldv_years)],
+                "saved_total": sum(e["saved"] for e in ldv_years.values()), "rate": rate, "limit": TAX_LDV_LIMIT},
+        "iis": tx_iis_table(st, settings), "hints": tx_hints(st, settings), "decl": tx_decl(st),
+        "carry_suggest": sugg, "warnings": st["eng"]["warnings"],
+        "assumptions": [
+            "Счета без ИИС объединены в одну налоговую базу (сальдирование прибылей и убытков между счетами одного налогоплательщика); каждый ИИС считается отдельно.",
+            "Налог по годам сравнивается с удержанным по дате операции удержания; брокер часто удерживает налог за год в декабре или в январе следующего года.",
+            "Ставка: 13 % и 15 % с части базы свыше 5 млн ₽ (2021–2024) или свыше 2,4 млн ₽ (с 2025 года). Заработная плата и другие доходы в порог не входят.",
+            "ЛДВ применяется к акциям, облигациям и фондам, купленным с 2014 года и проданным после трёх лет владения; бумаги, полученные переводом, не учитываются.",
+            "НКД, уплаченный при покупке, уменьшает купонный доход (остаток переносится), НКД при продаже входит в купонный доход.",
+            "Фьючерсы и опционы: отдельная база по вариационной марже; валюта и ЦФА в расчёт не входят."]}
+
+
+def tax_state(cfg, acc, force=False):
+    settings = tax_settings()
+    key = ("taxst", token_key(cfg), acc, json.dumps(settings, sort_keys=True))
+    hit = None if force else mem_get(key, 120)
+    if hit:
+        return hit, settings
+    with key_lock(key):
+        hit = None if force else mem_get(key, 120)
+        if hit:
+            return hit, settings
+        client = TInvest(cfg)
+        accs, sel, data = selection(cfg, acc, force)
+        ops = sorted([o for d in data for o in d["ops"]], key=lambda o: o.get("date") or "")
+        keys = {(o.get("instrumentUid"), o.get("figi")) for o in ops
+                if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
+        names = instruments(client, keys)
+        positions = build_summary(cfg, acc, "all", force)["portfolio"]["positions"]
+        st = tax_compute(ops, names, positions, sel, settings, tax_cbr_rate)
+        return mem_put(key, st), settings
+
+
+def tax_get(cfg, acc, q, force):
+    st, settings = tax_state(cfg, acc, force)
+    return tax_payload_from(st, settings)
+
+
+def tax_post_settings(cfg, body):
+    return {"settings": tax_settings_save(cfg, body or {})}
+
+
+def tax_reb_plan(st, settings, sells):
+    """sells: {класс: сумма продажи, ₽}. Для каждого класса сравниваем «продать пропорционально» и «сначала убыточные и с ЛДВ»."""
+    today, cy = st["today"], st["today"].year
+    fee_rate = st["eng"]["fee_rate"]
+    out = []
+    for cls_, amount in sells.items():
+        cands = []
+        for g in st["groups"]:
+            for uid, lots in tx_group_open(st, g).items():
+                if lots[0]["type"] != cls_:
+                    continue
+                pr = tx_pos_price(st["pos"].get(uid))
+                if not pr:
+                    continue
+                q = sum(l["qty"] for l in lots)
+                base = {"acc": lots[0]["acc"], "uid": uid, "name": lots[0]["name"], "ticker": lots[0]["ticker"], "type": cls_,
+                        "bucket": "deriv" if cls_ == "option" else "sec", "kind": "sell", "bdate": None}
+                rows = tx_fee_sim(lots, q, pr, fee_rate, today, base)
+                t0, _ = tx_cur_tax(g, [], cy, settings)
+                t1, _ = tx_cur_tax(g, rows, cy, settings)
+                value = q * pr
+                cands.append({"g": g, "uid": uid, "lots": lots, "price": pr, "qty": q, "value": value, "base": base,
+                              "rate": (t1 - t0) / value if value else 0.0})
+        if not cands:
+            out.append({"cls": cls_, "amount": amount, "plan": [], "tax_plan": None, "tax_naive": None, "note": "Нет данных о лотах по этому классу"})
+            continue
+
+        def run(pick):
+            per_g, items = defaultdict(list), []
+            for c, qq in pick:
+                rows = tx_fee_sim(c["lots"], qq, c["price"], fee_rate, today, c["base"])
+                per_g[c["g"]["key"]].extend(rows)
+                res = sum(r["result"] for r in rows)
+                soon = [l for l in c["lots"] if l["date"] and not l.get("blind") and 0 < (tx_add_years(l["date"], 3) + timedelta(days=1) - today).days <= 180]
+                why = "убыток" if res < 0 else ("прибыль освобождена по ЛДВ" if rows and all(r["ldv"] for r in rows) and res > 0 else "есть налог")
+                items.append({"uid": c["uid"], "name": c["base"]["name"], "ticker": c["base"]["ticker"], "gname": c["g"]["name"], "qty": qq,
+                              "sell_rub": qq * c["price"], "result": res, "why": why, "ldv_soon": bool(soon and res > 0)})
+            tot = 0.0
+            for c in {id(x[0]["g"]): x[0] for x in pick}.values():
+                g = c["g"]
+                t0, _ = tx_cur_tax(g, [], cy, settings)
+                t1, _ = tx_cur_tax(g, per_g[g["key"]], cy, settings)
+                tot += t1 - t0
+            return tot, items
+        total_v = sum(c["value"] for c in cands)
+        amt = min(amount, total_v)
+        naive = []
+        for c in cands:
+            qq = int(c["qty"] * amt / total_v)
+            if qq > 0:
+                naive.append((c, qq))
+        tax_naive, items_naive = run(naive) if naive else (0.0, [])
+        plan, rem = [], amt
+        for c in sorted(cands, key=lambda c: c["rate"]):
+            if rem < c["price"]:
+                break
+            qq = int(min(c["qty"], rem / c["price"]))
+            if qq <= 0:
+                continue
+            plan.append((c, qq))
+            rem -= qq * c["price"]
+        tax_plan, items = run(plan) if plan else (0.0, [])
+        if tax_plan > tax_naive:
+            tax_plan, items = tax_naive, items_naive
+        out.append({"cls": cls_, "amount": amount, "covered": amt, "tax_plan": tax_plan, "tax_naive": tax_naive,
+                    "saving": max(0.0, tax_naive - tax_plan), "plan": items})
+    return out
+
+
+def tax_reb_get(cfg, acc, q, force):
+    sells = {}
+    for part in (q.get("sells") or "").split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            try:
+                if float(v) > 0:
+                    sells[k] = float(v)
+            except ValueError:
+                pass
+    st, settings = tax_state(cfg, acc, force)
+    return {"items": tax_reb_plan(st, settings, sells), "warnings": st["eng"]["warnings"]}
+
+
+API_GET["/api/tax"] = tax_get
+API_GET["/api/tax/reb"] = tax_reb_get
+API_POST["/api/tax/settings"] = tax_post_settings
 # ═══════════════════════════════ зашифрованная резервная копия и экспорт ═══════════════════════════════
 # Шифрование: стандартный AES-256 (FIPS-197) в режиме CTR (NIST SP 800-38A) на чистом Python + HMAC-SHA256
 # (encrypt-then-MAC), ключи из пароля через PBKDF2-HMAC-SHA256. Своих шифров нет.
@@ -10045,6 +10914,12 @@ tr.scr-low td{opacity:.5}
 .tg-steps code{background:var(--card2);padding:1px 6px;border-radius:6px;font-size:12px}
 [data-theme=light] .wt-s,[data-theme=light] .wt-note-i{background:#f0f2f6}
 /* налоги */
+.tx .tx-tabs{max-width:100%}
+.tx .tx-ul{margin:6px 0 0;padding-left:20px;line-height:1.6}
+.tx .tx-ul li{margin:3px 0}
+.tx .card h2 .sp{font-weight:400}
+.tx select.in,.tx input[type=date].in{min-width:150px}
+@media print{.tx .tx-tabs{display:none!important}.tx .card{break-inside:avoid}}
 /* резервная копия и экспорт */
 .bk-warn{background:rgba(255,170,60,.12);border:1px solid rgba(255,170,60,.45);border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.45}
 .bk-sug{font-size:12.5px;color:var(--tx2);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
@@ -10909,8 +11784,36 @@ function pFees(){
   return out;
 }
 
-/* ── Налоги ── */
+/* ── Налоги: обзор, расчёт по лотам (FIFO), ЛДВ, ИИС, подсказки, данные для 3-НДФЛ, настройки ── */
+S.tx={tab:'ov',data:null,acc:null,busy:0,err:null,year:null,draft:null,msg:''};
+try{const t=localStorage.getItem('tx_tab');if(t&&['ov','yr','ldv','iis','hint','decl','set'].includes(t))S.tx.tab=t}catch(e){}
+const TXTABS=[['ov','Обзор'],['yr','Налог по годам'],['ldv','ЛДВ'],['iis','ИИС'],['hint','Подсказки'],['decl','Для декларации'],['set','Настройки налогов']];
+const tR=n=>bad(n)?'—':M(n,'rub',0),tS=n=>bad(n)?'—':(n>0?'+':'')+M(n,'rub',0);
+const tDt=s=>s?ddm(s):'—';
+function txGo(t){S.tx.tab=t;try{localStorage.setItem('tx_tab',t)}catch(e){}render()}
+function loadTax(force){
+  if(S.tx.busy)return;S.tx.busy=1;const acc=S.account;
+  api('/api/tax?'+new URLSearchParams(Object.assign({account:acc},force?{force:'1'}:{}))).then(j=>{
+    S.tx.busy=0;S.tx.acc=acc;S.tx.err=null;
+    if(S.account!==acc){if(S.page==='tax')render();return}
+    S.tx.data=j;S.tx.draft=null;if(S.page==='tax')render()
+  }).catch(e=>{S.tx.busy=0;S.tx.acc=acc;S.tx.data=null;S.tx.err=e.message;if(S.page==='tax')render()});
+}
+const txNote=`<p class="note">Расчёт справочный и не является налоговой консультацией: налог как налоговый агент считает и удерживает брокер, а итог за год определяется декларацией. Приложение считает по тем операциям, которые видит (история счетов и импортированные отчёты).</p>`;
+
 function pTax(){
+  const tx=S.tx;
+  const tabs=`<div class="seg tx-tabs noprint">${TXTABS.map(([k,t])=>`<button class="${k===tx.tab?'on':''}" onclick="txGo('${k}')">${t}</button>`).join('')}</div>`;
+  let body;
+  if(tx.tab==='ov')body=txOv();
+  else if(tx.err&&tx.acc===S.account)body=`<div class="msg err">${esc(tx.err)} <button class="btn ghost" onclick="S.tx.err=null;S.tx.acc=null;render()">Повторить</button></div>`;
+  else if(!tx.data||tx.acc!==S.account){loadTax();body=`<div class="card">${waitBox('Считаю налоги по лотам: покупки, продажи, ЛДВ, убытки…')}</div>`}
+  else body=({yr:txYr,ldv:txLdv,iis:txIis,hint:txHint,decl:txDecl,set:txSet})[tx.tab](tx.data)+txNote;
+  return`<div class="tx"><div class="row" style="margin-bottom:14px">${tabs}</div>${body}</div>`;
+}
+
+/* ── Обзор (прежняя страница) ── */
+function txOv(){
   const d=S.data,lf=d.life,rows=d.tax,cy=new Date().getFullYear(),cur=rows.find(r=>r.year===cy);
   const withheld=sumK(lf,TAXK);
   let out=`<div class="g g4">${kpi('Удержано налогов за всё время',M(withheld),'НДФЛ, удержанный брокером',null,S4)}
@@ -10923,11 +11826,166 @@ function pTax(){
   out+=`<div class="card" style="padding:6px 8px"><div class="tbl"><table><thead><tr><th>Год</th><th>Результат сделок</th><th>Дивиденды, купоны, РЕПО</th><th>Налоговая база</th><th>Оценка НДФЛ</th><th>Удержано</th><th>Разница</th></tr></thead><tbody>`+
     (rows.length?rows.slice().reverse().map(r=>`<tr><td><b>${r.year}</b></td><td class="num ${cls(r.trade)}">${SM(r.trade)}</td><td class="num">${M(r.income)}</td><td class="num">${M(Math.max(0,r.trade)+r.income)}</td>
     <td class="num">${M(r.estimate)}</td><td class="num">${M(r.withheld)}</td><td class="num ${r.diff>0.5?'neg':r.diff<-0.5?'pos':''}">${SM(r.diff)}</td></tr>`).join(''):'<tr><td colspan="7" class="l mu">Нет данных</td></tr>')+
-    `</tbody></table></div></div><p class="note"><b>Это оценка, а не декларация.</b> Ставка: 13 %; с 2021 по 2024 — 15 % с части базы свыше 5 млн ₽; с 2025 — 15 % свыше 2,4 млн ₽.
-    База: положительный результат продаж + дивиденды + купоны + доход по РЕПО в рублях. Не учтены убытки прошлых лет, льгота долгосрочного владения, ИИС, иностранные дивиденды и курсовые разницы. Точные суммы рассчитывает брокер как налоговый агент.</p>`;
+    `</tbody></table></div></div><p class="note"><b>Это быстрая оценка по сводке операций, а не декларация.</b> Ставка: 13 %; с 2021 по 2024 — 15 % с части базы свыше 5 млн ₽; с 2025 — 15 % свыше 2,4 млн ₽.
+    База здесь: положительный результат продаж + дивиденды + купоны + доход по РЕПО в рублях. Точный расчёт по лотам (FIFO), с ЛДВ, переносом убытков, ИИС и курсовыми разницами — на вкладках выше. Точные суммы рассчитывает брокер как налоговый агент.</p>`;
   return out;
 }
 
+/* ── Налог по годам ── */
+function txRowsTable(rows){
+  return`<div class="tbl"><table><thead><tr><th>Год</th><th>Результат сделок</th><th>ЛДВ</th><th>Убытки прошлых лет</th><th>Дивиденды</th><th>Купоны, РЕПО</th><th>Налоговая база</th><th>Налог по расчёту</th><th>Удержано</th><th>Разница</th><th>Откл.</th></tr></thead><tbody>${
+    rows.slice().reverse().map(r=>`<tr><td><b>${r.year}</b></td><td class="num ${cls(r.trade)}">${tS(r.trade)}</td><td class="num">${r.ldv_exempt>0.5?'−'+tR(r.ldv_exempt):'—'}</td>
+      <td class="num">${r.carry_used>0.5?'−'+tR(r.carry_used):'—'}</td><td class="num">${tR(r.dividends)}</td><td class="num">${tR(r.coupons+r.overnight)}</td><td class="num">${tR(r.base)}</td>
+      <td class="num"><b>${tR(r.tax)}</b></td><td class="num">${tR(r.withheld)}</td><td class="num ${r.diff>0.5?'neg':r.diff<-0.5?'pos':''}">${tS(r.diff)}</td>
+      <td class="num ${r.diff_pct!=null&&Math.abs(r.diff_pct)>25?'neg':'mu'}">${r.diff_pct==null?'—':pct(r.diff_pct,0)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+function txYr(d){
+  const ys=d.years;
+  if(!ys.length)return`<div class="card empty">Нет операций для расчёта налога</div>`;
+  const cy=new Date().getFullYear(),cur=ys.find(r=>r.year===cy)||ys[ys.length-1];
+  const tot=ys.reduce((a,r)=>({tax:a.tax+r.tax,wh:a.wh+r.withheld,ldv:a.ldv+r.ldv_saved}),{tax:0,wh:0,ldv:0});
+  chart('c-txy',bars,{labels:ys.map(r=>String(r.year)),series:[{n:'Налог по расчёту',c:S1,v:ys.map(r=>r.tax)},{n:'Удержано брокером',c:S2,v:ys.map(r=>r.withheld)}]});
+  let out=`<div class="g g4">${kpi(`Налог по расчёту за ${cur.year}`,tR(cur.tax),`база ${tR(cur.base)}; ставка 13 %${cur.tax15>0?' и 15 %':''}`,null,S1)}
+    ${kpi(`Удержано в ${cur.year}`,tR(cur.withheld),cur.diff_pct==null?'по операциям удержания':`расчёт отличается на ${pct(cur.diff_pct,0)}`,null,S2)}
+    ${kpi('Сэкономлено за счёт ЛДВ',tR(tot.ldv),'за все годы',tot.ldv>0?'pos':'',S3)}
+    ${kpi('Налог по расчёту за всё время',tR(tot.tax),`удержано ${tR(tot.wh)}`,null,S4)}</div>
+    <div class="card"><h2>Расчёт и удержанный налог по годам, ₽</h2><div id="c-txy" class="chart"></div></div>
+    <div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Все выбранные счета вместе</h2>${txRowsTable(ys)}</div>`;
+  if(d.groups.length>1)out+=d.groups.map(g=>`<div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">${esc(g.name)}${g.kind==='iis'?`<span class="sp">${g.iis.exempt?'доход освобождён от налога (срок соблюдён)':'ИИС тип '+({A:'А',B:'Б','3':'3'})[g.iis.type]}</span>`:''}</h2>${txRowsTable(g.rows)}</div>`).join('');
+  const cmp=ys.filter(r=>r.diff_pct!=null&&Math.abs(r.diff_pct)>25);
+  out+=`<div class="card"><h2>Почему расчёт и удержание могут расходиться</h2><ul class="tx-ul">
+    <li><b>Сроки.</b> Брокер удерживает налог не в день сделки, а в конце года, при выводе денег или в январе следующего года, поэтому суммы в соседних годах «плавают».</li>
+    <li><b>Данные брокера.</b> Он видит всю историю бумаг (включая переводы из других депозитариев) и считает расходы по своим документам; мы — только по операциям в приложении.</li>
+    <li><b>Убытки и купоны.</b> Убыток по сделкам по умолчанию не уменьшает купоны и дивиденды (флажок «Убыток по сделкам уменьшает купонный доход» — во вкладке «Настройки налогов»).</li>
+    <li><b>Фьючерсы, ИИС, другие брокеры</b> считаются отдельно; по сделкам в валюте используется курс ЦБ на даты покупки и продажи.</li></ul>
+    ${cmp.length?`<p class="note">Заметное расхождение (больше 25 %) в годах: ${cmp.map(r=>r.year).join(', ')}.</p>`:''}
+    <ul class="tx-ul note">${d.assumptions.map(a=>`<li>${esc(a)}</li>`).join('')}</ul>
+    ${d.warnings.length?`<div class="msg info" style="margin-top:8px">${d.warnings.map(esc).join('<br>')}</div>`:''}</div>`;
+  return out;
+}
+
+/* ── ЛДВ ── */
+function txLdv(d){
+  const l=d.ldv,up=l.upcoming,rd=l.ready,nxt=up[0];
+  let out=`<div class="g g4">${kpi('Сэкономлено за счёт ЛДВ',tR(l.saved_total),'налог, который не пришлось платить',l.saved_total>0?'pos':'',S3)}
+    ${kpi('Бумаг с наступившей ЛДВ',String(rd.length),rd.length?`прибыль без налога: ${tR(rd.reduce((a,e)=>a+Math.max(0,e.gain||0),0))}`:'пока нет',null,S1)}
+    ${kpi('Ближайшая ЛДВ',nxt?tDt(nxt.date):'—',nxt?`через ${nxt.days} дн.: ${esc(nxt.ticker||nxt.name)}`:'нет лотов на подходе',null,S2)}
+    ${kpi('Освобождение',`${short(l.limit)} ₽ × лет`,'предел дохода за каждый полный год владения',null,S4)}</div>`;
+  out+=`<div class="card"><h2>Как это работает</h2><p class="note">Если бумага (акции, облигации, фонды), купленная с 2014 года, продана <b>после трёх лет владения</b>, то прибыль не облагается налогом в пределах 3 млн ₽ × число полных лет владения. Срок считается по каждому лоту отдельно, продажа идёт по FIFO (первыми уходят самые старые лоты). На ИИС ЛДВ не применяется.</p></div>`;
+  out+=`<div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">ЛДВ уже наступила<span class="sp">можно продавать без налога с прибыли</span></h2><div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>С даты</th><th>Кол-во</th><th>Стоимость покупки</th><th>Сейчас</th><th>Прибыль</th><th>Налог без ЛДВ</th></tr></thead><tbody>${
+    rd.length?rd.map(e=>`<tr><td class="l"><b>${esc(e.name)}</b><br><small class="mu">${esc(e.ticker)}</small></td><td class="num">${tDt(e.date)}</td><td class="num">${NF0.format(e.qty)}</td><td class="num">${tR(e.cost)}</td><td class="num">${e.known?tR(e.value):'—'}</td><td class="num ${cls(e.gain)}">${e.known?tS(e.gain):'—'}</td><td class="num">${e.tax_now!=null?tR(e.tax_now):'—'}</td></tr>`).join(''):'<tr><td colspan="7" class="l mu">Лотов старше трёх лет пока нет</td></tr>'}</tbody></table></div></div>`;
+  out+=`<div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Скоро наступит ЛДВ<span class="sp">до этой даты продавать выгодно, только если нет прибыли</span></h2><div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>ЛДВ с даты</th><th>Осталось</th><th>Кол-во</th><th>Прибыль сейчас</th><th>Налог, если продать сегодня</th></tr></thead><tbody>${
+    up.length?up.slice(0,60).map(e=>`<tr><td class="l"><b>${esc(e.name)}</b><br><small class="mu">${esc(e.ticker)}</small></td><td class="num">${tDt(e.date)}</td><td class="num ${e.days<=90?'neg':''}">${e.days} дн.</td><td class="num">${NF0.format(e.qty)}</td>
+      <td class="num ${cls(e.gain)}">${e.known?tS(e.gain):'—'}</td><td class="num">${e.tax_now!=null?`<b class="${e.tax_now>0?'neg':''}">${tR(e.tax_now)}</b>`:'—'}</td></tr>`).join(''):'<tr><td colspan="6" class="l mu">Нет лотов, ожидающих ЛДВ</td></tr>'}</tbody></table></div></div>`;
+  out+=`<div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Применённая ЛДВ по годам</h2><div class="tbl"><table><thead><tr><th>Год</th><th>Лотов</th><th>Освобождено от налога</th><th>Предел</th><th>Налог сэкономлен</th></tr></thead><tbody>${
+    l.years.length?l.years.slice().reverse().map(e=>`<tr><td><b>${e.year}</b></td><td class="num">${e.n}</td><td class="num">${tR(e.exempt)}</td><td class="num">${tR(e.limit)}</td><td class="num pos">${tR(e.saved)}</td></tr>`).join(''):'<tr><td colspan="5" class="l mu">Продаж с ЛДВ не было</td></tr>'}</tbody></table></div></div>`;
+  return out;
+}
+
+/* ── ИИС ── */
+function txIis(d){
+  if(!d.iis.length)return`<div class="card empty">Среди выбранных счетов нет ИИС. Выберите счёт ИИС слева или «Все счета».</div>`;
+  const TN={A:'А (вычет на взносы)',B:'Б (освобождение дохода)','3':'ИИС-3 (вычет и освобождение)'};
+  return d.iis.map(i=>{
+    const dedAvail=i.type==='A'||i.type==='3',exAvail=i.type==='B'||i.type==='3';
+    return`<div class="card"><h2>${esc(i.name)}<span class="sp">тип ${TN[i.type]}${i.type_set?'':' · предположительно, уточните в настройках'}</span></h2>
+    <div class="g g4">${kpi('Открыт',tDt(i.opened),i.opened?'':'укажите дату в настройках',null,S1)}
+      ${kpi('Срок владения до',tDt(i.term),i.type==='3'?'5 лет для ИИС-3':'3 года',null,S2)}
+      ${kpi('Освобождение дохода',exAvail?(i.term_ok?'действует':'ещё нет'):'не предусмотрено',exAvail?(i.term_ok?'доход внутри счёта не облагается':'до срока при закрытии будет налог'):'для типа А налог платится с дохода',i.term_ok&&exAvail?'pos':'',S3)}
+      ${kpi('Вычет на взносы',dedAvail?tR(i.deduct_total):'не предусмотрен',dedAvail?'13 % от взносов до 400 тыс. ₽ в год':'у типа Б вычета на взносы нет',null,S4)}</div>
+    ${dedAvail?`<div class="tbl" style="margin-top:12px"><table><thead><tr><th>Год</th><th>Взносы</th><th>Учитывается в вычете (до 400 тыс. ₽)</th><th>Вернуть можно (13 %)</th></tr></thead><tbody>${
+      i.years.filter(y=>y.deposits>0).map(y=>`<tr><td><b>${y.year}</b></td><td class="num">${tR(y.deposits)}</td><td class="num">${tR(y.deduct_base)}${y.over>0?`<br><small class="mu">сверх лимита ${tR(y.over)}</small>`:''}</td><td class="num pos">${tR(y.deduct)}</td></tr>`).join('')||'<tr><td colspan="4" class="l mu">Пополнений в истории нет</td></tr>'}</tbody></table></div>
+    <p class="note">Вычет возвращает налог, уплаченный с вашей зарплаты и других доходов по ставке 13 %: больше, чем вы заплатили, вернуть нельзя. Заявляется в декларации 3-НДФЛ или через работодателя.</p>`:''}
+    ${exAvail?`<p class="note">При закрытии ИИС до срока (${tDt(i.term)}) налог с дохода придётся заплатить; расчётный налог по всему доходу счёта — ${tR(i.tax_if_closed)}. Результат сделок на ИИС: ${tS(i.trade_total)}, дивиденды и купоны: ${tR(i.income_total)}.</p>`:`<p class="note">Для типа А налог на доход внутри ИИС удерживается как обычно; результат сделок: ${tS(i.trade_total)}, дивиденды и купоны: ${tR(i.income_total)}.</p>`}</div>`}).join('')+
+    `<p class="note noprint"><a href="#" onclick="txGo('set');return false">Указать тип и дату открытия ИИС</a>. Условия вычета зависят от года открытия счёта — сверьтесь с правилами ФНС.</p>`;
+}
+
+/* ── Подсказки ── */
+function txHint(d){
+  const h=d.hints;
+  let out=`<div class="g g4">${kpi('Экономия от сбора убытков',tR(Math.max(0,h.harvest_total)),'вместе, после комиссий и спреда',h.harvest_total>0?'pos':'',S3)}
+    ${kpi('Позиций для сбора убытков',String(h.harvest.length),`до конца ${h.year} года осталось ${h.days_left} дн.`,null,S1)}
+    ${kpi('Предупреждений по ЛДВ',String(h.ldv_warn.length),'продажа прибыльных бумаг скоро невыгодна',h.ldv_warn.length?'neg':'',S2)}
+    ${kpi('Комиссия + спред',pctp((h.fee_rate+h.spread)*100,2),'оценка расходов на продажу и покупку',null,S4)}</div>`;
+  out+=`<div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Сбор убытков до конца года<span class="sp">продать с убытком и сразу откупить</span></h2>
+    <p class="note" style="padding:0 10px">Убыток от продажи уменьшает налогооблагаемую прибыль этого года. Экономия = меньшее из убытка и уже полученной прибыли × ставка. Позицию можно откупить сразу: экономический результат не меняется, но стоимость покупки обновится, а срок владения для ЛДВ начнётся заново.</p>
+    <div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Кол-во</th><th>Стоимость</th><th>Убыток при продаже</th><th>Экономия налога</th><th>Расходы (комиссия + спред)</th><th>Выгода</th></tr></thead><tbody>${
+      h.harvest.length?h.harvest.map(c=>`<tr><td class="l"><b>${esc(c.name)}</b><br><small class="mu">${esc(c.ticker)} · ${esc(c.gname)}${c.ldv_lost?' · <span class="neg">сбросится срок ЛДВ</span>':''}</small></td><td class="num">${NF0.format(c.qty)}</td><td class="num">${tR(c.value)}</td>
+        <td class="num neg">−${tR(c.loss)}</td><td class="num pos">${tR(c.saving)}</td><td class="num">${tR(c.cost)}</td><td class="num ${c.net>0?'pos':'neg'}"><b>${tS(c.net)}</b></td></tr>`).join(''):`<tr><td colspan="7" class="l mu">${esc(h.notes[0]||'Нет подходящих позиций')}</td></tr>`}</tbody></table></div></div>`;
+  out+=`<div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Не продавайте до ЛДВ<span class="sp">до конца льготного срока меньше года, прибыль есть</span></h2><div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>ЛДВ с даты</th><th>Осталось</th><th>Прибыль сейчас</th><th>Налог, если продать сегодня</th></tr></thead><tbody>${
+    h.ldv_warn.length?h.ldv_warn.map(e=>`<tr><td class="l"><b>${esc(e.name)}</b><br><small class="mu">${esc(e.ticker)}</small></td><td class="num">${tDt(e.date)}</td><td class="num">через ${e.days} дн.</td><td class="num pos">${tS(e.gain)}</td><td class="num neg"><b>${tR(e.tax_now)}</b></td></tr>`).join(''):'<tr><td colspan="5" class="l mu">Нет таких бумаг</td></tr>'}</tbody></table></div>
+    ${h.ldv_warn.length?`<p class="note" style="padding:0 10px">Через указанное число дней по этим бумагам наступит ЛДВ: продавать раньше невыгодно, если есть прибыль.</p>`:''}</div>`;
+  if(d.carry_suggest.length)out+=`<div class="card"><h2>Убытки прошлых лет</h2><p class="note">По расчёту у вас были убытки, которые можно перенести на будущие доходы (до 10 лет): ${d.carry_suggest.map(s=>`${s.year} — ${tR(s.loss)}`).join('; ')}. Проверьте суммы по декларациям и внесите в «Настройки налогов».</p></div>`;
+  return out;
+}
+
+/* ── Для декларации ── */
+function txDecl(d){
+  const ys=Object.keys(d.decl).map(Number).sort((a,b)=>b-a);
+  if(!ys.length)return`<div class="card empty">Нет данных для декларации</div>`;
+  const y=ys.includes(+S.tx.year)?+S.tx.year:ys[0],dc=d.decl[y];
+  const sel=`<div class="row noprint" style="margin-bottom:12px;gap:12px"><label class="field" style="max-width:200px"><span>Налоговый год</span><select class="in" onchange="S.tx.year=this.value;render()">${ys.map(v=>`<option value="${v}" ${v===y?'selected':''}>${v}</option>`).join('')}</select></label>
+    <button class="btn ghost" onclick="window.print()">Печать</button></div>`;
+  const wk=w=>Object.keys(w).filter(k=>Math.abs(w[k])>0.005).map(k=>`${esc(L[k]||k)}: ${tR(w[k])}`).join('; ');
+  const ii=Object.fromEntries(d.iis.map(i=>[i.id,i]));
+  return sel+dc.groups.map(g=>{
+    const rowsT=[
+      ['Доходы от продажи ценных бумаг',tR(g.proceeds)],['Расходы (покупка, комиссии)',tR(g.cost+g.fees)],['Финансовый результат по сделкам',tS(g.trade)],
+      ['Освобождение по ЛДВ',g.ldv_exempt>0.5?'−'+tR(g.ldv_exempt):'—'],['Убытки прошлых лет (зачтено)',g.carry_used>0.5?'−'+tR(g.carry_used):'—'],
+      ['Налоговая база по сделкам',tR(g.trade_base)],['Дивиденды',tR(g.dividends)],['Купоны (с учётом НКД)',tR(g.coupons)],['Доход по РЕПО',tR(g.overnight)],['Фьючерсы и опционы',tS(g.deriv)],
+      ['Общая налоговая база',`<b>${tR(g.base)}</b>`],['Налог 13 %',tR(g.tax13)],['Налог 15 %',tR(g.tax15)],['Налог по расчёту',`<b>${tR(g.tax)}</b>`],
+      ['Удержано брокером',tR(g.withheld)+(wk(g.w)?`<br><small class="mu">${wk(g.w)}</small>`:'')],['К доплате (+) / возврату (−)',`<b class="${g.diff>0.5?'neg':g.diff<-0.5?'pos':''}">${tS(g.diff)}</b>`],
+      ['Убыток года к переносу на будущие годы',g.loss_new>0.5?tR(g.loss_new):'—']];
+    const i=ii[g.key.replace('iis:','')];
+    const iis=i&&(i.type==='A'||i.type==='3')?(i.years.find(v=>v.year===y)||null):null;
+    return`<div class="card"><h2>${esc(g.name)}<span class="sp">${y}</span></h2><div class="tbl"><table><tbody>${rowsT.map(r=>`<tr><td class="l">${r[0]}</td><td class="num">${r[1]}</td></tr>`).join('')}</tbody></table></div>
+      ${iis?`<p class="note"><b>Вычет по ИИС (тип А):</b> взносы за год ${tR(iis.deposits)}, в вычет идёт ${tR(iis.deduct_base)}, к возврату до ${tR(iis.deduct)} (не больше уплаченного НДФЛ).</p>`:''}
+      ${g.lines.length?`<h3 style="margin:14px 0 6px;font-size:13px">Сделки по бумагам (до 80 крупнейших по результату)</h3><div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Кол-во</th><th>Выручка</th><th>Расход</th><th>Комиссия продажи</th><th>Результат</th><th>из них ЛДВ</th></tr></thead><tbody>${
+        g.lines.map(l=>`<tr><td class="l">${esc(l.name)}<br><small class="mu">${esc(l.ticker)}${l.kind==='repay'?' · погашение':l.kind==='amort'?' · амортизация':l.kind==='writeoff'?' · списание остатка':l.kind==='short'?' · шорт':''}</small></td><td class="num">${NF0.format(l.qty)}</td><td class="num">${tR(l.proceeds)}</td><td class="num">${tR(l.cost)}</td><td class="num">${tR(l.fee)}</td><td class="num ${cls(l.result)}">${tS(l.result)}</td><td class="num">${Math.abs(l.ldv_result)>0.5?tS(l.ldv_result):'—'}</td></tr>`).join('')}</tbody></table></div>`:''}</div>`}).join('')+
+    `<p class="note">Данные для заполнения 3-НДФЛ — справочные. Если налог удержан брокером полностью, декларация нужна, чтобы заявить вычет по ИИС, ЛДВ или перенос убытка. Справку о доходах и удержанном налоге запросите у брокера.</p>`;
+}
+
+/* ── Настройки налогов ── */
+function txDraft(d){
+  if(!S.tx.draft){const s=d.settings;S.tx.draft={iis:JSON.parse(JSON.stringify(s.iis||{})),loss:Object.keys(s.loss_carry||{}).sort().map(y=>({y:y,a:String(s.loss_carry[y])})),off:!!s.offset_coupons}}
+  return S.tx.draft;
+}
+function txIn(el){
+  const dr=S.tx.draft,k=el.dataset.k;
+  if(k==='iis'){dr.iis[el.dataset.id]=dr.iis[el.dataset.id]||{type:'',opened:''};dr.iis[el.dataset.id][el.dataset.f]=el.value}
+  else if(k==='loss'){dr.loss[+el.dataset.i][el.dataset.f]=el.value}
+  else if(k==='off'){dr.off=el.checked}
+}
+function txLossAdd(y,a){const dr=S.tx.draft;if(y&&dr.loss.some(r=>String(r.y)===String(y)))return;dr.loss.push({y:y?String(y):'',a:a?String(Math.round(a)):''});render()}
+function txLossDel(i){S.tx.draft.loss.splice(i,1);render()}
+async function txSave(btn){
+  const dr=S.tx.draft;btn.disabled=true;
+  try{
+    const lc={};for(const r of dr.loss){const y=String(r.y).trim(),a=parseFloat(String(r.a).replace(/\s/g,'').replace(',','.'));if(y&&a>0)lc[y]=a}
+    await post('/api/tax/settings',{iis:dr.iis,loss_carry:lc,offset_coupons:dr.off});
+    S.tx.msg='Сохранено';S.tx.data=null;S.tx.acc=null;render()
+  }catch(e){S.tx.msg=e.message;btn.disabled=false;render()}
+}
+function txSet(d){
+  const dr=txDraft(d);
+  const iisCards=d.iis.length?d.iis.map(i=>{const c=dr.iis[i.id]||{type:'',opened:''};
+    return`<div class="row" style="gap:14px;flex-wrap:wrap;margin-bottom:10px;align-items:flex-end"><div style="min-width:180px"><b>${esc(i.name)}</b><br><small class="mu">дата из API: ${tDt(i.opened)}</small></div>
+      <label class="field" style="max-width:230px"><span>Тип ИИС</span><select class="in" data-k="iis" data-id="${esc(i.id)}" data-f="type" onchange="txIn(this)">
+        ${[['','Не указан (считать как А)'],['A','А — вычет на взносы'],['B','Б — освобождение дохода'],['3','ИИС-3 (с 2024 года)']].map(([v,t])=>`<option value="${v}" ${c.type===v?'selected':''}>${t}</option>`).join('')}</select></label>
+      <label class="field" style="max-width:190px"><span>Дата открытия</span><input class="in" type="date" data-k="iis" data-id="${esc(i.id)}" data-f="opened" value="${esc(c.opened||'')}" onchange="txIn(this)"></label></div>`}).join(''):'<div class="note">Среди выбранных счетов нет ИИС.</div>';
+  const loss=dr.loss.map((r,i)=>`<div class="row" style="gap:10px;margin-bottom:8px;align-items:flex-end"><label class="field" style="max-width:110px"><span>Год убытка</span><input class="in num" type="number" min="2000" max="2100" value="${esc(r.y)}" data-k="loss" data-i="${i}" data-f="y" oninput="txIn(this)"></label>
+      <label class="field" style="max-width:200px"><span>Непогашенный убыток, ₽</span><input class="in num" type="text" value="${esc(r.a)}" data-k="loss" data-i="${i}" data-f="a" oninput="txIn(this)"></label>
+      <button class="btn ghost" onclick="txLossDel(${i})">Убрать</button></div>`).join('');
+  const sug=d.carry_suggest.filter(s=>!dr.loss.some(r=>String(r.y)===String(s.year)));
+  return`<div class="card"><h2>Счета ИИС</h2>${iisCards}</div>
+    <div class="card"><h2>Убытки прошлых лет<span class="sp">для переноса на будущие доходы (до 10 лет)</span></h2>
+      <p class="note">Внесите убытки, которые числятся за вами по прошлым декларациям или справкам брокера. Если для года указана сумма, она заменяет расчётный убыток этого года.</p>
+      ${loss||'<div class="note" style="margin-bottom:8px">Пока ничего не внесено.</div>'}
+      <div class="row" style="gap:10px"><button class="btn ghost" onclick="txLossAdd('','')">+ Добавить год</button></div>
+      ${sug.length?`<h3 style="margin:14px 0 6px;font-size:13px">Предложение по расчёту</h3>${sug.map(s=>`<div class="row" style="gap:10px;margin-bottom:6px"><span>${s.year}: убыток по расчёту <b>${tR(s.loss)}</b></span><button class="btn ghost" onclick="txLossAdd(${s.year},${Math.round(s.loss)})">Взять</button></div>`).join('')}`:''}</div>
+    <div class="card"><h2>Правила расчёта</h2><label class="sw"><input type="checkbox" ${dr.off?'checked':''} data-k="off" onchange="txIn(this)"><i></i><div><b>Убыток по сделкам уменьшает купонный доход</b><small>включите, если так считает ваш брокер; по умолчанию убыток гасит только прибыль по сделкам</small></div></label></div>
+    <div class="row noprint" style="gap:12px;margin-top:6px"><button class="btn" onclick="txSave(this)">Сохранить и пересчитать</button><span class="${/^Сохранено/.test(S.tx.msg)?'pos':'neg'}">${esc(S.tx.msg||'')}</span></div>`;
+}
 /* ── Импорт ── */
 const ROLE_RU={date:'Дата',type:'Тип операции',isin:'ISIN',ticker:'Тикер',name:'Название / описание',qty:'Количество',price:'Цена',amount:'Сумма',currency:'Валюта',commission:'Комиссия',nkd:'НКД'};
 async function renderImport(){
@@ -11173,7 +12231,33 @@ function ratesXHtml(){
   return h;
 }
 /* ── Ребалансировка ── */
-S.reb={contrib:'',buyOnly:true,draft:null};S.payDays=90;
+S.reb={contrib:'',buyOnly:true,draft:null,tax:null};S.payDays=90;
+/* налог при продаже (маршрут /api/tax/reb): сначала продаём бумаги с убытком и с наступившей ЛДВ */
+function rebTaxHtml(act,keys){
+  if(S.reb.buyOnly)return'';
+  const sells=keys.filter(k=>(act[k]||0)<-1&&!['currency','other'].includes(k)).map(k=>k+':'+Math.round(-act[k]));
+  if(!sells.length)return'';
+  const key=S.account+'|'+sells.join(','),t=S.reb.tax;
+  if(!t||t.key!==key){
+    const cur=S.reb.tax={key,data:null,err:0};
+    api('/api/tax/reb?'+new URLSearchParams({account:S.account,sells:sells.join(',')}))
+      .then(j=>{if(S.reb.tax===cur){cur.data=j;if(S.page==='reb')render()}})
+      .catch(e=>{if(S.reb.tax===cur){cur.err=1;if(S.page==='reb')render()}});
+    return`<div class="card">${waitBox('Считаю налог с продаж…')}</div>`;
+  }
+  if(t.err)return'';
+  if(!t.data)return`<div class="card">${waitBox('Считаю налог с продаж…')}</div>`;
+  const it=t.data.items.filter(x=>x.tax_plan!=null);
+  if(!it.length)return'';
+  const tot=it.reduce((a,x)=>a+x.tax_plan,0),nv=it.reduce((a,x)=>a+x.tax_naive,0);
+  const why=w=>w==='убыток'?'<span class="pos">убыток: налог не возникает</span>':w==='есть налог'?'<span class="neg">есть налог</span>':'<span class="pos">ЛДВ: прибыль освобождена</span>';
+  return`<div class="card"><h2>Налог при продаже<span class="sp">оценка НДФЛ за текущий год с учётом уже полученной прибыли</span></h2>
+    <div class="g g4">${kpi('Налог по плану',M(tot,'rub',0),'сначала лоты с убытком и с наступившей ЛДВ',tot>0?'neg':'pos')}${kpi('Если продавать пропорционально',M(nv,'rub',0),'всем бумагам класса поровну')}${kpi('Выгода порядка продаж',M(Math.max(0,nv-tot),'rub',0),'меньше налога',nv>tot?'pos':'')}</div>
+    ${it.map(x=>`<h3 style="margin:14px 0 6px;font-size:13px">${esc(TYPES[x.cls]||x.cls)}: продать на ${M(x.covered,'rub',0)}${x.covered<x.amount-1?` (из ${M(x.amount,'rub',0)} — не хватает бумаг с известной ценой)`:''} · налог ${M(x.tax_plan,'rub',0)}</h3>
+      <div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Продать</th><th>Результат продажи</th><th class="l">Почему</th></tr></thead><tbody>${x.plan.map(p=>`<tr><td class="l"><b>${esc(p.name)}</b><br><small class="mu">${esc(p.ticker)}</small></td><td class="num">${M(p.sell_rub,'rub',0)}<br><small class="mu">${NF0.format(p.qty)} шт.</small></td><td class="num ${cls(p.result)}">${SM(p.result)}</td>
+        <td class="l">${why(p.why)}${p.ldv_soon?'<br><small class="neg">ЛДВ наступит меньше чем через полгода — лучше подождать</small>':''}</td></tr>`).join('')||'<tr><td colspan="4" class="l mu">Нет данных о лотах</td></tr>'}</tbody></table></div>`).join('')}
+    <p class="note">Справочная оценка: порядок бумаг подбирается по ожидаемому налогу, продажа идёт по FIFO внутри каждой бумаги. Брокер как налоговый агент считает сам; это не налоговая консультация.</p></div>`;
+}
 function pReb(){
   const ps=S.data.portfolio.positions,tot=ps.reduce((a,x)=>a+(x.value_rub||0),0);
   if(!(tot>0))return'<div class="card empty">В портфеле нет активов для расчёта</div>';
@@ -11206,7 +12290,8 @@ function pReb(){
       <label class="sw"><input type="checkbox" id="rb-b" ${buyOnly?'checked':''}><i></i><div><b>Только докупать</b><small>Ничего не продавать, распределить взнос</small></div></label></div>
     <div class="tbl"><table><thead><tr><th class="l">Класс</th><th>Сейчас, ₽</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>Действие</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="row" style="margin-top:14px"><button class="btn" id="rb-s">Сохранить цели</button><button class="btn ghost" id="rb-r">Сбросить</button><span class="reb-sum" id="rb-sum"></span></div></div>
-  <p class="note">Расчёт по классам активов (акции, облигации, фонды, валюта…) на уровне портфеля, без учёта комиссий, налогов и лотности. Это справочный расчёт, а не инвестиционная рекомендация. Цели сохраняются локально.</p>`;
+  ${rebTaxHtml(act,keys)}
+  <p class="note">Расчёт по классам активов (акции, облигации, фонды, валюта…) на уровне портфеля, без учёта комиссий и лотности; налог при продаже оценивается отдельно (в режиме с продажами). Это справочный расчёт, а не инвестиционная рекомендация. Цели сохраняются локально.</p>`;
 }
 function bindReb(){
   const d=S.reb.draft;
