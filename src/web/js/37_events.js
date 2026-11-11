@@ -19,8 +19,8 @@ function loadCal(){
   if(c&&(c.loading||c.data||c.error))return;
   const [from,to]=calRange();
   S.cal.cache[key]={loading:true};
-  api('/api/events?'+new URLSearchParams({account:S.account,from,to})).then(d=>{S.cal.cache[key]={data:d};if(S.page==='cal')render()})
-   .catch(e=>{S.cal.cache[key]={error:e.message};if(S.page==='cal')render()});
+  api('/api/events?'+new URLSearchParams({account:S.account,from,to})).then(d=>{S.cal.cache[key]={data:d};if(S.page==='cal')renderSoon()})
+   .catch(e=>{S.cal.cache[key]={error:e.message};if(S.page==='cal')renderSoon()});
 }
 const calP2=n=>String(n).padStart(2,'0');
 function calMoney(e){return e.amount!=null?M(e.amount,'rub',2):''}

@@ -25,7 +25,7 @@ function drawOps(){
     rows.map(o=>`<tr><td class="num t2">${esc(o[0])}</td><td class="l"><span class="tag">${esc(OPN[o[1]]||o[1])}</span></td>
     <td class="l" style="max-width:380px">${o[3]||o[4]?`<div class="tk">${logo({name:o[3],ticker:o[4],logo:o[11]},24)}<div><b style="font-weight:550">${esc(o[3]||o[4])}</b></div></div>`:''}</td>
     ${multi?`<td class="l t2" style="max-width:160px;overflow:hidden;text-overflow:ellipsis">${esc(o[12])}</td>`:''}
-    <td class="num">${o[5]||''}</td><td class="num">${o[6]?f2(o[6]):''}</td><td class="num ${cls(o[7])}">${SM(o[7],o[8])}</td><td class="num mu">${o[9]?f2(o[9]):''}</td><td class="num ${cls(o[10])}">${o[10]?SM(o[10],o[8]):''}</td></tr>`).join('')+
+    <td class="num">${o[5]||''}</td><td class="num">${o[6]?f2(o[6]):''}</td><td class="num ${cls(o[7])}">${SM(o[7],o[8])}</td><td class="num mu">${o[9]?f2m(o[9]):''}</td><td class="num ${cls(o[10])}">${o[10]?SM(o[10],o[8]):''}</td></tr>`).join('')+
     `</tbody></table>${all.length>rows.length?`<div class="more"><button class="btn ghost" id="omore">Показать ещё (${f0(all.length-rows.length)})</button></div>`:''}</div>`;
   const m=$('#omore');if(m)m.onclick=()=>{S.opsN+=500;drawOps()};
 }

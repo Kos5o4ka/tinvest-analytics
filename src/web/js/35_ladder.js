@@ -8,7 +8,7 @@ function ladRun(){
   const p=new URLSearchParams({sum:String(q.sum||'500000').replace(/\s/g,'').replace(',','.'),years:q.years||'5',min_rating:q.rating||'A',floaters:q.floaters?'1':'0',amort:q.amort?'1':'0',monthly:q.monthly?'1':'0'});
   if(q.rungs)p.set('rungs',q.rungs);
   S.lad={loading:true};render();
-  api('/api/ladder?'+p).then(d=>{S.lad={data:d};if(S.page==='lad')render()}).catch(e=>{S.lad={error:e.message};if(S.page==='lad')render()});
+  api('/api/ladder?'+p).then(d=>{S.lad={data:d};if(S.page==='lad')renderSoon()}).catch(e=>{S.lad={error:e.message};if(S.page==='lad')renderSoon()});
 }
 function ladChart(el){
   const d=S.lad&&S.lad.data;if(!d||!d.cashflow_by_month||!d.cashflow_by_month.length)return emptyChart(el,260,'Нет выплат');
@@ -27,7 +27,7 @@ function ladResult(d){
   d.rungs.forEach((r,i)=>{
     body+=`<tr class="ld-rung"><td class="l" colspan="4">Ступень ${i+1}: срок около ${ddm(r.target_date)}</td><td colspan="2" class="num">${r.bonds.length?M(r.cost,'rub',0):'—'}</td><td colspan="2"></td></tr>`;
     if(!r.bonds.length)body+=`<tr><td class="l mu" colspan="8">Подходящих бумаг не нашлось</td></tr>`;
-    r.bonds.forEach(b=>{body+=`<tr data-isin="${esc(b.isin)}" title="Открыть карточку"><td class="l"><b style="font-weight:600">${esc(b.name)}</b>${b.floating?' <span class="tag">флоатер</span>':''}${b.amort?' <span class="tag">аморт</span>':''}<br><small class="mu">${esc(b.isin)}</small></td>
+    r.bonds.forEach(b=>{body+=`<tr data-isin="${esc(b.isin)}" title="Открыть карточку"><td class="l"><b style="font-weight:600">${esc(b.name)}</b>${b.floating?' <span class="tag">флоатер</span>':''}${b.amort?' <span class="tag">аморт</span>':''}<br><small class="mu num">${isinTxt(b.isin)}</small></td>
       <td class="l"><span class="tag rt rt-${esc(rBucket(b.rating).split(' ')[0])}">${esc(b.rating)}</span></td><td class="num">${pctp(b.ytm,1)}</td>
       <td class="num">${ddm(b.end_date)}<br><small class="mu">${b.end_kind==='offer'?'оферта':'погашение'}</small></td><td class="num">${b.lots} шт.<br><small class="mu">по ${f2(b.price)} %</small></td><td class="num">${M(b.cost,'rub',0)}<br><small class="mu">${pctp(b.share,1)}</small></td>
       <td class="l">${ladMonths(b.coupon_months)}</td></tr>`});

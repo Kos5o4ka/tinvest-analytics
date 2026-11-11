@@ -1,4 +1,14 @@
 /* ── Зашифрованная резервная копия и экспорт ── */
+/* постоянная плашка: копия принята, но применится только при следующем запуске */
+function restoreBar(on){
+  let b=document.getElementById('restore-bar');
+  if(!on){if(b)b.remove();return}
+  if(b)return;
+  b=document.createElement('div');b.id='restore-bar';b.className='msg err';b.setAttribute('role','alert');
+  b.innerHTML='<b>Копия будет применена при следующем запуске программы — перезапустите её.</b> До перезапуска на экране показаны прежние данные.';
+  const v=document.getElementById('view');v.parentNode.insertBefore(b,v);
+}
+setTimeout(()=>{api('/api/backup/status').then(s=>restoreBar(!!(s&&s.restore_pending))).catch(()=>{})},2500);
 function setBackupHtml(c){
   const ex=(w,t)=>`<div class="bk-ex"><span>${t}</span><a class="btn ghost" href="/api/export?what=${w}&fmt=csv&account=${encodeURIComponent(S.account||'all')}" download>CSV</a><a class="btn ghost" href="/api/export?what=${w}&fmt=xlsx&account=${encodeURIComponent(S.account||'all')}" download>Excel</a></div>`;
   return`<div class="card" id="bkcard"><h2>Резервная копия<span class="sp">зашифрована паролем</span></h2><div style="display:grid;gap:14px">
@@ -13,7 +23,7 @@ function setBackupHtml(c){
     <p class="note" id="bkinfo">Загружаю…</p><div id="bkfiles"></div>
     <h3 style="margin:6px 0 0;font-size:14px">Восстановление</h3>
     <div class="row"><input type="file" id="bkfile" accept=".tinvbak" class="in" style="flex:1;min-width:200px"><input class="in" type="password" id="bkrpw" placeholder="пароль этой копии" autocomplete="off" style="width:200px"><button class="btn ghost" id="bkrest">Восстановить</button></div>
-    <p class="note">Текущая база сохранится рядом как data.db.before-restore, а новая подставится при следующем запуске программы. Токен не меняется.</p></div></div>
+    <p class="note">Копия будет применена при следующем запуске программы — перезапустите её (до этого на экране прежние данные). Текущая база сохранится рядом как data.db.before-restore. Токен не меняется.</p></div></div>
   <div class="card"><h2>Экспорт данных<span class="sp">для Excel</span></h2><div style="display:grid;gap:8px">
     ${ex('positions','Позиции')}${ex('bonds','Облигации')}${ex('payments','Выплаты на год вперёд')}${ex('ops','Операции')}${ex('screener','Скринер облигаций')}
     <p class="note">CSV — в UTF-8 с разделителем «;» (открывается в Excel без настройки), Excel — файл .xlsx с числами и датами. Данные берутся по выбранному слева счёту.</p></div></div>`}
@@ -30,6 +40,7 @@ function bindSetBackup(c,msg){
       $('#bksug').onclick=e=>{const b=e.target.closest('[data-p]');if(b)$('#bkdir').value=b.dataset.p+(b.dataset.p.endsWith('/')?'':'/')+'TInvestBackup'}}
     $('#bkpwst').innerHTML=s.pw_set?'<span class="pos">· сохранён</span>':'<span class="mu">· не сохранён</span>';
     $('#bkclr').style.display=s.pw_set?'':'none';
+    restoreBar(!!s.restore_pending);
     const l=s.last;
     $('#bkinfo').innerHTML=s.running?'Делаю копию (шифрование занимает до минуты)…':l?(l.ok?`Последняя копия: ${esc(dt(l.t))}, ${esc(l.file)}, ${kb(l.size)}, ${l.sec} с${l.removed?`; удалено старых: ${l.removed}`:''}.`:`<span class="neg">Последняя попытка (${esc(dt(l.t))}) не удалась: ${esc(l.error)}</span>`):'Копий ещё не делали.';
     $('#bkfiles').innerHTML=s.dir_ok&&s.files.length?`<div class="note">В папке (${s.files.length}): ${s.files.slice(0,5).map(f=>esc(f.name)+' · '+kb(f.size)).join('; ')}${s.files.length>5?'…':''}</div>`:(s.dir&&!s.dir_ok?`<div class="note neg">${esc(s.dir_msg)}</div>`:'');
@@ -50,5 +61,6 @@ function bindSetBackup(c,msg){
     msg('Расшифровываю и проверяю копию…',1);
     const b64=await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]||'');r.onerror=()=>no(new Error('Не удалось прочитать файл'));r.readAsDataURL(f)});
     await post('/api/backup/restore',{data:b64,password:$('#bkrpw').value});$('#bkrpw').value='';
-    msg('Копия проверена и готова к восстановлению. Закройте программу полностью и запустите снова, тогда данные заменятся.',1)});
+    restoreBar(true);
+    msg('Копия проверена и принята. Копия будет применена при следующем запуске программы — перезапустите её. До перезапуска на экране остаются прежние данные.',1)});
 }
