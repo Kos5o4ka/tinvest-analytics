@@ -15,7 +15,8 @@
 
 Что делает сервер:
 
-- `GET /v1/health` — `{ok, version, uptime, cache_items}`;
+- `GET /v1/health` — открыт без ключа: `{ok, version, uptime, cache_items, auth: "keys"|"key"|"none", bot}`;
+- `GET /v1/auth/check` — проверка ключа из `X-Client-Key`: 200 `{ok, expires, username, plan, bot}` или 401 `{ok:false, error:"invalid"|"expired"|"banned", bot}`;
 - `GET /v1/stats` — счётчики по хостам, доля попаданий в кэш, ошибки источников (без адресов клиентов);
 - `GET|POST /v1/fetch?url=<url-кодированный адрес>` — получить страницу источника. Ответ: статус источника, тело (в том числе
   бинарное, например PDF Банка России), `Content-Type`, заголовки `X-Cache: hit|miss|stale` и `X-Age`.
@@ -51,7 +52,7 @@ python3 server/tinvest_server.py --port 8780 --data ./srvdata --key МОЙ_КЛ�
 python3 server/tinvest_server.py --version
 ```
 
-Флаги: `--host`, `--port`, `--data`, `--key` (или переменная `TINVEST_SERVER_KEY`), `--max-mb`, `--verbose`.
+Флаги: `--host`, `--port`, `--data`, `--key` (или переменная `TINVEST_SERVER_KEY`), `--keys-db` (`TINVEST_KEYS_DB`), `--bot` (`TINVEST_BOT`), `--max-mb`, `--verbose`.
 Если задан ключ, каждый запрос обязан содержать заголовок `X-Client-Key` (сравнение за постоянное время); без ключа сервер открыт для всех, кто до него дотянется,
 поэтому на публичном адресе ключ нужен.
 
@@ -60,51 +61,68 @@ python3 server/tinvest_server.py --version
 
 ## Развёртывание на VPS
 
-1. Создайте отдельного пользователя и каталоги:
+Сервер данных и Telegram-бот работают на одном VPS от одного пользователя `tinvest` и делят базу ключей
+`/var/lib/tinvest-bot/keys.sqlite`. Код ставится git-клонами, каждую ночь в 03:00 МСК таймер подтягивает обновления
+и перезапускает только то, что изменилось. Готовые файлы лежат в `server/deploy/`.
+
+1. Пользователь и каталоги:
 
    ```
    sudo useradd --system --home /var/lib/tinvest-server --shell /usr/sbin/nologin tinvest
-   sudo mkdir -p /opt/tinvest-server /var/lib/tinvest-server
-   sudo cp tinvest_server.py /opt/tinvest-server/
-   sudo chown -R tinvest:tinvest /var/lib/tinvest-server
+   sudo mkdir -p /var/lib/tinvest-server /var/lib/tinvest-bot
+   sudo chown tinvest:tinvest /var/lib/tinvest-server /var/lib/tinvest-bot
    ```
 
-2. Ключ доступа положите в файл окружения (права 0600), чтобы он не светился в списке процессов:
+2. Код сервера (публичный репозиторий):
 
    ```
-   echo 'TINVEST_SERVER_KEY=сгенерируйте_длинную_случайную_строку' | sudo tee /etc/tinvest-server.env
-   sudo chmod 600 /etc/tinvest-server.env
+   sudo git clone https://github.com/Kos5o4ka/tinvest-analytics.git /opt/tinvest-analytics
    ```
 
-3. Юнит systemd `/etc/systemd/system/tinvest-server.service`:
+3. Код бота (закрытый репозиторий) через deploy-ключ только на чтение:
 
    ```
-   [Unit]
-   Description=T-Invest Analytics data server
-   After=network-online.target
-   Wants=network-online.target
-
-   [Service]
-   User=tinvest
-   Group=tinvest
-   EnvironmentFile=/etc/tinvest-server.env
-   ExecStart=/usr/bin/python3 /opt/tinvest-server/tinvest_server.py --host 127.0.0.1 --port 8780 --data /var/lib/tinvest-server
-   Restart=on-failure
-   NoNewPrivileges=true
-   ProtectSystem=strict
-   ProtectHome=true
-   PrivateTmp=true
-   ReadWritePaths=/var/lib/tinvest-server
-
-   [Install]
-   WantedBy=multi-user.target
+   sudo ssh-keygen -t ed25519 -N "" -f /root/.ssh/tinvest_bot_deploy
+   sudo cat /root/.ssh/tinvest_bot_deploy.pub
    ```
 
+   Добавьте ключ в GitHub: репозиторий tinvest-bot → Settings → Deploy keys → Add deploy key (галочку «Allow write access» не ставьте). Затем:
+
    ```
+   sudo GIT_SSH_COMMAND="ssh -i /root/.ssh/tinvest_bot_deploy -o IdentitiesOnly=yes" \
+        git clone git@github.com:Kos5o4ka/tinvest-bot.git /opt/tinvest-bot
+   sudo git -C /opt/tinvest-bot config core.sshCommand "ssh -i /root/.ssh/tinvest_bot_deploy -o IdentitiesOnly=yes"
+   ```
+
+4. Настройки бота: `sudo cp /opt/tinvest-bot/.env.example /etc/tinvest-bot.env && sudo chmod 600 /etc/tinvest-bot.env`, впишите `BOT_TOKEN`
+   от @BotFather и свой Telegram ID в `ADMIN_ID`, `KEYS_DB=/var/lib/tinvest-bot/keys.sqlite`.
+   По желанию общий ключ для своих клиентов и мониторинга: `echo 'TINVEST_SERVER_KEY=длинная_случайная_строка' | sudo tee /etc/tinvest-server.env`.
+
+5. Сервисы и таймер:
+
+   ```
+   sudo cp /opt/tinvest-bot/tinvest-bot.service /etc/systemd/system/
+   sudo cp /opt/tinvest-analytics/server/deploy/tinvest-server.service \
+           /opt/tinvest-analytics/server/deploy/tinvest-update.service \
+           /opt/tinvest-analytics/server/deploy/tinvest-update.timer /etc/systemd/system/
    sudo systemctl daemon-reload
+   sudo systemctl enable --now tinvest-bot          # первым: создаёт базу ключей
    sudo systemctl enable --now tinvest-server
-   curl -H "X-Client-Key: ..." http://127.0.0.1:8780/v1/health
+   sudo systemctl enable --now tinvest-update.timer
    ```
+
+6. Проверка:
+
+   ```
+   curl http://127.0.0.1:8780/v1/health                 # "auth": "keys", "bot": "tanalyticbot"
+   systemctl list-timers tinvest-update.timer           # когда следующий запуск
+   journalctl -u tinvest-bot -u tinvest-server -n 50    # журналы
+   ```
+
+   Напишите боту `/start`, получите ключ и проверьте: `curl -H "X-Client-Key: TIA-…" http://127.0.0.1:8780/v1/auth/check`.
+
+Если сервер уже работал по старой схеме (`/opt/tinvest-server/tinvest_server.py`), остановите и отключите старый юнит перед шагом 5,
+кэш в `/var/lib/tinvest-server` подхватится новым сервисом.
 
 ## Cloudflare Tunnel
 
@@ -136,13 +154,45 @@ Cloudflare терминирует TLS: между пользователем и 
 
 ## Обновление
 
+Автоматически: `tinvest-update.timer` в 03:00 МСК запускает `server/deploy/tinvest-update.sh`. Скрипт делает `git fetch` обоих
+репозиториев, при новых коммитах в `main` переключает код, проверяет, что Python-файл компилируется, перезапускает сервис и через 5 секунд
+проверяет, что он жив (для сервера данных ещё и `/v1/health`). Если сервис не поднялся, код откатывается на прежний коммит.
+Без изменений ничего не перезапускается: ежедневный перезапуск «на всякий случай» не нужен, упавший сервис systemd поднимает сам (`Restart=always`).
+
+Вручную, не дожидаясь ночи: `sudo systemctl start tinvest-update && journalctl -u tinvest-update -n 20`.
+
+Если поменялись сами юниты в `server/deploy/`, скопируйте их заново в `/etc/systemd/system/` и выполните `sudo systemctl daemon-reload`.
+Кэш в `/var/lib/tinvest-server` сохраняется. Чтобы сбросить его целиком, остановите сервис и удалите `cache.sqlite*`.
+
+## Вход по ключу из Telegram-бота
+
+Доступ к приложению выдаёт бот `@tanalyticbot` (по умолчанию; меняется флагом `--bot`): он присылает ключ вида `TIA-XXXX-XXXX-XXXX`, действующий 24 часа.
+Бот живёт в **отдельном закрытом репозитории** и пишет в SQLite-файл, который этот сервер только читает (файл общий, режим WAL):
+
 ```
-sudo cp tinvest_server.py /opt/tinvest-server/tinvest_server.py
-sudo systemctl restart tinvest-server
+python3 tinvest_server.py --keys-db /var/lib/tinvest-bot/keys.sqlite --bot tanalyticbot
 ```
 
-Кэш в `/var/lib/tinvest-server` сохраняется. Чтобы сбросить его целиком, остановите сервис и удалите `cache.sqlite*`.
+Контракт базы (создаёт и ведёт бот):
+
+```
+users(tg_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, created REAL, consent REAL,
+      banned INTEGER NOT NULL DEFAULT 0, plan TEXT NOT NULL DEFAULT 'free')
+keys(key_hash TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, created REAL NOT NULL, expires REAL NOT NULL,
+     revoked INTEGER NOT NULL DEFAULT 0, last_used REAL)
+```
+
+`key_hash = sha256(normalize(key))` в hex, `normalize(k) = k.strip().upper().replace(" ", "")`; время — unix-секунды. Сами ключи в базе не хранятся.
+
+Ключ принимается, если запись есть, `revoked = 0`, `expires` в будущем и пользователь не забанен. Клиент получает идентификатор `tg:<tg_id>`.
+Отказ приходит как 401 с `error`: `invalid` (неизвестный ключ), `expired` (истёк или отозван), `banned`.
+
+- Проверки кэшируются в памяти: успешные на 60 секунд, но не дольше `expires`; отказы на 10 секунд. Отзыв ключа и бан действуют с задержкой до минуты.
+- Сервер сам пишет в базу только `keys.last_used` (не чаще раза в минуту на ключ, ошибки блокировки игнорируются). База открывается отдельным соединением на поток, с `busy_timeout`.
+- Если базу не удалось открыть, запросы с ключами получают 401, в журнал один раз пишется причина; сервер не падает.
+- Общий `--key` продолжает работать наряду с ключами бота (подходит для своих клиентов и мониторинга). Если не задано ни то ни другое, доступ открыт.
+- В приложении по умолчанию используется `https://aurora-bot.duckdns.org:8443/tinvest`; токен Т-Инвестиций на сервер и в бот не передаётся.
 
 ## На будущее
 
-Проверка доступа вынесена в функцию `authorize()` в `tinvest_server.py` — сюда подключится вход через Telegram (сессия пользователя вместо общего ключа).
+Проверка доступа вынесена в функцию `authorize_ex()` / `authorize()` в `tinvest_server.py`.

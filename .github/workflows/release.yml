@@ -1,0 +1,103 @@
+name: release-binaries
+# Собирает нативные приложения (лаунчер в PyInstaller) и добавляет их к релизу.
+# Ассет tinvest_analytics.py и его строку в SHA256SUMS не трогает: на них опирается лаунчер.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег релиза, к которому добавить сборки (например v0.16)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest        # Apple Silicon (arm64)
+            asset: TInvestAnalytics-mac-arm64.zip
+          - os: macos-15-intel      # Intel; метка раннера может измениться — при необходимости обновите
+            asset: TInvestAnalytics-mac-x64.zip
+          - os: windows-latest
+            asset: TInvestAnalytics-win.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Зависимости сборки (только для сборки, в программе их нет)
+        run: pip install pyinstaller==6.22.3 certifi pillow
+      - name: Программа из релиза (чтобы собрать список её импортов)
+        run: gh release download "$TAG" -p tinvest_analytics.py -D release_app --clobber
+      - name: Список импортов программы
+        run: python packaging/gen_hidden_imports.py release_app/tinvest_analytics.py -o packaging/hidden_imports.txt
+      - name: Иконки
+        run: python packaging/make_icon.py build_icons
+      - name: Сборка
+        env:
+          TINVEST_APP_SRC: release_app/tinvest_analytics.py
+          TINVEST_ICON_DIR: build_icons
+        run: pyinstaller --noconfirm --distpath build_out/dist --workpath build_out/work packaging/tinvest.spec
+      - name: Проверка архитектуры и подпись (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          APP="build_out/dist/T-Invest Analytics.app"
+          want="${{ contains(matrix.asset, 'arm64') && 'arm64' || 'x86_64' }}"
+          info="$(file "$APP/Contents/MacOS/T-Invest Analytics")"
+          echo "$info"
+          echo "$info" | grep -q "$want" || { echo "::error::ожидалась архитектура $want"; exit 1; }
+          # arm64-бинарники без подписи macOS не запускает («повреждён»): подписываем ad-hoc явно
+          codesign --force --deep -s - "$APP"
+          codesign --verify --deep --strict "$APP"
+          codesign -dv "$APP" 2>&1 | head -5
+      - name: Упаковка (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent "build_out/dist/T-Invest Analytics.app" "${{ matrix.asset }}"
+      - name: Упаковка (Windows)
+        if: runner.os == 'Windows'
+        run: cp build_out/dist/TInvestAnalytics.exe "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bin
+          merge-multiple: true
+      - name: Контрольные суммы и загрузка в релиз
+        run: |
+          set -euo pipefail
+          mkdir sums && cd sums
+          gh release download "$TAG" -p SHA256SUMS -R "$GITHUB_REPOSITORY" || touch SHA256SUMS
+          cd ../bin
+          ls -l
+          # строки для наших бинарников заменяем, остальные (в том числе tinvest_analytics.py) не трогаем
+          for f in *; do
+            awk -v n="$f" '{ if ($2 != n && $2 != "*" n) print }' ../sums/SHA256SUMS > ../sums/tmp
+            mv ../sums/tmp ../sums/SHA256SUMS
+          done
+          sha256sum * >> ../sums/SHA256SUMS
+          cat ../sums/SHA256SUMS
+          gh release upload "$TAG" * ../sums/SHA256SUMS --clobber -R "$GITHUB_REPOSITORY"

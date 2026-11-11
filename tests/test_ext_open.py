@@ -73,12 +73,12 @@ class ExtOpenTests(unittest.TestCase):
         self.fk = Fake()
         self.addCleanup(self.fk.close)
         self.orig = dict(self.m._ds_state)
-        os.environ.pop("TINVEST_DATA_SERVER", None)
+        os.environ["TINVEST_DATA_SERVER"] = "off"
         os.environ.pop("TINVEST_DATA_KEY", None)
         self.set_cfg("", "")
 
     def tearDown(self):
-        os.environ.pop("TINVEST_DATA_SERVER", None)
+        os.environ["TINVEST_DATA_SERVER"] = "off"
         os.environ.pop("TINVEST_DATA_KEY", None)
         self.set_cfg("", "")
 
