@@ -8,3 +8,7 @@
   .wrap{max-width:none}
   @page{margin:12mm}
 }
+@media print{
+  .disc{display:block!important;position:fixed;left:0;right:0;bottom:0;border:0;padding:0 0 2mm;color:#666;font-size:9px}
+  #toast,#kp-ov,#restore-bar{display:none!important}
+}

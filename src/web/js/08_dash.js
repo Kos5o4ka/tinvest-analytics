@@ -7,7 +7,7 @@ function pDash(){
   const income=sumK(t,['dividends','coupons','overnight']),taxes=sumK(t,TAXK);
   const profit=d.profit,ppct=d.invested>0&&profit!=null?profit/d.invested*100:null,hs=histSlice();
   const hero=`<div class="card hero"><div style="position:relative;z-index:1"><div class="lbl">Стоимость портфеля</div>
-    <div class="val num">${f2(p.total)} <small>₽</small></div>
+    <div class="val num">${f2m(p.total)} <small>₽</small></div>
     <div class="row" style="margin-top:10px">${p.daily!=null?`<span class="pill ${cls(p.daily)}">${SM(p.daily)} · ${pct(p.daily_pct)} за день</span>`:''}
     <span class="pill ${cls(p.upnl)}">${SM(p.upnl)} · ${pct(p.yield_pct)} по открытым позициям</span></div></div>
     <div class="meta"><div><span>Вложено (пополнения − выводы)</span><b class="num">${M(d.invested,'rub',0)}</b></div>

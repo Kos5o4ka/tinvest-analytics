@@ -1,30 +1,45 @@
 /* ── Облигации ── */
-function heatCell(v,mx,rgb,txt){if(bad(v))return'<td class="num mu">—</td>';const a=Math.max(0,Math.min(1,v/(mx||1)));return`<td class="num" style="background:rgba(${rgb},${(0.06+a*0.5).toFixed(3)})">${txt}</td>`}
+/* интенсивность показана лёгким «бейджем» вокруг значения, а не заливкой всей ячейки */
+function heatCell(v,mx,rgb,txt){if(bad(v))return'<td class="num mu">—</td>';const a=Math.max(0,Math.min(1,v/(mx||1)));return`<td class="num"><span class="hv" style="background:rgba(${rgb},${(0.05+a*0.15).toFixed(3)})">${txt}</span></td>`}
+S.bpre=lsGet('ta_bpre')||'main';
+function bondsPreset(k){S.bpre=k;lsSet('ta_bpre',k);render()}
 function pBonds(){
   const b=S.bonds;
   if(!b)return`<div class="card">${waitBox('Загружаю параметры облигаций и графики купонов…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   const m=b.metrics,tot=S.data.portfolio.total||1;
   if(!m.count)return'<div class="card empty">В портфеле нет облигаций</div>';
-  let rows=b.rows.slice();rows.forEach(r=>r.rk=r.rating?RSC.indexOf(r.rating.v):null);const{k,d}=S.bsort;
+  let rows=b.rows.slice();rows.forEach(r=>{r.rk=r.rating?RSC.indexOf(r.rating.v):null;r.next_d=r.next?r.next[0]:null;r.next_sum=r.next&&r.next[1]!=null?r.next[1]*(r.qty||0):null});const{k,d}=S.bsort;
   rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
   const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(1,...rows.map(r=>Math.min(r.ytm||0,60))),mxD=Math.max(...rows.map(r=>r.dur||0));
-  const cols=[['name','Облигация','l'],['qty','Кол-во'],['buy_pct','Покупка, %'],['price_pct','Цена, %'],['value_rub','Стоимость'],['pnl_rub','P&L'],['share','Доля'],['ytm','Доходность'],['ytm_tax','После НДФЛ'],['spread','Спред к КБД'],['dur','Дюрация'],['coupon','Купон'],['next','След. купон'],['maturity','Погашение'],['rk','Рейтинг','l'],['risk','Риск','l']];
-  const th=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
-  const body=rows.map(r=>`<tr data-isin="${esc(r.isin||r.ticker||'')}"><td>${ident(r,[r.ticker,r.floating?(r.est_coupons?'флоатер · прогноз купонов':'флоатер'):'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>
-    <td class="num">${f0(r.qty)}</td><td class="num">${r.buy_pct!=null?f2(r.buy_pct):'—'}</td><td class="num">${r.price_pct!=null?f2(r.price_pct):'—'}</td>
-    <td class="num">${M(r.value_rub,'rub',0)}</td>
-    <td class="num ${cls(r.pnl_rub)}"><span class="arr">${r.pnl_rub>0?'▲':r.pnl_rub<0?'▼':''}</span>${r.pnl_pct!=null?pct(r.pnl_pct,1):'—'}</td>
-    ${heatCell(r.share,mxS,'201,133,0',pctp(r.share))}
-    ${heatCell(r.ytm,mxY,'25,158,112',r.ytm!=null?pctp(r.ytm,2)+(r.to==='offer'?' <small class="mu">оф.</small>':'')+(r.cf_source==='approx'?' <small class="mu" title="Приблизительный расчёт: нет графика выплат MOEX">≈</small>':''):'—')}
-    ${heatCell(r.ytm_tax,mxY,'25,158,112',r.ytm_tax!=null?pctp(r.ytm_tax,2):'—')}
-    <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread)+' п.п.':'—'}</td>
-    ${heatCell(r.dur,mxD,'213,81,129',r.dur!=null?r.dur.toFixed(2).replace('.',',')+' г':'—')}
-    <td class="num">${r.coupon!=null?pctp(r.coupon,2):'—'}</td>
-    <td class="num">${r.next?`${ddm(r.next[0])}<br><small class="mu">${M(r.next[1])}</small>`:'—'}</td>
-    <td class="num">${r.maturity?ddm(r.maturity):'—'}${r.call?`<br><small class="mu">оферта ${ddm(r.call)}</small>`:''}</td>
-    <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
-    <td class="l">${r.risk?`<span class="tag" style="${r.risk==='высокий'?'color:var(--neg)':r.risk==='низкий'?'color:var(--pos)':''}">${r.risk}</span>`:''}</td></tr>`).join('');
+  const BC_COLS={
+    name:['Облигация','l',r=>`<td>${ident(r,[r.ticker,r.floating?(r.est_coupons?'флоатер · прогноз купонов':'флоатер'):'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>`],
+    qty:['Кол-во','',r=>`<td class="num">${f0(r.qty)}</td>`],
+    buy_pct:['Покупка, %','',r=>`<td class="num">${r.buy_pct!=null?f2(r.buy_pct):'—'}</td>`],
+    price_pct:['Цена, %','',r=>`<td class="num">${r.price_pct!=null?f2(r.price_pct):'—'}</td>`],
+    value_rub:['Стоимость','',r=>`<td class="num">${M(r.value_rub,'rub',0)}</td>`],
+    pnl_rub:['P&L','',r=>`<td class="num ${cls(r.pnl_rub)}"><span class="arr">${r.pnl_rub>0?'▲':r.pnl_rub<0?'▼':''}</span>${r.pnl_pct!=null?pct(r.pnl_pct,1):'—'}</td>`],
+    share:['Доля','',r=>heatCell(r.share,mxS,'201,133,0',pctp(r.share))],
+    ytm:['Доходность','',r=>heatCell(r.ytm,mxY,'25,158,112',r.ytm!=null?pctp(r.ytm,2)+(r.to==='offer'?' <small class="mu">оф.</small>':'')+(r.cf_source==='approx'?' <small class="mu" title="Приблизительный расчёт: нет графика выплат MOEX">≈</small>':''):'—')],
+    ytm_tax:['После НДФЛ','',r=>heatCell(r.ytm_tax,mxY,'25,158,112',r.ytm_tax!=null?pctp(r.ytm_tax,2):'—')],
+    spread:['Спред к КБД','',r=>`<td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread)+' п.п.':'—'}</td>`],
+    dur:['Дюрация','',r=>heatCell(r.dur,mxD,'213,81,129',r.dur!=null?r.dur.toFixed(2).replace('.',',')+' г':'—')],
+    coupon:['Купон','',r=>`<td class="num">${r.coupon!=null?pctp(r.coupon,2):'—'}</td>`],
+    next:['След. купон','',r=>`<td class="num">${r.next?`${ddm(r.next[0])}<br><small class="mu">${M(r.next[1])}</small>`:'—'}</td>`],
+    next_sum:['Сумма выплаты','',r=>`<td class="num">${r.next&&r.next[1]!=null?M(r.next[1]*(r.qty||0),r.face_cur||'rub',0):'—'}</td>`],
+    ctype:['Тип купона','l',r=>`<td class="l">${r.floating?'<span class="tag">флоатер</span>':'<span class="tag">фиксированный</span>'}</td>`],
+    amort:['Амортизация','l',r=>`<td class="l">${r.amort?'<span class="tag">да</span>':'<span class="mu">—</span>'}</td>`],
+    maturity:['Погашение','',r=>`<td class="num">${r.maturity?ddm(r.maturity):'—'}${r.call?`<br><small class="mu">оферта ${ddm(r.call)}</small>`:''}</td>`],
+    rk:['Рейтинг','l',r=>`<td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>`],
+    risk:['Риск','l',r=>`<td class="l">${r.risk?`<span class="tag" style="${r.risk==='высокий'?'color:var(--neg)':r.risk==='низкий'?'color:var(--pos)':''}">${r.risk}</span>`:''}</td>`]};
+  const BC_PRE={main:['Основное',['name','price_pct','ytm','coupon','maturity','rk','value_rub']],
+    an:['Аналитика',['name','price_pct','ytm','ytm_tax','spread','dur','rk','risk','share']],
+    cal:['Календарь',['name','next','next_sum','ctype','amort','maturity','coupon']],
+    all:['Все колонки',['name','qty','buy_pct','price_pct','value_rub','pnl_rub','share','ytm','ytm_tax','spread','dur','coupon','next','maturity','rk','risk']]};
+  const pre=BC_PRE[S.bpre]?S.bpre:'main',cols=BC_PRE[pre][1];
+  const th=cols.map(kk=>{const[t,c]=BC_COLS[kk];const sk=kk==='next'?'next_d':kk==='ctype'?'floating':kk;return`<th class="s ${c||''}" data-s="${sk}">${t} <span>${k===sk?(d>0?'↑':'↓'):''}</span></th>`}).join('');
+  const body=rows.map(r=>`<tr data-isin="${esc(r.isin||r.ticker||'')}">${cols.map(kk=>BC_COLS[kk][2](r)).join('')}</tr>`).join('');
+  const presetBar=`<div class="seg noprint" style="margin:0 0 10px">${Object.entries(BC_PRE).map(([k2,v])=>`<button class="${k2===pre?'on':''}" onclick="bondsPreset('${k2}')">${v[0]}</button>`).join('')}</div>`;
   const sk=['-3','-2','-1','1','2','3'],st=m.stress||{};
   chart('c-stress',bars,{h:220,labels:sk.map(x=>(x>0?'+':'−')+Math.abs(x)+' п.п.'),series:[{n:'Изменение стоимости',c:S3,v:sk.map(x=>(st[x]||{}).rub||0)}],legend:false,
     colorOf:v=>v>=0?'#19a070':'#d5524a',empty:'Нет данных для стресс-теста'});
@@ -38,7 +53,7 @@ function pBonds(){
     ${kpi('Дюрация',m.dur!=null?m.dur.toFixed(2).replace('.',',')+' года':'—','средневзвешенная, по Маколею',null,S5)}
     ${kpi('Текущая купонная доходность',pctp(m.cur_yield,2),'годовой купон / цена',null,S4)}
     ${kpi('Купоны за 12 месяцев',M(m.coupons_12m,'rub',0),'по графику выплат, до налога','pos',S7)}</div>
-    <div class="card" style="padding:12px 10px 6px"><div class="tbl" style="max-height:calc(100vh - 200px)"><table id="btab" class="bt"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div></div>
+    <div class="card" style="padding:12px 10px 6px">${presetBar}<div class="tbl" style="max-height:calc(100vh - 240px)"><table id="btab" class="bt"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div></div>
     <div class="g g3"><div class="card"><h2>Лестница погашений и оферт, ₽</h2><div id="c-ladder" class="chart"></div></div>
     <div class="card"><h2>Кредитный риск (оценка брокера)</h2>${hbars(b.risk.map(([n,v])=>({n,v,c:n==='высокий'?S8:n==='низкий'?S3:n==='средний'?S4:'#6f7686',s:pctp(v/(m.value||1)*100)})),S1,null,0)}</div>
     <div class="card"><h2>Тип купона, выпусков</h2>${hbars(b.kinds.map(([n,v],i)=>({n,v,c:PAL[i]})),S1,x=>f0(x.v),1)}</div></div>

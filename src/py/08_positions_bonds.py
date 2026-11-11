@@ -289,6 +289,15 @@ def bond_price_face(r, b, rates):
     return (r["price"] or 0.0) * k, (r["avg"] or 0.0) * k, aci if aci is not None else 0.0
 
 
+def issuer_group_key(name):
+    """Ключ эмитента по названию выпуска: без правовых форм и номеров серий; все ОФЗ — один эмитент (Минфин)."""
+    n = (name or "").strip()
+    low = n.lower().replace("ё", "е")
+    if low.startswith("офз") or "минфин" in low or low.startswith("ofz"):
+        return "минфин"
+    return "".join(sorted(name_tokens(_bond_query(n)))) or low
+
+
 def bonds_report(client, rows):
     today = date.today().isoformat()
     horizon = (date.today() + timedelta(days=365)).isoformat()
@@ -404,21 +413,29 @@ def bonds_report(client, rows):
 
     def divs(r):
         st = store()
-        v = st.get("div:" + r["uid"], ttl=DAY)
+        v = st.get("div2:" + r["uid"], ttl=DAY)
         if v is None and client.ready:
             try:
                 ds = client.dividends(r["uid"], today + "T00:00:00Z", horizon + "T00:00:00Z")
-                v = [[iso_date(d.get("paymentDate")) or iso_date(d.get("recordDate")), qf(d.get("dividendNet"))] for d in ds]
-                st.put("div:" + r["uid"], v)
+                v = [[iso_date(d.get("paymentDate")) or iso_date(d.get("recordDate")), qf(d.get("dividendNet")),
+                      cur_of(d.get("dividendNet"), r.get("cur") or "rub")] for d in ds]
+                st.put("div2:" + r["uid"], v)
             except ApiError:
                 v = []
         return r, v or []
 
-    for r, ds in pool_map(divs, shares):
-        for d, per in ds:
-            if d and today < d <= horizon and per:
+    div_data = list(pool_map(divs, shares))
+    dcurs = {(x[2] if len(x) > 2 else r.get("cur") or "rub") for r, ds in div_data for x in ds}
+    if dcurs - set(rates):
+        rates = dict(fx_now(client, dcurs - set(rates)), **rates)
+    for r, ds in div_data:
+        for x in ds:
+            d, per = x[0], x[1]
+            dc = (x[2] if len(x) > 2 else r.get("cur") or "rub").lower()
+            kk = 1.0 if dc == "rub" else rates.get(dc)
+            if d and today < d <= horizon and per and kk:        # выплата в валюте — переводим в рубли по текущему курсу
                 pays.append({"date": d, "kind": "dividend", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
-                             "amount": per * r["qty"], "est": False})
+                             "amount": per * r["qty"] * kk, "est": False, "cur": dc})
     pays.sort(key=lambda p: p["date"])
     irr = portfolio_irr(irr_items, today)
     metrics = {"count": len(bonds), "value": tot_bonds,
@@ -434,7 +451,7 @@ def bonds_report(client, rows):
                "dur": w["dur"] / w["dur_v"] if w["dur_v"] else None,
                "cur_yield": w["cy"] / w["cy_v"] if w["cy_v"] else None,
                "coupons_12m": sum(p["amount"] for p in pays if p["kind"] == "coupon"),
-               "issuers": len({r["name"].split(" ")[0] for r in bonds})}
+               "issuers": len({issuer_group_key(r["name"]) for r in bonds})}
     out.sort(key=lambda x: -(x.get("value_rub") or 0))
     return {"rows": out, "metrics": metrics, "ladder": sorted(ladder.items()), "risk": sorted(risk.items(), key=lambda x: -x[1]),
             "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays,

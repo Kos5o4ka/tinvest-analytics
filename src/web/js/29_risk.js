@@ -5,11 +5,11 @@ S.rsort={k:'value_rub',d:-1};
 function loadRisk(){
   if(S._riskLoading)return;S._riskLoading=1;const acc=S.account,q=S.riskQ;
   const p=new URLSearchParams({account:acc,recovery:q.rec||'25',horizon:String(q.hor||'3').replace(',','.')});if(q.target!=='')p.set('target',q.target.replace(',','.'));if(q.tax)p.set('tax','1');
-  api('/api/risk?'+p).then(j=>{S._riskLoading=0;if(S.account!==acc)return;S.risk=j;S.riskAcc=acc;if(S.page==='risk')render()})
-   .catch(e=>{S._riskLoading=0;S.risk={error:e.message};S.riskAcc=acc;if(S.page==='risk')render()});
+  api('/api/risk?'+p).then(j=>{S._riskLoading=0;if(S.account!==acc)return;S.risk=j;S.riskAcc=acc;if(S.page==='risk')renderSoon()})
+   .catch(e=>{S._riskLoading=0;S.risk={error:e.message};S.riskAcc=acc;if(S.page==='risk')renderSoon()});
 }
 const rkPd=x=>x==null?'—':x*100<0.1?'&lt;0,1 %':pctp(x*100,x*100<10?1:0);
-const rkRub=(v,d=0)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+NF0.format(Math.abs(v))+' ₽';
+const rkRub=(v,d=0)=>bad(v)?'—':INCOG.on?MASK+' ₽':(v>0?'+':v<0?'−':'')+NF0.format(Math.abs(v))+' ₽';
 const rkPct=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' %';
 function rkScnChart(el){
   const d=S.risk;if(!d||!d.scenarios)return;
@@ -85,7 +85,7 @@ function pRisk(){
   return ctl+kp+rkDurBlock(d)+`<div class="card"><h2>Сценарии ключевой ставки<span class="sp">доход за 12 месяцев (до ${hd}), без реинвестирования купонов</span></h2><div class="chart" id="rk-scn"></div>${scT}
     <p class="note" style="margin-top:10px">Сдвиг кривой доходности = Δ ключевой ставки × β: β = 1,0 для срока до 1 года и линейно снижается до 0,5 на сроке 7 лет и дольше (длинные ставки реагируют слабее). Кредитные спреды не меняются. Выпуск переоценивается через 12 месяцев: оставшиеся потоки дисконтируются по текущей доходности со сдвигом на дюрации остатка. Купоны флоатеров следуют траектории ставки сценария плюс спред эмитента; ставка идёт линейно к целевой за 12 месяцев. Сценарий «Рынок» доступен, если получен рыночный путь ставки.</p></div>
   <div class="g c-2-1 rk-g"><div class="card"><h2>Флоатеры против фиксированного купона<span class="sp">доходность подпортфелей за 12 месяцев</span></h2>${fT}<p class="note" style="margin-top:10px">${esc(rkFloatText(d))}</p></div>
-  <div class="card"><h2>«Казино»: если эмитенты не вернут долг</h2>${cs}<p class="note" style="margin-top:10px">Дефолтят самые рискованные эмитенты по рыночной вероятности. Потеря = (1 − возврат ${d.recovery.toFixed(0)} %) × стоимость позиций эмитента; купоны по ним за год не учитываются. База — сценарий «ставка без изменений» (${rkRub(d.base_rub)}).</p></div></div>
+  <div class="card"><h2>Стресс-тест дефолтов: если эмитенты не вернут долг</h2>${cs}<p class="note" style="margin-top:10px">Дефолтят самые рискованные эмитенты по рыночной вероятности. Потеря = (1 − возврат ${d.recovery.toFixed(0)} %) × стоимость позиций эмитента; купоны по ним за год не учитываются. База — сценарий «ставка без изменений» (${rkRub(d.base_rub)}).</p></div></div>
   <div class="card"><h2>Выпуски: риск дефолта и запас прочности<span class="sp">нажмите на строку — карточка выпуска; заголовок — сортировка</span></h2><div class="tbl rk-tbl"><table id="rk-tab"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div>
     <p class="note" style="margin-top:10px">PD рынка: из спреда к КБД s и доли возврата R: λ = s / (1 − R), PD(T) = 1 − e<sup>−λT</sup>. Ожидаемая доходность = доходность − PD по рейтингу (1 год) × (1 − R). Без рейтинга (*) берётся рыночная PD. Запас — на сколько п.п. должна вырасти доходность, чтобы убрать результат года (купоны + переоценка) в ноль; для коротких и плавающих бумаг запас велик.</p></div>
   <div class="card"><h2>Допущения и источники</h2><p class="note">${esc(d.sources.pd)}<br><br>${esc(d.sources.recovery)}<br><br>Таблица PD по рейтингу, % за год: ${Object.entries(d.pd_hist_table).map(([k,v])=>k+' '+String(v).replace('.',',')).join(' · ')}.

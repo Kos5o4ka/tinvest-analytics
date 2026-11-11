@@ -26,11 +26,17 @@ const IC={
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
 const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['pri','Первичка'],['cal','Календарь событий'],null,['imp','Импорт отчётов'],['set','Настройки']];
+/* группы меню: ключи страниц остаются прежними, PAGES — плоский список для поиска названий */
+const NAV_GROUPS=[['Портфель',['dash','ret','bench','pos','bonds','pay','off','ops','fees']],['Учёт и планы',['tax','reb','calc','lad']],
+  ['Рынок',['mkt','scr','map','sig','pri','cal']],['Риски и контроль',['risk','mon','watch','iss']]];
+const NAV_FIXED=['imp','set'],NAV_PINNED=['dash','set'];
+function lsJson(k,d){try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}}
+function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
 const PERIOD_PAGES=['dash','ret','bench','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
 let st={};try{st=JSON.parse(lsGet('ta_state')||'{}')||{}}catch(e){}
-const S={page:st.page||'dash',period:st.period||'all',account:st.account||'all',hideEmpty:st.hideEmpty!==false,
+const S={navHidden:lsJson('ta_nav_hidden',[]),navShut:lsJson('ta_nav_shut',{}),page:st.page||'dash',period:st.period||'all',account:st.account||'all',hideEmpty:st.hideEmpty!==false,
   data:null,bonds:null,hist:null,cfg:null,loading:false,err:null,accounts:[],
   sort:{k:'value_rub',d:-1},bsort:{k:'value_rub',d:-1},posType:'',opsN:200,opsQ:'',opsK:'',charts:[],imp:null};
 function persist(){try{localStorage.setItem('ta_state',JSON.stringify({page:S.page,period:S.period,account:S.account,hideEmpty:S.hideEmpty}))}catch(e){}}
@@ -56,8 +62,8 @@ function staleRefresh(path,first){
       if(j&&j.stale&&n<40){setTimeout(tick,4000);return}
       delete _stl[key];
       if(!j||j.error)return;
-      if(isB){S.bonds=j;if(['dash','bonds','pay'].includes(S.page))render()}
-      else{S.hist=j;if(['dash','ret'].includes(S.page))render()}
+      if(isB){S.bonds=j;if(['dash','bonds','pay'].includes(S.page))renderSoon()}
+      else{S.hist=j;if(['dash','ret'].includes(S.page))renderSoon()}
     }catch(e){delete _stl[key]}
   };
   setTimeout(tick,4000);

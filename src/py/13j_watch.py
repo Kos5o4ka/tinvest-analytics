@@ -275,11 +275,14 @@ def _tg_esc(s):
     return str(s if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+TG_DISCLAIMER = "\n\n<i>Не является ИИР.</i>"
+
+
 def tg_send(cfg, text):
     chat = str(cfg.get("tg_chat") or "").strip()
     if not chat:
         raise ApiError("Не указан chat id.", 400)
-    return tg_call(cfg.get("tg_token"), "sendMessage", {"chat_id": chat, "text": text[:4000], "parse_mode": "HTML",
+    return tg_call(cfg.get("tg_token"), "sendMessage", {"chat_id": chat, "text": text[:3970] + TG_DISCLAIMER, "parse_mode": "HTML",
                                                          "disable_web_page_preview": True})
 
 

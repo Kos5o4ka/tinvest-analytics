@@ -213,10 +213,14 @@ def parse_date(s):
     return None
 
 
+_TAX_W = ("ндфл", "налог", "tax")
 TYPE_WORDS = [
+    # налоги — первыми: «удержание НДФЛ с дивидендов» не должно стать дивидендом, «налог с купона» — купоном
+    (("ндфл с дивиденд", "налог с дивиденд", "налог на дивиденд", "удержан налог с дивиденд", "dividend tax", "tax on dividend"), "DIVIDEND_TAX"),
+    (("ндфл с купон", "налог с купон", "налог на купон", "ндфл по купон", "налог по купон", "ндфл с процент", "coupon tax", "tax on coupon"), "BOND_TAX"),
+    (_TAX_W, "TAX"),
     (("амортиз",), "BOND_REPAYMENT"), (("погашен", "redemption"), "BOND_REPAYMENT_FULL"),
     (("купон", "coupon"), "COUPON"), (("дивиденд", "dividend"), "DIVIDEND"),
-    (("ндфл", "налог", "tax"), "TAX"),
     (("маржин", "перенос позиц", "плеч", "заем", "займ"), "MARGIN_FEE"),
     (("обслуж", "тариф", "депозитар"), "SERVICE_FEE"), (("комисс", "commission", "fee"), "BROKER_FEE"),
     (("покуп", "buy", "купля"), "BUY"), (("продаж", "sell"), "SELL"),
@@ -249,6 +253,7 @@ def norm_cur(s):
 
 
 SIGN = {"BUY": -1, "SELL": 1, "COUPON": 1, "DIVIDEND": 1, "BOND_REPAYMENT": 1, "BOND_REPAYMENT_FULL": 1, "TAX": -1,
+        "DIVIDEND_TAX": -1, "BOND_TAX": -1,
         "BROKER_FEE": -1, "SERVICE_FEE": -1, "MARGIN_FEE": -1, "INPUT": 1, "OUTPUT": -1}
 
 
@@ -300,7 +305,7 @@ def rows_to_ops(rows, mapping, header=None):
             continue
         amount = abs(amount or 0.0) * SIGN.get(kind, 1)
         cur = norm_cur(cell(row, "currency"))
-        ident = isin or ticker or (name if kind in ("BUY", "SELL", "COUPON", "DIVIDEND", "BOND_REPAYMENT", "BOND_REPAYMENT_FULL") else "")
+        ident = isin or ticker or (name if kind in ("BUY", "SELL", "COUPON", "DIVIDEND", "BOND_REPAYMENT", "BOND_REPAYMENT_FULL", "DIVIDEND_TAX", "BOND_TAX") else "")
         o = {"id": "imp-" + uuid.uuid4().hex[:12], "date": dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "type": "OPERATION_TYPE_" + kind,
              "payment": to_money(round(amount, 9), cur), "name": name or ticker or isin, "_ident": ident}
         if qty:

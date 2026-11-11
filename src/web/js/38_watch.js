@@ -15,7 +15,7 @@ function watchHas(isin){
 }
 function watchRefreshView(){
   if(S.page==='scr'&&S.scr&&!S.scr.error&&$('#scr-body'))drawScr();
-  else if(['watch','mon'].includes(S.page))render();
+  else if(['watch','mon'].includes(S.page))renderSoon();
 }
 /* добавить/убрать бумагу; вызывается карточкой облигации и скринером */
 async function watchToggle(isin){
@@ -36,13 +36,13 @@ function watchEnsure(){
   if(w&&(w.loading||w.error||(w.data&&Date.now()-w.t<3e5)))return;
   S.watch={loading:true,t:Date.now()};
   api('/api/watch').then(d=>{S.watch={data:d,t:Date.now()};S.wset=new Set(d.items.map(x=>x.isin));
-    if(['watch','mon'].includes(S.page))render()}).catch(e=>{S.watch={error:e.message,t:Date.now()};if(['watch','mon'].includes(S.page))render()});
+    if(['watch','mon'].includes(S.page))renderSoon()}).catch(e=>{S.watch={error:e.message,t:Date.now()};if(['watch','mon'].includes(S.page))renderSoon()});
 }
 function notesEnsure(){
   const n=S.wnotes;
   if(n&&(n.loading||n.error||n.data))return;
   S.wnotes={loading:true};
-  api('/api/notes').then(d=>{S.wnotes={data:d.rows};if(S.page==='watch')render()}).catch(e=>{S.wnotes={error:e.message};if(S.page==='watch')render()});
+  api('/api/notes').then(d=>{S.wnotes={data:d.rows};if(S.page==='watch')renderSoon()}).catch(e=>{S.wnotes={error:e.message};if(S.page==='watch')renderSoon()});
 }
 
 /* группа «Наблюдение» на странице «Мониторинг» */
@@ -62,7 +62,7 @@ function watchMonGroup(){
 function wtRow(r){
   const th=v=>v!=null?String(v).replace('.',','):'';
   const sp=r.spark&&r.spark.length>2?monSpark(r.spark,70,22):'';
-  return`<tr data-isin="${esc(r.isin)}" title="Открыть карточку"><td class="l"><b style="font-weight:600">${esc(r.name)}</b>${r.n_high?` <span class="tag" style="color:var(--neg)">!</span>`:''}<br><small class="mu num">${esc(r.isin)}${r.offer?' · оферта '+ddm(r.offer):''}${r.mat?' · до '+ddm(r.mat):''}</small></td>
+  return`<tr data-isin="${esc(r.isin)}" title="Открыть карточку"><td class="l"><b style="font-weight:600">${esc(r.name)}</b>${r.n_high?` <span class="tag" style="color:var(--neg)">!</span>`:''}<br><small class="mu num">${isinTxt(r.isin)}${r.offer?' · оферта '+ddm(r.offer):''}${r.mat?' · до '+ddm(r.mat):''}</small></td>
     <td class="l">${r.rating?`<span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}">${esc(r.rating)}</span>`:'<span class="mu">—</span>'}</td>
     <td class="num">${r.price!=null?f2(r.price):'—'}</td><td class="num"><b>${r.yield_!=null?pctp(r.yield_,2):'—'}</b></td>
     <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
@@ -121,7 +121,7 @@ function bindWatch(){
   const q=$('#wt-q');
   if(q){
     const draw=()=>{const box=$('#wt-sug');if(!box)return;
-      box.innerHTML=S.wsug.length?S.wsug.map(x=>`<div class="wt-s" data-isin="${esc(x.isin)}"><div><b>${esc(x.name)}</b><small class="mu num"> ${esc(x.isin)}${x.mat?' · до '+ddm(x.mat):''}</small></div><span class="num">${x.yield!=null?pctp(x.yield,1):''}</span>
+      box.innerHTML=S.wsug.length?S.wsug.map(x=>`<div class="wt-s" data-isin="${esc(x.isin)}"><div><b>${esc(x.name)}</b><small class="mu num"> ${isinTxt(x.isin)}${x.mat?' · до '+ddm(x.mat):''}</small></div><span class="num">${x.yield!=null?pctp(x.yield,1):''}</span>
         <button class="btn ${x.in_watch?'ghost':''} wt-sm" data-wadd="${esc(x.isin)}" ${x.in_watch?'disabled':''}>${x.in_watch?'в списке':'Добавить'}</button></div>`).join(''):(q.value.trim().length>=2?'<div class="mu" style="padding:8px 2px;font-size:13px">Ничего не найдено среди облигаций, торгуемых на Мосбирже.</div>':'')};
     draw();
     q.oninput=()=>{clearTimeout(to);const v=q.value.trim(),my=++seq;

@@ -6,8 +6,8 @@ function loadSig(force){
   const k=sigKey();if(S.sig.loading&&!force)return;
   S.sig.loading=true;S.sig.err=null;
   const p=new URLSearchParams({account:S.account,min_turn:S.sig.f.turn,fee:S.sig.fee,threshold:S.sig.thr});if(force)p.set('force','1');
-  api('/api/signals?'+p).then(j=>{S.sig.loading=false;S.sig.d=j;S.sig.key=k;if(S.page==='sig')render()})
-    .catch(e=>{S.sig.loading=false;S.sig.err=e.message||String(e);S.sig.key=k;if(S.page==='sig')render()});
+  api('/api/signals?'+p).then(j=>{S.sig.loading=false;S.sig.d=j;S.sig.key=k;if(S.page==='sig')renderSoon()})
+    .catch(e=>{S.sig.loading=false;S.sig.err=e.message||String(e);S.sig.key=k;if(S.page==='sig')renderSoon()});
 }
 const sgN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
 const sgS=(v,d=2)=>v==null||isNaN(v)?'—':(v>0?'+':'')+sgN(v,d);

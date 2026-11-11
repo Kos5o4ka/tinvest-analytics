@@ -3,8 +3,8 @@ S.ratesDays=365;S.rates=null;
 const RDAYS=[[90,'3 мес'],[180,'6 мес'],[365,'Год'],[730,'2 года']];
 function loadRates(){
   const d=S.ratesDays;
-  api('/api/rates?days='+d).then(j=>{if(d!==S.ratesDays)return;S.rates=j;if(S.page==='mkt')render();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays)loadRates()},3000)})
-   .catch(e=>{S.rates={error:e.message,labels:[]};if(S.page==='mkt')render()});
+  api('/api/rates?days='+d).then(j=>{if(d!==S.ratesDays)return;S.rates=j;if(S.page==='mkt')renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays)loadRates()},3000)})
+   .catch(e=>{S.rates={error:e.message,labels:[]};if(S.page==='mkt')renderSoon()});
 }
 const pc1=v=>v==null?'—':(+v).toFixed(2).replace(/0$/,'').replace(/\.0$/,'').replace('.',',')+'%';
 function pMkt(){
@@ -34,7 +34,7 @@ function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КБД · 2 года: 
 S.ratesX=null;
 function loadRatesX(force){
   if(S._rxL&&!force)return;S._rxL=1;
-  api('/api/rates/extra').then(j=>{S._rxL=0;S.ratesX=j;if(S.page==='mkt'){render();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
+  api('/api/rates/extra').then(j=>{S._rxL=0;S.ratesX=j;if(S.page==='mkt'){renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
    .catch(e=>{S._rxL=0;S.ratesX={error:e.message}})
 }
 const RX_COL=['#ffdd2d','#3987e5','#19a070','#d95926','#9085e9'];

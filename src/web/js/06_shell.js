@@ -1,6 +1,19 @@
 /* ── shell ── */
+const navBtn=p=>`<button class="${p[0]===S.page?'on':''}" data-p="${p[0]}">${svgI(IC[p[0]])}${p[1]}</button>`;
+function navHid(k){return S.navHidden.includes(k)&&!NAV_PINNED.includes(k)&&k!==S.page}
 function renderNav(){
-  $('#nav').innerHTML=PAGES.map(p=>p?`<button class="${p[0]===S.page?'on':''}" data-p="${p[0]}">${svgI(IC[p[0]])}${p[1]}</button>`:'<div class="sep"></div>').join('');
+  const pg=k=>PAGES.find(p=>p&&p[0]===k);
+  const known=new Set(NAV_FIXED.concat(...NAV_GROUPS.map(g=>g[1])));
+  const extra=PAGES.filter(p=>p&&!known.has(p[0])).map(p=>p[0]);      /* страницы вне групп не теряются */
+  const groups=NAV_GROUPS.concat(extra.length?[['Прочее',extra]]:[]);
+  let h='';
+  for(const[g,keys]of groups){
+    const items=keys.filter(k=>pg(k)&&!navHid(k));if(!items.length)continue;
+    const act=items.includes(S.page),shut=!!S.navShut[g]&&!act;
+    h+=`<div class="ng${shut?' shut':''}"><button class="ngh" data-g="${esc(g)}" aria-expanded="${!shut}"><i>▾</i>${esc(g)}</button>${shut?'':items.map(k=>navBtn(pg(k))).join('')}</div>`;
+  }
+  h+='<div class="sep"></div>'+NAV_FIXED.map(k=>pg(k)).filter(Boolean).map(navBtn).join('');
+  $('#nav').innerHTML=h;
   $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
   $('#period').style.visibility=PERIOD_PAGES.includes(S.page)?'visible':'hidden';
   const a=S.accounts.find(x=>x.id===S.account);
@@ -16,7 +29,7 @@ function renderAccounts(){
       <small>${a.kind==='import'?'<em>импорт</em>':''}${a.type?`<em>${esc(a.type)}</em>`:''}${a.closed?'<em>закрыт</em>':''}</small></button>`).join('')+
     (S.hideEmpty&&vis.length<accs.length?`<div class="note" style="padding:4px 10px">Скрыто пустых: ${accs.length-vis.length}</div>`:'');
 }
-$('#nav').onclick=e=>{const b=e.target.closest('[data-p]');if(!b)return;go(b.dataset.p)};
+$('#nav').onclick=e=>{const g=e.target.closest('[data-g]');if(g){const n=g.dataset.g;S.navShut[n]=!S.navShut[n];lsSet('ta_nav_shut',JSON.stringify(S.navShut));renderNav();return}const b=e.target.closest('[data-p]');if(!b)return;go(b.dataset.p)};
 $('#period').onclick=e=>{const b=e.target.closest('[data-k]');if(!b||b.dataset.k===S.period)return;S.period=b.dataset.k;persist();renderNav();load(false,true)};
 $('#acl').onclick=e=>{const b=e.target.closest('[data-a]');if(!b||b.dataset.a===S.account)return;S.account=b.dataset.a;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
 $('#hideEmpty').onchange=e=>{S.hideEmpty=e.target.checked;persist();renderAccounts()};
@@ -43,14 +56,27 @@ async function load(force,periodOnly){
 function loadExtra(force){
   const acc=S.account,p=new URLSearchParams({account:acc});if(force)p.set('force','1');
   if(force){S.bonds=null;S.hist=null}
-  if(!S.bonds)api('/api/bonds?'+p).then(b=>{if(S.account!==acc)return;S.bonds=b;notifyUpcoming();if(['dash','bonds','pay'].includes(S.page))render()}).catch(e=>{if(S.account!==acc)return;S.bonds={error:e.message};if(['bonds','pay'].includes(S.page))render()});
-  if(!S.hist)api('/api/history?'+p).then(h=>{if(S.account!==acc)return;S.hist=h;if(['dash','ret'].includes(S.page))render()}).catch(e=>{if(S.account!==acc)return;S.hist={error:e.message,days:[]};if(['dash','ret'].includes(S.page))render()});
+  if(!S.bonds)api('/api/bonds?'+p).then(b=>{if(S.account!==acc)return;S.bonds=b;notifyUpcoming();if(['dash','bonds','pay'].includes(S.page))renderSoon()}).catch(e=>{if(S.account!==acc)return;S.bonds={error:e.message};if(['bonds','pay'].includes(S.page))renderSoon()});
+  if(!S.hist)api('/api/history?'+p).then(h=>{if(S.account!==acc)return;S.hist=h;if(['dash','ret'].includes(S.page))renderSoon()}).catch(e=>{if(S.account!==acc)return;S.hist={error:e.message,days:[]};if(['dash','ret'].includes(S.page))renderSoon()});
 }
 function skeleton(){
   $('#view').innerHTML=`<div class="wrap"><div class="sk" style="height:130px"></div><div class="g g6">${'<div class="sk" style="height:96px"></div>'.repeat(6)}</div>
   <div class="g c-2-1"><div class="sk" style="height:320px"></div><div class="sk" style="height:320px"></div></div></div>`;
 }
-function render(){
+/* Перерисовка #view. Фоновые перерисовки (ответ сервера, таймеры) откладываются, пока пользователь печатает в поле ввода
+   внутри #view: иначе innerHTML сбросит фокус и введённый текст. Действия пользователя (клик, ввод) рисуют сразу. */
+let _rPend=false;
+function typingInView(){
+  const a=document.activeElement,v=$('#view');
+  if(!a||a===document.body||!v||!v.contains(a))return false;
+  const t=a.tagName;
+  return t==='TEXTAREA'||t==='SELECT'||(t==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|file|color|image)$/.test(a.type));
+}
+function render(){if(!window.event&&typingInView()){_rPend=true;return}renderNow()}
+function renderSoon(){if(typingInView()){_rPend=true;return}renderNow()}
+document.addEventListener('focusout',()=>{if(_rPend)setTimeout(()=>{if(_rPend&&!typingInView())renderNow()},400)});
+function renderNow(){
+  _rPend=false;
   S.charts=[];hideTip();prInfo();
   const v=$('#view');
   if(S.page==='set')return renderSettings();

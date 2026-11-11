@@ -3,8 +3,8 @@ function loadOff(){
   const acc=S.account,o=S.off;
   if(o&&o.acc===acc&&(o.loading||o.data||o.error))return;
   S.off={acc,loading:true};
-  api('/api/offers?'+new URLSearchParams({account:acc})).then(d=>{if(S.account!==acc)return;S.off={acc,data:d};if(S.page==='off')render()})
-   .catch(e=>{if(S.account!==acc)return;S.off={acc,error:e.message};if(S.page==='off')render()});
+  api('/api/offers?'+new URLSearchParams({account:acc})).then(d=>{if(S.account!==acc)return;S.off={acc,data:d};if(S.page==='off')renderSoon()})
+   .catch(e=>{if(S.account!==acc)return;S.off={acc,error:e.message};if(S.page==='off')renderSoon()});
 }
 const OF_HINT={sell_market:['Продать на бирже','of-info'],put:['Предъявить','of-warn'],hold:['Держать','of-ok'],wait:['Подождать','of-wait'],call:['Предупреждение','of-warn'],closed:['Поздно','of-wait']};
 const ofDays=n=>n===0?'сегодня':n===1?'завтра':'через '+n+' '+(n%10===1&&n%100!==11?'день':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'дня':'дней');

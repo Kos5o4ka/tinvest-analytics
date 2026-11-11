@@ -6,7 +6,7 @@ function monEnsure(){
   S.mon={acc,loading:true,t:Date.now()};
   api('/api/monitor?'+new URLSearchParams({account:acc})).then(d=>{if(S.account!==acc)return;S.mon={acc,data:d,t:Date.now()};
     try{notifyMon(d)}catch(e){}
-    if(['mon','dash'].includes(S.page))render()}).catch(e=>{if(S.account!==acc)return;S.mon={acc,error:e.message,t:Date.now()};if(S.page==='mon')render()});
+    if(['mon','dash'].includes(S.page))renderSoon()}).catch(e=>{if(S.account!==acc)return;S.mon={acc,error:e.message,t:Date.now()};if(S.page==='mon')renderSoon()});
 }
 function monSpark(sp,w=96,h=26){
   if(!sp||sp.length<3)return'<span class="mu">—</span>';

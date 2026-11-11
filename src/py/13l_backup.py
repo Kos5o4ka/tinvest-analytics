@@ -308,7 +308,8 @@ def api_backup_status(cfg, acc, q, force):
     return {"running": _bk_state["running"], "last": st, "dir": d, "dir_ok": ok, "dir_msg": msg,
             "files": backup_list(d) if ok else [], "suggest": _bk_suggest(), "pw_set": bool(cfg.get("backup_password")),
             "auto": bool(cfg.get("backup_auto")), "keep": _bk_clamp_keep(cfg.get("backup_keep")),
-            "home": os.path.expanduser("~"), "windows": platform.system() == "Windows"}
+            "home": os.path.expanduser("~"), "windows": platform.system() == "Windows",
+            "restore_pending": os.path.exists(DB_PATH + ".restore-pending")}
 
 
 def api_backup_settings(cfg, body):

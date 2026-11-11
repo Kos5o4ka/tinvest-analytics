@@ -9,8 +9,8 @@ function rebTaxHtml(act,keys){
   if(!t||t.key!==key){
     const cur=S.reb.tax={key,data:null,err:0};
     api('/api/tax/reb?'+new URLSearchParams({account:S.account,sells:sells.join(',')}))
-      .then(j=>{if(S.reb.tax===cur){cur.data=j;if(S.page==='reb')render()}})
-      .catch(e=>{if(S.reb.tax===cur){cur.err=1;if(S.page==='reb')render()}});
+      .then(j=>{if(S.reb.tax===cur){cur.data=j;if(S.page==='reb')renderSoon()}})
+      .catch(e=>{if(S.reb.tax===cur){cur.err=1;if(S.page==='reb')renderSoon()}});
     return`<div class="card">${waitBox('Считаю налог с продаж…')}</div>`;
   }
   if(t.err)return'';

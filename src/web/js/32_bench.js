@@ -9,8 +9,8 @@ function bnKey(){return S.account+'|'+S.period}
 function bnLoadData(){
   const key=bnKey();if(S.bnLoad===key)return;S.bnLoad=key;
   const p=new URLSearchParams({account:S.account,period:S.period});
-  api('/api/bench?'+p).then(j=>{if(S.bnLoad===key)S.bnLoad=null;S.bn[key]={d:j,t:Date.now()};if(S.page==='bench'&&bnKey()===key)render()})
-   .catch(e=>{if(S.bnLoad===key)S.bnLoad=null;S.bn[key]={d:{error:e.message},t:Date.now(),fail:1};if(S.page==='bench'&&bnKey()===key)render()});
+  api('/api/bench?'+p).then(j=>{if(S.bnLoad===key)S.bnLoad=null;S.bn[key]={d:j,t:Date.now()};if(S.page==='bench'&&bnKey()===key)renderSoon()})
+   .catch(e=>{if(S.bnLoad===key)S.bnLoad=null;S.bn[key]={d:{error:e.message},t:Date.now(),fail:1};if(S.page==='bench'&&bnKey()===key)renderSoon()});
 }
 function bnCur(){const e=S.bn[bnKey()];return e&&Date.now()-e.t<10*60*1000?e:null}
 function bnSeries(d){

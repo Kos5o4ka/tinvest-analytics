@@ -1,13 +1,13 @@
 /* ── Первичные размещения ── */
 S.pri=null;
-function loadPri(){api('/api/primary').then(j=>{S.pri=j;if(S.page==='pri')render()}).catch(e=>{S.pri={error:e.message,rows:[]};if(S.page==='pri')render()})}
+function loadPri(){api('/api/primary').then(j=>{S.pri=j;if(S.page==='pri')renderSoon()}).catch(e=>{S.pri={error:e.message,rows:[]};if(S.page==='pri')renderSoon()})}
 function pPri(){
   const d=S.pri;
   if(!d){loadPri();return`<div class="card">${waitBox('Загружаю календарь первичных размещений…')}</div>`}
   if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="pri-r">Повторить</button></div>`;
   const today=new Date().toISOString().slice(0,10),rows=d.rows;
   const wk=new Date(Date.now()+7*864e5).toISOString().slice(0,10);
-  const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${esc(r.isin)}</small>`:''}</td>
+  const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${isinTxt(r.isin)}</small>`:''}</td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
     <td class="num">${ddm(r.start)}${r.start===today?'<br><small class="pos">сегодня</small>':''}</td><td class="num">${esc(r.end.replace(' г.',''))}</td>
     <td class="l">${esc(r.book)}</td><td class="l">${r.link?`<a class="blue-link" href="${esc(r.link)}" target="_blank" rel="noopener">объявление Мосбиржи ↗</a>`:''}</td></tr>`).join('');
@@ -25,7 +25,7 @@ function pPri(){
 S.priSt=null;
 function loadPriSt(force){
   if(S._priStL&&!force)return;S._priStL=1;
-  api('/api/primary/stats').then(j=>{S._priStL=0;S.priSt=j;if(S.page==='pri'){render();if(j.loading)setTimeout(()=>{if(S.page==='pri')loadPriSt(true)},4000)}})
+  api('/api/primary/stats').then(j=>{S._priStL=0;S.priSt=j;if(S.page==='pri'){renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='pri')loadPriSt(true)},4000)}})
    .catch(e=>{S._priStL=0;S.priSt={error:e.message}})
 }
 const ppd=(v,d=2)=>v==null||isNaN(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' п.п.';

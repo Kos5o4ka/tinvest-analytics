@@ -1,4 +1,19 @@
 /* ── Настройки ── */
+/* какие разделы показывать в меню (скрытые остаются доступными через поиск Ctrl+K) */
+function setMenuHtml(){
+  const hid=S.navHidden||[];
+  const grp=NAV_GROUPS.map(([g,keys])=>`<div><div class="note" style="margin:8px 0 6px"><b>${esc(g)}</b></div><div class="kmenu">${keys.map(k=>{const t=(PAGES.find(p=>p&&p[0]===k)||[])[1];if(!t)return'';
+    const lock=NAV_PINNED.includes(k);return`<label><input type="checkbox" ${hid.includes(k)?'':'checked'} ${lock?'disabled':''} onchange="navToggle('${k}',this.checked)">${esc(t)}${lock?' <span class="mu">(всегда)</span>':''}</label>`}).join('')}</div></div>`).join('');
+  return`<div class="card"><h2>Разделы меню<span class="sp">скрывайте то, чем не пользуетесь</span></h2><div style="display:grid;gap:6px">${grp}
+    <div class="row" style="margin-top:8px"><button class="btn ghost" onclick="navShowAll()">Показать все</button></div>
+    <p class="note">Скрытый раздел по-прежнему открывается через поиск (Ctrl+K / Cmd+K). «Обзор» и «Настройки» скрыть нельзя.</p></div></div>`;
+}
+function navToggle(k,on){
+  if(NAV_PINNED.includes(k))return;
+  S.navHidden=S.navHidden.filter(x=>x!==k);if(!on)S.navHidden.push(k);
+  lsSet('ta_nav_hidden',JSON.stringify(S.navHidden));renderNav();
+}
+function navShowAll(){S.navHidden=[];lsSet('ta_nav_hidden','[]');renderNav();renderSettings()}
 async function renderSettings(){
   S.charts=[];
   try{S.cfg=await api('/api/config')}catch(e){$('#view').innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
@@ -24,6 +39,7 @@ async function renderSettings(){
     <div class="row"><label class="field" style="max-width:260px"><span>Напоминать о выплатах за, дней (0 — выключить)</span><input class="in num" id="nd" type="number" min="0" max="60" value="${c.notify_days??7}"></label>
       <button class="btn ghost" id="ndsave" style="align-self:flex-end">Сохранить</button><button class="btn ghost" id="ntf" style="align-self:flex-end">Разрешить системные уведомления</button></div>
     <p class="note">Напоминания показываются на «Обзоре» и «Выплатах», а системные уведомления приходят, пока программа открыта. Печать отчёта: кнопка PDF сверху → «Сохранить как PDF» (печатается текущий раздел и период).</p></div></div>
+  ${setMenuHtml()}
   <div class="card"><h2>Прогноз ключевой ставки<span class="sp">для флоатеров</span></h2><div style="display:grid;gap:14px">
     <div class="row"><label class="field" style="max-width:420px"><span>Источник прогноза</span><select class="in" id="krmode">${[['cbr','Прогноз Банка России (по умолчанию)'],['survey','Опрос аналитиков Банка России'],['market','Рынок: форварды КБД'],['flat','Без изменений (текущая ставка)']].map(([k,t])=>`<option value="${k}" ${(c.keyrate_mode||'cbr')===k?'selected':''}>${t}</option>`).join('')}</select></label>
       <button class="btn ghost" id="krsave" style="align-self:flex-end">Сохранить</button></div>
