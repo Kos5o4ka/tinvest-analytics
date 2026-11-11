@@ -277,8 +277,14 @@ def ifrs_ticker_for(isin, em=None):
 
 # ── скоринг ──
 
-def iss_score_ifrs(fin):
-    """Скоринг по МСФО (ifrs_fin). Форма результата как у iss_score_fin: {ok, score, key, label, year, parts, penalties, note, basis}."""
+IFRS_FIN_RE = re.compile(r"лизинг|факторинг|микрофин|МФК|МКК|коллектор|ломбард", re.I)
+
+
+def iss_score_ifrs(fin, is_fin=False):
+    """Скоринг по МСФО (ifrs_fin). Форма результата как у iss_score_fin: {ok, score, key, label, year, parts, penalties, note, basis}.
+    is_fin — лизинг, МФО и прочие небанковские финансовые компании: долг для них — «сырьё» бизнеса, поэтому вместо
+    чистого долга/EBITDA, покрытия, маржи и FCF (отрицательный при росте портфеля — норма) смотрим
+    долг/капитал (≥ 8 — 0, ≤ 3 — полный, 25 б.), капитал/активы (5 % — 0, 15 % — полный, 20 б.), ROE (0 — 0, ≥ 15 % — полный, 20 б.)."""
     if not fin or fin.get("status") != "ok" or not fin.get("years"):
         return {"ok": False, "reason": (fin or {}).get("note") or "Нет отчётности МСФО."}
     yrs = fin["years"]
@@ -296,8 +302,8 @@ def iss_score_ifrs(fin):
     if bank:
         if c.get("eq_ratio") is not None:
             add("eq", "Капитал / активы", 20, _iss_t(c["eq_ratio"], 0.06, 0.12), c["eq_ratio"], "капитал — %s %% активов" % _iss_n(c["eq_ratio"] * 100, 1))
-        roe = c.get("roe")
-        if roe is None and c.get("net") is not None and c.get("equity"):
+        roe = c.get("roe") if (c.get("equity") is None or c["equity"] > 0) else None
+        if roe is None and c.get("net") is not None and c.get("equity") and c["equity"] > 0:
             roe = c["net"] / c["equity"]
         if roe is not None:
             add("roe", "Рентабельность капитала (ROE)", 20, _iss_t(roe, 0.0, 0.15), roe, "ROE %s %%" % _iss_n(roe * 100, 1))
@@ -309,6 +315,26 @@ def iss_score_ifrs(fin):
             add("car", "Достаточность капитала", 15, _iss_t(c["car"], 0.105, 0.14), c["car"], "общая достаточность %s %%" % _iss_n(c["car"] * 100, 1))
         if growth is not None:
             add("growth", "Динамика доходов", 10, _iss_t(growth, -0.15, 0.05), growth, "чистые операционные доходы %s на %s %%" % ("выросли" if growth >= 0 else "упали", _iss_n(abs(growth) * 100, 0)))
+    elif is_fin:
+        debt, eq = c.get("debt"), c.get("equity")
+        if debt is None and c.get("net_debt") is not None and c.get("cash") is not None:
+            debt = c["net_debt"] + c["cash"]
+        if debt is None:
+            debt = c.get("net_debt")
+        if eq is not None and eq <= 0:
+            add("lev", "Долг / капитал", 25, 0.0, None, "капитал отрицательный")
+        elif debt is not None and eq:
+            de = debt / eq
+            add("lev", "Долг / капитал", 25, _iss_t(de, 8, 3), de, "долг в %s раза больше капитала" % _iss_n(de, 1))
+        if c.get("eq_ratio") is not None:
+            add("eq", "Доля капитала", 20, _iss_t(c["eq_ratio"], 0.05, 0.15), c["eq_ratio"], "капитал — %s %% активов" % _iss_n(c["eq_ratio"] * 100, 0))
+        roe = c.get("roe") if (eq is None or eq > 0) else None   # при отрицательном капитале ROE бессмысленна
+        if roe is None and c.get("net") is not None and eq and eq > 0:
+            roe = c["net"] / eq
+        if roe is not None:
+            add("roe", "Рентабельность капитала (ROE)", 20, _iss_t(roe, 0.0, 0.15), roe, "ROE %s %%" % _iss_n(roe * 100, 1))
+        if growth is not None:
+            add("growth", "Динамика выручки", 15, _iss_t(growth, -0.15, 0.05), growth, "выручка %s на %s %%" % ("выросла" if growth >= 0 else "упала", _iss_n(abs(growth) * 100, 0)))
     else:
         e, it, nd = c.get("ebitda"), c.get("interest"), c.get("net_debt")
         if it is not None and it > 0:
@@ -357,7 +383,7 @@ def iss_score_ifrs(fin):
     k, t = _iss_label(sc)
     per = ("LTM на %s" % fin["as_of"]) if ltm and fin.get("as_of") else ("LTM" if ltm else "%d г." % last["y"])
     return {"ok": True, "score": sc, "key": k, "label": t, "year": last["y"], "period": per, "base": round(base, 1), "parts": parts, "penalties": pen,
-            "n_years": len(yrs), "fin_mode": False, "holding": False, "bank": bank, "basis": "ifrs",
+            "n_years": len(yrs), "fin_mode": bool(is_fin and not bank), "holding": False, "bank": bank, "basis": "ifrs",
             "note": "Консолидированная отчётность группы (МСФО) по данным агрегатора smart-lab; может отличаться от официальной."}
 
 
@@ -367,5 +393,7 @@ def ifrs_bundle(isin, em=None):
     if not mp:
         return None
     fin = ifrs_fin(mp["ticker"])
-    sc = iss_score_ifrs(fin)
+    # для групп «финансовой» считаем только лизинг/МФО/факторинг: в названиях холдингов («АФК Система») слово «финансовая» не про бизнес
+    nm = (em or {}).get("title") or mp.get("group") or ""
+    sc = iss_score_ifrs(fin, bool(IFRS_FIN_RE.search(nm)))
     return {"ticker": mp["ticker"], "how": mp["how"], "group": mp["group"], "kind": mp["kind"], "fin": fin, "score": sc, "url": fin.get("url") or IFRS_BASE % mp["ticker"]}

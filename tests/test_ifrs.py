@@ -143,6 +143,15 @@ class Score(unittest.TestCase):
         self.assertIn("Отрицательный капитал", names)
         self.assertIn("Убыток второй год подряд", names)       # предыдущий год в _fin тоже с net=-5
 
+    def test_leasing_mode(self):
+        f = _fin(y=self.y, net_debt=4000.0, equity=1000.0, growth=0.1)
+        s = m.iss_score_ifrs(f, is_fin=True)
+        ids = [p["id"] for p in s["parts"]]
+        self.assertIn("lev", ids)
+        self.assertNotIn("cover", ids)
+        self.assertNotIn("fcf", ids)
+        self.assertTrue(s["fin_mode"])
+
     def test_stale(self):
         s = m.iss_score_ifrs(_fin(y=2019))
         self.assertTrue(any("старше" in p["name"] for p in s["penalties"]))
