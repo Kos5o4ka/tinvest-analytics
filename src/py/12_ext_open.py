@@ -46,8 +46,13 @@ def _ds_down(msg):
 
 
 def _ssl():
-    if not _ext_ctx:
-        _ext_ctx.append(make_ssl_context())
+    if not _ext_ctx:                     # те же настройки проверки сертификатов, что и для API Т-Инвестиций (свой CA, корпоративный прокси)
+        try:
+            c = load_config()
+            ctx = make_ssl_context(c.get("ca_file") or "", c.get("verify_ssl", True))
+        except Exception:  # noqa: BLE001
+            ctx = make_ssl_context()
+        _ext_ctx.append(ctx)
     return _ext_ctx[0]
 
 
