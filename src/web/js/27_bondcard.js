@@ -144,9 +144,24 @@ function bcIssuerCurve(el,ic){
     g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'#3987e5'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
   el.innerHTML=`<svg width="${W}" height="${H}">${g}</svg>`;
 }
+function bcIssIfrs(j){
+  const b=j.ifrs,s=b.score,f=b.fin,m=j.market||{},c=f.ltm||f.years[f.years.length-1]||{},X=(v,d)=>v==null?'—':bcN(v,d)+'×',Pc=v=>v==null?'—':bcN(v*100,1)+' %';
+  const rs=j.score&&j.score.ok?j.score:null;
+  let h=`<div class="bc-iss-top"><span class="iss-sc iss-${esc(s.key)}"><b>${s.score}</b> ${esc(s.label)}</span><span class="mu" style="font-size:12.5px">МСФО группы (${esc(b.ticker)}) · ${esc(s.period||'')}</span></div>
+    <div class="mu" style="font-size:12.5px;margin-bottom:8px">${esc(b.how)}</div>`;
+  h+=s.bank?`<div class="bc-kpis">${bcKpi('ROE',Pc(c.roe),'рентабельность капитала')}${bcKpi('Капитал / активы',Pc(c.eq_ratio),'норма от 8–10 %')}${bcKpi('Неработающие кредиты',Pc(c.npl),'норма до 4–5 %')}${bcKpi('Достаточность капитала',Pc(c.car),'норма от 12 %')}</div>`
+    :`<div class="bc-kpis">${bcKpi('Покрытие процентов',X(c.cover,1),'EBITDA / проценты; норма от 4–6')}${bcKpi('Чистый долг / EBITDA',c.net_debt!=null&&c.net_debt<=0?'нет':X(c.nd_ebitda,1),'норма до 2–3')}
+    ${bcKpi('Капитал / активы',c.eq_ratio==null?'—':bcN(c.eq_ratio*100,0)+' %','норма от 25–40 %')}${bcKpi('Рентабельность EBITDA',Pc(c.margin_ebitda),'доля EBITDA в выручке')}</div>`;
+  if(m.key)h+=`<div class="bc-rel"><b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b></div>`;
+  if(j.history&&(j.history.defaults||j.history.tech))h+=`<div class="bc-warn">${esc(j.history.verdict)}</div>`;
+  h+=`<div class="mu" style="font-size:12.5px;margin-top:6px">${rs?'Для сравнения, РСБУ отдельной компании: '+rs.score+' ('+esc(rs.label)+'). ':''}<a href="${esc(b.url)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a></div>
+    <button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button><p class="note" style="margin-top:8px">Скоринг от 0 до 100 по консолидированной отчётности группы (МСФО). Данные агрегатора smart-lab, могут отличаться от официальной отчётности. Не инвестиционная рекомендация.</p>`;
+  return h;
+}
 function bcIssHtml(j,isin){
   const s=j.score||{},f=j.fin||{years:[]},m=j.market||{},is=j.issuer||{};
   if(!j.ok)return`<div class="mu" style="font-size:13px">${esc((j.errors||['Не удалось загрузить данные об эмитенте.'])[0])}</div>`;
+  if(j.ifrs&&j.ifrs.score&&j.ifrs.score.ok&&j.ifrs.fin&&j.ifrs.fin.years&&j.ifrs.fin.years.length)return bcIssIfrs(j);
   if(!s.ok)return`<div class="mu" style="font-size:13px">${esc(s.reason||f.note||'Нет данных по РСБУ.')}</div>${j.history?`<div class="bc-rel" style="margin-top:8px">${esc(j.history.verdict)}</div>`:''}<button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button>`;
   const y=f.years[f.years.length-1]||{},fm=s.fin_mode,X=(v,d)=>v==null?'—':bcN(v,d)+'×';
   const nd=y.net_debt!=null&&y.net_debt<=0?'нет':X(y.nd_ebit,1);
@@ -163,7 +178,7 @@ function bcIssHtml(j,isin){
 function bcIssuer(dr,c,tok){
   const box=dr.querySelector('#bc-iss');if(!box)return;
   const isin=c.isin,put=j=>{if(tok!==BC.tok||!document.body.contains(box))return;
-    box.innerHTML=`<h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2>`+bcIssHtml(j,isin);
+    box.innerHTML=`<h2>Финансы эмитента<span class="sp">${j.ifrs&&j.ifrs.score&&j.ifrs.score.ok?`МСФО группы, smart-lab`:`отчётность РСБУ, ГИР БО ФНС`}</span></h2>`+bcIssHtml(j,isin);
     const mb=box.querySelector('#bc-iss-more');if(mb)mb.onclick=()=>issOpen(isin)};
   if(c.market&&c.market.kind==='ofz'){box.innerHTML=`<h2>Финансы эмитента</h2><div class="mu" style="font-size:13px">Государственная облигация: оценка по отчётности не применяется.</div>`;return}
   if(BC.iss[isin]){put(BC.iss[isin]);return}

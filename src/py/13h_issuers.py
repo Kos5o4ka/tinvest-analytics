@@ -312,14 +312,28 @@ def _iss_is_fin(title, sector=None):
 
 def issuer_score(isin):
     """Публичная функция для других модулей: скоринг эмитента облигации по ISIN.
-    Возвращает {ok, score 0–100, key (strong/mid/weak/alarm), label, year, parts, penalties, issuer, inn} или {ok: False, reason}."""
+    Возвращает {ok, score 0–100, key (strong/mid/weak/alarm), label, year, parts, penalties, issuer, inn, basis, rsbu, ifrs} или {ok: False, reason}.
+    basis = "ifrs" (консолидированная отчётность группы по smart-lab, если нашлась) или "rsbu" (отдельная компания, ГИР БО);
+    s["rsbu"] — скоринг РСБУ, s["ifrs"] — скоринг МСФО (или None)."""
     try:
         em = issuer_of(isin)
         if not em or not em.get("inn"):
             return {"ok": False, "reason": "Не удалось определить эмитента (нет ИНН)."}
         fin = issuer_fin(em["inn"], em.get("title") or "")
         ci = tcat_info(isin) or {}
-        s = iss_score_fin(fin, _iss_is_fin(em.get("title"), ci.get("sector")))
+        rs = iss_score_fin(fin, _iss_is_fin(em.get("title"), ci.get("sector")))
+        try:
+            ib = ifrs_bundle(isin, em)
+        except Exception:  # noqa: BLE001
+            ib = None
+        if ib and ib["score"].get("ok"):
+            s = dict(ib["score"])
+            s["ifrs"] = dict(ib["score"], ticker=ib["ticker"], how=ib["how"])
+        else:
+            s = dict(rs)
+            s["ifrs"] = None
+        s["basis"] = "ifrs" if s["ifrs"] else "rsbu"
+        s["rsbu"] = rs
         s["issuer"], s["inn"] = em.get("short") or em.get("title"), em["inn"]
         return s
     except Exception as e:  # noqa: BLE001
@@ -477,14 +491,17 @@ def issuer_card(isin):
             return fn(), None
         except Exception as e:  # noqa: BLE001
             return None, str(e)[:120]
-    (fin, e1), (hist, e2), (mb, e3) = pool_map(run, [lambda: issuer_fin(inn, em.get("title") or ""), lambda: iss_history(inn),
-                                                     lambda: _iss_market_bonds(inn, isin)], workers=3)
-    for lab, er in (("отчётность ФНС", e1), ("история выпусков", e2), ("рыночные данные", e3)):
+    (fin, e1), (hist, e2), (mb, e3), (ifr, e4) = pool_map(run, [lambda: issuer_fin(inn, em.get("title") or ""), lambda: iss_history(inn),
+                                                                lambda: _iss_market_bonds(inn, isin), lambda: ifrs_bundle(isin, em)], workers=4)
+    for lab, er in (("отчётность ФНС", e1), ("история выпусков", e2), ("рыночные данные", e3), ("отчётность МСФО", e4)):
         if er:
             card["errors"].append("%s: %s" % (lab, er))
     ci = tcat_info(isin) or {}
     card["fin"] = fin or {"status": "err", "years": [], "note": "Отчётность временно недоступна."}
     card["score"] = iss_score_fin(fin, _iss_is_fin(em.get("title"), ci.get("sector"))) if fin else {"ok": False, "reason": "Отчётность недоступна."}
+    card["ifrs"] = ifr                       # {ticker, how, group, kind, fin, score, url} или None
+    card["basis"] = "ifrs" if ifr and ifr["score"].get("ok") else "rsbu"
+    main_sc = ifr["score"] if card["basis"] == "ifrs" else card["score"]
     card["history"] = hist
     card["bonds"] = mb or []
     spread, rating = _iss_spread_rating(card["bonds"], isin)
@@ -494,7 +511,7 @@ def issuer_card(isin):
             rating = rt["v"] if rt else None
         except Exception:  # noqa: BLE001
             rating = None
-    card["market"] = iss_market(card["score"].get("score") if card["score"].get("ok") else None, spread, rating)
+    card["market"] = iss_market(main_sc.get("score") if main_sc.get("ok") else None, spread, rating)
     card["ok"] = True
     return card
 
@@ -512,7 +529,7 @@ def _iss_portfolio(cfg, acc, job):
     groups = {}
     for r, em in zip(work, ems):
         k = (em or {}).get("inn") or ("isin:" + r["isin"])
-        g = groups.setdefault(k, {"inn": (em or {}).get("inn"), "title": (em or {}).get("short") or (em or {}).get("title") or r.get("name"),
+        g = groups.setdefault(k, {"inn": (em or {}).get("inn"), "emitter_id": (em or {}).get("emitter_id"), "title": (em or {}).get("short") or (em or {}).get("title") or r.get("name"),
                                   "full": (em or {}).get("title"), "rows": [], "known": bool(em)})
         g["rows"].append(r)
     glist = list(groups.values())
@@ -549,11 +566,29 @@ def _iss_portfolio(cfg, acc, job):
                 res.update(status="noinn", note="ИНН эмитента неизвестен.", score=None)
                 return res
             fin = issuer_fin(g["inn"], g["full"] or "")
+            try:
+                ib = ifrs_bundle(top["isin"], {"emitter_id": g.get("emitter_id"), "inn": g["inn"], "title": g["full"], "short": g["title"]})
+            except Exception:  # noqa: BLE001
+                ib = None
             res["status"] = fin["status"]
             res["note"] = fin.get("note")
             sc = iss_score_fin(fin, _iss_is_fin(g["full"] or g["title"], ci.get("sector")))
             res["fin_mode"] = bool(sc.get("fin_mode"))
-            if sc.get("ok"):
+            res["rsbu_score"] = sc["score"] if sc.get("ok") else None
+            if ib:
+                res["ifrs_ticker"], res["ifrs_how"] = ib["ticker"], ib["how"]
+                res["ifrs_score"] = ib["score"]["score"] if ib["score"].get("ok") else None
+                if not ib["score"].get("ok"):
+                    res["ifrs_note"] = ib["score"].get("reason")
+            if ib and ib["score"].get("ok"):
+                isc = ib["score"]
+                c_ = ib["fin"].get("ltm") or ib["fin"]["years"][-1]
+                res.update(basis="ifrs", score=isc["score"], key=isc["key"], label=isc["label"], year=isc["year"], period=isc["period"], holding=False,
+                           fin_mode=False, bank=isc.get("bank"), nd_ebit=c_.get("nd_ebitda"), cover=c_.get("cover"), eq_ratio=c_.get("eq_ratio"),
+                           rev=c_.get("rev"), net_debt=c_.get("net_debt"), debt_eq=None)
+                res["market"] = iss_market(isc["score"], spread, rating)
+            elif sc.get("ok"):
+                res["basis"] = "rsbu"
                 last = fin["years"][-1]
                 res.update(score=sc["score"], key=sc["key"], label=sc["label"], year=sc["year"], holding=sc.get("holding"),
                            nd_ebit=last.get("nd_ebit"), cover=last.get("cover"), eq_ratio=last.get("eq_ratio"), cur_liq=last.get("cur_liq"),
@@ -605,7 +640,7 @@ def issuers_payload(cfg, acc, q, force):
 
 def _iss_api_one(cfg, acc, q, force):
     isin = (q.get("isin") or "").strip().upper()
-    key = "iss_card_v2_" + isin
+    key = "iss_card_v3_" + isin
     if not force:
         hit = store().get(key, ttl=6 * 3600)
         if hit:

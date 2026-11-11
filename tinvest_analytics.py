@@ -7647,14 +7647,28 @@ def _iss_is_fin(title, sector=None):
 
 def issuer_score(isin):
     """Публичная функция для других модулей: скоринг эмитента облигации по ISIN.
-    Возвращает {ok, score 0–100, key (strong/mid/weak/alarm), label, year, parts, penalties, issuer, inn} или {ok: False, reason}."""
+    Возвращает {ok, score 0–100, key (strong/mid/weak/alarm), label, year, parts, penalties, issuer, inn, basis, rsbu, ifrs} или {ok: False, reason}.
+    basis = "ifrs" (консолидированная отчётность группы по smart-lab, если нашлась) или "rsbu" (отдельная компания, ГИР БО);
+    s["rsbu"] — скоринг РСБУ, s["ifrs"] — скоринг МСФО (или None)."""
     try:
         em = issuer_of(isin)
         if not em or not em.get("inn"):
             return {"ok": False, "reason": "Не удалось определить эмитента (нет ИНН)."}
         fin = issuer_fin(em["inn"], em.get("title") or "")
         ci = tcat_info(isin) or {}
-        s = iss_score_fin(fin, _iss_is_fin(em.get("title"), ci.get("sector")))
+        rs = iss_score_fin(fin, _iss_is_fin(em.get("title"), ci.get("sector")))
+        try:
+            ib = ifrs_bundle(isin, em)
+        except Exception:  # noqa: BLE001
+            ib = None
+        if ib and ib["score"].get("ok"):
+            s = dict(ib["score"])
+            s["ifrs"] = dict(ib["score"], ticker=ib["ticker"], how=ib["how"])
+        else:
+            s = dict(rs)
+            s["ifrs"] = None
+        s["basis"] = "ifrs" if s["ifrs"] else "rsbu"
+        s["rsbu"] = rs
         s["issuer"], s["inn"] = em.get("short") or em.get("title"), em["inn"]
         return s
     except Exception as e:  # noqa: BLE001
@@ -7812,14 +7826,17 @@ def issuer_card(isin):
             return fn(), None
         except Exception as e:  # noqa: BLE001
             return None, str(e)[:120]
-    (fin, e1), (hist, e2), (mb, e3) = pool_map(run, [lambda: issuer_fin(inn, em.get("title") or ""), lambda: iss_history(inn),
-                                                     lambda: _iss_market_bonds(inn, isin)], workers=3)
-    for lab, er in (("отчётность ФНС", e1), ("история выпусков", e2), ("рыночные данные", e3)):
+    (fin, e1), (hist, e2), (mb, e3), (ifr, e4) = pool_map(run, [lambda: issuer_fin(inn, em.get("title") or ""), lambda: iss_history(inn),
+                                                                lambda: _iss_market_bonds(inn, isin), lambda: ifrs_bundle(isin, em)], workers=4)
+    for lab, er in (("отчётность ФНС", e1), ("история выпусков", e2), ("рыночные данные", e3), ("отчётность МСФО", e4)):
         if er:
             card["errors"].append("%s: %s" % (lab, er))
     ci = tcat_info(isin) or {}
     card["fin"] = fin or {"status": "err", "years": [], "note": "Отчётность временно недоступна."}
     card["score"] = iss_score_fin(fin, _iss_is_fin(em.get("title"), ci.get("sector"))) if fin else {"ok": False, "reason": "Отчётность недоступна."}
+    card["ifrs"] = ifr                       # {ticker, how, group, kind, fin, score, url} или None
+    card["basis"] = "ifrs" if ifr and ifr["score"].get("ok") else "rsbu"
+    main_sc = ifr["score"] if card["basis"] == "ifrs" else card["score"]
     card["history"] = hist
     card["bonds"] = mb or []
     spread, rating = _iss_spread_rating(card["bonds"], isin)
@@ -7829,7 +7846,7 @@ def issuer_card(isin):
             rating = rt["v"] if rt else None
         except Exception:  # noqa: BLE001
             rating = None
-    card["market"] = iss_market(card["score"].get("score") if card["score"].get("ok") else None, spread, rating)
+    card["market"] = iss_market(main_sc.get("score") if main_sc.get("ok") else None, spread, rating)
     card["ok"] = True
     return card
 
@@ -7847,7 +7864,7 @@ def _iss_portfolio(cfg, acc, job):
     groups = {}
     for r, em in zip(work, ems):
         k = (em or {}).get("inn") or ("isin:" + r["isin"])
-        g = groups.setdefault(k, {"inn": (em or {}).get("inn"), "title": (em or {}).get("short") or (em or {}).get("title") or r.get("name"),
+        g = groups.setdefault(k, {"inn": (em or {}).get("inn"), "emitter_id": (em or {}).get("emitter_id"), "title": (em or {}).get("short") or (em or {}).get("title") or r.get("name"),
                                   "full": (em or {}).get("title"), "rows": [], "known": bool(em)})
         g["rows"].append(r)
     glist = list(groups.values())
@@ -7884,11 +7901,29 @@ def _iss_portfolio(cfg, acc, job):
                 res.update(status="noinn", note="ИНН эмитента неизвестен.", score=None)
                 return res
             fin = issuer_fin(g["inn"], g["full"] or "")
+            try:
+                ib = ifrs_bundle(top["isin"], {"emitter_id": g.get("emitter_id"), "inn": g["inn"], "title": g["full"], "short": g["title"]})
+            except Exception:  # noqa: BLE001
+                ib = None
             res["status"] = fin["status"]
             res["note"] = fin.get("note")
             sc = iss_score_fin(fin, _iss_is_fin(g["full"] or g["title"], ci.get("sector")))
             res["fin_mode"] = bool(sc.get("fin_mode"))
-            if sc.get("ok"):
+            res["rsbu_score"] = sc["score"] if sc.get("ok") else None
+            if ib:
+                res["ifrs_ticker"], res["ifrs_how"] = ib["ticker"], ib["how"]
+                res["ifrs_score"] = ib["score"]["score"] if ib["score"].get("ok") else None
+                if not ib["score"].get("ok"):
+                    res["ifrs_note"] = ib["score"].get("reason")
+            if ib and ib["score"].get("ok"):
+                isc = ib["score"]
+                c_ = ib["fin"].get("ltm") or ib["fin"]["years"][-1]
+                res.update(basis="ifrs", score=isc["score"], key=isc["key"], label=isc["label"], year=isc["year"], period=isc["period"], holding=False,
+                           fin_mode=False, bank=isc.get("bank"), nd_ebit=c_.get("nd_ebitda"), cover=c_.get("cover"), eq_ratio=c_.get("eq_ratio"),
+                           rev=c_.get("rev"), net_debt=c_.get("net_debt"), debt_eq=None)
+                res["market"] = iss_market(isc["score"], spread, rating)
+            elif sc.get("ok"):
+                res["basis"] = "rsbu"
                 last = fin["years"][-1]
                 res.update(score=sc["score"], key=sc["key"], label=sc["label"], year=sc["year"], holding=sc.get("holding"),
                            nd_ebit=last.get("nd_ebit"), cover=last.get("cover"), eq_ratio=last.get("eq_ratio"), cur_liq=last.get("cur_liq"),
@@ -7940,7 +7975,7 @@ def issuers_payload(cfg, acc, q, force):
 
 def _iss_api_one(cfg, acc, q, force):
     isin = (q.get("isin") or "").strip().upper()
-    key = "iss_card_v2_" + isin
+    key = "iss_card_v3_" + isin
     if not force:
         hit = store().get(key, ttl=6 * 3600)
         if hit:
@@ -10213,6 +10248,377 @@ API_POST["/api/backup/settings"] = api_backup_settings
 API_POST["/api/backup/run"] = api_backup_run
 API_POST["/api/backup/restore"] = api_backup_restore
 STARTUP_HOOKS.append(backup_start)
+# ═══════════════════════════════ эмитенты: отчётность группы по МСФО ═══════════════════════════════
+# Источник — публичные страницы фундаментальных показателей smart-lab.ru (/q/{ТИКЕР}/f/y/MSFO/, robots.txt разрешает /q/).
+# Наружу уходит только тикер акции. Данные агрегатора могут отличаться от официальной отчётности.
+# Суммы на сайте — в млрд ₽, в ответах API хранятся в млн ₽ (как РСБУ в 13h).
+#
+# Как эмитент облигации сопоставляется с тикером (ifrs_ticker_for):
+#   1) «сама компания»: у эмитента на Мосбирже есть торгуемая акция (ISS /emitters/{id}/securities);
+#   2) «входит в группу»: таблица IFRS_BY_INN (ИНН эмитента -> тикер материнской компании) — для SPV и «дочек»;
+#   3) то же по названию эмитента, IFRS_BY_NAME (регулярка по названию) — когда ИНН не проверен.
+# Чтобы добавить компанию: найдите ИНН выпускающей структуры (ISS: iss/securities.json?q=<название>, поле emitent_inn),
+# проверьте, что у тикера есть страница https://smart-lab.ru/q/<ТИКЕР>/f/y/MSFO/ с данными в рублях, и добавьте строку в таблицу.
+#
+# Скоринг по МСФО (iss_score_ifrs) — показатели последнего периода (LTM, если он есть и новее года; иначе последний год):
+#   покрытие процентов EBITDA/проценты  25 б.:  ≤ 2 — 0,   ≥ 6 — полный
+#   чистый долг / EBITDA                25 б.:  ≥ 4,5 — 0, ≤ 1,5 — полный (чистые деньги — полный; EBITDA ≤ 0 при долге — 0)
+#   капитал / активы                    15 б.:  ≤ 10 % — 0, ≥ 40 % — полный
+#   рентабельность по EBITDA            10 б.:  ≤ 5 % — 0,  ≥ 25 % — полный
+#   свободный денежный поток            10 б.:  ≥ 0 — полный, FCF = −50 % EBITDA и ниже — 0
+#   рост выручки (год к году)           15 б.:  ≤ −15 % — 0, ≥ +5 % — полный
+# Банки (отдельная схема, поля smart-lab другие): капитал/активы (≤ 6 % — 0, ≥ 12 % — полный, 20 б.), ROE (≤ 0 — 0, ≥ 15 % — 20 б.),
+#   стоимость риска (≥ 3 % — 0, ≤ 1 % — 15 б.), доля неработающих кредитов (≥ 10 % — 0, ≤ 4 % — 15 б.), достаточность капитала
+#   (≤ 10,5 % — 0, ≥ 14 % — 15 б.), рост чистых операционных доходов (≤ −15 % — 0, ≥ +5 % — 10 б.); что отсутствует — не считается.
+# Итог = набранные баллы / максимум по доступным показателям × 100 (минимум 40 баллов максимума), затем штрафы:
+#   убыток за год −8 (второй год подряд ещё −7), отрицательный капитал −15, последний годовой отчёт старше двух лет −10.
+
+IFRS_BASE = "https://smart-lab.ru/q/%s/f/y/MSFO/"
+IFRS_UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+           "Accept": "text/html,application/xhtml+xml", "Accept-Language": "ru,en;q=0.8"}
+IFRS_TTL, IFRS_NF_TTL, IFRS_ERR_TTL, IFRS_MAP_TTL = 7 * DAY, DAY, 3600, 30 * DAY
+_ifrs_lock = threading.Lock()          # одна загрузка за раз: и ограничение частоты, и защита от дублей
+_ifrs_last = [0.0]
+
+# ИНН эмитента (SPV, «дочка») -> (тикер материнской компании, название группы). ИНН проверены по справочнику Мосбиржи.
+IFRS_BY_INN = {
+    "7726588547": ("GAZP", "Газпром"),          # Газпром капитал
+    "7715630469": ("X5", "X5 Group"),            # ИКС 5 ФИНАНС
+    "7705619586": ("ETLN", "Эталон"),            # Эталон-Финанс
+    "7703255661": ("PIKK", "ПИК"),               # ПИК-Корпорация
+    "1402046014": ("SELG", "Селигдар"),          # Золото Селигдара
+    "7814148471": ("LENT", "Лента"),             # ООО «Лента»
+    "7838347927": ("LSRG", "ЛСР"),               # ЛСР-Инвест
+    "7710140679": ("T", "Т-Технологии"),         # АО «ТБанк»
+}
+# Название эмитента (регулярка, регистр не важен) -> (тикер, группа). Для случаев, когда ИНН не найден в справочнике.
+IFRS_BY_NAME = [
+    (r"икс\s*5|x5\b", "X5", "X5 Group"),
+    (r"газпром\s+капитал|\bгпн\b", "GAZP", "Газпром"),
+]
+
+
+def _ifrs_num(s):
+    """'11 674' -> 11674.0; '-364.0' -> -364.0; '31.4%' -> 0.314; '' / '—' / мусор -> None."""
+    if s is None:
+        return None
+    t = re.sub(r"<[^>]+>", "", str(s)).replace("&nbsp;", " ").replace("−", "-")
+    t = re.sub(r"[\s  ]+", "", t).replace(",", ".")
+    if not t or t in ("-", "—", "–"):
+        return None
+    pct = t.endswith("%")
+    if pct:
+        t = t[:-1]
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    return v / 100.0 if pct else v
+
+
+def ifrs_parse(html):
+    """HTML страницы smart-lab -> {labels: ['2021', ..., 'LTM'], rows: {поле: [значения по меткам, строки для текста]}} или None."""
+    if not html or "field=" not in html:
+        return None
+    m = re.search(r"<tr[^>]*class=\"[^\"]*header_row[^\"]*\"[^>]*>(.*?)</tr>", html, re.S)
+    if not m:
+        return None
+    labels = [x.strip() for x in re.findall(r"<strong>\s*([^<]+?)\s*</strong>", m.group(1))]
+    labels = [x for x in labels if re.fullmatch(r"\d{4}|LTM", x)]
+    if not labels:
+        return None
+    rows, bad = {}, 0
+    for fm in re.finditer(r"<tr[^>]*\bfield=\"([A-Za-z0-9_]+)\"[^>]*>(.*?)</tr>", html, re.S):
+        cells = []
+        for am, body in re.findall(r"<td([^>]*)>(.*?)</td>", fm.group(2), re.S):
+            if "chartrow" in am or "ltm_spc" in am:
+                continue
+            cells.append(re.sub(r"<[^>]+>", "", body).replace("&nbsp;", " ").strip())
+        if len(cells) != len(labels):
+            bad += 1
+            continue
+        rows[fm.group(1)] = cells
+    if not rows or bad > len(rows):
+        return None
+    return {"labels": labels, "rows": rows}
+
+
+_IFRS_BANK_KEYS = ("bank_assets", "net_interest_income", "net_operating_income")
+
+
+def _ifrs_val(rows, key, i, scale=1.0):
+    r = rows.get(key)
+    if not r or i >= len(r):
+        return None
+    v = _ifrs_num(r[i])
+    return None if v is None else v * scale
+
+
+def _ifrs_period(rows, i, bank, y):
+    """Один столбец (год или LTM) -> словарь показателей; суммы в млн ₽, доли — числами (0.25 = 25 %)."""
+    g = lambda k, sc=1.0: _ifrs_val(rows, k, i, sc)   # noqa: E731
+    M = 1000.0                                           # млрд -> млн
+    p = {"y": y}
+    if bank:
+        p.update(rev=g("net_operating_income", M), net=g("net_income", M), assets=g("bank_assets", M), equity=g("capital", M),
+                 nii=g("net_interest_income", M), roe=g("roe"), cost_risk=g("cost_of_risk_ratio"), npl=g("share_of_non_performing_loans"),
+                 car=g("total_capital_adequacy_ratio"), nim=g("net_intertest_margin") if "net_intertest_margin" in rows else g("net_interest_margin"),
+                 cti=g("cost_to_income"), ltd=g("loan_to_deposit_ratio"))
+        if p["equity"] is not None and p["assets"]:
+            p["eq_ratio"] = p["equity"] / p["assets"]
+        return p
+    p.update(rev=g("revenue", M), op_income=g("operating_income", M), ebitda=g("ebitda", M), net=g("net_income", M), interest=g("interest_expenses", M),
+             debt=g("debt", M), cash=g("cash", M), net_debt=g("net_debt", M), assets=g("assets", M), ocf=g("ocf", M), capex=g("capex", M),
+             roe=g("roe"))
+    eq = g("net_assets", M)
+    p["equity"] = eq if eq is not None else g("book_value", M)
+    if p["net_debt"] is None and p["debt"] is not None and p["cash"] is not None:
+        p["net_debt"] = p["debt"] - p["cash"]
+    if p["ocf"] is not None and p["capex"] is not None:
+        p["fcf"] = p["ocf"] - abs(p["capex"])
+    else:
+        p["fcf"] = g("fcf", M)
+    e, nd, it, rv = p["ebitda"], p["net_debt"], p["interest"], p["rev"]
+    p["nd_ebitda"] = nd / e if (nd is not None and e is not None and e > 0) else None
+    p["cover"] = e / it if (e is not None and it is not None and it > 0) else None
+    p["margin_ebitda"] = e / rv if (e is not None and rv) else None
+    p["net_margin"] = p["net"] / rv if (p["net"] is not None and rv) else None
+    p["eq_ratio"] = p["equity"] / p["assets"] if (p["equity"] is not None and p["assets"]) else None
+    return p
+
+
+def ifrs_build(parsed, ticker):
+    """Результат ifrs_parse -> структура ifrs_fin (без сети; для тестов)."""
+    labels, rows = parsed["labels"], parsed["rows"]
+    bank = any(k in rows for k in _IFRS_BANK_KEYS) and "revenue" not in rows
+    ccy = rows.get("currency") or []
+    last_ccy = next((c for c in reversed(ccy) if c), "RUB")
+    out = {"status": "ok", "ticker": ticker, "bank": bank, "url": IFRS_BASE % ticker, "currency": last_ccy, "years": [], "ltm": None,
+           "as_of": None, "fetched": time.time()}
+    if last_ccy.upper() not in ("RUB", "RUR"):
+        out.update(status="notrub", note="Отчётность группы в валюте %s — сравнить с рублёвыми показателями нельзя." % last_ccy)
+        return out
+    dates = rows.get("date") or []
+    prev_y = None
+    for i, lab in enumerate(labels):
+        if lab == "LTM":
+            p = _ifrs_period(rows, i, bank, "LTM")
+            if any(p.get(k) is not None for k in ("rev", "ebitda", "net")):
+                out["ltm"] = p
+                out["as_of"] = dates[i] if i < len(dates) and dates[i] else None
+            continue
+        y = int(lab)
+        p = _ifrs_period(rows, i, bank, y)
+        if not any(p.get(k) is not None for k in ("rev", "ebitda", "net", "assets")):
+            continue
+        out["years"].append(p)
+    for k, p in enumerate(out["years"]):
+        pv = out["years"][k - 1] if k else None
+        p["growth"] = None
+        if pv and pv["y"] == p["y"] - 1 and p.get("rev") is not None and pv.get("rev") and pv["rev"] > 0:
+            p["growth"] = p["rev"] / pv["rev"] - 1
+    if out["years"] and not out["as_of"]:
+        i = labels.index(str(out["years"][-1]["y"]))
+        out["as_of"] = dates[i] if i < len(dates) and dates[i] else None
+    if not out["years"]:
+        out.update(status="nodata", note="На smart-lab нет данных МСФО по этому тикеру.")
+    return out
+
+
+def _ifrs_http(url):
+    with _ifrs_lock:                                   # не чаще одного запроса в секунду на всё приложение
+        wait = 1.0 - (time.time() - _ifrs_last[0])
+        if wait > 0:
+            time.sleep(wait)
+        _ifrs_last[0] = time.time()
+    if not _ext_ctx:
+        _ext_ctx.append(make_ssl_context())
+    req = urllib.request.Request(url, headers=IFRS_UA)
+    with urllib.request.urlopen(req, timeout=20, context=_ext_ctx[0]) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+_ifrs_fetch_lock = threading.Lock()
+
+
+def ifrs_fin(ticker):
+    """Тикер -> {status ok|nodata|notrub|parse|err, ticker, years, ltm, bank, url, as_of, ...}; кэш 7 дней (нет данных — сутки). Не бросает исключений."""
+    ticker = (ticker or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{1,12}", ticker):
+        return {"status": "nodata", "ticker": ticker, "years": [], "ltm": None, "bank": False, "url": None}
+    key = "ifrs_fin_v1_" + ticker
+    with _ifrs_fetch_lock:
+        hit = store().get(key)
+        if hit:
+            age = time.time() - (hit.get("fetched") or 0)
+            if age < (IFRS_TTL if hit.get("status") == "ok" else IFRS_ERR_TTL if hit.get("status") == "err" else IFRS_NF_TTL):
+                return hit
+        try:
+            html = _ifrs_http(IFRS_BASE % ticker)
+            parsed = ifrs_parse(html)
+            if parsed is None:
+                res = {"status": "parse", "ticker": ticker, "years": [], "ltm": None, "bank": False, "url": IFRS_BASE % ticker, "fetched": time.time(),
+                       "note": "Страница smart-lab в неожиданном формате."}
+            else:
+                res = ifrs_build(parsed, ticker)
+        except urllib.error.HTTPError as e:
+            st = "nodata" if e.code == 404 else "err"
+            res = {"status": st, "ticker": ticker, "years": [], "ltm": None, "bank": False, "url": IFRS_BASE % ticker, "fetched": time.time(),
+                   "note": "На smart-lab нет страницы МСФО." if e.code == 404 else "smart-lab временно недоступен (HTTP %s)." % e.code}
+        except Exception as e:  # noqa: BLE001
+            res = {"status": "err", "ticker": ticker, "years": [], "ltm": None, "bank": False, "url": IFRS_BASE % ticker, "fetched": time.time(),
+                   "note": "smart-lab недоступен: %s" % str(e)[:80]}
+        try:
+            store().put(key, res)
+        except Exception:  # noqa: BLE001
+            pass
+        return res
+
+
+# ── сопоставление эмитента с тикером ──
+
+def _ifrs_emitter_shares(eid):
+    """Список бумаг эмитента на Мосбирже, у которых есть акции: [{secid, type, traded}] (кэш 30 дней)."""
+    key = "ifrs_emsec_v1_%s" % eid
+    hit = store().get(key, ttl=IFRS_MAP_TTL)
+    if hit is not None:
+        return hit
+    j = _iss_json("https://iss.moex.com/iss/emitters/%s/securities.json?iss.meta=off" % eid, 20)
+    cols = j["securities"]["columns"]
+    out = []
+    for r in j["securities"]["data"]:
+        d = dict(zip(cols, r))
+        if d.get("TYPE") in ("common_share", "preferred_share") and d.get("SECID"):
+            out.append({"secid": d["SECID"], "type": d["TYPE"], "traded": bool(d.get("IS_TRADED")), "board": d.get("PRIMARY_BOARDID")})
+    store().put(key, out)
+    return out
+
+
+def ifrs_ticker_for(isin, em=None):
+    """ISIN облигации -> {ticker, group, kind: 'own'|'group', how} или None, если листингового родителя не нашли."""
+    try:
+        em = em or issuer_of(isin)
+        if not em:
+            return None
+        eid = em.get("emitter_id")
+        if eid:
+            sh = [s for s in _ifrs_emitter_shares(eid) if s["traded"]]
+            sh.sort(key=lambda s: (s["type"] != "common_share", s["board"] != "TQBR"))
+            if sh:
+                t = sh[0]["secid"]
+                return {"ticker": t, "group": em.get("short") or em.get("title"), "kind": "own",
+                        "how": "эмитент — сама компания (акции %s на Мосбирже), показана отчётность группы по МСФО" % t}
+        hit = IFRS_BY_INN.get(str(em.get("inn") or ""))
+        if not hit:
+            title = em.get("title") or ""
+            for rx, t, g in IFRS_BY_NAME:
+                if re.search(rx, title, re.I):
+                    hit = (t, g)
+                    break
+        if hit:
+            return {"ticker": hit[0], "group": hit[1], "kind": "group",
+                    "how": "эмитент входит в группу «%s» (акции %s), показана консолидированная отчётность группы" % (hit[1], hit[0])}
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+# ── скоринг ──
+
+def iss_score_ifrs(fin):
+    """Скоринг по МСФО (ifrs_fin). Форма результата как у iss_score_fin: {ok, score, key, label, year, parts, penalties, note, basis}."""
+    if not fin or fin.get("status") != "ok" or not fin.get("years"):
+        return {"ok": False, "reason": (fin or {}).get("note") or "Нет отчётности МСФО."}
+    yrs = fin["years"]
+    ltm = fin.get("ltm")
+    c = ltm or yrs[-1]
+    last = yrs[-1]
+    prev = yrs[-2] if len(yrs) > 1 and yrs[-2]["y"] == last["y"] - 1 else None
+    bank = bool(fin.get("bank"))
+    parts = []
+
+    def add(pid, name, w, t, value, text):
+        if t is not None:
+            parts.append({"id": pid, "name": name, "max": w, "pts": round(w * t, 1), "grade": _iss_grade(t), "value": value, "text": text})
+    growth = last.get("growth")
+    if bank:
+        if c.get("eq_ratio") is not None:
+            add("eq", "Капитал / активы", 20, _iss_t(c["eq_ratio"], 0.06, 0.12), c["eq_ratio"], "капитал — %s %% активов" % _iss_n(c["eq_ratio"] * 100, 1))
+        roe = c.get("roe")
+        if roe is None and c.get("net") is not None and c.get("equity"):
+            roe = c["net"] / c["equity"]
+        if roe is not None:
+            add("roe", "Рентабельность капитала (ROE)", 20, _iss_t(roe, 0.0, 0.15), roe, "ROE %s %%" % _iss_n(roe * 100, 1))
+        if c.get("cost_risk") is not None:
+            add("crisk", "Стоимость риска", 15, _iss_t(c["cost_risk"], 0.03, 0.01), c["cost_risk"], "резервы съедают %s %% кредитов в год" % _iss_n(c["cost_risk"] * 100, 1))
+        if c.get("npl") is not None:
+            add("npl", "Неработающие кредиты", 15, _iss_t(c["npl"], 0.10, 0.04), c["npl"], "%s %% кредитов с просрочкой" % _iss_n(c["npl"] * 100, 1))
+        if c.get("car") is not None:
+            add("car", "Достаточность капитала", 15, _iss_t(c["car"], 0.105, 0.14), c["car"], "общая достаточность %s %%" % _iss_n(c["car"] * 100, 1))
+        if growth is not None:
+            add("growth", "Динамика доходов", 10, _iss_t(growth, -0.15, 0.05), growth, "чистые операционные доходы %s на %s %%" % ("выросли" if growth >= 0 else "упали", _iss_n(abs(growth) * 100, 0)))
+    else:
+        e, it, nd = c.get("ebitda"), c.get("interest"), c.get("net_debt")
+        if it is not None and it > 0:
+            if e is not None and e > 0:
+                add("cover", "Покрытие процентов", 25, _iss_t(c["cover"], 2.0, 6.0), c["cover"], "EBITDA покрывает проценты в %s раза" % _iss_n(c["cover"], 1))
+            elif e is not None:
+                add("cover", "Покрытие процентов", 25, 0.0, None, "EBITDA не положительна, проценты платятся из других источников")
+        elif c.get("debt") is not None and c.get("assets") and c["debt"] <= 0.02 * c["assets"]:
+            add("cover", "Покрытие процентов", 25, 1.0, None, "заёмных средств практически нет")
+        if nd is not None:
+            if nd <= 0:
+                add("lev", "Чистый долг / EBITDA", 25, 1.0, None, "денег больше, чем долга")
+            elif e is None or e <= 0:
+                add("lev", "Чистый долг / EBITDA", 25, 0.0, None, "есть чистый долг, а EBITDA не положительна")
+            else:
+                add("lev", "Чистый долг / EBITDA", 25, _iss_t(c["nd_ebitda"], 4.5, 1.5), c["nd_ebitda"], "чистый долг = %s годовой EBITDA" % _iss_n(c["nd_ebitda"], 1))
+        if c.get("eq_ratio") is not None:
+            add("eq", "Доля капитала", 15, _iss_t(c["eq_ratio"], 0.10, 0.40), c["eq_ratio"], "капитал — %s %% активов" % _iss_n(c["eq_ratio"] * 100, 0))
+        if c.get("margin_ebitda") is not None:
+            add("margin", "Рентабельность по EBITDA", 10, _iss_t(c["margin_ebitda"], 0.05, 0.25), c["margin_ebitda"], "EBITDA — %s %% выручки" % _iss_n(c["margin_ebitda"] * 100, 1))
+        f = c.get("fcf")
+        if f is not None:
+            if f >= 0:
+                add("fcf", "Свободный денежный поток", 10, 1.0, f, "положительный: операционный поток покрывает инвестиции")
+            elif e is not None and e > 0:
+                add("fcf", "Свободный денежный поток", 10, _iss_t(f / e, -0.5, 0.0), f, "отрицательный: %s %% от EBITDA" % _iss_n(abs(f) / e * 100, 0))
+            else:
+                add("fcf", "Свободный денежный поток", 10, 0.0, f, "отрицательный при слабой EBITDA")
+        if growth is not None:
+            add("growth", "Динамика выручки", 15, _iss_t(growth, -0.15, 0.05), growth, "выручка %s на %s %%" % ("выросла" if growth >= 0 else "упала", _iss_n(abs(growth) * 100, 0)))
+    mx = sum(p["max"] for p in parts)
+    if mx < 40:
+        return {"ok": False, "reason": "Слишком мало показателей МСФО для оценки%s." % (" (банк: не хватает данных)" if bank else "")}
+    base = sum(p["pts"] for p in parts) / mx * 100
+    pen = []
+    net = last.get("net")
+    if net is not None and net < 0:
+        pen.append({"name": "Убыток по итогам года", "pts": -8})
+        if prev and prev.get("net") is not None and prev["net"] < 0:
+            pen.append({"name": "Убыток второй год подряд", "pts": -7})
+    if c.get("equity") is not None and c["equity"] < 0:
+        pen.append({"name": "Отрицательный капитал", "pts": -15})
+    if last["y"] < date.today().year - 2:
+        pen.append({"name": "Отчётность старше двух лет (%d)" % last["y"], "pts": -10})
+    sc = max(0, min(100, int(round(base + sum(p["pts"] for p in pen)))))
+    k, t = _iss_label(sc)
+    per = ("LTM на %s" % fin["as_of"]) if ltm and fin.get("as_of") else ("LTM" if ltm else "%d г." % last["y"])
+    return {"ok": True, "score": sc, "key": k, "label": t, "year": last["y"], "period": per, "base": round(base, 1), "parts": parts, "penalties": pen,
+            "n_years": len(yrs), "fin_mode": False, "holding": False, "bank": bank, "basis": "ifrs",
+            "note": "Консолидированная отчётность группы (МСФО) по данным агрегатора smart-lab; может отличаться от официальной."}
+
+
+def ifrs_bundle(isin, em=None):
+    """Всё для интеграции: {ticker, how, group, kind, fin, score, url} или None, если МСФО-тикера нет."""
+    mp = ifrs_ticker_for(isin, em)
+    if not mp:
+        return None
+    fin = ifrs_fin(mp["ticker"])
+    sc = iss_score_ifrs(fin)
+    return {"ticker": mp["ticker"], "how": mp["how"], "group": mp["group"], "kind": mp["kind"], "fin": fin, "score": sc, "url": fin.get("url") or IFRS_BASE % mp["ticker"]}
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -12476,7 +12882,7 @@ const ROADMAP=[
  ['now','Проверка на реальных счетах','Сверка расчётов доходности и налогов с данными брокера'],
  ['next','Готовые форматы брокеров','Пресеты для отчётов ВТБ, Альфы и других брокеров'],
  ['next','Конвертации бумаг','Учёт обменов бумаг без операций в API (например, редомициляция) в истории стоимости'],
- ['later','Финансы эмитентов по МСФО','Отчётность групп компаний, а не только отдельной компании по РСБУ'],
+ ['done','Финансы эмитентов по МСФО','Скоринг по отчётности групп (smart-lab): ЧД/EBITDA, покрытие процентов, FCF; для SPV и «дочек» — по материнской компании, РСБУ остаётся рядом'],
  ['done','Налоги по лотам','ЛДВ, ИИС, перенос убытков, курсовые разницы, подсказки, сводка для 3-НДФЛ'],
  ['done','Точная история стоимости','Без ложных скачков: фьючерсы, сплиты, дубли бумаг, амортизация'],
  ['done','Ребалансировка с учётом налогов','Сначала продаются лоты с убытком или с наступившей ЛДВ'],
@@ -12699,9 +13105,24 @@ function bcIssuerCurve(el,ic){
     g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'#3987e5'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
   el.innerHTML=`<svg width="${W}" height="${H}">${g}</svg>`;
 }
+function bcIssIfrs(j){
+  const b=j.ifrs,s=b.score,f=b.fin,m=j.market||{},c=f.ltm||f.years[f.years.length-1]||{},X=(v,d)=>v==null?'—':bcN(v,d)+'×',Pc=v=>v==null?'—':bcN(v*100,1)+' %';
+  const rs=j.score&&j.score.ok?j.score:null;
+  let h=`<div class="bc-iss-top"><span class="iss-sc iss-${esc(s.key)}"><b>${s.score}</b> ${esc(s.label)}</span><span class="mu" style="font-size:12.5px">МСФО группы (${esc(b.ticker)}) · ${esc(s.period||'')}</span></div>
+    <div class="mu" style="font-size:12.5px;margin-bottom:8px">${esc(b.how)}</div>`;
+  h+=s.bank?`<div class="bc-kpis">${bcKpi('ROE',Pc(c.roe),'рентабельность капитала')}${bcKpi('Капитал / активы',Pc(c.eq_ratio),'норма от 8–10 %')}${bcKpi('Неработающие кредиты',Pc(c.npl),'норма до 4–5 %')}${bcKpi('Достаточность капитала',Pc(c.car),'норма от 12 %')}</div>`
+    :`<div class="bc-kpis">${bcKpi('Покрытие процентов',X(c.cover,1),'EBITDA / проценты; норма от 4–6')}${bcKpi('Чистый долг / EBITDA',c.net_debt!=null&&c.net_debt<=0?'нет':X(c.nd_ebitda,1),'норма до 2–3')}
+    ${bcKpi('Капитал / активы',c.eq_ratio==null?'—':bcN(c.eq_ratio*100,0)+' %','норма от 25–40 %')}${bcKpi('Рентабельность EBITDA',Pc(c.margin_ebitda),'доля EBITDA в выручке')}</div>`;
+  if(m.key)h+=`<div class="bc-rel"><b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b></div>`;
+  if(j.history&&(j.history.defaults||j.history.tech))h+=`<div class="bc-warn">${esc(j.history.verdict)}</div>`;
+  h+=`<div class="mu" style="font-size:12.5px;margin-top:6px">${rs?'Для сравнения, РСБУ отдельной компании: '+rs.score+' ('+esc(rs.label)+'). ':''}<a href="${esc(b.url)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a></div>
+    <button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button><p class="note" style="margin-top:8px">Скоринг от 0 до 100 по консолидированной отчётности группы (МСФО). Данные агрегатора smart-lab, могут отличаться от официальной отчётности. Не инвестиционная рекомендация.</p>`;
+  return h;
+}
 function bcIssHtml(j,isin){
   const s=j.score||{},f=j.fin||{years:[]},m=j.market||{},is=j.issuer||{};
   if(!j.ok)return`<div class="mu" style="font-size:13px">${esc((j.errors||['Не удалось загрузить данные об эмитенте.'])[0])}</div>`;
+  if(j.ifrs&&j.ifrs.score&&j.ifrs.score.ok&&j.ifrs.fin&&j.ifrs.fin.years&&j.ifrs.fin.years.length)return bcIssIfrs(j);
   if(!s.ok)return`<div class="mu" style="font-size:13px">${esc(s.reason||f.note||'Нет данных по РСБУ.')}</div>${j.history?`<div class="bc-rel" style="margin-top:8px">${esc(j.history.verdict)}</div>`:''}<button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button>`;
   const y=f.years[f.years.length-1]||{},fm=s.fin_mode,X=(v,d)=>v==null?'—':bcN(v,d)+'×';
   const nd=y.net_debt!=null&&y.net_debt<=0?'нет':X(y.nd_ebit,1);
@@ -12718,7 +13139,7 @@ function bcIssHtml(j,isin){
 function bcIssuer(dr,c,tok){
   const box=dr.querySelector('#bc-iss');if(!box)return;
   const isin=c.isin,put=j=>{if(tok!==BC.tok||!document.body.contains(box))return;
-    box.innerHTML=`<h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2>`+bcIssHtml(j,isin);
+    box.innerHTML=`<h2>Финансы эмитента<span class="sp">${j.ifrs&&j.ifrs.score&&j.ifrs.score.ok?`МСФО группы, smart-lab`:`отчётность РСБУ, ГИР БО ФНС`}</span></h2>`+bcIssHtml(j,isin);
     const mb=box.querySelector('#bc-iss-more');if(mb)mb.onclick=()=>issOpen(isin)};
   if(c.market&&c.market.kind==='ofz'){box.innerHTML=`<h2>Финансы эмитента</h2><div class="mu" style="font-size:13px">Государственная облигация: оценка по отчётности не применяется.</div>`;return}
   if(BC.iss[isin]){put(BC.iss[isin]);return}
@@ -13675,7 +14096,7 @@ function bindLad(){
   ['#ld-sum','#ld-years','#ld-rungs'].forEach(i=>{const e=$(i);if(e)e.onkeydown=ev=>{if(ev.key==='Enter')g.click()}});
 }
 /* ── Эмитенты: отчётность и скоринг ── */
-S.iss={data:null,acc:null,loading:false,prog:null,sel:null,cards:{},cardLoad:{},sort:{k:'share',d:-1}};
+S.iss={data:null,acc:null,loading:false,prog:null,sel:null,cards:{},cardLoad:{},tab:{},sort:{k:'share',d:-1}};
 const ISS_KEY={strong:'Устойчивое',mid:'Среднее',weak:'Слабое',alarm:'Тревожное'};
 const ISS_SIG={mkt_higher:['Рынок строже','Рынок оценивает риск выше, чем следует из отчётности'],mkt_lower:['Рынок мягче','Рынок оценивает риск ниже, чем следует из отчётности'],match:['Совпадает','Оценка рынка соответствует отчётности']};
 const ISS_HINT={
@@ -13685,10 +14106,22 @@ const ISS_HINT={
   liq:'Оборотные активы / краткосрочные обязательства: хватит ли ближайших ресурсов на ближайшие долги. Выше 1,5 — хорошо, ниже 0,8 — риск нехватки денег.',
   margin:'EBIT / выручка: сколько операционной прибыли остаётся с рубля продаж. Зависит от отрасли; от 12 % — хорошо, около 0 — бизнес едва зарабатывает.',
   growth:'Изменение выручки к прошлому году. Рост — хорошо, падение более чем на 15 % — тревожный знак.'};
+const ISS_HINT_I={
+  cover:'Во сколько раз EBITDA группы больше процентов по долгам. Ниже 2 — опасно; выше 6 — спокойно.',
+  lev:'Чистый долг (долг минус деньги) в годовых EBITDA группы. До 1,5 — комфортно, больше 4,5 — тяжело.',
+  eq:'Доля собственного капитала в активах группы. Выше 40 % — прочная основа, ниже 10 % — запаса прочности почти нет.',
+  margin:'EBITDA / выручка. Зависит от отрасли; от 25 % — хорошо, около 5 % и ниже — бизнес едва зарабатывает.',
+  fcf:'Операционный денежный поток минус капитальные затраты. Положительный — группа сама оплачивает инвестиции, отрицательный — растёт за счёт долга.',
+  growth:'Изменение выручки к прошлому году (по годовой отчётности). Падение более чем на 15 % — тревожный знак.',
+  roe:'Чистая прибыль / капитал банка. От 15 % — хорошо, около 0 — банк не зарабатывает.',
+  crisk:'Резервы под кредитные потери в процентах от кредитов за год. До 1 % — спокойно, от 3 % — высокий риск.',
+  npl:'Доля неработающих (просроченных) кредитов. До 4 % — норма, от 10 % — тревожно.',
+  car:'Общая достаточность капитала по нормативам Банка России. От 14 % — запас есть, ниже 10,5 % — близко к минимуму.'};
 const issX=(v,d=1)=>v==null||isNaN(v)?'—':v.toFixed(d).replace('.',',')+'×';
 const issP=(v,d=0)=>v==null||isNaN(v)?'—':(v*100).toFixed(d).replace('.',',')+' %';
 const issR=v=>v==null?'—':short(v*1e6);
 const issNd=y=>y.net_debt!=null&&y.net_debt<=0?'нет чистого долга':y.nd_ebit!=null?issX(y.nd_ebit):(y.net_debt!=null&&y.ebit!=null&&y.ebit<=0?'EBIT ≤ 0':'—');
+const issBasis=r=>r.basis==='ifrs'?`<small class="mu" title="${esc(r.ifrs_how||'')}">МСФО группы (${esc(r.ifrs_ticker||'')}) · ${esc(r.period||'')}</small>`:`<small class="mu">РСБУ · за ${r.year} г.</small>`;
 const issTag=(key,score,label)=>score==null?'<span class="mu">—</span>':`<span class="iss-sc iss-${esc(key)}"><b>${score}</b> ${esc(label||ISS_KEY[key]||'')}</span>`;
 const issSig=m=>{const s=m&&m.key&&ISS_SIG[m.key];return s?`<span class="iss-sg iss-sg-${esc(m.key)}" title="${esc(m.text||s[1])}">${s[0]}</span>`:'<span class="mu">—</span>'};
 
@@ -13725,7 +14158,7 @@ function issRows(d){
 function pIss(){
   const I=S.iss;
   if(I.data&&I.acc!==S.account)I.data=null;
-  const disc=`<p class="note" style="margin-top:12px">Справочная информация на основе открытой бухгалтерской отчётности по РСБУ (ГИР БО ФНС) и данных Мосбиржи. Не является инвестиционной рекомендацией. РСБУ отдельной компании может не отражать положение группы: у холдингов и «дочек» важна консолидированная отчётность, которой здесь нет. Банки и страховые компании отчитываются перед Банком России, их данных здесь нет.</p>`;
+  const disc=`<p class="note" style="margin-top:12px">Справочная информация на основе открытой бухгалтерской отчётности по РСБУ (ГИР БО ФНС) и данных Мосбиржи. Не является инвестиционной рекомендацией. Если эмитент — листинговая компания или входит в такую группу, скоринг считается по консолидированной отчётности группы (МСФО, данные агрегатора smart-lab — они могут отличаться от официальной отчётности); иначе — по РСБУ отдельной компании, которая может не отражать положение группы. Банки и страховые без МСФО-данных не оцениваются: их РСБУ в ГИР БО нет.</p>`;
   if(!I.data){loadIss();return`<div class="card">${waitBox('Собираю отчётность эмитентов портфеля (первый раз может занять около минуты)… <span id="iss-prog">'+(I.prog&&I.prog.total?`${I.prog.done} из ${I.prog.total}`:'')+'</span>')}</div>`}
   const d=I.data;
   if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="iss-retry">Повторить</button></div>`;
@@ -13740,32 +14173,35 @@ function pIss(){
     const ds=d.dist||{};
     h+=`<div class="card"><h2>Эмитенты портфеля<span class="sp">нажмите на строку — подробности по отчётности, скоринг и кредитная история</span></h2>
       <div class="iss-dist">${['strong','mid','weak','alarm'].map(x=>`<span class="iss-sc iss-${x}"><b>${ds[x]||0}</b> ${ISS_KEY[x].toLowerCase()}</span>`).join('')}<span class="mu" style="font-size:12px">скоринг от 0 до 100: ≥ 70 устойчивое · 50–69 среднее · 30–49 слабое · &lt; 30 тревожное</span></div>`;
-    const cols=[['name','Эмитент','l'],['share','Доля в облигациях'],['rating','Рейтинг','l'],['score','Скоринг','l'],['nd_ebit','Чистый долг / EBIT'],['cover','Покрытие процентов'],['eq_ratio','Капитал / активы'],['signal','Рынок и отчётность','l']];
+    const cols=[['name','Эмитент','l'],['share','Доля в облигациях'],['rating','Рейтинг','l'],['score','Скоринг','l'],['nd_ebit','Чистый долг / EBIT(DA)'],['cover','Покрытие процентов'],['eq_ratio','Капитал / активы'],['signal','Рынок и отчётность','l']];
     const th=cols.map(([k,t,c])=>`<th class="s ${c||''}" data-s="${k}">${t} <span>${I.sort.k===k?(I.sort.d>0?'↑':'↓'):''}</span></th>`).join('');
     const body=issRows(d).map(r=>{
       const has=r.score!=null,stale=has&&r.year<new Date().getFullYear()-2;
-      const lv=has?(r.fin_mode?`<span class="mu" title="Для лизинга и финансовых компаний долг — основа бизнеса, оценивается долг к капиталу">долг/кап. ${issX(r.debt_eq)}</span>`:(r.net_debt!=null&&r.net_debt<=0?'<span class="pos">нет чист. долга</span>':issX(r.nd_ebit))):'<span class="mu">—</span>';
+      const lv=has?(r.basis==='ifrs'?(r.bank?'<span class="mu">—</span>':(r.net_debt!=null&&r.net_debt<=0?'<span class="pos">нет чист. долга</span>':issX(r.nd_ebit))):r.fin_mode?`<span class="mu" title="Для лизинга и финансовых компаний долг — основа бизнеса, оценивается долг к капиталу">долг/кап. ${issX(r.debt_eq)}</span>`:(r.net_debt!=null&&r.net_debt<=0?'<span class="pos">нет чист. долга</span>':issX(r.nd_ebit))):'<span class="mu">—</span>';
       return`<tr class="iss-r${I.sel===r.isin?' on':''}" data-iss="${esc(r.isin)}"><td class="l"><div class="tk">${logo({name:r.title,ticker:'',logo:r.logo,color:r.color})}<div><b title="${esc(r.full||r.title)}">${esc(r.title)}</b><small>${r.inn?'ИНН '+esc(r.inn):'ИНН неизвестен'} · выпусков: ${r.n_bonds}</small></div></div></td>
         <td class="num">${pctp(r.share,1)}</td><td class="l">${r.rating?`<span class="tag rt rt-${esc(rBucket(r.rating).split(' ')[0])}">${esc(r.rating)}</span>`:'<span class="mu">—</span>'}</td>
-        <td class="l">${has?issTag(r.key,r.score,r.label)+`<br><small class="mu">за ${r.year} г.${stale?' · <span class="neg">устарела</span>':''}${r.holding?' · холдинг':''}</small>`:`<span class="mu" title="${esc(r.note||'')}">нет данных по РСБУ</span>`}</td>
+        <td class="l">${has?issTag(r.key,r.score,r.label)+`<br>${issBasis(r)}<small class="mu">${stale?' · <span class="neg">устарела</span>':''}${r.holding?' · холдинг (РСБУ отражает группу плохо)':''}</small>`:`<span class="mu" title="${esc(r.note||'')}">нет данных${r.ifrs_ticker?'':' по РСБУ'}</span>`}</td>
         <td class="num">${lv}</td><td class="num">${has?issX(r.cover):'—'}</td><td class="num">${has?issP(r.eq_ratio):'—'}</td><td class="l">${has?issSig(r.market):'<span class="mu">—</span>'}</td></tr>`}).join('');
     h+=`<div class="tbl iss-tbl"><table id="iss-tab"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div>
-      <p class="note" style="margin-top:10px">Обновлено ${esc(d.updated||'')}. Эмитенты без отчётности: банки и страховые (отчитываются перед Банком России), компании, не раскрывающие отчётность, новые компании. «Рынок строже» — спред облигаций к кривой доходности ОФЗ и рейтинг указывают на больший риск, чем видно из отчётности; «рынок мягче» — наоборот. <button class="btn ghost" id="iss-ref" style="padding:3px 10px;font-size:12px;margin-left:6px">Пересчитать</button></p></div>`;
+      <p class="note" style="margin-top:10px">Обновлено ${esc(d.updated||'')}. В колонке «Скоринг» указана основа расчёта: МСФО группы (тикер) или РСБУ компании. Эмитенты без отчётности: страховые и банки без МСФО, компании, не раскрывающие отчётность, новые компании. «Рынок строже» — спред облигаций к кривой доходности ОФЗ и рейтинг указывают на больший риск, чем видно из отчётности; «рынок мягче» — наоборот. <button class="btn ghost" id="iss-ref" style="padding:3px 10px;font-size:12px;margin-left:6px">Пересчитать</button></p></div>`;
   }
   if(I.sel)h+=issDetail(I.sel);
   return h+disc;
 }
-function issPartsHtml(s){
+function issPartsHtml(s,hints){
+  hints=hints||ISS_HINT;
   if(!s||!s.ok)return`<div class="mu" style="font-size:13px">${esc((s&&s.reason)||'Скоринг не рассчитан.')}</div>`;
   const rows=s.parts.map(p=>`<tr><td class="l"><b>${esc(p.name)}</b><br><small class="mu">${esc(p.text)}</small></td>
     <td><div class="iss-bar"><i class="g-${p.grade}" style="width:${Math.round(p.pts/p.max*100)}%"></i></div></td><td class="num">${p.pts.toFixed(1).replace('.',',')} из ${p.max}</td>
-    <td class="l iss-hint">${esc(ISS_HINT[p.id]||'')}</td></tr>`).join('');
+    <td class="l iss-hint">${esc(hints[p.id]||'')}</td></tr>`).join('');
   const pen=(s.penalties||[]).map(p=>`<tr><td class="l neg">${esc(p.name)}</td><td></td><td class="num neg">${p.pts}</td><td class="l iss-hint">Штраф: вычитается из итогового результата.</td></tr>`).join('');
   return`<div class="tbl"><table><thead><tr><th class="l">Показатель</th><th></th><th>Баллы</th><th class="l">Что значит и какой уровень нормальный</th></tr></thead><tbody>${rows}${pen}</tbody></table></div>
     <p class="note" style="margin-top:8px">Баллы по доступным показателям пересчитываются на 100 (${s.base!=null?'до штрафов — '+Math.round(s.base):''}), затем применяются штрафы. ${s.holding?'':esc(s.note||'')}</p>`;
 }
-function issChart(el,fin){
-  const ys=fin.years;bars(el,{h:260,labels:ys.map(y=>String(y.y)),series:[{n:'Выручка',c:S1,v:ys.map(y=>(y.rev||0)*1e6)},{n:'EBIT',c:S3,v:ys.map(y=>(y.ebit||0)*1e6)},
+function issChart(el,fin,ifrs){
+  const ys=fin.years;
+  if(ifrs){const bk=fin.bank;return bars(el,{h:260,labels:ys.map(y=>String(y.y)),series:bk?[{n:'Чистые операц. доходы',c:S1,v:ys.map(y=>(y.rev||0)*1e6)},{n:'Чистая прибыль',c:S3,v:ys.map(y=>(y.net||0)*1e6)}]
+    :[{n:'Выручка',c:S1,v:ys.map(y=>(y.rev||0)*1e6)},{n:'EBITDA',c:S3,v:ys.map(y=>(y.ebitda||0)*1e6)},{n:'Чистый долг',c:S8,v:ys.map(y=>(y.net_debt||0)*1e6)}],fa:short,ft:v=>short(v)+' ₽',empty:'Нет данных'})}bars(el,{h:260,labels:ys.map(y=>String(y.y)),series:[{n:'Выручка',c:S1,v:ys.map(y=>(y.rev||0)*1e6)},{n:'EBIT',c:S3,v:ys.map(y=>(y.ebit||0)*1e6)},
     {n:'Чистый долг',c:S8,v:ys.map(y=>(y.net_debt||0)*1e6)}],fa:short,ft:v=>short(v)+' ₽',empty:'Нет данных'});
 }
 function issFinTable(fin){
@@ -13779,6 +14215,35 @@ function issFinTable(fin){
   return`<div class="tbl"><table><thead><tr><th class="l">Абсолютные показатели, ₽</th>${th}<th class="l">Пояснение</th></tr></thead><tbody>${a.map(x=>row(x[0],x[1],x[2])).join('')}</tbody></table></div>
     <div class="tbl" style="margin-top:14px"><table><thead><tr><th class="l">Коэффициенты</th>${th}<th class="l">Что значит и какой уровень нормальный</th></tr></thead><tbody>${b.map(x=>row(x[0],x[1],x[2])).join('')}</tbody></table></div>`;
 }
+function issIfrsTable(fin){
+  const ys=fin.years.concat(fin.ltm?[fin.ltm]:[]),th=ys.map(y=>`<th>${y.y==='LTM'?'LTM':y.y}</th>`).join('');
+  const row=(n,f,hint)=>`<tr><td class="l">${n}</td>${ys.map(y=>`<td class="num">${f(y)}</td>`).join('')}<td class="l iss-hint">${hint||''}</td></tr>`;
+  const nd=y=>y.net_debt!=null&&y.net_debt<=0?'нет чистого долга':y.nd_ebitda!=null?issX(y.nd_ebitda):(y.net_debt!=null&&y.ebitda!=null&&y.ebitda<=0?'EBITDA ≤ 0':'—');
+  const g=y=>y.growth==null?'—':`<span class="${y.growth<0?'neg':'pos'}">${(y.growth>0?'+':'')+issP(y.growth)}</span>`;
+  const a=fin.bank?[['Чистые операционные доходы',y=>issR(y.rev)],['Чистая прибыль',y=>issR(y.net)],['Капитал',y=>issR(y.equity)],['Активы',y=>issR(y.assets)]]
+    :[['Выручка',y=>issR(y.rev)],['EBITDA',y=>issR(y.ebitda),'Прибыль до процентов, налогов и амортизации.'],['Чистая прибыль',y=>issR(y.net)],['Проценты к уплате',y=>issR(y.interest)],
+      ['Чистый долг',y=>issR(y.net_debt),'Долг минус деньги. Отрицательный — денег больше, чем долга.'],['Операционный денежный поток',y=>issR(y.ocf)],['Капитальные затраты',y=>issR(y.capex)],
+      ['Свободный денежный поток',y=>issR(y.fcf),'Операционный поток минус капзатраты.'],['Капитал',y=>issR(y.equity)],['Активы',y=>issR(y.assets)]];
+  const b=fin.bank?[['ROE',y=>`<b>${issP(y.roe,1)}</b>`,ISS_HINT_I.roe],['Капитал / активы',y=>`<b>${issP(y.eq_ratio,1)}</b>`,ISS_HINT_I.eq],['Стоимость риска',y=>`<b>${issP(y.cost_risk,1)}</b>`,ISS_HINT_I.crisk],
+      ['Неработающие кредиты',y=>`<b>${issP(y.npl,1)}</b>`,ISS_HINT_I.npl],['Достаточность капитала',y=>`<b>${issP(y.car,1)}</b>`,ISS_HINT_I.car],['Рост доходов',y=>`<b>${g(y)}</b>`,ISS_HINT_I.growth]]
+    :[['Чистый долг / EBITDA',y=>`<b>${nd(y)}</b>`,ISS_HINT_I.lev],['Покрытие процентов (EBITDA)',y=>`<b>${issX(y.cover)}</b>`,ISS_HINT_I.cover],['Доля капитала в активах',y=>`<b>${issP(y.eq_ratio)}</b>`,ISS_HINT_I.eq],
+      ['Рентабельность по EBITDA',y=>`<b>${issP(y.margin_ebitda,1)}</b>`,ISS_HINT_I.margin],['Рост выручки',y=>`<b>${g(y)}</b>`,ISS_HINT_I.growth]];
+  return`<div class="tbl"><table><thead><tr><th class="l">Абсолютные показатели, ₽</th>${th}<th class="l">Пояснение</th></tr></thead><tbody>${a.map(x=>row(x[0],x[1],x[2])).join('')}</tbody></table></div>
+    <div class="tbl" style="margin-top:14px"><table><thead><tr><th class="l">Коэффициенты</th>${th}<th class="l">Что значит и какой уровень нормальный</th></tr></thead><tbody>${b.map(x=>row(x[0],x[1],x[2])).join('')}</tbody></table></div>`;
+}
+function issIfrsBlock(ib){
+  const s=ib.score,f=ib.fin;let h='';
+  if(s.ok){
+    h+=`<div class="iss-top"><div class="iss-big iss-${esc(s.key)}"><b>${s.score}</b><span>из 100</span></div><div><div style="font-size:16px;font-weight:650">Финансовое состояние группы: ${esc(s.label)}</div>
+      <div class="mu" style="font-size:13px;margin-top:3px">По консолидированной отчётности МСФО (${esc(ib.group||ib.ticker)}, ${esc(ib.ticker)}), ${esc(s.period)}. Лет в таблице: ${s.n_years}. Шкала: ≥ 70 устойчивое · 50–69 среднее · 30–49 слабое · &lt; 30 тревожное.</div>
+      <div class="mu" style="font-size:13px;margin-top:3px">${esc(ib.how)}.</div></div></div>`;
+    if(s.year<new Date().getFullYear()-2)h+=`<div class="bc-warn">Последний годовой отчёт — за ${s.year} г.: оценка устарела.</div>`;
+    h+=`<h3 class="iss-h">За что баллы</h3>${issPartsHtml(s,ISS_HINT_I)}`;
+  }else h+=`<div class="msg" style="margin:6px 0 12px">${esc(s.reason||f.note||'Нет данных МСФО.')}</div>`;
+  if(f.years&&f.years.length)h+=`<h3 class="iss-h">Динамика по годам</h3><div id="iss-ch" class="bc-ch"></div>${issIfrsTable(f)}
+    <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. LTM — последние 12 месяцев по квартальной отчётности (если новее годовой). Рост выручки считается по годовым данным. <a href="${esc(ib.url)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a> — данные агрегатора, могут отличаться от официальной отчётности.</p>`;
+  return h;
+}
 function issDetail(isin){
   const I=S.iss,c=I.cards[isin];
   const bar=`<div class="row" style="justify-content:flex-end"><button class="btn ghost" id="iss-close" style="padding:4px 12px;font-size:12px">Свернуть ✕</button></div>`;
@@ -13787,6 +14252,12 @@ function issDetail(isin){
   const is=c.issuer||{},f=c.fin||{years:[]},s=c.score||{},m=c.market||{},hs=c.history;
   let h=`<div class="card" id="iss-det">${bar}<h2 style="margin-top:-6px">${esc(is.short||is.title||isin)}<span class="sp">${is.inn?'ИНН '+esc(is.inn)+' · ':''}${esc(is.title||'')}</span></h2>`;
   if(c.errors&&c.errors.length)h+=`<div class="bc-warn">${c.errors.map(esc).join('<br>')}</div>`;
+  const ib=c.ifrs,hasI=!!(ib&&ib.fin&&ib.fin.status==='ok'&&ib.fin.years&&ib.fin.years.length),tab=hasI?(I.tab[isin]||c.basis):'rsbu',useI=hasI&&tab==='ifrs';
+  if(ib&&!hasI)h+=`<div class="mu" style="font-size:12px;margin-bottom:8px">Для группы ${esc(ib.group||'')} (${esc(ib.ticker)}) данных МСФО на smart-lab нет: ${esc((ib.fin&&ib.fin.note)||'')}</div>`;
+  if(hasI)h+=`<div class="seg" id="iss-tabs" style="margin:2px 0 12px;display:inline-flex"><button data-tab="ifrs" class="${tab==='ifrs'?'on':''}">МСФО группы (${esc(ib.ticker)})${c.basis==='ifrs'?' · основа скоринга':''}</button>
+    <button data-tab="rsbu" class="${tab==='rsbu'?'on':''}">РСБУ компании${c.basis==='rsbu'?' · основа скоринга':''}</button></div>`;
+  if(useI)h+=issIfrsBlock(ib);
+  else{
   if(f.org_id)h+=`<div class="mu" style="font-size:12px;margin-bottom:8px"><a href="https://bo.nalog.gov.ru/organizations-card/${esc(String(f.org_id))}" target="_blank" rel="noopener">Отчётность на сайте ФНС ↗</a></div>`;
   if(s.ok){
     h+=`<div class="iss-top"><div class="iss-big iss-${esc(s.key)}"><b>${s.score}</b><span>из 100</span></div><div><div style="font-size:16px;font-weight:650">Финансовое состояние: ${esc(s.label)}</div>
@@ -13799,9 +14270,11 @@ function issDetail(isin){
     h+=`<h3 class="iss-h">Динамика по годам</h3><div id="iss-ch" class="bc-ch"></div>${issFinTable(f)}
       <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. EBIT здесь — прибыль до налогообложения плюс проценты к уплате (если строки нет — прибыль от продаж). Источник: бухгалтерская отчётность по РСБУ, ГИР БО ФНС (отчётность отдельной компании, не группы).</p>`;
   }
+  }
   h+=`<h3 class="iss-h">Рынок и отчётность</h3><div class="bc-rel">`;
   if(m.key)h+=`<b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b><br>`;else h+=esc(m.text||'');
-  h+=`<span class="mu">Скоринг по отчётности: ${s.ok?s.score:'—'} · по спреду к КБД: ${m.market_score==null?'—':m.market_score}${m.spread==null?'':' (спред '+bcN(m.spread,1)+' п.п.)'} · по рейтингу: ${m.rating_score==null?'—':m.rating_score}${m.rating?' ('+esc(m.rating)+')':''}. Оценки рынка и рейтинга переведены в ту же шкалу 0–100: чем выше спред и ниже рейтинг, тем меньше баллов.</span></div>`;
+  const ms=c.basis==='ifrs'?ib.score:s;
+  h+=`<span class="mu">Скоринг по отчётности (${c.basis==='ifrs'?'МСФО':'РСБУ'}): ${ms.ok?ms.score:'—'} · по спреду к КБД: ${m.market_score==null?'—':m.market_score}${m.spread==null?'':' (спред '+bcN(m.spread,1)+' п.п.)'} · по рейтингу: ${m.rating_score==null?'—':m.rating_score}${m.rating?' ('+esc(m.rating)+')':''}. Оценки рынка и рейтинга переведены в ту же шкалу 0–100: чем выше спред и ниже рейтинг, тем меньше баллов.</span></div>`;
   if(c.bonds&&c.bonds.length){
     h+=`<div class="tbl" style="margin-top:10px;max-height:300px"><table><thead><tr><th class="l">Выпуск</th><th>Рейтинг</th><th>Дюрация, г.</th><th>Доходность</th><th>Спред к КБД</th></tr></thead><tbody>`
       +c.bonds.map(b=>`<tr data-isin="${esc(b.isin)}" title="Открыть карточку выпуска"><td class="l">${esc(b.name)}${b.me?' <span class="tag">этот выпуск</span>':''}</td><td>${b.rating?`<span class="tag rt rt-${esc(rBucket(b.rating).split(' ')[0])}">${esc(b.rating)}</span>`:'<span class="mu">—</span>'}</td>
@@ -13812,7 +14285,7 @@ function issDetail(isin){
     h+=`<h3 class="iss-h">Кредитная история</h3><div class="bc-rel"><b class="${hs.defaults?'neg':hs.tech?'':'pos'}">${esc(hs.verdict)}</b><br><span class="mu">Выпусков эмитента на Мосбирже: ${hs.total} (торгуется сейчас: ${hs.traded}). Проверено на дефолт: ${hs.checked}${hs.total>hs.checked?' (сначала торгуемые)':''}. Флаги берутся из описания выпуска на Мосбирже.</span></div>`;
     if(bad_.length)h+=`<div class="tbl" style="margin-top:8px;max-height:260px"><table><thead><tr><th class="l">Выпуск</th><th class="l">Статус</th></tr></thead><tbody>`+bad_.map(x=>`<tr data-isin="${esc(x.isin)}"><td class="l">${esc(x.name)} <small class="mu">${esc(x.isin)}</small></td><td class="l neg">${x.default?'дефолт':'технический дефолт'}${x.traded?'':' · не торгуется'}</td></tr>`).join('')+`</tbody></table></div>`;
   }
-  return h+`<p class="note" style="margin-top:12px">Не является инвестиционной рекомендацией. Скоринг — упрощённая модель по открытой отчётности отдельной компании (РСБУ); она может не отражать положение группы, поддержку владельца и события после отчётной даты.</p></div>`;
+  return h+`<p class="note" style="margin-top:12px">Не является инвестиционной рекомендацией. Скоринг — упрощённая модель по открытой отчётности (МСФО группы по данным smart-lab, если эмитент входит в листинговую группу; иначе РСБУ отдельной компании); она может не отражать поддержку владельца и события после отчётной даты.</p></div>`;
 }
 function bindIss(){
   const I=S.iss;
@@ -13827,7 +14300,10 @@ function bindIss(){
   const det=document.getElementById('iss-det');
   if(det&&I.sel){
     const c=I.cards[I.sel],ch=document.getElementById('iss-ch');
-    if(c&&c.fin&&c.fin.years&&c.fin.years.length&&ch)try{issChart(ch,c.fin)}catch(e){ch.innerHTML='<div class="empty">Не удалось построить график</div>'}
+    const useI=c&&c.ifrs&&c.ifrs.fin&&c.ifrs.fin.years&&c.ifrs.fin.years.length&&(I.tab[I.sel]||c.basis)==='ifrs';
+    const fin=useI?c.ifrs.fin:c&&c.fin;
+    if(fin&&fin.years&&fin.years.length&&ch)try{issChart(ch,fin,useI)}catch(e){ch.innerHTML='<div class="empty">Не удалось построить график</div>'}
+    const tb=document.getElementById('iss-tabs');if(tb)tb.onclick=e=>{const b=e.target.closest('[data-tab]');if(!b)return;I.tab[I.sel]=b.dataset.tab;render()};
     if(I.scroll&&c){I.scroll=0;det.scrollIntoView({behavior:'smooth',block:'start'})}
   }
 }
