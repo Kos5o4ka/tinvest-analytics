@@ -1,0 +1,41 @@
+/* ── Тарифы Free / Pro: заглушка, плашки, бейджи ── */
+.pro-b{font-style:normal;font-size:9px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-left:auto;padding:1px 5px;border-radius:5px;background:#ffdd2d22;color:var(--ac);border:1px solid #ffdd2d44}
+#nav button{position:relative}
+.pro-lock{position:relative;min-height:440px;display:flex;align-items:center;justify-content:center;padding:20px 0;overflow:hidden}
+.pro-prev{position:absolute;inset:0;filter:blur(5px) grayscale(.6);opacity:.45;pointer-events:none;user-select:none;overflow:hidden}
+.pro-card{position:relative;width:min(520px,100%);display:flex;flex-direction:column;gap:12px;box-shadow:0 20px 60px #0007;border-color:var(--line2)}
+.pro-tag{align-self:flex-start;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:2px 8px;border-radius:6px;background:var(--ac);color:#111}
+.pro-card h2{margin:0}
+.pro-ft{display:flex;align-items:center;gap:10px;color:var(--tx2)}
+.pro-ft svg{width:20px;height:20px;flex:none;color:var(--ac)}.pro-ft b{color:var(--tx);font-size:15px}
+.pro-ul{list-style:none;padding:0;display:grid;gap:7px;color:var(--tx2);font-size:13px}
+.pro-ul li{position:relative;padding-left:20px}
+.pro-ul li:before{content:"";position:absolute;left:3px;top:6px;width:9px;height:5px;border-left:2px solid var(--pos);border-bottom:2px solid var(--pos);transform:rotate(-45deg)}
+.pro-btns{gap:10px;flex-wrap:wrap}.pro-btns .btn{text-decoration:none}
+.pro-sk{padding:24px;display:grid;gap:14px}
+.pro-sk i{display:block;border-radius:5px;background:var(--line2)}
+.pro-sk-row{display:flex;gap:18px;align-items:center}
+.pro-sk-ch{display:flex;align-items:flex-end;gap:10px;height:240px}.pro-sk-ch b{flex:1;background:var(--line2);border-radius:5px 5px 0 0}
+.pro-sk-g{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.pro-sk-c{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:16px;display:grid;gap:10px}
+.pro-line{display:flex;align-items:center;gap:8px;color:var(--mu);font-size:13px;margin:6px 0}
+.pro-line svg{width:15px;height:15px;flex:none}
+.pro-lk,.pro-try{all:unset;cursor:pointer;color:var(--ac);font-size:12px;text-decoration:underline dotted}
+.pro-lk:hover,.pro-try:hover{color:var(--ac2)}
+.pro-pill{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;border:1px solid var(--line2);color:var(--tx2)}
+.pro-pill.on{background:#ffdd2d1c;border-color:#ffdd2d55;color:var(--ac)}
+.pro-ban{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px}
+.pro-ban a{color:inherit;text-decoration:underline}
+.pro-ban button{all:unset;cursor:pointer;font-size:18px;line-height:1;padding:0 4px;opacity:.7}
+#pro-ov{position:fixed;inset:0;z-index:450;background:#000a;display:flex;align-items:center;justify-content:center;padding:20px;overflow:auto}
+.pro-box{position:relative;width:min(640px,100%);max-height:100%;overflow:auto;background:var(--card);border:1px solid var(--line2);border-radius:var(--r);padding:24px;display:flex;flex-direction:column;gap:14px;box-shadow:0 20px 60px #0008}
+.pro-box h3{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mu)}
+.pro-x{all:unset;cursor:pointer;position:absolute;right:14px;top:10px;font-size:24px;color:var(--mu)}
+.pro-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.pro-it{display:flex;gap:10px;align-items:flex-start;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--card2)}
+.pro-it svg{width:20px;height:20px;flex:none;color:var(--ac);margin-top:1px}
+.pro-it b{display:block;font-size:13px}.pro-it small{color:var(--mu);font-size:12px}
+@media(max-width:640px){.pro-grid,.pro-sk-g{grid-template-columns:1fr}.pro-lock{min-height:0}}
+[data-theme="light"] .pro-b,[data-theme="light"] .pro-pill.on{color:#8a6d00;background:#ffdd2d33;border-color:#c9a40088}
+[data-theme="light"] .pro-lk,[data-theme="light"] .pro-try{color:#8a6d00}
+[data-theme="light"] #pro-ov{background:#0007}

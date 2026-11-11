@@ -18,7 +18,7 @@ function pOps(){
 }
 function drawOps(){
   const all=opsFiltered(),rows=all.slice(0,S.opsN),el=$('#otab');if(!el)return;
-  if(!all.length){el.innerHTML='<div class="empty">Операций не найдено</div>';return}
+  if(!all.length){el.innerHTML=S.opsQ||S.opsK?'<div class="empty">Ничего не найдено. <button class="btn ghost" id="ops-reset">Сбросить фильтры</button></div>':emptyHint('Операций за этот период нет. Выберите период «Всё время» сверху или загрузите отчёт брокера.',[['imp','Импорт отчёта',1]]);const rb=$('#ops-reset');if(rb)rb.onclick=()=>{S.opsQ='';S.opsK='';render()};el.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   const multi=S.account==='all';
   el.innerHTML=`<p class="note" style="margin-bottom:8px">Найдено: ${f0(all.length)}</p><div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
     <th>Дата</th><th class="l">Операция</th><th class="l">Инструмент</th>${multi?'<th class="l">Счёт</th>':''}<th>Кол-во</th><th>Цена</th><th>Сумма</th><th>Комиссия</th><th>Результат</th></tr></thead><tbody>`+

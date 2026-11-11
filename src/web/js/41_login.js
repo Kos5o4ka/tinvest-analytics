@@ -12,7 +12,7 @@ function authWho(){
   const s=AUTH.st;
   if(!s||s.state!=='ok'||(!s.username&&!s.expires)){el.innerHTML='';el.style.display='none';return}
   el.style.display='';
-  el.innerHTML=`<span title="Вход по ключу из @${esc(AUTH.bot)}">${s.username?'@'+esc(s.username):'ключ'}${s.expires?' · до '+esc(authTime(s.expires)):''}</span><button id="who-out" title="Выйти и стереть ключ с этого компьютера">Выйти</button>`;
+  el.innerHTML=proPill()+`<span title="Вход по ключу из @${esc(AUTH.bot)}">${s.username?'@'+esc(s.username):'ключ'}${s.expires?' · до '+esc(authTime(s.expires)):''}</span><button id="who-out" title="Выйти и стереть ключ с этого компьютера">Выйти</button>`;
   $('#who-out').onclick=async()=>{try{AUTH.st=await post('/api/auth/logout');authApply()}catch(e){}};
 }
 function authOverlay(show,err){
@@ -51,6 +51,7 @@ function authApply(){
   if(s.state==='need_login'||expired)authOverlay(true,s.state==='need_login'?authMsg(s.error==='nokey'?'':s.error):authMsg('expired'));
   else authOverlay(false);
   authWho();
+  proAuthChanged();
 }
 async function authCheck(force){
   try{AUTH.st=await api('/api/auth/status'+(force?'?force=1':''));authApply()}catch(e){}

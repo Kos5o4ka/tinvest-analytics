@@ -29,8 +29,9 @@ function ofHelper(x){
     <p class="mu"><small>${esc(p.disclaimer)}</small></p>`;
   return{chip,body};
 }
+function ofTeaser(){return{chip:['Pro','of-wait'],body:proTeaser('Подсказка по оферте — в Pro')}}
 function ofCard(x){
-  const hp=x.kind==='put'?ofHelper(x):null;
+  const hp=x.kind==='put'?(isPro()?ofHelper(x):ofTeaser()):null;
   const h=x.hint||{},[lab,hc]=hp?hp.chip:(OF_HINT[h.code]||['','of-wait']),k=OF_KIND[x.kind]||OF_KIND.unknown,put=x.kind==='put';
   const yo=x.yield_to_offer!=null&&x.yield_to_offer<=100?pctp(x.yield_to_offer,1):x.yield_to_offer!=null?'&gt; 100 %':'—';
   const cpn=!put?'—':x.coupon_known?`<b>${pctp(x.new_rate,1)}</b> годовых<br><small class="mu">доходность ${x.hold_yield!=null?pctp(x.hold_yield,1):'—'}</small>`:'<span class="mu">не объявлен</span>';

@@ -167,6 +167,7 @@ document.addEventListener('click',async e=>{
 
 /* ── Telegram: карточка в «Настройках» (уведомления идут через сервер данных и общего бота) ── */
 function setTgHtml(c){
+  if(!isPro())return`<div class="card" id="tg-lock"><h2>Уведомления в Telegram<span class="sp">Pro</span></h2>${proTeaser('Уведомления в Telegram — в Pro: тревоги, выплаты и сводка прямо в мессенджере')}</div>`;
   const on=(k,d)=>c[k]==null?d:!!c[k];
   return`<div class="card" id="tg-card"><h2>Уведомления в Telegram<span class="sp">по желанию</span></h2>
     <div style="display:grid;gap:16px">

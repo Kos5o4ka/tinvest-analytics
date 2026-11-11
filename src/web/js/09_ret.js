@@ -11,7 +11,7 @@ function pRet(){
   const h=S.hist;
   if(!h)return`<div class="card">${waitBox('Восстанавливаю историю стоимости портфеля по дневным ценам закрытия. Первый раз это может занять до минуты — дальше данные берутся из локальной базы.')}</div>`;
   if(h.error)return`<div class="msg err">${esc(h.error)}</div>`;
-  if(!h.days.length)return'<div class="card empty">Нет операций для расчёта доходности</div>';
+  if(!h.days.length)returnemptyHint('Доходность считается по операциям: пополнениям, сделкам и выплатам. Подключите Т-Инвестиции или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['set','Настройки']]);
   const hs=histSlice();
   const ms=Object.keys(h.monthly).sort(),years=[...new Set(ms.map(m=>m.slice(0,4)))].sort().reverse();
   const inP=m=>{const s=periodStart(),e=periodEnd();return(!s||m>=s.slice(0,7))&&(!e||m<=e.slice(0,7))};

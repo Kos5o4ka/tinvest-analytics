@@ -299,10 +299,33 @@ class TgKeyTests(unittest.TestCase):
     def test_valid_and_normalized(self):
         st, j = self.check("TIA-AAAA-AAAA-AAAA")
         self.assertEqual((st, j["ok"], j["username"], j["plan"], j["bot"]), (200, True, "alice", "free", "testbot"))
+        self.assertIsNone(j["pro_until"])          # база старой схемы (без plan_until) -> Free
         self.assertEqual(j["expires"], self.NOW + 3600)
         self.assertEqual(self.check("  tia-aaaa-aaaa-aaaa ")[0], 200)
         self.assertEqual(self.check("tia-aaaa-aaaa -aaaa")[0], 200)
         self.assertEqual(self.f.call(self.f.up.url("/a"), headers={"X-Client-Key": "TIA-AAAA-AAAA-AAAA"})[0], 200)
+
+    def test_plan_pro_and_cache_ends_with_pro(self):
+        self.db.execute("ALTER TABLE users ADD COLUMN plan_until REAL")
+        self.db.execute("UPDATE users SET plan_until=? WHERE tg_id=1", (self.NOW + 30,))
+        self.db.commit()
+        self.f.close()
+        self.f = Fx(keys_db=self.dbp)
+        st, j = self.check("TIA-AAAA-AAAA-AAAA")
+        self.assertEqual((st, j["plan"], j["pro_until"], j["trial"]), (200, "pro", self.NOW + 30, False))   # колонки pro_kind нет
+        self.db.execute("ALTER TABLE users ADD COLUMN pro_kind TEXT")
+        self.db.execute("UPDATE users SET pro_kind='trial' WHERE tg_id=1")
+        self.db.commit()
+        self.f.close()
+        self.f = Fx(keys_db=self.dbp)
+        self.assertTrue(self.check("TIA-AAAA-AAAA-AAAA")[1]["trial"])
+        self.db.execute("UPDATE users SET pro_kind='pro' WHERE tg_id=1")
+        self.db.commit()
+        self.f.close()
+        self.f = Fx(keys_db=self.dbp)
+        self.assertFalse(self.check("TIA-AAAA-AAAA-AAAA")[1]["trial"])
+        self.f.now[0] = self.NOW + 40                                    # Pro истёк, кэш (60 с) не должен его продлить
+        self.assertEqual(self.check("TIA-AAAA-AAAA-AAAA")[1]["plan"], "free")
 
     def test_rejections(self):
         self.assertEqual(self.check("TIA-BBBB-BBBB-BBBB"), (401, {"ok": False, "error": "expired", "bot": "testbot"}))
@@ -383,6 +406,8 @@ class NotifyTests(unittest.TestCase):
         self.dbp = os.path.join(tempfile.mkdtemp(prefix="tnot_"), "bot.sqlite")
         self.db = make_keys_db(self.dbp)
         self.db.execute("INSERT INTO users(tg_id, username) VALUES (1,'alice'),(2,'bob')")
+        self.db.execute("ALTER TABLE users ADD COLUMN plan_until REAL")
+        self.db.execute("UPDATE users SET plan_until=?", (self.NOW + 30 * 86400,))          # оба на Pro
         for k, tg in ((self.KEY, 1), ("TIA-BBBB-BBBB-BBBB", 2)):
             self.db.execute("INSERT INTO keys(key_hash, tg_id, created, expires) VALUES (?,?,?,?)",
                             (ts.key_hash(k), tg, self.NOW - 100, self.NOW + 10 * 86400))
@@ -412,6 +437,24 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual((st, j["ok"]), (200, True))
         self.assertEqual(self.rows(), [(1, "<b>Привет</b>", 0)])
         self.assertEqual(self.db.execute("SELECT id FROM outbox").fetchone()[0], j["queued"])
+
+    def test_free_gets_402_old_schema_and_expired(self):
+        self.db.execute("UPDATE users SET plan_until=NULL WHERE tg_id=1")
+        self.db.execute("UPDATE users SET plan_until=? WHERE tg_id=2", (self.NOW - 5,))     # Pro закончился
+        self.db.commit()
+        self.assertEqual(self.post({"text": "x"}), (402, {"error": "pro_required"}))
+        self.assertEqual(self.post({"text": "x"}, key="TIA-BBBB-BBBB-BBBB"), (402, {"error": "pro_required"}))
+        self.assertEqual(self.rows(), [])
+        p2 = os.path.join(tempfile.mkdtemp(prefix="tnot_"), "old.sqlite")                   # база бота до v3
+        d2 = make_keys_db(p2)
+        d2.execute("INSERT INTO users(tg_id, username) VALUES (1,'alice')")
+        d2.execute("INSERT INTO keys(key_hash, tg_id, created, expires) VALUES (?,?,?,?)",
+                   (ts.key_hash(self.KEY), 1, self.NOW - 100, self.NOW + 86400))
+        d2.commit()
+        self.f.close()
+        self.f = Fx(keys_db=p2)
+        self.assertEqual(self.post({"text": "x"}), (402, {"error": "pro_required"}))
+        d2.close()
 
     def test_notify_flag(self):
         self.db.execute("ALTER TABLE users ADD COLUMN notify INTEGER NOT NULL DEFAULT 1")

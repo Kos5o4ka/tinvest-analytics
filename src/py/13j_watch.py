@@ -285,6 +285,8 @@ def tg_send(cfg, text):
     err = str(j.get("error") or "")
     if code == 409 or err == "notify_off":
         raise ApiError("Уведомления выключены в боте: отправьте ему /notify_on.", 409)
+    if code == 402 or err == "pro_required":
+        raise ApiError("Уведомления в Telegram доступны в тарифе Pro. Подробнее: команда /pro в боте.", 402)
     if code == 429:
         raise ApiError("Слишком много сообщений, попробуйте позже.", 429)
     if code == 401:

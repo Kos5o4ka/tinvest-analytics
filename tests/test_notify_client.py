@@ -76,6 +76,8 @@ class T(unittest.TestCase):
     def test_errors(self):
         self.stub.code, self.stub.reply = 409, {"ok": False, "error": "notify_off"}
         self.assertIn("/notify_on", self.err()[0])
+        self.stub.code, self.stub.reply = 402, {"error": "pro_required"}
+        self.assertIn("Pro", self.err()[0])
         self.stub.code, self.stub.reply = 429, {"ok": False, "error": "rate_limit"}
         self.assertIn("Слишком много сообщений", self.err()[0])
         self.stub.code, self.stub.reply = 401, {"ok": False, "error": "expired"}

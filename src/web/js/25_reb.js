@@ -28,7 +28,7 @@ function rebTaxHtml(act,keys){
 }
 function pReb(){
   const ps=S.data.portfolio.positions,tot=ps.reduce((a,x)=>a+(x.value_rub||0),0);
-  if(!(tot>0))return'<div class="card empty">В портфеле нет активов для расчёта</div>';
+  if(!(tot>0))returnemptyHint('Ребалансировке нужны активы в портфеле. Выберите счёт с бумагами или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']]);
   const cur={};ps.forEach(x=>{const t=x.type||'other';cur[t]=(cur[t]||0)+(x.value_rub||0)});
   if(!S.reb.draft)S.reb.draft=Object.assign({},(S.cfg&&S.cfg.targets)||{});
   const tg=S.reb.draft;

@@ -3731,7 +3731,8 @@ def _auth_http(srv, path, key):
 
 def _auth_eval(srv, key):
     """Состояние доступа по ответу сервера (без кэша)."""
-    base = {"state": "ok", "error": "", "expires": None, "username": "", "bot": _auth["bot"], "server": srv}
+    base = {"state": "ok", "error": "", "expires": None, "username": "", "bot": _auth["bot"], "server": srv,
+            "plan": "pro", "pro_until": None, "trial": False}   # свой сервер / общий ключ / старый сервер: всё доступно
     try:
         if not key:                                    # без ключа пускаем, только если сервер открытый
             code, j = _auth_http(srv, "/v1/health", "")
@@ -3748,7 +3749,12 @@ def _auth_eval(srv, key):
     if j.get("bot"):
         base["bot"] = str(j["bot"])
     if code == 200 and j.get("ok", True):
-        return dict(base, expires=j.get("expires"), username=str(j.get("username") or ""))
+        plan = str(j.get("plan") or "")
+        pu = j.get("pro_until")
+        return dict(base, expires=j.get("expires"), username=str(j.get("username") or ""),
+                    plan="free" if plan == "free" else "pro",
+                    pro_until=pu if isinstance(pu, (int, float)) and not isinstance(pu, bool) else None,
+                    trial=bool(j.get("trial")) and plan != "free")
     if code == 401 or code == 403:
         err = str(j.get("error") or "")
         return dict(base, state="need_login", error=err if err in ("expired", "banned") else "invalid")
@@ -3760,7 +3766,8 @@ def _auth_eval(srv, key):
 def auth_status(force=False):
     srv, key = ds_conf()
     if not srv:                                        # сервер отключён: приложение работает напрямую
-        return {"state": "ok", "error": "", "expires": None, "username": "", "bot": _auth["bot"], "server": ""}
+        return {"state": "ok", "error": "", "expires": None, "username": "", "bot": _auth["bot"], "server": "",
+                "plan": "pro", "pro_until": None, "trial": False}
     now = time.time()
     with _ds_lock:
         if not force:
@@ -10469,6 +10476,8 @@ def tg_send(cfg, text):
     err = str(j.get("error") or "")
     if code == 409 or err == "notify_off":
         raise ApiError("Уведомления выключены в боте: отправьте ему /notify_on.", 409)
+    if code == 402 or err == "pro_required":
+        raise ApiError("Уведомления в Telegram доступны в тарифе Pro. Подробнее: команда /pro в боте.", 402)
     if code == 429:
         raise ApiError("Слишком много сообщений, попробуйте позже.", 429)
     if code == 401:
@@ -12970,6 +12979,132 @@ API_GET["/api/localdata"] = ld_info_get
 API_POST["/api/localdata/open"] = ld_open_post
 API_POST["/api/localdata/clear"] = ld_clear_post
 API_POST["/api/localdata/wipe"] = ld_wipe_post
+# ═══════════════════════════════ «Сегодня»: дневная сводка на «Обзоре» ═══════════════════════════════
+# Выплаты на 7 дней, ближайшие оферты, рейтинговые действия за неделю и число тревог мониторинга.
+# Чистые функции (td_*) не ходят в сеть; сеть и кэши трогает только td_build/today_get. Кэш 10 минут.
+
+TD_PAY_DAYS, TD_OFFER_DAYS, TD_RATING_DAYS, TD_TTL = 7, 30, 7, 600
+TD_PAY_KINDS = ("coupon", "dividend", "amortization")
+
+
+def td_add_days(d, n):
+    return (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def td_payments(pays, today, days=TD_PAY_DAYS):
+    """Купоны, дивиденды и амортизации в окне [today, today+days]: сумма, число, разбивка по видам и 5 ближайших."""
+    end = td_add_days(today, days)
+    sel = sorted((p for p in pays or [] if p.get("kind") in TD_PAY_KINDS and today <= (p.get("date") or "") <= end and p.get("amount")),
+                 key=lambda p: (p["date"], -(p.get("amount") or 0)))
+    by = {}
+    for p in sel:
+        by[p["kind"]] = by.get(p["kind"], 0) + p["amount"]
+    return {"count": len(sel), "sum": sum(p["amount"] for p in sel), "days": days, "by_kind": by,
+            "next_date": sel[0]["date"] if sel else None,
+            "items": [{"date": p["date"], "kind": p["kind"], "name": p.get("name"), "amount": p["amount"]} for p in sel[:5]]}
+
+
+def td_offer_status(o, today):
+    """Статус оферты: open (идёт приём заявок) | upcoming (приём ещё не начался) | closed | unknown (период не опубликован)."""
+    ps, pe = o.get("period_start"), o.get("period_end")
+    if ps and pe:
+        return "open" if ps <= today <= pe else ("upcoming" if today < ps else "closed")
+    return "unknown"
+
+
+def td_offers(pairs, today, days=TD_OFFER_DAYS):
+    """pairs: [(строка облигации, список оферт offer_kinds)]. Оферты в ближайшие days дней, без отменённых, по возрастанию даты."""
+    end = td_add_days(today, days)
+    out = []
+    for r, offs in pairs or []:
+        for o in offs or []:
+            if o.get("status") == "cancelled" or not (today <= (o.get("date") or "") <= end):
+                continue
+            st = td_offer_status(o, today) if o["kind"] == "put" else "unknown"
+            if st == "closed":
+                continue
+            out.append({"isin": r.get("isin"), "name": r.get("name"), "kind": o["kind"], "date": o["date"],
+                        "days": (datetime.strptime(o["date"], "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days,
+                        "status": st, "period_start": o.get("period_start"), "period_end": o.get("period_end")})
+    out.sort(key=lambda x: (x["date"], {"put": 0, "call": 1}.get(x["kind"], 2), x["name"] or ""))
+    return {"count": len(out), "days": days, "put": sum(1 for x in out if x["kind"] == "put"),
+            "call": sum(1 for x in out if x["kind"] == "call"), "items": out[:5]}
+
+
+def td_ratings(events, rows_keys, today, days=TD_RATING_DAYS):
+    """Рейтинговые действия за days дней по эмитентам портфеля (та же логика, что у тревог монитора)."""
+    al = _mon_rating_alerts(rows_keys, events or [], td_add_days(today, -days))
+    return {"count": len(al), "days": days, "negative": sum(1 for a in al if a["severity"] in ("high", "medium")),
+            "items": [{"date": a["date"], "name": a["name"], "message": a["message"], "severity": a["severity"]} for a in al[:5]]}
+
+
+def td_digest(pays, pairs, events, rows_keys, today, alerts=None):
+    """Собирает сводку; пустые разделы выбрасываются, empty=True — показывать карточку нечего."""
+    d = {"today": today, "payments": td_payments(pays, today), "offers": td_offers(pairs, today),
+         "ratings": td_ratings(events, rows_keys, today)}
+    if alerts is not None:
+        d["alerts"] = {"count": sum(1 for a in alerts if a.get("severity") in ("high", "medium")),
+                       "high": sum(1 for a in alerts if a.get("severity") == "high")}
+    for k in ("payments", "offers", "ratings", "alerts"):
+        if k in d and not d[k]["count"]:
+            del d[k]
+    d["empty"] = not any(k in d for k in ("payments", "offers", "ratings", "alerts"))
+    return d
+
+
+def td_empty():
+    return {"today": date.today().isoformat(), "empty": True}
+
+
+def _td_warm_monitor(cfg, acc):
+    try:
+        build_monitor(cfg, acc)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def td_build(cfg, acc):
+    today = date.today().isoformat()
+    rep = build_bonds(cfg, acc)
+    rows = [r for r in rep.get("rows") or [] if r.get("isin") and r.get("qty")]
+
+    def one(r):
+        try:
+            return r, offers_of_isin(r["isin"], r.get("call"), today)
+        except Exception:  # noqa: BLE001
+            return r, []
+    pairs = pool_map(one, rows, workers=8)
+    events = (store().get(RT_LOG_KEY) or {}).get("events") or []
+    rows_keys = [(r, _mon_issuer_keys(r)) for r in rows]
+    alerts = None
+    try:                                  # мониторинг тяжёлый: берём только готовый результат, а прогрев запускаем в фоне
+        th = mon_thresholds(cfg)
+        mon = mem_get(("monitor", token_key(cfg), acc, tuple(sorted(th.items()))), 900)
+        if mon is not None:
+            alerts = mon.get("alerts") or []
+        else:
+            threading.Thread(target=_td_warm_monitor, args=(cfg, acc), daemon=True).start()
+    except Exception:  # noqa: BLE001
+        alerts = None
+    return td_digest(rep.get("payments") or [], pairs, events, rows_keys, today, alerts)
+
+
+def today_get(cfg, acc, q, force):
+    if not cfg.get("token") and not imports_list():
+        return td_empty()
+    key = ("today", token_key(cfg), acc)
+    if not force:
+        hit = mem_get(key, TD_TTL)
+        if hit:
+            return hit
+    try:
+        res = td_build(cfg, acc)
+    except Exception:  # noqa: BLE001
+        return td_empty()
+    return mem_put(key, res)
+
+
+API_GET["/api/today"] = today_get
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -14013,6 +14148,86 @@ tr.scr-low td{opacity:.5}
   .set-toc{top:0;gap:4px;padding:6px 0}.set-toc a{padding:3px 9px;font-size:12px}.set-sec{scroll-margin-top:96px}
   .ld-row{grid-template-columns:1fr auto;gap:4px 10px}.ld-bar{grid-column:1/3;order:3}
 }
+/* ── Тарифы Free / Pro: заглушка, плашки, бейджи ── */
+.pro-b{font-style:normal;font-size:9px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-left:auto;padding:1px 5px;border-radius:5px;background:#ffdd2d22;color:var(--ac);border:1px solid #ffdd2d44}
+#nav button{position:relative}
+.pro-lock{position:relative;min-height:440px;display:flex;align-items:center;justify-content:center;padding:20px 0;overflow:hidden}
+.pro-prev{position:absolute;inset:0;filter:blur(5px) grayscale(.6);opacity:.45;pointer-events:none;user-select:none;overflow:hidden}
+.pro-card{position:relative;width:min(520px,100%);display:flex;flex-direction:column;gap:12px;box-shadow:0 20px 60px #0007;border-color:var(--line2)}
+.pro-tag{align-self:flex-start;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:2px 8px;border-radius:6px;background:var(--ac);color:#111}
+.pro-card h2{margin:0}
+.pro-ft{display:flex;align-items:center;gap:10px;color:var(--tx2)}
+.pro-ft svg{width:20px;height:20px;flex:none;color:var(--ac)}.pro-ft b{color:var(--tx);font-size:15px}
+.pro-ul{list-style:none;padding:0;display:grid;gap:7px;color:var(--tx2);font-size:13px}
+.pro-ul li{position:relative;padding-left:20px}
+.pro-ul li:before{content:"";position:absolute;left:3px;top:6px;width:9px;height:5px;border-left:2px solid var(--pos);border-bottom:2px solid var(--pos);transform:rotate(-45deg)}
+.pro-btns{gap:10px;flex-wrap:wrap}.pro-btns .btn{text-decoration:none}
+.pro-sk{padding:24px;display:grid;gap:14px}
+.pro-sk i{display:block;border-radius:5px;background:var(--line2)}
+.pro-sk-row{display:flex;gap:18px;align-items:center}
+.pro-sk-ch{display:flex;align-items:flex-end;gap:10px;height:240px}.pro-sk-ch b{flex:1;background:var(--line2);border-radius:5px 5px 0 0}
+.pro-sk-g{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.pro-sk-c{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:16px;display:grid;gap:10px}
+.pro-line{display:flex;align-items:center;gap:8px;color:var(--mu);font-size:13px;margin:6px 0}
+.pro-line svg{width:15px;height:15px;flex:none}
+.pro-lk,.pro-try{all:unset;cursor:pointer;color:var(--ac);font-size:12px;text-decoration:underline dotted}
+.pro-lk:hover,.pro-try:hover{color:var(--ac2)}
+.pro-pill{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;border:1px solid var(--line2);color:var(--tx2)}
+.pro-pill.on{background:#ffdd2d1c;border-color:#ffdd2d55;color:var(--ac)}
+.pro-ban{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px}
+.pro-ban a{color:inherit;text-decoration:underline}
+.pro-ban button{all:unset;cursor:pointer;font-size:18px;line-height:1;padding:0 4px;opacity:.7}
+#pro-ov{position:fixed;inset:0;z-index:450;background:#000a;display:flex;align-items:center;justify-content:center;padding:20px;overflow:auto}
+.pro-box{position:relative;width:min(640px,100%);max-height:100%;overflow:auto;background:var(--card);border:1px solid var(--line2);border-radius:var(--r);padding:24px;display:flex;flex-direction:column;gap:14px;box-shadow:0 20px 60px #0008}
+.pro-box h3{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mu)}
+.pro-x{all:unset;cursor:pointer;position:absolute;right:14px;top:10px;font-size:24px;color:var(--mu)}
+.pro-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.pro-it{display:flex;gap:10px;align-items:flex-start;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--card2)}
+.pro-it svg{width:20px;height:20px;flex:none;color:var(--ac);margin-top:1px}
+.pro-it b{display:block;font-size:13px}.pro-it small{color:var(--mu);font-size:12px}
+@media(max-width:640px){.pro-grid,.pro-sk-g{grid-template-columns:1fr}.pro-lock{min-height:0}}
+[data-theme="light"] .pro-b,[data-theme="light"] .pro-pill.on{color:#8a6d00;background:#ffdd2d33;border-color:#c9a40088}
+[data-theme="light"] .pro-lk,[data-theme="light"] .pro-try{color:#8a6d00}
+[data-theme="light"] #pro-ov{background:#0007}
+/* ── Онбординг, «Сегодня», шпаргалка клавиш ── */
+.ob-card{display:grid;gap:4px;padding:26px 28px}
+.ob-hd{margin-bottom:10px}.ob-t{font-size:26px;font-weight:700;letter-spacing:-.02em}.ob-hd p{margin-top:6px}
+.ob-step{display:grid;grid-template-columns:34px 1fr;gap:14px;padding:16px 0;border-top:1px solid var(--line)}
+.ob-n{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:14px;background:var(--card2);color:var(--tx2);border:1px solid var(--line2)}
+.ob-step.now .ob-n{background:var(--ac);color:#121212;border-color:var(--ac)}
+.ob-step.done .ob-n{background:#3ecf8e22;color:var(--pos);border-color:#3ecf8e55}
+.ob-step.soon{opacity:.6}
+.ob-b h3{font-size:15.5px;font-weight:650;margin-bottom:4px}
+.ob-b p{font-size:13.5px;line-height:1.5}
+.ob-row{display:flex;gap:10px;margin:12px 0 8px;flex-wrap:wrap}.ob-row .in{flex:1;min-width:220px}
+.ob-how{margin:8px 0;font-size:13.5px}.ob-how summary{cursor:pointer;color:var(--ac);font-weight:600}
+.ob-how ol{margin:8px 0 0 20px;display:grid;gap:6px;color:var(--tx2);line-height:1.5}.ob-how a{color:var(--ac)}
+.ob-priv{display:flex;align-items:flex-start;gap:8px;margin-top:10px;color:var(--mu)}
+.ob-priv svg{width:16px;height:16px;flex:none;margin-top:2px}
+.ob-alt{border-top:1px solid var(--line);padding-top:16px;color:var(--tx2);font-size:13.5px}
+.lnk{all:unset;cursor:pointer;color:var(--ac);text-decoration:underline;text-underline-offset:3px}
+.lnk:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.td-card{padding:16px 18px}
+.td-card h2{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}
+.td-ld{font-size:12px;color:var(--mu);font-weight:400}
+.td-it{all:unset;box-sizing:border-box;width:100%;cursor:pointer;display:flex;align-items:center;gap:12px;padding:9px 10px;border-radius:10px;font-size:13.5px;line-height:1.4}
+.td-it:hover{background:var(--card2)}.td-it:focus-visible{outline:2px solid var(--ac)}
+.td-it>i{width:28px;height:28px;border-radius:8px;background:var(--card2);display:grid;place-items:center;flex:none;color:var(--tx2)}
+.td-it>i svg{width:16px;height:16px}
+.td-it>span{flex:1;min-width:0}.td-it>em{font-style:normal;color:var(--mu);font-size:18px}
+.td-it.hot>i{background:#ffdd2d22;color:var(--ac)}
+.td-k{display:inline-block;padding:1px 7px;border-radius:6px;font-size:11px;font-weight:700;background:var(--card2);color:var(--tx2)}
+.td-k.put{background:#3987e522;color:var(--s1)}.td-k.call{background:#c9850022;color:var(--s4)}
+.td-pro{font-size:10.5px;font-weight:700;padding:1px 7px;border-radius:999px;background:#ffdd2d22;color:var(--ac);letter-spacing:.03em}
+.td-grp{display:grid}.td-more{font-size:12px;padding:2px 10px 0 50px}
+.card.hint{padding:40px 20px}
+.hint .row{flex-wrap:wrap}
+#ks-ov{position:fixed;inset:0;z-index:200;background:#0009;display:grid;place-items:center;padding:16px}
+#ks{background:var(--card);border:1px solid var(--line2);border-radius:var(--r);padding:20px 22px;width:min(440px,100%)}
+#ks h2{margin-bottom:10px}
+.ks-r{display:flex;gap:14px;align-items:center;padding:7px 0;border-top:1px solid var(--line);font-size:13.5px}
+.ks-r kbd{font:600 12px ui-monospace,Menlo,monospace;background:var(--card2);border:1px solid var(--line2);border-radius:6px;padding:3px 8px;min-width:96px;text-align:center;white-space:nowrap}
+@media(max-width:760px){.ob-card{padding:18px 14px}.ob-step{grid-template-columns:28px 1fr;gap:10px}.ob-t{font-size:22px}.ob-row .btn{width:100%;justify-content:center}.td-more{padding-left:10px}}
 </style></head>
 <body>
 <aside>
@@ -14316,7 +14531,7 @@ function logo(r,size=30){
 const ident=(r,sub)=>`<div class="tk">${logo(r)}<div><b title="${esc(r.name)}">${esc(r.name||r.ticker)}</b><small>${esc(sub!=null?sub:(r.ticker&&r.ticker!==r.name?r.ticker:''))}</small></div></div>`;
 
 /* ── shell ── */
-const navBtn=p=>`<button class="${p[0]===S.page?'on':''}" data-p="${p[0]}">${svgI(IC[p[0]])}${p[1]}</button>`;
+const navBtn=p=>`<button class="${p[0]===S.page?'on':''}" data-p="${p[0]}">${svgI(IC[p[0]])}${p[1]}${proNavBadge(p[0])}</button>`;
 function navHid(k){return S.navHidden.includes(k)&&!NAV_PINNED.includes(k)&&k!==S.page}
 function renderNav(){
   const pg=k=>PAGES.find(p=>p&&p[0]===k);
@@ -14399,13 +14614,14 @@ function renderNow(){
   if(S.page==='set')return renderSettings();
   if(S.page==='imp')return renderImport();
   if(S.page==='kb')return renderKb();
+  if(PRO_PAGES.includes(S.page)&&!isPro()){v.innerHTML=`<div class="wrap">${proLock(S.page)}</div>`;return}
   if(S.err&&!S.data){v.innerHTML=`<div class="wrap"><div class="card empty fade">${svgI('<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>')}
     <div style="max-width:640px">${esc(S.err)}</div><div class="row" style="justify-content:center"><button class="btn" id="retry">Повторить</button>
     <button class="btn ghost" data-go="set">Настройки</button><button class="btn ghost" data-go="imp">Импорт отчёта</button></div></div></div>`;
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,cmp:pCmp,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,cal:pCal,watch:pWatch})[S.page]()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${S.page==='dash'?proBanner():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,cmp:pCmp,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,cal:pCal,watch:pWatch})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -14484,7 +14700,7 @@ function pDash(){
   if(S.hist&&S.hist.monthly){const ms=Object.keys(S.hist.monthly).sort().slice(-12);mret='<div id="c-mret" class="chart"></div>';
     chart('c-mret',bars,{labels:ms.map(mlabel),tipLabels:ms.map(m=>{const[y,mm]=m.split('-');return MONF[+mm-1]+' '+y}),labelsOn:ms.length<=12,
       series:[{n:'Доходность',c:S1,v:ms.map(m=>S.hist.monthly[m]*100)}],colorOf:v=>v>=0?'var(--pos)':'var(--neg)',fa:v=>(Math.round(v*10)/10).toString().replace('.',',')+'%',ft:v=>pct(v)})}
-  else if(S.hist&&S.hist.error)mret='<div class="empty">Нет данных</div>';
+  else if(S.hist&&S.hist.error)mret='<div class="empty">Не удалось посчитать доходность по месяцам. Нажмите «Обновить» сверху, чтобы повторить.</div>';
   let pays=waitBox('Собираю график купонов и дивидендов…');
   if(S.bonds&&S.bonds.payments){const pm=payMonths(S.bonds.payments,6);const tot=S.bonds.payments.reduce((a,x)=>a+x.amount,0);
     pays=`<div class="row" style="justify-content:space-between;margin:-4px 0 10px"><span class="t2" style="font-size:12.5px">За 12 месяцев ожидается</span><b class="num pos">${M(tot)}</b></div><div id="c-pay6" class="chart"></div>`;
@@ -14500,7 +14716,7 @@ function pDash(){
     ${[['Ликвидный портфель','liquidPortfolio'],['Начальная маржа','startingMargin'],['Минимальная маржа','minimalMargin'],['Скорр. маржа','correctedMargin'],['Не хватает средств','amountOfMissingFunds']]
       .map(([n,k])=>`<div><div class="mu" style="font-size:12px">${n}</div><div class="num" style="font-weight:650;font-size:16px;margin-top:4px">${M(d.margin[k])}</div></div>`).join('')}
     <div><div class="mu" style="font-size:12px">Уровень достаточности</div><div class="num ${d.margin.fundsSufficiencyLevel<1.1&&d.margin.fundsSufficiencyLevel>0?'neg':''}" style="font-weight:650;font-size:16px;margin-top:4px">${f2(d.margin.fundsSufficiencyLevel)}</div></div></div></div>`:'';
-  return hero+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
+  return hero+todayCard()+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
     <div class="card"><h2>Структура портфеля</h2><div id="c-alloc" class="chart"></div></div></div>
     <div class="g g2"><div class="card"><h2>Доходность по месяцам<span class="sp">последние 12 мес</span></h2>${mret}</div>
     <div class="card"><h2>Ближайшие выплаты<span class="sp">купоны · дивиденды · погашения</span></h2>${pays}</div></div>
@@ -14528,7 +14744,7 @@ function pRet(){
   const h=S.hist;
   if(!h)return`<div class="card">${waitBox('Восстанавливаю историю стоимости портфеля по дневным ценам закрытия. Первый раз это может занять до минуты — дальше данные берутся из локальной базы.')}</div>`;
   if(h.error)return`<div class="msg err">${esc(h.error)}</div>`;
-  if(!h.days.length)return'<div class="card empty">Нет операций для расчёта доходности</div>';
+  if(!h.days.length)returnemptyHint('Доходность считается по операциям: пополнениям, сделкам и выплатам. Подключите Т-Инвестиции или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['set','Настройки']]);
   const hs=histSlice();
   const ms=Object.keys(h.monthly).sort(),years=[...new Set(ms.map(m=>m.slice(0,4)))].sort().reverse();
   const inP=m=>{const s=periodStart(),e=periodEnd();return(!s||m>=s.slice(0,7))&&(!e||m<=e.slice(0,7))};
@@ -14597,7 +14813,7 @@ function pPos(){
     <div class="g c-1-2"><div class="card"><h2>Секторы</h2><div id="c-sect" class="chart"></div></div>
     <div class="card"><h2>Крупнейшие доли</h2>${hbars(nonCur.slice().sort((a,b)=>(b.value_rub||0)-(a.value_rub||0)).slice(0,10).map(x=>({n:x.name,v:x.share||0})),S1,x=>pctp(x.v),1)}</div></div>
     <div class="card" style="padding:12px 10px 6px"><div class="row" style="padding:0 6px 10px"><div class="seg" id="ptype"><button class="${!S.posType?'on':''}" data-t="">Все · ${all.length}</button>${typesHere.map(t=>`<button class="${S.posType===t?'on':''}" data-t="${t}">${TYPES[t]||t} · ${all.filter(x=>x.type===t).length}</button>`).join('')}</div></div>
-    ${ps.length?`<div class="tbl" style="max-height:calc(100vh - 220px)"><table id="ptab"><thead><tr>${th}</tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty">Позиций нет</div>'}</div>
+    ${ps.length?`<div class="tbl" style="max-height:calc(100vh - 220px)"><table id="ptab"><thead><tr>${th}</tr></thead><tbody>${rows}</tbody></table></div>`:emptyHint('Открытых позиций нет в выбранном счёте. Выберите другой счёт слева или добавьте сделки отчётом брокера.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']])}</div>
     <p class="note">P&amp;L по счетам Т-Инвестиций — по данным брокера (FIFO), для облигаций без НКД. По импортированным счетам — расчёт по сделкам из отчёта и текущим ценам биржи.</p>`;
 }
 
@@ -14675,7 +14891,7 @@ function pBonds(){
   if(!b)return`<div class="card">${waitBox('Загружаю параметры облигаций и графики купонов…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   const m=b.metrics,tot=S.data.portfolio.total||1;
-  if(!m.count)return'<div class="card empty">В портфеле нет облигаций</div>';
+  if(!m.count)returnemptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);
   let rows=b.rows.slice();rows.forEach(r=>{r.rk=r.rating?RSC.indexOf(r.rating.v):null;r.next_d=r.next?r.next[0]:null;r.next_sum=r.next&&r.next[1]!=null?r.next[1]*(r.qty||0):null});const{k,d}=S.bsort;
   rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
   const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(1,...rows.map(r=>Math.min(r.ytm||0,60))),mxD=Math.max(...rows.map(r=>r.dur||0));
@@ -15033,7 +15249,7 @@ function pPay(){
     ${kpi('Купоны',M(sum(p=>p.kind==='coupon')),ps.filter(p=>p.kind==='coupon').length+' выплат',null,S1)}${kpi('Дивиденды',M(sum(p=>p.kind==='dividend')),'только объявленные, до налога',null,S3)}</div>
     <div class="card"><h2>Календарь выплат по месяцам, ₽</h2><div id="c-pay" class="chart"></div></div>
     <div class="card"><h2>Выплаты по дням<span class="sp"><span class="seg" id="pdays">${[[30,'30 дней'],[90,'90 дней'],[365,'Год']].map(([d,t])=>`<button data-d="${d}" class="${d===S.payDays?'on':''}">${t}</button>`).join('')}</span></span></h2><div id="c-days" class="chart"></div></div>
-    ${list?`<div class="g g2">${list}</div>`:'<div class="card empty">Выплат в ближайший год не ожидается</div>'}
+    ${list?`<div class="g g2">${list}</div>`:emptyHint('В ближайший год выплат не ожидается: в портфеле нет облигаций с купонами и акций с объявленными дивидендами. Подобрать облигации с купоном можно в скринере.',[['scr','Подобрать облигации',1],['bonds','Мои облигации']])}
     <p class="note">Купоны — по графику эмитента и текущему количеству бумаг (до НДФЛ). Для флоатеров ещё не объявленные купоны — прогноз по ключевой ставке ЦБ плюс спред эмитента (пометка «прогноз по ключевой ставке»). Амортизации — частичное погашение номинала по графику Мосбиржи. Дивиденды — только уже объявленные, сумма до налога.</p>`;
 }
 
@@ -15057,7 +15273,7 @@ function pOps(){
 }
 function drawOps(){
   const all=opsFiltered(),rows=all.slice(0,S.opsN),el=$('#otab');if(!el)return;
-  if(!all.length){el.innerHTML='<div class="empty">Операций не найдено</div>';return}
+  if(!all.length){el.innerHTML=S.opsQ||S.opsK?'<div class="empty">Ничего не найдено. <button class="btn ghost" id="ops-reset">Сбросить фильтры</button></div>':emptyHint('Операций за этот период нет. Выберите период «Всё время» сверху или загрузите отчёт брокера.',[['imp','Импорт отчёта',1]]);const rb=$('#ops-reset');if(rb)rb.onclick=()=>{S.opsQ='';S.opsK='';render()};el.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   const multi=S.account==='all';
   el.innerHTML=`<p class="note" style="margin-bottom:8px">Найдено: ${f0(all.length)}</p><div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
     <th>Дата</th><th class="l">Операция</th><th class="l">Инструмент</th>${multi?'<th class="l">Счёт</th>':''}<th>Кол-во</th><th>Цена</th><th>Сумма</th><th>Комиссия</th><th>Результат</th></tr></thead><tbody>`+
@@ -15106,9 +15322,10 @@ const txNote=`<p class="note">Расчёт справочный и не явля
 
 function pTax(){
   const tx=S.tx;
-  const tabs=`<div class="seg tx-tabs noprint">${TXTABS.map(([k,t])=>`<button class="${k===tx.tab?'on':''}" onclick="txGo('${k}')">${t}</button>`).join('')}</div>`;
+  const tabs=`<div class="seg tx-tabs noprint">${TXTABS.map(([k,t])=>`<button class="${k===tx.tab?'on':''}" onclick="txGo('${k}')">${t}${k==='fc'&&!isPro()?proBadge():''}</button>`).join('')}</div>`;
   let body;
   if(tx.tab==='ov')body=txOv();
+  else if(tx.tab==='fc'&&!isPro())body=proLock('taxfc');
   else if(tx.err&&tx.acc===S.account)body=`<div class="msg err">${esc(tx.err)} <button class="btn ghost" onclick="S.tx.err=null;S.tx.acc=null;render()">Повторить</button></div>`;
   else if(!tx.data||tx.acc!==S.account){loadTax();body=`<div class="card">${waitBox('Считаю налоги по лотам: покупки, продажи, ЛДВ, убытки…')}</div>`}
   else body=({fc:txFc,yr:txYr,ldv:txLdv,iis:txIis,hint:txHint,decl:txDecl,set:txSet})[tx.tab](tx.data)+txNote;
@@ -15760,7 +15977,7 @@ function rebTaxHtml(act,keys){
 }
 function pReb(){
   const ps=S.data.portfolio.positions,tot=ps.reduce((a,x)=>a+(x.value_rub||0),0);
-  if(!(tot>0))return'<div class="card empty">В портфеле нет активов для расчёта</div>';
+  if(!(tot>0))returnemptyHint('Ребалансировке нужны активы в портфеле. Выберите счёт с бумагами или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']]);
   const cur={};ps.forEach(x=>{const t=x.type||'other';cur[t]=(cur[t]||0)+(x.value_rub||0)});
   if(!S.reb.draft)S.reb.draft=Object.assign({},(S.cfg&&S.cfg.targets)||{});
   const tg=S.reb.draft;
@@ -17155,8 +17372,9 @@ function ofHelper(x){
     <p class="mu"><small>${esc(p.disclaimer)}</small></p>`;
   return{chip,body};
 }
+function ofTeaser(){return{chip:['Pro','of-wait'],body:proTeaser('Подсказка по оферте — в Pro')}}
 function ofCard(x){
-  const hp=x.kind==='put'?ofHelper(x):null;
+  const hp=x.kind==='put'?(isPro()?ofHelper(x):ofTeaser()):null;
   const h=x.hint||{},[lab,hc]=hp?hp.chip:(OF_HINT[h.code]||['','of-wait']),k=OF_KIND[x.kind]||OF_KIND.unknown,put=x.kind==='put';
   const yo=x.yield_to_offer!=null&&x.yield_to_offer<=100?pctp(x.yield_to_offer,1):x.yield_to_offer!=null?'&gt; 100 %':'—';
   const cpn=!put?'—':x.coupon_known?`<b>${pctp(x.new_rate,1)}</b> годовых<br><small class="mu">доходность ${x.hold_yield!=null?pctp(x.hold_yield,1):'—'}</small>`:'<span class="mu">не объявлен</span>';
@@ -17814,6 +18032,7 @@ document.addEventListener('click',async e=>{
 
 /* ── Telegram: карточка в «Настройках» (уведомления идут через сервер данных и общего бота) ── */
 function setTgHtml(c){
+  if(!isPro())return`<div class="card" id="tg-lock"><h2>Уведомления в Telegram<span class="sp">Pro</span></h2>${proTeaser('Уведомления в Telegram — в Pro: тревоги, выплаты и сводка прямо в мессенджере')}</div>`;
   const on=(k,d)=>c[k]==null?d:!!c[k];
   return`<div class="card" id="tg-card"><h2>Уведомления в Telegram<span class="sp">по желанию</span></h2>
     <div style="display:grid;gap:16px">
@@ -18012,7 +18231,7 @@ function authWho(){
   const s=AUTH.st;
   if(!s||s.state!=='ok'||(!s.username&&!s.expires)){el.innerHTML='';el.style.display='none';return}
   el.style.display='';
-  el.innerHTML=`<span title="Вход по ключу из @${esc(AUTH.bot)}">${s.username?'@'+esc(s.username):'ключ'}${s.expires?' · до '+esc(authTime(s.expires)):''}</span><button id="who-out" title="Выйти и стереть ключ с этого компьютера">Выйти</button>`;
+  el.innerHTML=proPill()+`<span title="Вход по ключу из @${esc(AUTH.bot)}">${s.username?'@'+esc(s.username):'ключ'}${s.expires?' · до '+esc(authTime(s.expires)):''}</span><button id="who-out" title="Выйти и стереть ключ с этого компьютера">Выйти</button>`;
   $('#who-out').onclick=async()=>{try{AUTH.st=await post('/api/auth/logout');authApply()}catch(e){}};
 }
 function authOverlay(show,err){
@@ -18051,6 +18270,7 @@ function authApply(){
   if(s.state==='need_login'||expired)authOverlay(true,s.state==='need_login'?authMsg(s.error==='nokey'?'':s.error):authMsg('expired'));
   else authOverlay(false);
   authWho();
+  proAuthChanged();
 }
 async function authCheck(force){
   try{AUTH.st=await api('/api/auth/status'+(force?'?force=1':''));authApply()}catch(e){}
@@ -18255,7 +18475,13 @@ const KB=[
 <p>Токен сохраняется только в папке данных на вашем компьютере. Никому его не пересылайте и не публикуйте. Если токен мог попасть к постороннему, отзовите его в личном кабинете и создайте новый. Удалить токен из программы можно кнопкой на странице «Настройки».</p>
 <p><b>Вход по ключу.</b> Для доступа к программе вы получаете ключ в Telegram-боте <b>@tanalyticbot</b>. Ключ действует 24 часа, после чего нужно запросить новый в боте. Он нужен только для доступа к самой программе: токен Т-Инвестиций к боту не передаётся и остаётся на вашем компьютере. Если ключ истёк, программа попросит получить новый, а ваши данные при этом не пропадают.</p>
 <p>Пример: утром вы получили ключ и ввели его, весь день пользуетесь программой, а на следующий день видите просьбу ввести новый ключ. Это обычный порядок, а не ошибка.</p>
-<p>Если пропал доступ к API (например, токен истёк или отозван), программа покажет сообщение об ошибке. Создайте новый токен и вставьте его в настройках.</p>`}
+<p>Если пропал доступ к API (например, токен истёк или отозван), программа покажет сообщение об ошибке. Создайте новый токен и вставьте его в настройках.</p>`},
+{id:'pro',c:'Программа',t:'Free и Pro',k:'free pro тариф подписка пробный период 7 дней платно бесплатно оформить бот',h:`
+<p><b>Free (бесплатно)</b> — всё, что нужно для учёта портфеля: обзор, позиции, облигации, доходность, выплаты и календарь, операции, комиссии, налоги по факту (ЛДВ, ИИС, данные для декларации), ребалансировка, калькулятор, ставки, эмитенты, наблюдение, импорт отчётов и резервные копии.</p>
+<p><b>Pro</b> — инструменты анализа: скринер и сравнение облигаций, лесенка, сигналы, риски и сценарии, мониторинг, карта рынка, подсказка по оферте (держать или предъявить), прогноз налога на 31 декабря и уведомления в Telegram.</p>
+<p><b>Пробный период.</b> Новому пользователю бот <b>@tanalyticbot</b> сам даёт 7 дней Pro после первого согласия на обработку данных. За два дня до конца и в день окончания бот пришлёт напоминание.</p>
+<p><b>Как получить Pro.</b> Оплата пока не подключена: напишите боту команду <code>/pro</code> — он покажет, что входит в Pro и к кому обратиться. После выдачи Pro программа подхватит его в течение минуты, перезапускать её не нужно.</p>
+<p><b>Токен Т-Инвестиций</b> хранится только на вашем компьютере и никогда не передаётся боту или серверу данных, на любом тарифе. Тариф влияет лишь на набор функций программы. Если Pro закончился, ваши данные остаются на месте, закрываются только страницы Pro.</p>`}
 ];
 
 /* текст статьи без тегов — для поиска */
@@ -18301,6 +18527,232 @@ function renderKb(){
   v.scrollTop=0;
   if(jump)requestAnimationFrame(()=>{const a=$('#kb-a');if(a)a.scrollIntoView({block:'start'});const on=$('#kb-l .on');if(on)on.scrollIntoView({block:'nearest'})});
 }
+/* ── Тарифы Free / Pro ──
+   Тариф приходит из /api/auth/status (plan, pro_until). Без сервера данных, с общим ключом и на старом сервере всё доступно (plan='pro').
+   Клиентские блокировки — это UX: код программы открыт и обходится правкой. Принудительно сервер проверяет Pro только для уведомлений в Telegram (402). */
+const PRO_PAGES=['scr','cmp','lad','sig','risk','mon','map'];
+const PRO_FEATURES={
+ scr:{t:'Скринер облигаций',ic:'scr',b:['Фильтры по доходности, сроку, рейтингу и типу выпуска','Поиск выпусков под вашу цель за секунды','Сортировка по любому столбцу','Переход в карточку выпуска в один клик'],pv:'table'},
+ cmp:{t:'Сравнение облигаций',ic:'cmp',b:['До нескольких выпусков рядом: доходность, дюрация, рейтинг, купон','Подсветка лучшего и худшего значения по каждому параметру','Оферты PUT и CALL, амортизация, оборот и НКД','Добавление из карточки выпуска кнопкой «Сравнить»'],pv:'table'},
+ lad:{t:'Лесенка облигаций',ic:'lad',b:['Куда и когда возвращаются деньги из вашего портфеля','Конструктор новой лесенки под сумму и горизонт','Учёт рейтинга, флоатеров и амортизации','График выплат по месяцам и кварталам'],pv:'chart'},
+ sig:{t:'Сигналы',ic:'sig',b:['Бумаги портфеля, которые дешевле аналогов или дороже них','Варианты замены на похожие выпуски','Сравнение с выпусками того же рейтинга и срока','Объяснение, почему сработал сигнал'],pv:'cards'},
+ risk:{t:'Риски и сценарии',ic:'risk',b:['Что будет с портфелем при росте и снижении ставок','Концентрация по эмитентам, секторам и срокам','Стресс-сценарии и чувствительность цены','Кредитные риски по рейтингам'],pv:'chart'},
+ mon:{t:'Мониторинг',ic:'mon',b:['Слежение за рейтингами, дефолтами и резкими движениями цен','Тревоги по вашим бумагам с объяснением','Расширение спреда и ликвидность: сколько дней на продажу','Уведомления в Telegram (тоже Pro)'],pv:'cards'},
+ map:{t:'Карта рынка',ic:'map',b:['Все выпуски на одной карте: доходность против срока','Ваши бумаги на фоне рынка','Видно, какие выпуски дают больше при том же сроке','Переход в карточку выпуска с карты'],pv:'chart'},
+ offers:{t:'Подсказка по оферте',ic:'off',b:['Что выгоднее: предъявить бумагу или оставить','Сравнение с доходностью похожих выпусков','Когда и как подавать заявку','Кредитные риски эмитента рядом с решением'],pv:'cards'},
+ taxfc:{t:'Прогноз налога на 31.12',ic:'tax',b:['Сколько налога будет удержано на конец года','Ожидаемые купоны и дивиденды до конца года','Сбор убытков: что продать, чтобы снизить налог','Учёт ЛДВ и ставки 13 / 15 %'],pv:'table'},
+ tg:{t:'Уведомления в Telegram',ic:'mon',b:['Тревоги мониторинга и списка наблюдения','Пут-оферты: новый купон, открытие приёма заявок, последние дни','Возможный колл по вашим бумагам','Приходят от @tanalyticbot, ничего настраивать не нужно'],pv:'cards'}
+};
+const PRO_FREE_LIST=['Портфель, позиции, облигации и доходность','Выплаты, календарь, операции и комиссии','Налоги: факт по годам, ЛДВ, ИИС, данные для декларации','Ребалансировка, калькулятор, ставки, эмитенты, наблюдение','Импорт отчётов, резервные копии, база знаний'];
+const proBot=()=>String(AUTH&&AUTH.bot||'tanalyticbot').replace(/^@/,'');
+const proUrl=()=>`https://t.me/${proBot()}?start=pro`;
+function isPro(){
+  const s=AUTH&&AUTH.st;
+  if(!s||s.plan!=='free'&&!(s.pro_until&&s.pro_until*1000<=Date.now()))return true;      /* статус ещё не получен или нет данных о тарифе — не блокируем */
+  return false;
+}
+const proDm=ts=>{const d=new Date(ts*1000);return String(d.getDate()).padStart(2,'0')+'.'+String(d.getMonth()+1).padStart(2,'0')};
+function proDaysLeft(){const s=AUTH&&AUTH.st;return s&&s.pro_until?Math.ceil((s.pro_until*1000-Date.now())/864e5):null}
+const proBadge=()=>'<em class="pro-b">Pro</em>';
+/* function (всплывает): renderNav вызывается из загрузчика раньше, чем выполнится этот файл; тогда бейджей ещё нет */
+function proNavBadge(k){try{return PRO_PAGES.includes(k)&&!isPro()?proBadge():''}catch(e){return''}}
+function proSkel(kind){
+  const bar=(w,h=10)=>`<i style="width:${w}%;height:${h}px"></i>`;
+  if(kind==='chart')return`<div class="pro-sk"><div class="pro-sk-row">${bar(30,14)}${bar(20,14)}${bar(15,14)}</div><div class="pro-sk-ch">${[40,65,50,80,60,90,55,75,45,70].map(h=>`<b style="height:${h}%"></b>`).join('')}</div></div>`;
+  if(kind==='cards')return`<div class="pro-sk"><div class="pro-sk-g">${[1,2,3].map(()=>`<div class="pro-sk-c">${bar(60,12)}${bar(90)}${bar(75)}</div>`).join('')}</div>${[1,2].map(()=>`<div class="pro-sk-c">${bar(40,12)}${bar(95)}${bar(80)}</div>`).join('')}</div>`;
+  return`<div class="pro-sk"><div class="pro-sk-row">${bar(18,14)}${bar(14,14)}${bar(14,14)}${bar(14,14)}</div>${Array.from({length:8},()=>`<div class="pro-sk-row">${bar(24)}${bar(12)}${bar(12)}${bar(12)}${bar(10)}</div>`).join('')}</div>`;
+}
+/* Карточка-заглушка вместо недоступной страницы/блока: feature — ключ из PRO_FEATURES, previewHtml — статичная картинка под размытием */
+function proLock(feature,previewHtml){
+  const f=PRO_FEATURES[feature]||{t:'Эта функция',ic:'set',b:['Инструменты анализа облигаций','Прогнозы и подсказки','Уведомления в Telegram'],pv:'table'};
+  const bot=esc(proBot());
+  return`<div class="pro-lock fade"><div class="pro-prev" aria-hidden="true">${previewHtml||proSkel(f.pv)}</div>
+    <div class="card pro-card" role="region" aria-label="Доступно в Pro"><span class="pro-tag">Pro</span>
+      <h2>Доступно в Pro</h2>
+      <div class="pro-ft">${svgI(IC[f.ic]||IC.set)}<b>${esc(f.t)}</b></div>
+      <ul class="pro-ul">${f.b.slice(0,4).map(x=>`<li>${esc(x)}</li>`).join('')}</ul>
+      <div class="row pro-btns"><a class="btn" href="${esc(proUrl())}" target="_blank" rel="noopener noreferrer">Открыть @${bot}</a><button class="btn ghost" data-pro-about>Что даёт Pro</button></div>
+      <p class="note">Новым пользователям бот дарит 7 дней Pro. Токен Т-Инвестиций остаётся на вашем компьютере на любом тарифе.</p></div></div>`;
+}
+/* Короткая строка вместо блока внутри страницы */
+function proTeaser(text){return`<p class="pro-line">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}<span>${esc(text)}</span><button class="pro-lk" data-pro-about>Что даёт Pro</button></p>`}
+/* Плашка в шапке рядом с «Выйти» */
+function proPill(){
+  const s=AUTH&&AUTH.st;if(!s||s.state!=='ok')return'';
+  if(!isPro())return`<span class="pro-pill free" title="Бесплатный тариф">Free</span><button class="pro-try" data-pro-about>Попробовать Pro</button>`;
+  if(s.plan==='pro'&&s.pro_until)return`<span class="pro-pill on" title="${s.trial?'Пробный период':'Pro выдан в боте'}">Pro${s.trial?' · пробный':''} до ${proDm(s.pro_until)}</span>`;
+  return'';
+}
+/* Мягкое напоминание за 3 дня до конца (можно закрыть до следующего срока) */
+function proBanner(){
+  const s=AUTH&&AUTH.st,d=proDaysLeft();
+  if(!s||s.plan!=='pro'||!s.pro_until||d==null||d<=0||d>3)return'';
+  if(lsGet('ta_pro_ban')===String(s.pro_until))return'';
+  return`<div class="msg info pro-ban"><span>Pro действует до ${proDm(s.pro_until)}${d<=1?' (остался день)':''}. Продлить: <a href="${esc(proUrl())}" target="_blank" rel="noopener noreferrer">@${esc(proBot())}</a>, команда /pro.</span><button data-pro-dismiss title="Скрыть">×</button></div>`;
+}
+function proAbout(){
+  if(document.getElementById('pro-ov'))return;
+  const ov=document.createElement('div');ov.id='pro-ov';
+  const keys=PRO_PAGES.concat(['offers','taxfc','tg']);
+  ov.innerHTML=`<div class="pro-box" role="dialog" aria-modal="true" aria-label="Что даёт Pro"><button class="pro-x" data-pro-close aria-label="Закрыть">×</button>
+    <h2>Free и Pro</h2><p class="note">Оплата пока не подключена. Pro выдаётся в боте: 7 дней в подарок новым пользователям, дальше по запросу администратору.</p>
+    <h3>Pro</h3><div class="pro-grid">${keys.map(k=>{const f=PRO_FEATURES[k];return`<div class="pro-it">${svgI(IC[f.ic]||IC.set)}<div><b>${esc(f.t)}</b><small>${esc(f.b[0])}</small></div></div>`}).join('')}</div>
+    <h3>Free</h3><ul class="pro-ul">${PRO_FREE_LIST.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>
+    <div class="row pro-btns"><a class="btn" href="${esc(proUrl())}" target="_blank" rel="noopener noreferrer">Открыть @${esc(proBot())}</a><button class="btn ghost" data-pro-kb>Подробнее в базе знаний</button><button class="btn ghost" data-pro-close>Закрыть</button></div>
+    <p class="note">Токен Т-Инвестиций не покидает ваш компьютер на любом тарифе.</p></div>`;
+  document.body.appendChild(ov);
+}
+function proClose(){const o=document.getElementById('pro-ov');if(o)o.remove()}
+document.addEventListener('click',e=>{
+  const t=e.target;if(!t||!t.closest)return;
+  if(t.closest('[data-pro-about]')){e.preventDefault();proAbout();return}
+  if(t.closest('[data-pro-kb]')){proClose();kbOpen('pro');return}
+  if(t.closest('[data-pro-close]')||t.id==='pro-ov'){proClose();return}
+  if(t.closest('[data-pro-dismiss]')){const s=AUTH.st;if(s&&s.pro_until)try{localStorage.setItem('ta_pro_ban',String(s.pro_until))}catch(x){}const b=t.closest('.pro-ban');if(b)b.remove()}
+});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')proClose()});
+/* Тариф изменился (вход, выход, выдача Pro) — обновить меню, шапку и текущую страницу */
+let _proSig='';
+function proAuthChanged(){
+  const s=AUTH.st,sig=s?[s.state,s.plan,s.pro_until].join('|'):'';
+  if(sig===_proSig)return;
+  const first=_proSig==='';_proSig=sig;
+  try{renderNav();if(!first)render()}catch(e){}
+}
+/* ── Первые минуты и ежедневный визит: онбординг, карточка «Сегодня», подсказки пустых состояний, шпаргалка клавиш ── */
+const obPl=(n,a,b,c)=>{const m=Math.abs(n)%100,k=m%10;return m>10&&m<20?c:k===1?a:k>1&&k<5?b:c};
+const obDm=d=>d?d.slice(8,10)+'.'+d.slice(5,7):'';
+const obIsPro=()=>typeof isPro==='function'?isPro():true;
+
+/* ── 1. Онбординг: вместо голой страницы настроек, пока не задан токен и нет импортов ── */
+const ob={busy:false,done:false,err:'',skip:false,help:false};
+const _renderSettingsOrig=renderSettings;
+renderSettings=async function(){
+  let c=S.cfg;
+  try{c=await api('/api/config');S.cfg=c}catch(e){}
+  if(c&&!c.token_set&&!(c.imports||[]).length&&!ob.skip){ob.done=false;ob.err='';return obRender()}
+  return _renderSettingsOrig();
+};
+function obStep(n,state,title,body){
+  return`<div class="ob-step ${state}"><div class="ob-n">${state==='done'?'✓':n}</div><div class="ob-b"><h3>${title}</h3>${body||''}</div></div>`;
+}
+function obRender(){
+  const v=$('#view');if(!v)return;
+  const tokDone=ob.done;
+  const authOk=typeof AUTH!=='undefined'&&AUTH.st&&AUTH.st.state==='ok';
+  v.innerHTML=`<div class="wrap fade" style="max-width:760px"><div class="card ob-card">
+    <div class="ob-hd"><div class="ob-t">Добро пожаловать 👋</div><p class="t2">Три шага, и вы увидите свой портфель: доходность, выплаты, оферты и риски по облигациям.</p></div>
+    ${obStep(1,'done','Ключ из бота',`<p class="mu">${authOk?'Вход выполнен.':'Готово — можно переходить к следующему шагу.'}</p>`)}
+    ${obStep(2,tokDone?'done':'now','Токен Т-Инвестиций «только чтение»',tokDone?'<p class="mu">Токен сохранён и проверен.</p>':`
+      <p class="mu">Он нужен, чтобы программа могла прочитать ваши счета. Покупать и продавать с ним нельзя.</p>
+      <div class="ob-row"><input class="in" type="password" id="ob-tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false" aria-label="API-токен Т-Инвестиций">
+        <button class="btn" id="ob-save">Сохранить и проверить</button></div>
+      <div id="ob-msg" role="status">${ob.err?`<div class="msg err">${esc(ob.err)}</div>`:''}</div>
+      <details class="ob-how" ${ob.help?'open':''}><summary>Где взять токен</summary><ol>
+        <li>Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении: Профиль → Настройки → Токены T-Invest API).</li>
+        <li>Нажмите «Создать токен», выберите доступ <b>«Только для чтения»</b> и нужные счета.</li>
+        <li>Скопируйте токен сразу (второй раз его не покажут) и вставьте в поле выше.</li></ol></details>
+      <p class="ob-priv">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}Токен хранится только на этом компьютере и никуда не отправляется, кроме Т-Инвестиций.</p>`)}
+    ${obStep(3,tokDone?'now':'soon','Первый взгляд на портфель',tokDone?'<div class="wait">Загружаю портфель…</div>':'<p class="mu">Откроется сам, как только токен будет сохранён.</p>')}
+    <div class="ob-alt">Нет Т-Инвестиций? <button class="lnk" id="ob-imp">Импортируйте отчёт другого брокера</button>
+      <span class="mu"> · </span><button class="lnk" id="ob-all">Все настройки</button></div>
+  </div></div>`;
+  const b=$('#ob-save');if(!b)return;
+  const input=$('#ob-tok');
+  const save=async()=>{
+    const tok=input.value.trim();
+    if(!tok){ob.err='Вставьте токен в поле.';$('#ob-msg').innerHTML=`<div class="msg err">${esc(ob.err)}</div>`;input.focus();return}
+    ob.busy=true;ob.err='';b.disabled=true;b.textContent='Проверяю…';
+    try{
+      await post('/api/config',{token:tok});
+      const r=await post('/api/test');
+      ob.done=true;ob.help=false;
+      try{S.cfg=await api('/api/config')}catch(e){}
+      const c=S.cfg||{};$('#mode').className='badge'+(c.sandbox?' sb':'');$('#mode').innerHTML=c.token_set?'<b></b>'+(c.sandbox?'Песочница':'Боевой режим'):'';
+      obRender();
+      S.data=S.bonds=S.hist=S.today=null;S.account='all';S.page='dash';persist();renderNav();load(true);
+    }catch(e){
+      ob.err=(e&&e.message?e.message:'Не удалось подключиться')+'. Проверьте, что токен скопирован целиком и имеет доступ «только чтение».';
+      ob.help=true;ob.busy=false;obRender();
+    }
+  };
+  b.onclick=save;
+  input.onkeydown=e=>{if(e.key==='Enter')save()};
+  $('#ob-imp').onclick=()=>go('imp');
+  $('#ob-all').onclick=()=>{ob.skip=true;renderSettings()};
+  if(!tokDone&&!ob.err)input.focus();
+}
+/* пока токена нет, а страница «Настройки» открыта при старте: бутстрап вызывает renderSettings() по имени — перехват выше сработает */
+
+/* ── 2. Карточка «Сегодня» на «Обзоре» ── */
+const TD_TTL_MS=10*60*1000;
+function todayEnsure(){
+  const k=S.account||'all',t=S.today;
+  if(t&&t.acc===k&&(t.loading||Date.now()-t.at<TD_TTL_MS))return;
+  S.today={acc:k,loading:true,at:Date.now(),data:null};
+  api('/api/today?account='+encodeURIComponent(k)).then(d=>{
+    if(!S.today||S.today.acc!==k)return;
+    S.today={acc:k,loading:false,at:Date.now(),data:d};
+    if(S.page==='dash')renderSoon();
+  }).catch(()=>{if(S.today&&S.today.acc===k){S.today={acc:k,loading:false,at:Date.now(),data:{empty:true}};}});
+}
+(()=>{const r=$('#refresh');if(r)r.addEventListener('click',()=>{S.today=null})})();
+const tdTag=()=>obIsPro()?'':'<span class="td-pro" title="Функция тарифа Pro">Pro</span>';
+function tdLine(go,ico,html,tag,cls){
+  return`<button class="td-it ${cls||''}" data-go="${go}"><i>${svgI(ico,1.9)}</i><span>${html}</span>${tag||''}<em aria-hidden="true">›</em></button>`;
+}
+function tdOfferText(o){
+  const kind=o.kind==='put'?'PUT':o.kind==='call'?'CALL':'оферта';
+  const st=o.status==='open'?`идёт приём заявок${o.period_end?' до '+obDm(o.period_end):''}`:o.status==='upcoming'?`приём заявок с ${obDm(o.period_start)}`:o.kind==='put'?'приём заявок пока не открыт':'решает эмитент';
+  return`<span class="td-k ${o.kind}">${kind}</span> <b>${esc(o.name||'')}</b> · ${obDm(o.date)} · ${st}`;
+}
+function todayCard(){
+  if(!(S.data&&S.data.portfolio))return'';
+  todayEnsure();
+  const t=S.today,d=t&&t.data,p=S.data.portfolio,lines=[];
+  if(p.daily!=null&&p.total)lines.push(tdLine('pos','<path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
+    `Сегодня портфель ${p.daily===0?'без изменений':`<b class="num ${cls(p.daily)}">${SM(p.daily)}</b>${p.daily_pct!=null?` <span class="mu">(${pct(p.daily_pct)})</span>`:''}`}`));
+  if(d&&!d.empty){
+    if(d.payments){const x=d.payments,bk=x.by_kind||{},parts=[];
+      if(bk.coupon)parts.push('купоны');if(bk.dividend)parts.push('дивиденды');if(bk.amortization)parts.push('амортизации');
+      lines.push(tdLine('pay','<rect x="3" y="5" width="18" height="16" rx="3"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+        `На ближайшие ${x.days} дней: <b class="num pos">${M(x.sum,'rub',0)}</b> · ${x.count} ${obPl(x.count,'выплата','выплаты','выплат')}${parts.length?' <span class="mu">('+parts.join(', ')+')</span>':''}`));}
+    if(d.offers){const x=d.offers;
+      lines.push(`<div class="td-grp">${x.items.slice(0,3).map(o=>tdLine('off','<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/>',tdOfferText(o),tdTag(),o.status==='open'?'hot':'')).join('')}${x.count>3?`<div class="mu td-more">…и ещё ${x.count-3} в «Офертах»</div>`:''}</div>`);}
+    if(d.ratings){const x=d.ratings;
+      lines.push(tdLine('mon','<path d="M12 3l2.5 5.5L20 9.5l-4 4 1 6-5-3-5 3 1-6-4-4 5.5-1z"/>',
+        `Рейтинги за ${x.days} дней: <b>${x.count}</b> ${obPl(x.count,'изменение','изменения','изменений')} у эмитентов портфеля${x.negative?` <span class="neg">· ${x.negative} ${obPl(x.negative,'требует','требуют','требуют')} внимания</span>`:''}`));}
+    if(d.alerts){const x=d.alerts;
+      lines.push(tdLine('mon','<path d="M18 16v-5a6 6 0 0 0-12 0v5l-2 3h16z"/><path d="M10 21h4"/>',
+        `Тревоги мониторинга: <b>${x.count}</b>${x.high?` <span class="neg">· ${x.high} ${obPl(x.high,'высокая','высокие','высоких')}</span>`:''}`,tdTag()));}
+  }else if(t&&t.loading&&!lines.length)return`<div class="card td-card noprint"><h2>Сегодня</h2><div class="sk" style="height:46px;border-radius:10px"></div></div>`;
+  if(!lines.length)return'';
+  return`<div class="card td-card noprint"><h2>Сегодня<span class="sp">${new Date().toLocaleDateString('ru-RU',{day:'numeric',month:'long'})}</span>${t&&t.loading?'<span class="td-ld">обновляю…</span>':''}</h2>${lines.join('')}</div>`;
+}
+
+/* ── 3. Подсказки в пустых состояниях ── */
+function emptyHint(text,btns,ico){
+  return`<div class="card empty hint">${svgI(ico||'<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/>')}<div style="max-width:440px">${text}</div>${btns&&btns.length?`<div class="row" style="justify-content:center">${btns.map(([g,t,primary])=>`<button class="btn ${primary?'':'ghost'}" data-go="${g}">${esc(t)}</button>`).join('')}</div>`:''}</div>`;
+}
+
+/* ── 4. Шпаргалка клавиш («?») ── */
+const KS_ROWS=[['Ctrl + K  /  ⌘ + K','Поиск по разделам, бумагам и командам'],['?','Эта шпаргалка'],['Esc','Закрыть окно, карточку бумаги или поиск'],['↑  ↓  Enter','Выбор в поиске']];
+function ksToggle(){
+  const o=document.getElementById('ks-ov');
+  if(o){o.remove();return}
+  const el=document.createElement('div');el.id='ks-ov';
+  el.innerHTML=`<div id="ks" role="dialog" aria-label="Горячие клавиши"><h2>Горячие клавиши</h2>${KS_ROWS.map(([k,t])=>`<div class="ks-r"><kbd>${esc(k)}</kbd><span>${esc(t)}</span></div>`).join('')}<div class="mu" style="font-size:12px;margin-top:10px">Esc — закрыть</div></div>`;
+  el.addEventListener('mousedown',e=>{if(e.target===el)el.remove()});
+  document.body.appendChild(el);
+}
+document.addEventListener('keydown',e=>{
+  const o=document.getElementById('ks-ov');
+  if(o&&e.key==='Escape'){e.preventDefault();e.stopPropagation();o.remove();return}
+  if(e.key!=='?'||e.ctrlKey||e.metaKey||e.altKey)return;
+  const a=document.activeElement,t=a&&a.tagName;
+  if(t==='TEXTAREA'||t==='SELECT'||(t==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|file|color)$/.test(a.type))||(a&&a.isContentEditable))return;
+  e.preventDefault();ksToggle();
+},true);
 </script></body></html>
 '''
 

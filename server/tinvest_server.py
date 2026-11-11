@@ -156,6 +156,9 @@ class KeyStore:
             until = now + ttl
             if res[0] == "ok":
                 until = min(until, res[1]["expires"])
+                pu = res[1].get("pro_until")
+                if pu and pu > now:
+                    until = min(until, pu)            # кэш не переживёт конец Pro
             with self._lock:
                 if len(self._cache) > self.MAX_CACHE:
                     self._cache.clear()
@@ -165,18 +168,27 @@ class KeyStore:
         return res
 
     def _query(self, h, now):
+        sql = ("SELECT k.tg_id, k.expires, k.revoked, u.banned, u.username, %s FROM keys k "
+               "LEFT JOIN users u ON u.tg_id = k.tg_id WHERE k.key_hash = ?")
         try:
-            row = self._conn().execute(
-                "SELECT k.tg_id, k.expires, k.revoked, u.banned, u.username, u.plan FROM keys k "
-                "LEFT JOIN users u ON u.tg_id = k.tg_id WHERE k.key_hash = ?", (h,)).fetchone()
+            row = None
+            for cols in ("u.plan_until, u.pro_kind", "u.plan_until, NULL", "NULL, NULL"):     # база бота старой схемы (до v3): все Free
+                try:
+                    row = self._conn().execute(sql % cols, (h,)).fetchone()
+                    break
+                except sqlite3.OperationalError as e:
+                    if "plan_until" not in str(e) and "pro_kind" not in str(e):
+                        raise
         except (sqlite3.Error, OSError) as e:
             self._local.c = None
             self._warn(e)
             return "error", None
         if not row:
             return "invalid", None
-        tg_id, expires, revoked, banned, username, plan = row
-        info = {"tg_id": tg_id, "expires": expires, "username": username or "", "plan": plan or "free"}
+        tg_id, expires, revoked, banned, username, plan_until, pro_kind = row
+        pro = bool(plan_until) and plan_until > now
+        info = {"tg_id": tg_id, "expires": expires, "username": username or "", "plan": "pro" if pro else "free",
+                "pro_until": plan_until if plan_until else None, "trial": pro and pro_kind == "trial"}
         if banned:
             return "banned", info
         if revoked or expires is None or expires <= now:
@@ -551,7 +563,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/v1/auth/check":
             return self._send(200, {"ok": True, "expires": info["expires"] if info else None,
                                     "username": info["username"] if info else "", "plan": info["plan"] if info else "",
-                                    "bot": app.bot})
+                                    "pro_until": info.get("pro_until") if info else None,
+                                    "trial": bool(info and info.get("trial")), "bot": app.bot})
         if u.path == "/v1/notify":
             return self._notify(client, info, body)
         if u.path == "/v1/stats":
@@ -578,6 +591,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(405, {"error": "method not allowed"}, extra=[("Allow", "POST")])
         if not self.app.notifier or not info:
             return self._send(403, {"error": "уведомления доступны только по ключу из бота"})
+        if info.get("plan") != "pro":
+            return self._send(402, {"error": "pro_required"})
         try:
             text = json.loads(body.decode("utf-8")).get("text")
         except (ValueError, AttributeError, UnicodeDecodeError):

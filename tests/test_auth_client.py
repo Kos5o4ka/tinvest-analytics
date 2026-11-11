@@ -17,6 +17,7 @@ class Stub:
         self.mode = "keys"          # keys | none | down | 5xx | old
         self.keys = {"TIA-AAAA-AAAA-AAAA": ("ok", 4_000_000_000), "TIA-OLD0-OLD0-OLD0": ("expired", 1), "TIA-BAN0-BAN0-BAN0": ("banned", 5)}
         self.calls = []
+        self.plan = {"plan": "free"}
         me = self
 
         class H(BaseHTTPRequestHandler):
@@ -46,7 +47,7 @@ class Stub:
                         return self._j(200, {"ok": True, "expires": None, "username": "", "plan": "", "bot": "stubbot"})
                     st, exp = me.keys.get(key, ("invalid", 0))
                     if st == "ok":
-                        return self._j(200, {"ok": True, "expires": exp, "username": "alice", "plan": "free", "bot": "stubbot"})
+                        return self._j(200, {"ok": True, "expires": exp, "username": "alice", "bot": "stubbot", **me.plan})
                     return self._j(401, {"ok": False, "error": st, "bot": "stubbot"})
                 if self.path.startswith("/v1/fetch"):
                     if me.mode == "keys" and me.keys.get(key, ("x",))[0] != "ok":
@@ -91,7 +92,22 @@ class AuthClientTests(unittest.TestCase):
 
     def test_disabled_server_is_ok(self):
         self.set_cfg("off", "")
-        self.assertEqual(self.m.auth_status(True)["state"], "ok")
+        r = self.m.auth_status(True)
+        self.assertEqual((r["state"], r["plan"]), ("ok", "pro"))          # direct mode: всё доступно
+
+    def test_plan_passthrough(self):
+        self.set_cfg(self.st.base, "TIA-AAAA-AAAA-AAAA")
+        r = self.m.auth_status(True)
+        self.assertEqual((r["plan"], r["pro_until"]), ("free", None))
+        self.st.plan = {"plan": "pro", "pro_until": 4_000_000_001, "trial": True}
+        r = self.m.auth_status(True)
+        self.assertEqual((r["plan"], r["pro_until"], r["trial"]), ("pro", 4_000_000_001, True))
+        self.st.mode = "none"                                              # общий ключ/открытый сервер: plan "" -> pro
+        self.set_cfg(self.st.base, "")
+        self.assertEqual(self.m.auth_status(True)["plan"], "pro")
+        self.st.mode = "old"
+        self.set_cfg(self.st.base, "TIA-AAAA-AAAA-AAAA")
+        self.assertEqual(self.m.auth_status(True)["plan"], "pro")
 
     def test_no_key_need_login(self):
         r = self.m.auth_status(True)

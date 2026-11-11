@@ -17,9 +17,10 @@ const txNote=`<p class="note">Расчёт справочный и не явля
 
 function pTax(){
   const tx=S.tx;
-  const tabs=`<div class="seg tx-tabs noprint">${TXTABS.map(([k,t])=>`<button class="${k===tx.tab?'on':''}" onclick="txGo('${k}')">${t}</button>`).join('')}</div>`;
+  const tabs=`<div class="seg tx-tabs noprint">${TXTABS.map(([k,t])=>`<button class="${k===tx.tab?'on':''}" onclick="txGo('${k}')">${t}${k==='fc'&&!isPro()?proBadge():''}</button>`).join('')}</div>`;
   let body;
   if(tx.tab==='ov')body=txOv();
+  else if(tx.tab==='fc'&&!isPro())body=proLock('taxfc');
   else if(tx.err&&tx.acc===S.account)body=`<div class="msg err">${esc(tx.err)} <button class="btn ghost" onclick="S.tx.err=null;S.tx.acc=null;render()">Повторить</button></div>`;
   else if(!tx.data||tx.acc!==S.account){loadTax();body=`<div class="card">${waitBox('Считаю налоги по лотам: покупки, продажи, ЛДВ, убытки…')}</div>`}
   else body=({fc:txFc,yr:txYr,ldv:txLdv,iis:txIis,hint:txHint,decl:txDecl,set:txSet})[tx.tab](tx.data)+txNote;

@@ -201,7 +201,8 @@ def _auth_http(srv, path, key):
 
 def _auth_eval(srv, key):
     """Состояние доступа по ответу сервера (без кэша)."""
-    base = {"state": "ok", "error": "", "expires": None, "username": "", "bot": _auth["bot"], "server": srv}
+    base = {"state": "ok", "error": "", "expires": None, "username": "", "bot": _auth["bot"], "server": srv,
+            "plan": "pro", "pro_until": None, "trial": False}   # свой сервер / общий ключ / старый сервер: всё доступно
     try:
         if not key:                                    # без ключа пускаем, только если сервер открытый
             code, j = _auth_http(srv, "/v1/health", "")
@@ -218,7 +219,12 @@ def _auth_eval(srv, key):
     if j.get("bot"):
         base["bot"] = str(j["bot"])
     if code == 200 and j.get("ok", True):
-        return dict(base, expires=j.get("expires"), username=str(j.get("username") or ""))
+        plan = str(j.get("plan") or "")
+        pu = j.get("pro_until")
+        return dict(base, expires=j.get("expires"), username=str(j.get("username") or ""),
+                    plan="free" if plan == "free" else "pro",
+                    pro_until=pu if isinstance(pu, (int, float)) and not isinstance(pu, bool) else None,
+                    trial=bool(j.get("trial")) and plan != "free")
     if code == 401 or code == 403:
         err = str(j.get("error") or "")
         return dict(base, state="need_login", error=err if err in ("expired", "banned") else "invalid")
@@ -230,7 +236,8 @@ def _auth_eval(srv, key):
 def auth_status(force=False):
     srv, key = ds_conf()
     if not srv:                                        # сервер отключён: приложение работает напрямую
-        return {"state": "ok", "error": "", "expires": None, "username": "", "bot": _auth["bot"], "server": ""}
+        return {"state": "ok", "error": "", "expires": None, "username": "", "bot": _auth["bot"], "server": "",
+                "plan": "pro", "pro_until": None, "trial": False}
     now = time.time()
     with _ds_lock:
         if not force:
