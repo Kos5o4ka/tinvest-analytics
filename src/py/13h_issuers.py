@@ -534,8 +534,9 @@ def _iss_portfolio(cfg, acc, job):
             rts = []
             for r in rs:
                 try:
-                    b = best_rating(r["isin"], r.get("name") or "")
-                    if b:
+                    b = r.get("rating") if isinstance(r.get("rating"), dict) else None   # рейтинг уже найден в отчёте по облигациям
+                    b = b or best_rating(r["isin"], r.get("name") or "")
+                    if b and b.get("v") in RATING_SCALE:
                         rts.append(b["v"])
                 except Exception:  # noqa: BLE001
                     pass
