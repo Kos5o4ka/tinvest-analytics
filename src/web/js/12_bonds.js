@@ -20,7 +20,7 @@ function pBonds(){
     value_rub:['Стоимость','',r=>`<td class="num">${M(r.value_rub,'rub',0)}</td>`],
     pnl_rub:['P&L','',r=>`<td class="num ${cls(r.pnl_rub)}"><span class="arr">${r.pnl_rub>0?'▲':r.pnl_rub<0?'▼':''}</span>${r.pnl_pct!=null?pct(r.pnl_pct,1):'—'}</td>`],
     share:['Доля','',r=>heatCell(r.share,mxS,'201,133,0',pctp(r.share))],
-    ytm:['Доходность','',r=>heatCell(r.ytm,mxY,'25,158,112',r.ytm!=null?pctp(r.ytm,2)+(r.to==='offer'?' <small class="mu">оф.</small>':'')+(r.cf_source==='approx'?' <small class="mu" title="Приблизительный расчёт: нет графика выплат MOEX">≈</small>':''):'—')],
+    ytm:['Доходность','',r=>heatCell(r.ytm,mxY,'25,158,112',r.ytm!=null?pctp(r.ytm,2)+(r.to==='offer'?` <small class="mu" title="${r.to_kind==='put'?'к дате пут-оферты':r.to_kind==='call'?'к дате колл — досрочного погашения по решению эмитента':'к дате оферты (тип не указан)'}">${r.to_kind==='put'?'пут':r.to_kind==='call'?'колл':'оф.'}</small>`:'')+(r.cf_source==='approx'?' <small class="mu" title="Приблизительный расчёт: нет графика выплат MOEX">≈</small>':''):'—')],
     ytm_tax:['После НДФЛ','',r=>heatCell(r.ytm_tax,mxY,'25,158,112',r.ytm_tax!=null?pctp(r.ytm_tax,2):'—')],
     spread:['Спред к КБД','',r=>`<td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread)+' п.п.':'—'}</td>`],
     dur:['Дюрация','',r=>heatCell(r.dur,mxD,'213,81,129',r.dur!=null?r.dur.toFixed(2).replace('.',',')+' г':'—')],

@@ -11,6 +11,7 @@
 .of-ok{background:#3ecf8e12;border-color:#3ecf8e33}.of-ok .of-lab{background:#3ecf8e26;color:var(--pos)}
 .of-warn{background:#f2a63a14;border-color:#f2a63a44}.of-warn .of-lab{background:#f2a63a2a;color:#f2b45e}
 .of-wait{background:#ffffff08}.of-wait .of-lab{background:#ffffff12;color:var(--tx2)}
+.of-t-put{background:#3d9be922;color:#5aaef0}.of-t-unk{background:#8884;color:var(--tx2)}.of-do{color:var(--tx2)}
 .of-t-urg{background:#ff6b6b22;color:var(--neg)}.of-t-call{background:#f2a63a22;color:#f2b45e}
 [data-theme=light] .of-info .of-lab{color:#2b6cb0}[data-theme=light] .of-warn .of-lab{color:#a86a0a}
 @media(max-width:1180px){.of-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}

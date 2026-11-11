@@ -453,6 +453,9 @@ def bonds_report(client, rows):
                "coupons_12m": sum(p["amount"] for p in pays if p["kind"] == "coupon"),
                "issuers": len({issuer_group_key(r["name"]) for r in bonds})}
     out.sort(key=lambda x: -(x.get("value_rub") or 0))
+    annotate_offer_kinds(out, today)       # put/call у даты оферты (из кэша Мосбиржи)
+    for x in out:
+        x["to_kind"] = x.get("call_kind") if x.get("to") == "offer" else None
     return {"rows": out, "metrics": metrics, "ladder": sorted(ladder.items()), "risk": sorted(risk.items(), key=lambda x: -x[1]),
             "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays,
             "ratings": apply_ratings(out), "ratings_info": ratings_status()}

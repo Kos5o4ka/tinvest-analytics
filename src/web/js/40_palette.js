@@ -52,8 +52,9 @@ function kpBuild(raw){
   const q=kpNorm(raw).trim(),res=[];
   kpCommands().forEach(c=>{const sc=kpScore(c.t+' '+c.k,q);if(sc)res.push(Object.assign({sc},c))});
   PAGES.filter(Boolean).forEach(p=>{const sc=kpScore(p[1],q);if(sc)res.push({g:'Разделы',t:p[1],sc,s:S.navHidden.includes(p[0])&&!NAV_PINNED.includes(p[0])?'скрыт в меню':'',run:()=>go(p[0])})});
+  if(q)KB.forEach((a,i)=>{const tk=kpNorm(a.t+' '+a.k),sc=q.split(/\s+/).filter(Boolean).every(w=>tk.includes(w))?kpScore(a.t+' '+a.k,q):0;if(sc)res.push({g:'База знаний',t:a.t,s:a.c,sc,run:()=>kbOpen(a.id)})});
   if(q)res.push(...kpSecurities(q));
-  const order={'Команды':q?1:0,'Разделы':q?0:1,'Бумаги':2};
+  const order={'Команды':q?1:0,'Разделы':q?0:1,'База знаний':2,'Бумаги':3};
   res.sort((a,b)=>order[a.g]-order[b.g]||(q?b.sc-a.sc:0));
   return res.slice(0,40);
 }

@@ -17,7 +17,7 @@ function renderNav(){
   $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
   $('#period').style.visibility=PERIOD_PAGES.includes(S.page)?'visible':'hidden';
   const a=S.accounts.find(x=>x.id===S.account);
-  $('#title').innerHTML=esc(PAGES.find(p=>p&&p[0]===S.page)[1])+(['imp','set'].includes(S.page)?'':` <small>${esc(S.account==='all'?'все счета':a?a.name:'')}</small>`);
+  $('#title').innerHTML=esc(PAGES.find(p=>p&&p[0]===S.page)[1])+(['imp','set','kb'].includes(S.page)?'':` <small>${esc(S.account==='all'?'все счета':a?a.name:'')}</small>`);
 }
 function renderAccounts(){
   const accs=S.accounts||[];
@@ -40,7 +40,7 @@ let reqId=0;
 async function load(force,periodOnly){
   const my=++reqId;S.loading=true;S.err=null;
   $('#refresh').classList.add('spin');$('#refresh').disabled=true;
-  if(!S.data&&!['set','imp'].includes(S.page))skeleton();
+  if(!S.data&&!['set','imp','kb'].includes(S.page))skeleton();
   try{
     const p=new URLSearchParams({period:S.period,account:S.account});if(force)p.set('force','1');
     const d=await api('/api/summary?'+p);
@@ -51,7 +51,7 @@ async function load(force,periodOnly){
     if(!periodOnly||force||!S.bonds||!S.hist)loadExtra(force);
   }catch(e){if(my!==reqId)return;S.err=e.message}
   finally{if(my===reqId){S.loading=false;$('#refresh').classList.remove('spin');$('#refresh').disabled=false}}
-  if(my===reqId&&!['set','imp'].includes(S.page))render();
+  if(my===reqId&&!['set','imp','kb'].includes(S.page))render();
 }
 function loadExtra(force){
   const acc=S.account,p=new URLSearchParams({account:acc});if(force)p.set('force','1');
@@ -81,6 +81,7 @@ function renderNow(){
   const v=$('#view');
   if(S.page==='set')return renderSettings();
   if(S.page==='imp')return renderImport();
+  if(S.page==='kb')return renderKb();
   if(S.err&&!S.data){v.innerHTML=`<div class="wrap"><div class="card empty fade">${svgI('<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>')}
     <div style="max-width:640px">${esc(S.err)}</div><div class="row" style="justify-content:center"><button class="btn" id="retry">Повторить</button>
     <button class="btn ghost" data-go="set">Настройки</button><button class="btn ghost" data-go="imp">Импорт отчёта</button></div></div></div>`;

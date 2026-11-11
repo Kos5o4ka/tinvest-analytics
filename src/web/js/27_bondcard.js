@@ -2,6 +2,8 @@
 const BC={stack:[],tok:0,all:false,iss:{}};
 const BC_SEC={financial:'Финансы',industrials:'Промышленность',materials:'Сырьё',energy:'Энергетика',consumer:'Потребительский',government:'Государственные',real_estate:'Недвижимость',telecom:'Телеком',municipal:'Муниципальные',utilities:'Коммунальные',it:'IT',health_care:'Здравоохранение',other:'Прочее'};
 const BC_EV={coupon:'Купон',amort:'Амортизация',offer:'Оферта',redemption:'Погашение'};
+const BC_OK={put:['PUT — право продать эмитенту','of-t-put','Право держателя: в период предъявления можно подать заявку через брокера, эмитент выкупит бумагу по цене оферты.'],call:['CALL — эмитент может погасить досрочно','of-t-call','Право эмитента: он может досрочно погасить выпуск. Заявку подавать не нужно, но возможен риск реинвестирования.'],unknown:['тип не указан','of-t-unk','Источники не сообщают, чей это выбор — держателя или эмитента. Проверьте документы выпуска.']};
+const bcOfKind=k=>{const t=BC_OK[k]||BC_OK.unknown;return`<span class="tag ${t[1]}" title="${esc(t[2])}">${esc(t[0])}</span>`};
 const BC_KR_SRC={cbr:'ключевая ставка по прогнозу ЦБ',survey:'ключевая ставка по опросу аналитиков ЦБ',market:'ключевая ставка по ожиданиям рынка (КБД)',flat:'текущая ключевая ставка'};
 const BC_RISK={RISK_LEVEL_LOW:'низкий',RISK_LEVEL_MODERATE:'средний',RISK_LEVEL_HIGH:'высокий'};
 
@@ -78,7 +80,7 @@ function bcBody(c){
   add('Купон',m&&m.coupon!=null?bcN(m.coupon,2)+' %'+(d.COUPONFREQUENCY?` · ${esc(d.COUPONFREQUENCY)} р/год`:''):(d.COUPONFREQUENCY?`${esc(d.COUPONFREQUENCY)} р/год`:''));
   add('Следующий купон',m&&m.next?ddm(m.next):'');
   add('Погашение',m&&m.mat?ddm(m.mat):(ci.maturity?ddm(ci.maturity):(d.MATDATE?ddm(d.MATDATE):'')));
-  add('Оферта',m&&m.offer?ddm(m.offer):'');
+  add('Оферты',(c.offers||[]).length?c.offers.map(o=>`${ddm(o.date)} ${bcOfKind(o.kind)}${o.period_start&&o.period_end?` <small class="mu">предъявление ${ddm(o.period_start)} – ${ddm(o.period_end)}</small>`:''}`).join('<br>')+' <a href="#" class="kb-a" data-kb="offers">Что такое put и call</a>':(m&&m.offer?ddm(m.offer)+' '+bcOfKind('put'):''));
   add('Размещена',d.ISSUEDATE?ddm(d.ISSUEDATE):'');
   add('Объём выпуска',d.ISSUESIZE?short(+d.ISSUESIZE)+' шт.':'');
   add('Номинал',d.FACEVALUE?bcN(+d.FACEVALUE,2)+' '+esc(cur.toUpperCase())+(d.INITIALFACEVALUE&&d.INITIALFACEVALUE!==d.FACEVALUE?` (первоначально ${esc(d.INITIALFACEVALUE)})`:''):'');
@@ -94,7 +96,7 @@ function bcBody(c){
   h+=`<div class="card bc-sec"><h2>Денежный поток<span class="sp">ближайшие выплаты на 1 облигацию</span></h2>`;
   if(fl.length){
     h+=`<div class="tbl"><table><thead><tr><th>Дата</th><th>Событие</th><th>Сумма</th><th>% номинала / ставка</th></tr></thead><tbody>`
-      +fl.slice(0,lim).map(e=>`<tr><td>${ddm(e.d)}</td><td>${BC_EV[e.t]||esc(e.t)}</td><td class="num">${e.amt==null?'<span class="mu">по ставке</span>':e.est?`<span class="est" title="${esc(BC_KR_SRC[(c.keyrate||{}).source]||'ключевая ставка по прогнозу')} ${bcN(e.base,2)}% + спред ${bcN(e.spread,2)} п.п.">≈ ${M(e.amt,cur)}</span>`:M(e.amt,cur)}</td><td class="num">${e.pct==null?'—':(e.est?'≈ ':'')+bcN(e.pct,2)+' %'}</td></tr>`).join('')
+      +fl.slice(0,lim).map(e=>`<tr><td>${ddm(e.d)}</td><td>${BC_EV[e.t]||esc(e.t)}${e.t==='offer'&&e.kind&&e.kind!=='both'?' '+bcOfKind(e.kind):e.t==='offer'&&e.kind==='both'?' '+bcOfKind('put')+' '+bcOfKind('call'):''}</td><td class="num">${e.amt==null?'<span class="mu">по ставке</span>':e.est?`<span class="est" title="${esc(BC_KR_SRC[(c.keyrate||{}).source]||'ключевая ставка по прогнозу')} ${bcN(e.base,2)}% + спред ${bcN(e.spread,2)} п.п.">≈ ${M(e.amt,cur)}</span>`:M(e.amt,cur)}</td><td class="num">${e.pct==null?'—':(e.est?'≈ ':'')+bcN(e.pct,2)+' %'}</td></tr>`).join('')
       +`</tbody></table></div>`;
     if(c.keyrate)h+=`<p class="note" style="margin-top:8px">≈ — прогноз: ставка купона флоатера ещё не объявлена, принята равной ключевой ставке на начало купонного периода + спред эмитента к ключевой на прошлых купонах. Прогноз ключевой ставки: ${esc(c.keyrate.name)}${c.keyrate.as_of?`, на ${esc(c.keyrate.as_of)}`:''}.</p>`;
     if(fl.length>lim)h+=`<button class="btn ghost bc-more" id="bc-more">Показать все (${fl.length})</button>`;

@@ -1,8 +1,183 @@
 # ═══════════════════════════════ оферты и конструктор лесенки ═══════════════════════════════
 # Справочные подсказки на данных Мосбиржи (bondization) и скринера; не индивидуальные инвестиционные рекомендации.
+#
+# Как Мосбиржа отдаёт оферты (проверено на ~540 выпусках с датой оферты, ноябрь 2026):
+#  1. Список бумаг /iss/engines/stock/markets/bonds/securities[/{ISIN}].json содержит поля
+#     PUTOPTIONDATE (ближайшая дата пут-оферты, право держателя; совпадает с OFFERDATE), CALLOPTIONDATE (ближайшая дата колл,
+#     право эмитента), BUYBACKDATE/BUYBACKPRICE (ближайшая дата и цена выкупа, put или call — тип не различает).
+#     Поля хранят только ОДНУ ближайшую дату каждого типа; пустая дата приходит как null или «0000-00-00».
+#  2. bondization.json -> offers[] хранит все даты, но тип записи у него всего три значения offertype:
+#     «Оферта» — пут-оферта (все будущие «Оферта» в выборке были put: совпадают с PUTOPTIONDATE или идут следующими
+#     циклами, из-за этого у выпуска может быть несколько будущих put-дат);
+#     «Оферта/Погашение» — досрочное погашение по усмотрению эмитента (call): дата совпадает с CALLOPTIONDATE, а запись с
+#     пустой датой «0000-00-00» — просто погашение в срок, это не оферта;
+#     «Оферта (состоялось)» — уже прошедшая оферта.
+#     Период предъявления (offerdatestart/offerdateend) Мосбиржа публикует только перед самой офертой.
+#  3. /iss/securities/{ISIN}.json (description) даёт лишь BUYBACKDATE, без типа — для классификации не нужен.
+#  4. T-Invest API (Bond) отдаёт одну дату callDate без указания типа; поля даты put в API нет. Эта дата в приложении
+#     считается колл, если Мосбиржа не знает такой даты как пут.
+#  Среди выборки не нашлось выпуска с одновременными put и call, но код допускает обе записи (даже на одну дату).
 
-OF_DAYS, OF_PRICE_EPS, OF_MARGIN = 365, 0.1, 0.5      # окно оферт, дней; допуск цены, п. п.; запас до медианы аналогов, п. п.
-OF_CALL_WORDS = ("колл", "call", "досроч")            # Мосбиржа обозначает put-оферту просто «Оферта»; колл — по ключевым словам
+OF_PRICE_EPS, OF_MARGIN = 0.1, 0.5      # допуск цены, п. п.; запас до медианы аналогов, п. п.
+OF_CALL_WORDS = ("колл", "call", "досроч", "погашени", "усмотрен")     # право эмитента
+OF_PUT_WORDS = ("put", "пут", "по требованию", "выкуп", "предъявлен")  # право держателя
+OF_KIND_ORDER = {"put": 0, "call": 1, "unknown": 2}
+OPT_URL = ("https://iss.moex.com/iss/engines/stock/markets/bonds/securities/%s.json?iss.meta=off&iss.only=securities"
+           "&securities.columns=SECID,BOARDID,BUYBACKDATE,BUYBACKPRICE,CALLOPTIONDATE,PUTOPTIONDATE")
+
+
+def moex_bond_options(isin):
+    """Явные даты put/call выпуска из списка бумаг Мосбиржи: {'put': [даты], 'call': [даты], 'prices': {дата: цена}}.
+    Кэш 24 ч; ошибка кэшируется на 1 ч, тогда None."""
+    isin = (isin or "").strip().upper()
+    if not isin or not re.match(r"^[A-Z0-9]{4,14}$", isin):
+        return None
+    st = store()
+    key = "bopt1:" + isin
+    v = st.get(key, ttl=BC_TTL)
+    if v is not None:
+        if v.get("ok"):
+            return v
+        if time.time() - v.get("ts", 0) < BC_ERR_TTL:
+            return None
+    try:
+        rows = _bc_table(json.loads(http_text(OPT_URL % isin, 20)), "securities")
+        out = {"ok": True, "ts": time.time(), "put": [], "call": [], "prices": {}}
+        for r in rows:
+            for fld, k in (("PUTOPTIONDATE", "put"), ("CALLOPTIONDATE", "call")):
+                d = _of_date(r.get(fld))
+                if d and d not in out[k]:
+                    out[k].append(d)
+            bd = _of_date(r.get("BUYBACKDATE"))
+            if bd and r.get("BUYBACKPRICE"):
+                out["prices"][bd] = r["BUYBACKPRICE"]
+        out["put"].sort()
+        out["call"].sort()
+    except Exception:  # noqa: BLE001
+        out = {"ok": False, "ts": time.time()}
+    st.put(key, out)
+    return out if out.get("ok") else None
+
+
+OF_BROKER_NEAR = 21                                   # дней: дата брокера рядом с датой Мосбиржи — то же событие
+
+
+def _of_text_kind(t, has_period):
+    """Тип по тексту offertype: ('put'|'call'|'unknown', вывод сделан по слабому признаку)."""
+    base = re.sub(r"\(.*?\)", "", t).strip().lower()
+    if any(w in base for w in OF_CALL_WORDS):
+        return "call", False
+    if any(w in base for w in OF_PUT_WORDS):
+        return "put", False
+    if base == "оферта":                      # так Мосбиржа обозначает пут-оферту
+        return "put", not has_period
+    return "unknown", False
+
+
+def offer_kinds(bz, opt, broker_call=None, today=None):
+    """Все БУДУЩИЕ оферты выпуска из всех источников, без дублей по (дата, тип).
+    Запись: {date, kind: put|call|unknown, source, price, period_start, period_end, status: scheduled|cancelled, inferred}.
+    Приоритет: явные поля PUTOPTIONDATE/CALLOPTIONDATE, затем тип записи bondization, затем дата брокера (присоединяется к близкой дате
+    Мосбиржи, иначе 'unknown'). Одна дата может быть и put, и call — тогда две записи. Неопределимый тип — 'unknown'."""
+    today = today or date.today().isoformat()
+    recs = {}
+
+    def add(d, kind, source, price=None, ps=None, pe=None, status="scheduled", inferred=False):
+        if not d or d <= today:
+            return
+        r = recs.get((d, kind))
+        if r is None:
+            recs[(d, kind)] = {"date": d, "kind": kind, "source": source, "price": price, "period_start": ps,
+                               "period_end": pe, "status": status, "inferred": inferred}
+            return
+        if source not in r["source"].split("+"):
+            r["source"] += "+" + source
+        for k, val in (("price", price), ("period_start", ps), ("period_end", pe)):
+            if r[k] is None:
+                r[k] = val
+        if status == "cancelled":
+            r["status"] = "cancelled"
+        r["inferred"] = r["inferred"] and inferred
+    prices = (opt or {}).get("prices") or {}
+    for k in ("put", "call"):
+        for d in (opt or {}).get(k) or []:
+            add(d, k, "moex_" + k + "_field", prices.get(d))
+    for o in (bz or {}).get("offers") or []:
+        t = o.get("offertype") or ""
+        d = _of_date(o.get("offerdate"))
+        tl = t.lower()
+        if not d or "оферт" not in tl or ("состоял" in tl and "не состоял" not in tl):
+            continue
+        ps, pe = _of_date(o.get("offerdatestart")), _of_date(o.get("offerdateend"))
+        kind, weak = _of_text_kind(t, bool(ps and pe))
+        cancelled = "отмен" in tl or "не состоял" in tl
+        add(d, kind, "moex_offertype", o.get("price"), ps, pe, "cancelled" if cancelled else "scheduled", weak)
+    bc = _of_date(broker_call)
+    if bc and bc > today:
+        # Брокер отдаёт одну дату без типа и нередко на несколько дней раньше даты Мосбиржи (например, 09.02 вместо пута 12.02):
+        # близкую дату Мосбиржи считаем тем же событием, иначе честно пишем «тип не указан».
+        near = [k for k in recs if abs(_of_days(bc, k[0])) <= OF_BROKER_NEAR]
+        if near:
+            r = recs[min(near, key=lambda k: abs(_of_days(bc, k[0])))]
+            if "broker" not in r["source"].split("+"):
+                r["source"] += "+broker"
+        else:
+            add(bc, "unknown", "broker")
+    for d in {k[0] for k in recs if k[1] in ("put", "call")}:      # «неизвестный» на дату с известным типом — тот же факт
+        recs.pop((d, "unknown"), None)
+    return sorted(recs.values(), key=lambda x: (x["date"], OF_KIND_ORDER[x["kind"]]))
+
+
+def offers_of_isin(isin, broker_call=None, today=None):
+    """Будущие оферты выпуска по кэшированным данным Мосбиржи; без данных — только дата брокера."""
+    bz = opt = None
+    try:
+        bz = moex_bondization(isin)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        opt = moex_bond_options(isin)
+    except Exception:  # noqa: BLE001
+        pass
+    return offer_kinds(bz or {}, opt, broker_call, today)
+
+
+def offer_kind_on(offs, d):
+    """Тип оферт на дату d: put | call | both | unknown (если даты нет в списке)."""
+    live = [x for x in offs if x["status"] != "cancelled"]
+    near = [x["date"] for x in live if abs(_of_days(d, x["date"])) <= OF_BROKER_NEAR]
+    if near and d not in near:                     # дата брокера чуть сдвинута относительно Мосбиржи
+        d = min(near, key=lambda x: abs(_of_days(d, x)))
+    ks = {x["kind"] for x in live if x["date"] == d}
+    return "both" if {"put", "call"} <= ks else (next(iter(ks)) if len(ks) == 1 else ("put" if "put" in ks else "unknown"))
+
+
+def annotate_offer_kinds(rows, today=None):
+    """Строкам с датой оферты/колл (r['call']) добавляет r['call_kind']: put | call | both | unknown."""
+    today = today or date.today().isoformat()
+    rows = [r for r in rows if r.get("isin") and r.get("call") and r["call"] > today]
+
+    def one(r):
+        try:
+            return offer_kind_on(offers_of_isin(r["isin"], r["call"], today), r["call"])
+        except Exception:  # noqa: BLE001
+            return None
+    for r, k in zip(rows, pool_map(one, rows)):
+        r["call_kind"] = k
+
+
+def offer_alert_text(kind, left, ds):
+    """Текст тревоги «Мониторинга» по типу оферты; left — дней до даты, ds — дата дд.мм.гггг."""
+    if kind == "put":
+        return "Пут-оферта %s (через %d дн.): решите, предъявлять ли бумагу к выкупу" % (ds, left)
+    if kind == "call":
+        return "Колл-опцион %s (через %d дн.): эмитент может досрочно погасить выпуск, заявку подавать не нужно" % (ds, left)
+    if kind == "both":
+        return "Пут-оферта и колл-опцион %s (через %d дн.): проверьте условия в карточке выпуска" % (ds, left)
+    return "Оферта %s (через %d дн.): тип не указан, проверьте условия в документах выпуска" % (ds, left)
+
+
+OF_KIND_RU = {"put": "пут-оферта", "call": "колл-опцион эмитента", "unknown": "оферта (тип не указан)"}
 
 
 def _of_days(a, b):
@@ -70,25 +245,22 @@ def _of_pct(x):
     return ("%.1f" % x).replace(".", ",")
 
 
-def _of_one(r, bz, today, flags):
-    """Оферты одной позиции в ближайшие OF_DAYS дней -> список записей."""
-    horizon = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=OF_DAYS)).strftime("%Y-%m-%d")
+def _of_one(r, bz, offs, today, flags):
+    """Оферты одной позиции (все будущие, put и call отдельными записями) -> список записей для страницы."""
     face = r.get("nominal") or 1000.0
-    offs = []
-    for o in bz.get("offers") or []:
-        t = (o.get("offertype") or "")
-        od = _of_date(o.get("offerdate"))
-        if not od or "оферт" not in t.lower() or "состоял" in t.lower() or not today < od <= horizon:
-            continue
-        offs.append((od, o, any(w in t.lower() for w in OF_CALL_WORDS)))
+    offs = [o for o in offs if o.get("status") != "cancelled"]
     if not offs:
         return []
     fl_ = bool(r.get("floating"))
-    flows, _k, _e = bond_flows(bz, today, face, mode="maturity", floating=fl_)
+    bz = bz or {"coupons": [], "amort": [], "offers": []}
+    try:
+        flows, _k, _e = bond_flows(bz, today, face, mode="maturity", floating=fl_)
+    except Exception:  # noqa: BLE001
+        flows = None
     cps = sorted((c["coupondate"], c.get("value"), c.get("valueprc")) for c in bz["coupons"] if c.get("coupondate"))
     rt = (r.get("rating") or {})
     rv = rt.get("v")
-    me = next((e for e in _bc_universe() if e["_isin"] == r.get("isin")), None)
+    me = next((e for e in _bc_universe() if e["_isin"] == r.get("isin")), None) if any(o["kind"] == "put" for o in offs) else None
     outlooks = " ".join((x.get("outlook") or "") for x in rt.get("all") or []).lower()
     risk_notes = []
     if flags.get("default"):
@@ -101,29 +273,28 @@ def _of_one(r, bz, today, flags):
         risk_notes.append("рейтинг взят под наблюдение")
     price_pct = r.get("price_pct")
     out = []
-    for od, o, is_call in sorted(offs, key=lambda x: x[0]):
+    for o in offs:
+        od, kind = o["date"], o["kind"]
         days = _of_days(today, od)
-        ps, pe = _of_date(o.get("offerdatestart")), _of_date(o.get("offerdateend"))
+        ps, pe = o.get("period_start"), o.get("period_end")
         price = o.get("price") or 100.0
         status, days_left = "unknown", None
         if ps and pe:
             days_left = _of_days(today, pe)
             status = "open" if ps <= today <= pe else ("upcoming" if today < ps else "closed")
-        urgent = status == "open" or (status == "upcoming" and days_left is not None and days_left <= 7) or \
-            (status == "unknown" and days <= 7)
+        urgent = kind == "put" and (status == "open" or (status == "upcoming" and days_left is not None and days_left <= 7) or
+                                    (status == "unknown" and days <= 7))
         rec = {"isin": r.get("isin"), "uid": r.get("uid"), "name": r["name"], "logo": r.get("logo"), "color": r.get("color"),
                "qty": r.get("qty"), "value_rub": r.get("value_rub"), "rating": rv, "floating": fl_,
-               "kind": "call" if is_call else "put", "date": od, "days": days, "period_start": ps, "period_end": pe,
+               "kind": kind, "source": o.get("source"), "inferred": bool(o.get("inferred")), "date": od, "days": days,
+               "period_start": ps, "period_end": pe,
                "period_status": status, "period_days_left": days_left, "urgent": urgent, "offer_price": price,
+               "price_known": bool(o.get("price")),
                "price": price_pct, "ytm_now": r.get("ytm"), "to_offer_rub": (r.get("qty") or 0) * face * price / 100.0,
                "risk_notes": risk_notes, "yield_to_offer": None, "coupon_known": False, "new_rate": None,
                "hold_yield": None, "peer_median": None, "peers_n": 0, "threshold": None}
-        if is_call:
-            rec["hint"] = {"code": "call", "title": "Эмитент может погасить досрочно",
-                           "text": "Эмитент вправе выкупить или погасить бумаги досрочно: доходность к этой дате может оказаться "
-                                   "единственной, на которую стоит рассчитывать. Заявку подавать не нужно."}
-            out.append(rec)
-            continue
+        if kind != "put":
+            rec["to_offer_rub"] = None
         after_cut = None
         try:
             if flows:
@@ -134,10 +305,14 @@ def _of_one(r, bz, today, flags):
                     y = cf_ytm(dirty, cut, today)
                     rec["yield_to_offer"] = y * 100 if y is not None else None
                 after = [x for x in flows if x[0] > od]
-                if after:
+                if after and kind == "put":
                     after_cut = (after, remain, _of_aci(bz, flows, od))
         except Exception:  # noqa: BLE001
             after_cut = None
+        if kind != "put":
+            rec["hint"] = _of_hint_other(rec)
+            out.append(rec)
+            continue
         nxt = next(((d, v, vp) for d, v, vp in cps if d > od), None)
         known = bool(nxt and (nxt[1] or nxt[2]))
         rec["coupon_known"] = known
@@ -159,6 +334,28 @@ def _of_one(r, bz, today, flags):
         rec["hint"] = _of_hint(rec, risk_notes)
         out.append(rec)
     return out
+
+
+def _of_hint_other(rec):
+    """Подсказка для колл-опциона эмитента и для оферты неуказанного типа."""
+    y = rec.get("yield_to_offer")
+    if rec["kind"] == "call":
+        yt = (" Доходность к этой дате при текущей цене — %s %% годовых (выкуп по %s)." % (
+            _of_pct(y), "%s %%" % _of_pct(rec["offer_price"]) if rec.get("price_known") else "номиналу")) if y is not None and y <= 100 else ""
+        src = (" Дата получена от брокера, на Мосбирже условия не найдены — уточните их в проспекте выпуска."
+               if rec.get("source") == "broker" else "")
+        return {"code": "call", "title": "Эмитент может погасить досрочно",
+                "text": "Это право эмитента, а не ваше: заявку подавать не нужно. Если ставки к тому времени упадут, эмитент "
+                        "может погасить выпуск и вам придётся вкладывать деньги под меньший доход (риск реинвестирования), "
+                        "поэтому ориентируйтесь на доходность к этой дате, а не к погашению.%s%s" % (yt, src)}
+    if rec.get("source") == "broker":
+        return {"code": "unknown", "title": "Тип оферты не указан",
+                "text": "Эту дату сообщает брокер, а на Мосбирже оферта по выпуску не опубликована. Чаще всего так выглядит право "
+                        "эмитента досрочно погасить выпуск (call) — тогда делать ничего не нужно. Но это может быть и put: "
+                        "проверьте условия в решении о выпуске или у брокера, прежде чем полагаться на эту дату."}
+    return {"code": "unknown", "title": "Тип оферты не указан",
+            "text": "Мосбиржа не сообщает, кто решает: держатель (put) или эмитент (call). Не подавайте заявку, пока не проверите "
+                    "условия в документах выпуска или у брокера."}
 
 
 def _of_hint(rec, risk_notes):
@@ -215,44 +412,36 @@ def offers_payload(cfg, acc):
     def one(r):
         try:
             bz = moex_bondization(r["isin"])
-            if not bz:
+            offs = offer_kinds(bz or {}, moex_bond_options(r["isin"]), r.get("call"), today)
+            if not any(o["status"] != "cancelled" for o in offs):
                 return [], None
-            if not any(_of_date(o.get("offerdate")) for o in bz.get("offers") or []):
-                return [], None
-            flags = _mon_flags(r["isin"])
-            return _of_one(r, bz, today, flags), None
+            return _of_one(r, bz, offs, today, _mon_flags(r["isin"])), None
         except Exception as e:  # noqa: BLE001
             return [], "%s: %s" % (r.get("name"), str(e)[:100])
     res = pool_map(one, rows, workers=8)
-    items = sorted([x for lst, _ in res for x in lst], key=lambda x: (x["date"], x["name"]))
+    items = sorted([x for lst, _ in res for x in lst], key=lambda x: (x["date"], OF_KIND_ORDER[x["kind"]], x["name"]))
     errs = [e for _, e in res if e]
-    # оферты по данным брокера, которых нет в Мосбирже
-    have = {x["isin"] for x in items}
-    horizon = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=OF_DAYS)).strftime("%Y-%m-%d")
-    for r in rows:
-        c = r.get("call")
-        if c and today < c <= horizon and r["isin"] not in have:
-            items.append({"isin": r["isin"], "uid": r.get("uid"), "name": r["name"], "logo": r.get("logo"), "color": r.get("color"),
-                          "qty": r.get("qty"), "value_rub": r.get("value_rub"), "rating": (r.get("rating") or {}).get("v"),
-                          "floating": bool(r.get("floating")), "kind": "call", "date": c, "days": _of_days(today, c),
-                          "period_start": None, "period_end": None, "period_status": "unknown", "period_days_left": None,
-                          "urgent": False, "offer_price": None, "price": r.get("price_pct"), "ytm_now": r.get("ytm"),
-                          "to_offer_rub": None, "risk_notes": [], "yield_to_offer": None, "coupon_known": False,
-                          "new_rate": None, "hold_yield": None, "peer_median": None, "peers_n": 0, "threshold": None,
-                          "hint": {"code": "call", "title": "Возможна досрочная дата",
-                                   "text": "По данным брокера, у выпуска есть дата досрочного погашения или оферты. На Мосбирже "
-                                           "условия не опубликованы — уточните в проспекте выпуска."}})
-    items.sort(key=lambda x: (x["date"], x["name"]))
     puts = [x for x in items if x["kind"] == "put"]
+    calls = [x for x in items if x["kind"] == "call"]
+    by_isin = defaultdict(set)
+    for x in items:
+        by_isin[x["isin"]].add(x["kind"])
     return {"account": acc, "today": today, "items": items, "count": len(items), "put_count": len(puts),
+            "call_count": len(calls), "unknown_count": len(items) - len(puts) - len(calls),
+            "both_count": sum(1 for v in by_isin.values() if {"put", "call"} <= v),
             "urgent_count": sum(1 for x in puts if x["urgent"]),
             "value_rub": sum(x["value_rub"] or 0 for x in items), "to_offer_rub": sum(x["to_offer_rub"] or 0 for x in puts),
             "bonds_count": len(rows), "errors": errs,
-            "empty_text": "В ближайшие 12 месяцев по облигациям портфеля оферт нет: выпуски погашаются по графику.",
-            "notes": ["Оферта — право держателя продать бумагу эмитенту по заранее известной цене. Если вы ничего не делаете, "
-                      "бумага остаётся у вас, но купон после оферты эмитент может изменить.",
-                      "Мосбиржа публикует оферты одним типом; право эмитента досрочно погасить (колл) в данных обычно не отдельно "
-                      "помечено, поэтому такие даты могут быть не видны."]}
+            "empty_text": "По облигациям портфеля будущих оферт нет: выпуски погашаются по графику.",
+            "notes": ["PUT — право держателя предъявить бумагу эмитенту к выкупу по заранее известной цене (обычно 100 % номинала). "
+                      "Если вы ничего не делаете, бумага остаётся у вас, но купон после оферты эмитент может изменить.",
+                      "CALL — право эмитента досрочно погасить или выкупить выпуск. Решение принимает эмитент, заявку подавать не "
+                      "нужно; для вас это риск реинвестирования: деньги вернутся, когда ставки, возможно, уже ниже. Поэтому у такой "
+                      "бумаги смотрят доходность к дате колл, а не к погашению.",
+                      "У одного выпуска может быть несколько дат и оба типа сразу — каждая показана отдельной строкой. Тип берётся из "
+                      "данных Мосбиржи (поля дат put/call и тип записи оферты); если определить его не удалось, строка помечена "
+                      "«тип не указан». Дата от брокера без подтверждения Мосбиржи тоже помечена «тип не указан». "
+                      "Период предъявления Мосбиржа публикует незадолго до оферты."]}
 
 
 # ═══════════════════ конструктор лесенки облигаций ═══════════════════

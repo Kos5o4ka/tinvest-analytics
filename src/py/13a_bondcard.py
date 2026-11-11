@@ -280,6 +280,14 @@ def bond_card(isin):
     card["history"] = hist or {"d": [], "p": [], "y": [], "v": []}
     card["flows"] = flows or []
     try:
+        card["offers"] = [o for o in offers_of_isin(isin) if o["status"] != "cancelled"]
+        for e in card["flows"]:
+            if e["t"] == "offer":
+                e["kind"] = offer_kind_on(card["offers"], e["d"])
+    except Exception as e:  # noqa: BLE001
+        card["offers"] = []
+        errors.append("оферты: %s" % str(e)[:120])
+    try:
         face = (desc or {}).get("FACEVALUE") or (me or {}).get("nominal")
         if _bc_mark_est(card["flows"], isin, bool((ci or {}).get("floating")), float(face) if face else 0.0):
             info = keyrate_forecast_info()

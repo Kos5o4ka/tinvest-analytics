@@ -103,5 +103,5 @@ setInterval(()=>{fetch('/api/ping').catch(()=>{})},20000);fetch('/api/ping').cat
   $('#ver').textContent='v'+(c.version||'');$('#ver').onclick=()=>{go('set');setTimeout(()=>{const w=$('#whatsnew');if(w)w.scrollIntoView({behavior:'smooth'})},400)};
   $('#mode').className='badge'+(c.sandbox?' sb':'');$('#mode').innerHTML=c.token_set?'<b></b>'+(c.sandbox?'Песочница':'Боевой режим'):'';
   if(!c.token_set&&!(c.imports||[]).length){S.page='set';renderNav();renderSettings();return}
-  if(['set','imp'].includes(S.page)){render();load(false)}else load(false);
+  if(['set','imp','kb'].includes(S.page)){render();load(false)}else load(false);
 })();

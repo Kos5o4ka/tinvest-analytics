@@ -354,11 +354,19 @@ def _monitor_core(rows, th, t0, tm, notes, liquidity=True):
                                    str(sp_chg).replace(".", ","), str(sp_now).replace(".", ",")), url=""))
         # --- оферта
         cl = r.get("call")
-        if cl and today <= cl <= (date.today() + timedelta(days=int(th["mon_offer_days"]))).isoformat():
-            left = (datetime.strptime(cl, "%Y-%m-%d").date() - date.today()).days
-            alerts.append(dict(base, id="of|%s|%s" % (isin, cl), severity="high" if left <= 7 else "medium", kind="offer",
-                               date=cl, message="Оферта %s (через %d дн.): решите, предъявлять ли бумагу к выкупу. Тип оферты (put/call) проверьте в карточке выпуска" % (
-                                   cl[8:] + "." + cl[5:7] + "." + cl[:4], left), url=""))
+        win_end = (date.today() + timedelta(days=int(th["mon_offer_days"]))).isoformat()
+        if cl and today <= cl:
+            try:
+                offs = [o for o in offers_of_isin(isin, cl, today) if o["status"] != "cancelled" and o["date"] <= win_end]
+            except Exception:  # noqa: BLE001
+                offs = []
+            if not offs and cl <= win_end:
+                offs = [{"date": cl, "kind": r.get("call_kind") if r.get("call_kind") in ("put", "call") else "unknown"}]
+            for d_ in sorted({o["date"] for o in offs}):
+                kind = offer_kind_on(offs, d_)
+                left = (datetime.strptime(d_, "%Y-%m-%d").date() - date.today()).days
+                alerts.append(dict(base, id="of|%s|%s" % (isin, d_), severity="high" if left <= 7 else "medium", kind="offer",
+                                   date=d_, message=offer_alert_text(kind, left, d_[8:] + "." + d_[5:7] + "." + d_[:4]), url=""))
         # --- признаки дефолта
         fl = flags.get(isin) or {}
         if fl.get("default"):
@@ -428,7 +436,7 @@ def monitor_watch_rows(isins):
             continue
         ci = tcat_info(isin) or {}
         rows.append({"isin": isin, "name": s.get("name"), "ticker": s.get("id"), "value_rub": 0, "qty": 1, "maturity": s.get("mat"),
-                     "call": s.get("offer"), "floating": bool(ci.get("floating")), "price_pct": s.get("price"),
+                     "call": s.get("offer"), "call_kind": "put" if s.get("offer") else None, "floating": bool(ci.get("floating")), "price_pct": s.get("price"),
                      "dur": s.get("dur"), "spread": s.get("spread"), "ytm": s.get("yield"),
                      "rating": best_rating(isin, ci.get("name") or s.get("name") or "")})
     return rows

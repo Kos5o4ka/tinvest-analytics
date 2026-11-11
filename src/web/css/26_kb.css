@@ -1,0 +1,28 @@
+/* база знаний */
+.kb{display:grid;grid-template-columns:300px minmax(0,1fr);gap:16px;align-items:start}
+.kb-side{position:sticky;top:0;max-height:calc(100vh - 110px);overflow:auto;padding:14px}
+.kb-q{box-sizing:border-box;width:100%;padding:9px 12px;border-radius:10px;border:1px solid var(--line2);background:var(--card2);color:var(--tx);font:inherit;font-size:13px;margin-bottom:8px}
+.kb-q:focus{outline:none;border-color:var(--ac)}
+.kb-cat{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mu);margin:12px 4px 4px;font-weight:600}
+.kb-i{all:unset;box-sizing:border-box;display:block;width:100%;cursor:pointer;padding:7px 10px;border-radius:8px;color:var(--tx2);font-size:13px;line-height:1.35}
+.kb-i:hover{background:var(--card2);color:var(--tx)}
+.kb-i.on{background:var(--card2);color:var(--tx);font-weight:600;box-shadow:inset 3px 0 0 var(--ac)}
+.kb-none{padding:10px 4px}
+.kb-main{padding:22px 26px;min-width:0;scroll-margin-top:8px}
+.kb-cn{font-size:12px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.kb-main h2.kb-t{font-size:22px;font-weight:700;color:var(--tx);margin:0 0 14px;display:block;line-height:1.25}
+.kb-b{font-size:14.5px;line-height:1.65;color:var(--tx2);max-width:760px;overflow-wrap:anywhere}
+.kb-b p{margin:0 0 12px}
+.kb-b b{color:var(--tx)}
+.kb-b code{background:var(--card2);padding:1px 6px;border-radius:6px;font-size:13px;color:var(--tx);overflow-wrap:anywhere}
+.kb-a{color:var(--ac);text-decoration:underline;text-underline-offset:2px;cursor:pointer}
+.kb-nav{display:flex;justify-content:space-between;gap:10px;margin-top:20px;padding-top:14px;border-top:1px solid var(--line);flex-wrap:wrap}
+.kb-nav .btn{max-width:100%;text-align:left}
+.kb-disc{margin:14px 4px 0;text-align:center}
+[data-theme=light] .kb-a{color:#8a6d00}
+@media(max-width:760px){
+  .kb{grid-template-columns:minmax(0,1fr)}
+  .kb-side{position:static;max-height:260px}
+  .kb-main{padding:16px 14px}
+  .kb-main h2.kb-t{font-size:19px}
+}
