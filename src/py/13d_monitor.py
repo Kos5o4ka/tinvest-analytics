@@ -229,10 +229,15 @@ def build_monitor(cfg, acc):
 
 def _build_monitor(cfg, acc, th, t0):
     tm = {}
-    notes = []
     b = build_bonds(cfg, acc)
     tm["bonds"] = round(time.time() - t0, 2)
     rows = [r for r in (b.get("rows") or []) if r.get("isin") and r.get("qty")]
+    return _monitor_core(rows, th, t0, tm, [])
+
+
+def _monitor_core(rows, th, t0, tm, notes, liquidity=True):
+    """Проверки мониторинга для произвольного списка бумаг. rows — строки вида build_bonds (isin, name, ticker, value_rub, qty,
+    maturity, call, floating, price_pct, dur, spread, ytm, rating). Портфель и список наблюдения идут одним кодом."""
     today = date.today().isoformat()
     # соответствие ISIN -> код на Мосбирже
     t1 = time.time()
@@ -381,7 +386,7 @@ def _build_monitor(cfg, acc, th, t0):
                                message="Негативный прогноз по рейтингу (%s)" % (rts["agency"] or ""), url=""))
         # --- ликвидность
         dts = row["days_to_sell"]
-        if h and (dts is None or dts > th["mon_sell_days"]):
+        if liquidity and h and (dts is None or dts > th["mon_sell_days"]):
             row["flags"].append("неликвид")
             alerts.append(dict(base, id="lq|%s|%s" % (isin, today[:7]), severity="info", kind="liquidity", date=today,
                                message=("Нет оборота за 30 дней: продать позицию быстро не получится" if dts is None else
@@ -408,3 +413,46 @@ def _build_monitor(cfg, acc, th, t0):
 def _neg(d):
     """Ключ для сортировки дат по убыванию."""
     return tuple(-ord(c) for c in d or "")
+
+
+def monitor_watch_rows(isins):
+    """Строки списка наблюдения в формате build_bonds (из строк скринера Мосбиржи и каталога T-Invest)."""
+    sec = {}
+    for s in screener_rows():
+        if s.get("isin"):
+            sec[s["isin"]] = s
+    rows = []
+    for isin in isins:
+        s = sec.get(isin)
+        if not s:
+            continue
+        ci = tcat_info(isin) or {}
+        rows.append({"isin": isin, "name": s.get("name"), "ticker": s.get("id"), "value_rub": 0, "qty": 1, "maturity": s.get("mat"),
+                     "call": s.get("offer"), "floating": bool(ci.get("floating")), "price_pct": s.get("price"),
+                     "dur": s.get("dur"), "spread": s.get("spread"), "ytm": s.get("yield"),
+                     "rating": best_rating(isin, ci.get("name") or s.get("name") or "")})
+    return rows
+
+
+def build_monitor_for(cfg, isins):
+    """Те же проверки, что в «Мониторинге», для списка ISIN (без позиции в портфеле: ликвидность и стоимость не считаются)."""
+    th = mon_thresholds(cfg)
+    isins = sorted(set(i for i in isins if i))
+    key = ("monitor_for", tuple(isins), tuple(sorted(th.items())))
+    hit = mem_get(key, 300)
+    if hit:
+        return hit
+    with _mon_lock:
+        hit = mem_get(key, 300)
+        if hit:
+            return hit
+        t0 = time.time()
+        notes = []
+        try:
+            rows = monitor_watch_rows(isins)
+        except Exception as e:  # noqa: BLE001
+            rows = []
+            notes.append("Скринер Мосбиржи недоступен: %s" % str(e)[:80])
+        res = _monitor_core(rows, th, t0, {}, notes, liquidity=False)
+        mem_put(key, res)
+        return res

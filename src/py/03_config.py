@@ -25,7 +25,7 @@ def load_config():
 
 
 def make_backup():
-    """Zip с согласованной копией базы и настройками БЕЗ токена."""
+    """Zip с согласованной копией базы и настройками БЕЗ токена и других секретов (SECRET_KEYS)."""
     tmp = os.path.join(APP_DIR, "backup.%d.tmp" % threading.get_ident())
     try:
         src = sqlite3.connect(DB_PATH)
@@ -34,12 +34,12 @@ def make_backup():
             src.backup(dst)
         dst.close()
         src.close()
-        cfg = {k: v for k, v in load_config().items() if k != "token"}
+        cfg = {k: v for k, v in load_config().items() if k not in SECRET_KEYS}     # токен и прочие секреты не входят
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(tmp, "data.db")
             z.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
-            z.writestr("README.txt", "Резервная копия T-Invest Analytics. Токен API в копию не входит.\n"
+            z.writestr("README.txt", "Резервная копия T-Invest Analytics. Токены и пароли в копию не входят.\n"
                        "Восстановление: закройте программу и положите data.db в папку данных (%s).\n" % APP_DIR)
         return buf.getvalue()
     finally:

@@ -169,7 +169,7 @@ def load_config():
 
 
 def make_backup():
-    """Zip с согласованной копией базы и настройками БЕЗ токена."""
+    """Zip с согласованной копией базы и настройками БЕЗ токена и других секретов (SECRET_KEYS)."""
     tmp = os.path.join(APP_DIR, "backup.%d.tmp" % threading.get_ident())
     try:
         src = sqlite3.connect(DB_PATH)
@@ -178,12 +178,12 @@ def make_backup():
             src.backup(dst)
         dst.close()
         src.close()
-        cfg = {k: v for k, v in load_config().items() if k != "token"}
+        cfg = {k: v for k, v in load_config().items() if k not in SECRET_KEYS}     # токен и прочие секреты не входят
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(tmp, "data.db")
             z.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
-            z.writestr("README.txt", "Резервная копия T-Invest Analytics. Токен API в копию не входит.\n"
+            z.writestr("README.txt", "Резервная копия T-Invest Analytics. Токены и пароли в копию не входят.\n"
                        "Восстановление: закройте программу и положите data.db в папку данных (%s).\n" % APP_DIR)
         return buf.getvalue()
     finally:
@@ -5254,10 +5254,15 @@ def build_monitor(cfg, acc):
 
 def _build_monitor(cfg, acc, th, t0):
     tm = {}
-    notes = []
     b = build_bonds(cfg, acc)
     tm["bonds"] = round(time.time() - t0, 2)
     rows = [r for r in (b.get("rows") or []) if r.get("isin") and r.get("qty")]
+    return _monitor_core(rows, th, t0, tm, [])
+
+
+def _monitor_core(rows, th, t0, tm, notes, liquidity=True):
+    """Проверки мониторинга для произвольного списка бумаг. rows — строки вида build_bonds (isin, name, ticker, value_rub, qty,
+    maturity, call, floating, price_pct, dur, spread, ytm, rating). Портфель и список наблюдения идут одним кодом."""
     today = date.today().isoformat()
     # соответствие ISIN -> код на Мосбирже
     t1 = time.time()
@@ -5406,7 +5411,7 @@ def _build_monitor(cfg, acc, th, t0):
                                message="Негативный прогноз по рейтингу (%s)" % (rts["agency"] or ""), url=""))
         # --- ликвидность
         dts = row["days_to_sell"]
-        if h and (dts is None or dts > th["mon_sell_days"]):
+        if liquidity and h and (dts is None or dts > th["mon_sell_days"]):
             row["flags"].append("неликвид")
             alerts.append(dict(base, id="lq|%s|%s" % (isin, today[:7]), severity="info", kind="liquidity", date=today,
                                message=("Нет оборота за 30 дней: продать позицию быстро не получится" if dts is None else
@@ -5433,6 +5438,49 @@ def _build_monitor(cfg, acc, th, t0):
 def _neg(d):
     """Ключ для сортировки дат по убыванию."""
     return tuple(-ord(c) for c in d or "")
+
+
+def monitor_watch_rows(isins):
+    """Строки списка наблюдения в формате build_bonds (из строк скринера Мосбиржи и каталога T-Invest)."""
+    sec = {}
+    for s in screener_rows():
+        if s.get("isin"):
+            sec[s["isin"]] = s
+    rows = []
+    for isin in isins:
+        s = sec.get(isin)
+        if not s:
+            continue
+        ci = tcat_info(isin) or {}
+        rows.append({"isin": isin, "name": s.get("name"), "ticker": s.get("id"), "value_rub": 0, "qty": 1, "maturity": s.get("mat"),
+                     "call": s.get("offer"), "floating": bool(ci.get("floating")), "price_pct": s.get("price"),
+                     "dur": s.get("dur"), "spread": s.get("spread"), "ytm": s.get("yield"),
+                     "rating": best_rating(isin, ci.get("name") or s.get("name") or "")})
+    return rows
+
+
+def build_monitor_for(cfg, isins):
+    """Те же проверки, что в «Мониторинге», для списка ISIN (без позиции в портфеле: ликвидность и стоимость не считаются)."""
+    th = mon_thresholds(cfg)
+    isins = sorted(set(i for i in isins if i))
+    key = ("monitor_for", tuple(isins), tuple(sorted(th.items())))
+    hit = mem_get(key, 300)
+    if hit:
+        return hit
+    with _mon_lock:
+        hit = mem_get(key, 300)
+        if hit:
+            return hit
+        t0 = time.time()
+        notes = []
+        try:
+            rows = monitor_watch_rows(isins)
+        except Exception as e:  # noqa: BLE001
+            rows = []
+            notes.append("Скринер Мосбиржи недоступен: %s" % str(e)[:80])
+        res = _monitor_core(rows, th, t0, {}, notes, liquidity=False)
+        mem_put(key, res)
+        return res
 # ═══════════════════════════════ сравнение с рынком: индексы и фонды Мосбиржи ═══════════════════════════════
 # Наружу уходят только обезличенные GET-запросы к iss.moex.com (история индексов и фондов); состав портфеля никуда не передаётся.
 
@@ -6609,6 +6657,526 @@ def _safe_call(fn, *a):
 # ═══════════════════════════════ эмитенты: отчётность, скоринг ═══════════════════════════════
 # ═══════════════════════════════ календарь событий, первичка против вторички, история спредов ═══════════════════════════════
 # ═══════════════════════════════ список наблюдения, заметки, уведомления в Telegram ═══════════════════════════════
+# Список наблюдения и дневник хранятся только в локальной базе. Telegram: личный бот пользователя; наружу (на серверы
+# Telegram) уходят только тексты уведомлений. Токен бота — секрет (SECRET_KEYS), в журнал и в ответы API не попадает.
+
+WATCH_KEY, NOTES_KEY, TG_SENT_KEY, TG_STATE_KEY = "watch_v1", "notes_v1", "tg_sent_v1", "tg_state_v1"
+TG_DEFAULTS = {"tg_chat": "", "tg_on_mon": True, "tg_on_watch": True, "tg_pay_days": 0, "tg_digest": False, "tg_digest_time": "10:00"}
+SECRET_KEYS.add("tg_token")
+_watch_lock = threading.Lock()
+_tg_lock = threading.Lock()
+
+
+def _isin_ok(s):
+    s = str(s or "").strip().upper()
+    return s if re.fullmatch(r"[A-Z0-9]{6,16}", s) else ""
+
+
+def _num(x):
+    try:
+        v = float(str(x).replace(",", ".").replace(" ", ""))
+        return v if v == v and abs(v) < 1e9 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def watch_items():
+    return [dict(x) for x in (store().get(WATCH_KEY) or []) if isinstance(x, dict) and x.get("isin")]
+
+
+def watch_isins():
+    """ISIN бумаг из списка наблюдения (для других модулей)."""
+    return [x["isin"] for x in watch_items()]
+
+
+def _scr_by_isin():
+    out = {}
+    try:
+        for s in screener_rows():
+            out[s.get("isin") or s["id"]] = s
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _bond_name(isin, sec=None):
+    s = (sec or {}).get(isin)
+    if s and s.get("name"):
+        return s["name"]
+    try:
+        ci = tcat_info(isin)
+        if ci and ci.get("name"):
+            return ci["name"]
+    except Exception:  # noqa: BLE001
+        pass
+    return isin
+
+
+def watch_post(cfg, body):
+    act = str(body.get("action") or "")
+    isin = _isin_ok(body.get("isin"))
+    if not isin:
+        raise ApiError("Укажите ISIN бумаги.", 400)
+    with _watch_lock:
+        items = watch_items()
+        cur = next((x for x in items if x["isin"] == isin), None)
+        if act == "toggle":
+            act = "remove" if cur else "add"
+        if act == "add":
+            if not cur:
+                cur = {"isin": isin, "added": date.today().isoformat()}
+                items.append(cur)
+        elif act == "remove":
+            items = [x for x in items if x["isin"] != isin]
+        elif act == "update":
+            if not cur:
+                raise ApiError("Бумаги нет в списке наблюдения.", 404)
+        else:
+            raise ApiError("Неизвестное действие.", 400)
+        if act in ("add", "update") and cur is not None:
+            for k in ("target_yield", "target_price"):
+                if k in body:
+                    v = _num(body[k]) if str(body[k]).strip() != "" else None
+                    if v is not None and v <= 0:
+                        v = None
+                    if v is None:
+                        cur.pop(k, None)
+                    else:
+                        cur[k] = round(v, 4)
+            if "note" in body:
+                n = str(body["note"] or "").strip()[:300]
+                if n:
+                    cur["note"] = n
+                else:
+                    cur.pop("note", None)
+        store().put(WATCH_KEY, items)
+    mem_clear_watch()
+    return {"ok": True, "isins": [x["isin"] for x in items], "in_watch": any(x["isin"] == isin for x in items)}
+
+
+def mem_clear_watch():
+    with _mem_lock:
+        for k in [k for k in _mem if isinstance(k, tuple) and k and k[0] == "monitor_for"]:
+            _mem.pop(k, None)
+
+
+def watch_search(cfg, acc, q, force):
+    s = str((q or {}).get("q") or "").strip().lower()
+    if len(s) < 2:
+        return {"rows": []}
+    have = set(watch_isins())
+    out = []
+    for r in screener_rows():
+        isin = r.get("isin") or r["id"]
+        if s in (r.get("name") or "").lower() or s in isin.lower() or s in (r.get("full") or "").lower() or s in (r.get("id") or "").lower():
+            out.append({"isin": isin, "name": r.get("name"), "yield": r.get("yield"), "mat": r.get("mat"), "in_watch": isin in have,
+                        "turn": r.get("turn") or 0})
+    out.sort(key=lambda x: (not x["name"].lower().startswith(s) if x["name"] else True, -x["turn"]))
+    return {"rows": out[:12]}
+
+
+# ── дневник ──
+
+def notes_all():
+    return [dict(x) for x in (store().get(NOTES_KEY) or []) if isinstance(x, dict) and x.get("id")]
+
+
+def notes_get(cfg, acc, q, force):
+    isin = _isin_ok((q or {}).get("isin"))
+    sec = _scr_by_isin()
+    rows = [n for n in notes_all() if not isin or n["isin"] == isin]
+    for n in rows:
+        n["name"] = _bond_name(n["isin"], sec)
+    rows.sort(key=lambda n: (n.get("date") or "", n["id"]), reverse=True)
+    return {"rows": rows}
+
+
+def notes_post(cfg, body):
+    act = str(body.get("action") or "")
+    with _watch_lock:
+        items = notes_all()
+        if act == "add":
+            isin = _isin_ok(body.get("isin"))
+            text = str(body.get("text") or "").strip()[:2000]
+            if not isin or not text:
+                raise ApiError("Укажите бумагу и текст заметки.", 400)
+            n = {"id": "n%d%03d" % (int(time.time() * 1000), len(items) % 1000), "isin": isin,
+                 "date": date.today().isoformat(), "text": text}
+            d = _num(body.get("remind_days"))
+            if d is not None and 0 < d <= 3650:
+                n["remind_on"] = (date.today() + timedelta(days=int(d))).isoformat()
+            items.append(n)
+        elif act == "delete":
+            items = [x for x in items if x["id"] != body.get("id")]
+        elif act == "done":
+            for x in items:
+                if x["id"] == body.get("id"):
+                    x.pop("remind_on", None)
+        else:
+            raise ApiError("Неизвестное действие.", 400)
+        store().put(NOTES_KEY, items)
+    mem_clear_watch()
+    return {"ok": True}
+
+
+# ── данные раздела «Наблюдение» и тревоги ──
+
+def watch_payload(cfg, acc=None, q=None, force=False):
+    items = watch_items()
+    isins = [x["isin"] for x in items]
+    sec = _scr_by_isin()
+    mon = build_monitor_for(cfg, isins) if isins else {"alerts": [], "rows": [], "notes": []}
+    mrow = {r["isin"]: r for r in mon.get("rows") or []}
+    today = date.today().isoformat()
+    rows, alerts = [], list(mon.get("alerts") or [])
+    for it in items:
+        isin = it["isin"]
+        s = sec.get(isin)
+        m = mrow.get(isin) or {}
+        try:
+            ci = tcat_info(isin) or {}
+            rt = best_rating(isin, ci.get("name") or (s or {}).get("name") or "")
+        except Exception:  # noqa: BLE001
+            ci, rt = {}, None
+        row = dict(it, name=_bond_name(isin, sec), in_market=bool(s), rating=rt["v"] if rt else None,
+                   sector=ci.get("sector"), price=(s or {}).get("price"), yield_=(s or {}).get("yield"),
+                   spread=(s or {}).get("spread"), dur=(s or {}).get("dur"), turn=(s or {}).get("turn"),
+                   mat=(s or {}).get("mat") or ci.get("maturity"), offer=(s or {}).get("offer"), cur=(s or {}).get("cur"),
+                   coupon=(s or {}).get("coupon"), chg5=m.get("chg5"), chg30=m.get("chg30"), spread_chg30=m.get("spread_chg30"),
+                   spark=m.get("spark"), flags=m.get("flags") or [], rating_state=m.get("rating"))
+        base = {"isin": isin, "isins": [isin], "name": row["name"], "bonds": [row["name"]]}
+        ty, tp = it.get("target_yield"), it.get("target_price")
+        if s and ty is not None and s.get("yield") is not None and s["yield"] >= ty:
+            alerts.append(dict(base, id="gy|%s|%s" % (isin, ty), severity="medium", kind="goal", date=today,
+                               message="Цель достигнута: доходность %s %% (цель — от %s %%)" % (_f2(s["yield"]), _f2(ty)), url=""))
+        if s and tp is not None and s.get("price") is not None and s["price"] <= tp:
+            alerts.append(dict(base, id="gp|%s|%s" % (isin, tp), severity="medium", kind="goal", date=today,
+                               message="Цель достигнута: цена %s %% (цель — не выше %s %%)" % (_f2(s["price"]), _f2(tp)), url=""))
+        if not s:
+            row["flags"] = row["flags"] + ["нет данных Мосбиржи"]
+        rows.append(row)
+    for n in notes_all():
+        if n.get("remind_on") and n["remind_on"] <= today:
+            nm = _bond_name(n["isin"], sec)
+            alerts.append({"isin": n["isin"], "isins": [n["isin"]], "name": nm, "bonds": [nm], "id": "rm|" + n["id"], "severity": "medium",
+                           "kind": "reminder", "date": n["remind_on"], "note_id": n["id"], "url": "",
+                           "message": "Напоминание из дневника от %s: %s" % (n["date"][8:] + "." + n["date"][5:7], n["text"][:160])})
+    alerts.sort(key=lambda a: (_SEV[a["severity"]], _neg(a["date"])))
+    for a in alerts:
+        for r in rows:
+            if r["isin"] in (a.get("isins") or []):
+                r["n_" + a["severity"]] = r.get("n_" + a["severity"], 0) + 1
+    return {"items": rows, "alerts": alerts, "notes": mon.get("notes") or [],
+            "summary": {s_: sum(1 for a in alerts if a["severity"] == s_) for s_ in _SEV}, "updated": time.time()}
+
+
+def _f2(x):
+    return ("%.2f" % x).replace(".", ",")
+
+
+def watch_isins_get(cfg, acc, q, force):
+    return {"isins": watch_isins()}
+
+
+API_GET["/api/watch"] = watch_payload
+API_GET["/api/watch/isins"] = watch_isins_get
+API_GET["/api/watch/search"] = watch_search
+API_GET["/api/notes"] = notes_get
+API_POST["/api/watch"] = watch_post
+API_POST["/api/notes"] = notes_post
+
+
+# ═══════════════════════════ Telegram ═══════════════════════════
+
+def _tg_base():
+    return (os.environ.get("TINVEST_TG_API") or "https://api.telegram.org").rstrip("/")
+
+
+def _tg_scrub(msg, token):
+    msg = str(msg)
+    if token:
+        msg = msg.replace(token, "***")
+    return re.sub(r"bot\d+:[A-Za-z0-9_\-]+", "bot***", msg)[:200]
+
+
+def tg_call(token, method, params=None, timeout=15):
+    """Вызов Bot API. Любые ошибки превращаются в ApiError без токена в тексте."""
+    if not token:
+        raise ApiError("Токен бота не задан.", 400)
+    url = "%s/bot%s/%s" % (_tg_base(), token, method)
+    data = json.dumps(params or {}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    ctx = None
+    if url.startswith("https://"):
+        import ssl
+        ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            j = json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            j = {}
+        if e.code in (401, 404):
+            raise ApiError("Telegram не принял токен бота. Проверьте, что он скопирован целиком.", 400)
+        raise ApiError("Telegram ответил ошибкой: %s" % _tg_scrub(j.get("description") or e.code, token), 502)
+    except Exception as e:  # noqa: BLE001
+        raise ApiError("Не удалось связаться с Telegram (%s). Если api.telegram.org недоступен из вашей сети, понадобится VPN или прокси."
+                       % _tg_scrub(getattr(e, "reason", e), token), 502)
+    if not j.get("ok"):
+        raise ApiError("Telegram: %s" % _tg_scrub(j.get("description") or "ошибка", token), 502)
+    return j.get("result")
+
+
+def _tg_esc(s):
+    return str(s if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def tg_send(cfg, text):
+    chat = str(cfg.get("tg_chat") or "").strip()
+    if not chat:
+        raise ApiError("Не указан chat id.", 400)
+    return tg_call(cfg.get("tg_token"), "sendMessage", {"chat_id": chat, "text": text[:4000], "parse_mode": "HTML",
+                                                         "disable_web_page_preview": True})
+
+
+def tg_public(cfg):
+    return {k: cfg.get(k, d) for k, d in TG_DEFAULTS.items()}
+
+
+def tg_save(cfg, body):
+    cfg = load_config()
+    if body.get("token"):
+        tok = "".join(str(body["token"]).split())
+        if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_\-]{20,}", tok):
+            raise ApiError("Токен бота выглядит неверно: он должен быть вида 123456789:AAH… (его выдаёт @BotFather).", 400)
+        cfg["tg_token"] = tok
+    if body.get("clear_token"):
+        cfg["tg_token"] = ""
+    if "chat" in body:
+        c = str(body["chat"]).strip()
+        if c and not re.fullmatch(r"-?\d{1,20}|@[A-Za-z0-9_]{3,64}", c):
+            raise ApiError("Chat id — это число (например 123456789). Нажмите «Найти мой chat id».", 400)
+        cfg["tg_chat"] = c
+    for k in ("tg_on_mon", "tg_on_watch", "tg_digest"):
+        if k in body:
+            cfg[k] = bool(body[k])
+    if "tg_pay_days" in body:
+        d = _num(body["tg_pay_days"])
+        cfg["tg_pay_days"] = max(0, min(60, int(d))) if d is not None else 0
+    if "tg_digest_time" in body:
+        t = str(body["tg_digest_time"]).strip()
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t):
+            raise ApiError("Время сводки — в формате ЧЧ:ММ, например 10:00.", 400)
+        cfg["tg_digest_time"] = t
+    save_config(cfg)
+    return {"ok": True, "token_set": bool(cfg.get("tg_token")), "settings": tg_public(cfg)}
+
+
+def tg_find_chat(cfg, body):
+    cfg = load_config()
+    ups = tg_call(cfg.get("tg_token"), "getUpdates", {"limit": 50, "timeout": 0}) or []
+    best = None
+    for u in ups:
+        m = u.get("message") or u.get("edited_message") or u.get("channel_post")
+        if m and m.get("chat") and m["chat"].get("id") is not None:
+            if m["chat"].get("type", "private") == "private" or best is None:
+                best = m["chat"]
+    if not best:
+        raise ApiError("Сообщений боту пока нет. Откройте своего бота в Telegram, нажмите «Запустить» (/start) или напишите ему любое сообщение и повторите.", 404)
+    name = " ".join(x for x in (best.get("first_name"), best.get("last_name")) if x) or best.get("title") or best.get("username") or ""
+    cfg["tg_chat"] = str(best["id"])
+    save_config(cfg)
+    return {"ok": True, "chat": str(best["id"]), "name": name}
+
+
+def tg_test(cfg, body):
+    cfg = load_config()
+    tg_send(cfg, "✅ <b>T-Invest Analytics</b>: тестовое сообщение. Уведомления подключены.")
+    return {"ok": True}
+
+
+def tg_run_now(cfg, body):
+    n = tg_tick(force_digest=bool(body.get("digest")))
+    return {"ok": True, "sent": n}
+
+
+API_POST["/api/tg/save"] = tg_save
+API_POST["/api/tg/find_chat"] = tg_find_chat
+API_POST["/api/tg/test"] = tg_test
+API_POST["/api/tg/run"] = tg_run_now
+
+
+_TG_KIND = {"price": "📉", "spread": "📈", "offer": "🔔", "default": "⛔", "rating": "🏷", "watch": "👁", "outlook": "👁",
+            "halt": "⏸", "liquidity": "💧", "goal": "🎯", "reminder": "📝"}
+_TG_COOL = {"price": 7 * DAY, "spread": 7 * DAY}      # повтор не раньше, чем через неделю; остальные тревоги — один раз
+
+
+def _tg_key(a):
+    k = a["id"]
+    if a.get("kind") in _TG_COOL:
+        k = "%s|%s|%s" % (a["kind"], a.get("isin"), "")
+    return k
+
+
+def _tg_alert_line(a):
+    nm = a.get("name") or ""
+    return "%s <b>%s</b>: %s" % (_TG_KIND.get(a.get("kind"), "•"), _tg_esc(nm), _tg_esc(a.get("message")))
+
+
+def _tg_dispatch(cfg, title, alerts, sent, now):
+    """Отправляет ещё не отправленные тревоги одним сообщением (до 10 штук). Возвращает число тревог."""
+    fresh = []
+    for a in alerts:
+        k = _tg_key(a)
+        last = sent.get(k)
+        if last is not None and now - last < _TG_COOL.get(a.get("kind"), 400 * DAY):
+            continue
+        fresh.append((k, a))
+    if not fresh:
+        return 0
+    sent_n = 0
+    for i in range(0, min(len(fresh), 30), 10):          # до трёх сообщений за проверку; остальное уйдёт в следующий раз
+        chunk = fresh[i:i + 10]
+        tg_send(cfg, "<b>%s</b>\n\n%s" % (_tg_esc(title), "\n\n".join(_tg_alert_line(a) for k, a in chunk)))
+        for k, a in chunk:
+            sent[k] = now
+        sent_n += len(chunk)
+    return sent_n
+
+
+def _tg_payments(cfg, days):
+    b = build_bonds(cfg, "all")
+    end = (date.today() + timedelta(days=days)).isoformat()
+    today = date.today().isoformat()
+    ev = [(p["date"], p.get("kind"), p.get("name"), p.get("amount")) for p in (b.get("payments") or []) if today <= p["date"] <= end]
+    ev += [(r["call"], "offer", r.get("name"), None) for r in (b.get("rows") or []) if r.get("call") and today <= r["call"] <= end]
+    return sorted(ev, key=lambda x: (x[0], str(x[2])))
+
+
+_TG_EV = {"coupon": "купон", "dividend": "дивиденд", "redemption": "погашение", "offer": "оферта"}
+
+
+def _tg_ev_line(e):
+    amt = " · %s ₽" % ("{:,.0f}".format(e[3]).replace(",", " ")) if e[3] else ""
+    return "%s · %s · %s%s" % (e[0][8:] + "." + e[0][5:7], _TG_EV.get(e[1], e[1] or ""), _tg_esc(e[2]), amt)
+
+
+def tg_digest_text(cfg):
+    parts = ["<b>Сводка T-Invest Analytics · %s</b>" % date.today().strftime("%d.%m.%Y")]
+    if cfg.get("token"):
+        try:
+            s = build_summary(cfg, "all", "all")
+            p = s.get("portfolio") or {}
+            if p.get("total") is not None:
+                d = p.get("daily")
+                parts.append("Портфель: %s ₽%s" % ("{:,.0f}".format(p["total"]).replace(",", " "),
+                             (" (за день %s%s ₽)" % ("+" if d >= 0 else "−", "{:,.0f}".format(abs(d)).replace(",", " "))) if d is not None else ""))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ev = _tg_payments(cfg, 7)
+            if ev:
+                parts.append("Ближайшие 7 дней:\n" + "\n".join(_tg_ev_line(e) for e in ev[:8]) + ("\n…и ещё %d" % (len(ev) - 8) if len(ev) > 8 else ""))
+            else:
+                parts.append("Ближайшие 7 дней: выплат нет.")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            m = build_monitor(cfg, "all")
+            parts.append("Мониторинг портфеля: высоких тревог — %d, средних — %d." % (m["summary"]["high"], m["summary"]["medium"]))
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        w = watch_payload(cfg)
+        if w["items"]:
+            ln = []
+            for r in w["items"][:8]:
+                ln.append("%s: %s" % (_tg_esc(r["name"]), ("доходность %s %%" % _f2(r["yield_"])) if r.get("yield_") is not None else "нет данных"))
+            parts.append("Наблюдение (%d, тревог: %d):\n%s" % (len(w["items"]), len(w["alerts"]), "\n".join(ln)))
+    except Exception:  # noqa: BLE001
+        pass
+    return "\n\n".join(parts)
+
+
+def tg_tick(force_digest=False):
+    """Одна проверка: новые тревоги, выплаты, ежедневная сводка. Возвращает число отправленных пунктов."""
+    if not _tg_lock.acquire(False):
+        return 0
+    try:
+        cfg = load_config()
+        if not cfg.get("tg_token") or not str(cfg.get("tg_chat") or "").strip():
+            return 0
+        st = store()
+        now = time.time()
+        sent = {k: v for k, v in (st.get(TG_SENT_KEY) or {}).items() if now - v < 400 * DAY}
+        n = 0
+        try:
+            if cfg.get("tg_on_mon", True) and cfg.get("token"):
+                al = [a for a in build_monitor(cfg, "all")["alerts"] if a["severity"] == "high"]
+                n += _tg_dispatch(cfg, "Тревоги по портфелю", al, sent, now)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if cfg.get("tg_on_watch", True) and (watch_isins() or notes_all()):
+                al = [a for a in watch_payload(cfg)["alerts"] if a["severity"] != "info"]
+                n += _tg_dispatch(cfg, "Наблюдение и цели", al, sent, now)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            days = int(cfg.get("tg_pay_days") or 0)
+            if days > 0 and cfg.get("token"):
+                ev = [e for e in _tg_payments(cfg, days)]
+                fresh = []
+                for e in ev:
+                    k = "pay|%s|%s|%s" % (e[0], e[1], e[2])
+                    if k not in sent:
+                        fresh.append((k, e))
+                if fresh:
+                    tg_send(cfg, "<b>Ближайшие выплаты (%d дн.)</b>\n\n%s" % (days, "\n".join(_tg_ev_line(e) for k, e in fresh[:15])))
+                    for k, e in fresh:
+                        sent[k] = now
+                    n += len(fresh)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            state = st.get(TG_STATE_KEY) or {}
+            hh = str(cfg.get("tg_digest_time") or "10:00")
+            nowl = datetime.now()
+            due = force_digest or (cfg.get("tg_digest") and state.get("digest") != date.today().isoformat()
+                                   and nowl.strftime("%H:%M") >= hh)
+            if due:
+                tg_send(cfg, tg_digest_text(cfg))
+                if not force_digest:
+                    state["digest"] = date.today().isoformat()
+                    st.put(TG_STATE_KEY, state)
+                n += 1
+        except Exception:  # noqa: BLE001
+            pass
+        st.put(TG_SENT_KEY, sent)
+        return n
+    except Exception:  # noqa: BLE001
+        return 0            # сеть/Telegram недоступны — попробуем в следующий раз; детали (с токеном) не пишем
+    finally:
+        _tg_lock.release()
+
+
+def _tg_loop():
+    time.sleep(90)
+    while True:
+        try:
+            tg_tick()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(int(os.environ.get("TINVEST_TG_PERIOD") or 720))
+
+
+def tg_start():
+    threading.Thread(target=_tg_loop, daemon=True, name="tg-notify").start()
+
+
+STARTUP_HOOKS.append(tg_start)
 # ═══════════════════════════════ налоги по лотам: ЛДВ, ИИС, перенос убытков, подсказки ═══════════════════════════════
 # ═══════════════════════════════ зашифрованная резервная копия и экспорт ═══════════════════════════════
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
@@ -7386,6 +7954,27 @@ tr.scr-low td{opacity:.5}
 /* эмитенты */
 /* календарь событий */
 /* наблюдение */
+.wt-star{background:none;border:0;cursor:pointer;font-size:18px;line-height:1;color:var(--mu);padding:2px 6px;border-radius:6px}
+.wt-star:hover{color:var(--s4)}.wt-star.on{color:var(--s4)}
+.wt-sth,.wt-std{width:34px;text-align:center;padding-left:4px;padding-right:4px}
+.wt-add{position:relative}
+.wt-sug{display:grid;gap:4px;margin-top:8px}
+.wt-s{display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:10px;background:var(--card2);cursor:pointer}
+.wt-s>div{flex:1;min-width:0}.wt-s:hover{filter:brightness(1.06)}
+.wt-sm{padding:4px 12px!important;font-size:12px!important}
+.wt-in{min-width:84px;padding:6px 8px;font-size:12.5px}
+.wt-in.wt-note{min-width:150px;text-align:left}
+.wt-del{padding:2px 10px;font-size:15px}
+#wt-tab tbody tr{cursor:pointer}
+.wt-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+.wt-ta{font-family:inherit;font-size:13.5px}
+.wt-note-i{padding:10px 12px;margin:8px 0;border-radius:10px;background:var(--card2);cursor:pointer}
+.wt-nh{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.wt-nt{margin-top:6px;white-space:pre-wrap;font-size:13.5px;color:var(--tx2)}
+.wt-due{color:var(--s4)}
+.tg-steps{margin:0;padding-left:20px;display:grid;gap:6px;font-size:13px;color:var(--tx2)}
+.tg-steps code{background:var(--card2);padding:1px 6px;border-radius:6px;font-size:12px}
+[data-theme=light] .wt-s,[data-theme=light] .wt-note-i{background:#f0f2f6}
 /* налоги */
 /* резервная копия */
 </style></head>
@@ -8040,10 +8629,10 @@ function scrRows(){
 }
 function drawScr(){
   const rs=scrRows(),n=Math.min(rs.length,S.sn),fl=S.scr.floor&&S.scr.floor.lqdt;
-  const cols=[['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield','Доходность'],['spread','Спред к КБД'],['coupon','Купон, %'],['years','До погашения'],['dur','Дюрация'],['turn','Оборот сегодня']];
+  const cols=[['_w','★','l'],['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield','Доходность'],['spread','Спред к КБД'],['coupon','Купон, %'],['years','До погашения'],['dur','Дюрация'],['turn','Оборот сегодня']];
   const {k,d}=S.ssort;
-  $('#scr-head').innerHTML=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
-  $('#scr-body').innerHTML=rs.slice(0,n).map(r=>`<tr${fl>0&&r.yield<fl?' class="scr-low" title="Доходность ниже, чем у фонда ликвидности"':''} data-isin="${esc(r.isin||r.id)}"><td class="l"><b>${esc(r.name)}</b><br><small class="mu num">${esc(r.isin||r.id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></td>
+  $('#scr-head').innerHTML=cols.map(([kk,t,c])=>kk==='_w'?`<th class="wt-sth" title="Список наблюдения">${t}</th>`:`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
+  $('#scr-body').innerHTML=rs.slice(0,n).map(r=>`<tr${fl>0&&r.yield<fl?' class="scr-low" title="Доходность ниже, чем у фонда ликвидности"':''} data-isin="${esc(r.isin||r.id)}"><td class="wt-std">${watchStar(r.isin||r.id)}</td><td class="l"><b>${esc(r.name)}</b><br><small class="mu num">${esc(r.isin||r.id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></td>
     <td class="l">${r.rating?`<span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}" title="${esc(r.rt_agency||'')}${r.rt_approx?' (приблизительное совпадение названия)':''}">${r.rt_approx?'≈ ':''}${esc(r.rating)}</span>`:'<span class="mu">—</span>'}</td>
     <td class="l">${r.sector?esc(SECT[r.sector]||r.sector):'<span class="mu">—</span>'}</td>
     <td class="num">${f2(r.price)}</td><td class="num"><b>${pctp(r.yield,2)}</b></td>
@@ -9096,6 +9685,7 @@ function pMon(){
   ${(d.notes||[]).map(n=>`<div class="msg">${esc(n)}</div>`).join('')}
   <div class="card"><h2>Тревоги<span class="sp">рейтинги — за 90 дней, рынок — на сегодня</span><button class="btn ghost" id="mon-r" style="margin-left:auto;padding:4px 12px;font-size:12px">Обновить</button></h2>
     ${d.alerts.length?d.alerts.slice(0,S.monAll?999:12).map(monAlertHtml).join('')+(d.alerts.length>12?`<button class="btn ghost" id="mon-all" style="margin-top:6px">${S.monAll?'Свернуть':'Показать все ('+d.alerts.length+')'}</button>`:''):'<div class="mon-ok">Тревог нет</div>'}</div>
+  ${watchMonGroup()}
   <div class="card"><h2>Облигации портфеля<span class="sp">цены Мосбиржи, спред — доходность минус КБД на дюрации бумаги</span></h2>
     <div class="tbl"><table id="mon-tab"><thead><tr><th class="l">Облигация</th><th>Стоимость</th><th class="l">Рейтинг · прогноз</th><th>Цена, %</th><th>Δ 5 дн.</th><th>Δ 30 дн.</th>
     <th>Спред, п.п.</th><th>Δ спреда 30 дн.</th><th>Спред 90 дн.</th><th>Оборот в день</th><th title="Стоимость позиции / (20 % среднего дневного оборота за 30 дней)">Дней на продажу</th><th class="l">Признаки</th></tr></thead><tbody>${rows}</tbody></table></div>
@@ -9662,11 +10252,206 @@ function bindIss(){}
 /* ── Календарь событий ── */
 function pCal(){return`<div class="card empty">Раздел в разработке</div>`}
 function bindCal(){}
-/* ── Наблюдение, заметки, Telegram ── */
-function pWatch(){return`<div class="card empty">Раздел в разработке</div>`}
-function bindWatch(){}
-function setTgHtml(c){return''}
-function bindSetTg(c,msg){}
+/* ── Наблюдение: список бумаг с целями и тревогами, дневник, уведомления в Telegram ── */
+S.wset=null;S.watch=null;S.wnotes=null;S.wfilter='';S.wsug=[];
+const WT_REMIND=[['','без напоминания'],['7','через 7 дней'],['30','через 30 дней'],['90','через 3 месяца'],['180','через полгода'],['365','через год']];
+const WT_TPL=[['Почему купил: ','Почему купил'],['Продать, если: ','Что должно случиться, чтобы продать']];
+
+/* множество ISIN из списка (для звёздочек в скринере и карточке) */
+function watchLoadSet(){
+  if(S.wset&&S.wset.loading)return;
+  const old=S.wset;S.wset=Object.assign(new Set(old||[]),{loading:true});
+  api('/api/watch/isins').then(j=>{S.wset=new Set(j.isins||[]);watchRefreshView()}).catch(()=>{S.wset=new Set(old||[])});
+}
+function watchHas(isin){
+  if(!S.wset||!(S.wset instanceof Set))watchLoadSet();
+  return !!(S.wset&&S.wset.has(isin));
+}
+function watchRefreshView(){
+  if(S.page==='scr'&&S.scr&&!S.scr.error&&$('#scr-body'))drawScr();
+  else if(['watch','mon'].includes(S.page))render();
+}
+/* добавить/убрать бумагу; вызывается карточкой облигации и скринером */
+async function watchToggle(isin){
+  if(!isin)return false;
+  const r=await post('/api/watch',{action:'toggle',isin});
+  S.wset=new Set(r.isins||[]);S.watch=null;
+  try{document.dispatchEvent(new CustomEvent('watchchange',{detail:{isin,on:!!r.in_watch}}))}catch(e){}
+  watchRefreshView();
+  return !!r.in_watch;
+}
+function watchStar(isin){
+  const on=watchHas(isin);
+  return`<button class="wt-star${on?' on':''}" data-wstar="${esc(isin)}" title="${on?'Убрать из наблюдения':'Добавить в наблюдение'}" aria-label="Наблюдение">${on?'★':'☆'}</button>`;
+}
+
+function watchEnsure(){
+  const w=S.watch;
+  if(w&&(w.loading||w.error||(w.data&&Date.now()-w.t<3e5)))return;
+  S.watch={loading:true,t:Date.now()};
+  api('/api/watch').then(d=>{S.watch={data:d,t:Date.now()};S.wset=new Set(d.items.map(x=>x.isin));
+    if(['watch','mon'].includes(S.page))render()}).catch(e=>{S.watch={error:e.message,t:Date.now()};if(['watch','mon'].includes(S.page))render()});
+}
+function notesEnsure(){
+  const n=S.wnotes;
+  if(n&&(n.loading||n.error||n.data))return;
+  S.wnotes={loading:true};
+  api('/api/notes').then(d=>{S.wnotes={data:d.rows};if(S.page==='watch')render()}).catch(e=>{S.wnotes={error:e.message};if(S.page==='watch')render()});
+}
+
+/* группа «Наблюдение» на странице «Мониторинг» */
+function watchMonGroup(){
+  if(!S.wset||!(S.wset instanceof Set)){watchLoadSet();return''}
+  if(!S.wset.size)return'';
+  watchEnsure();
+  const w=S.watch;
+  if(!w||w.loading)return`<div class="card"><h2>Наблюдение<span class="sp">загружаю…</span></h2></div>`;
+  if(w.error||!w.data)return'';
+  const al=w.data.alerts;
+  return`<div class="card"><h2>Наблюдение<span class="sp">${w.data.items.length} бумаг · ${al.length?al.length+' тревог':'тревог нет'}</span>
+    <button class="btn ghost" data-go="watch" style="margin-left:auto;padding:4px 12px;font-size:12px">Открыть список</button></h2>
+    ${al.length?al.slice(0,8).map(monAlertHtml).join('')+(al.length>8?`<div class="mu" style="font-size:12px;margin-top:6px">…и ещё ${al.length-8}</div>`:''):'<div class="mon-ok">По бумагам из списка наблюдения тревог нет</div>'}</div>`;
+}
+
+function wtRow(r){
+  const th=v=>v!=null?String(v).replace('.',','):'';
+  const sp=r.spark&&r.spark.length>2?monSpark(r.spark,70,22):'';
+  return`<tr data-isin="${esc(r.isin)}" title="Открыть карточку"><td class="l"><b style="font-weight:600">${esc(r.name)}</b>${r.n_high?` <span class="tag" style="color:var(--neg)">!</span>`:''}<br><small class="mu num">${esc(r.isin)}${r.offer?' · оферта '+ddm(r.offer):''}${r.mat?' · до '+ddm(r.mat):''}</small></td>
+    <td class="l">${r.rating?`<span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}">${esc(r.rating)}</span>`:'<span class="mu">—</span>'}</td>
+    <td class="num">${r.price!=null?f2(r.price):'—'}</td><td class="num"><b>${r.yield_!=null?pctp(r.yield_,2):'—'}</b></td>
+    <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
+    <td class="num ${cls(r.chg30)}">${r.chg30!=null?pct(r.chg30,1):'—'}</td><td>${sp}</td>
+    <td class="num">${r.dur!=null?f2(r.dur):'—'}</td><td class="num">${r.turn?short(r.turn):'—'}</td>
+    <td><input class="in num wt-in" data-k="target_yield" data-isin="${esc(r.isin)}" value="${esc(th(r.target_yield))}" placeholder="от, %" inputmode="decimal" title="Сообщить, когда доходность станет не ниже"></td>
+    <td><input class="in num wt-in" data-k="target_price" data-isin="${esc(r.isin)}" value="${esc(th(r.target_price))}" placeholder="до, %" inputmode="decimal" title="Сообщить, когда цена станет не выше"></td>
+    <td><input class="in wt-in wt-note" data-k="note" data-isin="${esc(r.isin)}" value="${esc(r.note||'')}" placeholder="заметка" maxlength="300"></td>
+    <td class="l">${(r.flags||[]).map(f=>`<span class="tag" style="color:var(--neg)">${esc(f)}</span>`).join(' ')}</td>
+    <td><button class="btn ghost wt-del" data-wdel="${esc(r.isin)}" title="Убрать из наблюдения">×</button></td></tr>`;
+}
+function wtNoteHtml(n){
+  const due=n.remind_on&&n.remind_on<=new Date().toISOString().slice(0,10);
+  return`<div class="wt-note-i" data-isin="${esc(n.isin)}"><div class="wt-nh"><b>${esc(n.name||n.isin)}</b><small class="mu num">${ddm(n.date)}</small>
+    ${n.remind_on?`<span class="tag ${due?'wt-due':''}" title="Напоминание">${due?'пора пересмотреть':'напомнить '+ddm(n.remind_on)}</span>`:''}
+    <span style="margin-left:auto;display:flex;gap:6px">${n.remind_on?`<button class="btn ghost wt-sm" data-ndone="${esc(n.id)}">Пересмотрено</button>`:''}<button class="btn ghost wt-sm" data-ndel="${esc(n.id)}" title="Удалить заметку">Удалить</button></span></div>
+    <div class="wt-nt">${esc(n.text)}</div></div>`;
+}
+function pWatch(){
+  watchEnsure();notesEnsure();
+  const w=S.watch,nt=S.wnotes;
+  if(!w||w.loading)return`<div class="card">${waitBox('Проверяю бумаги из списка: цены, рейтинги, спреды и цели…')}</div>`;
+  if(w.error)return`<div class="msg err">${esc(w.error)} <button class="btn ghost" id="wt-r">Повторить</button></div>`;
+  const d=w.data,sm=d.summary,goals=d.alerts.filter(a=>a.kind==='goal').length;
+  const hold=(S.bonds&&S.bonds.rows||[]).filter(r=>r.isin).map(r=>[r.isin,r.name,'в портфеле']);
+  const opts=[...d.items.map(r=>[r.isin,r.name,'наблюдение']),...hold.filter(h=>!d.items.some(r=>r.isin===h[0]))];
+  const notes=((nt&&nt.data)||[]).filter(n=>!S.wfilter||n.isin===S.wfilter);
+  const nIsins=[...new Map(((nt&&nt.data)||[]).map(n=>[n.isin,n.name||n.isin])).entries()];
+  return`<div class="g g4">${kpi('Бумаг в списке',d.items.length,'облигации, за которыми вы следите',null,S1)}${kpi('Высокие тревоги',sm.high,'дефолт, понижение рейтинга, сильное падение','neg',S8)}
+    ${kpi('Средние тревоги',sm.medium,'наблюдение, оферты, напоминания','',S3)}${kpi('Цели достигнуты',goals,'доходность или цена дошли до заданной',goals?'pos':'',S2)}</div>
+  ${(d.notes||[]).filter(n=>d.items.length).map(n=>`<div class="msg">${esc(n)}</div>`).join('')}
+  <div class="card"><h2>Добавить бумагу<span class="sp">по названию или ISIN, из облигаций Мосбиржи</span></h2>
+    <div class="wt-add"><input class="in" id="wt-q" placeholder="например, Самолет или RU000A0JQAM6" autocomplete="off"><div id="wt-sug" class="wt-sug"></div></div>
+    <p class="note" style="margin-top:8px">Можно также нажать ☆ в строке скринера или в карточке облигации. Цели задаются прямо в таблице ниже.</p></div>
+  ${d.alerts.length?`<div class="card"><h2>Тревоги по списку<span class="sp">рейтинги, цена, спред, оферты, цели и напоминания</span></h2>${d.alerts.slice(0,S.wtAll?999:10).map(monAlertHtml).join('')}${d.alerts.length>10?`<button class="btn ghost" id="wt-all" style="margin-top:6px">${S.wtAll?'Свернуть':'Показать все ('+d.alerts.length+')'}</button>`:''}</div>`:''}
+  <div class="card"><h2>Список наблюдения<span class="sp">клик по строке — карточка выпуска</span><button class="btn ghost" id="wt-r" style="margin-left:auto;padding:4px 12px;font-size:12px">Обновить</button></h2>
+    ${d.items.length?`<div class="tbl"><table id="wt-tab"><thead><tr><th class="l">Выпуск</th><th class="l">Рейтинг</th><th>Цена, %</th><th>Доходность</th><th>Спред, п.п.</th><th>Δ 30 дн.</th><th>Спред 90 дн.</th><th>Дюрация</th><th>Оборот</th>
+      <th title="Тревога, когда доходность станет не ниже этого значения">Цель: доходность ≥</th><th title="Тревога, когда цена станет не выше этого значения">Цель: цена ≤</th><th class="l">Заметка</th><th class="l">Флаги</th><th></th></tr></thead><tbody>${d.items.map(wtRow).join('')}</tbody></table></div>
+      <p class="note" style="margin-top:10px">Цены и доходность — по данным Мосбиржи с задержкой. Тревоги считаются теми же правилами и порогами, что и в «Мониторинге» (пороги меняются там). Справочная информация, не инвестиционная рекомендация.</p>`
+      :'<div class="empty" style="padding:18px 0">Список пуст. Найдите бумагу выше или нажмите ☆ в скринере.</div>'}</div>
+  <div class="card"><h2>Дневник<span class="sp">заметки по любым бумагам, в том числе из портфеля</span></h2>
+    <div class="wt-form"><label class="field"><span>Бумага</span><select class="in" id="nt-sel"><option value="">— выберите —</option>${opts.map(o=>`<option value="${esc(o[0])}">${esc(o[1])} · ${o[2]}</option>`).join('')}<option value="_other">другая (ввести ISIN)…</option></select>
+      <input class="in" id="nt-isin" placeholder="ISIN" style="display:none;margin-top:6px"></label>
+      <label class="field"><span>Напомнить пересмотреть</span><select class="in" id="nt-rem">${WT_REMIND.map(o=>`<option value="${o[0]}">${o[1]}</option>`).join('')}</select></label></div>
+    <label class="field" style="margin-top:12px"><span>Заметка</span><textarea class="in wt-ta" id="nt-text" rows="3" maxlength="2000" placeholder="Почему купил, на что рассчитываю, что должно случиться, чтобы продать…"></textarea></label>
+    <div class="row" style="margin-top:10px">${WT_TPL.map(t=>`<button class="btn ghost wt-sm" data-tpl="${esc(t[0])}">${t[1]}</button>`).join('')}<button class="btn" id="nt-add" style="margin-left:auto">Добавить заметку</button></div>
+    <div id="nt-msg"></div>
+    <div class="row" style="margin:18px 0 6px"><label class="field" style="max-width:320px"><span>Показывать</span><select class="in" id="nt-flt"><option value="">все заметки</option>${nIsins.map(([i,n])=>`<option value="${esc(i)}" ${S.wfilter===i?'selected':''}>${esc(n)}</option>`).join('')}</select></label></div>
+    ${!nt||nt.loading?waitBox('Загружаю заметки…'):nt.error?`<div class="msg err">${esc(nt.error)}</div>`:notes.length?notes.map(wtNoteHtml).join(''):'<div class="mu" style="font-size:13px;padding:6px 0">Заметок пока нет.</div>'}</div>`;
+}
+function bindWatch(){
+  const rl=()=>{S.watch=null;render()};
+  const r=$('#wt-r');if(r)r.onclick=rl;
+  const al=$('#wt-all');if(al)al.onclick=()=>{S.wtAll=!S.wtAll;render()};
+  let to,seq=0;
+  const q=$('#wt-q');
+  if(q){
+    const draw=()=>{const box=$('#wt-sug');if(!box)return;
+      box.innerHTML=S.wsug.length?S.wsug.map(x=>`<div class="wt-s" data-isin="${esc(x.isin)}"><div><b>${esc(x.name)}</b><small class="mu num"> ${esc(x.isin)}${x.mat?' · до '+ddm(x.mat):''}</small></div><span class="num">${x.yield!=null?pctp(x.yield,1):''}</span>
+        <button class="btn ${x.in_watch?'ghost':''} wt-sm" data-wadd="${esc(x.isin)}" ${x.in_watch?'disabled':''}>${x.in_watch?'в списке':'Добавить'}</button></div>`).join(''):(q.value.trim().length>=2?'<div class="mu" style="padding:8px 2px;font-size:13px">Ничего не найдено среди облигаций, торгуемых на Мосбирже.</div>':'')};
+    draw();
+    q.oninput=()=>{clearTimeout(to);const v=q.value.trim(),my=++seq;
+      if(v.length<2){S.wsug=[];draw();return}
+      to=setTimeout(()=>api('/api/watch/search?'+new URLSearchParams({q:v})).then(j=>{if(my!==seq)return;S.wsug=j.rows||[];draw()}).catch(()=>{}),200)};
+    q.onkeydown=e=>{if(e.key==='Enter'&&S.wsug.length){const x=S.wsug.find(s=>!s.in_watch);if(x)watchToggle(x.isin)}};
+  }
+  const sug=$('#wt-sug');
+  if(sug)sug.onclick=async e=>{const b=e.target.closest('[data-wadd]');if(!b)return;e.stopPropagation();b.disabled=true;
+    try{await watchToggle(b.dataset.wadd);S.wsug=[]}catch(er){alert(er.message)}};
+  const tab=$('#wt-tab');
+  if(tab){
+    tab.onclick=async e=>{const b=e.target.closest('[data-wdel]');if(!b)return;e.stopPropagation();
+      try{await post('/api/watch',{action:'remove',isin:b.dataset.wdel});S.wset.delete(b.dataset.wdel);S.watch=null;render()}catch(er){alert(er.message)}};
+    tab.onchange=async e=>{const i=e.target.closest('.wt-in');if(!i)return;
+      try{await post('/api/watch',{action:'update',isin:i.dataset.isin,[i.dataset.k]:i.value});if(i.dataset.k!=='note'){S.watch=null;render()}}catch(er){alert(er.message)}};
+  }
+  const sel=$('#nt-sel');
+  if(sel)sel.onchange=()=>{$('#nt-isin').style.display=sel.value==='_other'?'':'none'};
+  document.querySelectorAll('[data-tpl]').forEach(b=>b.onclick=()=>{const t=$('#nt-text');t.value=(t.value?t.value+'\n':'')+b.dataset.tpl;t.focus()});
+  const add=$('#nt-add');
+  if(add)add.onclick=async()=>{
+    const m=(t,ok)=>{$('#nt-msg').innerHTML=`<div class="msg ${ok?'ok':'err'}">${esc(t)}</div>`};
+    let isin=sel.value==='_other'?$('#nt-isin').value.trim().toUpperCase():sel.value;
+    if(!isin)return m('Выберите бумагу или введите ISIN.');
+    if(!$('#nt-text').value.trim())return m('Напишите текст заметки.');
+    add.disabled=true;
+    try{await post('/api/notes',{action:'add',isin,text:$('#nt-text').value,remind_days:$('#nt-rem').value});S.wnotes=null;S.watch=null;render()}
+    catch(er){m(er.message);add.disabled=false}};
+  const fl=$('#nt-flt');if(fl)fl.onchange=()=>{S.wfilter=fl.value;render()};
+  const view=$('#view');
+  if(view)view.querySelectorAll('[data-ndel]').forEach(b=>b.onclick=async e=>{e.stopPropagation();if(!confirm('Удалить заметку?'))return;
+    try{await post('/api/notes',{action:'delete',id:b.dataset.ndel});S.wnotes=null;S.watch=null;render()}catch(er){alert(er.message)}});
+  if(view)view.querySelectorAll('[data-ndone]').forEach(b=>b.onclick=async e=>{e.stopPropagation();
+    try{await post('/api/notes',{action:'done',id:b.dataset.ndone});S.wnotes=null;S.watch=null;render()}catch(er){alert(er.message)}});
+}
+/* звёздочки (скринер, карточка и др.): клик не открывает карточку выпуска */
+document.addEventListener('click',async e=>{
+  const b=e.target.closest('[data-wstar]');if(!b)return;
+  e.stopPropagation();b.disabled=true;
+  try{await watchToggle(b.dataset.wstar)}catch(er){alert(er.message)}finally{b.disabled=false}
+},true);
+
+/* ── Telegram: карточка в «Настройках» ── */
+function setTgHtml(c){
+  const set=c.secret_set&&c.secret_set.tg_token,on=(k,d)=>c[k]==null?d:!!c[k];
+  return`<div class="card" id="tg-card"><h2>Уведомления в Telegram<span class="sp">по желанию, через ваш личный бот</span></h2>
+    <div style="display:grid;gap:16px">
+    <ol class="tg-steps"><li>В Telegram откройте <b>@BotFather</b>, отправьте <code>/newbot</code> и придумайте имя бота. BotFather пришлёт токен вида <code>123456789:AAH…</code></li>
+      <li>Вставьте токен ниже и нажмите «Сохранить».</li><li>Откройте своего бота в Telegram и отправьте ему <code>/start</code>.</li>
+      <li>Нажмите «Найти мой chat id», затем «Отправить тестовое сообщение».</li></ol>
+    <label class="field"><span>Токен бота ${set?`<span class="pos">· сохранён. Оставьте пустым, чтобы не менять</span>`:''}</span>
+      <input class="in" type="password" id="tg-tok" placeholder="123456789:AAH…" autocomplete="off" spellcheck="false"></label>
+    <div class="row"><label class="field" style="max-width:260px"><span>Chat id</span><input class="in num" id="tg-chat" value="${esc(c.tg_chat||'')}" placeholder="например, 123456789" inputmode="numeric"></label>
+      <button class="btn ghost" id="tg-find" style="align-self:flex-end">Найти мой chat id</button></div>
+    <label class="sw"><input type="checkbox" id="tg-mon" ${on('tg_on_mon',true)?'checked':''}><i></i><div><b>Тревоги мониторинга</b><small>Только высокой важности: дефолт, понижение рейтинга, сильное падение цены</small></div></label>
+    <label class="sw"><input type="checkbox" id="tg-wat" ${on('tg_on_watch',true)?'checked':''}><i></i><div><b>Наблюдение и цели</b><small>Тревоги по списку наблюдения, достигнутые цели и напоминания из дневника</small></div></label>
+    <div class="row"><label class="field" style="max-width:300px"><span>Ближайшие выплаты: за сколько дней сообщать (0 — выключить)</span><input class="in num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}"></label></div>
+    <div class="row"><label class="sw"><input type="checkbox" id="tg-dg" ${on('tg_digest',false)?'checked':''}><i></i><div><b>Ежедневная сводка</b><small>Портфель, выплаты на неделю, тревоги</small></div></label>
+      <label class="field" style="max-width:130px"><span>Время</span><input class="in num" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}"></label></div>
+    <div class="row"><button class="btn" id="tg-save">Сохранить</button><button class="btn ghost" id="tg-test">Отправить тестовое сообщение</button><button class="btn ghost" id="tg-run" title="Проверить тревоги и отправить новые прямо сейчас">Проверить сейчас</button>
+      ${set?'<button class="btn danger" id="tg-clr">Удалить токен бота</button>':''}</div>
+    <p class="note"><b>Что нужно знать.</b> Сообщения проходят через серверы Telegram и содержат названия бумаг и суммы — отправляйте их только в свой личный чат. Токен бота хранится только на этом компьютере (в файле настроек с ограниченным доступом) и в резервную копию не входит. Уведомления приходят, <b>только пока программа запущена</b>; проверка выполняется раз в 10–15 минут, одна и та же тревога повторно не отправляется. Если Telegram не открывается из вашей сети, понадобится VPN или прокси.</p></div></div>`;
+}
+function bindSetTg(c,msg){
+  const g=id=>document.getElementById(id);if(!g('tg-card'))return;
+  const body=()=>({token:g('tg-tok').value,chat:g('tg-chat').value,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
+    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00'});
+  const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
+  const save=async()=>{const r=await post('/api/tg/save',body());g('tg-tok').value='';c.secret_set=Object.assign({},c.secret_set,{tg_token:!!r.token_set});Object.assign(c,r.settings);return r};
+  g('tg-save').onclick=e=>busy(e.currentTarget,async()=>{await save();msg('Настройки Telegram сохранены.',1);if(!document.getElementById('tg-clr')&&c.secret_set.tg_token)renderSettings()});
+  g('tg-find').onclick=e=>busy(e.currentTarget,async()=>{await save();const r=await post('/api/tg/find_chat');g('tg-chat').value=r.chat;c.tg_chat=r.chat;msg('Chat id найден: '+r.chat+(r.name?' ('+r.name+')':'')+'. Теперь отправьте тестовое сообщение.',1)});
+  g('tg-test').onclick=e=>busy(e.currentTarget,async()=>{await save();await post('/api/tg/test');msg('Тестовое сообщение отправлено — проверьте Telegram.',1)});
+  g('tg-run').onclick=e=>busy(e.currentTarget,async()=>{await save();const r=await post('/api/tg/run');msg(r.sent?'Отправлено новых пунктов: '+r.sent+'.':'Новых тревог для отправки нет.',1)});
+  const cl=g('tg-clr');if(cl)cl.onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить токен бота из настроек?'))return;await post('/api/tg/save',{clear_token:true});c.secret_set=Object.assign({},c.secret_set,{tg_token:false});renderSettings()});
+}
 /* ── Зашифрованная резервная копия и экспорт ── */
 function setBackupHtml(c){return''}
 function bindSetBackup(c,msg){}
