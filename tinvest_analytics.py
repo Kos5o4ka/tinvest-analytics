@@ -58,6 +58,8 @@ DAY = 86400
 #   API_GET["/api/x"] = fn(cfg, acc, q, force)  -> dict (JSON) или кортеж (код, тело, content-type, заголовки)
 #   API_POST["/api/x"] = fn(cfg, body)           -> dict (JSON) или такой же кортеж
 API_GET, API_POST = {}, {}
+# Функции без аргументов, которые сервер вызывает один раз при запуске (фоновые потоки модулей).
+STARTUP_HOOKS = []
 # Ключи настроек, которые никогда не отдаются в интерфейс через /api/config (секреты).
 SECRET_KEYS = {"token"}
 
@@ -6749,6 +6751,11 @@ def main():
             warmup_start()
         except Exception:  # noqa: BLE001
             pass
+        for hook in STARTUP_HOOKS:
+            try:
+                hook()
+            except Exception:  # noqa: BLE001
+                pass
         srv.serve_forever()
     except KeyboardInterrupt:
         pass

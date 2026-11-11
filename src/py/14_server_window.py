@@ -333,6 +333,11 @@ def main():
             warmup_start()
         except Exception:  # noqa: BLE001
             pass
+        for hook in STARTUP_HOOKS:
+            try:
+                hook()
+            except Exception:  # noqa: BLE001
+                pass
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
