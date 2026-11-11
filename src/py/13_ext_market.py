@@ -166,7 +166,12 @@ def screener_payload():
         hist = _stats_history(stats)
     except Exception:  # noqa: BLE001
         hist = {}
-    return {"rows": rows, "kbd": kbd_curve(), "updated": _scr["t"], "ratings": ratings_status(), "stats": stats, "stats_hist": hist}
+    try:
+        lq = bench_lqdt_yield()
+    except Exception:  # noqa: BLE001
+        lq = None
+    return {"rows": rows, "kbd": kbd_curve(), "updated": _scr["t"], "ratings": ratings_status(), "stats": stats, "stats_hist": hist,
+            "floor": {"lqdt": lq}}
 
 
 # ── первичные размещения (по объявлениям Мосбиржи; сводка investmint.ru) ──

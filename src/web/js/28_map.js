@@ -31,13 +31,15 @@ function mpScatter(el){
   for(let v=0;v<=X1+nx.step/2;v+=nx.step){if(v>X1+1e-9)break;s+=`<line class="grid-l" x1="${X(v)}" x2="${X(v)}" y1="${pt}" y2="${pt+ph}"/><text class="ax num" x="${X(v)}" y="${H-8}" text-anchor="middle">${+v.toFixed(2)}</text>`}
   const kb=((S.scr.kbd)||[]).filter(p=>p[0]<=X1+1);
   if(kb.length>1)s+=`<polyline class="mp-kbd" fill="none" points="${kb.map(p=>X(Math.min(p[0],X1)).toFixed(1)+','+Y(Math.min(p[1],Y1)).toFixed(1)).join(' ')}"/>`;
+  const fl=S.scr.floor&&S.scr.floor.lqdt;
+  if(fl>0&&fl<=Y1)s+=`<line class="mp-fl" x1="${pl}" x2="${W-pr}" y1="${Y(fl).toFixed(1)}" y2="${Y(fl).toFixed(1)}"/><text class="ax mp-flt" x="${W-pr-4}" y="${(Y(fl)-5).toFixed(1)}" text-anchor="end">Фонд ликвидности LQDT ≈ ${f2(fl)} %</text>`;
   const rad=t=>t>0?Math.max(2.5,Math.min(9,2.5+(Math.log10(t)-5)*1.6)):2.5;
   rs.sort((a,b)=>b.r.turn-a.r.turn);
   let dots='',rings='';
   rs.forEach(p=>{const r=p.r,c=MP_COL[rBucket(r.rating)],rd=rad(r.turn),cx=X(p.x).toFixed(1),cy=Y(r.yield).toFixed(1),id=r.isin||r.id;
     dots+=`<circle class="mp-d" data-isin="${esc(id)}" data-k="${esc(r.id)}" cx="${cx}" cy="${cy}" r="${rd.toFixed(1)}" fill="${c}" fill-opacity=".72" stroke="${c}"/>`;
     if(mine.has(r.isin)||mine.has(r.id))rings+=`<circle class="mp-ring" cx="${cx}" cy="${cy}" r="${(rd+4.5).toFixed(1)}"/>`});
-  el.innerHTML=`<div class="legend">${MP_BK.map(b=>`<span><i style="background:${MP_COL[b]}"></i>${b}</span>`).join('')}<span><i class="mp-lk"></i>КБД</span><span class="mu">ось X — дюрация, лет; ось Y — доходность</span>${mine.size?'<span><i class="mp-lr"></i>мой портфель</span>':''}</div><svg width="${W}" height="${H}">${s}<g>${dots}</g><g style="pointer-events:none">${rings}</g></svg>`;
+  el.innerHTML=`<div class="legend">${MP_BK.map(b=>`<span><i style="background:${MP_COL[b]}"></i>${b}</span>`).join('')}<span><i class="mp-lk"></i>КБД</span>${fl>0?'<span><i class="mp-lf"></i>фонд ликвидности</span>':''}<span class="mu">ось X — дюрация, лет; ось Y — доходность</span>${mine.size?'<span><i class="mp-lr"></i>мой портфель</span>':''}</div><svg width="${W}" height="${H}">${s}<g>${dots}</g><g style="pointer-events:none">${rings}</g></svg>`;
   const byK={};rs.forEach(p=>byK[p.r.id]=p);
   el.onmousemove=e=>{const t=e.target.closest('circle[data-k]');if(!t||!el.contains(t)){hideTip();return}
     const p=byK[t.dataset.k];if(!p)return;const r=p.r,c=MP_COL[rBucket(r.rating)];

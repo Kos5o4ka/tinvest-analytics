@@ -13,3 +13,8 @@
 .mp-hm th{text-align:center}.mp-hm th.l,.mp-hm td.l{text-align:left}
 .mp-g{align-items:start}
 @media(max-width:760px){.mp-chips button{padding:4px 10px}.mp-hm td small{white-space:normal}}
+.mp-fl{stroke:#19a070;stroke-width:1.5;stroke-dasharray:2 4;opacity:.95}
+.mp-flt{fill:#19a070;font-size:11.5px}
+.legend i.mp-lf{width:16px;height:0;border-top:2px dotted #19a070;border-radius:0;background:none}
+.scr-fl{margin:0 0 10px}
+tr.scr-low td{opacity:.5}

@@ -3,3 +3,4 @@
 .rk-tbl{max-height:640px}
 #rk-tab tbody tr{cursor:pointer}
 #rk-tab td small.neg{color:var(--neg);font-size:11px;line-height:1.3;display:inline-block;max-width:190px;white-space:normal}
+.rk-dur p{margin:0 0 8px}.rk-dur b{color:var(--tx2)}

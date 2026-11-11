@@ -1,1 +1,21 @@
-/* калькулятор инвестиций */
+/* ── Калькулятор инвестиций ── */
+.cl-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px 16px;align-items:end;margin-bottom:6px}
+.cl-grid>*{min-width:0}.cl-grid .sw{align-self:center}
+#cl-goalbox{grid-column:1/-1;grid-template-columns:repeat(3,minmax(0,1fr));margin:0}
+.cl-sec{font-size:12px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.04em;margin:18px 0 10px}
+.cl-row{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin:10px 0}
+.cl-chips{display:flex;flex-wrap:wrap;gap:8px}
+.cl-chip input{display:none}
+.cl-chip span{display:inline-flex;align-items:center;gap:8px;padding:7px 13px;border:1px solid var(--line2);border-radius:999px;cursor:pointer;color:var(--tx2);font-size:13px;user-select:none;transition:.15s}
+.cl-chip span i,.cl-dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
+.cl-dot{margin-right:8px}
+.cl-chip input:checked+span{background:var(--card2);border-color:var(--ac);color:var(--tx)}
+#cl-years{width:100%;accent-color:var(--ac)}
+.cl-ans{font-size:15px;line-height:1.6}
+.cl-goal{border-left:3px solid var(--ac)}
+.cl-disc{margin:6px 2px 24px}
+#cl-out .tbl td small{font-size:11px}
+@media(max-width:1180px){.cl-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#cl-goalbox{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.cl-grid{grid-template-columns:1fr}#cl-goalbox{grid-template-columns:1fr}}
+.cl-page{display:grid;gap:16px;min-width:0}.cl-page>*{min-width:0}
+#cl-out{display:grid;gap:16px;min-width:0}#cl-out>*{min-width:0}

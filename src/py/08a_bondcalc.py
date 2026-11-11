@@ -18,7 +18,7 @@ def moex_bondization(isin):
     if not isin or not re.match(r"^[A-Z0-9]{4,14}$", isin):
         return None
     st = store()
-    key = "bondiz:" + isin
+    key = "bondiz2:" + isin
     v = st.get(key, ttl=BC_TTL)
     if v is not None:
         if v.get("ok"):
@@ -34,7 +34,7 @@ def moex_bondization(isin):
         for k in ("coupons", "amort", "offers"):      # оставляем только нужные поля
             keep = {"coupons": ("coupondate", "value", "valueprc", "faceunit"),
                     "amort": ("amortdate", "value", "valueprc", "faceunit"),
-                    "offers": ("offerdate", "price", "offertype", "faceunit")}[k]
+                    "offers": ("offerdate", "offerdatestart", "offerdateend", "price", "offertype", "faceunit")}[k]
             out[k] = [{c: r.get(c) for c in keep} for r in out[k]]
     except Exception:  # noqa: BLE001
         out = {"ok": False, "ts": time.time()}

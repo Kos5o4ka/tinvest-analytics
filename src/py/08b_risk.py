@@ -139,12 +139,50 @@ def _fnum(x, lo, hi, dflt):
     return v if lo <= v <= hi else dflt
 
 
+RISK_INFL_DEFAULT = 4.0       # инфляция по умолчанию, % годовых, если прогноз ЦБ недоступен
+RISK_GAP_TOL = 0.5            # допуск дюрационного разрыва, лет
+
+
+def _risk_infl(years):
+    """Средняя годовая инфляция на срок years лет по прогнозу ЦБ (по календарным годам с учётом долей), дробью.
+    Года за пределами прогноза берут значение последнего года. Возвращает (инфляция, источник 'cbr'|'estimate', дата прогноза)."""
+    try:
+        inf = inflation_forecast()
+    except Exception:  # noqa: BLE001
+        inf = {"source": "none", "yearly": []}
+    ys = {x["year"]: x["mid"] for x in inf.get("yearly") or []}
+    if inf.get("source") == "none" or not ys:
+        return RISK_INFL_DEFAULT / 100.0, "estimate", ""
+    years = max(years or 1.0, 0.25)
+    t0 = datetime.strptime(date.today().isoformat(), "%Y-%m-%d")
+    first, last = min(ys), max(ys)
+    fac, t = 1.0, 0.0
+    while t < years - 1e-9:
+        d = t0 + timedelta(days=t * 365.25)
+        end_of_year = datetime(d.year + 1, 1, 1)
+        step = min(years - t, max((end_of_year - d).days / 365.25, 1e-3))
+        r = ys.get(d.year, ys[first] if d.year < first else ys[last]) / 100.0
+        fac *= (1 + r) ** step
+        t += step
+    return fac ** (1.0 / years) - 1, "cbr", inf.get("as_of") or ""
+
+
+def _risk_gap_text(gap):
+    if gap > RISK_GAP_TOL:
+        return ("long", "Деньги понадобятся раньше, чем портфель «вернётся»: при росте ставок к сроку цели он может стоить меньше "
+                "(ценовой риск).")
+    if gap < -RISK_GAP_TOL:
+        return ("short", "Бумаги гасятся раньше цели: деньги придётся вкладывать заново по неизвестной ставке (риск реинвестирования).")
+    return ("match", "Сроки совпадают: изменения ставок почти не влияют на итог к сроку цели.")
+
+
 def build_risk(cfg, acc, q=None):
     q = q or {}
+    goal = _fnum(q.get("horizon"), 0.1, 50.0, 3.0)
     rec = _fnum(q.get("recovery"), 0.0, 90.0, RISK_RECOVERY)
     target = _fnum(q.get("target"), 0.0, 60.0, None) if q.get("target") not in (None, "") else None
     tax = q.get("tax") == "1"
-    key = ("risk", token_key(cfg), acc, rec, target, tax)
+    key = ("risk", token_key(cfg), acc, rec, target, tax, goal)
     hit = mem_get(key, 300)
     if hit:
         return hit
@@ -214,7 +252,7 @@ def build_risk(cfg, acc, q=None):
            "beta": [list(x) for x in RISK_BETA], "rows": rows,
            "scenarios": [{k: s[k] for k in ("key", "name", "k12", "delta", "note")} for s in scs]}
     if not tot:
-        out.update(portfolio=None, scn_total=[], floaters={}, casino=[])
+        out.update(portfolio=None, scn_total=[], floaters={}, casino=[], duration=None, real=None, goal_years=goal)
         return mem_put(key, out)
     wy = sum(x["ytm"] * x["value_rub"] for x in rows) / tot
     el_h = sum(x["value_rub"] * ((x["pd_hist_1y"] if x["pd_hist_1y"] is not None else (x["pd_mkt_1y"] or 0.0))) * (1 - R) for x in rows)
@@ -259,4 +297,29 @@ def build_risk(cfg, acc, q=None):
                        "result_rub": res, "result_pct": res / tot * 100.0, "lost_rub": sum(g["value"] * (1 - R) for g in pick)})
     out["casino"] = casino
     out["base_rub"] = base
+    out["goal_years"] = goal
+    # дюрационный разрыв: дюрация портфеля облигаций (взвешена по стоимости) против горизонта цели
+    dv = [(x["dur"], x["value_rub"]) for x in rows if x.get("dur") is not None]
+    mv = [(x["mdur"], x["value_rub"]) for x in rows if x.get("mdur") is not None]
+    out["duration"] = None
+    if dv:
+        w = sum(v for _, v in dv)
+        mac = sum(d * v for d, v in dv) / w
+        mw = sum(v for _, v in mv)
+        mod = sum(d * v for d, v in mv) / mw if mw else None
+        gap = mac - goal
+        kind, text = _risk_gap_text(gap)
+        out["duration"] = {"mac": mac, "mod": mod, "goal": goal, "gap": gap, "kind": kind, "text": text, "value": w,
+                           "share": w / tot * 100.0}
+    # реальная доходность по формуле Фишера: (1 + номинальная) / (1 + инфляция) - 1, инфляция усреднена на срок дюрации
+    m = rep.get("metrics") or {}
+    out["real"] = None
+    if m.get("irr") is not None:
+        yrs = (out["duration"] or {}).get("mac") or 1.0
+        infl, src, asof = _risk_infl(yrs)
+        fish = lambda n: ((1 + n / 100.0) / (1 + infl) - 1) * 100.0      # noqa: E731
+        out["real"] = {"irr": m["irr"], "irr_tax": m.get("irr_tax"), "inflation": infl * 100.0, "years": yrs, "source": src,
+                       "estimate": src != "cbr", "as_of": asof, "real": fish(m["irr"]),
+                       "real_tax": fish(m["irr_tax"]) if m.get("irr_tax") is not None else None,
+                       "irr_count": m.get("irr_count"), "irr_value": m.get("irr_value")}
     return mem_put(key, out)

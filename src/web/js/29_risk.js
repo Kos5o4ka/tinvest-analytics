@@ -1,8 +1,10 @@
 /* ── Риски и сценарии: вероятность дефолта, ожидаемая доходность, сценарии ключевой ставки ── */
-S.riskQ={rec:'25',target:'',tax:false};S.rsort={k:'value_rub',d:-1};
+S.riskQ={rec:'25',target:'',tax:false,hor:'3'};
+try{const v=JSON.parse(localStorage.getItem('rk_hor')||'null');if(v&&+v>0)S.riskQ.hor=String(v)}catch(e){}
+S.rsort={k:'value_rub',d:-1};
 function loadRisk(){
   if(S._riskLoading)return;S._riskLoading=1;const acc=S.account,q=S.riskQ;
-  const p=new URLSearchParams({account:acc,recovery:q.rec||'25'});if(q.target!=='')p.set('target',q.target.replace(',','.'));if(q.tax)p.set('tax','1');
+  const p=new URLSearchParams({account:acc,recovery:q.rec||'25',horizon:String(q.hor||'3').replace(',','.')});if(q.target!=='')p.set('target',q.target.replace(',','.'));if(q.tax)p.set('tax','1');
   api('/api/risk?'+p).then(j=>{S._riskLoading=0;if(S.account!==acc)return;S.risk=j;S.riskAcc=acc;if(S.page==='risk')render()})
    .catch(e=>{S._riskLoading=0;S.risk={error:e.message};S.riskAcc=acc;if(S.page==='risk')render()});
 }
@@ -26,6 +28,20 @@ function rkRows(d){
     ratio:r=>r.ratio,ey_hist:r=>r.ey_hist,breakeven:r=>r.breakeven==null&&r.be_gt?99:r.breakeven}[S.rsort.k]||(r=>r.value_rub);
   return d.rows.slice().sort((a,b)=>{const x=g(a),y=g(b);if(typeof x==='string'||typeof y==='string')return S.rsort.d*String(x||'').localeCompare(String(y||''));return S.rsort.d*((x??-Infinity)-(y??-Infinity))});
 }
+const rkYr=v=>bad(v)?'—':v.toFixed(1).replace('.',',')+' г.';
+function rkDurBlock(d){
+  const u=d.duration,r=d.real;if(!u&&!r)return'';
+  const gk=u?(u.kind==='match'?'':u.kind==='long'?'neg':''):'';
+  const gp=u?(u.gap>0?'+':u.gap<0?'−':'')+Math.abs(u.gap).toFixed(1).replace('.',',')+' г.':'';
+  const kp=`<div class="g g4">${u?kpi('Дюрация портфеля',rkYr(u.mac),`модифицированная: ${rkYr(u.mod)}`,null,S1):''}
+    ${u?kpi('Дюрационный разрыв',gp,`дюрация − горизонт ${rkYr(u.goal)}`,gk,S4):''}
+    ${r?kpi('Реальная доходность',pctp(r.real,1),`до налога: ${pctp(r.irr,1)} − инфляция ${pctp(r.inflation,1)}${r.estimate?' (оценка)':''}`,r.real<0?'neg':'',S3):''}
+    ${r&&r.real_tax!=null?kpi('Реальная после НДФЛ',pctp(r.real_tax,1),`номинальная после налога: ${pctp(r.irr_tax,1)}`,r.real_tax<0?'neg':'',S2):''}</div>`;
+  const tx=u?`<p><b>Срок и ставки.</b> ${esc(u.text)} Дюрация портфеля облигаций — ${rkYr(u.mac)}, горизонт цели — ${rkYr(u.goal)}</p>`:'';
+  const rt=r?`<p><b>Реальная доходность</b> — сколько вы зарабатываете сверх роста цен: (1 + доходность) / (1 + инфляция) − 1. Доходность портфеля (IRR) ${pctp(r.irr,1)}, ожидаемая инфляция в среднем за ${rkYr(r.years)} — ${pctp(r.inflation,1)} ${r.estimate?'(прогноз Банка России недоступен, взята оценка 4 %)':'(прогноз Банка России'+(r.as_of?' от '+ddm(r.as_of):'')+')'}.</p>`:'';
+  return`<div class="card"><h2>Срок цели и реальная доходность<span class="sp">дюрационный разрыв, инфляция</span></h2>${kp}<div class="note rk-dur" style="margin-top:10px">${tx}${rt}
+    <p>Справочная оценка по упрощённой модели, не инвестиционная рекомендация. Доходность выпусков с аномально высокой ставкой завышает общий показатель.</p></div></div>`;
+}
 function pRisk(){
   if(S.risk&&S.riskAcc!==S.account)S.risk=null;
   if(!S.risk){loadRisk();return`<div class="card">${waitBox('Считаю вероятности дефолта и сценарии ставки (потоки по каждому выпуску)…')}</div>`}
@@ -34,6 +50,7 @@ function pRisk(){
   const ctl=`<div class="card"><h2>Параметры</h2><div class="flt rk-ctl">
     <label class="field"><span>Доля возврата при дефолте, %</span><input class="in" id="rk-rec" type="number" min="0" max="90" step="5" value="${esc(q.rec)}"></label>
     <label class="field"><span>Своя ключевая ставка через 12 мес., %</span><input class="in" id="rk-tgt" type="number" min="0" max="60" step="0.5" placeholder="например 12" value="${esc(q.target)}"></label>
+    <label class="field"><span>Горизонт цели, лет</span><input class="in" id="rk-hor" type="number" min="0.5" max="50" step="0.5" value="${esc(q.hor)}"></label>
     <label class="sw"><input type="checkbox" id="rk-tax" ${q.tax?'checked':''}><i></i><div><b>Учесть НДФЛ 13 %</b><small>на купоны и прирост цены</small></div></label>
     <button class="btn" id="rk-apply">Пересчитать</button></div></div>`;
   if(!d.portfolio)return ctl+'<div class="card empty">В портфеле нет облигаций с рассчитанной доходностью</div>';
@@ -65,7 +82,7 @@ function pRisk(){
       <td class="num">${r.ratio!=null?(r.ratio>=10?Math.round(r.ratio):f2(r.ratio))+' ×':'—'}${flag}</td>
       <td class="num ${r.ey_hist<0?'neg':''}">${pctp(r.ey_hist,1)}${r.hist_basis==='market'?' <small class="mu" title="Нет рейтинга: использована рыночная вероятность дефолта">*</small>':''}</td><td class="num" title="${r.be_approx!=null?'Грубая оценка доходность / модифицированная дюрация сегодня: '+f2(r.be_approx)+' п.п. Точный расчёт учитывает, что через год дюрация короче.':''}">${be}</td></tr>`}).join('');
   chart('rk-scn',rkScnChart);
-  return ctl+kp+`<div class="card"><h2>Сценарии ключевой ставки<span class="sp">доход за 12 месяцев (до ${hd}), без реинвестирования купонов</span></h2><div class="chart" id="rk-scn"></div>${scT}
+  return ctl+kp+rkDurBlock(d)+`<div class="card"><h2>Сценарии ключевой ставки<span class="sp">доход за 12 месяцев (до ${hd}), без реинвестирования купонов</span></h2><div class="chart" id="rk-scn"></div>${scT}
     <p class="note" style="margin-top:10px">Сдвиг кривой доходности = Δ ключевой ставки × β: β = 1,0 для срока до 1 года и линейно снижается до 0,5 на сроке 7 лет и дольше (длинные ставки реагируют слабее). Кредитные спреды не меняются. Выпуск переоценивается через 12 месяцев: оставшиеся потоки дисконтируются по текущей доходности со сдвигом на дюрации остатка. Купоны флоатеров следуют траектории ставки сценария плюс спред эмитента; ставка идёт линейно к целевой за 12 месяцев. Сценарий «Рынок» доступен, если получен рыночный путь ставки.</p></div>
   <div class="g c-2-1 rk-g"><div class="card"><h2>Флоатеры против фиксированного купона<span class="sp">доходность подпортфелей за 12 месяцев</span></h2>${fT}<p class="note" style="margin-top:10px">${esc(rkFloatText(d))}</p></div>
   <div class="card"><h2>«Казино»: если эмитенты не вернут долг</h2>${cs}<p class="note" style="margin-top:10px">Дефолтят самые рискованные эмитенты по рыночной вероятности. Потеря = (1 − возврат ${d.recovery.toFixed(0)} %) × стоимость позиций эмитента; купоны по ним за год не учитываются. База — сценарий «ставка без изменений» (${rkRub(d.base_rub)}).</p></div></div>
@@ -76,7 +93,7 @@ function pRisk(){
 }
 function bindRisk(){
   const a=$('#rk-apply');
-  if(a)a.onclick=()=>{const q=S.riskQ;if($('#rk-rec'))q.rec=$('#rk-rec').value||'25';if($('#rk-tgt'))q.target=$('#rk-tgt').value;if($('#rk-tax'))q.tax=$('#rk-tax').checked;S.risk=null;render()};
-  ['#rk-rec','#rk-tgt'].forEach(i=>{const e=$(i);if(e)e.onkeydown=ev=>{if(ev.key==='Enter')a.click()}});
+  if(a)a.onclick=()=>{const q=S.riskQ;if($('#rk-rec'))q.rec=$('#rk-rec').value||'25';if($('#rk-tgt'))q.target=$('#rk-tgt').value;if($('#rk-tax'))q.tax=$('#rk-tax').checked;if($('#rk-hor')){q.hor=$('#rk-hor').value||'3';try{localStorage.setItem('rk_hor',JSON.stringify(q.hor))}catch(e){}}S.risk=null;render()};
+  ['#rk-rec','#rk-tgt','#rk-hor'].forEach(i=>{const e=$(i);if(e)e.onkeydown=ev=>{if(ev.key==='Enter')a.click()}});
   const t=$('#rk-tab');if(t)t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;S.rsort={k,d:S.rsort.k===k?-S.rsort.d:(k==='name'?1:-1)};render()};
 }
