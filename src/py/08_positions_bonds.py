@@ -271,7 +271,7 @@ def bond_exact(client, r, b, today, rates):
     return {"isin": isin, "ytm": y * 100, "ytm_tax": yt * 100 if yt is not None else None, "dur": mac, "mdur": mod,
             "convexity": conv, "to": kind, "end": end, "stress_pct": {dy: (p / 100.0 * face + aci) / dirty * 100 - 100
                                                                       for dy, p in st.items()},
-            "cf_source": "moex", "est_coupons": len(est), "flows": flows, "basis": price, "dirty": dirty}
+            "cf_source": "moex", "est_coupons": len(est), "est_detail": est, "bz": bz, "flows": flows, "basis": price, "dirty": dirty}
 
 
 def bond_price_face(r, b, rates):
@@ -367,15 +367,38 @@ def bonds_report(client, rows):
         if b.get("amort"):
             kinds["С амортизацией"] += 1
         known = [p for _, p in b.get("coupons") or [] if p]
+        fc_ = (b.get("cur") or "rub").lower()
+        k_ = 1.0 if fc_ == "rub" else (rates.get(fc_) or 1.0)       # выплаты считаем в рублях по текущему курсу номинала
+        fest = (ex or {}).get("est_detail") or {}
         for d, p in b.get("coupons") or []:
             if today < d <= horizon:
-                amt = (p or (known[-1] if known else 0.0)) * r["qty"]
+                if not p and b.get("floating") and d in fest:
+                    amt, est = fest[d]["amt"] * r["qty"] * k_, "forecast"      # прогноз ключевой ставки ЦБ + спред эмитента
+                else:
+                    amt, est = (p or (known[-1] if known else 0.0)) * r["qty"] * k_, not p
                 if amt:
                     pays.append({"date": d, "kind": "coupon", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
-                                 "amount": amt, "est": not p})
+                                 "amount": amt, "est": est})
+        # прогнозные купоны флоатера, которых ещё нет в графике брокера
+        have = {d for d, _ in b.get("coupons") or []}
+        for d, e in sorted(fest.items()):
+            if d not in have and today < d <= horizon and e["amt"]:
+                pays.append({"date": d, "kind": "coupon", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
+                             "amount": e["amt"] * r["qty"] * k_, "est": "forecast"})
+        # амортизации (частичное погашение номинала) из графика MOEX; погашение в последний день — остаток номинала
+        am_total = 0.0
+        if ex and b.get("maturity"):
+            for a in sorted((ex.get("bz") or {}).get("amort") or [], key=lambda x: x.get("amortdate") or ""):
+                ad, av = a.get("amortdate"), a.get("value")
+                if not ad or not av or ad <= today or ad >= b["maturity"]:
+                    continue
+                am_total += av
+                if ad <= horizon:
+                    pays.append({"date": ad, "kind": "amortization", "name": r["name"], "ticker": r["ticker"],
+                                 "logo": r["logo"], "amount": av * r["qty"] * k_, "est": False})
         if b.get("maturity") and today < b["maturity"] <= horizon:
             pays.append({"date": b["maturity"], "kind": "redemption", "name": r["name"], "ticker": r["ticker"],
-                         "logo": r["logo"], "amount": nominal * r["qty"], "est": False})
+                         "logo": r["logo"], "amount": max(nominal - am_total, 0.0) * r["qty"] * k_, "est": False})
     # дивиденды по акциям (объявленные)
     shares = [r for r in rows if r["type"] in ("share",) and r["uid"] and r["qty"] > 0 and not r["uid"].startswith("imp:")]
 

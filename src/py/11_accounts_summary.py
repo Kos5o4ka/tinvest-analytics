@@ -48,6 +48,12 @@ def account_data(cfg, a, force=False):
     hit = None if force else mem_get(key, 90)
     if hit:
         return hit
+    with key_lock(key):
+        hit = None if force else mem_get(key, 90)
+        return hit or _account_data(cfg, a, key)
+
+
+def _account_data(cfg, a, key):
     client = TInvest(cfg)
     if a["kind"] == "import":
         ops = store().ops(a["id"])
@@ -68,6 +74,12 @@ def list_accounts(cfg, force=False):
     hit = None if force else mem_get(key, 60)
     if hit:
         return hit
+    with key_lock(key):
+        hit = None if force else mem_get(key, 60)
+        return hit or _list_accounts(cfg, key)
+
+
+def _list_accounts(cfg, key):
     client = TInvest(cfg)
     accs = []
     if client.ready:
@@ -158,41 +170,91 @@ def build_summary(cfg, acc, period, force=False):
     return res
 
 
+BONDS_TTL, HIST_TTL = 600, 900
+_bg = set()
+
+
+def cached_result(kind, cfg, acc, ttl, compute, force=False):
+    """Результат тяжёлого отчёта (bonds/hist) по счёту. Свежий — из памяти; иначе последний сохранённый в базе отдаётся
+    сразу с признаком stale=True, а пересчёт идёт в фоне (один на ключ). Без сохранённого — считаем и ждём.
+    force=True — всегда считаем заново."""
+    key = (kind, token_key(cfg), acc)
+    skey = "res:%s:%s:%s" % (kind, token_key(cfg), acc)
+    if not force:
+        hit = mem_get(key, ttl)
+        if hit:
+            return hit
+    st = store()
+
+    def run():
+        with key_lock(key):
+            if not force:
+                hit = mem_get(key, ttl)
+                if hit:
+                    return hit
+            res = compute()
+            mem_put(key, res)
+            try:
+                st.put(skey, {"t": time.time(), "v": res})
+            except Exception:  # noqa: BLE001
+                pass
+            return res
+    if not force:
+        try:
+            saved = st.get(skey)
+        except Exception:  # noqa: BLE001
+            saved = None
+        if saved and saved.get("v") is not None and time.time() - saved.get("t", 0) < ttl:
+            return mem_put(key, saved["v"])
+        if saved and saved.get("v") is not None:
+            if key not in _bg:
+                _bg.add(key)
+
+                def bg():
+                    try:
+                        run()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    finally:
+                        _bg.discard(key)
+                threading.Thread(target=bg, daemon=True).start()
+            v = dict(saved["v"])
+            v["stale"] = True
+            return v
+    return run()
+
+
 def build_bonds(cfg, acc, force=False):
     ratings_start()          # обновит рейтинги, если данным больше 12 часов
-    key = ("bonds", token_key(cfg), acc)
-    hit = None if force else mem_get(key, 600)
-    if hit:
-        st = ratings_status()
-        if hit.get("ratings_info", {}).get("updated") != st["updated"]:
-            hit["ratings"] = apply_ratings(hit["rows"])
-        hit["ratings_info"] = st
-        return hit
-    s = build_summary(cfg, acc, "all")
-    rep_ = mem_put(key, bonds_report(TInvest(cfg), s["portfolio"]["positions"]))
-    try:
-        expert_start([r["name"] for r in rep_["rows"]])      # дозапросит рейтинги Эксперт РА по эмитентам портфеля
-    except Exception:  # noqa: BLE001
-        pass
-    return rep_
+    def compute():
+        s = build_summary(cfg, acc, "all")
+        rep_ = bonds_report(TInvest(cfg), s["portfolio"]["positions"])
+        try:
+            expert_start([r["name"] for r in rep_["rows"]])      # дозапросит рейтинги Эксперт РА по эмитентам портфеля
+        except Exception:  # noqa: BLE001
+            pass
+        return rep_
+    hit = cached_result("bonds", cfg, acc, BONDS_TTL, compute, force)
+    st = ratings_status()
+    if hit.get("ratings_info", {}).get("updated") != st["updated"]:
+        hit["ratings"] = apply_ratings(hit["rows"])
+    hit["ratings_info"] = st
+    return hit
 
 
 def build_history_for(cfg, acc, force=False):
-    key = ("hist", token_key(cfg), acc)
-    hit = None if force else mem_get(key, 900)
-    if hit:
-        return hit
-    client = TInvest(cfg)
-    accs, sel, data = selection(cfg, acc)
-    ops = sorted([o for d in data for o in d["ops"]], key=lambda o: o.get("date") or "")
-    keys = {(o.get("instrumentUid"), o.get("figi")) for o in ops
-            if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
-    names = instruments(client, keys)
-    total = sum(qf((d["port"] or {}).get("totalAmountPortfolio")) for d in data if d["port"] is not None)
-    if any(d["port"] is None for d in data):
-        total += sum(sum((r["value_rub"] or 0) for r in imported_positions(client, d["ops"], names)) for d in data if d["port"] is None)
-    h = build_history(client, ops, names, total) or {"days": []}
-    return mem_put(key, h)
+    def compute():
+        client = TInvest(cfg)
+        accs, sel, data = selection(cfg, acc)
+        ops = sorted([o for d in data for o in d["ops"]], key=lambda o: o.get("date") or "")
+        keys = {(o.get("instrumentUid"), o.get("figi")) for o in ops
+                if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
+        names = instruments(client, keys)
+        total = sum(qf((d["port"] or {}).get("totalAmountPortfolio")) for d in data if d["port"] is not None)
+        if any(d["port"] is None for d in data):
+            total += sum(sum((r["value_rub"] or 0) for r in imported_positions(client, d["ops"], names)) for d in data if d["port"] is None)
+        return build_history(client, ops, names, total) or {"days": []}
+    return cached_result("hist", cfg, acc, HIST_TTL, compute, force)
 
 
 def operations_csv(data):
@@ -243,5 +305,19 @@ def logo_bytes(name):
 
 
 def warmup_start():
-    """Фоновый прогрев кэшей при запуске сервера (заполняется в рамках ускорения первого запуска)."""
-    return None
+    """Фоновый прогрев при запуске сервера: сводка, облигации, история (счета all) и каталог облигаций.
+    Общие блокировки (key_lock) и кэши не дают дублировать работу с первыми запросами пользователя."""
+    def job():
+        try:
+            cfg = load_config()
+            if not (cfg.get("token") or "").strip() and not imports_list():
+                return
+            for fn in (lambda: build_summary(cfg, "all", "all"), lambda: tcat(),
+                       lambda: build_bonds(cfg, "all"), lambda: build_history_for(cfg, "all")):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=job, daemon=True, name="warmup").start()

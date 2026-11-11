@@ -6,7 +6,7 @@ function upcoming(){
   (b.rows||[]).forEach(r=>{if(r.call&&r.call>=from&&r.call<=to)ev.push({date:r.call,name:r.name,kind:'offer',amount:null})});
   return ev.sort((a,c)=>a.date.localeCompare(c.date));
 }
-const EVK={coupon:'купон',dividend:'дивиденд',redemption:'погашение',offer:'оферта'};
+const EVK={coupon:'купон',dividend:'дивиденд',redemption:'погашение',amortization:'амортизация',offer:'оферта'};
 function remindHtml(){
   const ev=upcoming();if(!ev.length)return'';
   return`<div class="card remind noprint"><div>${svgI(IC.pay,1.8).replace('<svg','<svg width="22" height="22"')}</div><div><b>Ближайшие события (${ev.length})</b>

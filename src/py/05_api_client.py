@@ -40,6 +40,9 @@ def utc_now_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+API_SEM = threading.BoundedSemaphore(10)      # одновременно не больше 10 запросов к API: не устраиваем шторм
+
+
 class TInvest:
     _good_host = {}
     _ctx_cache = {}
@@ -71,12 +74,13 @@ class TInvest:
                     "Authorization": "Bearer " + self.token, "Content-Type": "application/json",
                     "Accept": "application/json", "x-app-name": "tinvest-analytics"})
                 try:
-                    with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
-                        TInvest._good_host[self.sandbox] = host
-                        return json.loads(r.read().decode("utf-8") or "{}")
+                    with API_SEM:
+                        with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
+                            TInvest._good_host[self.sandbox] = host
+                            return json.loads(r.read().decode("utf-8") or "{}")
                 except urllib.error.HTTPError as e:
                     raw = e.read().decode("utf-8", "replace")
-                    if e.code in (429, 503, 504) and attempt < 5:
+                    if (e.code in (429, 503, 504) or (e.code >= 500 and "RESOURCE_EXHAUSTED" in raw)) and attempt < 5:
                         try:
                             wait = float(e.headers.get("x-ratelimit-reset") or 1)
                         except ValueError:
@@ -148,6 +152,10 @@ class TInvest:
         return self.call("InstrumentsService", "GetDividends",
                          {"instrumentId": uid, "from": frm, "to": to}, timeout=20).get("dividends") or []
 
+    def instruments_all(self, kind):
+        """Справочник доступных инструментов одним запросом: kind in Bonds / Shares / Etfs (пакетно вместо GetInstrumentBy)."""
+        return self.call("InstrumentsService", kind, {"instrumentStatus": "INSTRUMENT_STATUS_BASE"}, timeout=90).get("instruments") or []
+
     def find(self, query):
         return self.call("InstrumentsService", "FindInstrument", {"query": query}, timeout=20).get("instruments") or []
 
@@ -167,7 +175,7 @@ class TInvest:
         return out
 
 
-def pool_map(fn, items, workers=6):
+def pool_map(fn, items, workers=8):
     items = list(items)
     if not items:
         return []

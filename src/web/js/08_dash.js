@@ -60,8 +60,8 @@ function pDash(){
 
 function payMonths(pays,n){
   const now=new Date(),keys=[];for(let i=0;i<n;i++){const d=new Date(now.getFullYear(),now.getMonth()+i,1);keys.push(d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'))}
-  const k3={coupon:{},dividend:{},redemption:{}};pays.forEach(p=>{const m=p.date.slice(0,7);if(keys.includes(m))k3[p.kind][m]=(k3[p.kind][m]||0)+p.amount});
+  const k3={coupon:{},dividend:{},redemption:{},amortization:{}};pays.forEach(p=>{const m=p.date.slice(0,7);if(keys.includes(m))(k3[p.kind]=k3[p.kind]||{})[m]=(k3[p.kind][m]||0)+p.amount});
   return{labels:keys.map(mlabel),tips:keys.map(m=>{const[y,mm]=m.split('-');return MONF[+mm-1]+' '+y}),
-    series:[{n:'Купоны',c:S1,v:keys.map(k=>k3.coupon[k]||0)},{n:'Дивиденды',c:S3,v:keys.map(k=>k3.dividend[k]||0)},{n:'Погашения',c:S4,v:keys.map(k=>k3.redemption[k]||0)}]};
+    series:[{n:'Купоны',c:S1,v:keys.map(k=>k3.coupon[k]||0)},{n:'Дивиденды',c:S3,v:keys.map(k=>k3.dividend[k]||0)},{n:'Погашения',c:S4,v:keys.map(k=>k3.redemption[k]||0)},{n:'Амортизации',c:S5,v:keys.map(k=>k3.amortization[k]||0)}]};
 }
 

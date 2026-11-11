@@ -9,45 +9,120 @@ def inst_key(uid, figi):
     return uid or figi or ""
 
 
+_inst_lock = threading.Lock()
+_bulk = {}                        # вид справочника -> (время, {uid|figi: (info, параметры облигации | None)})
+_bulk_lock = threading.Lock()
+BULK_TTL = 3600
+
+
+def inst_info_from(i, kind=None):
+    b = i.get("brand") or {}
+    return {"uid": i.get("uid") or "", "figi": i.get("figi") or "", "ticker": i.get("ticker") or "",
+            "isin": i.get("isin") or "", "name": i.get("name") or "", "type": i.get("instrumentType") or kind or "",
+            "cur": (i.get("currency") or "rub").lower(), "sector": i.get("sector") or "",
+            "logo": b.get("logoName") or "", "color": b.get("logoBaseColor") or "",
+            "country": i.get("countryOfRisk") or "", "cls": i.get("classCode") or ""}
+
+
+def bond_params(r):
+    """Параметры облигации из ответа BondBy / Bonds (одинаковая структура)."""
+    return {"nominal": qf(r.get("nominal")) or qf(r.get("initialNominal")) or 1000.0,
+            "initial": qf(r.get("initialNominal")), "cur": cur_of(r.get("nominal")),
+            "maturity": iso_date(r.get("maturityDate")), "call": iso_date(r.get("callDate")),
+            "placement": iso_date(r.get("placementDate")), "cpy": int(r.get("couponQuantityPerYear") or 0),
+            "aci": qf(r.get("aciValue")), "floating": bool(r.get("floatingCouponFlag")),
+            "amort": bool(r.get("amortizationFlag")), "perpetual": bool(r.get("perpetualFlag")),
+            "risk": r.get("riskLevel") or "", "sector": r.get("sector") or "", "name": r.get("name") or ""}
+
+
+def bulk_catalog(client, endpoint, kind):
+    """{uid|figi: (info, параметры облигации)} по одному запросу на весь справочник (держим в памяти час)."""
+    with _bulk_lock:
+        hit = _bulk.get(endpoint)
+        if hit and time.time() - hit[0] < BULK_TTL:
+            return hit[1]
+    with key_lock("bulk:" + endpoint):
+        hit = _bulk.get(endpoint)
+        if hit and time.time() - hit[0] < BULK_TTL:
+            return hit[1]
+        d = {}
+        try:
+            for i in client.instruments_all(endpoint):
+                v = (inst_info_from(i, kind), bond_params(i) if kind == "bond" else None)
+                if i.get("uid"):
+                    d[i["uid"]] = v
+                if i.get("figi"):
+                    d[i["figi"]] = v
+        except ApiError:
+            return {}
+        with _bulk_lock:
+            _bulk[endpoint] = (time.time(), d)
+        return d
+
+
 def instruments(client, keys):
-    """keys: [(uid, figi)] -> {uid|figi: info}. Кэш в базе на 30 дней."""
+    """keys: [(uid, figi)] -> {uid|figi: info}. Кэш в базе на 30 дней; отсутствующие берутся пакетно из справочников
+    Bonds/Shares/Etfs (один запрос на справочник вместо запроса на каждый инструмент), остальное — по одному."""
     st = store()
     out, need = {}, []
-    for u, f in set(keys):
-        k = inst_key(u, f)
-        if not k:
-            continue
-        v = st.get("inst:" + k, ttl=30 * DAY)
-        if v:
-            out[k] = v
-            if f:
-                out[f] = v
-            if v.get("uid"):
-                out[v["uid"]] = v
-        else:
-            need.append((u, f))
-    if need and client.ready:
-        def one(k):
-            u, f = k
-            try:
-                i = client.instrument(uid=u, figi=None if u else f)
-            except ApiError:
-                return k, None
-            b = i.get("brand") or {}
-            return k, {"uid": i.get("uid") or u or "", "figi": i.get("figi") or f or "", "ticker": i.get("ticker") or "",
-                       "isin": i.get("isin") or "", "name": i.get("name") or "", "type": i.get("instrumentType") or "",
-                       "cur": (i.get("currency") or "rub").lower(), "sector": i.get("sector") or "",
-                       "logo": b.get("logoName") or "", "color": b.get("logoBaseColor") or "",
-                       "country": i.get("countryOfRisk") or "", "cls": i.get("classCode") or ""}
-        save = []
-        for k, v in pool_map(one, need[:400]):
+
+    def scan(todo):
+        miss = []
+        for u, f in set(todo):
+            k = inst_key(u, f)
+            if not k:
+                continue
+            v = st.get("inst:" + k, ttl=30 * DAY)
             if v:
-                for kk in {inst_key(*k), v["uid"], v["figi"]}:
-                    if kk:
-                        out[kk] = v
-                        save.append(("inst:" + kk, v))
-        if save:
-            st.put_many(save)
+                out[k] = v
+                if f:
+                    out[f] = v
+                if v.get("uid"):
+                    out[v["uid"]] = v
+            elif st.get("instmiss:" + k, ttl=DAY) is None:
+                miss.append((u, f))
+        return miss
+    need = scan(keys)
+    if need and client.ready:
+        with _inst_lock:                       # параллельные запросы не дублируют работу
+            need = scan(need)
+            save = []
+            if len(need) > 5:
+                cats = pool_map(lambda e: bulk_catalog(client, *e), (("Bonds", "bond"), ("Shares", "share"), ("Etfs", "etf")))
+                left, bsave = [], []
+                for u, f in need:
+                    hit = next((c[x] for c in cats for x in (u, f) if x and x in c), None)
+                    if not hit:
+                        left.append((u, f))
+                        continue
+                    info, bp = hit
+                    for kk in {inst_key(u, f), info["uid"], info["figi"]}:
+                        if kk:
+                            out[kk] = info
+                            save.append(("inst:" + kk, info))
+                    if bp and info["uid"] and st.get("bond:" + info["uid"], ttl=12 * 3600) is None:
+                        bsave.append(("bond:" + info["uid"], bp))
+                if bsave:
+                    st.put_many(bsave)
+                need = left
+
+            def one(k):
+                u, f = k
+                try:
+                    i = client.instrument(uid=u, figi=None if u else f)
+                except ApiError as e:
+                    if e.status == 404:          # инструмента нет в справочнике: не спрашиваем повторно сутки
+                        st.put("instmiss:" + inst_key(u, f), 1)
+                    return k, None
+                return k, inst_info_from(dict(i, uid=i.get("uid") or u or "", figi=i.get("figi") or f or ""))
+            for k, v in pool_map(one, need[:400]):
+                if v:
+                    for kk in {inst_key(*k), v["uid"], v["figi"]}:
+                        if kk:
+                            out[kk] = v
+                            save.append(("inst:" + kk, v))
+            if save:
+                st.put_many(save)
     return out
 
 
@@ -55,20 +130,25 @@ def bond_info(client, uid):
     """Параметры облигации и купоны; кэш: параметры 12 ч, купоны 3 дня (для погашенных — 60 дней)."""
     st = store()
     b = st.get("bond:" + uid, ttl=12 * 3600)
-    if b is None and client.ready:
-        try:
-            r = client.bond_by(uid)
-        except ApiError:
-            r = None
-        if r:
-            b = {"nominal": qf(r.get("nominal")) or qf(r.get("initialNominal")) or 1000.0,
-                 "initial": qf(r.get("initialNominal")), "cur": cur_of(r.get("nominal")),
-                 "maturity": iso_date(r.get("maturityDate")), "call": iso_date(r.get("callDate")),
-                 "placement": iso_date(r.get("placementDate")), "cpy": int(r.get("couponQuantityPerYear") or 0),
-                 "aci": qf(r.get("aciValue")), "floating": bool(r.get("floatingCouponFlag")),
-                 "amort": bool(r.get("amortizationFlag")), "perpetual": bool(r.get("perpetualFlag")),
-                 "risk": r.get("riskLevel") or "", "sector": r.get("sector") or "", "name": r.get("name") or ""}
-            st.put("bond:" + uid, b)
+    if b is None and client.ready and st.get("bondmiss:" + uid, ttl=600) is None \
+            and st.get("bondmiss404:" + uid, ttl=DAY) is None:
+        with key_lock("bond:" + uid):
+            b = st.get("bond:" + uid, ttl=12 * 3600)
+            if b is None:
+                r = None
+                hit = (bulk_catalog(client, "Bonds", "bond") or {}).get(uid)
+                if hit:
+                    b = hit[1]
+                else:
+                    try:
+                        r = client.bond_by(uid)
+                    except ApiError as e:
+                        # нет в справочнике — не спрашиваем сутки, API занят/ошибка — 10 минут
+                        st.put("bondmiss404:" + uid if e.status == 404 else "bondmiss:" + uid, 1)
+                    if r:
+                        b = bond_params(r)
+                if b:
+                    st.put("bond:" + uid, b)
     if not b:
         return None
     matured = b.get("maturity") and b["maturity"] < date.today().isoformat()

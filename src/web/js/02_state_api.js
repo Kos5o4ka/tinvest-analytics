@@ -39,7 +39,28 @@ async function api(path,opt){
   const r=await fetch(path,opt);let j={};
   try{j=await r.json()}catch(e){}
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  if(j&&j.stale&&/^\/api\/(bonds|history)\?/.test(path))staleRefresh(path,j);
   return j;
+}
+/* Сервер отдал прошлый сохранённый результат (stale) и пересчитывает его в фоне: перезапрашиваем, пока не придёт свежий */
+const _stl={};
+function staleRefresh(path,first){
+  const key=path.split('?')[0],isB=key==='/api/bonds',acc=S.account;
+  if(_stl[key])return;
+  let n=0;_stl[key]=1;
+  const tick=async()=>{
+    n++;
+    try{
+      const j=await fetch(path.replace(/&?force=1/,'')).then(r=>r.json());
+      if(S.account!==acc){delete _stl[key];return}
+      if(j&&j.stale&&n<40){setTimeout(tick,4000);return}
+      delete _stl[key];
+      if(!j||j.error)return;
+      if(isB){S.bonds=j;if(['dash','bonds','pay'].includes(S.page))render()}
+      else{S.hist=j;if(['dash','ret'].includes(S.page))render()}
+    }catch(e){delete _stl[key]}
+  };
+  setTimeout(tick,4000);
 }
 const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
 

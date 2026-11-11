@@ -26,11 +26,11 @@ function payDays(ps,limit){
   const f=ps.filter(p=>p.date>=from&&p.date<=to);
   const tot={};f.forEach(p=>tot[p.name]=(tot[p.name]||0)+p.amount);
   const names=Object.keys(tot).sort((a,b)=>tot[b]-tot[a]),col={};names.forEach((n,i)=>col[n]=colAt(i));
-  const red=new Set(f.filter(p=>p.kind==='redemption').map(p=>p.name));
-  const KL={coupon:'купон',dividend:'дивиденд',redemption:'погашение'},by={};
+  const red=new Set(f.filter(p=>p.kind==='redemption').map(p=>p.name)),amo=new Set(f.filter(p=>p.kind==='amortization').map(p=>p.name));
+  const KL={coupon:'купон',dividend:'дивиденд',redemption:'погашение',amortization:'амортизация'},by={};
   f.forEach(p=>(by[p.date]=by[p.date]||[]).push(p));
   const days=Object.keys(by).sort().map(dt=>{const items=by[dt].slice().sort((a,b)=>tot[b.name]-tot[a.name]).map(p=>({name:p.name,amount:p.amount,c:col[p.name],kind:p.kind,kl:KL[p.kind]||p.kind}));
     const [y,m,d]=dt.split('-');return{label:`${d}.${m}.${y}`,full:ddm(dt),total:items.reduce((a,x)=>a+x.amount,0),items}});
-  return{days,legend:names.map(n=>({n,c:col[n],tag:red.has(n)?'погашение':''}))};
+  return{days,legend:names.map(n=>({n,c:col[n],tag:[red.has(n)?'погашение':'',amo.has(n)?'амортизация':''].filter(Boolean).join(', ')}))};
 }
 

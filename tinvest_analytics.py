@@ -289,6 +289,16 @@ class Store:
 
 
 STORE = None
+_klocks, _klocks_lock = {}, threading.Lock()
+
+
+def key_lock(key):
+    """Блокировка на ключ: одинаковую тяжёлую работу (запросы к API) параллельные потоки выполняют по одному разу."""
+    with _klocks_lock:
+        lk = _klocks.get(key)
+        if lk is None:
+            lk = _klocks[key] = threading.Lock()
+        return lk
 
 
 def store():
@@ -340,6 +350,9 @@ def utc_now_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+API_SEM = threading.BoundedSemaphore(10)      # одновременно не больше 10 запросов к API: не устраиваем шторм
+
+
 class TInvest:
     _good_host = {}
     _ctx_cache = {}
@@ -371,12 +384,13 @@ class TInvest:
                     "Authorization": "Bearer " + self.token, "Content-Type": "application/json",
                     "Accept": "application/json", "x-app-name": "tinvest-analytics"})
                 try:
-                    with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
-                        TInvest._good_host[self.sandbox] = host
-                        return json.loads(r.read().decode("utf-8") or "{}")
+                    with API_SEM:
+                        with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
+                            TInvest._good_host[self.sandbox] = host
+                            return json.loads(r.read().decode("utf-8") or "{}")
                 except urllib.error.HTTPError as e:
                     raw = e.read().decode("utf-8", "replace")
-                    if e.code in (429, 503, 504) and attempt < 5:
+                    if (e.code in (429, 503, 504) or (e.code >= 500 and "RESOURCE_EXHAUSTED" in raw)) and attempt < 5:
                         try:
                             wait = float(e.headers.get("x-ratelimit-reset") or 1)
                         except ValueError:
@@ -448,6 +462,10 @@ class TInvest:
         return self.call("InstrumentsService", "GetDividends",
                          {"instrumentId": uid, "from": frm, "to": to}, timeout=20).get("dividends") or []
 
+    def instruments_all(self, kind):
+        """Справочник доступных инструментов одним запросом: kind in Bonds / Shares / Etfs (пакетно вместо GetInstrumentBy)."""
+        return self.call("InstrumentsService", kind, {"instrumentStatus": "INSTRUMENT_STATUS_BASE"}, timeout=90).get("instruments") or []
+
     def find(self, query):
         return self.call("InstrumentsService", "FindInstrument", {"query": query}, timeout=20).get("instruments") or []
 
@@ -467,7 +485,7 @@ class TInvest:
         return out
 
 
-def pool_map(fn, items, workers=6):
+def pool_map(fn, items, workers=8):
     items = list(items)
     if not items:
         return []
@@ -488,45 +506,120 @@ def inst_key(uid, figi):
     return uid or figi or ""
 
 
+_inst_lock = threading.Lock()
+_bulk = {}                        # вид справочника -> (время, {uid|figi: (info, параметры облигации | None)})
+_bulk_lock = threading.Lock()
+BULK_TTL = 3600
+
+
+def inst_info_from(i, kind=None):
+    b = i.get("brand") or {}
+    return {"uid": i.get("uid") or "", "figi": i.get("figi") or "", "ticker": i.get("ticker") or "",
+            "isin": i.get("isin") or "", "name": i.get("name") or "", "type": i.get("instrumentType") or kind or "",
+            "cur": (i.get("currency") or "rub").lower(), "sector": i.get("sector") or "",
+            "logo": b.get("logoName") or "", "color": b.get("logoBaseColor") or "",
+            "country": i.get("countryOfRisk") or "", "cls": i.get("classCode") or ""}
+
+
+def bond_params(r):
+    """Параметры облигации из ответа BondBy / Bonds (одинаковая структура)."""
+    return {"nominal": qf(r.get("nominal")) or qf(r.get("initialNominal")) or 1000.0,
+            "initial": qf(r.get("initialNominal")), "cur": cur_of(r.get("nominal")),
+            "maturity": iso_date(r.get("maturityDate")), "call": iso_date(r.get("callDate")),
+            "placement": iso_date(r.get("placementDate")), "cpy": int(r.get("couponQuantityPerYear") or 0),
+            "aci": qf(r.get("aciValue")), "floating": bool(r.get("floatingCouponFlag")),
+            "amort": bool(r.get("amortizationFlag")), "perpetual": bool(r.get("perpetualFlag")),
+            "risk": r.get("riskLevel") or "", "sector": r.get("sector") or "", "name": r.get("name") or ""}
+
+
+def bulk_catalog(client, endpoint, kind):
+    """{uid|figi: (info, параметры облигации)} по одному запросу на весь справочник (держим в памяти час)."""
+    with _bulk_lock:
+        hit = _bulk.get(endpoint)
+        if hit and time.time() - hit[0] < BULK_TTL:
+            return hit[1]
+    with key_lock("bulk:" + endpoint):
+        hit = _bulk.get(endpoint)
+        if hit and time.time() - hit[0] < BULK_TTL:
+            return hit[1]
+        d = {}
+        try:
+            for i in client.instruments_all(endpoint):
+                v = (inst_info_from(i, kind), bond_params(i) if kind == "bond" else None)
+                if i.get("uid"):
+                    d[i["uid"]] = v
+                if i.get("figi"):
+                    d[i["figi"]] = v
+        except ApiError:
+            return {}
+        with _bulk_lock:
+            _bulk[endpoint] = (time.time(), d)
+        return d
+
+
 def instruments(client, keys):
-    """keys: [(uid, figi)] -> {uid|figi: info}. Кэш в базе на 30 дней."""
+    """keys: [(uid, figi)] -> {uid|figi: info}. Кэш в базе на 30 дней; отсутствующие берутся пакетно из справочников
+    Bonds/Shares/Etfs (один запрос на справочник вместо запроса на каждый инструмент), остальное — по одному."""
     st = store()
     out, need = {}, []
-    for u, f in set(keys):
-        k = inst_key(u, f)
-        if not k:
-            continue
-        v = st.get("inst:" + k, ttl=30 * DAY)
-        if v:
-            out[k] = v
-            if f:
-                out[f] = v
-            if v.get("uid"):
-                out[v["uid"]] = v
-        else:
-            need.append((u, f))
-    if need and client.ready:
-        def one(k):
-            u, f = k
-            try:
-                i = client.instrument(uid=u, figi=None if u else f)
-            except ApiError:
-                return k, None
-            b = i.get("brand") or {}
-            return k, {"uid": i.get("uid") or u or "", "figi": i.get("figi") or f or "", "ticker": i.get("ticker") or "",
-                       "isin": i.get("isin") or "", "name": i.get("name") or "", "type": i.get("instrumentType") or "",
-                       "cur": (i.get("currency") or "rub").lower(), "sector": i.get("sector") or "",
-                       "logo": b.get("logoName") or "", "color": b.get("logoBaseColor") or "",
-                       "country": i.get("countryOfRisk") or "", "cls": i.get("classCode") or ""}
-        save = []
-        for k, v in pool_map(one, need[:400]):
+
+    def scan(todo):
+        miss = []
+        for u, f in set(todo):
+            k = inst_key(u, f)
+            if not k:
+                continue
+            v = st.get("inst:" + k, ttl=30 * DAY)
             if v:
-                for kk in {inst_key(*k), v["uid"], v["figi"]}:
-                    if kk:
-                        out[kk] = v
-                        save.append(("inst:" + kk, v))
-        if save:
-            st.put_many(save)
+                out[k] = v
+                if f:
+                    out[f] = v
+                if v.get("uid"):
+                    out[v["uid"]] = v
+            elif st.get("instmiss:" + k, ttl=DAY) is None:
+                miss.append((u, f))
+        return miss
+    need = scan(keys)
+    if need and client.ready:
+        with _inst_lock:                       # параллельные запросы не дублируют работу
+            need = scan(need)
+            save = []
+            if len(need) > 5:
+                cats = pool_map(lambda e: bulk_catalog(client, *e), (("Bonds", "bond"), ("Shares", "share"), ("Etfs", "etf")))
+                left, bsave = [], []
+                for u, f in need:
+                    hit = next((c[x] for c in cats for x in (u, f) if x and x in c), None)
+                    if not hit:
+                        left.append((u, f))
+                        continue
+                    info, bp = hit
+                    for kk in {inst_key(u, f), info["uid"], info["figi"]}:
+                        if kk:
+                            out[kk] = info
+                            save.append(("inst:" + kk, info))
+                    if bp and info["uid"] and st.get("bond:" + info["uid"], ttl=12 * 3600) is None:
+                        bsave.append(("bond:" + info["uid"], bp))
+                if bsave:
+                    st.put_many(bsave)
+                need = left
+
+            def one(k):
+                u, f = k
+                try:
+                    i = client.instrument(uid=u, figi=None if u else f)
+                except ApiError as e:
+                    if e.status == 404:          # инструмента нет в справочнике: не спрашиваем повторно сутки
+                        st.put("instmiss:" + inst_key(u, f), 1)
+                    return k, None
+                return k, inst_info_from(dict(i, uid=i.get("uid") or u or "", figi=i.get("figi") or f or ""))
+            for k, v in pool_map(one, need[:400]):
+                if v:
+                    for kk in {inst_key(*k), v["uid"], v["figi"]}:
+                        if kk:
+                            out[kk] = v
+                            save.append(("inst:" + kk, v))
+            if save:
+                st.put_many(save)
     return out
 
 
@@ -534,20 +627,25 @@ def bond_info(client, uid):
     """Параметры облигации и купоны; кэш: параметры 12 ч, купоны 3 дня (для погашенных — 60 дней)."""
     st = store()
     b = st.get("bond:" + uid, ttl=12 * 3600)
-    if b is None and client.ready:
-        try:
-            r = client.bond_by(uid)
-        except ApiError:
-            r = None
-        if r:
-            b = {"nominal": qf(r.get("nominal")) or qf(r.get("initialNominal")) or 1000.0,
-                 "initial": qf(r.get("initialNominal")), "cur": cur_of(r.get("nominal")),
-                 "maturity": iso_date(r.get("maturityDate")), "call": iso_date(r.get("callDate")),
-                 "placement": iso_date(r.get("placementDate")), "cpy": int(r.get("couponQuantityPerYear") or 0),
-                 "aci": qf(r.get("aciValue")), "floating": bool(r.get("floatingCouponFlag")),
-                 "amort": bool(r.get("amortizationFlag")), "perpetual": bool(r.get("perpetualFlag")),
-                 "risk": r.get("riskLevel") or "", "sector": r.get("sector") or "", "name": r.get("name") or ""}
-            st.put("bond:" + uid, b)
+    if b is None and client.ready and st.get("bondmiss:" + uid, ttl=600) is None \
+            and st.get("bondmiss404:" + uid, ttl=DAY) is None:
+        with key_lock("bond:" + uid):
+            b = st.get("bond:" + uid, ttl=12 * 3600)
+            if b is None:
+                r = None
+                hit = (bulk_catalog(client, "Bonds", "bond") or {}).get(uid)
+                if hit:
+                    b = hit[1]
+                else:
+                    try:
+                        r = client.bond_by(uid)
+                    except ApiError as e:
+                        # нет в справочнике — не спрашиваем сутки, API занят/ошибка — 10 минут
+                        st.put("bondmiss404:" + uid if e.status == 404 else "bondmiss:" + uid, 1)
+                    if r:
+                        b = bond_params(r)
+                if b:
+                    st.put("bond:" + uid, b)
     if not b:
         return None
     matured = b.get("maturity") and b["maturity"] < date.today().isoformat()
@@ -1200,7 +1298,7 @@ def bond_exact(client, r, b, today, rates):
     return {"isin": isin, "ytm": y * 100, "ytm_tax": yt * 100 if yt is not None else None, "dur": mac, "mdur": mod,
             "convexity": conv, "to": kind, "end": end, "stress_pct": {dy: (p / 100.0 * face + aci) / dirty * 100 - 100
                                                                       for dy, p in st.items()},
-            "cf_source": "moex", "est_coupons": len(est), "flows": flows, "basis": price, "dirty": dirty}
+            "cf_source": "moex", "est_coupons": len(est), "est_detail": est, "bz": bz, "flows": flows, "basis": price, "dirty": dirty}
 
 
 def bond_price_face(r, b, rates):
@@ -1296,15 +1394,38 @@ def bonds_report(client, rows):
         if b.get("amort"):
             kinds["С амортизацией"] += 1
         known = [p for _, p in b.get("coupons") or [] if p]
+        fc_ = (b.get("cur") or "rub").lower()
+        k_ = 1.0 if fc_ == "rub" else (rates.get(fc_) or 1.0)       # выплаты считаем в рублях по текущему курсу номинала
+        fest = (ex or {}).get("est_detail") or {}
         for d, p in b.get("coupons") or []:
             if today < d <= horizon:
-                amt = (p or (known[-1] if known else 0.0)) * r["qty"]
+                if not p and b.get("floating") and d in fest:
+                    amt, est = fest[d]["amt"] * r["qty"] * k_, "forecast"      # прогноз ключевой ставки ЦБ + спред эмитента
+                else:
+                    amt, est = (p or (known[-1] if known else 0.0)) * r["qty"] * k_, not p
                 if amt:
                     pays.append({"date": d, "kind": "coupon", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
-                                 "amount": amt, "est": not p})
+                                 "amount": amt, "est": est})
+        # прогнозные купоны флоатера, которых ещё нет в графике брокера
+        have = {d for d, _ in b.get("coupons") or []}
+        for d, e in sorted(fest.items()):
+            if d not in have and today < d <= horizon and e["amt"]:
+                pays.append({"date": d, "kind": "coupon", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
+                             "amount": e["amt"] * r["qty"] * k_, "est": "forecast"})
+        # амортизации (частичное погашение номинала) из графика MOEX; погашение в последний день — остаток номинала
+        am_total = 0.0
+        if ex and b.get("maturity"):
+            for a in sorted((ex.get("bz") or {}).get("amort") or [], key=lambda x: x.get("amortdate") or ""):
+                ad, av = a.get("amortdate"), a.get("value")
+                if not ad or not av or ad <= today or ad >= b["maturity"]:
+                    continue
+                am_total += av
+                if ad <= horizon:
+                    pays.append({"date": ad, "kind": "amortization", "name": r["name"], "ticker": r["ticker"],
+                                 "logo": r["logo"], "amount": av * r["qty"] * k_, "est": False})
         if b.get("maturity") and today < b["maturity"] <= horizon:
             pays.append({"date": b["maturity"], "kind": "redemption", "name": r["name"], "ticker": r["ticker"],
-                         "logo": r["logo"], "amount": nominal * r["qty"], "est": False})
+                         "logo": r["logo"], "amount": max(nominal - am_total, 0.0) * r["qty"] * k_, "est": False})
     # дивиденды по акциям (объявленные)
     shares = [r for r in rows if r["type"] in ("share",) and r["uid"] and r["qty"] > 0 and not r["uid"].startswith("imp:")]
 
@@ -2543,6 +2664,12 @@ def account_data(cfg, a, force=False):
     hit = None if force else mem_get(key, 90)
     if hit:
         return hit
+    with key_lock(key):
+        hit = None if force else mem_get(key, 90)
+        return hit or _account_data(cfg, a, key)
+
+
+def _account_data(cfg, a, key):
     client = TInvest(cfg)
     if a["kind"] == "import":
         ops = store().ops(a["id"])
@@ -2563,6 +2690,12 @@ def list_accounts(cfg, force=False):
     hit = None if force else mem_get(key, 60)
     if hit:
         return hit
+    with key_lock(key):
+        hit = None if force else mem_get(key, 60)
+        return hit or _list_accounts(cfg, key)
+
+
+def _list_accounts(cfg, key):
     client = TInvest(cfg)
     accs = []
     if client.ready:
@@ -2653,41 +2786,91 @@ def build_summary(cfg, acc, period, force=False):
     return res
 
 
+BONDS_TTL, HIST_TTL = 600, 900
+_bg = set()
+
+
+def cached_result(kind, cfg, acc, ttl, compute, force=False):
+    """Результат тяжёлого отчёта (bonds/hist) по счёту. Свежий — из памяти; иначе последний сохранённый в базе отдаётся
+    сразу с признаком stale=True, а пересчёт идёт в фоне (один на ключ). Без сохранённого — считаем и ждём.
+    force=True — всегда считаем заново."""
+    key = (kind, token_key(cfg), acc)
+    skey = "res:%s:%s:%s" % (kind, token_key(cfg), acc)
+    if not force:
+        hit = mem_get(key, ttl)
+        if hit:
+            return hit
+    st = store()
+
+    def run():
+        with key_lock(key):
+            if not force:
+                hit = mem_get(key, ttl)
+                if hit:
+                    return hit
+            res = compute()
+            mem_put(key, res)
+            try:
+                st.put(skey, {"t": time.time(), "v": res})
+            except Exception:  # noqa: BLE001
+                pass
+            return res
+    if not force:
+        try:
+            saved = st.get(skey)
+        except Exception:  # noqa: BLE001
+            saved = None
+        if saved and saved.get("v") is not None and time.time() - saved.get("t", 0) < ttl:
+            return mem_put(key, saved["v"])
+        if saved and saved.get("v") is not None:
+            if key not in _bg:
+                _bg.add(key)
+
+                def bg():
+                    try:
+                        run()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    finally:
+                        _bg.discard(key)
+                threading.Thread(target=bg, daemon=True).start()
+            v = dict(saved["v"])
+            v["stale"] = True
+            return v
+    return run()
+
+
 def build_bonds(cfg, acc, force=False):
     ratings_start()          # обновит рейтинги, если данным больше 12 часов
-    key = ("bonds", token_key(cfg), acc)
-    hit = None if force else mem_get(key, 600)
-    if hit:
-        st = ratings_status()
-        if hit.get("ratings_info", {}).get("updated") != st["updated"]:
-            hit["ratings"] = apply_ratings(hit["rows"])
-        hit["ratings_info"] = st
-        return hit
-    s = build_summary(cfg, acc, "all")
-    rep_ = mem_put(key, bonds_report(TInvest(cfg), s["portfolio"]["positions"]))
-    try:
-        expert_start([r["name"] for r in rep_["rows"]])      # дозапросит рейтинги Эксперт РА по эмитентам портфеля
-    except Exception:  # noqa: BLE001
-        pass
-    return rep_
+    def compute():
+        s = build_summary(cfg, acc, "all")
+        rep_ = bonds_report(TInvest(cfg), s["portfolio"]["positions"])
+        try:
+            expert_start([r["name"] for r in rep_["rows"]])      # дозапросит рейтинги Эксперт РА по эмитентам портфеля
+        except Exception:  # noqa: BLE001
+            pass
+        return rep_
+    hit = cached_result("bonds", cfg, acc, BONDS_TTL, compute, force)
+    st = ratings_status()
+    if hit.get("ratings_info", {}).get("updated") != st["updated"]:
+        hit["ratings"] = apply_ratings(hit["rows"])
+    hit["ratings_info"] = st
+    return hit
 
 
 def build_history_for(cfg, acc, force=False):
-    key = ("hist", token_key(cfg), acc)
-    hit = None if force else mem_get(key, 900)
-    if hit:
-        return hit
-    client = TInvest(cfg)
-    accs, sel, data = selection(cfg, acc)
-    ops = sorted([o for d in data for o in d["ops"]], key=lambda o: o.get("date") or "")
-    keys = {(o.get("instrumentUid"), o.get("figi")) for o in ops
-            if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
-    names = instruments(client, keys)
-    total = sum(qf((d["port"] or {}).get("totalAmountPortfolio")) for d in data if d["port"] is not None)
-    if any(d["port"] is None for d in data):
-        total += sum(sum((r["value_rub"] or 0) for r in imported_positions(client, d["ops"], names)) for d in data if d["port"] is None)
-    h = build_history(client, ops, names, total) or {"days": []}
-    return mem_put(key, h)
+    def compute():
+        client = TInvest(cfg)
+        accs, sel, data = selection(cfg, acc)
+        ops = sorted([o for d in data for o in d["ops"]], key=lambda o: o.get("date") or "")
+        keys = {(o.get("instrumentUid"), o.get("figi")) for o in ops
+                if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
+        names = instruments(client, keys)
+        total = sum(qf((d["port"] or {}).get("totalAmountPortfolio")) for d in data if d["port"] is not None)
+        if any(d["port"] is None for d in data):
+            total += sum(sum((r["value_rub"] or 0) for r in imported_positions(client, d["ops"], names)) for d in data if d["port"] is None)
+        return build_history(client, ops, names, total) or {"days": []}
+    return cached_result("hist", cfg, acc, HIST_TTL, compute, force)
 
 
 def operations_csv(data):
@@ -2738,8 +2921,22 @@ def logo_bytes(name):
 
 
 def warmup_start():
-    """Фоновый прогрев кэшей при запуске сервера (заполняется в рамках ускорения первого запуска)."""
-    return None
+    """Фоновый прогрев при запуске сервера: сводка, облигации, история (счета all) и каталог облигаций.
+    Общие блокировки (key_lock) и кэши не дают дублировать работу с первыми запросами пользователя."""
+    def job():
+        try:
+            cfg = load_config()
+            if not (cfg.get("token") or "").strip() and not imports_list():
+                return
+            for fn in (lambda: build_summary(cfg, "all", "all"), lambda: tcat(),
+                       lambda: build_bonds(cfg, "all"), lambda: build_history_for(cfg, "all")):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=job, daemon=True, name="warmup").start()
 # ═══════════════════ внешние данные: кредитные рейтинги, КБД, ключевая ставка ═══════════════════
 # Наружу уходят только обезличенные GET-запросы к публичным страницам (t.me, cbr.ru, moex.com):
 # ни токен, ни состав портфеля никуда не передаются.
@@ -7287,7 +7484,28 @@ async function api(path,opt){
   const r=await fetch(path,opt);let j={};
   try{j=await r.json()}catch(e){}
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  if(j&&j.stale&&/^\/api\/(bonds|history)\?/.test(path))staleRefresh(path,j);
   return j;
+}
+/* Сервер отдал прошлый сохранённый результат (stale) и пересчитывает его в фоне: перезапрашиваем, пока не придёт свежий */
+const _stl={};
+function staleRefresh(path,first){
+  const key=path.split('?')[0],isB=key==='/api/bonds',acc=S.account;
+  if(_stl[key])return;
+  let n=0;_stl[key]=1;
+  const tick=async()=>{
+    n++;
+    try{
+      const j=await fetch(path.replace(/&?force=1/,'')).then(r=>r.json());
+      if(S.account!==acc){delete _stl[key];return}
+      if(j&&j.stale&&n<40){setTimeout(tick,4000);return}
+      delete _stl[key];
+      if(!j||j.error)return;
+      if(isB){S.bonds=j;if(['dash','bonds','pay'].includes(S.page))render()}
+      else{S.hist=j;if(['dash','ret'].includes(S.page))render()}
+    }catch(e){delete _stl[key]}
+  };
+  setTimeout(tick,4000);
 }
 const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
 
@@ -7588,9 +7806,9 @@ function pDash(){
 
 function payMonths(pays,n){
   const now=new Date(),keys=[];for(let i=0;i<n;i++){const d=new Date(now.getFullYear(),now.getMonth()+i,1);keys.push(d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'))}
-  const k3={coupon:{},dividend:{},redemption:{}};pays.forEach(p=>{const m=p.date.slice(0,7);if(keys.includes(m))k3[p.kind][m]=(k3[p.kind][m]||0)+p.amount});
+  const k3={coupon:{},dividend:{},redemption:{},amortization:{}};pays.forEach(p=>{const m=p.date.slice(0,7);if(keys.includes(m))(k3[p.kind]=k3[p.kind]||{})[m]=(k3[p.kind][m]||0)+p.amount});
   return{labels:keys.map(mlabel),tips:keys.map(m=>{const[y,mm]=m.split('-');return MONF[+mm-1]+' '+y}),
-    series:[{n:'Купоны',c:S1,v:keys.map(k=>k3.coupon[k]||0)},{n:'Дивиденды',c:S3,v:keys.map(k=>k3.dividend[k]||0)},{n:'Погашения',c:S4,v:keys.map(k=>k3.redemption[k]||0)}]};
+    series:[{n:'Купоны',c:S1,v:keys.map(k=>k3.coupon[k]||0)},{n:'Дивиденды',c:S3,v:keys.map(k=>k3.dividend[k]||0)},{n:'Погашения',c:S4,v:keys.map(k=>k3.redemption[k]||0)},{n:'Амортизации',c:S5,v:keys.map(k=>k3.amortization[k]||0)}]};
 }
 
 /* ── Доходность ── */
@@ -7902,12 +8120,12 @@ function payDays(ps,limit){
   const f=ps.filter(p=>p.date>=from&&p.date<=to);
   const tot={};f.forEach(p=>tot[p.name]=(tot[p.name]||0)+p.amount);
   const names=Object.keys(tot).sort((a,b)=>tot[b]-tot[a]),col={};names.forEach((n,i)=>col[n]=colAt(i));
-  const red=new Set(f.filter(p=>p.kind==='redemption').map(p=>p.name));
-  const KL={coupon:'купон',dividend:'дивиденд',redemption:'погашение'},by={};
+  const red=new Set(f.filter(p=>p.kind==='redemption').map(p=>p.name)),amo=new Set(f.filter(p=>p.kind==='amortization').map(p=>p.name));
+  const KL={coupon:'купон',dividend:'дивиденд',redemption:'погашение',amortization:'амортизация'},by={};
   f.forEach(p=>(by[p.date]=by[p.date]||[]).push(p));
   const days=Object.keys(by).sort().map(dt=>{const items=by[dt].slice().sort((a,b)=>tot[b.name]-tot[a.name]).map(p=>({name:p.name,amount:p.amount,c:col[p.name],kind:p.kind,kl:KL[p.kind]||p.kind}));
     const [y,m,d]=dt.split('-');return{label:`${d}.${m}.${y}`,full:ddm(dt),total:items.reduce((a,x)=>a+x.amount,0),items}});
-  return{days,legend:names.map(n=>({n,c:col[n],tag:red.has(n)?'погашение':''}))};
+  return{days,legend:names.map(n=>({n,c:col[n],tag:[red.has(n)?'погашение':'',amo.has(n)?'амортизация':''].filter(Boolean).join(', ')}))};
 }
 
 /* ── Выплаты ── */
@@ -7920,17 +8138,17 @@ function pPay(){
   const pm=payMonths(ps,12);
   const pdd=payDays(ps,S.payDays);chart('c-days',dayBars,{days:pdd.days,legend:pdd.legend,h:340});
   chart('c-pay',bars,{h:260,labels:pm.labels,tipLabels:pm.tips,stack:true,total:true,skipZero:true,series:pm.series,empty:'Выплат не ожидается'});
-  const KIND={coupon:['Купон',S1],dividend:['Дивиденд',S3],redemption:['Погашение',S4]};
+  const KIND={coupon:['Купон',S1],dividend:['Дивиденд',S3],redemption:['Погашение',S4],amortization:['Амортизация',S5]};
   const byM={};ps.forEach(p=>(byM[p.date.slice(0,7)]=byM[p.date.slice(0,7)]||[]).push(p));
   const list=Object.keys(byM).sort().map(m=>{const[y,mm]=m.split('-');const t=byM[m].reduce((a,x)=>a+x.amount,0);
     return`<div class="card"><h2>${MONF[+mm-1]} ${y}<span class="sp num" style="color:var(--pos);font-size:13px;font-weight:600">${M(t)}</span></h2><div class="li">`+
-    byM[m].map(p=>`<div class="it">${logo(p,34)}<div><b>${esc(p.name)}</b><small>${ddm(p.date)} · <span style="color:${KIND[p.kind][1]}">${KIND[p.kind][0]}</span>${p.est?' · оценка':''}</small></div><div class="rv num">${M(p.amount)}</div></div>`).join('')+`</div></div>`}).join('');
-  return`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(sum(()=>1)),'купоны, дивиденды и погашения','pos',S3)}
+    byM[m].map(p=>`<div class="it">${logo(p,34)}<div><b>${esc(p.name)}</b><small>${ddm(p.date)} · <span style="color:${KIND[p.kind][1]}">${KIND[p.kind][0]}</span>${p.est==='forecast'?' · прогноз по ключевой ставке':p.est?' · оценка':''}</small></div><div class="rv num">${M(p.amount)}</div></div>`).join('')+`</div></div>`}).join('');
+  return`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(sum(()=>1)),'купоны, дивиденды, амортизации и погашения','pos',S3)}
     ${kpi('Купоны',M(sum(p=>p.kind==='coupon')),ps.filter(p=>p.kind==='coupon').length+' выплат',null,S1)}${kpi('Дивиденды',M(sum(p=>p.kind==='dividend')),'только объявленные, до налога',null,S3)}</div>
     <div class="card"><h2>Календарь выплат по месяцам, ₽</h2><div id="c-pay" class="chart"></div></div>
     <div class="card"><h2>Выплаты по дням<span class="sp"><span class="seg" id="pdays">${[[30,'30 дней'],[90,'90 дней'],[365,'Год']].map(([d,t])=>`<button data-d="${d}" class="${d===S.payDays?'on':''}">${t}</button>`).join('')}</span></span></h2><div id="c-days" class="chart"></div></div>
     ${list?`<div class="g g2">${list}</div>`:'<div class="card empty">Выплат в ближайший год не ожидается</div>'}
-    <p class="note">Купоны — по графику эмитента и текущему количеству бумаг (до НДФЛ). Для флоатеров будущие купоны — оценка по последнему известному. Дивиденды — только уже объявленные, сумма до налога.</p>`;
+    <p class="note">Купоны — по графику эмитента и текущему количеству бумаг (до НДФЛ). Для флоатеров ещё не объявленные купоны — прогноз по ключевой ставке ЦБ плюс спред эмитента (пометка «прогноз по ключевой ставке»). Амортизации — частичное погашение номинала по графику Мосбиржи. Дивиденды — только уже объявленные, сумма до налога.</p>`;
 }
 
 /* ── Операции ── */
@@ -8153,7 +8371,7 @@ function upcoming(){
   (b.rows||[]).forEach(r=>{if(r.call&&r.call>=from&&r.call<=to)ev.push({date:r.call,name:r.name,kind:'offer',amount:null})});
   return ev.sort((a,c)=>a.date.localeCompare(c.date));
 }
-const EVK={coupon:'купон',dividend:'дивиденд',redemption:'погашение',offer:'оферта'};
+const EVK={coupon:'купон',dividend:'дивиденд',redemption:'погашение',amortization:'амортизация',offer:'оферта'};
 function remindHtml(){
   const ev=upcoming();if(!ev.length)return'';
   return`<div class="card remind noprint"><div>${svgI(IC.pay,1.8).replace('<svg','<svg width="22" height="22"')}</div><div><b>Ближайшие события (${ev.length})</b>

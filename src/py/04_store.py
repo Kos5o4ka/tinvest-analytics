@@ -85,6 +85,16 @@ class Store:
 
 
 STORE = None
+_klocks, _klocks_lock = {}, threading.Lock()
+
+
+def key_lock(key):
+    """Блокировка на ключ: одинаковую тяжёлую работу (запросы к API) параллельные потоки выполняют по одному разу."""
+    with _klocks_lock:
+        lk = _klocks.get(key)
+        if lk is None:
+            lk = _klocks[key] = threading.Lock()
+        return lk
 
 
 def store():
