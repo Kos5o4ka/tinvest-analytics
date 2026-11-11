@@ -114,6 +114,26 @@ class History(unittest.TestCase):
         self.assertAlmostEqual(h["value"][200], 100000, delta=1)
         self.assertLess(max(abs(r) for r in rets), 0.001)
 
+    def test_dividend_to_card_is_not_cash(self):
+        # дивиденд на карту (DIV_EXT): доход и сразу вывод — на счёте денег не прибавляется, доходность его учитывает
+        s = "h-divext"
+        candles(s, 100.0)
+        names = {s: {"type": "share", "cur": "rub"}}
+        ops = [op(0, "INPUT", pay=100000), op(1, "BUY", s, qty=100, pay=-10000), op(50, "DIV_EXT", s, qty=0, pay=1000)]
+        h, rets = run(ops, names)
+        self.assertAlmostEqual(h["value"][-1], 100000, delta=1)
+        self.assertAlmostEqual(h["invested"][-1], 99000, delta=1)
+        self.assertGreater(h["twr"][-1], 1.0)
+
+    def test_zero_priced_position_is_dropped_after_last_candle(self):
+        s = "h-dead"
+        M.store().candles_put(s, [(day(i), 100.0) for i in range(0, 60)])
+        names = {s: {"type": "share", "cur": "rub"}}
+        ops = [op(0, "INPUT", pay=100000), op(1, "BUY", s, qty=100, pay=-10000)]
+        h = M.build_history(Offline(), ops, names, 0, None, {s})
+        self.assertAlmostEqual(h["value"][59], 100000, delta=1)
+        self.assertAlmostEqual(h["value"][-1], 90000, delta=1)
+
 
 class Helpers(unittest.TestCase):
     def test_split_scale(self):

@@ -66,10 +66,20 @@ def amort_events(bz, ops_ev, today):
     return sorted(ev)
 
 
-def build_history(client, ops, names, actual_total):
+def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=None):
     ops = sorted([o for o in ops if o.get("date")], key=lambda o: o["date"])
     if not ops:
         return None
+    # обмены бумаг (ГДР -> акции и т.п.), которых нет в операциях API
+    events = find_conversions(ops, names, held_qty, resolve=(lambda t: benchmark_uid(client, t)) if client.ready else None)
+    if events:
+        ops = apply_conversions(ops, events)
+        need = {(e["new_uid"], None) for e in events if e.get("new_uid") and e["new_uid"] not in (names or {})}
+        if need and client.ready:
+            try:
+                names = dict(names, **instruments(client, need))
+            except ApiError:
+                pass
     start = ops[0]["date"][:10]
     today = date.today().isoformat()
     by_day = defaultdict(list)
@@ -86,9 +96,9 @@ def build_history(client, ops, names, actual_total):
         if mu and mu not in members.setdefault(uid, []):
             members[uid].append(mu)
         q = op_qty(o)
-        if k in ("buy", "sec_in"):
+        if k in ("buy", "sec_in", "conv_in"):
             qty[uid] += q
-        elif k in ("sell", "sec_out"):
+        elif k in ("sell", "sec_out", "conv_out"):
             qty[uid] -= q
         elif k == "repayments" and op_type(o) == "BOND_REPAYMENT_FULL":
             qty[uid] = 0
@@ -199,6 +209,13 @@ def build_history(client, ops, names, actual_total):
     for u in extra:
         closes[u] = dict(series.get(u) or ())
 
+    # бумага числится в портфеле с нулевой ценой (ГДР после делистинга и т.п.), а свечи кончились: через месяц после
+    # последней свечи она стоит 0, а не держит последнюю цену вечно
+    dead_from = {}
+    for g in real:
+        if zero_priced and types[g] not in ("bond", "currency") and closes.get(g) and any(i in zero_priced for i in [g] + (members.get(g) or [])):
+            dead_from[g] = (datetime.strptime(max(closes[g]), "%Y-%m-%d") + timedelta(days=30)).strftime("%Y-%m-%d")
+
     last_close, fallback, cash, scale = {}, {}, defaultdict(float), {}
     qty = defaultdict(float)          # количество в «единицах свечи» (с учётом сплитов)
     out_days, vals, inv, rets = [], [], [], []
@@ -218,6 +235,8 @@ def build_history(client, ops, names, actual_total):
         return nom + sum(a for da, a in amort.get(u, ()) if da > day)
 
     def unit(u, day):
+        if u in dead_from and day > dead_from[u]:
+            return 0.0
         c = last_close.get(u)
         t = types.get(u)
         if c is None:
@@ -242,8 +261,13 @@ def build_history(client, ops, names, actual_total):
             uid = pos_key(o)
             # сделки с фьючерсами/опционами: payment — условная стоимость контракта, деньги движутся через
             # вариационную маржу (отдельные операции); считать payment деньгами — значит выдумать скачки на ±цену контракта
-            if not (k in ("buy", "sell") and uid and types.get(uid) in ("futures", "option")):
+            # дивиденды «на карту» (DIV_EXT) на счёт не поступают: это доход и сразу вывод. Покупка с карты (BUY_CARD)
+            # в операциях сопровождается пополнением на ту же сумму, поэтому идёт как обычная покупка
+            ext = op_type(o) == "DIV_EXT"
+            if not ext and not (k in ("buy", "sell") and uid and types.get(uid) in ("futures", "option")):
                 cash[c] += pay
+            if ext:
+                flow -= pay * (fx(c) or 0.0)
             q = op_qty(o)
             sc = scale.get(uid, 1.0)
             if uid and q and k in ("buy", "sell") and pay:
@@ -254,11 +278,25 @@ def build_history(client, ops, names, actual_total):
                     if f is not None:
                         sc = scale[uid] = f
                 fallback[uid] = abs(pay) / q / sc * r
+            if k == "conv_in" and uid and q:
+                # у новой бумаги ещё нет своих сделок для определения сплита: сравниваем цену старой бумаги (за вычетом
+                # коэффициента) с ценой новой на день обмена — как для обычных сделок
+                cv = o.get("_conv") or {}
+                fk = cv.get("from_key")
+                if last_close.get(uid) and types.get(uid) not in ("bond", "currency", "futures", "option"):
+                    nu, ou = unit(uid, ds), unit(fk, ds) if fk else 0.0
+                    f = split_scale(ou * scale.get(fk, 1.0) / (cv.get("ratio") or 1) / nu) if nu and ou else None
+                    if f is not None:
+                        sc = scale[uid] = f
             qa = q * sc
             if k in ("buy", "sec_in") and uid:
                 qty[uid] = round(qty[uid] + qa, 6)
             elif k in ("sell", "sec_out") and uid:
                 qty[uid] = round(qty[uid] - qa, 6)
+            elif k == "conv_out" and uid:
+                qty[uid] = 0                  # обмен: вся позиция уходит без денежного потока
+            elif k == "conv_in" and uid:
+                qty[uid] = round(qty[uid] + qa, 6)
             elif k == "repayments" and op_type(o) == "BOND_REPAYMENT_FULL" and uid:
                 qty[uid] = 0
             if k in ("deposits", "withdrawals"):
@@ -294,6 +332,7 @@ def build_history(client, ops, names, actual_total):
     return {"days": out_days, "value": vals, "invested": inv, "twr": twr,
             "bench": {t: v for t, v in bench_vals.items() if any(x is not None for x in v)},
             "monthly": {m: round(x - 1, 6) for m, x in monthly.items()},
-            "recon": {"calc": vals[-1] if vals else 0, "actual": actual_total}, "glitches": glitches}
+            "recon": {"calc": vals[-1] if vals else 0, "actual": actual_total}, "glitches": glitches,
+            "conversions": conversions_view(events)}
 
 

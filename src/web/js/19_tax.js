@@ -64,7 +64,7 @@ function txYr(d){
     ${kpi('Сэкономлено за счёт ЛДВ',tR(tot.ldv),'за все годы',tot.ldv>0?'pos':'',S3)}
     ${kpi('Налог по расчёту за всё время',tR(tot.tax),`удержано ${tR(tot.wh)}`,null,S4)}</div>
     <div class="card"><h2>Расчёт и удержанный налог по годам, ₽</h2><div id="c-txy" class="chart"></div></div>
-    <div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Все выбранные счета вместе</h2>${txRowsTable(ys)}</div>`;
+    <div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">Все выбранные счета вместе</h2>${txRowsTable(ys)}${ys.filter(r=>r.extra_progressive>0.5).reverse().map(r=>`<p class="note" style="padding:0 10px">${r.year}: <b>Ожидаемая доплата по прогрессивной шкале (совокупность счетов) ${tR(r.extra_progressive)}</b>. Порог 15 % относится к совокупному доходу налогоплательщика, а счета и ИИС считаются отдельно: если вместе база превысила порог, ФНС доначислит разницу.</p>`).join('')}</div>`;
   if(d.groups.length>1)out+=d.groups.map(g=>`<div class="card" style="padding:6px 8px"><h2 style="padding:10px 10px 0">${esc(g.name)}${g.kind==='iis'?`<span class="sp">${g.iis.exempt?'доход освобождён от налога (срок соблюдён)':'ИИС тип '+({A:'А',B:'Б','3':'3'})[g.iis.type]}</span>`:''}</h2>${txRowsTable(g.rows)}</div>`).join('');
   const cmp=ys.filter(r=>r.diff_pct!=null&&Math.abs(r.diff_pct)>25);
   out+=`<div class="card"><h2>Почему расчёт и удержание могут расходиться</h2><ul class="tx-ul">
@@ -74,6 +74,7 @@ function txYr(d){
     <li><b>Фьючерсы, ИИС, другие брокеры</b> считаются отдельно; по сделкам в валюте используется курс ЦБ на даты покупки и продажи.</li></ul>
     ${cmp.length?`<p class="note">Заметное расхождение (больше 25 %) в годах: ${cmp.map(r=>r.year).join(', ')}.</p>`:''}
     <ul class="tx-ul note">${d.assumptions.map(a=>`<li>${esc(a)}</li>`).join('')}</ul>
+    ${convNote(d.conversions,true)}
     ${d.warnings.length?`<div class="msg info" style="margin-top:8px">${d.warnings.map(esc).join('<br>')}</div>`:''}</div>`;
   return out;
 }
