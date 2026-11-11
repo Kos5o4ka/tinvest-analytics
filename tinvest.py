@@ -540,7 +540,8 @@ class Window:
         self.root.protocol("WM_DELETE_WINDOW", lambda: self.finish("quit"))
 
     # --- этап работы программы (только в собранном приложении) ---
-    def running(self, thread, cap, result):
+    def running(self, thread, cap, result, native=False):
+        """native: окно служит только заставкой, пока сервер не ответит; потом оно закрывается и возвращается "native"."""
         self.decision = None
         self.bar("hidden")
         self.show_steps(False)
@@ -554,7 +555,11 @@ class Window:
         self.q, self.dead = queue.Queue(), False
 
         def tick():
-            if cap.url and not self.btns[0].on and not self.dead:
+            if native and result.get("ready") and not self.dead:
+                self.dead = True
+                self.finish("native")
+                return
+            if cap.url and self.btns and not self.btns[0].on and not self.dead:
                 self.btns[0].enable(True)
                 self.c.itemconfigure(self.detail, text=cap.url)
             if not thread.is_alive() and not self.dead:
@@ -564,15 +569,24 @@ class Window:
                 else:
                     self.finish("quit")
         self.tick = tick
+        if native:
+            self.say("Запуск…", "Открываю окно программы", dot=POS)
+            self.buttons([])
         self.root.after(200, self.poll)
         self.root.mainloop()
+        if self.decision == "native":
+            return "native"
         return result.get("code") or 0
 
     def close(self):
         try:
+            self.root.quit()
             self.root.destroy()
         except Exception:
             pass
+        self.root = None
+        import gc
+        gc.collect()                                            # Tcl-объекты уходят до старта Cocoa-цикла pywebview
 
 
 def make_window():
@@ -608,7 +622,99 @@ class Capture:
         return False
 
 
-def run_inprocess(args, ui):
+# ───────────────────────────── собственное окно (pywebview) ─────────────────────────────
+
+WIN_W, WIN_H, MIN_W, MIN_H = 1440, 900, 1024, 680
+STATE = os.path.join(HOME, "window.json")
+
+
+def want_native(frozen, no_gui, env=None):
+    """Собственное окно — только в собранном приложении с графикой; TINVEST_NO_WEBVIEW=1 отключает (запасной режим)."""
+    env = os.environ if env is None else env
+    return bool(frozen) and not no_gui and env.get("TINVEST_NO_WEBVIEW") != "1"
+
+
+def window_geometry(saved, screen, want=(WIN_W, WIN_H), min_size=(MIN_W, MIN_H)):
+    """(ширина, высота, x, y) окна. saved — dict из window.json (или None); screen — (ширина, высота) или None.
+    Размер не больше экрана (с полями) и не меньше min_size, если экран позволяет; x/y — только если окно видно на экране."""
+    def num(k, d=None):
+        v = (saved or {}).get(k)
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else d
+    w, h = num("w", want[0]), num("h", want[1])
+    x, y = num("x"), num("y")
+    if screen:
+        sw, sh = screen
+        w = min(w, max(sw - 40, 1)); h = min(h, max(sh - 80, 1))
+        w = max(w, min(min_size[0], sw)); h = max(h, min(min_size[1], sh))
+        if x is None or y is None or x < -w + 100 or y < 0 or x > sw - 100 or y > sh - 100:
+            x = y = None
+    elif w < min_size[0] or h < min_size[1]:
+        w, h = max(w, min_size[0]), max(h, min_size[1])
+    return w, h, x, y
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(w, h, x, y):
+    try:
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        with open(STATE, "w") as f:
+            json.dump({"w": int(w), "h": int(h), "x": int(x), "y": int(y)}, f)
+    except Exception:
+        pass
+
+
+def wait_ping(get_url, thread, timeout=90):
+    """Ждёт, пока сервер программы ответит на /api/ping. False — не дождались или программа остановилась."""
+    end = time.time() + timeout
+    while time.time() < end and thread.is_alive():
+        url = get_url()
+        if url:
+            try:
+                with urllib.request.urlopen(url + "api/ping", timeout=2) as r:
+                    if r.status == 200:
+                        return True
+            except Exception:
+                pass
+        time.sleep(0.15)
+    return False
+
+
+def open_native(url, thread):
+    """Окно программы на pywebview (WKWebView / Edge WebView2). Возвращает управление после закрытия окна;
+    бросает исключение, если окно показать не удалось (тогда запускается запасное окно tk)."""
+    import webview
+    webview.settings["ALLOW_DOWNLOADS"] = True                  # выгрузки CSV/ICS по ссылкам
+    webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True   # t.me, MOEX и прочие target=_blank — в обычный браузер
+    screen = None
+    try:
+        sc = webview.screens[0]
+        screen = (sc.width, sc.height)
+    except Exception:
+        pass
+    w, h, x, y = window_geometry(load_state(), screen)
+    win = webview.create_window(TITLE, url, width=w, height=h, x=x, y=y, min_size=(MIN_W, MIN_H),
+                                background_color=BG, text_select=True)
+
+    def remember(*_):
+        try:
+            save_state(win.width, win.height, win.x, win.y)
+        except Exception:
+            pass
+    for ev in (win.events.closing, win.events.resized, win.events.moved):   # closing не вызывается при выходе по Cmd+Q
+        ev += remember
+    threading.Thread(target=lambda: (thread.join(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
+    webview.start()
+
+
+def run_inprocess(args, ui, native=False):
     """Собранный лаунчер: Python-интерпретатора рядом нет, поэтому программа выполняется внутри него."""
     import runpy, traceback
     sys.argv = [APP] + args
@@ -627,7 +733,31 @@ def run_inprocess(args, ui):
     cap = sys.stdout = sys.stderr = Capture(sys.stdout)
     t = threading.Thread(target=target, daemon=True)           # tk занимает главный поток
     t.start()
-    return ui.running(t, cap, result)
+    if native:
+        def ready():
+            result["ready"] = wait_ping(lambda: cap.url, t)
+        threading.Thread(target=ready, daemon=True).start()
+    r = ui.running(t, cap, result, native)
+    if r != "native":
+        return r
+    ui.close()                                                  # tk полностью разобран до Cocoa/WebView2
+    try:
+        open_native(cap.url, t)
+        return result.get("code") or 0
+    except Exception as e:                                      # нет WebView2 и т. п. — запасное окно tk
+        sys.stderr.write("Собственное окно недоступно (%s), открываю запасное.\n" % e)
+        ui2 = make_window()
+        if ui2 is None:
+            webbrowser_open(cap.url)
+            t.join()
+            return result.get("code") or 0
+        ui2.set_version()
+        return ui2.running(t, cap, result)
+
+
+def webbrowser_open(url):
+    import webbrowser
+    webbrowser.open(url)
 
 
 def main():
@@ -649,7 +779,9 @@ def main():
     if not have_app():
         sys.exit("Программа ещё не скачана, а обновиться не удалось. Проверьте интернет и REPO в лаунчере.")
     if FROZEN:
-        code = run_inprocess(args, ui)
+        if not isinstance(ui, Console) and "--no-window" not in args:
+            args.append("--no-window")                           # окно открываем сами (или показываем кнопку), не браузер программы
+        code = run_inprocess(args, ui, native=want_native(FROZEN, no_gui) and not isinstance(ui, Console))
         ui.close()
         sys.stdout and sys.stdout.flush()
         os._exit(code)                                          # не ждём фоновые потоки программы

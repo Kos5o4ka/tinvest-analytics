@@ -17,6 +17,18 @@ ICON_DIR = os.path.abspath(os.environ.get("TINVEST_ICON_DIR") or HERE)   # PyIns
 hidden = hidden_imports(APP_SRC) + ["certifi"] + collect_submodules("encodings")
 datas = collect_data_files("certifi")           # корневые сертификаты: у Python с python.org их нет
 
+# Собственное окно программы: pywebview (macOS — WKWebView через pyobjc, Windows — Edge WebView2 через pythonnet)
+hidden += collect_submodules("webview")
+datas += collect_data_files("webview")           # js, а на Windows и lib/*.dll
+if sys.platform == "darwin":
+    for m in ("objc", "Foundation", "AppKit", "WebKit", "Quartz", "Security", "UniformTypeIdentifiers"):
+        hidden += collect_submodules(m)
+elif sys.platform == "win32":
+    for m in ("clr_loader", "pythonnet"):
+        hidden += collect_submodules(m)
+        datas += collect_data_files(m)
+    hidden += ["clr"]
+
 
 def icon(ext):
     p = os.path.join(ICON_DIR, "icon." + ext)

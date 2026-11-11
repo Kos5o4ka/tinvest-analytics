@@ -41,7 +41,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Зависимости сборки (только для сборки, в программе их нет)
-        run: pip install pyinstaller==6.22.3 certifi pillow
+        run: |
+          pip install pyinstaller==6.22.3 certifi pillow pywebview==6.2.1
+          # Windows: pywebview берёт Edge WebView2 через pythonnet (ставится как зависимость; явно — на случай смены метаданных)
+          if [ "$RUNNER_OS" = "Windows" ]; then pip install pythonnet clr_loader; fi
       - name: Программа из релиза (чтобы собрать список её импортов)
         run: gh release download "$TAG" -p tinvest_analytics.py -D release_app --clobber
       - name: Список импортов программы

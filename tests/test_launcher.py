@@ -179,5 +179,50 @@ class Update(unittest.TestCase):
         self.assertTrue(ev[2])
 
 
+class NativeWindow(unittest.TestCase):
+    def test_want_native(self):
+        self.assertTrue(L.want_native(True, False, {}))
+        self.assertFalse(L.want_native(False, False, {}))                       # python3 tinvest.py — как раньше
+        self.assertFalse(L.want_native(True, True, {}))                         # --no-gui
+        self.assertFalse(L.want_native(True, False, {"TINVEST_NO_WEBVIEW": "1"}))
+
+    def test_geometry_default_and_clamp(self):
+        self.assertEqual(L.window_geometry(None, None), (1440, 900, None, None))
+        self.assertEqual(L.window_geometry(None, (1512, 982)), (1440, 900, None, None))
+        w, h, _, _ = L.window_geometry(None, (1280, 720))
+        self.assertEqual((w, h), (1240, 680))                                   # 720-80=640 < min 680 -> 680
+        w, h, _, _ = L.window_geometry({"w": 300, "h": 200}, (1920, 1080))
+        self.assertEqual((w, h), (1024, 680))                                   # не меньше min_size
+
+    def test_geometry_tiny_screen(self):
+        w, h, _, _ = L.window_geometry(None, (800, 600))
+        self.assertEqual((w, h), (800, 600))                                    # экран меньше минимума
+
+    def test_geometry_position(self):
+        self.assertEqual(L.window_geometry({"w": 1200, "h": 800, "x": 50, "y": 40}, (1920, 1080)), (1200, 800, 50, 40))
+        self.assertEqual(L.window_geometry({"w": 1200, "h": 800, "x": 5000, "y": 40}, (1920, 1080))[2:], (None, None))
+        self.assertEqual(L.window_geometry({"w": "x", "h": None, "x": True}, (1920, 1080)), (1440, 900, None, None))
+
+    def test_state_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = L.STATE
+            L.STATE = os.path.join(d, "window.json")
+            try:
+                self.assertIsNone(L.load_state())
+                L.save_state(1300, 800, 10, 20)
+                self.assertEqual(L.load_state(), {"w": 1300, "h": 800, "x": 10, "y": 20})
+                with open(L.STATE, "w") as f:
+                    f.write("[1")
+                self.assertIsNone(L.load_state())
+            finally:
+                L.STATE = old
+
+    def test_wait_ping_stops_when_thread_dead(self):
+        t = threading.Thread(target=lambda: None)
+        t.start()
+        t.join()
+        self.assertFalse(L.wait_ping(lambda: "", t, timeout=2))
+
+
 if __name__ == "__main__":
     unittest.main()
