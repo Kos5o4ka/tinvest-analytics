@@ -203,6 +203,7 @@ def tax_engine(ops, types=None, fx=None, held=None):
         return fee_key.get((o.get("_acc") or "", (o.get("date") or "")[:19], o.get("instrumentUid") or o.get("figi") or ""), 0.0)
 
     books, sales, meta = {}, [], {}
+    moved, convs = {}, []
     inc = defaultdict(tx_inc_new)
     turn = [0.0, 0.0]
     for o in ops:
@@ -291,6 +292,40 @@ def tax_engine(ops, types=None, fx=None, held=None):
             if not unit:
                 warns["unk_cost"] = "У бумаг, зачисленных переводом, нет цены: стоимость принята нулевой (прибыль завышена)."
             bk["lots"].append({"qty": float(q), "unit": unit, "date": d, "cur": cur, "blind": True})
+        elif kind == "conv_out":
+            # Обмен бумаг (ГДР/АДР на акции российского МКПАО, смена кода и т.п.) не продажа: лоты старой бумаги уходят в «карман» обмена
+            cv = o.get("_conv") or {}
+            lots, left = [], float(op_qty(o))
+            for u in cv.get("old_uids") or [uid]:
+                bk = books.get((acc, u))
+                while bk and bk["lots"] and left > 1e-9:
+                    lot = bk["lots"][0]
+                    t = min(left, lot["qty"])
+                    lots.append(dict(lot, qty=t))
+                    lot["qty"] -= t
+                    left -= t
+                    if lot["qty"] <= 1e-9:
+                        bk["lots"].pop(0)
+            lots.sort(key=lambda l: l["date"])
+            moved[o.get("id")] = lots
+        elif kind == "conv_in":
+            # Лоты переходят в новую бумагу: количество × коэффициент, цена за штуку / коэффициент, даты покупки сохраняются.
+            # По закону о редомициляции обмен депозитарных расписок на акции не считается реализацией, срок владения для ЛДВ
+            # продолжается, поэтому дата покупки не обнуляется.
+            cv = o.get("_conv") or {}
+            ratio = cv.get("ratio") or 1
+            lots = moved.pop((o.get("id") or "")[:-3] + ":out", [])
+            left = float(op_qty(o))
+            bk = books.setdefault((acc, uid), {"lots": [], "shorts": [], "last_repay": None, "last_unit": 0.0})
+            for lot in lots:
+                t = min(left, lot["qty"] * ratio)
+                if t > 1e-9:
+                    bk["lots"].append(dict(lot, qty=t, unit=lot["unit"] / ratio))
+                    left -= t
+            bk["lots"].sort(key=lambda l: l["date"])
+            if uid not in meta:
+                meta[uid] = {"name": info.get("name") or cv.get("new_ticker") or uid, "ticker": info.get("ticker") or cv.get("new_ticker") or "", "type": itype}
+            convs.append(cv)
         elif kind == "sec_out":
             q = op_qty(o)
             bk = books.get((acc, uid))
@@ -515,7 +550,7 @@ def tx_pos_price(r):
     return p or None
 
 
-def tax_compute(ops, names, positions, sel, settings, fx=None, today=None):
+def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resolve=None):
     """Чистая часть расчёта (без сети): ops + позиции + выбранные счета -> структура состояния."""
     today = today or date.today()
     pos = {}
@@ -523,6 +558,8 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None):
         if r.get("type") not in ("currency", "futures") and r.get("uid"):
             pos[r["uid"]] = r
     held = {u: r["qty"] for u, r in pos.items()} if pos else None
+    events = find_conversions(ops, names, held, resolve=resolve)
+    ops = apply_conversions(ops, events)
     eng = tax_engine(ops, names, fx, held)
     accs = {a["id"]: a for a in sel}
     groups = {}
@@ -562,7 +599,8 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None):
         g["rows"], g["pool"], g["sales"], g["inc"] = rows, pool, sales, inc
         per_rows.append(rows)
         out_groups.append(g)
-    return {"eng": eng, "groups": out_groups, "years": tx_sum_rows(per_rows), "iis": iis_list, "pos": pos, "today": today, "accs": accs}
+    return {"eng": eng, "groups": out_groups, "years": tx_sum_rows(per_rows), "iis": iis_list, "pos": pos, "today": today, "accs": accs,
+            "conversions": conversions_view(events)}
 
 
 def tx_ldv_tables(st):
@@ -742,7 +780,7 @@ def tax_payload_from(st, settings):
         "ldv": {"upcoming": up[:80], "ready": rd[:40], "years": [ldv_years[y] for y in sorted(ldv_years)],
                 "saved_total": sum(e["saved"] for e in ldv_years.values()), "rate": rate, "limit": TAX_LDV_LIMIT},
         "iis": tx_iis_table(st, settings), "hints": tx_hints(st, settings), "decl": tx_decl(st),
-        "carry_suggest": sugg, "warnings": st["eng"]["warnings"],
+        "carry_suggest": sugg, "warnings": st["eng"]["warnings"], "conversions": st.get("conversions") or [],
         "assumptions": [
             "Счета без ИИС объединены в одну налоговую базу (сальдирование прибылей и убытков между счетами одного налогоплательщика); каждый ИИС считается отдельно.",
             "Налог по годам сравнивается с удержанным по дате операции удержания; брокер часто удерживает налог за год в декабре или в январе следующего года.",
@@ -769,7 +807,8 @@ def tax_state(cfg, acc, force=False):
                 if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
         names = instruments(client, keys)
         positions = build_summary(cfg, acc, "all", force)["portfolio"]["positions"]
-        st = tax_compute(ops, names, positions, sel, settings, tax_cbr_rate)
+        st = tax_compute(ops, names, positions, sel, settings, tax_cbr_rate,
+                         resolve=lambda t: benchmark_uid(client, t) if client.ready else None)
         return mem_put(key, st), settings
 
 

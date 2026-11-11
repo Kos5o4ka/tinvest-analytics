@@ -74,6 +74,7 @@ function txYr(d){
     <li><b>Фьючерсы, ИИС, другие брокеры</b> считаются отдельно; по сделкам в валюте используется курс ЦБ на даты покупки и продажи.</li></ul>
     ${cmp.length?`<p class="note">Заметное расхождение (больше 25 %) в годах: ${cmp.map(r=>r.year).join(', ')}.</p>`:''}
     <ul class="tx-ul note">${d.assumptions.map(a=>`<li>${esc(a)}</li>`).join('')}</ul>
+    ${convNote(d.conversions,true)}
     ${d.warnings.length?`<div class="msg info" style="margin-top:8px">${d.warnings.map(esc).join('<br>')}</div>`:''}</div>`;
   return out;
 }

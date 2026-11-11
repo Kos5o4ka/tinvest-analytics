@@ -853,6 +853,8 @@ def classify(t):
     if t in WITHDRAW: return "withdrawals"
     if t == "INPUT_SECURITIES": return "sec_in"
     if t == "OUTPUT_SECURITIES": return "sec_out"
+    if t == "X_CONV_OUT": return "conv_out"      # служебные операции обмена бумаг (см. 07a_conversions.py)
+    if t == "X_CONV_IN": return "conv_in"
     return "other"
 
 
@@ -926,10 +928,30 @@ def period_bounds(period, now):
 def fifo(ops):
     """Позиции по сделкам методом FIFO: {uid: {qty, cost, last_unit}}, заодно результат продаж (op['_yield'])."""
     pos = defaultdict(lambda: {"lots": [], "last_unit": 0.0})
+    moved = {}
     for o in ops:
         k = classify(o.get("type"))
         uid = o.get("instrumentUid") or o.get("figi")
         q = op_qty(o)
+        if k == "conv_out" and uid:
+            # обмен бумаг: лоты старой бумаги переходят в новую вместе со стоимостью
+            lots = []
+            for u in (o.get("_conv") or {}).get("old_uids") or [uid]:
+                lots += pos[u]["lots"] if u in pos else []
+                if u in pos:
+                    pos[u]["lots"] = []
+            moved[o.get("id")[:-4] if o.get("id") else uid] = lots
+            continue
+        if k == "conv_in" and uid:
+            lots = moved.pop((o.get("id") or "")[:-3], [])
+            r = (o.get("_conv") or {}).get("ratio") or 1
+            left = q
+            for lq, lu in lots:
+                t = min(left, lq * r)
+                if t > 0:
+                    pos[uid]["lots"].append([t, lu / r])
+                    left -= t
+            continue
         if not uid or k not in ("buy", "sell", "sec_in", "sec_out", "repayments") or not q:
             if k == "repayments" and uid and op_type(o) == "BOND_REPAYMENT_FULL":
                 pos[uid]["lots"] = []
@@ -994,7 +1016,7 @@ def analyze(ops, names, period, portfolio_value):
             entries.append(("buy_turnover", cur, abs(pay)))
         elif kind == "sell":
             entries += [("sell_turnover", cur, abs(pay)), ("realized", ycur, yld)]
-        elif kind not in ("other", "sec_in", "sec_out"):
+        elif kind not in ("other", "sec_in", "sec_out", "conv_in", "conv_out"):
             entries.append((kind, cur, -pay if kind in FLIP else pay))
         if kind in ("buy", "sell") and comm and o.get("_acc") not in accs_with_broker_ops:
             entries.append(("fee_broker", ccur, -comm if comm < 0 else comm))
@@ -1051,6 +1073,232 @@ def analyze(ops, names, period, portfolio_value):
     }
 
 
+# ═══════════════════════════════ обмены бумаг (конвертации, редомициляция) ═══════════════════════════════
+# В операциях API нет записей об обмене ГДР/АДР на акции российской компании: старая бумага «висит» в позиции навсегда,
+# а новая продаётся без покупки. Здесь такие обмены находятся (по таблице известных и автоматически) и превращаются
+# в служебные операции X_CONV_OUT / X_CONV_IN, которые учитывают история стоимости, налоги и FIFO.
+
+# Каждая запись проверена по данным Мосбиржи (ISS): коды, ISIN, даты начала торгов новой бумаги и непрерывность цены
+# старой и новой бумаги в день обмена (цены совпадают -> обмен 1:1). Записи, где коэффициент подтвердить не удалось
+# (Русагро, FixPrice, Глобалтранс, Ozon, МД Медикал, Лента), не включены; часть из них ловит автоопределение.
+SEC_CONVERSIONS = [
+    {"old_tickers": ["US87238U2033"], "old_isins": ["US87238U2033"], "new_ticker": "T", "new_isin": "RU000A107UL4",
+     "ratio": 1, "date": "2024-03-18", "label": "ГДР TCS Group на акции Т-Технологии"},
+    {"old_tickers": ["YNDX"], "old_isins": ["NL0009805522"], "new_ticker": "YDEX", "new_isin": "RU000A107T19",
+     "ratio": 1, "date": "2024-07-24", "label": "Yandex N.V. на акции МКПАО Яндекс"},
+    {"old_tickers": ["FIVE"], "old_isins": ["US98387E2054"], "new_ticker": "X5", "new_isin": "RU000A108X38",
+     "ratio": 1, "date": "2025-01-09", "label": "ГДР X5 Retail Group на акции ИКС 5"},
+    {"old_tickers": ["HHRU"], "old_isins": ["US42207L1061"], "new_ticker": "HEAD", "new_isin": "RU000A107662",
+     "ratio": 1, "date": "2024-09-26", "label": "АДР HeadHunter на акции МКПАО Хэдхантер"},
+    {"old_tickers": ["CIAN"], "old_isins": ["US83418T1088"], "new_ticker": "CNRU", "new_isin": "RU000A10ANA1",
+     "ratio": 1, "date": "2025-04-03", "label": "АДР Cian на акции МКПАО Циан"},
+    {"old_tickers": [], "old_isins": ["US29760G1031"], "new_ticker": "ETLN", "new_isin": "RU000A10C1L6",
+     "ratio": 1, "date": "2025-09-08", "label": "ГДР Etalon Group на акции МКПАО Эталон Груп"},
+    {"old_tickers": ["MAIL"], "old_isins": ["US5603172082"], "new_ticker": "VKCO", "new_isin": "RU000A106YF0",
+     "ratio": 1, "date": "2023-10-20", "label": "ГДР Mail.ru Group на акции ПАО ВК"},
+]
+
+CONV_SKIP_TYPES = ("currency", "bond", "futures", "option", "dfa", "cfa")
+CONV_REFLECT_DAYS = 120
+
+
+def _cv_day(s):
+    return (s or "")[:10]
+
+
+def _cv_add_day(iso, n):
+    return (datetime.strptime(iso, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def _cv_gap(a, b):
+    return abs((datetime.strptime(a, "%Y-%m-%d") - datetime.strptime(b, "%Y-%m-%d")).days)
+
+
+def _cv_positions(ops, names):
+    """{(счёт, ключ позиции): данные} по сделкам и переводам бумаг."""
+    pos = {}
+    for o in ops:
+        k = classify(o.get("type"))
+        sign = 1 if k in ("buy", "sec_in") else -1 if k in ("sell", "sec_out") else 0
+        key = pos_key(o)
+        q = op_qty(o)
+        if not sign or not key or not q or str(o.get("instrumentUid") or "").startswith("imp:"):
+            continue
+        acc = o.get("_acc") or ""
+        p = pos.setdefault((acc, key), {"acc": acc, "key": key, "ops": [], "tickers": set(), "isins": set(), "uids": {}, "pos": None,
+                                        "figi": None, "itype": "", "kind": None})
+        p["ops"].append((o.get("date") or "", _cv_day(o.get("date")), sign * q, k))
+        if o.get("ticker"):
+            p["tickers"].add(o["ticker"])
+        uid = o.get("instrumentUid") or o.get("figi")
+        if uid:
+            p["uids"][uid] = p["uids"].get(uid, 0) + 1
+            info = (names or {}).get(uid) or {}
+            if info.get("isin"):
+                p["isins"].add(info["isin"])
+            if info.get("ticker"):
+                p["tickers"].add(info["ticker"])
+            if info.get("type") and not p["itype"]:
+                p["itype"] = info["type"]
+        p["pos"] = p["pos"] or o.get("positionUid")
+        p["figi"] = p["figi"] or o.get("figi")
+        p["kind"] = p["kind"] or o.get("instrumentKind")
+        if not p["itype"]:
+            p["itype"] = {"bonds": "bond", "shares": "share"}.get(o.get("instrumentType") or "", o.get("instrumentType") or "") \
+                or TYPE_FROM_KIND.get(o.get("instrumentKind") or "", "")
+    for p in pos.values():
+        p["ops"].sort(key=lambda x: x[0])
+        p["net"] = sum(x[2] for x in p["ops"])
+        run, mn, neg = 0, 0, None
+        for dt, day, q, _ in p["ops"]:
+            run += q
+            if run < mn:
+                mn = run
+            if run < 0 and neg is None:
+                neg = day
+        p["neg_day"], p["depth"] = neg, -mn
+        p["first_day"], p["last_day"] = p["ops"][0][1], p["ops"][-1][1]
+        p["uid"] = max(p["uids"], key=lambda u: p["uids"][u]) if p["uids"] else None
+        p["ticker"] = next(iter(sorted(p["tickers"], key=lambda t: (len(t) > 8, t))), "")
+    return pos
+
+
+def _cv_held(p, held):
+    if held is None:
+        return None
+    ids = set(p["uids"]) | {p["key"], p["pos"], p["figi"]}
+    vals = [held[i] for i in ids if i and i in held]
+    return max(vals) if vals else 0.0
+
+
+def _cv_is_old(p, e):
+    if e["new_isin"] in p["isins"]:
+        return False
+    return bool(p["isins"] & set(e["old_isins"])) or bool(p["tickers"] & set(e["old_tickers"]))
+
+
+def _cv_is_new(p, e):
+    if e["new_isin"] in p["isins"]:
+        return True
+    return e["new_ticker"] in p["tickers"] and not (p["isins"] & set(e["old_isins"]))
+
+
+def _cv_event(acc, date, old, new, old_qty, new_qty, ratio, label, source, new_ticker=None, new_uid=None):
+    n = new or {}
+    return {"acc": acc, "date": date, "old_key": old["key"], "new_key": n.get("key") or new_uid, "old_qty": old_qty,
+            "new_qty": new_qty, "ratio": ratio, "label": label, "source": source,
+            "new_uid": n.get("uid") or new_uid, "new_ticker": new_ticker or n.get("ticker") or "",
+            "old_ticker": old["ticker"], "old_uid": old["uid"], "old_uids": list(old["uids"]), "old_pos": old["pos"],
+            "old_figi": old["figi"], "new_pos": n.get("pos") or new_uid, "new_figi": n.get("figi"),
+            "old_kind": old["kind"], "old_type": old["itype"]}
+
+
+def find_conversions(ops, names, held=None, last_close_day=None, resolve=None):
+    """Обмены бумаг по счетам. held — {ключ/uid: кол-во} текущих позиций (если известны), last_close_day — {ключ: дата
+    последней свечи}, resolve(ticker) -> uid новой бумаги, которой нет в операциях счёта (иначе такой обмен пропускается)."""
+    pos = _cv_positions(ops, names)
+    by_acc = defaultdict(list)
+    for p in pos.values():
+        if p["itype"] not in CONV_SKIP_TYPES:
+            by_acc[p["acc"]].append(p)
+    events, used = [], set()
+    lcd = last_close_day or {}
+    for acc, plist in by_acc.items():
+        for e in SEC_CONVERSIONS:
+            olds = [p for p in plist if _cv_is_old(p, e)]
+            news = [p for p in plist if _cv_is_new(p, e)]
+            new = max(news, key=lambda p: len(p["ops"])) if news else None
+            for old in olds:
+                used.add((acc, old["key"]))
+                if new:
+                    used.add((acc, new["key"]))
+                lo = _cv_add_day(old["last_day"], 1)
+                if lcd.get(old["key"]):
+                    lo = max(lo, _cv_add_day(lcd[old["key"]][:10], 1))
+                hi = new["neg_day"] if new and new["neg_day"] else None
+                if hi is None:
+                    date = max(e["date"], lo)
+                else:
+                    date = min(max(e["date"], lo), hi) if hi >= lo else lo
+                old_qty = sum(x[2] for x in old["ops"] if x[1] < date)
+                if old_qty <= 0:
+                    continue
+                new_qty = int(round(old_qty * e["ratio"]))
+                # брокер уже отразил обмен переводом бумаг — повторно не добавляем
+                if any(x[3] == "sec_out" and _cv_gap(x[1], date) <= CONV_REFLECT_DAYS for x in old["ops"]):
+                    continue
+                out_total = sum(-x[2] for x in old["ops"] if x[3] == "sec_out")
+                if new and any(x[3] == "sec_in" and _cv_gap(x[1], date) <= CONV_REFLECT_DAYS and x[2] in (new_qty, int(round((old_qty + out_total) * e["ratio"])))
+                               for x in new["ops"]):
+                    continue
+                ho = _cv_held(old, held)
+                if ho is not None and ho > 0.5 and ho >= old_qty - 0.5:
+                    continue                      # старая бумага всё ещё в портфеле — обмена не было
+                new_uid = None
+                if not new:
+                    new_uid = resolve(e["new_ticker"]) if resolve else None
+                    if not new_uid:
+                        continue
+                events.append(_cv_event(acc, date, old, new, old_qty, new_qty, e["ratio"], e["label"], "table", e["new_ticker"], new_uid))
+    # автоопределение: остаток старой бумаги и продажа новой без покупок ровно на этот остаток (коэффициент 1)
+    for acc, plist in by_acc.items():
+        shares = [p for p in plist if p["itype"] in ("share", "") and (acc, p["key"]) not in used]
+        olds = [p for p in shares if p["net"] > 0 and not (_cv_held(p, held) or 0) > 0.5]
+        news = [p for p in shares if p["neg_day"]]
+        cand = {}
+        for o in olds:
+            cand[o["key"]] = [n for n in news if n["key"] != o["key"] and n["depth"] == o["net"] and n["neg_day"] > o["last_day"]]
+        for o in olds:
+            c = cand[o["key"]]
+            if len(c) != 1 or sum(1 for k, v in cand.items() if c[0] in v) != 1:
+                continue
+            n = c[0]
+            date = n["neg_day"]
+            events.append(_cv_event(acc, date, o, n, o["net"], o["net"], 1, "Обмен бумаг (определён автоматически, предположение)", "auto"))
+    # ограничение по текущим позициям: новая бумага не должна «вырасти» сверх фактического остатка
+    if held is not None:
+        groups = defaultdict(list)
+        for ev in events:
+            groups[ev["new_key"]].append(ev)
+        for nk, evs in groups.items():
+            base = sum(p["net"] for p in pos.values() if p["key"] == nk)
+            ref = next((p for p in pos.values() if p["key"] == nk), None)
+            h = _cv_held(ref, held) if ref else held.get(nk, held.get(evs[0]["new_uid"], 0.0))
+            add = sum(ev["new_qty"] for ev in evs)
+            if base <= h + 0.5 and base + add > h + 0.5:
+                allow = max(0.0, h - base)
+                for ev in sorted(evs, key=lambda x: x["date"]):
+                    t = min(ev["new_qty"], int(allow))
+                    allow -= t
+                    ev["new_qty"] = t
+        events = [ev for ev in events if ev["new_qty"] > 0]
+    return sorted(events, key=lambda x: (x["date"], x["acc"], str(x["old_key"])))
+
+
+def apply_conversions(ops, events):
+    """Новый отсортированный список операций с вставленными служебными X_CONV_OUT / X_CONV_IN."""
+    out = list(ops)
+    zero = {"currency": "rub", "units": "0", "nano": 0}
+    for ev in events:
+        meta = {"from_key": ev["old_key"], "to_key": ev["new_key"], "ratio": ev["ratio"], "label": ev["label"], "source": ev["source"],
+                "old_uids": ev.get("old_uids") or [], "new_uid": ev.get("new_uid"), "old_qty": ev["old_qty"], "new_qty": ev["new_qty"],
+                "old_ticker": ev.get("old_ticker"), "new_ticker": ev.get("new_ticker")}
+        base = {"date": ev["date"] + "T00:00:01Z", "state": "OPERATION_STATE_EXECUTED", "payment": dict(zero), "_acc": ev["acc"],
+                "_conv": meta, "instrumentKind": ev.get("old_kind") or "INSTRUMENT_TYPE_SHARE", "instrumentType": ev.get("old_type") or "share"}
+        cid = "conv:%s:%s:%s" % (ev["acc"], ev["old_key"], ev["date"])
+        a = dict(base, id=cid + ":out", type="OPERATION_TYPE_X_CONV_OUT", quantity=str(ev["old_qty"]), quantityDone=str(ev["old_qty"]),
+                 instrumentUid=ev.get("old_uid"), positionUid=ev.get("old_pos"), figi=ev.get("old_figi"), ticker=ev.get("old_ticker"))
+        b = dict(base, id=cid + ":in", type="OPERATION_TYPE_X_CONV_IN", quantity=str(ev["new_qty"]), quantityDone=str(ev["new_qty"]),
+                 instrumentUid=ev.get("new_uid"), positionUid=ev.get("new_pos"), figi=ev.get("new_figi"), ticker=ev.get("new_ticker"))
+        out += [a, b]
+    out.sort(key=lambda o: o.get("date") or "")
+    return out
+
+
+def conversions_view(events):
+    """Список обменов для интерфейса."""
+    return [{"date": e["date"], "label": e["label"], "old": e.get("old_ticker") or "", "new": e.get("new_ticker") or "",
+             "qty": e["old_qty"], "new_qty": e["new_qty"], "source": e["source"]} for e in events]
 # ═══════════════════════════════ позиции ═══════════════════════════════
 
 def pos_row(info, **kw):
@@ -2139,10 +2387,20 @@ def amort_events(bz, ops_ev, today):
     return sorted(ev)
 
 
-def build_history(client, ops, names, actual_total):
+def build_history(client, ops, names, actual_total, held_qty=None):
     ops = sorted([o for o in ops if o.get("date")], key=lambda o: o["date"])
     if not ops:
         return None
+    # обмены бумаг (ГДР -> акции и т.п.), которых нет в операциях API
+    events = find_conversions(ops, names, held_qty, resolve=(lambda t: benchmark_uid(client, t)) if client.ready else None)
+    if events:
+        ops = apply_conversions(ops, events)
+        need = {(e["new_uid"], None) for e in events if e.get("new_uid") and e["new_uid"] not in (names or {})}
+        if need and client.ready:
+            try:
+                names = dict(names, **instruments(client, need))
+            except ApiError:
+                pass
     start = ops[0]["date"][:10]
     today = date.today().isoformat()
     by_day = defaultdict(list)
@@ -2159,9 +2417,9 @@ def build_history(client, ops, names, actual_total):
         if mu and mu not in members.setdefault(uid, []):
             members[uid].append(mu)
         q = op_qty(o)
-        if k in ("buy", "sec_in"):
+        if k in ("buy", "sec_in", "conv_in"):
             qty[uid] += q
-        elif k in ("sell", "sec_out"):
+        elif k in ("sell", "sec_out", "conv_out"):
             qty[uid] -= q
         elif k == "repayments" and op_type(o) == "BOND_REPAYMENT_FULL":
             qty[uid] = 0
@@ -2327,11 +2585,25 @@ def build_history(client, ops, names, actual_total):
                     if f is not None:
                         sc = scale[uid] = f
                 fallback[uid] = abs(pay) / q / sc * r
+            if k == "conv_in" and uid and q:
+                # у новой бумаги ещё нет своих сделок для определения сплита: сравниваем цену старой бумаги (за вычетом
+                # коэффициента) с ценой новой на день обмена — как для обычных сделок
+                cv = o.get("_conv") or {}
+                fk = cv.get("from_key")
+                if last_close.get(uid) and types.get(uid) not in ("bond", "currency", "futures", "option"):
+                    nu, ou = unit(uid, ds), unit(fk, ds) if fk else 0.0
+                    f = split_scale(ou * scale.get(fk, 1.0) / (cv.get("ratio") or 1) / nu) if nu and ou else None
+                    if f is not None:
+                        sc = scale[uid] = f
             qa = q * sc
             if k in ("buy", "sec_in") and uid:
                 qty[uid] = round(qty[uid] + qa, 6)
             elif k in ("sell", "sec_out") and uid:
                 qty[uid] = round(qty[uid] - qa, 6)
+            elif k == "conv_out" and uid:
+                qty[uid] = 0                  # обмен: вся позиция уходит без денежного потока
+            elif k == "conv_in" and uid:
+                qty[uid] = round(qty[uid] + qa, 6)
             elif k == "repayments" and op_type(o) == "BOND_REPAYMENT_FULL" and uid:
                 qty[uid] = 0
             if k in ("deposits", "withdrawals"):
@@ -2367,7 +2639,8 @@ def build_history(client, ops, names, actual_total):
     return {"days": out_days, "value": vals, "invested": inv, "twr": twr,
             "bench": {t: v for t, v in bench_vals.items() if any(x is not None for x in v)},
             "monthly": {m: round(x - 1, 6) for m, x in monthly.items()},
-            "recon": {"calc": vals[-1] if vals else 0, "actual": actual_total}, "glitches": glitches}
+            "recon": {"calc": vals[-1] if vals else 0, "actual": actual_total}, "glitches": glitches,
+            "conversions": conversions_view(events)}
 
 
 # ═══════════════════════════════ импорт отчётов брокеров ═══════════════════════════════
@@ -3043,7 +3316,14 @@ def build_history_for(cfg, acc, force=False):
         total = sum(qf((d["port"] or {}).get("totalAmountPortfolio")) for d in data if d["port"] is not None)
         if any(d["port"] is None for d in data):
             total += sum(sum((r["value_rub"] or 0) for r in imported_positions(client, d["ops"], names)) for d in data if d["port"] is None)
-        return build_history(client, ops, names, total) or {"days": []}
+        held = None
+        if all(d["port"] is not None for d in data):     # текущие позиции — для проверки обменов бумаг
+            held = defaultdict(float)
+            for d in data:
+                for x in d["port"].get("positions") or []:
+                    for i in {x.get("instrumentUid"), x.get("positionUid"), x.get("figi")} - {None, ""}:
+                        held[i] += qf(x.get("quantity"))
+        return build_history(client, ops, names, total, held) or {"days": []}
     return cached_result("hist", cfg, acc, HIST_TTL, compute, force)
 
 
@@ -8945,6 +9225,7 @@ def tax_engine(ops, types=None, fx=None, held=None):
         return fee_key.get((o.get("_acc") or "", (o.get("date") or "")[:19], o.get("instrumentUid") or o.get("figi") or ""), 0.0)
 
     books, sales, meta = {}, [], {}
+    moved, convs = {}, []
     inc = defaultdict(tx_inc_new)
     turn = [0.0, 0.0]
     for o in ops:
@@ -9033,6 +9314,40 @@ def tax_engine(ops, types=None, fx=None, held=None):
             if not unit:
                 warns["unk_cost"] = "У бумаг, зачисленных переводом, нет цены: стоимость принята нулевой (прибыль завышена)."
             bk["lots"].append({"qty": float(q), "unit": unit, "date": d, "cur": cur, "blind": True})
+        elif kind == "conv_out":
+            # Обмен бумаг (ГДР/АДР на акции российского МКПАО, смена кода и т.п.) не продажа: лоты старой бумаги уходят в «карман» обмена
+            cv = o.get("_conv") or {}
+            lots, left = [], float(op_qty(o))
+            for u in cv.get("old_uids") or [uid]:
+                bk = books.get((acc, u))
+                while bk and bk["lots"] and left > 1e-9:
+                    lot = bk["lots"][0]
+                    t = min(left, lot["qty"])
+                    lots.append(dict(lot, qty=t))
+                    lot["qty"] -= t
+                    left -= t
+                    if lot["qty"] <= 1e-9:
+                        bk["lots"].pop(0)
+            lots.sort(key=lambda l: l["date"])
+            moved[o.get("id")] = lots
+        elif kind == "conv_in":
+            # Лоты переходят в новую бумагу: количество × коэффициент, цена за штуку / коэффициент, даты покупки сохраняются.
+            # По закону о редомициляции обмен депозитарных расписок на акции не считается реализацией, срок владения для ЛДВ
+            # продолжается, поэтому дата покупки не обнуляется.
+            cv = o.get("_conv") or {}
+            ratio = cv.get("ratio") or 1
+            lots = moved.pop((o.get("id") or "")[:-3] + ":out", [])
+            left = float(op_qty(o))
+            bk = books.setdefault((acc, uid), {"lots": [], "shorts": [], "last_repay": None, "last_unit": 0.0})
+            for lot in lots:
+                t = min(left, lot["qty"] * ratio)
+                if t > 1e-9:
+                    bk["lots"].append(dict(lot, qty=t, unit=lot["unit"] / ratio))
+                    left -= t
+            bk["lots"].sort(key=lambda l: l["date"])
+            if uid not in meta:
+                meta[uid] = {"name": info.get("name") or cv.get("new_ticker") or uid, "ticker": info.get("ticker") or cv.get("new_ticker") or "", "type": itype}
+            convs.append(cv)
         elif kind == "sec_out":
             q = op_qty(o)
             bk = books.get((acc, uid))
@@ -9257,7 +9572,7 @@ def tx_pos_price(r):
     return p or None
 
 
-def tax_compute(ops, names, positions, sel, settings, fx=None, today=None):
+def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resolve=None):
     """Чистая часть расчёта (без сети): ops + позиции + выбранные счета -> структура состояния."""
     today = today or date.today()
     pos = {}
@@ -9265,6 +9580,8 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None):
         if r.get("type") not in ("currency", "futures") and r.get("uid"):
             pos[r["uid"]] = r
     held = {u: r["qty"] for u, r in pos.items()} if pos else None
+    events = find_conversions(ops, names, held, resolve=resolve)
+    ops = apply_conversions(ops, events)
     eng = tax_engine(ops, names, fx, held)
     accs = {a["id"]: a for a in sel}
     groups = {}
@@ -9304,7 +9621,8 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None):
         g["rows"], g["pool"], g["sales"], g["inc"] = rows, pool, sales, inc
         per_rows.append(rows)
         out_groups.append(g)
-    return {"eng": eng, "groups": out_groups, "years": tx_sum_rows(per_rows), "iis": iis_list, "pos": pos, "today": today, "accs": accs}
+    return {"eng": eng, "groups": out_groups, "years": tx_sum_rows(per_rows), "iis": iis_list, "pos": pos, "today": today, "accs": accs,
+            "conversions": conversions_view(events)}
 
 
 def tx_ldv_tables(st):
@@ -9484,7 +9802,7 @@ def tax_payload_from(st, settings):
         "ldv": {"upcoming": up[:80], "ready": rd[:40], "years": [ldv_years[y] for y in sorted(ldv_years)],
                 "saved_total": sum(e["saved"] for e in ldv_years.values()), "rate": rate, "limit": TAX_LDV_LIMIT},
         "iis": tx_iis_table(st, settings), "hints": tx_hints(st, settings), "decl": tx_decl(st),
-        "carry_suggest": sugg, "warnings": st["eng"]["warnings"],
+        "carry_suggest": sugg, "warnings": st["eng"]["warnings"], "conversions": st.get("conversions") or [],
         "assumptions": [
             "Счета без ИИС объединены в одну налоговую базу (сальдирование прибылей и убытков между счетами одного налогоплательщика); каждый ИИС считается отдельно.",
             "Налог по годам сравнивается с удержанным по дате операции удержания; брокер часто удерживает налог за год в декабре или в январе следующего года.",
@@ -9511,7 +9829,8 @@ def tax_state(cfg, acc, force=False):
                 if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
         names = instruments(client, keys)
         positions = build_summary(cfg, acc, "all", force)["portfolio"]["positions"]
-        st = tax_compute(ops, names, positions, sel, settings, tax_cbr_rate)
+        st = tax_compute(ops, names, positions, sel, settings, tax_cbr_rate,
+                         resolve=lambda t: benchmark_uid(client, t) if client.ready else None)
         return mem_put(key, st), settings
 
 
@@ -11499,6 +11818,13 @@ function payMonths(pays,n){
 
 /* ── Доходность ── */
 function heatBg(v,mx){if(bad(v))return'';const a=Math.min(1,Math.abs(v)/(mx||1));return`background:${v>=0?'rgba(62,207,142,'+(0.08+a*0.42)+')':'rgba(255,107,107,'+(0.08+a*0.42)+')'}`}
+/* Обмены бумаг (ГДР -> акции и т.п.), восстановленные по таблице известных и автоматически */
+function convNote(list,tax){
+  if(!list||!list.length)return'';
+  const dm=x=>x.slice(8)+'.'+x.slice(5,7)+'.'+x.slice(0,4);
+  const items=list.map(c=>`${esc(c.old||'?')} → ${esc(c.new||'?')} (${c.qty} шт., ${dm(c.date)}${c.source==='auto'?', предположение':''})`).join(', ');
+  const auto=list.some(c=>c.source==='auto');
+  return`<p class="note">Учтены обмены бумаг: ${items}. ${tax?'Стоимость покупки и даты владения (для ЛДВ) сохранены.':'Брокер не отдаёт такие обмены в операциях, поэтому они восстановлены по таблице известных обменов.'}${auto?' Обмены с пометкой «предположение» найдены автоматически (остаток старой бумаги и продажа новой без покупки на то же количество) — они могут быть неточными.':''}</p>`}
 function pRet(){
   const h=S.hist;
   if(!h)return`<div class="card">${waitBox('Восстанавливаю историю стоимости портфеля по дневным ценам закрытия. Первый раз это может занять до минуты — дальше данные берутся из локальной базы.')}</div>`;
@@ -11540,6 +11866,7 @@ function pRet(){
   out+=`<p class="note">Стоимость портфеля на каждый день восстановлена по операциям и дневным ценам закрытия (облигации — с НКД по графику купонов). Доходность считается по методу TWR — пополнения и выводы на неё не влияют, поэтому её можно сравнивать с бенчмарками.
     ${diff!=null&&Math.abs(diff)>2?`<b>Расчётная стоимость на сегодня (${M(rc.calc,'rub',0)}) отличается от фактической (${M(rc.actual,'rub',0)}) на ${pct(diff,1)}</b> — вероятно, по части бумаг нет истории цен (внебиржевые, заблокированные, фьючерсы) или переводы бумаг между брокерами.`:''}
     ${h.glitches?`Пропущено дней с некорректными ценами: ${h.glitches}.`:''} Бенчмарки — фонды LQDT (денежный рынок) и TMOS (индекс МосБиржи) с учётом их собственной доходности.</p>`;
+  out+=convNote(h.conversions,false);
   return out;
 }
 
@@ -12009,6 +12336,7 @@ function txYr(d){
     <li><b>Фьючерсы, ИИС, другие брокеры</b> считаются отдельно; по сделкам в валюте используется курс ЦБ на даты покупки и продажи.</li></ul>
     ${cmp.length?`<p class="note">Заметное расхождение (больше 25 %) в годах: ${cmp.map(r=>r.year).join(', ')}.</p>`:''}
     <ul class="tx-ul note">${d.assumptions.map(a=>`<li>${esc(a)}</li>`).join('')}</ul>
+    ${convNote(d.conversions,true)}
     ${d.warnings.length?`<div class="msg info" style="margin-top:8px">${d.warnings.map(esc).join('<br>')}</div>`:''}</div>`;
   return out;
 }
@@ -12475,8 +12803,8 @@ const CHANGELOG=[
 const ROADMAP=[
  ['now','Проверка на реальных счетах','Сверка расчётов доходности и налогов с данными брокера'],
  ['next','Готовые форматы брокеров','Пресеты для отчётов ВТБ, Альфы и других брокеров'],
- ['next','Конвертации бумаг','Учёт обменов бумаг без операций в API (например, редомициляция) в истории стоимости'],
  ['later','Финансы эмитентов по МСФО','Отчётность групп компаний, а не только отдельной компании по РСБУ'],
+ ['done','Конвертации бумаг','Обмены ГДР/АДР на акции (Яндекс, ИКС 5, Хэдхантер, Циан, Эталон, ВК, Т-Технологии) и похожие случаи учитываются в истории стоимости, налоговых лотах и FIFO: количество и стоимость переносятся без продажи, даты покупки сохраняются'],
  ['done','Налоги по лотам','ЛДВ, ИИС, перенос убытков, курсовые разницы, подсказки, сводка для 3-НДФЛ'],
  ['done','Точная история стоимости','Без ложных скачков: фьючерсы, сплиты, дубли бумаг, амортизация'],
  ['done','Ребалансировка с учётом налогов','Сначала продаются лоты с убытком или с наступившей ЛДВ'],

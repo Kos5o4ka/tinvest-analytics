@@ -40,6 +40,8 @@ def classify(t):
     if t in WITHDRAW: return "withdrawals"
     if t == "INPUT_SECURITIES": return "sec_in"
     if t == "OUTPUT_SECURITIES": return "sec_out"
+    if t == "X_CONV_OUT": return "conv_out"      # служебные операции обмена бумаг (см. 07a_conversions.py)
+    if t == "X_CONV_IN": return "conv_in"
     return "other"
 
 
@@ -113,10 +115,30 @@ def period_bounds(period, now):
 def fifo(ops):
     """Позиции по сделкам методом FIFO: {uid: {qty, cost, last_unit}}, заодно результат продаж (op['_yield'])."""
     pos = defaultdict(lambda: {"lots": [], "last_unit": 0.0})
+    moved = {}
     for o in ops:
         k = classify(o.get("type"))
         uid = o.get("instrumentUid") or o.get("figi")
         q = op_qty(o)
+        if k == "conv_out" and uid:
+            # обмен бумаг: лоты старой бумаги переходят в новую вместе со стоимостью
+            lots = []
+            for u in (o.get("_conv") or {}).get("old_uids") or [uid]:
+                lots += pos[u]["lots"] if u in pos else []
+                if u in pos:
+                    pos[u]["lots"] = []
+            moved[o.get("id")[:-4] if o.get("id") else uid] = lots
+            continue
+        if k == "conv_in" and uid:
+            lots = moved.pop((o.get("id") or "")[:-3], [])
+            r = (o.get("_conv") or {}).get("ratio") or 1
+            left = q
+            for lq, lu in lots:
+                t = min(left, lq * r)
+                if t > 0:
+                    pos[uid]["lots"].append([t, lu / r])
+                    left -= t
+            continue
         if not uid or k not in ("buy", "sell", "sec_in", "sec_out", "repayments") or not q:
             if k == "repayments" and uid and op_type(o) == "BOND_REPAYMENT_FULL":
                 pos[uid]["lots"] = []
@@ -181,7 +203,7 @@ def analyze(ops, names, period, portfolio_value):
             entries.append(("buy_turnover", cur, abs(pay)))
         elif kind == "sell":
             entries += [("sell_turnover", cur, abs(pay)), ("realized", ycur, yld)]
-        elif kind not in ("other", "sec_in", "sec_out"):
+        elif kind not in ("other", "sec_in", "sec_out", "conv_in", "conv_out"):
             entries.append((kind, cur, -pay if kind in FLIP else pay))
         if kind in ("buy", "sell") and comm and o.get("_acc") not in accs_with_broker_ops:
             entries.append(("fee_broker", ccur, -comm if comm < 0 else comm))

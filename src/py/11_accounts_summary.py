@@ -253,7 +253,14 @@ def build_history_for(cfg, acc, force=False):
         total = sum(qf((d["port"] or {}).get("totalAmountPortfolio")) for d in data if d["port"] is not None)
         if any(d["port"] is None for d in data):
             total += sum(sum((r["value_rub"] or 0) for r in imported_positions(client, d["ops"], names)) for d in data if d["port"] is None)
-        return build_history(client, ops, names, total) or {"days": []}
+        held = None
+        if all(d["port"] is not None for d in data):     # текущие позиции — для проверки обменов бумаг
+            held = defaultdict(float)
+            for d in data:
+                for x in d["port"].get("positions") or []:
+                    for i in {x.get("instrumentUid"), x.get("positionUid"), x.get("figi")} - {None, ""}:
+                        held[i] += qf(x.get("quantity"))
+        return build_history(client, ops, names, total, held) or {"days": []}
     return cached_result("hist", cfg, acc, HIST_TTL, compute, force)
 
 
