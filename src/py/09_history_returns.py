@@ -189,12 +189,12 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
         for u in members.get(g) or [g]:
             want[u] = list(held[g])
     extra = [u for u in fxu.values() if u and u not in held]
-    bench = {}
+    bench, bench_all = {}, {}
     for t in ("LQDT", "TMOS"):
-        u = benchmark_uid(client, t) if client.ready else None
-        if u:
-            bench[t] = u
-            extra.append(u)
+        us = benchmark_uids(client, t) if client.ready else []
+        if us:
+            bench[t], bench_all[t] = us[0], us
+            extra += [u for u in us if u not in extra]
     for u in extra:
         want[u] = [start, today]
     jobs = [(u, r[0], r[1]) for u, r in want.items()]
@@ -208,6 +208,11 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
         closes[g] = dict(drop_spikes(rows, 0.05 if types[g] == "bond" else 0.3))
     for u in extra:
         closes[u] = dict(series.get(u) or ())
+    for t, us in bench_all.items():   # один фонд под несколькими uid (смена режима торгов): склеиваем ряды
+        merged = {}
+        for u in us:
+            merged.update(dict(series.get(u) or ()))
+        closes[bench[t]] = merged
 
     # бумага числится в портфеле с нулевой ценой (ГДР после делистинга и т.п.), а свечи кончились: через месяц после
     # последней свечи она стоит 0, а не держит последнюю цену вечно (только если по операциям она и осталась в позиции:

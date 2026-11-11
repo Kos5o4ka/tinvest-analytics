@@ -256,6 +256,28 @@ def benchmark_uid(client, ticker):
     return None
 
 
+def benchmark_uids(client, ticker):
+    """Все uid фонда с этим тикером (основной — первым). Мосбиржа переводит фонды между режимами (в июне 2026 TMOS и LQDT
+    ушли с TQTF на TQBR), а брокер заводит под новый режим отдельный инструмент: цены старого на этом заканчиваются."""
+    st = store()
+    v = st.get("benchs:" + ticker, ttl=7 * DAY)
+    if v:
+        return v
+    main = benchmark_uid(client, ticker)
+    try:
+        found = client.find(ticker)
+    except ApiError:
+        return [main] if main else []
+    uids = [main] if main else []
+    for i in found:
+        u = i.get("uid")
+        if (i.get("ticker") or "").upper() == ticker and u and u not in uids and i.get("classCode") in ("TQTF", "TQBR", "TQTD", "TQTE"):
+            uids.append(u)
+    if uids:
+        st.put("benchs:" + ticker, uids)
+    return uids
+
+
 def candle_series(client, uid, d_from, d_to):
     """Дневные цены закрытия из локальной базы; недостающее догружается из API годовыми кусками."""
     st = store()

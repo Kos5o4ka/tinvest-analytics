@@ -780,6 +780,28 @@ def benchmark_uid(client, ticker):
     return None
 
 
+def benchmark_uids(client, ticker):
+    """Все uid фонда с этим тикером (основной — первым). Мосбиржа переводит фонды между режимами (в июне 2026 TMOS и LQDT
+    ушли с TQTF на TQBR), а брокер заводит под новый режим отдельный инструмент: цены старого на этом заканчиваются."""
+    st = store()
+    v = st.get("benchs:" + ticker, ttl=7 * DAY)
+    if v:
+        return v
+    main = benchmark_uid(client, ticker)
+    try:
+        found = client.find(ticker)
+    except ApiError:
+        return [main] if main else []
+    uids = [main] if main else []
+    for i in found:
+        u = i.get("uid")
+        if (i.get("ticker") or "").upper() == ticker and u and u not in uids and i.get("classCode") in ("TQTF", "TQBR", "TQTD", "TQTE"):
+            uids.append(u)
+    if uids:
+        st.put("benchs:" + ticker, uids)
+    return uids
+
+
 def candle_series(client, uid, d_from, d_to):
     """Дневные цены закрытия из локальной базы; недостающее догружается из API годовыми кусками."""
     st = store()
@@ -2628,12 +2650,12 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
         for u in members.get(g) or [g]:
             want[u] = list(held[g])
     extra = [u for u in fxu.values() if u and u not in held]
-    bench = {}
+    bench, bench_all = {}, {}
     for t in ("LQDT", "TMOS"):
-        u = benchmark_uid(client, t) if client.ready else None
-        if u:
-            bench[t] = u
-            extra.append(u)
+        us = benchmark_uids(client, t) if client.ready else []
+        if us:
+            bench[t], bench_all[t] = us[0], us
+            extra += [u for u in us if u not in extra]
     for u in extra:
         want[u] = [start, today]
     jobs = [(u, r[0], r[1]) for u, r in want.items()]
@@ -2647,6 +2669,11 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
         closes[g] = dict(drop_spikes(rows, 0.05 if types[g] == "bond" else 0.3))
     for u in extra:
         closes[u] = dict(series.get(u) or ())
+    for t, us in bench_all.items():   # один фонд под несколькими uid (смена режима торгов): склеиваем ряды
+        merged = {}
+        for u in us:
+            merged.update(dict(series.get(u) or ()))
+        closes[bench[t]] = merged
 
     # бумага числится в портфеле с нулевой ценой (ГДР после делистинга и т.п.), а свечи кончились: через месяц после
     # последней свечи она стоит 0, а не держит последнюю цену вечно (только если по операциям она и осталась в позиции:
@@ -14005,12 +14032,16 @@ tr.scr-low td{opacity:.5}
 .wt-due{color:var(--s4)}
 [data-theme=light] .wt-s,[data-theme=light] .wt-note-i{background:#f0f2f6}
 /* налоги */
+.tx{min-width:0}               /* элемент сетки .wrap: не распирать страницу шириной вкладок */
 .tx .tx-tabs{max-width:100%}
 .tx .tx-ul{margin:6px 0 0;padding-left:20px;line-height:1.6}
 .tx .tx-ul li{margin:3px 0}
 .tx .card h2 .sp{font-weight:400}
 .tx select.in,.tx input[type=date].in{min-width:150px}
 @media print{.tx .tx-tabs{display:none!important}.tx .card{break-inside:avoid}}
+
+/* блоки вкладок налогов идут подряд без общей сетки: отступ, чтобы карточки не слипались */
+.tx>.g+*,.tx>.card+*,.tx>.tbl+*{margin-top:16px}
 /* резервная копия и экспорт */
 .bk-warn{background:rgba(255,170,60,.12);border:1px solid rgba(255,170,60,.45);border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.45}
 .bk-sug{font-size:12.5px;color:var(--tx2);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
