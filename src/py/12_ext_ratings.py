@@ -71,14 +71,15 @@ def name_tokens(s):
     return frozenset(out)
 
 
+_SERIES_TOK = re.compile(r"^(?:бо|боп|бп|п|кс|обл|р|с)?\d+[а-я]?\d*$")        # п01, боп1, бо01: хвост серии выпуска
+
+
 def name_words(s):
-    """Полные нормализованные слова названия по порядку (без правовых форм и слов с цифрами); «Банк» в начале остаётся."""
-    out = []
-    for t in re.findall(r"[a-zа-я0-9]+", (s or "").lower().replace("ё", "е")):
-        if t in _LEGAL or len(t) < 2 or any(ch.isdigit() for ch in t):
-            continue
-        out.append(t)
-    return tuple(out)
+    """Полные нормализованные слова названия по порядку (без правовых форм и слов с цифрами); «Банк» в начале остаётся.
+    Если ничего не осталось («А101 001Р-01»), берутся слова с буквы с цифрами внутри, кроме признаков серии."""
+    toks = [t for t in re.findall(r"[a-zа-я0-9]+", (s or "").lower().replace("ё", "е")) if t not in _LEGAL and len(t) >= 2]
+    out = tuple(t for t in toks if not any(ch.isdigit() for ch in t))
+    return out or tuple(t for t in toks if t[0].isalpha() and not _SERIES_TOK.match(t))
 
 
 def _words_key(w):
@@ -337,11 +338,23 @@ def ratings_status():
             "progress": _rt_state["progress"], "error": _rt_state["error"]}
 
 
+def _rt_src(key):
+    """Хранилище рейтингов; пока новая версия пуста (после смены ключа идёт пересканирование) — берём прежнюю."""
+    st = store()
+    d = st.get(key)
+    if d and d.get("items"):
+        return d, 2
+    old = st.get(key[:-2] + "v1") if key.endswith("_v2") else None
+    return (old, 1) if old and old.get("items") else (d or {}, 2)
+
+
+def ratings_stamp():
+    return _rating_index()["u"]
+
+
 def _rating_index():
-    d = store().get(RT_KEY) or {}
-    sd = store().get(SITE_KEY) or {}
-    ed = store().get(EXP_KEY) or {}
-    stamp = (d.get("updated"), sd.get("updated"), len(ed.get("items") or {}))
+    (d, v1), (sd, v2), (ed, v3) = _rt_src(RT_KEY), _rt_src(SITE_KEY), _rt_src(EXP_KEY)
+    stamp = (d.get("updated"), v1, sd.get("updated"), v2, len(ed.get("items") or {}), v3)
     if _rt_idx.get("u") != stamp:
         old = (date.today() - timedelta(days=RT_OLD)).isoformat()
         merged = {}

@@ -3939,14 +3939,15 @@ def name_tokens(s):
     return frozenset(out)
 
 
+_SERIES_TOK = re.compile(r"^(?:бо|боп|бп|п|кс|обл|р|с)?\d+[а-я]?\d*$")        # п01, боп1, бо01: хвост серии выпуска
+
+
 def name_words(s):
-    """Полные нормализованные слова названия по порядку (без правовых форм и слов с цифрами); «Банк» в начале остаётся."""
-    out = []
-    for t in re.findall(r"[a-zа-я0-9]+", (s or "").lower().replace("ё", "е")):
-        if t in _LEGAL or len(t) < 2 or any(ch.isdigit() for ch in t):
-            continue
-        out.append(t)
-    return tuple(out)
+    """Полные нормализованные слова названия по порядку (без правовых форм и слов с цифрами); «Банк» в начале остаётся.
+    Если ничего не осталось («А101 001Р-01»), берутся слова с буквы с цифрами внутри, кроме признаков серии."""
+    toks = [t for t in re.findall(r"[a-zа-я0-9]+", (s or "").lower().replace("ё", "е")) if t not in _LEGAL and len(t) >= 2]
+    out = tuple(t for t in toks if not any(ch.isdigit() for ch in t))
+    return out or tuple(t for t in toks if t[0].isalpha() and not _SERIES_TOK.match(t))
 
 
 def _words_key(w):
@@ -4205,11 +4206,23 @@ def ratings_status():
             "progress": _rt_state["progress"], "error": _rt_state["error"]}
 
 
+def _rt_src(key):
+    """Хранилище рейтингов; пока новая версия пуста (после смены ключа идёт пересканирование) — берём прежнюю."""
+    st = store()
+    d = st.get(key)
+    if d and d.get("items"):
+        return d, 2
+    old = st.get(key[:-2] + "v1") if key.endswith("_v2") else None
+    return (old, 1) if old and old.get("items") else (d or {}, 2)
+
+
+def ratings_stamp():
+    return _rating_index()["u"]
+
+
 def _rating_index():
-    d = store().get(RT_KEY) or {}
-    sd = store().get(SITE_KEY) or {}
-    ed = store().get(EXP_KEY) or {}
-    stamp = (d.get("updated"), sd.get("updated"), len(ed.get("items") or {}))
+    (d, v1), (sd, v2), (ed, v3) = _rt_src(RT_KEY), _rt_src(SITE_KEY), _rt_src(EXP_KEY)
+    stamp = (d.get("updated"), v1, sd.get("updated"), v2, len(ed.get("items") or {}), v3)
     if _rt_idx.get("u") != stamp:
         old = (date.today() - timedelta(days=RT_OLD)).isoformat()
         merged = {}
@@ -9955,8 +9968,7 @@ def _iss_portfolio(cfg, acc, job):
             rts = []
             for r in rs:
                 try:
-                    b = r.get("rating") if isinstance(r.get("rating"), dict) else None   # рейтинг уже найден в отчёте по облигациям
-                    b = b or best_rating(r["isin"], r.get("name") or "")
+                    b = best_rating(r["isin"], r.get("name") or "")      # заново: рейтинг в кэшированном отчёте мог быть посчитан до загрузки рейтингов
                     if b and b.get("v") in RATING_SCALE:
                         rts.append(b["v"])
                 except Exception:  # noqa: BLE001
@@ -10022,12 +10034,12 @@ def issuers_payload(cfg, acc, q, force):
     key = (token_key(cfg), acc)
     with _iss_jobs_lock:
         job = _iss_jobs.get(key)
-        fresh = job and job["state"] == "done" and time.time() - job["t"] < 1800
+        fresh = job and job["state"] == "done" and time.time() - job["t"] < 1800 and job.get("rs") == ratings_stamp()
         if job and job["state"] == "run":
             return {"pending": True, "done": job["done"], "total": job["total"]}
         if fresh and not force:
             return job["res"]
-        job = {"state": "run", "done": 0, "total": 0, "t": time.time(), "res": None}
+        job = {"state": "run", "done": 0, "total": 0, "t": time.time(), "res": None, "rs": ratings_stamp()}   # рейтинги сменились — пересчёт
         _iss_jobs[key] = job
 
     def work():
@@ -13959,6 +13971,7 @@ body.bc-open{overflow:hidden}
 #bc-iss .bc-kpis{margin:6px 0 10px}
 .rt-ag{font-weight:400;font-size:10px;color:var(--mu)}
 .bc-rt td,.bc-rt th{white-space:nowrap}
+#ptab tbody tr[data-isin]:hover td{background:var(--card2)}
 .bc-docs{display:flex;flex-wrap:wrap;gap:8px}
 .bc-docs .btn{padding:8px 12px;font-size:13px;text-decoration:none}
 .cmp-add{position:relative;max-width:460px;margin-bottom:14px}
@@ -15000,7 +15013,7 @@ function pPos(){
   const cols=[['name','Инструмент','l'],['type','Тип','l'],['qty','Кол-во'],['avg','Средняя'],['price','Текущая'],['value_rub','Стоимость, ₽'],['share','Доля'],['pnl_rub','P&L, ₽'],['pnl_pct','P&L %']];
   const th=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   const mxs=Math.max(1,...ps.map(x=>x.share||0));
-  const rows=ps.map(x=>`<tr><td>${ident(x)}</td>
+  const rows=ps.map(x=>`<tr${x.type==='bond'&&(x.isin||x.ticker)?` data-isin="${esc(x.isin||x.ticker)}" title="Открыть карточку выпуска"`:''}><td>${ident(x)}</td>
     <td class="l"><span class="tag">${TYPES[x.type]||esc(x.type)}</span>${x.blocked?' <span class="tag" style="color:var(--neg)">блок</span>':''}</td>
     <td class="num">${NFQ.format(x.qty)}</td><td class="num">${x.avg&&x.type!=='currency'?M(x.avg,x.cur):'—'}</td><td class="num">${M(x.price,x.cur)}</td>
     <td class="num">${x.value_rub!=null?M(x.value_rub):M(x.value,x.cur)}</td>
