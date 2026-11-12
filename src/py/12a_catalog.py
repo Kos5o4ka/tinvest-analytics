@@ -96,7 +96,7 @@ def best_rating(isin, name):
         return base
     allr = list(cat.values())
     for x in (base or {}).get("all") or []:
-        if x["agency"] not in cat and not x.get("approx"):
+        if x["agency"] not in cat and not x.get("approx"):     # по названию — только точные; приблизительные худший не выбирают
             allr.append(x)
     low = max(allr, key=lambda x: RATING_SCALE.index(x["rating"]))
     return {"v": low["rating"], "agency": low["agency"], "issuer": low["issuer"], "date": low["date"],
