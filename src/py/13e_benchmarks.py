@@ -25,6 +25,7 @@ BENCH_CATALOG = [
 ]
 BENCH_RF = {"code": "RUSFAR", "kind": "index", "group": "Ставка денежного рынка", "name": "Ставка RUSFAR (накопленная)",
             "note": "Ставка однодневного межбанковского кредита. Накопленная — как если бы деньги каждый день размещались под эту ставку."}
+BENCH_PERIODS = ("1m", "3m", "6m", "12m", "3y", "ytd", "py", "all")      # сроки сравнения (на странице свой выбор срока)
 BENCH_TTL = 6 * 3600
 BENCH_FROM_MIN = "2019-01-01"
 _bench_locks, _bench_locks_lock, _bench_fail = {}, threading.Lock(), {}
@@ -230,8 +231,12 @@ def _bn_window(days, period):
         s = (today - timedelta(days=30)).isoformat()
     elif period == "3m":
         s = (today - timedelta(days=91)).isoformat()
+    elif period == "6m":
+        s = (today - timedelta(days=182)).isoformat()
     elif period == "12m":
         s = (today - timedelta(days=365)).isoformat()
+    elif period == "3y":
+        s = (today - timedelta(days=1096)).isoformat()
     elif period == "ytd":
         s = "%d-01-01" % today.year
     elif period == "py":
@@ -303,7 +308,7 @@ def bench_premium(cfg, acc):
 def bench_payload(cfg, acc, q=None):
     q = q or {}
     period = q.get("period") or "all"
-    if period not in ("1m", "3m", "ytd", "12m", "py", "all"):
+    if period not in BENCH_PERIODS:
         period = "all"
     want = {c for c in (q.get("codes") or "").replace(";", ",").split(",") if c}
     key = ("bench", token_key(cfg), acc, period, tuple(sorted(want)))

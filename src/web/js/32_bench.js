@@ -5,10 +5,17 @@ const BN_LC={d1:'#19a070',d5:'#e3a21a',dm:'#e66767',na:'#8a90a0'};
 const bnRub=v=>bad(v)?'—':(v>0?'+':v<0?'−':'')+NF0.format(Math.abs(v))+' ₽';
 const bnPct=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' %';
 const bnPp=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' п.п.';
-function bnKey(){return S.account+'|'+S.period}
+/* срок сравнения выбирается на самой странице; при смене общего периода в шапке возвращаемся к нему */
+const BN_PER=[['1m','1 мес'],['3m','3 мес'],['6m','6 мес'],['12m','1 год'],['3y','3 года'],['ytd','С начала года'],['py','Прошлый год'],['all','Всё время']];
+function bnPer(){if(S.bnPg!==S.period){S.bnP=null;S.bnPg=S.period}return S.bnP&&BN_PER.some(x=>x[0]===S.bnP)?S.bnP:S.period}
+const bnPerName=()=>(BN_PER.find(x=>x[0]===bnPer())||['','за период'])[1].toLowerCase();
+const bnPerLbl=()=>{const k=bnPer();return k==='ytd'||k==='py'||k==='all'?bnPerName():'за '+bnPerName()};
+function bnPerSeg(){return`<div class="bn-per noprint"><span class="bn-gl">Срок сравнения</span><div class="seg" id="bn-per">${BN_PER.map(([k,t])=>`<button type="button" class="${k===bnPer()?'on':''}" data-p="${k}">${t}</button>`).join('')}</div></div>`}
+function bnSpan(a,b){const dd=(new Date(b)-new Date(a))/864e5;if(dd<75)return Math.round(dd)+' дн.';if(dd<700)return Math.round(dd/30.4)+' мес';return(dd/365.25).toFixed(1).replace('.',',')+' г.'}
+function bnKey(){return S.account+'|'+bnPer()}
 function bnLoadData(){
   const key=bnKey();if(S.bnLoad===key)return;S.bnLoad=key;
-  const p=new URLSearchParams({account:S.account,period:S.period});
+  const p=new URLSearchParams({account:S.account,period:bnPer()});
   api('/api/bench?'+p).then(j=>{if(S.bnLoad===key)S.bnLoad=null;S.bn[key]={d:j,t:Date.now()};if(S.page==='bench'&&bnKey()===key)renderSoon()})
    .catch(e=>{if(S.bnLoad===key)S.bnLoad=null;S.bn[key]={d:{error:e.message},t:Date.now(),fail:1};if(S.page==='bench'&&bnKey()===key)renderSoon()});
 }
@@ -39,6 +46,7 @@ function bnTable(d){
   const row=(b,isP)=>{
     const sm=b.same;
     return`<tr${isP?' class="bn-me"':''}><td class="l">${isP?'<b>Мой портфель</b>':`<b>${esc(b.name)}</b>${b.partial?`<br><small class="mu">данные с ${ddm(b.start)}</small>`:''}`}</td>
+      <td class="num mu">${bnSpan(isP?d.start:b.start,d.end)}</td>
       <td class="num ${isP?cls(b.ret):bnCmp(b.ret,p.ret,true)}">${bnPct(b.ret)}</td>
       <td class="num ${isP?'':bnCmp(b.ann,p.ann,true)}">${b.ann==null?'<span class="mu">—</span>':bnPct(b.ann)}</td>
       <td class="num ${isP?'':bnCmp(b.vol,p.vol,false)}">${f1(b.vol,' %')}</td>
@@ -49,8 +57,8 @@ function bnTable(d){
       <td class="num ${isP?'':sm?cls(sm.diff):''}">${isP?'—':sm?bnRub(sm.diff):'—'}</td></tr>`};
   const by={};d.bench.filter(b=>b.available).forEach(b=>{(by[b.group]=by[b.group]||[]).push(b)});
   let h=row(p,true);
-  d.groups.filter(g=>by[g]).forEach(g=>{h+=`<tr class="bn-gr"><td class="l" colspan="10">${esc(g)}</td></tr>`+by[g].map(b=>row(b,false)).join('')});
-  return`<div class="tbl"><table class="bn-t"><thead><tr><th class="l">Что сравниваем</th><th>Доходность за период</th><th>В пересчёте на год</th><th>Колебания цены за год</th><th>Макс. просадка</th><th>Шарп</th><th>Бета к портфелю</th><th>Корреляция</th><th>Было бы с теми же деньгами</th><th>Вы заработали больше (меньше)</th></tr></thead><tbody>${h}</tbody></table></div>`;
+  d.groups.filter(g=>by[g]).forEach(g=>{h+=`<tr class="bn-gr"><td class="l" colspan="11">${esc(g)}</td></tr>`+by[g].map(b=>row(b,false)).join('')});
+  return`<div class="tbl"><table class="bn-t"><thead><tr><th class="l">Что сравниваем</th><th>Срок</th><th>Доходность ${bnPerLbl()}</th><th>В пересчёте на год</th><th>Колебания цены за год</th><th>Макс. просадка</th><th>Шарп</th><th>Бета к портфелю</th><th>Корреляция</th><th>Было бы с теми же деньгами</th><th>Вы заработали больше (меньше)</th></tr></thead><tbody>${h}</tbody></table></div>`;
 }
 function bnLiquidity(d){
   const l=d.liquidity;
@@ -86,26 +94,26 @@ function bnPremium(d){
 }
 function pBench(){
   const e=bnCur();
-  if(!e){bnLoadData();return`<div class="card">${waitBox('Сравниваю портфель с индексами и фондами Мосбиржи. Первый раз это может занять несколько минут (загружается история цен и оценивается ликвидность), потом данные берутся из локального кэша…')}</div>`}
+  if(!e){bnLoadData();return`<div class="card">${bnPerSeg()}${waitBox('Сравниваю портфель с индексами и фондами Мосбиржи. Первый раз это может занять несколько минут (загружается история цен и оценивается ликвидность), потом данные берутся из локального кэша…')}</div>`}
   const d=e.d;
-  if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="bn-retry">Повторить</button></div>`;
+  if(d.error)return bnPerSeg()+`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="bn-retry">Повторить</button></div>`;
   const p=d.portfolio,B=c=>d.bench.find(b=>b.code===c&&b.available),lq=B('LQDT'),cb=B('RUCBTRNS');
   const l=d.liquidity,fast=l&&l.bonds_count?(l.buckets.find(b=>b.key==='d1')||{}).share:null;
   const pr=d.premium,prem=pr&&pr.lqdt!=null?(pr.prem_ytm_ex!=null?pr.prem_ytm_ex:pr.prem_ytm):null;
   const sm=lq&&lq.same;
   chart('bn-chart',bnChart);
   const kp=`<div class="g g6">
-    ${kpi('Ваша доходность',bnPct(p.ret,2),`LQDT: ${lq?bnPct(lq.ret,1):'—'} · корп. облигации: ${cb?bnPct(cb.ret,1):'—'}`,cls(p.ret),S1)}
+    ${kpi('Ваша доходность '+bnPerLbl(),bnPct(p.ret,2),`LQDT: ${lq?bnPct(lq.ret,1):'—'} · корп. облигации: ${cb?bnPct(cb.ret,1):'—'}`,cls(p.ret),S1)}
     ${kpi('Те же деньги в LQDT',sm?bnRub(sm.diff):'—',sm?(sm.diff>=0?'вы заработали больше, чем дал бы фонд ликвидности':'фонд ликвидности дал бы больше, чем вы заработали'):'нет данных по LQDT',sm?cls(sm.diff):'',S3)}
     ${kpi('Доходность в годовых (XIRR)',p.xirr==null?'—':bnPct(p.xirr,1),p.xirr==null?'период короче 3 месяцев':`LQDT с теми же вложениями: ${sm&&sm.xirr!=null?bnPct(sm.xirr,1):'—'}`,cls(p.xirr),S7)}
     ${kpi('Коэффициент Шарпа',bad(p.sharpe)?'—':f2(p.sharpe),'доходность сверх безрисковой ставки на единицу риска',p.sharpe>0?'pos':p.sharpe<0?'neg':'',S2)}
     ${kpi('Продаётся за 1 день',fast==null?'—':pctp(fast,0),'доля облигаций, которую можно продать за день',fast!=null&&fast<70?'neg':'',S5)}
     ${kpi('Премия к LQDT',prem==null?'—':bnPp(prem),pr&&pr.lqdt!=null?`LQDT даёт ≈ ${pctp(pr.lqdt,1)} годовых`:'доходность LQDT недоступна',prem==null?'':cls(prem),S4)}</div>`;
   const notes=(d.notes||[]).length?`<div class="msg info" style="margin:0 0 12px">${d.notes.map(esc).join('<br>')}</div>`:'';
-  return kp+notes+`<div class="card"><h2>Накопленная доходность<span class="sp">${periodName()}: ${ddm(d.start)} — ${ddm(d.end)}</span></h2>
+  return bnPerSeg()+kp+notes+`<div class="card"><h2>Накопленная доходность ${bnPerLbl()}<span class="sp">${ddm(d.start)} — ${ddm(d.end)}</span></h2>
     <div class="bn-sel" id="bn-sel">${bnChips(d)}</div><div id="bn-chart" class="chart"></div>
     <p class="note" style="margin-top:8px">Показано, на сколько процентов выросли вложения с начала периода. Линия портфеля — по методу TWR: пополнения и выводы не искажают результат.</p></div>
-  <div class="card"><h2>Сравнение по показателям<span class="sp">красным выделено то, в чём бенчмарк лучше вашего портфеля, зелёным — где хуже</span></h2>${bnTable(d)}
+  <div class="card"><h2>Сравнение по показателям ${bnPerLbl()}<span class="sp">красным выделено то, в чём бенчмарк лучше вашего портфеля, зелёным — где хуже</span></h2>${bnTable(d)}
     <p class="note" style="margin-top:10px">«Колебания цены» — насколько сильно портфель «качается» (годовое стандартное отклонение дневных изменений по торговым дням Мосбиржи). «Макс. просадка» — самое большое падение от пика до дна. «Шарп» — доходность сверх ставки RUSFAR (безрисковая ставка межбанка) на единицу колебаний; для фондов ликвидности он малоинформативен, потому что колебаний почти нет, а для периода короче нескольких месяцев — шумный. «Бета» показывает, на сколько процентов в среднем меняется ваш портфель при изменении бенчмарка на 1 %, «корреляция» — насколько они движутся вместе (от −1 до 1). «Было бы с теми же деньгами» — во что превратились бы стоимость портфеля на начало периода и все ваши пополнения и выводы, если бы в те же дни их вложили в этот бенчмарк.</p></div>
   <div class="g g2 bn-g">${bnLiquidity(d)}${bnPremium(d)}</div>
   <div class="card"><h2>Как читать этот раздел</h2><div class="note bn-expl">
@@ -116,6 +124,8 @@ function pBench(){
 }
 function bindBench(){
   const r=$('#bn-retry');if(r)r.onclick=()=>{delete S.bn[bnKey()];S.bnLoad=null;render()};
+  const per=$('#bn-per');
+  if(per)per.onclick=e=>{const b=e.target.closest('button[data-p]');if(!b||b.dataset.p===bnPer())return;S.bnP=b.dataset.p;S.bnPg=S.period;render()};
   const sel=$('#bn-sel');
   if(sel)sel.onclick=e=>{const b=e.target.closest('button[data-c]');if(!b||b.disabled)return;const c=b.dataset.c;
     if(S.bnSel.has(c))S.bnSel.delete(c);else S.bnSel.add(c);b.classList.toggle('on',S.bnSel.has(c));const el=$('#bn-chart');if(el)bnChart(el)};

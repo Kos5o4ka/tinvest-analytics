@@ -4,3 +4,4 @@
 #rk-tab tbody tr{cursor:pointer}
 #rk-tab td small.neg{color:var(--neg);font-size:11px;line-height:1.3;display:inline-block;max-width:190px;white-space:normal}
 .rk-dur p{margin:0 0 8px}.rk-dur b{color:var(--tx2)}
+.rk-how{margin-bottom:16px;font-size:13px;color:var(--tx2)}.rk-how summary{cursor:pointer;font-weight:600;color:var(--tx)}.rk-how p{margin:10px 0 0;line-height:1.5}.rk-how b{color:var(--tx)}
