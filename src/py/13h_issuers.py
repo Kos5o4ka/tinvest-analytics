@@ -551,8 +551,7 @@ def _iss_portfolio(cfg, acc, job):
             rts = []
             for r in rs:
                 try:
-                    b = r.get("rating") if isinstance(r.get("rating"), dict) else None   # рейтинг уже найден в отчёте по облигациям
-                    b = b or best_rating(r["isin"], r.get("name") or "")
+                    b = best_rating(r["isin"], r.get("name") or "")      # заново: рейтинг в кэшированном отчёте мог быть посчитан до загрузки рейтингов
                     if b and b.get("v") in RATING_SCALE:
                         rts.append(b["v"])
                 except Exception:  # noqa: BLE001
@@ -618,12 +617,12 @@ def issuers_payload(cfg, acc, q, force):
     key = (token_key(cfg), acc)
     with _iss_jobs_lock:
         job = _iss_jobs.get(key)
-        fresh = job and job["state"] == "done" and time.time() - job["t"] < 1800
+        fresh = job and job["state"] == "done" and time.time() - job["t"] < 1800 and job.get("rs") == ratings_stamp()
         if job and job["state"] == "run":
             return {"pending": True, "done": job["done"], "total": job["total"]}
         if fresh and not force:
             return job["res"]
-        job = {"state": "run", "done": 0, "total": 0, "t": time.time(), "res": None}
+        job = {"state": "run", "done": 0, "total": 0, "t": time.time(), "res": None, "rs": ratings_stamp()}   # рейтинги сменились — пересчёт
         _iss_jobs[key] = job
 
     def work():

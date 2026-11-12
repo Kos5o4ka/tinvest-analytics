@@ -38,3 +38,4 @@ body.bc-open{overflow:hidden}
 #bc-iss .bc-kpis{margin:6px 0 10px}
 .rt-ag{font-weight:400;font-size:10px;color:var(--mu)}
 .bc-rt td,.bc-rt th{white-space:nowrap}
+#ptab tbody tr[data-isin]:hover td{background:var(--card2)}

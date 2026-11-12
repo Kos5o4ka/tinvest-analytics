@@ -14,7 +14,7 @@ function pPos(){
   const cols=[['name','Инструмент','l'],['type','Тип','l'],['qty','Кол-во'],['avg','Средняя'],['price','Текущая'],['value_rub','Стоимость, ₽'],['share','Доля'],['pnl_rub','P&L, ₽'],['pnl_pct','P&L %']];
   const th=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   const mxs=Math.max(1,...ps.map(x=>x.share||0));
-  const rows=ps.map(x=>`<tr><td>${ident(x)}</td>
+  const rows=ps.map(x=>`<tr${x.type==='bond'&&(x.isin||x.ticker)?` data-isin="${esc(x.isin||x.ticker)}" title="Открыть карточку выпуска"`:''}><td>${ident(x)}</td>
     <td class="l"><span class="tag">${TYPES[x.type]||esc(x.type)}</span>${x.blocked?' <span class="tag" style="color:var(--neg)">блок</span>':''}</td>
     <td class="num">${NFQ.format(x.qty)}</td><td class="num">${x.avg&&x.type!=='currency'?M(x.avg,x.cur):'—'}</td><td class="num">${M(x.price,x.cur)}</td>
     <td class="num">${x.value_rub!=null?M(x.value_rub):M(x.value,x.cur)}</td>
