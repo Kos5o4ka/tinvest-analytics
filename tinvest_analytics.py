@@ -4717,10 +4717,37 @@ def primary_payload():
 
 
 
-# ── ключевая ставка ЦБ и КБД Мосбиржи (доходность 2 года) ──
+# ── ключевая ставка ЦБ и КБД Мосбиржи (любые сроки из сетки кривой) ──
 
-KBD_KEY, KEY_KEY = "kbd2y_v1", "keyrate_v1"
+# v2: на каждую дату вся сетка {срок: доходность}; v1 хранил только 2 года (используем как запас, пока v2 докачивается)
+KBD_KEY, KBD_OLD_KEY, KEY_KEY = "kbd_grid_v2", "kbd2y_v1", "keyrate_v1"
+RATE_TERM_MIN, RATE_TERM_MAX, RATE_TERMS_MAX = 0.25, 30.0, 6
 _rates_state = {"running": False}
+
+
+def kbd_interp(grid, term):
+    """Доходность КБД на срок term (лет): линейная интерполяция между соседними точками сетки {срок: доходность}.
+    Вне диапазона сетки возвращает None (не экстраполируем и не тянем крайнее значение)."""
+    pts = sorted((float(k), v) for k, v in (grid or {}).items() if v is not None)
+    if not pts or term is None or term < pts[0][0] - 1e-9 or term > pts[-1][0] + 1e-9:
+        return None
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if term <= x1 + 1e-9:
+            return y0 if x1 == x0 else y0 + (y1 - y0) * (term - x0) / (x1 - x0)
+    return pts[-1][1]
+
+
+def parse_rate_terms(raw):
+    """'1,2,5.5' -> [1.0, 2.0, 5.5]: только числа в 0.25..30, без повторов, по возрастанию, не больше 6; по умолчанию [2.0]."""
+    out = set()
+    for x in str(raw or "").replace(";", ",").split(","):
+        try:
+            t = round(float(x.strip().replace(",", ".")), 2)
+        except ValueError:
+            continue
+        if RATE_TERM_MIN <= t <= RATE_TERM_MAX:
+            out.add(t)
+    return sorted(out)[:RATE_TERMS_MAX] or [2.0]
 
 
 def key_rate_series():
@@ -4742,8 +4769,8 @@ def key_rate_series():
 
 def _kbd_one(d):
     j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/zcyc.json?iss.meta=off&iss.only=yearyields&date=" + d))
-    ys = [r for r in j["yearyields"]["data"] if r[2] == 2.0]
-    return d, (ys[0][3] if ys else None)
+    g = {str(float(r[2])): r[3] for r in j["yearyields"]["data"] if r[3] is not None}
+    return d, (g or None)
 
 
 def _rates_run(days):
@@ -4787,10 +4814,12 @@ def rates_start(days):
     threading.Thread(target=_rates_run, args=(days,), daemon=True).start()
 
 
-def rates_payload(days):
+def rates_payload(days, terms=None):
     days = max(30, min(int(days or 365), 900))
+    tl = terms if isinstance(terms, list) else parse_rate_terms(terms)
     st = store()
     cache = st.get(KBD_KEY) or {}
+    old = st.get(KBD_OLD_KEY) or {}
     today = date.today()
     first = (today - timedelta(days=days)).isoformat()
     miss = sum(1 for i in range(days + 1) if (today - timedelta(days=i)).weekday() < 5
@@ -4801,16 +4830,28 @@ def rates_payload(days):
         keys = key_rate_series()
     except Exception:  # noqa: BLE001
         keys = st.get(KEY_KEY) or []
-    iso = sorted(d for d, v in cache.items() if v is not None and d >= first)
-    kbd, key, ki, last = [], [], 0, None
+    grids = {}
+    for d in set(cache) | set(old):
+        if d < first:
+            continue
+        g = cache.get(d)
+        if g:
+            grids[d] = g
+        elif d not in cache and old.get(d) is not None:
+            grids[d] = {"2.0": old[d]}      # запас до докачки v2: только срок 2 года
+    iso = sorted(grids)
+    kbd = {("%g" % t): [] for t in tl}
+    key, ki, last = [], 0, None
     for d in iso:
         while ki < len(keys) and keys[ki][0] <= d:
             last = keys[ki][1]
             ki += 1
-        kbd.append(round(cache[d], 2))
+        for t in tl:
+            v = kbd_interp(grids[d], t)
+            kbd["%g" % t].append(round(v, 2) if v is not None else None)
         key.append(last)
     return {"iso": iso, "labels": [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y") for d in iso],
-            "kbd": kbd, "key": key, "loading": _rates_state["running"] or miss > 0,
+            "kbd": kbd, "terms": tl, "key": key, "loading": _rates_state["running"] or miss > 0,
             "keys": [k for k in keys if k[0] >= first]}
 
 
@@ -13253,7 +13294,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/ladder":
                 return self.send(200, ladder_payload(cfg, q))
             if u.path == "/api/rates":
-                return self.send(200, rates_payload(q.get("days", "365")))
+                return self.send(200, rates_payload(q.get("days", "365"), q.get("terms", "2")))
             if u.path == "/api/backup":
                 return self.send(200, make_backup(), "application/zip",
                                  {"Content-Disposition": 'attachment; filename="tinvest_backup_%s.zip"' % date.today().isoformat()})
@@ -15889,34 +15930,71 @@ function notifyMon(d){
 /* ── Ставки: КБД и ключевая ставка ── */
 S.ratesDays=365;S.rates=null;
 const RDAYS=[[90,'3 мес'],[180,'6 мес'],[365,'Год'],[730,'2 года']];
+const RT_PRE=[1,2,3,5,10],RT_COL=['#2f6df6','#f59e0b','#8b5cf6','#e5484d','#0ea5a4','#64748b'],RT_MAX=6;
+/* выбранные сроки КБД (лет) и свои сроки; хранятся в localStorage */
+(()=>{const j=lsJson('ta_rates_terms',{}),ok=a=>Array.isArray(a)?a.map(Number).filter(t=>t>=0.25&&t<=30):[];
+  S.rTerms=[...new Set(ok(j.sel))].sort((x,y)=>x-y).slice(0,RT_MAX);if(!S.rTerms.length)S.rTerms=[2];
+  S.rCustom=[...new Set(ok(j.custom))].filter(t=>!RT_PRE.includes(t)).sort((x,y)=>x-y)})();
+const rtSave=()=>lsSet('ta_rates_terms',JSON.stringify({sel:S.rTerms,custom:S.rCustom}));
+const rtLab=t=>t<1?Math.round(t*12)+' мес':String(t).replace('.',',')+' г.';
+const rtColor=t=>RT_COL[S.rTerms.indexOf(t)%RT_COL.length];
+function rtReload(){S.rates=null;rtSave();render()}
 function loadRates(){
-  const d=S.ratesDays;
-  api('/api/rates?days='+d).then(j=>{if(d!==S.ratesDays)return;S.rates=j;if(S.page==='mkt')renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays)loadRates()},3000)})
+  const d=S.ratesDays,tm=S.rTerms.join(',');
+  api('/api/rates?days='+d+'&terms='+tm).then(j=>{if(d!==S.ratesDays||tm!==S.rTerms.join(','))return;S.rates=j;if(S.page==='mkt')renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays&&tm===S.rTerms.join(','))loadRates()},3000)})
    .catch(e=>{S.rates={error:e.message,labels:[]};if(S.page==='mkt')renderSoon()});
 }
+document.addEventListener('click',e=>{
+  const c=e.target.closest('#rterms [data-t]');
+  if(c){const t=+c.dataset.t,i=S.rTerms.indexOf(t);
+    if(i>=0){if(S.rTerms.length>1)S.rTerms.splice(i,1)}else if(S.rTerms.length<RT_MAX){S.rTerms.push(t);S.rTerms.sort((x,y)=>x-y)}else return;
+    return rtReload()}
+  const x=e.target.closest('#rterms [data-x]');
+  if(x){const t=+x.dataset.x;S.rCustom=S.rCustom.filter(v=>v!==t);const i=S.rTerms.indexOf(t);if(i>=0&&S.rTerms.length>1)S.rTerms.splice(i,1);return rtReload()}
+  if(e.target.closest('#rtadd'))rtAdd();
+});
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='rtin')rtAdd()});
+function rtAdd(){
+  const el=$('#rtin'),t=Math.round(parseFloat(String(el.value).replace(',','.'))*100)/100;
+  if(!(t>=0.25&&t<=30)){el.style.borderColor='var(--neg)';return}
+  if(!RT_PRE.includes(t)&&!S.rCustom.includes(t)){S.rCustom.push(t);S.rCustom.sort((x,y)=>x-y)}
+  if(!S.rTerms.includes(t)){if(S.rTerms.length>=RT_MAX)return;S.rTerms.push(t);S.rTerms.sort((x,y)=>x-y)}
+  rtReload();
+}
+function termChips(){
+  const all=[...RT_PRE,...S.rCustom].sort((x,y)=>x-y);
+  return`<div class="rt-bar" id="rterms">${all.map(t=>{const on=S.rTerms.includes(t),cu=S.rCustom.includes(t);
+    return`<span class="rt-chip${on?' on':''}"${on?` style="--rc:${rtColor(t)}"`:''}><button data-t="${t}">${on?'<i></i>':''}${rtLab(t)}</button>${cu?`<button class="rt-x" data-x="${t}" title="Убрать срок">×</button>`:''}</span>`}).join('')}
+    <span class="rt-add"><input id="rtin" type="number" min="0.25" max="30" step="0.5" placeholder="+ свой срок, лет"><button id="rtadd" class="btn">Добавить</button></span></div>`;
+}
 const pc1=v=>v==null?'—':(+v).toFixed(2).replace(/0$/,'').replace(/\.0$/,'').replace('.',',')+'%';
+const ppf=v=>(v>0?'+':'')+v.toFixed(2).replace('.',',')+' п.п.';
 function pMkt(){
   const r=S.rates;
   if(!r){loadRates();return`<div class="card">${waitBox('Загружаю кривую доходности и ключевую ставку…')}</div>`}
   if(r.error)return`<div class="msg err">${esc(r.error)}</div>`;
-  const n=r.labels.length,i0=n-1;
+  const n=r.labels.length,i0=n-1,tms=r.terms||S.rTerms,K=t=>(r.kbd||{})[String(t)]||[];
   const seg=`<div class="seg" id="rdays">${RDAYS.map(([d,t])=>`<button data-d="${d}" class="${d===S.ratesDays?'on':''}">${t}</button>`).join('')}</div>`;
-  if(n<2)return`<div class="card">${r.loading?waitBox('Загружаю историю КБД с Мосбиржи — первый раз это занимает до минуты…'):'<div class="empty">Нет данных. Проверьте подключение к интернету.</div>'}</div>`;
-  const lastK=r.kbd[i0],lastC=r.key[i0],first=r.kbd[0];
+  if(n<2)return`<div class="card">${termChips()}${r.loading?waitBox('Загружаю историю КБД с Мосбиржи — первый раз это занимает до минуты…'):'<div class="empty">Нет данных. Проверьте подключение к интернету.</div>'}</div>`;
+  const bt=tms.includes(2)?2:tms[0],bk=K(bt),lastK=bk[i0],lastC=r.key[i0],firstI=bk.findIndex(v=>v!=null),first=bk[firstI];
+  const hasSl=tms.includes(1)&&tms.includes(10)&&K(10)[i0]!=null&&K(1)[i0]!=null,sl=hasSl?K(10)[i0]-K(1)[i0]:null;
   chart('c-rates',line,{h:360,zero:false,labels:r.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc1(v),
-    series:[{n:'КБД · 2 года',c:'#2f6df6',hex:'#2f6df6',v:r.kbd,w:2.2},{n:'Ключевая ставка',c:'#3f7a4f',hex:'#3f7a4f',v:r.key,w:2.4,step:true}],
+    series:[{n:'Ключевая ставка',c:'#3f7a4f',hex:'#3f7a4f',v:r.key,w:2.4,step:true},...tms.map(t=>({n:'КБД · '+rtLab(t),c:rtColor(t),hex:rtColor(t),v:K(t),w:2.2}))],
     hover:i=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i)},leave:()=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i0)}});
-  return`<div class="g g4">${kpi('КБД · 2 года',pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,'#2f6df6')}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'#3f7a4f')}
-    ${kpi('КБД − ключевая',lastC!=null?((lastK-lastC>0?'+':'')+(lastK-lastC).toFixed(2).replace('.',',')+' п.п.'):'—','рынок закладывает '+(lastK>lastC?'повышение / удержание':'снижение')+' ставки',lastK>lastC?'neg':'pos')}
-    ${kpi('КБД за период',((lastK-first>0?'+':'')+(lastK-first).toFixed(2).replace('.',',')+' п.п.'),'с '+r.labels[0],lastK-first>0?'neg':'pos')}</div>
-  <div class="card rates"><h2>Доходность КБД (2 года) и ключевая ставка<span class="sp">${seg}</span></h2>
-    <p class="note rx-lead">Синяя линия — доходность 2-летних гособлигаций (КБД), зелёная — ключевая ставка. Если синяя выше зелёной — рынок ждёт, что ставка останется высокой; ниже — ждёт её снижения.</p>
+  const dk=lastK!=null&&lastC!=null?lastK-lastC:null;
+  return`<div class="g g4">${kpi('КБД · '+rtLab(bt),pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,rtColor(bt))}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'#3f7a4f')}
+    ${kpi('КБД '+rtLab(bt)+' − ключевая',dk!=null?ppf(dk):'—',dk==null?'':'рынок закладывает '+(dk>0?'повышение / удержание':'снижение')+' ставки',dk==null?null:dk>0?'neg':'pos')}
+    ${hasSl?kpi('Наклон: 10 лет − 1 год',ppf(sl),sl<0?'кривая инвертирована':'длинные ставки выше коротких',sl<0?'pos':null):
+      kpi('КБД '+rtLab(bt)+' за период',lastK!=null&&first!=null?ppf(lastK-first):'—','с '+r.labels[Math.max(0,firstI)],lastK!=null&&first!=null?(lastK-first>0?'neg':'pos'):null)}</div>
+  <div class="card rates"><h2>Доходность КБД и ключевая ставка<span class="sp">${seg}</span></h2>
+    <p class="note rx-lead">Линии КБД — доходность гособлигаций выбранных сроков, зелёная — ключевая ставка. Если линия КБД выше зелёной — рынок ждёт, что ставка останется высокой; ниже — ждёт её снижения. Сроки между точками кривой считаются линейной интерполяцией.</p>
+    ${termChips()}
     <div class="axt">Ставка, % годовых</div><div id="c-rates" class="chart"></div><div class="axt" style="text-align:center">Дата</div>
     <div class="strip" id="rstrip">${stripHtml(r,i0)}</div>${r.loading?'<p class="note">Догружаю историю…</p>':''}</div>
   ${ratesXHtml()}
-  <p class="note">КБД — кривая бескупонной доходности ОФЗ Московской биржи (срок 2 года), ключевая ставка — Банка России. Данные берутся с сайтов Мосбиржи и ЦБ при открытой программе и сохраняются локально. Справочная информация, не инвестиционная рекомендация.</p>`;
+  <p class="note">КБД — кривая бескупонной доходности ОФЗ Московской биржи (выбранные сроки), ключевая ставка — Банка России. Данные берутся с сайтов Мосбиржи и ЦБ при открытой программе и сохраняются локально. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
-function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КБД · 2 года: <b>${pc1(r.kbd[i])}</b></span><span>КС: <b>${pc1(r.key[i])}</b></span>`}
+function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КС: <b>${pc1(r.key[i])}</b></span>`+(r.terms||[]).map(t=>`<span>КБД · ${rtLab(t)}: <b>${pc1(((r.kbd||{})[String(t)]||[])[i])}</b></span>`).join('')}
 
 
 /* ── Кривая КБД: сегодня против прошлых дат; история спредов к КБД по рейтингам ── */
@@ -15987,6 +16065,12 @@ function curveCard(cv,its){
 .rx-tb{width:100%;margin-top:12px}.rx-tb td:first-child{text-align:left}.rx-tb td.pos{color:var(--pos)}.rx-tb td.neg{color:var(--neg)}
 .rx-sum b.pos,#tip span.pos{color:var(--pos)}.rx-sum b.neg,#tip span.neg{color:var(--neg)}
 .rx-lead{margin:2px 0 10px}
+.rt-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:4px 0 12px}
+.rt-chip{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;background:var(--card)}
+.rt-chip button{all:unset;cursor:pointer;padding:5px 12px;font-size:13px;color:var(--tx2);display:inline-flex;align-items:center;gap:6px}
+.rt-chip.on{border-color:var(--rc)}.rt-chip.on button{color:var(--tx)}.rt-chip i{width:9px;height:9px;border-radius:50%;background:var(--rc)}
+.rt-chip .rt-x{padding:5px 9px 5px 0;color:var(--mu)}.rt-chip .rt-x:hover{color:var(--neg)}
+.rt-add{display:inline-flex;gap:6px;margin-left:auto}.rt-add input{width:150px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--tx);padding:5px 8px;font-size:13px}
 `;document.head.appendChild(st)})();
 /* ── Ребалансировка ── */
 S.reb={contrib:'',buyOnly:true,draft:null,tax:null};S.payDays=90;

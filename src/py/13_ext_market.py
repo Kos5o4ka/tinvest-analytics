@@ -242,10 +242,37 @@ def primary_payload():
 
 
 
-# ── ключевая ставка ЦБ и КБД Мосбиржи (доходность 2 года) ──
+# ── ключевая ставка ЦБ и КБД Мосбиржи (любые сроки из сетки кривой) ──
 
-KBD_KEY, KEY_KEY = "kbd2y_v1", "keyrate_v1"
+# v2: на каждую дату вся сетка {срок: доходность}; v1 хранил только 2 года (используем как запас, пока v2 докачивается)
+KBD_KEY, KBD_OLD_KEY, KEY_KEY = "kbd_grid_v2", "kbd2y_v1", "keyrate_v1"
+RATE_TERM_MIN, RATE_TERM_MAX, RATE_TERMS_MAX = 0.25, 30.0, 6
 _rates_state = {"running": False}
+
+
+def kbd_interp(grid, term):
+    """Доходность КБД на срок term (лет): линейная интерполяция между соседними точками сетки {срок: доходность}.
+    Вне диапазона сетки возвращает None (не экстраполируем и не тянем крайнее значение)."""
+    pts = sorted((float(k), v) for k, v in (grid or {}).items() if v is not None)
+    if not pts or term is None or term < pts[0][0] - 1e-9 or term > pts[-1][0] + 1e-9:
+        return None
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if term <= x1 + 1e-9:
+            return y0 if x1 == x0 else y0 + (y1 - y0) * (term - x0) / (x1 - x0)
+    return pts[-1][1]
+
+
+def parse_rate_terms(raw):
+    """'1,2,5.5' -> [1.0, 2.0, 5.5]: только числа в 0.25..30, без повторов, по возрастанию, не больше 6; по умолчанию [2.0]."""
+    out = set()
+    for x in str(raw or "").replace(";", ",").split(","):
+        try:
+            t = round(float(x.strip().replace(",", ".")), 2)
+        except ValueError:
+            continue
+        if RATE_TERM_MIN <= t <= RATE_TERM_MAX:
+            out.add(t)
+    return sorted(out)[:RATE_TERMS_MAX] or [2.0]
 
 
 def key_rate_series():
@@ -267,8 +294,8 @@ def key_rate_series():
 
 def _kbd_one(d):
     j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/zcyc.json?iss.meta=off&iss.only=yearyields&date=" + d))
-    ys = [r for r in j["yearyields"]["data"] if r[2] == 2.0]
-    return d, (ys[0][3] if ys else None)
+    g = {str(float(r[2])): r[3] for r in j["yearyields"]["data"] if r[3] is not None}
+    return d, (g or None)
 
 
 def _rates_run(days):
@@ -312,10 +339,12 @@ def rates_start(days):
     threading.Thread(target=_rates_run, args=(days,), daemon=True).start()
 
 
-def rates_payload(days):
+def rates_payload(days, terms=None):
     days = max(30, min(int(days or 365), 900))
+    tl = terms if isinstance(terms, list) else parse_rate_terms(terms)
     st = store()
     cache = st.get(KBD_KEY) or {}
+    old = st.get(KBD_OLD_KEY) or {}
     today = date.today()
     first = (today - timedelta(days=days)).isoformat()
     miss = sum(1 for i in range(days + 1) if (today - timedelta(days=i)).weekday() < 5
@@ -326,16 +355,28 @@ def rates_payload(days):
         keys = key_rate_series()
     except Exception:  # noqa: BLE001
         keys = st.get(KEY_KEY) or []
-    iso = sorted(d for d, v in cache.items() if v is not None and d >= first)
-    kbd, key, ki, last = [], [], 0, None
+    grids = {}
+    for d in set(cache) | set(old):
+        if d < first:
+            continue
+        g = cache.get(d)
+        if g:
+            grids[d] = g
+        elif d not in cache and old.get(d) is not None:
+            grids[d] = {"2.0": old[d]}      # запас до докачки v2: только срок 2 года
+    iso = sorted(grids)
+    kbd = {("%g" % t): [] for t in tl}
+    key, ki, last = [], 0, None
     for d in iso:
         while ki < len(keys) and keys[ki][0] <= d:
             last = keys[ki][1]
             ki += 1
-        kbd.append(round(cache[d], 2))
+        for t in tl:
+            v = kbd_interp(grids[d], t)
+            kbd["%g" % t].append(round(v, 2) if v is not None else None)
         key.append(last)
     return {"iso": iso, "labels": [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y") for d in iso],
-            "kbd": kbd, "key": key, "loading": _rates_state["running"] or miss > 0,
+            "kbd": kbd, "terms": tl, "key": key, "loading": _rates_state["running"] or miss > 0,
             "keys": [k for k in keys if k[0] >= first]}
 
 
