@@ -1,5 +1,5 @@
 [Unit]
-Description=Обновление сервера данных и бота T-Invest Analytics из GitHub
+Description=Обновление сервера данных и бота TAnalytic из GitHub
 After=network-online.target
 Wants=network-online.target
 

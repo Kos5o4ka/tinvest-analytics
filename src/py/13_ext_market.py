@@ -199,10 +199,10 @@ def screener_payload():
 _pri = {"t": 0, "rows": []}
 
 
-def primary_rows():
-    if time.time() - _pri["t"] < 1800 and _pri["rows"]:
-        return _pri["rows"]
-    s = http_text("https://investmint.ru/bond-placements/", timeout=40)
+# ВАЖНО: placements_parse (и _strip) дублируются в server/tinvest_server.py (эндпоинт /v1/parsed/investmint/placements).
+# Менять синхронно; tests/test_parsed.py сверяет результаты на общем HTML-образце.
+def placements_parse(s):
+    """HTML investmint.ru/bond-placements/ -> список строк календаря размещений (по дате старта). Чистая функция."""
     rows, seen = [], set()
     for tr in re.findall(r"<tr>\s*<td class=\"min-w-56.*?</tr>", s, re.S):
         isin = re.search(r'font-mono text-xs">([A-Z0-9]{12})<', tr)
@@ -225,6 +225,15 @@ def primary_rows():
                      "book": _strip(tds[2]) if len(tds) > 2 else "", "status": _strip(tds[3]) if len(tds) > 3 else "",
                      "link": link.group(1) if link else ""})
     rows.sort(key=lambda r: r["start"])
+    return rows
+
+
+def primary_rows():
+    if time.time() - _pri["t"] < 1800 and _pri["rows"]:
+        return _pri["rows"]
+    rows = ds_parsed("investmint/placements", timeout=40)       # разбор на сервере данных; None -> разбираем сами
+    if not (isinstance(rows, list) and rows and all(isinstance(r, dict) and r.get("start") for r in rows)):
+        rows = placements_parse(http_text("https://investmint.ru/bond-placements/", timeout=40))
     _pri.update(t=time.time(), rows=rows)
     return rows
 

@@ -138,7 +138,7 @@ def encrypt_bytes(password, plain, iters=BK_ITER):
 
 def decrypt_bytes(password, blob):
     if len(blob) < 8 + 4 + 16 + 12 + 32 or blob[:8] != BK_MAGIC:
-        raise BackupError("Это не файл резервной копии T-Invest Analytics (или он повреждён).")
+        raise BackupError("Это не файл резервной копии TAnalytic (или он повреждён).")
     iters = struct.unpack(">I", blob[8:12])[0]
     if not 1000 <= iters <= 20000000:
         raise BackupError("Файл повреждён: неверные параметры шифрования.")
@@ -170,7 +170,7 @@ def backup_plain():
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
             z.write(tmp, "data.db")
             z.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
-            z.writestr("README.txt", "Зашифрованная резервная копия T-Invest Analytics. Токен API и пароли в копию не входят.\n")
+            z.writestr("README.txt", "Зашифрованная резервная копия TAnalytic. Токен API и пароли в копию не входят.\n")
         return buf.getvalue()
     finally:
         try:

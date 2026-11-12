@@ -1,5 +1,5 @@
 [Unit]
-Description=Ежесуточное обновление T-Invest Analytics в 03:00 МСК
+Description=Ежесуточное обновление TAnalytic в 03:00 МСК
 
 [Timer]
 OnCalendar=*-*-* 03:00:00 Europe/Moscow

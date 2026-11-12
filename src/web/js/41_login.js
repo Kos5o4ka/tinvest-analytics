@@ -1,4 +1,4 @@
-/* ── Вход по ключу из Telegram-бота (ключ действует сутки; токен Т-Инвестиций остаётся на компьютере) ── */
+/* ── Вход по ключу из Telegram-бота (ключ действует 7 дней; токен Т-Инвестиций остаётся на компьютере) ── */
 const AUTH={st:null,bot:'tanalyticbot',busy:false,tick:0};
 function authTime(ts){
   const d=new Date(ts*1000),t=d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
@@ -23,8 +23,8 @@ function authOverlay(show,err){
   ov=document.createElement('div');ov.id='login-ov';
   ov.innerHTML=`<div class="lg-box" role="dialog" aria-modal="true" aria-label="Вход">
     <div class="logo"><i><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#111" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16l5-6 4 3 7-8"/></svg></i>
-      <div>T-Invest Analytics<small>аналитика портфеля</small></div></div>
-    <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует сутки.</p>
+      <div>TAnalytic<small>аналитика портфеля</small></div></div>
+    <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует 7 дней.</p>
     <a class="btn" id="lg-bot" href="https://t.me/${bot}?start=app" target="_blank" rel="noopener noreferrer">Открыть @${bot}</a>
     <form id="lg-form" autocomplete="off">
       <input class="in" id="lg-key" placeholder="TIA-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" autofocus>

@@ -1,0 +1,7 @@
+/* ── Демо-режим и подсказка про токен «только чтение» ── */
+#demo-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 12px;padding:10px 16px;border-radius:12px;background:#ffdd2d1f;border:1px solid #ffdd2d66;color:var(--tx);font-size:14px}
+#demo-bar .dm-b{display:flex;gap:8px;flex-wrap:wrap}
+#demo-bar .btn{padding:6px 12px}
+.ro-note{display:flex;gap:10px;align-items:flex-start;padding:11px 14px;border-radius:12px;background:#3ecf8e1a;border:1px solid #3ecf8e55;color:var(--tx);font-size:13.5px;line-height:1.5;margin:6px 0}
+.ro-note svg{width:18px;height:18px;flex:none;margin-top:2px;color:var(--pos)}
+@media print{#demo-bar{display:none}}

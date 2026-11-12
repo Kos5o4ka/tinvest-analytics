@@ -19,7 +19,7 @@ function notifyUpcoming(){
     if(!('Notification' in window)||Notification.permission!=='granted')return;
     const seen=new Set(JSON.parse(lsGet('ta_notified')||'[]'));
     upcoming().forEach(e=>{const k=e.date+'|'+e.kind+'|'+e.name;if(seen.has(k))return;seen.add(k);
-      new Notification('T-Invest: '+(EVK[e.kind]||e.kind)+' '+ddm(e.date),{body:e.name+(e.amount!=null?' · '+M(e.amount):'')})});
+      new Notification('TAnalytic: '+(EVK[e.kind]||e.kind)+' '+ddm(e.date),{body:e.name+(e.amount!=null?' · '+M(e.amount):'')})});
     localStorage.setItem('ta_notified',JSON.stringify([...seen].slice(-300)));
   }catch(e){}
 }
@@ -30,7 +30,7 @@ function notifyMon(d){
     if(!('Notification' in window)||Notification.permission!=='granted')return;
     const seen=new Set(JSON.parse(lsGet('ta_notified')||'[]'));
     (d.alerts||[]).filter(a=>a.severity==='high').forEach(a=>{const k='mon|'+a.id;if(seen.has(k))return;seen.add(k);
-      new Notification('T-Invest: тревога по '+(a.name||'облигации'),{body:a.message})});
+      new Notification('TAnalytic: тревога по '+(a.name||'облигации'),{body:a.message})});
     localStorage.setItem('ta_notified',JSON.stringify([...seen].slice(-300)));
   }catch(e){}
 }

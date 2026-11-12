@@ -356,7 +356,9 @@ def resolve_idents(client, idents):
     return out
 
 
-def finalize_import(client, ops):
+def finalize_import(client, ops, keep_demo=False):
+    if not keep_demo:
+        demo_remove()  # настоящий отчёт заменяет демо-портфель
     ids = resolve_idents(client, [o.get("_ident") for o in ops])
     for o in ops:
         ident = o.pop("_ident", "")

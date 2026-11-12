@@ -188,7 +188,7 @@ function issDetail(isin){
     h+=`<h3 class="iss-h">Кредитная история</h3><div class="bc-rel"><b class="${hs.defaults?'neg':hs.tech?'':'pos'}">${esc(hs.verdict)}</b><br><span class="mu">Выпусков эмитента на Мосбирже: ${hs.total} (торгуется сейчас: ${hs.traded}). Проверено на дефолт: ${hs.checked}${hs.total>hs.checked?' (сначала торгуемые)':''}. Флаги берутся из описания выпуска на Мосбирже.</span></div>`;
     if(bad_.length)h+=`<div class="tbl" style="margin-top:8px;max-height:260px"><table><thead><tr><th class="l">Выпуск</th><th class="l">Статус</th></tr></thead><tbody>`+bad_.map(x=>`<tr data-isin="${esc(x.isin)}"><td class="l">${esc(x.name)} <small class="mu">${esc(x.isin)}</small></td><td class="l neg">${x.default?'дефолт':'технический дефолт'}${x.traded?'':' · не торгуется'}</td></tr>`).join('')+`</tbody></table></div>`;
   }
-  return h+`<p class="note" style="margin-top:12px">Не является инвестиционной рекомендацией. Скоринг — упрощённая модель по открытой отчётности (МСФО группы по данным smart-lab, если эмитент входит в листинговую группу; иначе РСБУ отдельной компании); она может не отражать поддержку владельца и события после отчётной даты.</p></div>`;
+  return h+`<p class="note" style="margin-top:12px">Скоринг — упрощённая модель по открытой отчётности (МСФО группы по данным smart-lab, если эмитент входит в листинговую группу; иначе РСБУ отдельной компании); она может не отражать поддержку владельца и события после отчётной даты.</p>${NIR_NOTE}</div>`;
 }
 function bindIss(){
   const I=S.iss;

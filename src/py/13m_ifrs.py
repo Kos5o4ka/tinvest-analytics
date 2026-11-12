@@ -68,6 +68,8 @@ def _ifrs_num(s):
     return v / 100.0 if pct else v
 
 
+# ВАЖНО: ifrs_parse и _ifrs_num дублируются в server/tinvest_server.py (эндпоинт /v1/parsed/smartlab/ifrs).
+# Менять синхронно; tests/test_parsed.py сверяет результаты на общем HTML-образце.
 def ifrs_parse(html):
     """HTML страницы smart-lab -> {labels: ['2021', ..., 'LTM'], rows: {поле: [значения по меткам, строки для текста]}} или None."""
     if not html or "field=" not in html:
@@ -202,8 +204,9 @@ def ifrs_fin(ticker):
             if age < (IFRS_TTL if hit.get("status") == "ok" else IFRS_ERR_TTL if hit.get("status") == "err" else IFRS_NF_TTL):
                 return hit
         try:
-            html = _ifrs_http(IFRS_BASE % ticker)
-            parsed = ifrs_parse(html)
+            parsed = ds_parsed("smartlab/ifrs", {"ticker": ticker}, timeout=30)      # разбор на сервере; None -> сами
+            if not (isinstance(parsed, dict) and parsed.get("labels") and isinstance(parsed.get("rows"), dict)):
+                parsed = ifrs_parse(_ifrs_http(IFRS_BASE % ticker))
             if parsed is None:
                 res = {"status": "parse", "ticker": ticker, "years": [], "ltm": None, "bank": False, "url": IFRS_BASE % ticker, "fetched": time.time(),
                        "note": "Страница smart-lab в неожиданном формате."}

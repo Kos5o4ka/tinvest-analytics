@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Сервер данных T-Invest Analytics: общий кэширующий прокси к публичным источникам.
+"""Сервер данных TAnalytic: общий кэширующий прокси к публичным источникам.
 
 Клиент -> этот сервер -> MOEX ISS, ФНС ГИР БО, ЦБ, smart-lab, рейтинговые агентства.
 Сервер ходит к источникам один раз, кэширует ответ в SQLite и отдаёт всем клиентам, соблюдая лимиты запросов.
@@ -11,6 +11,7 @@
 import argparse
 import hashlib
 import hmac
+import html as html_mod
 import json
 import os
 import re
@@ -51,6 +52,106 @@ def _trading_now(now):
 
 def _moex_market_ttl(now):
     return 5 * MIN if _trading_now(now) else HOUR
+
+
+# ───────────────────────── разбор страниц источников (/v1/parsed/*) ─────────────────────────
+# ВАЖНО: функции ниже — копии клиентских парсеров из src/py/13_ext_market.py (placements_parse, _strip) и
+# src/py/13m_ifrs.py (_ifrs_num, ifrs_parse). Менять синхронно; tests/test_parsed.py сверяет результаты на общем HTML-образце.
+# Когда сайт меняет разметку, достаточно поправить парсер здесь и задеплоить сервер: клиент берёт готовый разбор отсюда.
+PARSED_V = 1
+
+
+def _strip(t):
+    return re.sub(r"\s+", " ", html_mod.unescape(re.sub(r"<[^>]+>", " ", t))).strip()
+
+
+def placements_parse(s):
+    """HTML investmint.ru/bond-placements/ -> список строк календаря размещений (по дате старта). Чистая функция."""
+    rows, seen = [], set()
+    for tr in re.findall(r"<tr>\s*<td class=\"min-w-56.*?</tr>", s, re.S):
+        isin = re.search(r'font-mono text-xs">([A-Z0-9]{12})<', tr)
+        issuer = re.search(r'font-medium">(.*?)</div>', tr, re.S)
+        desc = re.search(r'text-muted-foreground">(.*?)</div>', tr, re.S)
+        start = re.search(r'<time datetime="(\d{4}-\d\d-\d\d)"', tr)
+        if not (issuer and start):
+            continue
+        end = re.search(r"Плановое окончание:\s*([^<]+)<", tr)
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        link = re.search(r'href="(https://www\.moex\.com/[^"]+)"', tr)
+        key = isin.group(1) if isin else _strip(issuer.group(1)) + start.group(1)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = re.sub(r"(?i)\b(общество с ограниченной ответственностью|публичное акционерное общество|акционерное общество)\b", "",
+                      _strip(issuer.group(1))).replace('"', "").strip(" ()")
+        rows.append({"issuer": _strip(issuer.group(1)), "short": name, "desc": _strip(desc.group(1)) if desc else "",
+                     "isin": isin.group(1) if isin else "", "start": start.group(1), "end": _strip(end.group(1)) if end else "",
+                     "book": _strip(tds[2]) if len(tds) > 2 else "", "status": _strip(tds[3]) if len(tds) > 3 else "",
+                     "link": link.group(1) if link else ""})
+    rows.sort(key=lambda r: r["start"])
+    return rows
+
+
+def _ifrs_num(s):
+    """'11 674' -> 11674.0; '-364.0' -> -364.0; '31.4%' -> 0.314; '' / '—' / мусор -> None."""
+    if s is None:
+        return None
+    t = re.sub(r"<[^>]+>", "", str(s)).replace("&nbsp;", " ").replace("−", "-")
+    t = re.sub(r"[\s  ]+", "", t).replace(",", ".")
+    if not t or t in ("-", "—", "–"):
+        return None
+    pct = t.endswith("%")
+    if pct:
+        t = t[:-1]
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    return v / 100.0 if pct else v
+
+
+def ifrs_parse(html):
+    """HTML страницы smart-lab -> {labels: ['2021', ..., 'LTM'], rows: {поле: [значения по меткам, строки для текста]}} или None."""
+    if not html or "field=" not in html:
+        return None
+    m = re.search(r"<tr[^>]*class=\"[^\"]*header_row[^\"]*\"[^>]*>(.*?)</tr>", html, re.S)
+    if not m:
+        return None
+    labels = [x.strip() for x in re.findall(r"<strong>\s*([^<]+?)\s*</strong>", m.group(1))]
+    labels = [x for x in labels if re.fullmatch(r"\d{4}|LTM", x)]
+    if not labels:
+        return None
+    rows, bad = {}, 0
+    for fm in re.finditer(r"<tr[^>]*\bfield=\"([A-Za-z0-9_]+)\"[^>]*>(.*?)</tr>", html, re.S):
+        cells = []
+        for am, body in re.findall(r"<td([^>]*)>(.*?)</td>", fm.group(2), re.S):
+            if "chartrow" in am or "ltm_spc" in am:
+                continue
+            cells.append(re.sub(r"<[^>]+>", "", body).replace("&nbsp;", " ").strip())
+        if len(cells) != len(labels):
+            bad += 1
+            continue
+        rows[fm.group(1)] = cells
+    if not rows or bad > len(rows):
+        return None
+    return {"labels": labels, "rows": rows}
+
+
+def _p_placements(params):
+    return "https://investmint.ru/bond-placements/", placements_parse
+
+
+def _p_ifrs(params):
+    t = (params.get("ticker") or [""])[0].strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{1,12}", t):
+        raise ValueError("bad ticker")
+    return "https://smart-lab.ru/q/%s/f/y/MSFO/" % t, ifrs_parse
+
+
+# имя -> функция(params) -> (url источника, парсер html -> данные | None/пусто = неудача)
+PARSERS = {"investmint/placements": _p_placements, "smartlab/ifrs": _p_ifrs}
 
 
 # ───────────────────────── правила TTL ─────────────────────────
@@ -382,6 +483,7 @@ class DataServer:
         self._flights, self._flock = {}, threading.Lock()
         self._rate_lock, self._next_slot = threading.Lock(), {}
         self._stats_lock, self._stats = threading.Lock(), {}
+        self._plock, self._pcache = threading.Lock(), {}
 
     # --- разрешённость URL ---
     def url_allowed(self, url):
@@ -482,6 +584,40 @@ class DataServer:
             return res
         self._stat(host, "miss")
         return res
+
+    def parsed(self, name, params):
+        """Разбор страницы источника -> (http-код, json). Страница берётся через fetch() (кэш, TTL, лимиты); результат разбора
+        запоминается по хэшу тела страницы, так что повторный запрос при неизменной странице не парсит заново."""
+        mk = PARSERS.get(name)
+        if not mk:
+            return 404, {"ok": False, "error": "unknown parser"}
+        try:
+            url, fn = mk(params)
+        except ValueError as e:
+            return 400, {"ok": False, "error": str(e)}
+        r = self.fetch("GET", url)
+        if r.error:
+            return 502, {"ok": False, "error": "upstream failed"}
+        if r.status != 200:
+            return 200, {"ok": False, "error": "upstream status %d" % r.status}
+        h = hashlib.sha256(r.body).hexdigest()
+        ck = (name, url)
+        with self._plock:
+            c = self._pcache.get(ck)
+        if c and c[0] == h:
+            data = c[1]
+        else:
+            try:
+                data = fn(r.body.decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001
+                data = None
+            with self._plock:
+                if len(self._pcache) > 500:
+                    self._pcache.clear()
+                self._pcache[ck] = (h, data)
+        if not data:
+            return 200, {"ok": False, "error": "parse failed"}
+        return 200, {"ok": True, "v": PARSED_V, "data": data}
 
     def _single_flight(self, key, fn):
         with self._flock:
@@ -584,6 +720,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, {"error": "upstream failed"}, extra=[("X-Upstream-Error", "1")])
             extra = [("X-Cache", r.xcache), ("X-Age", str(r.age))] + [("X-Set-Cookie", c) for c in r.cookies]
             return self._send(r.status, r.body, r.ctype, extra)
+        if u.path.startswith("/v1/parsed/"):
+            if self.command != "GET":
+                return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", "GET")])
+            code, obj = app.parsed(u.path[len("/v1/parsed/"):], parse_qs(u.query))
+            return self._send(code, obj)
         self._send(404, {"error": "not found"})
 
     def _notify(self, client, info, body):
@@ -623,7 +764,7 @@ def make_http_server(app, host="127.0.0.1", port=8780):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Сервер данных T-Invest Analytics")
+    ap = argparse.ArgumentParser(description="Сервер данных TAnalytic")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--data", default=os.path.join(os.path.expanduser("~"), ".tinvest_server"))

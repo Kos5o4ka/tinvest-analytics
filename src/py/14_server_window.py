@@ -4,7 +4,7 @@ _ping = [0.0]
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "TInvestAnalytics/3.0"
+    server_version = "TAnalytic/3.0"
 
     def log_message(self, *a):
         pass
@@ -131,7 +131,9 @@ class Handler(BaseHTTPRequestHandler):
         self.guard(run)
 
     def do_POST(self):
-        if not self.ok_host() or "application/json" not in (self.headers.get("Content-Type") or ""):
+        # Sec-Fetch-Site: запросы с чужих сайтов отклоняем (защита от CSRF; старые браузеры заголовок не шлют)
+        if not self.ok_host() or "application/json" not in (self.headers.get("Content-Type") or "") \
+                or self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none"):
             return self.send(403, {"error": "forbidden"})
         path = urlparse(self.path).path
 

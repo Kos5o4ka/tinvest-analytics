@@ -86,7 +86,7 @@ function bindSetLocal(c,msg,busy,reset){
 /* ── Аккаунт и доступ ── */
 function setAccHtml(){
   return`<div class="card" id="acc-card"><h2>Аккаунт и доступ</h2><div style="display:grid;gap:12px">
-    <p class="note" style="margin:0">Вход в программу выполняется по ключу из Telegram-бота. Ключ действует сутки, токен Т-Инвестиций боту не передаётся.</p>
+    <p class="note" style="margin:0">Вход в программу выполняется по ключу из Telegram-бота. Ключ действует 7 дней, токен Т-Инвестиций боту не передаётся.</p>
     <div id="acc-who" class="ld-path">Проверяю…</div>
     <div class="row"><button class="btn ghost" id="acc-out" style="display:none">Выйти</button><a class="btn ghost" href="https://t.me/${esc(AUTH.bot)}" target="_blank" rel="noopener noreferrer">Открыть @${esc(AUTH.bot)}</a></div></div></div>`;
 }
@@ -117,6 +117,7 @@ async function renderSettings(){
       <input class="in" type="password" id="tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false"></label>
     <div class="row"><button class="btn" id="save">Сохранить и подключиться</button><button class="btn ghost" id="test">Проверить</button>
       ${c.token_set?'<button class="btn danger" id="clr">Удалить токен</button>':''}</div>
+    <div class="ro-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><div><b>Нужен токен только для чтения.</b> С ним нельзя торговать, выводить деньги или менять настройки счёта — это ограничение на стороне Т-Банка. Токен хранится только на этом компьютере.</div></div>
     <div class="note" style="line-height:1.6"><b>Как получить токен</b> (1 минута):<br>
       1. Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении Т-Инвестиции: Профиль → Настройки → Токены T-Invest API).<br>
       2. Нажмите «Создать токен», выберите доступ <b>«Только для чтения»</b> и все счета (или только нужные).<br>

@@ -264,7 +264,7 @@ def _tg_esc(s):
     return str(s if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-TG_DISCLAIMER = "\n\n<i>Не является ИИР.</i>"
+TG_DISCLAIMER = "\n\n<i>Не является индивидуальной инвестиционной рекомендацией.</i>"
 
 
 def tg_send(cfg, text):
@@ -327,7 +327,7 @@ def tg_info(cfg, acc, q, force):
 
 
 def tg_test(cfg, body):
-    tg_send(load_config(), "✅ <b>T-Invest Analytics</b>: тестовое сообщение. Уведомления подключены.")
+    tg_send(load_config(), "✅ <b>TAnalytic</b>: тестовое сообщение. Уведомления подключены.")
     return {"ok": True}
 
 
@@ -402,7 +402,7 @@ def tg_offer_due(items, today):
         base = "ofr|%s|%s|" % (isin, od)
         if kind == "put":
             if it.get("coupon_status") == "announced" and it.get("new_rate") is not None and (not pe or today <= pe):
-                out.append((base + "coupon", "🔔 <b>%s</b>: эмитент объявил купон после пут-оферты (%s): %s %% годовых. Можно решать, предъявлять ли бумагу."
+                out.append((base + "coupon", "🔔 <b>%s</b>: эмитент объявил купон после пут-оферты (%s): %s %% годовых. Приём заявок открывается в период предъявления."
                             % (nm, _tg_dmy(od), _f2(it["new_rate"]))))
             if ps and pe and ps <= today <= pe:
                 out.append((base + "open", "🔔 <b>%s</b>: открыт приём заявок по пут-оферте, с %s по %s (выкуп %s). Заявку подаёт брокер."
@@ -460,7 +460,7 @@ def _tg_ev_line(e):
 
 
 def tg_digest_text(cfg):
-    parts = ["<b>Сводка T-Invest Analytics · %s</b>" % date.today().strftime("%d.%m.%Y")]
+    parts = ["<b>Сводка TAnalytic · %s</b>" % date.today().strftime("%d.%m.%Y")]
     if cfg.get("token"):
         try:
             s = build_summary(cfg, "all", "all")

@@ -75,10 +75,10 @@ class Helper(unittest.TestCase):
         base = dict(coupon_status="announced", new_rate=15.0, peer_median=16.0, peers_n=5)
         b = T.of_helper(rec(hold_yield=14.0, **base))
         self.assertEqual(b["outcome"], "below")
-        self.assertIn("ниже рынка на 2,0 п. п.", b["title"])
+        self.assertIn("ниже медианы похожих выпусков на 2,0 п. п.", b["title"])
         self.assertIn("с 15.01 по 21.01", b["apply"])
-        self.assertEqual(T.of_helper(rec(hold_yield=16.2, **base))["title"], "Купон в рынке — можно оставить")
-        self.assertEqual(T.of_helper(rec(hold_yield=17.5, **base))["title"], "Купон выше рынка — оставить выгоднее")
+        self.assertEqual(T.of_helper(rec(hold_yield=16.2, **base))["title"], "Доходность на уровне медианы похожих выпусков")
+        self.assertEqual(T.of_helper(rec(hold_yield=17.5, **base))["title"], "Доходность выше медианы похожих выпусков")
 
     def test_no_peers_and_closed_and_price(self):
         h = T.of_helper(rec(coupon_status="announced", new_rate=15.0, hold_yield=15.0))

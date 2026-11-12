@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-T-Invest Analytics — аналитика брокерских счетов Т-Инвестиций и отчётов других брокеров.
+TAnalytic — аналитика брокерских счетов Т-Инвестиций и отчётов других брокеров.
 
 Один файл, только стандартная библиотека Python 3.8+. Запуск:
 
@@ -44,8 +44,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
-APP_NAME = "T-Invest Analytics"
-APP_VERSION = "0.17"
+APP_NAME = "TAnalytic"
+APP_VERSION = "0.18"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")

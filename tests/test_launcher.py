@@ -38,9 +38,9 @@ class FakeOpener:
 
 class Sums(unittest.TestCase):
     def test_parse(self):
-        txt = "%s  tinvest_analytics.py\n%s  TInvestAnalytics-win.exe\n" % (SHA, "b" * 64)
+        txt = "%s  tinvest_analytics.py\n%s  TAnalytic-win.exe\n" % (SHA, "b" * 64)
         self.assertEqual(L.parse_sums(txt, "tinvest_analytics.py"), SHA)
-        self.assertEqual(L.parse_sums(txt, "TInvestAnalytics-win.exe"), "b" * 64)
+        self.assertEqual(L.parse_sums(txt, "TAnalytic-win.exe"), "b" * 64)
 
     def test_binary_marker_and_case(self):
         self.assertEqual(L.parse_sums("%s *x.py" % SHA.upper(), "x.py"), SHA)
@@ -112,7 +112,7 @@ class Update(unittest.TestCase):
         rel = {"tag_name": tag, "assets": [
             {"name": "tinvest_analytics.py", "browser_download_url": "https://github.com/x/code"},
             {"name": "SHA256SUMS", "browser_download_url": "https://github.com/x/sums"}]}
-        sums = sums if sums is not None else "%s  tinvest_analytics.py\n%s  TInvestAnalytics-win.exe\n" % (SHA, "c" * 64)
+        sums = sums if sums is not None else "%s  tinvest_analytics.py\n%s  TAnalytic-win.exe\n" % (SHA, "c" * 64)
         calls = []
 
         def fetch(url, limit=0, progress=None, cancel=None):

@@ -117,7 +117,7 @@ function ladResult(d){
   chart('ld-cf',ladChart);
   return kp+warn+`<div class="card"><h2>Ступени лесенки<span class="sp">нажмите на строку — карточка выпуска</span></h2><div class="tbl"><table class="ld-tbl"><thead><tr><th class="l">Облигация</th><th class="l">Рейтинг</th><th>Доходность</th><th>Срок</th><th>Куплено</th><th>Стоимость</th><th class="l">Купоны</th></tr></thead><tbody>${body}</tbody></table></div></div>
   <div class="card"><h2>Выплаты по месяцам<span class="sp">купоны и возврат номинала</span></h2><div class="chart" id="ld-cf"></div></div>
-  <div class="card ld-notes"><h2>Почему так</h2><div class="note">${d.notes.map(n=>`<p>${esc(n)}</p>`).join('')}<p>Цены и доходности — по данным Мосбиржи на сегодня, расчёт с учётом накопленного купонного дохода и без комиссий; налог не учтён. Состав — справочная подборка, не индивидуальная инвестиционная рекомендация: перед покупкой проверьте эмитентов и условия выпусков.</p></div></div>`;
+  <div class="card ld-notes"><h2>Почему так</h2><div class="note">${d.notes.map(n=>`<p>${esc(n)}</p>`).join('')}<p>Цены и доходности — по данным Мосбиржи на сегодня, расчёт с учётом накопленного купонного дохода и без комиссий; налог не учтён. Состав — справочная подборка по заданным параметрам; сведения об эмитентах и условиях выпусков приведены в их документах.</p>${NIR_NOTE}</div></div>`;
 }
 function pLad(){
   const tabs=`<div class="seg noprint" style="margin-bottom:14px;width:fit-content">${[['my','Мой портфель'],['build','Подобрать лесенку']].map(([k,t])=>`<button class="${S.ladTab===k?'on':''}" data-ldtab="${k}">${t}</button>`).join('')}</div>`;

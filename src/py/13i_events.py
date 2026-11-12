@@ -287,8 +287,8 @@ def _ics_fold(line):
 
 def build_ics(events):
     now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//T-Invest Analytics//Calendar//RU", "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
-             "X-WR-CALNAME:T-Invest Analytics: события", "X-WR-TIMEZONE:Europe/Moscow"]
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TAnalytic//Calendar//RU", "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+             "X-WR-CALNAME:TAnalytic: события", "X-WR-TIMEZONE:Europe/Moscow"]
     for e in events:
         try:
             d0 = datetime.strptime(e["date"], "%Y-%m-%d")

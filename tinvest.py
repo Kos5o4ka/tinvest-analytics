@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Лаунчер T-Invest Analytics: проверяет обновления на GitHub, скачивает и запускает программу.
+"""Лаунчер TAnalytic: проверяет обновления на GitHub, скачивает и запускает программу.
 
 Запуск:  python3 tinvest.py          (--no-update — не проверять обновления,
                                        --no-gui — без окна, прогресс в консоли; то же TINVEST_NO_GUI=1)
@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 REPO = "Kos5o4ka/tinvest-analytics"
 FILE = "tinvest_analytics.py"            # файл программы в релизе
 SUMS = "SHA256SUMS"                      # строки вида «<sha256>  <имя файла>»
-TITLE = "T-Invest Analytics"
+TITLE = "TAnalytic"
 HOME = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 APP_DIR = os.path.join(HOME, "app")
 APP, VER = os.path.join(APP_DIR, FILE), os.path.join(APP_DIR, "version.txt")

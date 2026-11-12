@@ -23,9 +23,11 @@ function obRender(){
     <div class="ob-hd"><div class="ob-t">Добро пожаловать 👋</div><p class="t2">Три шага, и вы увидите свой портфель: доходность, выплаты, оферты и риски по облигациям.</p></div>
     ${obStep(1,'done','Ключ из бота',`<p class="mu">${authOk?'Вход выполнен.':'Готово — можно переходить к следующему шагу.'}</p>`)}
     ${obStep(2,tokDone?'done':'now','Токен Т-Инвестиций «только чтение»',tokDone?'<p class="mu">Токен сохранён и проверен.</p>':`
-      <p class="mu">Он нужен, чтобы программа могла прочитать ваши счета. Покупать и продавать с ним нельзя.</p>
+      ${`<div class="ro-note">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}<div><b>Нужен токен только для чтения.</b> С ним нельзя торговать, выводить деньги или менять настройки счёта — это ограничение на стороне Т-Банка. Токен хранится только на этом компьютере.</div></div>`}
+      <p class="mu">Он нужен, чтобы программа могла прочитать ваши счета.</p>
       <div class="ob-row"><input class="in" type="password" id="ob-tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false" aria-label="API-токен Т-Инвестиций">
-        <button class="btn" id="ob-save">Сохранить и проверить</button></div>
+        <button class="btn" id="ob-save">Сохранить и проверить</button>
+        <button class="btn ghost" id="ob-demo" title="Модельный портфель — без токена и без ваших данных">Посмотреть демо-портфель</button></div>
       <div id="ob-msg" role="status">${ob.err?`<div class="msg err">${esc(ob.err)}</div>`:''}</div>
       <details class="ob-how" ${ob.help?'open':''}><summary>Где взять токен</summary><ol>
         <li>Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении: Профиль → Настройки → Токены T-Invest API).</li>
@@ -56,6 +58,7 @@ function obRender(){
     }
   };
   b.onclick=save;
+  const dm=$('#ob-demo');if(dm)dm.onclick=()=>demoEnter(dm);
   input.onkeydown=e=>{if(e.key==='Enter')save()};
   $('#ob-imp').onclick=()=>go('imp');
   $('#ob-all').onclick=()=>{ob.skip=true;renderSettings()};

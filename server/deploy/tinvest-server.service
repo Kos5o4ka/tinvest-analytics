@@ -1,5 +1,5 @@
 [Unit]
-Description=T-Invest Analytics data server
+Description=TAnalytic data server
 After=network-online.target tinvest-bot.service
 Wants=network-online.target
 

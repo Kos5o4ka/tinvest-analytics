@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-T-Invest Analytics — аналитика брокерских счетов Т-Инвестиций и отчётов других брокеров.
+TAnalytic — аналитика брокерских счетов Т-Инвестиций и отчётов других брокеров.
 
 Один файл, только стандартная библиотека Python 3.8+. Запуск:
 
@@ -44,8 +44,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
-APP_NAME = "T-Invest Analytics"
-APP_VERSION = "0.17"
+APP_NAME = "TAnalytic"
+APP_VERSION = "0.18"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -184,7 +184,7 @@ def make_backup():
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(tmp, "data.db")
             z.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
-            z.writestr("README.txt", "Резервная копия T-Invest Analytics. Токены и пароли в копию не входят.\n"
+            z.writestr("README.txt", "Резервная копия TAnalytic. Токены и пароли в копию не входят.\n"
                        "Восстановление: закройте программу и положите data.db в папку данных (%s).\n" % APP_DIR)
         return buf.getvalue()
     finally:
@@ -195,6 +195,11 @@ def make_backup():
 
 
 def save_config(cfg):
+    if (cfg.get("token") or "").strip():
+        try:
+            demo_remove()  # реальный токен заменяет демо-портфель
+        except Exception:  # noqa: BLE001
+            pass
     with _cfg_lock:
         _private_write(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"))
 
@@ -3195,7 +3200,9 @@ def resolve_idents(client, idents):
     return out
 
 
-def finalize_import(client, ops):
+def finalize_import(client, ops, keep_demo=False):
+    if not keep_demo:
+        demo_remove()  # настоящий отчёт заменяет демо-портфель
     ids = resolve_idents(client, [o.get("_ident") for o in ops])
     for o in ops:
         ident = o.pop("_ident", "")
@@ -3260,6 +3267,222 @@ TEMPLATE_CSV = ("Дата;Тип операции;ISIN;Тикер;Названи
                 "31.12.2025;НДФЛ;;;;;;520;RUB;;\n")
 
 
+# ═══════════════════════════════ демо-портфель (без токена) ═══════════════════════════════
+# Модельный портфель в формате импорта отчёта брокера. Даты задаются смещением «дней назад» от сегодняшнего дня,
+# поэтому история всегда охватывает последние ~2 года. Цены и суммы выплат — приблизительные, не данные реального клиента.
+
+DEMO_ID = "imp-demo"
+DEMO_NAME = "Демо-портфель"
+
+# (ISIN, тикер MOEX, название, вид, купон на 1 облигацию в ₽, период купона в днях, дней назад до последнего купона)
+DEMO_INSTRUMENTS = [
+    ("RU000A1038V6", "SU26238RMFS4", "ОФЗ-ПД 26238", "bond", 35.40, 182, 162),
+    ("RU000A106E90", "SU26243RMFS4", "ОФЗ-ПД 26243", "bond", 48.87, 182, 162),
+    ("RU000A108EH4", "SU26248RMFS3", "ОФЗ-ПД 26248", "bond", 61.08, 182, 162),
+    ("RU000A106Z61", "SU29025RMFS2", "ОФЗ-ПК 29025 (флоатер)", "bond", 37.00, 91, 77),
+    ("RU000A10DS74", "RU000A10DS74", "Сбербанк Sb51R", "bond", 12.21, 30, 1),
+    ("RU000A1008D7", "RU000A1008D7", "РЖД 1Р-14R", "bond", 45.38, 182, 6),
+    ("RU000A10CL07", "RU000A10CL07", "Магнит БО 001P-09", "bond", 10.93, 30, 22),
+    ("RU000A10ER66", "RU000A10ER66", "ФосАгро БО 001P-06", "bond", 11.30, 30, 14),
+    ("RU000A10BW62", "RU000A10BW62", "МТС 2P-12", "bond", 10.89, 30, 23),
+    ("RU000A10BGY3", "RU000A10BGY3", "МТС 2P-10", "bond", 10.89, 30, 27),
+    ("RU000A0JXQ44", "RU000A0JXQ44", "РЖД Б01P2R", "bond", 71.80, 182, 27),
+    ("RU0009029540", "SBER", "Сбербанк России ПАО ао", "share", 0, 0, 0),
+    ("RU0009024277", "LKOH", "НК ЛУКОЙЛ (ПАО) - ао", "share", 0, 0, 0),
+]
+
+# ISIN -> (дата погашения, купонов в год, плавающий купон) — для карточки облигации без справочника Т-Инвестиций
+DEMO_BOND_PARAMS = {
+    "RU000A1038V6": ("2041-05-15", 2, False), "RU000A106E90": ("2038-05-19", 2, False), "RU000A108EH4": ("2040-05-16", 2, False),
+    "RU000A106Z61": ("2037-08-12", 4, True), "RU000A10DS74": ("2028-06-03", 12, False), "RU000A1008D7": ("2029-05-04", 2, False),
+    "RU000A10CL07": ("2027-08-17", 12, False), "RU000A10ER66": ("2029-04-16", 12, False), "RU000A10BW62": ("2030-06-01", 12, False),
+    "RU000A10BGY3": ("2030-03-30", 12, False), "RU000A0JXQ44": ("2037-04-02", 2, False),
+}
+
+# (дней назад, операция, ISIN, количество, цена в % номинала (облигации) или ₽ (акции))
+DEMO_TRADES = [
+    (720, "Покупка", "RU000A1038V6", 200, 63.2), (690, "Покупка", "RU000A106E90", 150, 78.5),
+    (600, "Покупка", "RU000A10CL07", 300, 100.6), (570, "Покупка", "RU0009029540", 500, 275.0),
+    (540, "Покупка", "RU000A108EH4", 120, 88.0), (500, "Покупка", "RU000A106Z61", 300, 98.9),
+    (480, "Покупка", "RU0009024277", 20, 6900.0), (450, "Покупка", "RU000A10DS74", 400, 99.5),
+    (420, "Покупка", "RU000A10BW62", 300, 100.3), (380, "Покупка", "RU000A1008D7", 250, 86.4),
+    (330, "Покупка", "RU000A10ER66", 200, 101.2), (300, "Покупка", "RU000A1038V6", 150, 56.0),
+    (250, "Покупка", "RU000A106E90", 100, 70.2), (250, "Покупка", "RU0009029540", 200, 310.0),
+    (250, "Покупка", "RU000A0JXQ44", 100, 97.0), (200, "Покупка", "RU000A10BGY3", 200, 99.9),
+    (90, "Продажа", "RU000A10CL07", 100, 99.8), (70, "Продажа", "RU0009029540", 200, 322.0),
+    (60, "Продажа", "RU000A1038V6", 100, 53.5),
+]
+# (дней назад, ISIN, выплата на 1 бумагу в ₽) — дивиденды
+DEMO_DIVS = [(482, "RU0009029540", 34.84), (117, "RU0009029540", 37.0), (330, "RU0009024277", 541.0), (150, "RU0009024277", 514.0)]
+# (дней назад, сумма) — пополнения счёта
+DEMO_DEPOSITS = [(730, 1800000)]   # дальше счёт досыпается автоматически, когда не хватает на покупку
+
+
+def _demo_fmt(x, nd=2):
+    return ("%." + str(nd) + "f") % x if x is not None else ""
+
+
+def demo_rows(today=None):
+    """Строки отчёта: [дата, тип, ISIN, тикер, название, кол-во, цена, сумма, валюта, комиссия, НКД] — по возрастанию даты."""
+    today = today or date.today()
+    info = {i[0]: i for i in DEMO_INSTRUMENTS}
+    day = lambda n: today - timedelta(days=n)
+    ev = []   # (дата, порядок, строка)
+
+    def nkd_at(isin, d):
+        _, _, _, _, cv, per, last = info[isin]
+        ago = (today - d).days
+        k = 0
+        while last + k * per < ago:
+            k += 1
+        prev = last + k * per                 # дней назад до предыдущего купона
+        return cv * (prev - ago) / per
+
+    for n, amt in DEMO_DEPOSITS:
+        ev.append((day(n), 0, [day(n), "Пополнение", "", "", "", "", "", amt, "RUB", "", ""]))
+    held = defaultdict(list)                  # isin -> [(дата, ±кол-во)]
+    for n, op, isin, qty, price in DEMO_TRADES:
+        _, tick, name, kind = info[isin][:4]
+        d = day(n)
+        if kind == "bond":
+            nk = nkd_at(isin, d)
+            amount = qty * (price / 100.0 * 1000.0 + nk)
+        else:
+            nk, amount = 0.0, qty * price
+        comm = round(amount * 0.0005, 2)
+        ev.append((d, 1, [d, op, isin, tick, name, qty, price, round(amount, 2), "RUB", comm, ""]))
+        held[isin].append((d, qty if op == "Покупка" else -qty))
+
+    def qty_at(isin, d):
+        return sum(q for dd, q in held[isin] if dd <= d)
+
+    income = defaultdict(float)               # год -> облагаемый доход (для НДФЛ)
+    for isin, _, name, kind, cv, per, last in DEMO_INSTRUMENTS:
+        if kind != "bond":
+            continue
+        k = 0
+        while last + k * per <= 730:
+            d = day(last + k * per)
+            q = qty_at(isin, d - timedelta(days=1))
+            if q > 0:
+                amt = round(q * cv, 2)
+                ev.append((d, 2, [d, "Купон", isin, info[isin][1], name, "", "", amt, "RUB", "", ""]))
+                income[d.year] += amt
+            k += 1
+    for n, isin, per_share in DEMO_DIVS:
+        d = day(n)
+        q = qty_at(isin, d - timedelta(days=1))
+        if q > 0:
+            amt = round(q * per_share, 2)
+            ev.append((d, 2, [d, "Дивиденд", isin, info[isin][1], info[isin][2], "", "", amt, "RUB", "", ""]))
+            income[d.year] += amt
+    for y, inc in sorted(income.items()):     # НДФЛ удерживается в конце года за прошедшие выплаты
+        d = date(y, 12, 25)
+        if d < today and d >= day(730):
+            paid = sum(r[7] for dd, _, r in ev if r[1] in ("Купон", "Дивиденд") and dd.year == y and dd <= d)
+            ev.append((d, 3, [d, "НДФЛ", "", "", "", "", "", round(paid * 0.13, 2), "RUB", "", ""]))
+    ev.sort(key=lambda e: (e[0], e[1]))
+    cash, topups = 0.0, []
+    for d, _, r in ev:                        # пополнения «по необходимости», круглыми суммами
+        sign = {"Покупка": -1, "Продажа": 1, "НДФЛ": -1}.get(r[1], 1)
+        delta = sign * r[7] - (r[9] or 0)
+        if cash + delta < 0:
+            need = int(-(cash + delta) // 50000 + 1) * 50000
+            topups.append((d - timedelta(days=1), 0, [d - timedelta(days=1), "Пополнение", "", "", "", "", "", need, "RUB", "", ""]))
+            cash += need
+        cash += delta
+    ev = sorted(ev + topups, key=lambda e: (e[0], e[1]))
+    out = []
+    for d, _, r in ev:
+        r = list(r)
+        r[0] = d.strftime("%d.%m.%Y")
+        out.append(["" if v is None else (_demo_fmt(v).replace(".", ",") if isinstance(v, float) else str(v)) for v in r])
+    return out
+
+
+def demo_csv(today=None):
+    """Тот же отчёт в виде CSV-текста (формат шаблона импорта)."""
+    head = ["Дата", "Тип операции", "ISIN", "Тикер", "Название", "Количество", "Цена", "Сумма", "Валюта", "Комиссия", "НКД"]
+    return "\n".join(";".join(r) for r in [head] + demo_rows(today)) + "\n"
+
+
+class _NoClient:
+    ready = False
+
+
+def demo_active():
+    return any(x.get("demo") or x.get("id") == DEMO_ID for x in imports_list())
+
+
+def demo_remove():
+    """Убирает только демо-импорт и его данные. Возвращает True, если что-то было удалено."""
+    if not demo_active():
+        return False
+    store().put("imports", [x for x in imports_list() if not (x.get("demo") or x.get("id") == DEMO_ID)])
+    store().ops_clear(DEMO_ID)
+    mem_clear()
+    return True
+
+
+def demo_seed():
+    """Справочные записи для бумаг демо (иначе без токена нет ни ISIN, ни параметров облигации). Кэш истекает — обновляем при обращении."""
+    st = store()
+    put = []
+    for isin, tick, name, kind, *_ in DEMO_INSTRUMENTS:
+        uid = "imp:" + isin
+        if st.get("inst:" + uid, ttl=20 * DAY) is None:
+            put.append(("inst:" + uid, {"uid": uid, "figi": "", "ticker": tick, "isin": isin, "name": name, "type": kind,
+                                        "cur": "rub", "sector": "", "logo": "", "color": "", "country": "RU", "cls": ""}))
+        if kind == "bond" and st.get("bond:" + uid, ttl=6 * 3600) is None and isin in DEMO_BOND_PARAMS:
+            mat, cpy, fl = DEMO_BOND_PARAMS[isin]
+            put.append(("bond:" + uid, {"nominal": 1000.0, "initial": 1000.0, "cur": "rub", "maturity": mat, "call": None,
+                                        "placement": None, "cpy": cpy, "aci": 0.0, "floating": fl, "amort": False,
+                                        "perpetual": False, "risk": "", "sector": "", "name": name}))
+    if put:
+        st.put_many(put)
+
+
+def demo_enable():
+    raw = demo_csv().encode("utf-8")
+    tables = read_tables("demo.csv", raw)
+    mapping = guess_mapping(tables[0][0])
+    ops, _ = rows_to_ops([r for r in tables[0][1:] if any(r)], mapping, tables[0][0])
+    ops, _ids = finalize_import(_NoClient(), ops, keep_demo=True)
+    kinds = {i[0]: "INSTRUMENT_TYPE_" + i[3].upper() for i in DEMO_INSTRUMENTS}
+    for o in ops:
+        ident = (o.get("instrumentUid") or "").replace("imp:", "")
+        if ident in kinds:
+            o["instrumentKind"] = kinds[ident]
+    store().ops_clear(DEMO_ID)
+    store().ops_put(DEMO_ID, ops)
+    demo_seed()
+    lst = [x for x in imports_list() if x.get("id") != DEMO_ID]
+    lst.append({"id": DEMO_ID, "name": DEMO_NAME, "broker": "Демо", "demo": True, "created": utc_now_str(),
+                "files": [{"name": "demo.csv", "count": len(ops), "at": utc_now_str()}]})
+    store().put("imports", lst)
+    mem_clear()
+    return len(ops)
+
+
+def _api_demo_enable(cfg, body):
+    n = demo_enable()
+    return {"ok": True, "id": DEMO_ID, "count": n}
+
+
+def _api_demo_disable(cfg, body):
+    return {"ok": True, "removed": demo_remove()}
+
+
+def _api_demo_status(cfg, acc, q, force):
+    on = demo_active()
+    if on:
+        demo_seed()
+    return {"active": on, "id": DEMO_ID, "name": DEMO_NAME}
+
+
+API_GET["/api/demo/status"] = _api_demo_status
+API_POST["/api/demo/enable"] = _api_demo_enable
+API_POST["/api/demo/disable"] = _api_demo_disable
 # ═══════════════════════════════ счета и сводка ═══════════════════════════════
 
 _mem, _mem_lock = {}, threading.Lock()
@@ -3595,7 +3818,7 @@ def warmup_start():
 # Если задан «сервер данных» (настройки или TINVEST_DATA_SERVER / TINVEST_DATA_KEY), запрос идёт через него:
 # GET|POST {сервер}/v1/fetch?url=... Сервер кэширует ответы и сам ходит к источникам. При любой неудаче сервера
 # (нет связи, таймаут, 5xx, 401/403) запрос выполняется напрямую, а сервер на 5 минут считается недоступным.
-# Сервер по умолчанию — DS_DEFAULT; он требует личный ключ из Telegram-бота (24 часа), см. «вход по ключу» ниже
+# Сервер по умолчанию — DS_DEFAULT; он требует личный ключ из Telegram-бота (7 дней), см. «вход по ключу» ниже
 # (/api/auth/*). «off» в настройках или в TINVEST_DATA_SERVER отключает сервер совсем (запросы идут напрямую).
 # API Т-Инвестиций сюда НЕ входит: он всегда идёт напрямую, токен на сервер данных не передаётся. Уведомления Telegram — отдельный вызов POST /v1/notify (13j_watch.py).
 
@@ -3709,6 +3932,38 @@ def _ds_request(srv, key, url, data, headers, timeout):
         return None
 
 
+DS_PARSED_V = 1
+
+
+def ds_parsed(name, params=None, timeout=20):
+    """Готовый разбор страницы источника с сервера данных: GET {сервер}/v1/parsed/<name>?... -> data либо None.
+    None: сервер выключен/недоступен, старый сервер (404), ok:false, другая версия формата. Тогда вызывающий разбирает страницу сам."""
+    srv, key = ds_conf()
+    if not srv or time.time() < _ds_state["down_until"]:
+        return None
+    q = ("?" + urllib.parse.urlencode(params)) if params else ""
+    hd = {"User-Agent": EXT_UA["User-Agent"]}
+    if key:
+        hd["X-Client-Key"] = key
+    try:
+        req = urllib.request.Request(srv + "/v1/parsed/" + name + q, headers=hd)
+        with urllib.request.urlopen(req, timeout=timeout + 5, context=_ssl()) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            with _ds_lock:
+                _auth["need_login"] = e.code == 401 or _auth["need_login"]
+                _auth["res"] = None
+            _ds_down("сервер ответил %d" % e.code)
+        return None                                    # 404 (старый сервер), 5xx источника и т.п. — не «роняем» сервер
+    except Exception as e:  # noqa: BLE001
+        _ds_down("нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
+        return None
+    if not isinstance(j, dict) or j.get("ok") is not True or j.get("v") != DS_PARSED_V:
+        return None
+    return j.get("data")
+
+
 def ext_open(url, data=None, headers=None, timeout=25, jar=None):
     """Запрос публичных данных -> (статус, байты, content-type). При HTTP-ошибке источника бросает urllib.error.HTTPError
     (как и прежний urlopen). jar — dict с cookie сессии (обновляется из ответа), нужен, например, raexpert (CSRF)."""
@@ -3770,7 +4025,7 @@ def ds_test(cfg, body):
     except Exception as e:  # noqa: BLE001
         raise ApiError("Не удалось подключиться: %s" % (getattr(e, "reason", None) or type(e).__name__), 400)
     if not isinstance(j, dict) or not j.get("ok"):
-        raise ApiError("Это не сервер данных T-Invest Analytics.", 400)
+        raise ApiError("Это не сервер данных TAnalytic.", 400)
     return {"ok": True, "version": j.get("version", ""), "uptime": j.get("uptime", 0), "cache_items": j.get("cache_items", 0)}
 
 
@@ -4763,10 +5018,10 @@ def screener_payload():
 _pri = {"t": 0, "rows": []}
 
 
-def primary_rows():
-    if time.time() - _pri["t"] < 1800 and _pri["rows"]:
-        return _pri["rows"]
-    s = http_text("https://investmint.ru/bond-placements/", timeout=40)
+# ВАЖНО: placements_parse (и _strip) дублируются в server/tinvest_server.py (эндпоинт /v1/parsed/investmint/placements).
+# Менять синхронно; tests/test_parsed.py сверяет результаты на общем HTML-образце.
+def placements_parse(s):
+    """HTML investmint.ru/bond-placements/ -> список строк календаря размещений (по дате старта). Чистая функция."""
     rows, seen = [], set()
     for tr in re.findall(r"<tr>\s*<td class=\"min-w-56.*?</tr>", s, re.S):
         isin = re.search(r'font-mono text-xs">([A-Z0-9]{12})<', tr)
@@ -4789,6 +5044,15 @@ def primary_rows():
                      "book": _strip(tds[2]) if len(tds) > 2 else "", "status": _strip(tds[3]) if len(tds) > 3 else "",
                      "link": link.group(1) if link else ""})
     rows.sort(key=lambda r: r["start"])
+    return rows
+
+
+def primary_rows():
+    if time.time() - _pri["t"] < 1800 and _pri["rows"]:
+        return _pri["rows"]
+    rows = ds_parsed("investmint/placements", timeout=40)       # разбор на сервере данных; None -> разбираем сами
+    if not (isinstance(rows, list) and rows and all(isinstance(r, dict) and r.get("start") for r in rows)):
+        rows = placements_parse(http_text("https://investmint.ru/bond-placements/", timeout=40))
     _pri.update(t=time.time(), rows=rows)
     return rows
 
@@ -8638,7 +8902,7 @@ def annotate_offer_kinds(rows, today=None):
 def offer_alert_text(kind, left, ds):
     """Текст тревоги «Мониторинга» по типу оферты; left — дней до даты, ds — дата дд.мм.гггг."""
     if kind == "put":
-        return "Пут-оферта %s (через %d дн.): решите, предъявлять ли бумагу к выкупу" % (ds, left)
+        return "Пут-оферта %s (через %d дн.): у держателя есть право предъявить бумагу к выкупу" % (ds, left)
     if kind == "call":
         return "Колл-опцион %s (через %d дн.): эмитент может досрочно погасить выпуск, заявку подавать не нужно" % (ds, left)
     if kind == "both":
@@ -8745,7 +9009,7 @@ def _of_dm(d):
 
 def of_helper(rec):
     """Помощник по пут-оферте (справочно): статус купона, итог сравнения с рынком, даты подачи заявки. rec — запись _of_one.
-    Рекомендация появляется только когда эмитент объявил купон на период после оферты."""
+    Сравнение строится только когда эмитент объявил купон на период после оферты."""
     if rec.get("kind") != "put":
         return None
     ps, pe = rec.get("period_start"), rec.get("period_end")
@@ -8754,7 +9018,7 @@ def of_helper(rec):
          "numbers": "", "apply": "", "risk_notes": list(rec.get("risk_notes") or []), "kb": "offers",
          "disclaimer": "Справочная информация, не инвестиционная рекомендация."}
     if rec.get("period_status") == "closed":
-        h.update(status="closed", title="Приём заявок закончился", text="Подать заявку уже нельзя: бумага останется у вас.")
+        h.update(status="closed", title="Период приёма заявок прошёл", text="Приём заявок завершён: бумага остаётся у держателя.")
         return h
     h["apply"] = ("Подать заявку через брокера %s (дата выкупа %s)." % (window, _of_dm(rec["date"]))) if window else \
         ("Период приёма заявок пока не опубликован. Дата выкупа по оферте: %s." % _of_dm(rec["date"]))
@@ -8778,15 +9042,15 @@ def of_helper(rec):
     code, gap = of_outcome(hy, med)
     h["outcome"], h["gap"] = code, gap
     if code == "below":
-        h.update(title="Купон ниже рынка на %s п. п. — разумно предъявить к оферте" % _of_pct(-gap),
-                 text="Деньги по оферте (%s %% номинала) можно вложить в бумагу с более высокой доходностью." % _of_pct(rec["offer_price"]))
+        h.update(title="Доходность ниже медианы похожих выпусков на %s п. п." % _of_pct(-gap),
+                 text="Цена оферты (%s %% номинала) при вложении под медианную доходность похожих выпусков даёт более высокую доходность." % _of_pct(rec["offer_price"]))
     elif code == "above":
-        h.update(title="Купон выше рынка — оставить выгоднее",
-                 text="Доходность выше медианы похожих выпусков на %s п. п.: предъявлять нет смысла, если деньги не нужны." % _of_pct(gap))
+        h.update(title="Доходность выше медианы похожих выпусков",
+                 text="Доходность выше медианы похожих выпусков на %s п. п." % _of_pct(gap))
     elif code == "fair":
-        h.update(title="Купон в рынке — можно оставить", text="Доходность в пределах %s п. п. от медианы похожих выпусков." % _of_pct(OF_MARGIN))
+        h.update(title="Доходность на уровне медианы похожих выпусков", text="Доходность в пределах %s п. п. от медианы похожих выпусков." % _of_pct(OF_MARGIN))
     else:
-        h.update(title="Купон объявлен", text="Сравнить с рынком не с чем: подходящих аналогов мало. Оцените ставку сами.")
+        h.update(title="Купон объявлен", text="Сравнить с рынком не с чем: подходящих аналогов мало.")
     if rec.get("price") is not None and rec["price"] > rec["offer_price"] + OF_PRICE_EPS:
         h["text"] += " Но рыночная цена (%s %%) выше цены выкупа (%s %%): на бирже получите больше, чем по оферте." % (
             _of_pct(rec["price"]), _of_pct(rec["offer_price"]))
@@ -8906,8 +9170,8 @@ def _of_hint_other(rec):
                         "эмитента досрочно погасить выпуск (call) — тогда делать ничего не нужно. Но это может быть и put: "
                         "проверьте условия в решении о выпуске или у брокера, прежде чем полагаться на эту дату."}
     return {"code": "unknown", "title": "Тип оферты не указан",
-            "text": "Мосбиржа не сообщает, кто решает: держатель (put) или эмитент (call). Не подавайте заявку, пока не проверите "
-                    "условия в документах выпуска или у брокера."}
+            "text": "Мосбиржа не сообщает, кто решает: держатель (put) или эмитент (call). Условия приведены "
+                    "в документах выпуска и у брокера."}
 
 
 def _of_hint(rec, risk_notes):
@@ -8916,42 +9180,39 @@ def _of_hint(rec, risk_notes):
     how = ("Заявку на выкуп подаёт брокер; обычно он принимает поручения на несколько дней раньше окончания периода "
            "предъявления — уточните сроки у брокера.")
     if rec["period_status"] == "closed":
-        return {"code": "closed", "title": "Период предъявления закончился",
-                "text": "Принимать заявки на выкуп уже поздно: бумага останется у вас, условия после оферты определяет эмитент."}
+        return {"code": "closed", "title": "Период предъявления прошёл",
+                "text": "Приём заявок на выкуп завершён: бумага остаётся у держателя, условия после оферты определяет эмитент."}
     if price is not None and price > op + OF_PRICE_EPS:
-        return {"code": "sell_market", "title": "Выгоднее продать на бирже",
-                "text": "Рыночная цена (%s %%) выше цены выкупа (%s %%): на бирже получите больше, чем по оферте. "
-                        "Предъявлять бумаги не нужно." % (_of_pct(price), _of_pct(op))}
+        return {"code": "sell_market", "title": "Биржевая цена выше цены оферты",
+                "text": "Рыночная цена (%s %%) выше цены выкупа (%s %%): цена на бирже выше выкупной по оферте." % (_of_pct(price), _of_pct(op))}
     if risk_notes:
         low = (" Рыночная цена (%s %%) заметно ниже цены выкупа: рынок сомневается, что эмитент выкупит бумаги." % _of_pct(price)
                if price is not None and price < op - 10 else "")
-        return {"code": "put", "title": "Рассмотрите предъявление",
-                "text": "Есть признаки повышенного риска эмитента: %s. Предъявление к выкупу по %s %% вернёт деньги по номиналу "
-                        "до того, как условия могут измениться.%s %s" % ("; ".join(risk_notes), _of_pct(op), low, how)}
+        return {"code": "put", "title": "Есть признаки риска эмитента",
+                "text": "Есть признаки повышенного риска эмитента: %s. Цена выкупа по оферте — %s %% номинала.%s %s" % ("; ".join(risk_notes), _of_pct(op), low, how)}
     if rec["floating"] and not rec["coupon_known"]:
-        return {"code": "hold", "title": "Можно держать",
-                "text": "Купон плавающий и следует за ключевой ставкой, поэтому после оферты он обычно остаётся на уровне рынка. "
-                        "Предъявлять нужно, только если вам нужны деньги."}
+        return {"code": "hold", "title": "Доходность к погашению не ниже рынка",
+                "text": "Купон плавающий и следует за ключевой ставкой, поэтому после оферты он обычно остаётся на уровне рынка."}
     if rec["coupon_known"] and hy is not None:
         code = of_outcome(hy, med)[0]
         if code == "below":
-            return {"code": "put", "title": "Рассмотрите предъявление",
+            return {"code": "put", "title": "Есть признаки риска эмитента",
                     "text": "Новый купон (%s %% годовых) даёт доходность %s %% против %s %% у похожих выпусков (%d шт.): ниже "
                             "рынка больше чем на 0,5 п. п. Деньги по оферте (%s %%) можно вложить в бумагу с более высокой "
                             "доходностью. %s" % (_of_pct(rec["new_rate"] or 0), _of_pct(hy), _of_pct(med), rec["peers_n"],
                                                  _of_pct(op), how)}
         if med is None:
-            return {"code": "hold", "title": "Можно держать",
+            return {"code": "hold", "title": "Доходность к погашению не ниже рынка",
                     "text": "Новый купон известен (%s %% годовых), доходность после оферты %s %%. Сравнить с рынком не с чем: "
-                            "подходящих аналогов мало. Оцените ставку сами." % (_of_pct(rec["new_rate"] or 0), _of_pct(hy))}
-        return {"code": "hold", "title": "Можно держать",
+                            "подходящих аналогов мало." % (_of_pct(rec["new_rate"] or 0), _of_pct(hy))}
+        return {"code": "hold", "title": "Доходность к погашению не ниже рынка",
                 "text": "Новый купон (%s %% годовых) даёт доходность %s %% против %s %% у похожих выпусков (%d шт.): %s. "
                         "Предъявлять нет смысла, если деньги не нужны." % (_of_pct(rec["new_rate"] or 0), _of_pct(hy), _of_pct(med),
                                                                             rec["peers_n"], "выше рынка" if code == "above" else "на уровне рынка")}
-    t = "Новый купон ещё не объявлен: дождитесь объявления ставки."
+    t = "Новый купон ещё не объявлен."
     if rec["urgent"]:
         t += " Срок предъявления близко. " + how
-    return {"code": "wait", "title": "Дождитесь объявления ставки", "text": t}
+    return {"code": "wait", "title": "Ставка ещё не объявлена", "text": t}
 
 
 def offers_payload(cfg, acc):
@@ -10481,8 +10742,8 @@ def _ics_fold(line):
 
 def build_ics(events):
     now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//T-Invest Analytics//Calendar//RU", "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
-             "X-WR-CALNAME:T-Invest Analytics: события", "X-WR-TIMEZONE:Europe/Moscow"]
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TAnalytic//Calendar//RU", "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+             "X-WR-CALNAME:TAnalytic: события", "X-WR-TIMEZONE:Europe/Moscow"]
     for e in events:
         try:
             d0 = datetime.strptime(e["date"], "%Y-%m-%d")
@@ -10787,7 +11048,7 @@ def _tg_esc(s):
     return str(s if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-TG_DISCLAIMER = "\n\n<i>Не является ИИР.</i>"
+TG_DISCLAIMER = "\n\n<i>Не является индивидуальной инвестиционной рекомендацией.</i>"
 
 
 def tg_send(cfg, text):
@@ -10850,7 +11111,7 @@ def tg_info(cfg, acc, q, force):
 
 
 def tg_test(cfg, body):
-    tg_send(load_config(), "✅ <b>T-Invest Analytics</b>: тестовое сообщение. Уведомления подключены.")
+    tg_send(load_config(), "✅ <b>TAnalytic</b>: тестовое сообщение. Уведомления подключены.")
     return {"ok": True}
 
 
@@ -10925,7 +11186,7 @@ def tg_offer_due(items, today):
         base = "ofr|%s|%s|" % (isin, od)
         if kind == "put":
             if it.get("coupon_status") == "announced" and it.get("new_rate") is not None and (not pe or today <= pe):
-                out.append((base + "coupon", "🔔 <b>%s</b>: эмитент объявил купон после пут-оферты (%s): %s %% годовых. Можно решать, предъявлять ли бумагу."
+                out.append((base + "coupon", "🔔 <b>%s</b>: эмитент объявил купон после пут-оферты (%s): %s %% годовых. Приём заявок открывается в период предъявления."
                             % (nm, _tg_dmy(od), _f2(it["new_rate"]))))
             if ps and pe and ps <= today <= pe:
                 out.append((base + "open", "🔔 <b>%s</b>: открыт приём заявок по пут-оферте, с %s по %s (выкуп %s). Заявку подаёт брокер."
@@ -10983,7 +11244,7 @@ def _tg_ev_line(e):
 
 
 def tg_digest_text(cfg):
-    parts = ["<b>Сводка T-Invest Analytics · %s</b>" % date.today().strftime("%d.%m.%Y")]
+    parts = ["<b>Сводка TAnalytic · %s</b>" % date.today().strftime("%d.%m.%Y")]
     if cfg.get("token"):
         try:
             s = build_summary(cfg, "all", "all")
@@ -12272,7 +12533,7 @@ def encrypt_bytes(password, plain, iters=BK_ITER):
 
 def decrypt_bytes(password, blob):
     if len(blob) < 8 + 4 + 16 + 12 + 32 or blob[:8] != BK_MAGIC:
-        raise BackupError("Это не файл резервной копии T-Invest Analytics (или он повреждён).")
+        raise BackupError("Это не файл резервной копии TAnalytic (или он повреждён).")
     iters = struct.unpack(">I", blob[8:12])[0]
     if not 1000 <= iters <= 20000000:
         raise BackupError("Файл повреждён: неверные параметры шифрования.")
@@ -12304,7 +12565,7 @@ def backup_plain():
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
             z.write(tmp, "data.db")
             z.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
-            z.writestr("README.txt", "Зашифрованная резервная копия T-Invest Analytics. Токен API и пароли в копию не входят.\n")
+            z.writestr("README.txt", "Зашифрованная резервная копия TAnalytic. Токен API и пароли в копию не входят.\n")
         return buf.getvalue()
     finally:
         try:
@@ -12806,6 +13067,8 @@ def _ifrs_num(s):
     return v / 100.0 if pct else v
 
 
+# ВАЖНО: ifrs_parse и _ifrs_num дублируются в server/tinvest_server.py (эндпоинт /v1/parsed/smartlab/ifrs).
+# Менять синхронно; tests/test_parsed.py сверяет результаты на общем HTML-образце.
 def ifrs_parse(html):
     """HTML страницы smart-lab -> {labels: ['2021', ..., 'LTM'], rows: {поле: [значения по меткам, строки для текста]}} или None."""
     if not html or "field=" not in html:
@@ -12940,8 +13203,9 @@ def ifrs_fin(ticker):
             if age < (IFRS_TTL if hit.get("status") == "ok" else IFRS_ERR_TTL if hit.get("status") == "err" else IFRS_NF_TTL):
                 return hit
         try:
-            html = _ifrs_http(IFRS_BASE % ticker)
-            parsed = ifrs_parse(html)
+            parsed = ds_parsed("smartlab/ifrs", {"ticker": ticker}, timeout=30)      # разбор на сервере; None -> сами
+            if not (isinstance(parsed, dict) and parsed.get("labels") and isinstance(parsed.get("rows"), dict)):
+                parsed = ifrs_parse(_ifrs_http(IFRS_BASE % ticker))
             if parsed is None:
                 res = {"status": "parse", "ticker": ticker, "years": [], "ltm": None, "bank": False, "url": IFRS_BASE % ticker, "fetched": time.time(),
                        "note": "Страница smart-lab в неожиданном формате."}
@@ -13443,7 +13707,7 @@ _ping = [0.0]
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "TInvestAnalytics/3.0"
+    server_version = "TAnalytic/3.0"
 
     def log_message(self, *a):
         pass
@@ -13570,7 +13834,9 @@ class Handler(BaseHTTPRequestHandler):
         self.guard(run)
 
     def do_POST(self):
-        if not self.ok_host() or "application/json" not in (self.headers.get("Content-Type") or ""):
+        # Sec-Fetch-Site: запросы с чужих сайтов отклоняем (защита от CSRF; старые браузеры заголовок не шлют)
+        if not self.ok_host() or "application/json" not in (self.headers.get("Content-Type") or "") \
+                or self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none"):
             return self.send(403, {"error": "forbidden"})
         path = urlparse(self.path).path
 
@@ -13814,7 +14080,7 @@ def main():
 
 PAGE = r'''<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>T-Invest Analytics</title>
+<title>TAnalytic</title>
 <script>(function(){try{var t=localStorage.getItem('ta_theme')||'auto';document.documentElement.dataset.theme=t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}catch(e){document.documentElement.dataset.theme='dark'}})()</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffdd2d'/%3E%3Cpath d='M8 21l5-6 4 3 7-8' stroke='%23111' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
@@ -14598,11 +14864,18 @@ tr.scr-low td{opacity:.5}
 .ks-r{display:flex;gap:14px;align-items:center;padding:7px 0;border-top:1px solid var(--line);font-size:13.5px}
 .ks-r kbd{font:600 12px ui-monospace,Menlo,monospace;background:var(--card2);border:1px solid var(--line2);border-radius:6px;padding:3px 8px;min-width:96px;text-align:center;white-space:nowrap}
 @media(max-width:760px){.ob-card{padding:18px 14px}.ob-step{grid-template-columns:28px 1fr;gap:10px}.ob-t{font-size:22px}.ob-row .btn{width:100%;justify-content:center}.td-more{padding-left:10px}}
+/* ── Демо-режим и подсказка про токен «только чтение» ── */
+#demo-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 12px;padding:10px 16px;border-radius:12px;background:#ffdd2d1f;border:1px solid #ffdd2d66;color:var(--tx);font-size:14px}
+#demo-bar .dm-b{display:flex;gap:8px;flex-wrap:wrap}
+#demo-bar .btn{padding:6px 12px}
+.ro-note{display:flex;gap:10px;align-items:flex-start;padding:11px 14px;border-radius:12px;background:#3ecf8e1a;border:1px solid #3ecf8e55;color:var(--tx);font-size:13.5px;line-height:1.5;margin:6px 0}
+.ro-note svg{width:18px;height:18px;flex:none;margin-top:2px;color:var(--pos)}
+@media print{#demo-bar{display:none}}
 </style></head>
 <body>
 <aside>
   <div class="logo"><i><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#111" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16l5-6 4 3 7-8"/></svg></i>
-    <div>T-Invest Analytics<small>аналитика портфеля</small></div></div>
+    <div>TAnalytic<small>аналитика портфеля</small></div></div>
   <nav class="nav" id="nav"></nav>
   <div class="accs">
     <div class="acc-h">Счета <label class="msw" title="Скрыть счета без активов"><input type="checkbox" id="hideEmpty"><i></i>скрыть пустые</label></div>
@@ -15037,6 +15310,8 @@ function histSlice(){
   return{days,twr,dd,bench,value:h.value.slice(i0,i1+1),invested:h.invested.slice(i0,i1+1),total,ann,vol,maxdd:Math.min(...dd),years};
 }
 
+/* единая строка-дисклеймер (39-ФЗ) для страниц со сравнением бумаг, сигналами, офертами и т. п. */
+const NIR_NOTE='<p class="note nir">Не является индивидуальной инвестиционной рекомендацией. Расчёты носят информационно-справочный характер; упомянутые инструменты и операции могут не соответствовать вашему инвестиционному профилю.</p>';
 /* ── Обзор ── */
 function pDash(){
   const d=S.data,p=d.portfolio,t=T(),lf=d.life;
@@ -15344,7 +15619,7 @@ function pPri(){
   <div class="card" style="padding:12px 10px 6px"><div class="row" style="padding:0 6px 10px"><b>Календарь первичных размещений</b><button class="btn ghost" id="pri-r" style="margin-left:auto">Обновить</button></div>
     ${rows.length?`<div class="tbl"><table><thead><tr><th class="l">Эмитент и выпуск</th><th class="l">Рейтинг</th><th>Начало размещения</th><th>Окончание</th><th class="l">Книга заявок</th><th class="l">Источник</th></tr></thead><tbody>${body}</tbody></table></div>`:'<div class="empty">Объявленных размещений нет</div>'}</div>
   ${priStatsHtml()}
-  <p class="note">Даты начала размещения — по объявлениям Московской биржи (сводка investmint.ru). Ставку купона эмитент обычно объявляет в день сбора заявок: уточняйте её у брокера. Рейтинг сопоставлен с эмитентом по названию. Справочная информация, не инвестиционная рекомендация.</p>`;
+  <p class="note">Даты начала размещения — по объявлениям Московской биржи (сводка investmint.ru). Ставку купона эмитент обычно объявляет в день сбора заявок: уточняйте её у брокера. Рейтинг сопоставлен с эмитентом по названию. </p>${NIR_NOTE}`;
 }
 
 
@@ -15391,7 +15666,7 @@ function priStatsHtml(){
     ${d.sectors.map(b=>`<tr><td class="l">${esc(SECT[b.sector]||b.sector)}</td><td class="num">${b.n}</td><td class="num">${pp1(b.p30)}</td><td class="num">${b.below30==null?'—':pctp(b.below30,0)}</td></tr>`).join('')}</tbody></table></div>`:''}</div></div>
   ${priStTable(d.best||[],'Лучшие размещения: сильнее всего выросли в цене с 1-го дня')}${priStTable(d.worst||[],'Худшие размещения: сильнее всего подешевели')}
   ${d.loading?`<p class="note">Догружаю данные: ${esc(d.phase||'')} ${d.total?d.done+' из '+d.total:''}…</p>`:''}
-  <p class="note">Считаются корпоративные облигации и ОФЗ, размещённые за последние 12 месяцев и торгуемые сейчас (досрочно погашенные в расчёт не попали, поэтому картина может быть чуть лучше реальной). Цена — средневзвешенная, в процентах от номинала; «Сейчас» — последняя рыночная цена, у части выпусков она меняется из-за купонов и амортизации. Рейтинг сопоставлен по названию эмитента. Ежедневные снимки объявленных размещений сохраняются на компьютере (накоплено дней: ${d.snap_days}) — позже по ним можно сравнить ориентир купона и итог. Справочная информация, не инвестиционная рекомендация.</p></div>`;
+  <p class="note">Считаются корпоративные облигации и ОФЗ, размещённые за последние 12 месяцев и торгуемые сейчас (досрочно погашенные в расчёт не попали, поэтому картина может быть чуть лучше реальной). Цена — средневзвешенная, в процентах от номинала; «Сейчас» — последняя рыночная цена, у части выпусков она меняется из-за купонов и амортизации. Рейтинг сопоставлен по названию эмитента. Ежедневные снимки объявленных размещений сохраняются на компьютере (накоплено дней: ${d.snap_days}) — позже по ним можно сравнить ориентир купона и итог. </p>${NIR_NOTE}</div>`;
 }
 
 
@@ -15474,7 +15749,7 @@ function priVolHtml(){
   <div class="row" style="padding:10px 6px"><div class="seg" id="pv-f">${seg.map(([v,t])=>`<button class="${S.priVF===v?'on':''}" data-pvf="${v}">${t}</button>`).join('')}</div>${d.loading?'<small class="mu" style="margin-left:auto">обновляю…</small>':''}</div>
   <div class="tbl" style="max-height:calc(100vh - 220px)"><table id="pv-tab"><thead><tr>${th}</tr></thead><tbody>${rows.map(r=>pvRow(r,today)).join('')||'<tr><td colspan="8" class="empty">В этой группе пусто</td></tr>'}</tbody></table></div>
   ${(d.errors||[]).length?`<p class="note">Не всё удалось загрузить: ${esc(d.errors.slice(0,3).join('; '))}. Попробуйте «Обновить» чуть позже.</p>`:''}
-  <p class="note">Новые выпуски — облигации, торги которыми начались за последние 30 дней, и объявленные размещения. Объём выпуска и «размещено» — в рублях по номиналу: штуки × номинал (у части выпусков «размещено» — сумма сделок на площадке размещения Мосбиржи, а не отчёт эмитента). «Сегодня» — оборот по рыночной цене сделок, данные Мосбиржи обновляются в течение дня (при открытых торгах — раз в несколько минут). Нажмите ›, чтобы увидеть разбивку по дням и площадкам; клик по строке открывает карточку выпуска. Справочная информация, не инвестиционная рекомендация.</p></div>`;
+  <p class="note">Новые выпуски — облигации, торги которыми начались за последние 30 дней, и объявленные размещения. Объём выпуска и «размещено» — в рублях по номиналу: штуки × номинал (у части выпусков «размещено» — сумма сделок на площадке размещения Мосбиржи, а не отчёт эмитента). «Сегодня» — оборот по рыночной цене сделок, данные Мосбиржи обновляются в течение дня (при открытых торгах — раз в несколько минут). Нажмите ›, чтобы увидеть разбивку по дням и площадкам; клик по строке открывает карточку выпуска. </p>${NIR_NOTE}</div>`;
 }
 document.addEventListener('click',e=>{
   if(S.page!=='pri')return;
@@ -15554,7 +15829,7 @@ function pScr(){
     ${flN}
     <div class="tbl" style="max-height:calc(100vh - 300px)"><table><thead><tr id="scr-head"></tr></thead><tbody id="scr-body"></tbody></table></div>
     <div class="row" style="margin-top:12px"><button class="btn ghost" id="scr-more">Показать ещё</button></div></div>
-  <p class="note">Данные — Московская биржа (ISS, режимы торгов Т+ для корпоративных облигаций и ОФЗ; с задержкой, как в бесплатном доступе). Доходность — по цене последних торгов, спред — к кривой КБД при той же дюрации. Рейтинг найден у ${rated} из ${d.rows.length} выпусков: эмитенты без рейтинга в базе не обязательно ненадёжны. По умолчанию скрыты выпуски с доходностью выше 60% (обычно это дефолтные или почти не торгуемые бумаги) — поле «Доходность до» можно очистить. Справочная информация, не инвестиционная рекомендация.</p>`;
+  <p class="note">Данные — Московская биржа (ISS, режимы торгов Т+ для корпоративных облигаций и ОФЗ; с задержкой, как в бесплатном доступе). Доходность — по цене последних торгов, спред — к кривой КБД при той же дюрации. Рейтинг найден у ${rated} из ${d.rows.length} выпусков: эмитенты без рейтинга в базе не обязательно ненадёжны. По умолчанию скрыты выпуски с доходностью выше 60% (обычно это дефолтные или почти не торгуемые бумаги) — поле «Доходность до» можно очистить. </p>${NIR_NOTE}`;
 }
 function bindScr(){
   if(!S.scr||S.scr.error){const b=$('#scr-r');if(b)b.onclick=()=>{S.scr=null;render()};return}
@@ -16070,7 +16345,7 @@ function bindSetLocal(c,msg,busy,reset){
 /* ── Аккаунт и доступ ── */
 function setAccHtml(){
   return`<div class="card" id="acc-card"><h2>Аккаунт и доступ</h2><div style="display:grid;gap:12px">
-    <p class="note" style="margin:0">Вход в программу выполняется по ключу из Telegram-бота. Ключ действует сутки, токен Т-Инвестиций боту не передаётся.</p>
+    <p class="note" style="margin:0">Вход в программу выполняется по ключу из Telegram-бота. Ключ действует 7 дней, токен Т-Инвестиций боту не передаётся.</p>
     <div id="acc-who" class="ld-path">Проверяю…</div>
     <div class="row"><button class="btn ghost" id="acc-out" style="display:none">Выйти</button><a class="btn ghost" href="https://t.me/${esc(AUTH.bot)}" target="_blank" rel="noopener noreferrer">Открыть @${esc(AUTH.bot)}</a></div></div></div>`;
 }
@@ -16101,6 +16376,7 @@ async function renderSettings(){
       <input class="in" type="password" id="tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false"></label>
     <div class="row"><button class="btn" id="save">Сохранить и подключиться</button><button class="btn ghost" id="test">Проверить</button>
       ${c.token_set?'<button class="btn danger" id="clr">Удалить токен</button>':''}</div>
+    <div class="ro-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><div><b>Нужен токен только для чтения.</b> С ним нельзя торговать, выводить деньги или менять настройки счёта — это ограничение на стороне Т-Банка. Токен хранится только на этом компьютере.</div></div>
     <div class="note" style="line-height:1.6"><b>Как получить токен</b> (1 минута):<br>
       1. Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении Т-Инвестиции: Профиль → Настройки → Токены T-Invest API).<br>
       2. Нажмите «Создать токен», выберите доступ <b>«Только для чтения»</b> и все счета (или только нужные).<br>
@@ -16181,7 +16457,7 @@ window.addEventListener('beforeprint',()=>{_prevTheme=document.documentElement.d
 window.addEventListener('afterprint',()=>{if(_prevTheme)document.documentElement.dataset.theme=_prevTheme});
 function prInfo(){const a=S.accounts.find(x=>x.id===S.account),pg=(PAGES.find(p=>p&&p[0]===S.page)||[])[1]||'';
   const per=PAGES&&PERIOD_PAGES.includes(S.page)?((PERIODS.find(x=>x[0]===S.period)||[])[1]||''):'';
-  $('#prinfo').textContent=['T-Invest Analytics',pg,S.account==='all'?'все счета':(a?a.name:''),per,new Date().toLocaleDateString('ru-RU')].filter(Boolean).join(' · ')}
+  $('#prinfo').textContent=['TAnalytic',pg,S.account==='all'?'все счета':(a?a.name:''),per,new Date().toLocaleDateString('ru-RU')].filter(Boolean).join(' · ')}
 
 /* ── напоминания о выплатах ── */
 function upcoming(){
@@ -16204,7 +16480,7 @@ function notifyUpcoming(){
     if(!('Notification' in window)||Notification.permission!=='granted')return;
     const seen=new Set(JSON.parse(lsGet('ta_notified')||'[]'));
     upcoming().forEach(e=>{const k=e.date+'|'+e.kind+'|'+e.name;if(seen.has(k))return;seen.add(k);
-      new Notification('T-Invest: '+(EVK[e.kind]||e.kind)+' '+ddm(e.date),{body:e.name+(e.amount!=null?' · '+M(e.amount):'')})});
+      new Notification('TAnalytic: '+(EVK[e.kind]||e.kind)+' '+ddm(e.date),{body:e.name+(e.amount!=null?' · '+M(e.amount):'')})});
     localStorage.setItem('ta_notified',JSON.stringify([...seen].slice(-300)));
   }catch(e){}
 }
@@ -16215,7 +16491,7 @@ function notifyMon(d){
     if(!('Notification' in window)||Notification.permission!=='granted')return;
     const seen=new Set(JSON.parse(lsGet('ta_notified')||'[]'));
     (d.alerts||[]).filter(a=>a.severity==='high').forEach(a=>{const k='mon|'+a.id;if(seen.has(k))return;seen.add(k);
-      new Notification('T-Invest: тревога по '+(a.name||'облигации'),{body:a.message})});
+      new Notification('TAnalytic: тревога по '+(a.name||'облигации'),{body:a.message})});
     localStorage.setItem('ta_notified',JSON.stringify([...seen].slice(-300)));
   }catch(e){}
 }
@@ -16438,12 +16714,13 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+ ['0.18','12.11.2026',['<b>Новое название — TAnalytic</b> (ранее T-Invest Analytics). Ваши данные и настройки остаются на месте','<b>Ключ из бота действует 7 дней</b> вместо суток','<b>Демо-портфель</b>: на первом экране можно посмотреть программу на модельном портфеле облигаций, не вводя токен','<b>Оферты и сравнение с аналогами</b>: вместо подсказок «предъявить / держать» — сравнение доходностей к оферте, к погашению и медианы похожих выпусков','<b>Калькулятор</b>: из типов счёта оставлены обычный счёт и ИИС-3 — с 2024 года открыть ИИС типа А или Б нельзя','Календарь размещений и отчётность МСФО теперь разбираются на сервере данных — меньше поломок при изменении сайтов-источников','Защита локального сервера программы от запросов с чужих сайтов']],
  ['0.17','12.11.2026',['<b>Оферты PUT и CALL</b>: тип каждой оферты по данным Мосбиржи, все будущие даты (не только ближайшие), фильтры по сроку и типу; у одного выпуска могут быть обе','<b>Помощник по оферте</b>: когда эмитент объявит новый купон, подсказка — оставить бумагу или предъявить, и даты подачи заявки','<b>Доходность с учётом колла</b>: для CALL — худшая из доходностей к погашению и к колл-дате; лесенка переносит ступень только на пут-оферту','<b>Календарь и Telegram</b>: приём заявок, последний день и выкуп по пут-оферте, возможный колл; напоминания от @tanalyticbot','<b>Сравнение облигаций</b> рядом (до 4) и <b>документы выпуска</b> в карточке: раскрытие информации эмитента и страница на Мосбирже','<b>Налоги</b>: прогноз на 31 декабря и какие убыточные бумаги продать до конца года, чтобы уменьшить налог (с учётом ЛДВ)','<b>Калькулятор</b>: цель по пассивному доходу — сколько нужно капитала и сколько докладывать в месяц','<b>Тарифы Free и Pro</b>: портфель бесплатно, инструменты анализа — в Pro; новым пользователям 7 дней Pro в подарок','<b>Первый запуск по шагам</b>, карточка <b>«Сегодня»</b> на обзоре, <b>база знаний</b>, понятные настройки и раздел «Данные на компьютере»','Исправлено: LQDT и TMOS на графике доходности после перевода фондов на другой режим торгов; песочница больше не включена по умолчанию']],
- ['0.16','12.11.2026',['<b>Вход по ключу из Telegram-бота</b> @tanalyticbot: ключ действует сутки, новый — командой /key. Токен Т-Инвестиций остаётся только на этом компьютере','<b>Приложения для macOS и Windows</b>: скачать и открыть, без установки Python; программа обновляется сама, окно загрузки с прогрессом','<b>«Лесенка облигаций»</b>: вкладка «Мой портфель» — когда вернутся деньги по годам и кварталам, перегруженные и пустые годы, таблица по периодам','<b>«Первичка»</b>: объём выпуска, сколько размещено, оборот за день и разбивка по дням для новых выпусков','<b>«Ставки»</b>: понятная кривая КБД — сегодня против выбранной даты, выводы простыми словами и таблица по срокам; подписи дат на графиках больше не наезжают друг на друга']],
+ ['0.16','12.11.2026',['<b>Вход по ключу из Telegram-бота</b> @tanalyticbot: ключ действует 7 дней, новый — командой /key. Токен Т-Инвестиций остаётся только на этом компьютере','<b>Приложения для macOS и Windows</b>: скачать и открыть, без установки Python; программа обновляется сама, окно загрузки с прогрессом','<b>«Лесенка облигаций»</b>: вкладка «Мой портфель» — когда вернутся деньги по годам и кварталам, перегруженные и пустые годы, таблица по периодам','<b>«Первичка»</b>: объём выпуска, сколько размещено, оборот за день и разбивка по дням для новых выпусков','<b>«Ставки»</b>: понятная кривая КБД — сегодня против выбранной даты, выводы простыми словами и таблица по срокам; подписи дат на графиках больше не наезжают друг на друга']],
  ['0.15','11.11.2026',['<b>Обмены бумаг</b>: ГДР и АДР, обменянные на российские акции (TCS → T, YNDX → YDEX, FIVE → X5, Хэдхантер, Циан, Эталон, ВК), и слияние выпусков учитываются без продажи: история стоимости без провалов, налоговые лоты переходят на новую бумагу с ценой и датой покупки','<b>История стоимости</b>: дивиденды, выплаченные на карту, больше не попадают в остаток на счёте; бумаги после делистинга с нулевой оценкой брокера не держат старую цену — расчёт сходится с фактической стоимостью счетов','<b>Финансы эмитентов по МСФО</b>: отчётность групп (данные smart-lab) для эмитентов с акциями на бирже и их «дочек» (Газпром капитал, ИКС 5 Финанс и др.), отдельные схемы для банков и лизинга; РСБУ остаётся рядом для сравнения','<b>Меню по разделам</b>: «Портфель», «Учёт и планы», «Рынок», «Риски и контроль»; разделы сворачиваются, ненужные можно скрыть в «Настройках»','<b>Быстрый поиск</b> Ctrl+K / ⌘K: разделы, бумаги портфеля и каталога, команды','<b>Скрыть суммы</b> (глаз в шапке): балансы и суммы заменяются точками, проценты остаются — для скриншотов','<b>Облигации</b>: наборы колонок «Основное», «Аналитика», «Календарь»; скринер — фильтры по обороту, типу купона и сроку до оферты; ISIN копируется по клику','<b>Налоги</b>: ожидаемая доплата по прогрессивной шкале, если доходы на нескольких счетах вместе превышают порог; импорт отчётов больше не принимает удержание НДФЛ за дивиденд или купон','<b>Сервер данных</b> (по желанию): данные Мосбиржи, ФНС, ЦБ, рейтингов и МСФО можно брать через свой сервер с общим кэшем; если он недоступен — напрямую. Токен и портфель на сервер не передаются','<b>Подсказка по токену</b> со ссылкой на страницу выпуска токена в Т-Инвестициях','Исправлено: число эмитентов в облигациях, дивиденды в валюте в календаре выплат, себестоимость амортизируемых облигаций в импорте, сброс набранного текста при фоновом обновлении, понятное сообщение о восстановлении копии; строка «не является ИИР» в интерфейсе, PDF и Telegram']],
  ['0.14','11.11.2026',['<b>Налоги по лотам</b> (FIFO): налог по годам против удержанного брокером, ЛДВ по датам покупки и когда она наступит, ИИС (А, Б, ИИС-3), перенос убытков прошлых лет, курсовые разницы по курсу ЦБ, подсказки до конца года, сводка для 3-НДФЛ','<b>Ребалансировка с учётом налога</b>: сначала лоты с убытком или с наступившей ЛДВ','<b>Точная история стоимости портфеля</b>: исправлены фьючерсы (в кэш попадала условная стоимость контракта), одна бумага под разными идентификаторами, сплиты и консолидации, амортизация и задержка купона — исчезли ложные скачки до ±24 % в день, доходность за период и просадка теперь совпадают с XIRR по пополнениям','Рейтинги эмитентов на странице «Эмитенты» берутся из данных облигаций портфеля']],
  ['0.13','11.11.2026',['<b>«Эмитенты»</b>: отчётность компаний из ГИР БО ФНС (выручка, прибыль, долг, капитал за несколько лет), скоринг 0–100 с объяснением баллов, «рынок оценивает риск выше или ниже, чем следует из отчётности», кредитная история; блок «Финансы эмитента» в карточке облигации','<b>«Наблюдение»</b>: бумаги вне портфеля с тревогами и целями по доходности и цене, ★ в скринере и карточке; <b>дневник</b> с напоминаниями пересмотреть','<b>Уведомления в личный Telegram-бот</b> (по желанию): тревоги, цели, выплаты, ежедневная сводка','<b>«Календарь событий»</b>: заседания ЦБ, купоны, погашения, амортизации, оферты, размещения, бумаги из наблюдения; экспорт в Google/Apple Календарь (.ics)','<b>Первичка против вторички</b>: как торгуются новые выпуски через 1, 7 и 30 дней по рейтингам и отраслям','<b>«Ставки»</b>: кривая КБД сейчас против 1–12 месяцев назад и история спредов по рейтингам','<b>Зашифрованная резервная копия</b> (AES-256) в папку облачного диска, автоматически раз в день, с восстановлением; <b>экспорт таблиц</b> в Excel и CSV','Токены и пароли не попадают в обычную резервную копию']],
- ['0.12','11.11.2026',['<b>«Сравнение с рынком»</b>: портфель против индексов облигаций Мосбиржи (ОФЗ, корпоративные, ВДО), фондов ликвидности и облигационных фондов; «те же деньги в те же дни» в рублях; волатильность, просадка, коэффициент Шарпа, бета; ликвидность позиций и премия к фонду ликвидности','<b>«Калькулятор»</b> инвестиций: пополнения, реинвест купонов с округлением до лотов, налоги 13/15 %, ИИС-А, ИИС-Б, ИИС-3 и ЛДВ, инфляция по прогнозу ЦБ, сценарии ключевой ставки, ожидаемые потери от дефолтов, сравнение стратегий и расчёт цели «пассивный доход в месяц»','<b>«Оферты»</b>: держать, предъявить к выкупу или продать на бирже — с учётом нового купона и доходности аналогов','<b>«Лесенка облигаций»</b>: подбор бумаг под сумму, срок и минимальный рейтинг с графиком выплат','Дюрационный разрыв и <b>реальная доходность</b> (за вычетом инфляции) в «Рисках и сценариях»','Флоатеры и амортизации в <b>календаре выплат</b> — по прогнозу ключевой ставки','Линия фонда ликвидности на карте рынка и в скринере','Быстрый повторный запуск: данные открываются сразу и обновляются в фоне; автотесты расчётов']],
+ ['0.12','11.11.2026',['<b>«Сравнение с рынком»</b>: портфель против индексов облигаций Мосбиржи (ОФЗ, корпоративные, ВДО), фондов ликвидности и облигационных фондов; «те же деньги в те же дни» в рублях; волатильность, просадка, коэффициент Шарпа, бета; ликвидность позиций и премия к фонду ликвидности','<b>«Калькулятор»</b> инвестиций: пополнения, реинвест купонов с округлением до лотов, налоги 13/15 %, ИИС-3 и ЛДВ, инфляция по прогнозу ЦБ, сценарии ключевой ставки, ожидаемые потери от дефолтов, сравнение стратегий и расчёт цели «пассивный доход в месяц»','<b>«Оферты»</b>: держать, предъявить к выкупу или продать на бирже — с учётом нового купона и доходности аналогов','<b>«Лесенка облигаций»</b>: подбор бумаг под сумму, срок и минимальный рейтинг с графиком выплат','Дюрационный разрыв и <b>реальная доходность</b> (за вычетом инфляции) в «Рисках и сценариях»','Флоатеры и амортизации в <b>календаре выплат</b> — по прогнозу ключевой ставки','Линия фонда ликвидности на карте рынка и в скринере','Быстрый повторный запуск: данные открываются сразу и обновляются в фоне; автотесты расчётов']],
  ['0.11','11.11.2026',['<b>«Риски и сценарии»</b>: вероятность дефолта по рынку и по рейтингу, ожидаемая доходность с учётом дефолтов, «казино» — что если не заплатят 1–3 самых рискованных эмитента, сценарии ключевой ставки на год, флоатеры против фикса, точка безубыточности','<b>«Сигналы»</b>: что на рынке дешевле и дороже аналогов (z-оценка, дни подряд) и возможные замены бумаг портфеля с учётом комиссии и налога','<b>«Мониторинг»</b>: тревоги по понижениям рейтингов, «под наблюдением», техническим дефолтам, падению цены, расширению спреда и офертам; журнал рейтинговых действий; ликвидность позиций; тревоги на «Обзоре» и в уведомлениях','<b>Кривая эмитента</b> в карточке облигации — все выпуски эмитента на одном графике']],
  ['0.10','11.11.2026',['<b>Доходность портфеля (IRR)</b> по всем будущим выплатам всех облигаций — высокорисковые бумаги учитываются, а не исключаются','<b>Флоатеры по прогнозу ключевой ставки</b>: среднесрочный прогноз Банка России (или опрос аналитиков, рынок, текущая ставка — выбор в настройках) плюс спред эмитента']],
  ['0.9','11.11.2026',['<b>Точный расчёт облигаций</b>: денежный поток с Мосбиржи с амортизациями и офертами — доходность совпадает с биржевой; исправлены валютные облигации','<b>Доходность после НДФЛ</b>, модифицированная дюрация, выпуклость и <b>стресс-тест</b> портфеля на ±1–3 п.п.','<b>Карточка облигации</b> по клику: параметры, история цены и доходности, денежный поток, рейтинги и <b>аналоги</b> по рейтингу, отрасли, дюрации и типу купона с оценкой «дешевле/дороже аналогов»','<b>Карта рынка</b>: доходность против дюрации по рейтингам на фоне КБД, медианные спреды по рейтингам, срокам и отраслям','Рейтинги по ISIN из каталога Т-Инвестиций — точнее и для большего числа выпусков; отрасль и фильтр по ней в скринере']],
@@ -16690,7 +16967,7 @@ function bcBody(c){
         <td class="num ${a.dy>0?'pos':a.dy<0?'neg':''}">${a.dy==null?'—':(a.dy>0?'+':'')+bcN(a.dy,2)}</td><td class="num">${short(a.turn||0)}</td></tr>`).join('')
       +`</tbody></table></div>`;
   }else h+=`<div class="mu" style="font-size:13px">Подходящих аналогов не найдено${m?'':' (нет рыночных данных по выпуску)'}.</div>`;
-  h+=`</div><p class="note" style="margin-top:14px">Справочная информация на основе открытых данных Мосбиржи, каталога T-Invest и публичных рейтингов. Не является инвестиционной рекомендацией. Аналоги подобраны автоматически по рейтингу, сроку, сектору и типу выпуска; сравнение спреда не учитывает всех различий в риске и ликвидности.</p>`;
+  h+=`</div><p class="note" style="margin-top:14px">Справочная информация на основе открытых данных Мосбиржи, каталога T-Invest и публичных рейтингов. Аналоги подобраны автоматически по рейтингу, сроку, сектору и типу выпуска; сравнение спреда не учитывает всех различий в риске и ликвидности.</p>${NIR_NOTE}`;
   return h;
 }
 function bcIssuerCurve(el,ic){
@@ -16836,7 +17113,7 @@ function pCmp(){
   return`<div class="card"><h2>Сравнение облигаций<span class="sp" id="cmp-cnt"></span></h2>
     <div class="cmp-add"><input class="in" id="cmp-q" placeholder="Название, тикер или ISIN выпуска" autocomplete="off"><div class="cmp-res" id="cmp-res"></div></div>
     <div id="cmp-tbl"></div>
-    <p class="note">Зелёным отмечено лучшее значение в строке: выше доходность, рейтинг, спред и оборот (аномально высокая доходность не отмечается). Но более высокая доходность, как правило, означает более высокий риск: смотрите на рейтинг, срок, оферты и амортизацию вместе. Доходность — к погашению или к ближайшей оферте (как считает Мосбиржа), до налогов. Подробности по каждому выпуску — в карточке (клик по названию). Справочная информация, не инвестиционная рекомендация.</p></div>`;
+    <p class="note">Зелёным отмечено лучшее значение в строке: выше доходность, рейтинг, спред и оборот (аномально высокая доходность не отмечается). Но более высокая доходность, как правило, означает более высокий риск: смотрите на рейтинг, срок, оферты и амортизацию вместе. Доходность — к погашению или к ближайшей оферте (как считает Мосбиржа), до налогов. Подробности по каждому выпуску — в карточке (клик по названию). </p>${NIR_NOTE}</div>`;
 }
 function bindCmp(){
   cmpFetch();cmpDraw();
@@ -16946,7 +17223,7 @@ function pMap(){
   <div class="card"><h2>По секторам</h2>${mpSectors()}</div></div>
   <div class="card"><h2>История медианных спредов<span class="sp">п.п. к КБД, по рейтингам</span></h2><div class="chart" id="map-hist"></div>
     <p class="note" style="margin-top:8px">История копится ежедневно, начиная с дня установки приложения: снимок сохраняется при открытии скринера или карты.</p></div></div>
-  <p class="note">По горизонтали — дюрация (лет), по вертикали — доходность к погашению. Размер точки — дневной оборот, цвет — рейтинг, пунктир — кривая КБД, кольцо — выпуск из вашего портфеля. Рейтинги сопоставлены по названию эмитента, у части выпусков их нет. Рассматриваются рублёвые корпоративные облигации. Справочная информация, не инвестиционная рекомендация.</p>`;
+  <p class="note">По горизонтали — дюрация (лет), по вертикали — доходность к погашению. Размер точки — дневной оборот, цвет — рейтинг, пунктир — кривая КБД, кольцо — выпуск из вашего портфеля. Рейтинги сопоставлены по названию эмитента, у части выпусков их нет. Рассматриваются рублёвые корпоративные облигации. </p>${NIR_NOTE}`;
 }
 function bindMap(){
   const f=S.mp,redraw=()=>{const e=$('#map-sc');if(e)mpScatter(e)};
@@ -17071,7 +17348,7 @@ function bindRisk(){
   ['#rk-rec','#rk-tgt','#rk-hor'].forEach(i=>{const e=$(i);if(e)e.onkeydown=ev=>{if(ev.key==='Enter')a.click()}});
   const t=$('#rk-tab');if(t)t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;S.rsort={k,d:S.rsort.k===k?-S.rsort.d:(k==='name'?1:-1)};render()};
 }
-/* ── Сигналы: дешевле/дороже аналогов, история сигналов, возможные замены в портфеле ── */
+/* ── Сравнение с аналогами: спред выше/ниже медианы, история, сопоставление выпусков портфеля ── */
 S.sig={d:null,key:'',err:null,loading:false,f:{rmin:'',sector:'',dmax:'all',turn:'1000000',sort:'z',outl:false,worse:false,more:{c:false,r:false}},fee:'0.3',thr:'1'};
 const SG_NOTE='Сравнение с аналогами не учитывает все риски; справочная информация, не инвестиционная рекомендация.';
 function sigKey(){const f=S.sig.f;return[S.account,f.turn,S.sig.fee,S.sig.thr].join('|')}
@@ -17099,7 +17376,7 @@ function sgRows(side){
 function sgTable(side){
   const rs=sgRows(side),d=S.sig.d,key=side>0?'c':'r',more=S.sig.f.more[key],lim=more?60:15,hasH=d.meta.hist_days>=2;
   if(!rs.length)return`<div class="empty" style="padding:26px">Нет выпусков под выбранные фильтры</div>`;
-  return`<div class="tbl"><table class="sg-t"><thead><tr><th class="l">Выпуск</th><th>Рейтинг</th><th class="l">Сектор</th><th>Дюр., г.</th><th>Дох., %</th><th>Спред</th><th>Медиана аналогов</th><th>Δ п.п.</th><th title="Отклонение в единицах разброса аналогов (MAD)">z</th><th>Оборот</th>${hasH?'<th title="Сколько снимков подряд выпуск был дешевле/дороже аналогов (снимок раз в день)">Дней подряд</th><th>Тренд</th>':''}</tr></thead><tbody>`
+  return`<div class="tbl"><table class="sg-t"><thead><tr><th class="l">Выпуск</th><th>Рейтинг</th><th class="l">Сектор</th><th>Дюр., г.</th><th>Дох., %</th><th>Спред</th><th>Медиана аналогов</th><th>Δ п.п.</th><th title="Отклонение в единицах разброса аналогов (MAD)">z</th><th>Оборот</th>${hasH?'<th title="Сколько снимков подряд выпуск был выше/ниже медианы аналогов по спреду (снимок раз в день)">Дней подряд</th><th>Тренд</th>':''}</tr></thead><tbody>`
     +rs.slice(0,lim).map(r=>`<tr data-isin="${esc(r.isin)}" title="Аналоги: ${esc(r.refs.map(a=>a.name).join(', '))}"><td class="l"><b>${esc(r.name)}</b>${r.outlier?' <span class="tag" title="Отклонение или доходность аномально велики: возможен дефолтный выпуск или некорректные данные">выброс</span>':''}${r.amort?' <span class="tag">аморт</span>':''}${r.sub?' <span class="tag">суборд</span>':''}<small class="mu sg-isin">${esc(r.isin)}</small></td>
       <td><span class="tag rt rt-${esc(rBucket(r.rating).split(' ')[0])}">${esc(r.rating)}</span></td><td class="l">${esc(SECT[r.sector]||r.sector||'—')}</td>
       <td class="num">${sgN(r.dur)}</td><td class="num">${sgN(r.yield)}</td><td class="num">${sgS(r.spread)}</td><td class="num">${sgS(r.med)}</td>
@@ -17122,7 +17399,7 @@ function sgRepl(){
   rep.forEach(({p,o})=>{
     h+=`<div class="sg-pos"><div class="sg-ph" data-isin="${esc(p.isin)}"><div><b>${esc(p.name)}</b> <span class="tag rt rt-${esc(rBucket(p.rating).split(' ')[0])}">${esc(p.rating||'—')}</span></div>
       <div class="mu">позиция ${M(p.value,'rub')} · доходность ${sgN(p.yield_)} % · дюрация ${sgN(p.dur)} г. · ${p.diff==null?'':`к аналогам ${sgS(p.diff)} п.п. · `}издержки перехода ≈ ${M(p.cost_rub,'rub')} (${sgN(p.cost_pp)} % позиции: комиссии ${M(p.commission_rub,'rub')}${p.tax_rub?`, налог с прибыли ${M(p.tax_rub,'rub')}`:''})</div></div>
-      <div class="tbl"><table class="sg-t"><thead><tr><th class="l">Возможная замена для изучения</th><th>Рейтинг</th><th>Дюр., г.</th><th>Дох., %</th><th>Δ к аналогам</th><th>Оборот</th><th title="Разница доходностей, п.п. в год">Разница, п.п.</th><th title="Разница за вычетом издержек, размазанных на срок до погашения более короткой из бумаг (не более 5 лет)">После издержек, п.п./год</th><th>₽ в год на позицию</th><th title="За сколько месяцев разница в доходности покроет издержки перехода">Окупаемость, мес.</th></tr></thead><tbody>${o.map(sgOpt).join('')}</tbody></table></div></div>`});
+      <div class="tbl"><table class="sg-t"><thead><tr><th class="l">Выпуск для сравнения</th><th>Рейтинг</th><th>Дюр., г.</th><th>Дох., %</th><th>Δ к аналогам</th><th>Оборот</th><th title="Разница доходностей, п.п. в год">Разница, п.п.</th><th title="Разница за вычетом издержек, размазанных на срок до погашения более короткой из бумаг (не более 5 лет)">После издержек, п.п./год</th><th>₽ в год на позицию</th><th title="За сколько месяцев разница в доходности покроет издержки перехода">Окупаемость, мес.</th></tr></thead><tbody>${o.map(sgOpt).join('')}</tbody></table></div></div>`});
   return h;
 }
 function pSig(){
@@ -17139,11 +17416,11 @@ function pSig(){
   chart('sg-root',bindSig);
   return`<div id="sg-root">${s.err?`<div class="msg err">${esc(s.err)}</div>`:''}
   <div class="g g4 sg-k">${kpi('Выпусков сравнено',k.universe,`ликвидных, оборот от ${short(d.params.min_turn)} ₽`)}
-    ${kpi('Дешевле аналогов',k.cheap,`из них заметно (z ≥ 2): ${k.cheap_strong}`,'pos')}
-    ${kpi('Дороже аналогов',k.rich,`из них заметно (z ≤ −2): ${k.rich_strong}`,'neg')}
-    ${kpi('Возможных замен в портфеле',nrep,`пороги: от ${sgN(d.params.threshold,1)} п.п. после издержек`)}</div>
-  <div class="card"><h2>Дешевле и дороже аналогов<span class="sp">спред к КБД против медианы 12 похожих выпусков</span></h2>
-    <p class="note" style="margin-bottom:12px">Для каждой рублёвой корпоративной облигации с рейтингом (без флоатеров и бессрочных) подбираются ближайшие аналоги: рейтинг в пределах двух ступеней, сопоставимая дюрация, сектор, тип выпуска — так же, как в карточке облигации. «Дешевле» — спред к КБД выше медианы аналогов (доходность выше при сопоставимом риске), «дороже» — ниже. z — отклонение в единицах разброса аналогов (робастная оценка по MAD): чем больше |z|, тем заметнее выпуск выделяется на фоне аналогов. Расхождение часто объясняется рисками, которых нет в рейтинге.</p>
+    ${kpi('Спред выше медианы аналогов',k.cheap,`из них заметно (z ≥ 2): ${k.cheap_strong}`,'pos')}
+    ${kpi('Спред ниже медианы аналогов',k.rich,`из них заметно (z ≤ −2): ${k.rich_strong}`,'neg')}
+    ${kpi('Аналогов с большей доходностью',nrep,`пороги: от ${sgN(d.params.threshold,1)} п.п. после издержек`)}</div>
+  <div class="card"><h2>Сравнение с аналогами<span class="sp">спред к КБД против медианы 12 похожих выпусков</span></h2>
+    <p class="note" style="margin-bottom:12px">Для каждой рублёвой корпоративной облигации с рейтингом (без флоатеров и бессрочных) подбираются ближайшие аналоги: рейтинг в пределах двух ступеней, сопоставимая дюрация, сектор, тип выпуска — так же, как в карточке облигации. «Спред выше» — спред к КБД выше медианы аналогов (доходность выше при сопоставимом риске), «спред ниже» — ниже медианы. z — отклонение в единицах разброса аналогов (робастная оценка по MAD): чем больше |z|, тем заметнее выпуск выделяется на фоне аналогов. Расхождение часто объясняется рисками, которых нет в рейтинге.</p>
     <div class="flt">
       <label class="field"><span>Рейтинг не ниже</span><select class="in" id="sg-r"><option value="">любой</option>${RSC.slice(0,16).map(x=>opt(x,x,f.rmin)).join('')}</select></label>
       <label class="field"><span>Сектор</span><select class="in" id="sg-s"><option value="">любой</option>${sectors.map(x=>opt(x,SECT[x]||x,f.sector)).join('')}</select></label>
@@ -17153,11 +17430,11 @@ function pSig(){
       <label class="sw"><input type="checkbox" id="sg-x" ${f.outl?'checked':''}><i></i><div><b>Показывать выбросы</b><small>${k.outliers} выпусков с аномалиями</small></div></label>
     </div>
     <div class="sg-g2">
-      <div><h3 class="sg-h pos">Дешевле аналогов</h3>${sgTable(1)}</div>
-      <div><h3 class="sg-h neg">Дороже аналогов</h3>${sgTable(-1)}</div></div>
-    <p class="note" style="margin-top:12px">${m.hist_days>=2?`История сигналов копится ежедневно по будним дням (снимок при расчёте): накоплено дней — ${m.hist_days}, с ${ddm(m.hist_from)}. «Дней подряд» — число последних снимков подряд, в которых выпуск оставался дешевле/дороже аналогов не менее чем на ${sgN(d.eps,2)} п.п.; «Тренд» — изменение отклонения за ≈ 5 снимков.`:`История сигналов копится ежедневно по будним дням, начиная с сегодняшнего дня: сейчас накоплено дней — ${m.hist_days}. Колонки «Дней подряд» и «Тренд» появятся, когда снимков будет хотя бы два.`}
+      <div><h3 class="sg-h pos">Спред выше медианы аналогов</h3>${sgTable(1)}</div>
+      <div><h3 class="sg-h neg">Спред ниже медианы аналогов</h3>${sgTable(-1)}</div></div>
+    <p class="note" style="margin-top:12px">${m.hist_days>=2?`История сигналов копится ежедневно по будним дням (снимок при расчёте): накоплено дней — ${m.hist_days}, с ${ddm(m.hist_from)}. «Дней подряд» — число последних снимков подряд, в которых выпуск оставался выше/ниже медианы аналогов по спреду не менее чем на ${sgN(d.eps,2)} п.п.; «Тренд» — изменение отклонения за ≈ 5 снимков.`:`История сигналов копится ежедневно по будним дням, начиная с сегодняшнего дня: сейчас накоплено дней — ${m.hist_days}. Колонки «Дней подряд» и «Тренд» появятся, когда снимков будет хотя бы два.`}
     Расчёт: ${sgN(m.calc_s,1)} с, выпусков в сравнении ${m.pool}. Выбросы (отклонение более 8 п.п., доходность выше 40 % или спред ниже −6 п.п.) скрыты по умолчанию.</p></div>
-  <div class="card sg-rep"><h2>Возможные замены в вашем портфеле<span class="sp">для изучения, не рекомендация</span></h2>
+  <div class="card sg-rep"><h2>Аналоги с более высокой доходностью для выпусков портфеля<span class="sp">справочное сравнение, не рекомендация</span></h2>
     <p class="note" style="margin-bottom:12px">Для каждой рублёвой корпоративной облигации портфеля ищутся похожие выпуски (близкие рейтинг, срок, сектор) с более высокой рыночной доходностью. Учитываются комиссия за продажу и покупку, налог ${sgN(d.params.tax,0)} % с прибыли при продаже выше цены покупки (НКД не учитывается), ликвидность целевого выпуска. Издержки равномерно относятся на срок до погашения более короткой из двух бумаг (не более 5 лет). Показываются варианты, где разница после издержек не меньше порога; выпуски с более низким рейтингом показываются только по отдельному переключателю. Бóльшая доходность обычно отражает бóльший риск, а не недооценку.</p>
     <div class="flt">
       <label class="field"><span>Комиссия за сделку, %</span><input class="in" id="sg-fee" type="number" min="0" max="5" step="0.05" value="${esc(s.fee)}"></label>
@@ -17167,7 +17444,7 @@ function pSig(){
     </div>
     ${sgRepl()}
     ${d.skipped.length?`<p class="note" style="margin-top:10px">Не сравнивались: ${d.skipped.map(x=>esc(x.name)+' ('+esc(x.why)+')').join('; ')}.</p>`:''}</div>
-  <p class="note">${SG_NOTE} Данные: Мосбиржа (ISS), каталог T-Invest, публичные рейтинги; КБД — кривая бескупонной доходности Мосбиржи.</p></div>`;
+  <p class="note">${SG_NOTE} Данные: Мосбиржа (ISS), каталог T-Invest, публичные рейтинги; КБД — кривая бескупонной доходности Мосбиржи.</p>${NIR_NOTE}</div>`;
 }
 function bindSig(){
   const f=S.sig.f,again=()=>render();
@@ -17251,7 +17528,7 @@ function pMon(){
     ${fld('mon_drop5','Падение цены за 5 дней, %',0.1,0.5)}${fld('mon_drop30','Падение цены за 30 дней, %',0.1,0.5)}${fld('mon_spread30','Рост спреда за 30 дней, п.п.',0.1,0.5)}
     ${fld('mon_sell_days','Неликвид: дней на продажу более',0.5,0.5)}${fld('mon_offer_days','Оферта: за сколько дней предупреждать',1,1)}
     <button class="btn" id="mon-save" style="align-self:flex-end">Сохранить</button></div>
-    <p class="note" style="margin-top:10px">Вдвое превышенный порог даёт высокую важность. Что программа не видит: факт оплаты купона (биржа его не публикует). Дефолт определяется по флагам Мосбиржи, дефолтному рейтингу (D, C) и остановке торгов.</p></details>`;
+    <p class="note" style="margin-top:10px">Вдвое превышенный порог даёт высокую важность. Что программа не видит: факт оплаты купона (биржа его не публикует). Дефолт определяется по флагам Мосбиржи, дефолтному рейтингу (D, C) и остановке торгов.</p></details>${NIR_NOTE}`;
 }
 function bindMon(){
   const r=$('#mon-r');if(r)r.onclick=()=>{S.mon=null;render()};
@@ -17398,7 +17675,7 @@ const CL_BR=[[2.4e6,.13],[Infinity,.15]];   /* шкала НДФЛ для инв
 const CL_STR=[['dep','Вклад','#8a93a6'],['fund','Фонд ликвидности','#19a070'],['ofz','ОФЗ','#3987e5'],['aaa','Корпоративные AAA','#7ab4f5'],['aa','Корпоративные AA','#9085e9'],
   ['a','Корпоративные A','#c98500'],['hy','ВДО (BB и ниже)','#e66767'],['pf','Мой портфель','#d55181'],['own','Своя ставка','#d95926']];
 const CL_BETA={ofz:.6,aaa:.7,aa:.7,a:.7,hy:.7};
-const CL_ACC=[['plain','Обычный брокерский счёт'],['iisA','ИИС типа А (вычет с взносов)'],['iisB','ИИС типа Б (доход без налога)'],['iis3','ИИС-3 (вычет и освобождение дохода)']];
+const CL_ACC=[['plain','Обычный брокерский счёт'],['iis3','ИИС-3 (вычет и освобождение дохода)']];
 function clNdfl(b){if(!(b>0))return 0;let t=0,lo=0;for(const[h,r]of CL_BR){if(b>lo)t+=(Math.min(b,h)-lo)*r;lo=h;if(b<=h)break}return t}
 function clTaxInc(inc,x){return clNdfl(inc+x)-clNdfl(inc)}
 const clYE=(env,k)=>(env.m0+k)%12===0;   /* шаг k приходится на 1 января: закончился календарный (налоговый) год */
@@ -17428,7 +17705,7 @@ function clEnv(P,F,startDate){
 function clContrib(p,k){return k===0?p.start:(k<=p.months?p.monthly*Math.pow(1+p.idx/100,Math.floor((k-1)/12)):0)}
 function clAccInfo(p){
   const a=p.acct,N=p.months;
-  return{ded:a==='iisA'||a==='iis3',exempt:(a==='iisB'&&N>=36)||(a==='iis3'&&N>=60),cap:a==='iis3'?30e6:Infinity,iis:a!=='plain'};
+  return{ded:a==='iis3',exempt:a==='iis3'&&N>=60,cap:a==='iis3'?30e6:Infinity,iis:a!=='plain'};
 }
 /* вычет ИИС: сумма и точка начисления (конец года) */
 function clRefunds(p,ai){
@@ -17495,7 +17772,7 @@ function clSimBond(id,p,env,seg){
   const ynew=k=>k===0?y0:Math.max(.5,y0+beta*(env.key(k)-env.kr0));
   const tr=[],cap=[],r={cap,deposited:0,deductions:0,taxes:0,notes:[]};
   let cashInv=0,idle=0,pot=0,incY=0,incTot=0;const useLot=p.lot>1;
-  /* начисленный, но не удержанный налог: на ИИС — весь доход в год закрытия (ИИС Б / ИИС-3 — сверх лимита освобождения) */
+  /* начисленный, но не удержанный налог: на ИИС — весь доход в год закрытия (ИИС-3 — сверх лимита освобождения) */
   const due=()=>ai.iis?clNdfl(ai.exempt?Math.max(0,incTot-ai.cap):incTot):clNdfl(incY);
   const pay=x=>{if(!(x>0))return;r.taxes+=x;let t;
     t=Math.min(idle,x);idle-=t;x-=t;t=Math.min(cashInv,x);cashInv-=t;x-=t;t=Math.min(pot,x);pot-=t;x-=t;
@@ -17534,7 +17811,7 @@ function clSim(id,p,P,env,F){
   return clSimBond(id,p,env,clSegOf(id,P,F));
 }
 function clParams(F,months){
-  return{start:+F.start||0,monthly:+F.monthly||0,idx:+F.idx||0,months:months||Math.round((+F.years||1)*12),acct:F.acct,reinvest:!!F.reinvest,freq:+F.freq||12,
+  return{start:+F.start||0,monthly:+F.monthly||0,idx:+F.idx||0,months:months||Math.round((+F.years||1)*12),acct:(F.acct==='iisA'||F.acct==='iisB')?'iis3':F.acct,reinvest:!!F.reinvest,freq:+F.freq||12,
     lot:+F.lot||0,lotFund:F.lotFund==='fund',reinvDed:!!F.reinvDed,ldv:!!F.ldv,defaults:!!F.defaults};
 }
 /* Цель: нужное ежемесячное пополнение при заданном сроке или нужный срок при заданном пополнении (бисекция) */
@@ -17564,6 +17841,7 @@ function clLoadF(){
   const F=JSON.parse(JSON.stringify(CL_DEF));
   try{const s=JSON.parse(localStorage.getItem('ta_calc')||'null');
     if(s&&typeof s==='object')for(const k in F){if(s[k]!==undefined&&typeof s[k]===typeof F[k])F[k]=k==='strat'?Object.assign({},s[k]):s[k]}}catch(e){}
+  if(F.acct==='iisA'||F.acct==='iisB')F.acct='iis3';
   return CL_F=F;
 }
 function clSave(){try{localStorage.setItem('ta_calc',JSON.stringify(CL_F))}catch(e){}}
@@ -17647,9 +17925,8 @@ function clOut(){
   if(F.acct!=='plain'){
     if(res.some(r=>r.id==='dep'))warn.push('Вклад лежит в банке, а не на ИИС: вычет и льготы ИИС к нему не применяются, налог считается как на обычном счёте.');
     if((p.start+p.monthly*12)>1e6)warn.push('Взносы на ИИС ограничены 1 млн ₽ в год: калькулятор этот лимит не проверяет, проверьте свои суммы.');
-    if(F.acct==='iisB'&&N<36)warn.push('Освобождение дохода на ИИС типа Б действует при сроке от 3 лет: при меньшем сроке налог удерживается при закрытии счёта.');
     if(F.acct==='iis3'&&N<60)warn.push('ИИС-3: освобождение дохода (до 30 млн ₽) принято при сроке владения от 5 лет; при меньшем сроке налог удерживается при закрытии счёта.');
-    if(F.acct==='iis3'&&N>=60)warn.push('Допущение ИИС-3: минимальный срок для освобождения дохода принят равным 5 годам, лимит освобождаемого дохода 30 млн ₽; вычет считается как на ИИС типа А (13 % от взносов до 400 тыс. ₽ в год).');
+    if(F.acct==='iis3'&&N>=60)warn.push('Допущение ИИС-3: минимальный срок для освобождения дохода принят равным 5 годам, лимит освобождаемого дохода 30 млн ₽; вычет — 13 % от взносов до 400 тыс. ₽ в год.');
   }
   if(F.acct==='plain'&&res.some(r=>r.id==='fund')&&F.ldv)warn.push('ЛДВ для фонда ликвидности: рост пая без налога при владении 3 года и более, лимит 3 млн ₽ × число лет. Каждое пополнение учитывается отдельно по сроку владения.');
   if(P.portfolio==null&&F.strat.pf)warn.push('Нет данных о портфеле — «Мой портфель» недоступен.');
@@ -17707,7 +17984,7 @@ function pCalcInv(){
   <div class="card"><h2>Как это считается</h2><div class="note">Шаг расчёта — месяц; взносы вносятся в конце месяца; налоговый год — календарный. Шкала НДФЛ для инвестиционных доходов (купоны, продажа бумаг, проценты по вкладам): 13 % до 2,4 млн ₽ дохода в год, 15 % с превышения.
    <b>Вклад</b>: ежемесячная капитализация по ставке «ключевая − ${f2(F.depSpread)} п.п.» по пути выбранного сценария. НДФЛ платится раз в год по уведомлению с процентов за год сверх необлагаемой суммы (1 млн ₽ × максимальная ключевая ставка года по сценарию); в модели налог списывается со вклада в конце года (в жизни — до 1 декабря следующего года). Необлагаемая сумма общая на все вклады человека: если есть другие вклады, налог будет больше.
    <b>Фонд ликвидности</b>: ежедневное начисление приближено месячным по «ключевая − спред к ключевой»; налог только при продаже в конце срока (или ЛДВ / ИИС).
-   <b>ОФЗ, корпоративные, ВДО</b>: покупаем по текущей медианной доходности сегмента, держим до погашения (срок ≈ медианная дюрация), купоны по этой доходности; погашенный номинал и купоны вкладываются по будущей доходности ≈ текущая + β × (ключевая в тот момент − ключевая сейчас), β = 0,6 для ОФЗ и 0,7 для остальных. Купоны реинвестируются целиком: брокер удерживает НДФЛ с купонов раз в год, в конце календарного года, и с остатка — при выводе денег в конце срока; налог берётся из свободных денег на счёте, а если их не хватает — продаётся часть облигаций. На ИИС налог удерживается только при закрытии счёта (весь доход попадает в базу года закрытия); на ИИС типа Б от 3 лет и ИИС-3 от 5 лет налога нет (ИИС-3 — с дохода до 30 млн ₽). Переоценка цены облигаций при удержании до погашения не учитывается; на конец срока позиции считаются по номиналу.
+   <b>ОФЗ, корпоративные, ВДО</b>: покупаем по текущей медианной доходности сегмента, держим до погашения (срок ≈ медианная дюрация), купоны по этой доходности; погашенный номинал и купоны вкладываются по будущей доходности ≈ текущая + β × (ключевая в тот момент − ключевая сейчас), β = 0,6 для ОФЗ и 0,7 для остальных. Купоны реинвестируются целиком: брокер удерживает НДФЛ с купонов раз в год, в конце календарного года, и с остатка — при выводе денег в конце срока; налог берётся из свободных денег на счёте, а если их не хватает — продаётся часть облигаций. На ИИС налог удерживается только при закрытии счёта (весь доход попадает в базу года закрытия); на ИИС-3 при сроке от 5 лет налога нет (ИИС-3 — с дохода до 30 млн ₽). Переоценка цены облигаций при удержании до погашения не учитывается; на конец срока позиции считаются по номиналу.
    <b>Мой портфель</b>: доходность облигаций портфеля (IRR) используется как ставка; <b>Своя ставка</b> — постоянная ставка с купонным налогом. Капитал в промежуточные месяцы показан за вычетом начисленного, но ещё не удержанного налога. Инфляция — прогноз Банка России, после его горизонта — последнее значение.</div></div>
   <div class="note cl-disc">Модель упрощённая. Результаты — не прогноз и не индивидуальная инвестиционная рекомендация: реальные ставки, цены, налоги и дефолты будут отличаться.</div>`;
 }
@@ -17840,7 +18117,7 @@ function pCalc(){
   return`<div class="cl-page">${sw}${m==='goal'?pCalcGoal():pCalcInv()}</div>`;
 }
 function bindCalc(){if(cgMode()==='goal')bindCalcGoal();else bindCalcInv()}
-/* ── Оферты: держать или предъявить ── */
+/* ── Оферты: сравнение доходностей ── */
 function loadOff(){
   const acc=S.account,o=S.off;
   if(o&&o.acc===acc&&(o.loading||o.data||o.error))return;
@@ -17848,7 +18125,7 @@ function loadOff(){
   api('/api/offers?'+new URLSearchParams({account:acc})).then(d=>{if(S.account!==acc)return;S.off={acc,data:d};if(S.page==='off')renderSoon()})
    .catch(e=>{if(S.account!==acc)return;S.off={acc,error:e.message};if(S.page==='off')renderSoon()});
 }
-const OF_HINT={sell_market:['Продать на бирже','of-info'],put:['Предъявить','of-warn'],hold:['Держать','of-ok'],wait:['Подождать','of-wait'],call:['Знать','of-info'],unknown:['Проверить','of-wait'],closed:['Поздно','of-wait']};
+const OF_HINT={sell_market:['Биржевая цена выше оферты','of-info'],put:['Цена оферты выше рынка','of-warn'],hold:['Рынок не ниже оферты','of-ok'],wait:['Ставка ещё не объявлена','of-wait'],call:['Право эмитента','of-info'],unknown:['Тип оферты не указан','of-wait'],closed:['Период предъявления прошёл','of-wait']};
 const OF_KIND={put:['PUT — право продать эмитенту','of-t-put','Право ДЕРЖАТЕЛЯ: в период предъявления вы можете подать заявку через брокера, и эмитент выкупит бумагу по цене оферты (обычно 100 % номинала). Не хотите — ничего не делайте.'],call:['CALL — эмитент может погасить досрочно','of-t-call','Право ЭМИТЕНТА: он может досрочно погасить или выкупить выпуск по заранее известной цене. Заявку подавать не нужно; для вас это риск реинвестирования — деньги вернутся, когда ставки могут быть ниже.'],unknown:['тип не указан','of-t-unk','Источники не сообщают, кто вправе решать: держатель (put) или эмитент (call). Проверьте условия в документах выпуска, пока не принято решение.']};
 const OF_HOR=[['all','все'],['92','3 мес'],['366','1 год']],OF_TYP=[['all','все типы'],['put','PUT'],['call','CALL']];
 S.offH=S.offH||'all';S.offT=S.offT||'all';
@@ -17861,7 +18138,7 @@ function ofPeriod(x){
   return x.period_status==='open'?`<b class="pos">${t}</b><br><small class="${x.urgent?'neg':'mu'}">открыт, до конца ${x.period_days_left===0?'сегодня':ofDays(x.period_days_left).replace('через ','')}</small>`
     :x.period_status==='closed'?`${t}<br><small class="mu">закончился</small>`:`${t}<br><small class="${x.urgent?'neg':'mu'}">${x.period_days_left!=null?'закроется '+ofDays(x.period_days_left):''}</small>`;
 }
-const OF_HELP_CHIP={pending:['Подождать','of-wait'],formula:['По формуле','of-wait'],closed:['Поздно','of-wait'],below:['Предъявить','of-warn'],fair:['Оставить','of-ok'],above:['Оставить','of-ok'],none:['Оценить','of-wait']};
+const OF_HELP_CHIP={pending:['Ставка ещё не объявлена','of-wait'],formula:['Купон по формуле','of-wait'],closed:['Период предъявления прошёл','of-wait'],below:['Доходность к оферте выше','of-warn'],fair:['Доходность на уровне рынка','of-ok'],above:['Доходность к погашению выше','of-ok'],none:['Нет данных для сравнения','of-wait']};
 function ofHelper(x){
   const p=x.helper;if(!p)return null;
   const chip=(x.hint&&x.hint.code==='sell_market')?OF_HINT.sell_market:OF_HELP_CHIP[p.outcome||p.status]||OF_HELP_CHIP.none;
@@ -17871,7 +18148,7 @@ function ofHelper(x){
     <p class="mu"><small>${esc(p.disclaimer)}</small></p>`;
   return{chip,body};
 }
-function ofTeaser(){return{chip:['Pro','of-wait'],body:proTeaser('Подсказка по оферте — в Pro')}}
+function ofTeaser(){return{chip:['Pro','of-wait'],body:proTeaser('Сравнение по оферте — в Pro')}}
 function ofCard(x){
   const hp=x.kind==='put'?(isPro()?ofHelper(x):ofTeaser()):null;
   const h=x.hint||{},[lab,hc]=hp?hp.chip:(OF_HINT[h.code]||['','of-wait']),k=OF_KIND[x.kind]||OF_KIND.unknown,put=x.kind==='put';
@@ -17880,8 +18157,8 @@ function ofCard(x){
   const peers=x.peer_median!=null?`${pctp(x.peer_median,1)}<br><small class="mu">${x.peers_n} похожих выпусков</small>`:'<span class="mu">нет данных</span>';
   const dl=put?'Дата оферты':x.kind==='call'?'Дата колл':'Дата оферты';
   const priceTxt=x.offer_price!=null&&(put||x.price_known)?f2(x.offer_price)+' %':put?'—':'номинал?';
-  const what=put?`<p class="of-do"><b>Что делать.</b> Хотите вернуть деньги по цене оферты — подайте заявку через брокера в период предъявления (обычно за несколько дней до его конца). Не хотите — бумага останется у вас.</p>`
-    :x.kind==='call'?`<p class="of-do"><b>Что это значит для вас.</b> Решает эмитент, заявку подавать не нужно. Если выпуск погасят досрочно, вы получите номинал и купон на дату погашения, но дальше придётся искать новое вложение; смотрите «доходность к колл».</p>`:'';
+  const what=put?`<p class="of-do"><b>Как устроена оферта.</b> Держатель может вернуть деньги по цене оферты, подав заявку через брокера в период предъявления (обычно за несколько дней до его конца). Без заявки бумага остаётся у держателя.</p>`
+    :x.kind==='call'?`<p class="of-do"><b>Что это значит.</b> Решает эмитент, заявку подавать не нужно. При досрочном погашении держатель получает номинал и купон на дату погашения, а деньги нужно вкладывать заново (риск реинвестирования); для сравнения приведена «доходность к колл».</p>`:'';
   return`<div class="card of-card ${x.urgent?'of-urgent':''}">
     <div class="of-head" data-isin="${esc(x.isin||'')}" title="Открыть карточку выпуска">${logo(x,34)}<div class="of-nm"><b>${esc(x.name)}</b><small class="mu">${esc(x.isin||'')}${x.floating?' · флоатер':''} · ${M(x.value_rub,'rub',0)}</small></div>
       ${x.rating?`<span class="tag rt rt-${esc(rBucket(x.rating).split(' ')[0])}">${esc(x.rating)}</span>`:''}
@@ -17893,7 +18170,7 @@ function ofCard(x){
       <div><span class="k">${put?'Доходность к оферте':x.kind==='call'?'Доходность к колл':'Доходность к дате'}</span><span class="num">${yo}</span></div>
       <div><span class="k">Купон после оферты</span>${cpn}</div>
       <div><span class="k">Аналоги, доходность</span>${put?peers:'—'}</div></div>
-    <div class="of-hint ${hc}"><span class="of-lab">${esc(lab)}</span>${hp?`<div><span class="mu"><small>Помощник по оферте</small></span><br>${hp.body}${x.inferred?'<p class="mu"><small>Тип определён по формулировке Мосбиржи («Оферта» = право держателя); отдельного подтверждения даты нет.</small></p>':''}</div>`:`<div><b>${esc(h.title||'')}</b><p>${esc(h.text||'')}</p>${what}${x.risk_notes&&x.risk_notes.length&&h.code!=='put'?`<p class="neg">Обратите внимание: ${esc(x.risk_notes.join('; '))}.</p>`:''}${x.inferred?'<p class="mu"><small>Тип определён по формулировке Мосбиржи («Оферта» = право держателя); отдельного подтверждения даты нет.</small></p>':''}</div>`}</div></div>`;
+    <div class="of-hint ${hc}"><span class="of-lab">${esc(lab)}</span>${hp?`<div><span class="mu"><small>Расчёт по оферте</small></span><br>${hp.body}${x.inferred?'<p class="mu"><small>Тип определён по формулировке Мосбиржи («Оферта» = право держателя); отдельного подтверждения даты нет.</small></p>':''}</div>`:`<div><b>${esc(h.title||'')}</b><p>${esc(h.text||'')}</p>${what}${x.risk_notes&&x.risk_notes.length&&h.code!=='put'?`<p class="neg">Обратите внимание: ${esc(x.risk_notes.join('; '))}.</p>`:''}${x.inferred?'<p class="mu"><small>Тип определён по формулировке Мосбиржи («Оферта» = право держателя); отдельного подтверждения даты нет.</small></p>':''}</div>`}</div></div>`;
 }
 function ofFiltered(d){
   const hz=S.offH==='all'?null:+S.offH;
@@ -17908,13 +18185,13 @@ function pOff(){
   if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="of-r">Повторить</button></div>`;
   const L=ofFiltered(d),pu=L.filter(x=>x.kind==='put'),ca=L.filter(x=>x.kind==='call'),un=L.length-pu.length-ca.length;
   const hl=(OF_HOR.find(h=>h[0]===S.offH)||OF_HOR[0])[1];
-  const kp=`<div class="g g4">${kpi('Всего оферт',L.length,`${S.offH==='all'?'за всё время до погашения':'за период: '+hl} · ${d.bonds_count} облигаций${un?' · тип не указан: '+un:''}`,null,S1)}${kpi('PUT: можно предъявить',pu.length,'держатель может продать эмитенту',null,S3)}
+  const kp=`<div class="g g4">${kpi('Всего оферт',L.length,`${S.offH==='all'?'за всё время до погашения':'за период: '+hl} · ${d.bonds_count} облигаций${un?' · тип не указан: '+un:''}`,null,S1)}${kpi('PUT: есть право предъявить',pu.length,'держатель может продать эмитенту',null,S3)}
     ${kpi('CALL: эмитент может погасить',ca.length,d.both_count?`${d.both_count} вып. имеют и put, и call`:'заявку подавать не нужно',null,S8)}${kpi('Выкуп по put',M(pu.reduce((a,x)=>a+(x.to_offer_rub||0),0),'rub',0),`срочных: ${pu.filter(x=>x.urgent).length}`,pu.some(x=>x.urgent)?'neg':'',S2)}</div>`;
   const seg=(id,arr,cur)=>`<div class="seg" id="${id}">${arr.map(([v,t])=>`<button data-v="${v}" class="${cur===v?'on':''}">${t}</button>`).join('')}</div>`;
   const bar=`<div class="row" style="padding:0 0 10px;gap:12px;flex-wrap:wrap;align-items:center"><span class="mu">Горизонт</span>${seg('of-h',OF_HOR,S.offH)}<span class="mu">Тип</span>${seg('of-t',OF_TYP,S.offT)}<span style="margin-left:auto">${ofKbLink()}</span></div>`;
   const list=L.length?L.map(ofCard).join(''):`<div class="card empty">${esc(d.items.length?'В выбранном горизонте и типе оферт нет: расширьте горизонт или смените тип.':d.empty_text)}</div>`;
   return kp+bar+(d.errors&&d.errors.length?`<div class="msg">Не удалось разобрать часть выпусков: ${esc(d.errors.slice(0,3).join('; '))}</div>`:'')+list+
-   `<div class="card"><h2>Как это читать</h2><p class="note">${(d.notes||[]).map(esc).join('<br><br>')}<br><br>Правило подсказки для put: если на бирже бумага стоит дороже цены выкупа — выгоднее продать на бирже; подсказка появляется только после того, как эмитент объявил купон на период после оферты (обычно за день до открытия приёма заявок). Тогда доходность бумаги при текущей цене с новым купоном сравнивается с медианой похожих выпусков (тот же рейтинг ±1 ступень, близкий срок): ниже больше чем на 0,5 п. п. — предъявление выглядит разумнее; выше больше чем на 0,5 п. п. — оставить выгоднее; иначе купон в рынке. У плавающего купона размер считается по формуле, сравнение не строится. Подсказки справочные, это не индивидуальная инвестиционная рекомендация: условия оферты проверяйте в документах выпуска и у брокера. ${ofKbLink()}.</p></div>`;
+   `<div class="card"><h2>Как это читать</h2><p class="note">${(d.notes||[]).map(esc).join('<br><br>')}<br><br>Правило сравнения для put: если биржевая цена выше цены выкупа, это отмечается отдельно; сравнение доходностей появляется только после того, как эмитент объявил купон на период после оферты (обычно за день до открытия приёма заявок). Тогда доходность бумаги при текущей цене с новым купоном сравнивается с медианой похожих выпусков (тот же рейтинг ±1 ступень, близкий срок): ниже больше чем на 0,5 п. п. — отмечается «доходность к оферте выше»; выше больше чем на 0,5 п. п. — «доходность к погашению выше»; иначе «на уровне рынка». У плавающего купона размер считается по формуле, сравнение не строится. Условия оферты указаны в документах выпуска и у брокера. ${ofKbLink()}.</p>${NIR_NOTE}</div>`;
 }
 function bindOff(){
   const r=$('#of-r');if(r)r.onclick=()=>{S.off=null;render()};
@@ -18040,7 +18317,7 @@ function ladResult(d){
   chart('ld-cf',ladChart);
   return kp+warn+`<div class="card"><h2>Ступени лесенки<span class="sp">нажмите на строку — карточка выпуска</span></h2><div class="tbl"><table class="ld-tbl"><thead><tr><th class="l">Облигация</th><th class="l">Рейтинг</th><th>Доходность</th><th>Срок</th><th>Куплено</th><th>Стоимость</th><th class="l">Купоны</th></tr></thead><tbody>${body}</tbody></table></div></div>
   <div class="card"><h2>Выплаты по месяцам<span class="sp">купоны и возврат номинала</span></h2><div class="chart" id="ld-cf"></div></div>
-  <div class="card ld-notes"><h2>Почему так</h2><div class="note">${d.notes.map(n=>`<p>${esc(n)}</p>`).join('')}<p>Цены и доходности — по данным Мосбиржи на сегодня, расчёт с учётом накопленного купонного дохода и без комиссий; налог не учтён. Состав — справочная подборка, не индивидуальная инвестиционная рекомендация: перед покупкой проверьте эмитентов и условия выпусков.</p></div></div>`;
+  <div class="card ld-notes"><h2>Почему так</h2><div class="note">${d.notes.map(n=>`<p>${esc(n)}</p>`).join('')}<p>Цены и доходности — по данным Мосбиржи на сегодня, расчёт с учётом накопленного купонного дохода и без комиссий; налог не учтён. Состав — справочная подборка по заданным параметрам; сведения об эмитентах и условиях выпусков приведены в их документах.</p>${NIR_NOTE}</div></div>`;
 }
 function pLad(){
   const tabs=`<div class="seg noprint" style="margin-bottom:14px;width:fit-content">${[['my','Мой портфель'],['build','Подобрать лесенку']].map(([k,t])=>`<button class="${S.ladTab===k?'on':''}" data-ldtab="${k}">${t}</button>`).join('')}</div>`;
@@ -18267,7 +18544,7 @@ function issDetail(isin){
     h+=`<h3 class="iss-h">Кредитная история</h3><div class="bc-rel"><b class="${hs.defaults?'neg':hs.tech?'':'pos'}">${esc(hs.verdict)}</b><br><span class="mu">Выпусков эмитента на Мосбирже: ${hs.total} (торгуется сейчас: ${hs.traded}). Проверено на дефолт: ${hs.checked}${hs.total>hs.checked?' (сначала торгуемые)':''}. Флаги берутся из описания выпуска на Мосбирже.</span></div>`;
     if(bad_.length)h+=`<div class="tbl" style="margin-top:8px;max-height:260px"><table><thead><tr><th class="l">Выпуск</th><th class="l">Статус</th></tr></thead><tbody>`+bad_.map(x=>`<tr data-isin="${esc(x.isin)}"><td class="l">${esc(x.name)} <small class="mu">${esc(x.isin)}</small></td><td class="l neg">${x.default?'дефолт':'технический дефолт'}${x.traded?'':' · не торгуется'}</td></tr>`).join('')+`</tbody></table></div>`;
   }
-  return h+`<p class="note" style="margin-top:12px">Не является инвестиционной рекомендацией. Скоринг — упрощённая модель по открытой отчётности (МСФО группы по данным smart-lab, если эмитент входит в листинговую группу; иначе РСБУ отдельной компании); она может не отражать поддержку владельца и события после отчётной даты.</p></div>`;
+  return h+`<p class="note" style="margin-top:12px">Скоринг — упрощённая модель по открытой отчётности (МСФО группы по данным smart-lab, если эмитент входит в листинговую группу; иначе РСБУ отдельной компании); она может не отражать поддержку владельца и события после отчётной даты.</p>${NIR_NOTE}</div>`;
 }
 function bindIss(){
   const I=S.iss;
@@ -18756,7 +19033,7 @@ document.addEventListener('keydown',e=>{
   else if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();const n=KP.items.length;if(n){KP.sel=(KP.sel+(e.key==='ArrowDown'?1:n-1))%n;kpDraw()}}
   else if(e.key==='Enter'){e.preventDefault();kpRun(KP.sel)}
 },true);
-/* ── Вход по ключу из Telegram-бота (ключ действует сутки; токен Т-Инвестиций остаётся на компьютере) ── */
+/* ── Вход по ключу из Telegram-бота (ключ действует 7 дней; токен Т-Инвестиций остаётся на компьютере) ── */
 const AUTH={st:null,bot:'tanalyticbot',busy:false,tick:0};
 function authTime(ts){
   const d=new Date(ts*1000),t=d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
@@ -18781,8 +19058,8 @@ function authOverlay(show,err){
   ov=document.createElement('div');ov.id='login-ov';
   ov.innerHTML=`<div class="lg-box" role="dialog" aria-modal="true" aria-label="Вход">
     <div class="logo"><i><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#111" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16l5-6 4 3 7-8"/></svg></i>
-      <div>T-Invest Analytics<small>аналитика портфеля</small></div></div>
-    <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует сутки.</p>
+      <div>TAnalytic<small>аналитика портфеля</small></div></div>
+    <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует 7 дней.</p>
     <a class="btn" id="lg-bot" href="https://t.me/${bot}?start=app" target="_blank" rel="noopener noreferrer">Открыть @${bot}</a>
     <form id="lg-form" autocomplete="off">
       <input class="in" id="lg-key" placeholder="TIA-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" autofocus>
@@ -18848,7 +19125,7 @@ const KB=[
 <p>Практический смысл: длинные облигации с низким купоном сильнее реагируют на смену ставок, короткие и флоатеры — слабее. Если вы планируете держать бумагу до погашения, колебания цены в пути на итоговую доходность не влияют (при отсутствии дефолта). Если может понадобиться продать досрочно, дюрация показывает размер возможной просадки. Дюрация портфеля — взвешенное среднее дюраций бумаг, её видно на страницах «Риски и сценарии» и «Облигации».</p>`},
 {id:'offers',c:'Облигации',t:'Оферты: put и call',k:'оферта put call пут колл досрочное погашение выкуп предъявить реинвестирование',h:`
 <p><b>Оферта</b> — предусмотренная условиями выпуска возможность досрочно «закрыть» бумагу. Бывает два принципиально разных вида.</p>
-<p><b>Put-оферта</b> — право <i>держателя</i> предъявить облигацию к выкупу по цене оферты (обычно 100 % номинала) в период приёма заявок. Этот период короткий, часто несколько дней, и он заканчивается раньше даты выкупа. Чтобы воспользоваться правом, нужно подать заявку через брокера (в приложении брокера обычно есть отдельный раздел для заявок по офертам). Если ничего не делать, бумага остаётся у вас, а эмитент вправе пересмотреть условия: купон может быть изменён, в том числе снижен. Так что бездействие — тоже решение.</p>
+<p><b>Put-оферта</b> — право <i>держателя</i> предъявить облигацию к выкупу по цене оферты (обычно 100 % номинала) в период приёма заявок. Этот период короткий, часто несколько дней, и он заканчивается раньше даты выкупа. Чтобы воспользоваться правом, нужно подать заявку через брокера (в приложении брокера обычно есть отдельный раздел для заявок по офертам). Если ничего не делать, бумага остаётся у вас, а эмитент вправе пересмотреть условия: купон может быть изменён, в том числе снижен. Отсутствие заявки означает, что бумага остаётся у держателя.</p>
 <p><b>Call-оферта</b> — право <i>эмитента</i> досрочно погасить выпуск в указанную дату, обычно по номиналу. Держатель решать ничего не может. Главный риск — реинвестирование: если ставки к тому времени упали, вернувшиеся деньги придётся вложить под меньший процент. Поэтому осторожный расчёт ведут к колл-дате: доходность к ближайшему колл считают по цене покупки и номиналу на дату колл.</p>
 <p>У одного выпуска могут быть оба типа и несколько дат. Например, put через 2 года и call ещё через год.</p>
 <p>Программа определяет оферты по данным Мосбиржи и справочников и показывает ближайшую дату, тип и доходность к ней. Но эти данные могут быть неполными или неточными (дата, цена выкупа, статус ставки). Всегда проверяйте <b>эмиссионные документы</b> (решение о выпуске, проспект, условия размещения) на сайте эмитента или в системе раскрытия информации: тип оферты, цену выкупа, даты приёма заявок и порядок определения нового купона.</p>`},
@@ -18869,7 +19146,7 @@ const KB=[
 {id:'types',c:'Облигации',t:'ОФЗ, корпоративные и ВДО',k:'офз корпоративные вдо высокодоходные эмитент надёжность',h:`
 <p><b>ОФЗ</b> — облигации федерального займа, долг Министерства финансов России. Это самый надёжный рублёвый эмитент, поэтому доходность у ОФЗ обычно самая низкая и служит ориентиром для остального рынка. Ликвидность обычно высокая.</p>
 <p><b>Корпоративные облигации</b> выпускают компании. Доходность выше, чем у ОФЗ с похожим сроком, потому что вы берёте на себя кредитный риск — риск того, что компания не рассчитается. У крупных эмитентов с высоким рейтингом он невелик.</p>
-<p><b>ВДО</b> (высокодоходные облигации) — выпуски малых и средних компаний с рейтингом ниже инвестиционного уровня. Ставки заметно выше, но выше и вероятность проблем с выплатами, а торгуются они менее ликвидно. Такие бумаги разумно держать небольшой долей и с хорошей диверсификацией: убыток по одному эмитенту не должен ощутимо ударить по портфелю.</p>
+<p><b>ВДО</b> (высокодоходные облигации) — выпуски малых и средних компаний с рейтингом ниже инвестиционного уровня. Ставки заметно выше, но выше и вероятность проблем с выплатами, а торгуются они менее ликвидно. Для таких бумаг типична небольшая доля в портфеле и диверсификация: убыток по одному эмитенту не должен ощутимо ударить по портфелю.</p>
 <p>Пример: ОФЗ даёт 15 % годовых, надёжная корпоративная бумага 17 %, ВДО 24 %. Разница в 2 и 9 п. п. — это и есть плата за риск (спред к ОФЗ или к кривой бескупонной доходности), см. статью «Спред к КБД».</p>
 <p>Есть ограничения доступа: часть выпусков доступна только квалифицированным инвесторам. Тип инвестора и ограничения брокер показывает при покупке. В скринере облигаций эти категории можно фильтровать.</p>`},
 {id:'ratings',c:'Облигации',t:'Кредитные рейтинги',k:'рейтинг акра эксперт ра нкр нра прогноз под наблюдением ruaaa',h:`
@@ -18935,14 +19212,16 @@ const KB=[
 <p>— обмены и конвертации бумаг могут влиять на срок владения, детали зависят от операции;</p>
 <p>— убыточные продажи в расчёте ЛДВ не нужны, но убыток может пригодиться для зачёта;</p>
 <p>— для облигаций выгода обычно невелика: основной доход — купоны, а они ЛДВ не освобождаются.</p>
-<p>Страница «Налоги → ЛДВ» показывает бумаги, по которым льгота уже наступила или скоро наступит, и напоминает не продавать прибыльные позиции прямо перед этой датой.</p>`},
-{id:'tax-iis',c:'Налоги',t:'ИИС: типы А, Б и III',k:'иис индивидуальный инвестиционный счёт тип а б вычет 400 тысяч iis три',h:`
-<p><b>ИИС</b> — индивидуальный инвестиционный счёт, налоговый режим внутри брокерского счёта. Он открывается на физлицо, обычно у одного брокера (в старых правилах разрешалось два), и для получения льгот его нужно держать не менее трёх лет.</p>
-<p><b>Тип А</b> (вычет на взнос). За каждый год вы можете вернуть 13 % от внесённой суммы, но не более 52 000 ₽ при внесении до 400 000 ₽ в год. Вычет получает тот, у кого есть налогооблагаемый доход с налоговой ставкой 13 % (например, зарплата): возврат идёт из налога, который уже уплачен. Заявку подаёт сам инвестор, в налоговую или через брокера.</p>
-<p><b>Тип Б</b> (вычет на доход). Налог с прибыли по операциям на счёте не взимается. Вариант подходит, если вы ожидаете значительный доход на счёте, а выгодой вычета А воспользоваться нельзя.</p>
-<p><b>ИИС типа III</b> (с 2024 года). Это новый вариант с объединением: при закрытии вы получаете льготу, учитывающую и вклад, и доход, но с ограничениями по предельной сумме. Условия смотрите на сайте Банка России и у вашего брокера. Если открывали ИИС до 2024 года, он остаётся прежним типа А или Б.</p>
-<p>Пример типа А: внесено 400 000 ₽ — возврат 52 000 ₽ за год. При типе Б, если за три года заработано 300 000 ₽, налог 39 000 ₽ платить не придётся.</p>
-<p>Досрочное закрытие до трёх лет обычно лишает льгот, а полученный вычет придётся вернуть. Страница «Налоги → ИИС» показывает срок и подсказывает, что сделать.</p>`},
+<p>Страница «Налоги → ЛДВ» показывает бумаги, по которым льгота уже наступила или скоро наступит, и показывает, сколько дней осталось до этой даты.</p>`},
+{id:'tax-iis',c:'Налоги',t:'ИИС-3 (и ИИС типов А и Б)',k:'иис индивидуальный инвестиционный счёт иис-3 iis3 тип а б вычет 400 тысяч iis три',h:`
+<p><b>ИИС</b> — индивидуальный инвестиционный счёт, налоговый режим внутри брокерского счёта. Он открывается на физлицо у брокера.</p>
+<p><b>С 1 января 2024 года открыть можно только ИИС-3.</b> Новые ИИС типа А и типа Б не открываются.</p>
+<p><b>ИИС-3</b> (действующий вариант). Объединяет обе льготы. Вычет на взносы: 13 % от внесённой за год суммы, но не более 52 000 ₽ в год (взносы до 400 000 ₽ в год учитываются для вычета; вносить на счёт можно до 1 млн ₽ в год). Вычет получает тот, у кого есть налогооблагаемый доход по ставке 13 %: возврат идёт из налога, который уже уплачен. Освобождение дохода: при сроке владения от 5 лет налог на доход по операциям на счёте не взимается в пределах 30 млн ₽ финансового результата. При закрытии раньше срока льготы теряются, а полученный вычет возвращается. Точные условия смотрите на сайте Банка России и у вашего брокера.</p>
+<p>Пример ИИС-3: внесено 400 000 ₽ — вычет за год составляет 52 000 ₽.</p>
+<p><b>ИИС типов А и Б</b> — для владельцев счетов, открытых до 2024 года. Такие счета продолжают работать по прежним правилам; тип менять не нужно.</p>
+<p><b>Тип А</b> (вычет на взнос): 13 % от внесённой за год суммы, не более 52 000 ₽ при внесении до 400 000 ₽ в год. Заявку подаёт сам инвестор, в налоговую или через брокера.</p>
+<p><b>Тип Б</b> (вычет на доход): налог с прибыли по операциям на счёте не взимается при сроке владения не менее трёх лет. Пример: если за три года заработано 300 000 ₽, налог 39 000 ₽ платить не придётся.</p>
+<p>Досрочное закрытие до истечения минимального срока (три года для А и Б, пять лет для ИИС-3) лишает льгот, а полученный вычет придётся вернуть. Страница «Налоги → ИИС» показывает срок владения счётом.</p>`},
 {id:'tax-loss',c:'Налоги',t:'Убытки и 3-НДФЛ',k:'убыток перенос зачёт 3-ндфл декларация вычет налоговая',h:`
 <p>Убыток от продажи ценных бумаг уменьшает налогооблагаемую прибыль. Вы можете зачесть его против прибыли <i>того же</i> года, и налоговый агент (брокер) делает это автоматически в пределах одного брокера.</p>
 <p><b>Перенос убытков.</b> Если убыток не удалось покрыть в текущем году, его можно переносить на следующие годы — до 10 лет. Для этого нужна декларация 3-НДФЛ и подтверждающие документы по сделкам (отчёты брокера). Перенесённый убыток уменьшает базу по операциям с ценными бумагами и деривативами. Зачёт идёт в порядке возникновения убытков.</p>
@@ -18953,7 +19232,7 @@ const KB=[
 <p>— у брокера не было возможности удержать налог (иностранные бумаги, доходы у зарубежного брокера);</p>
 <p>— вам начислили доход, который агент не учёл.</p>
 <p>Подать декларацию можно в личном кабинете налогоплательщика ФНС. Срок — до 30 апреля следующего года, если нужно уплатить налог; для вычетов и возврата — в течение трёх лет.</p>
-<p>Страница «Налоги → Для декларации» собирает суммы и таблицу сделок, а вкладка «Подсказки» ищет убытки, которые выгодно зафиксировать. Это справочная информация, перепроверьте её по документам брокера.</p>`},
+<p>Страница «Налоги → Для декларации» собирает суммы и таблицу сделок, а вкладка «Подсказки» показывает позиции с убытком, который уменьшает налоговую базу. Это справочная информация, перепроверьте её по документам брокера.</p>`},
 {id:'xirr',c:'Портфель',t:'Доходность: XIRR и простая',k:'xirr доходность простая irr денежный поток внутренняя норма взносы пополнения',h:`
 <p><b>Простая доходность</b> — отношение прибыли к вложенной сумме. Вложили 100 000 ₽, сейчас 110 000 ₽ — доходность 10 %. Она хороша, пока не было пополнений и выводов и неважно, за какое время получен результат.</p>
 <p>Проблемы возникают, когда деньги приходили в разные моменты. Пример: вы вложили 100 000 ₽ в начале года, а ещё 100 000 ₽ добавили в декабре. К концу года стоимость 215 000 ₽. Простая формула даст 7,5 %, хотя вторая сумма почти не работала, а первая выросла сильнее.</p>
@@ -19009,15 +19288,15 @@ const KB=[
 <p>Сетевые запросы идут к API Т-Инвестиций (портфель и операции по вашему токену), к открытым источникам рыночных данных (Мосбиржа, ЦБ, ФНС и др.) и к боту для входа по ключу.</p>
 <p><b>Резервная копия:</b> на странице «Настройки» есть резервное копирование; также можно просто скопировать папку целиком.</p>
 <p><b>Как удалить всё.</b> Закройте программу, затем удалите папку <code>.tinvest_analytics</code> (в Windows — через Проводник, в macOS через Finder с сочетанием Cmd+Shift+. для показа скрытых папок, либо командой <code>rm -rf ~/.tinvest_analytics</code>). Пока вы не удалили эту папку, данные сохранятся. После удаления рекомендуется отозвать токен в личном кабинете Т-Инвестиций.</p>`},
-{id:'token',c:'Программа',t:'Токен и вход по ключу',k:'токен только для чтения ключ бот tanalyticbot 24 часа вход безопасность api',h:`
+{id:'token',c:'Программа',t:'Токен и вход по ключу',k:'токен только для чтения ключ бот tanalyticbot 7 дней неделя вход безопасность api',h:`
 <p><b>Токен</b> — длинная строка, которая даёт программе доступ к вашему брокерскому счёту через API Т-Инвестиций. Его создают в личном кабинете (Настройки → Токены API). Выберите доступ <b>«Только для чтения»</b>: тогда программа сможет видеть счета, портфель и операции, но не сможет создавать заявки, продавать, покупать или переводить деньги. Ограничить токен можно отдельными счетами.</p>
 <p>Токен сохраняется только в папке данных на вашем компьютере. Никому его не пересылайте и не публикуйте. Если токен мог попасть к постороннему, отзовите его в личном кабинете и создайте новый. Удалить токен из программы можно кнопкой на странице «Настройки».</p>
-<p><b>Вход по ключу.</b> Для доступа к программе вы получаете ключ в Telegram-боте <b>@tanalyticbot</b>. Ключ действует 24 часа, после чего нужно запросить новый в боте. Он нужен только для доступа к самой программе: токен Т-Инвестиций к боту не передаётся и остаётся на вашем компьютере. Если ключ истёк, программа попросит получить новый, а ваши данные при этом не пропадают.</p>
+<p><b>Вход по ключу.</b> Для доступа к программе вы получаете ключ в Telegram-боте <b>@tanalyticbot</b>. Ключ действует 7 дней, после чего нужно запросить новый в боте. Он нужен только для доступа к самой программе: токен Т-Инвестиций к боту не передаётся и остаётся на вашем компьютере. Если ключ истёк, программа попросит получить новый, а ваши данные при этом не пропадают.</p>
 <p>Пример: утром вы получили ключ и ввели его, весь день пользуетесь программой, а на следующий день видите просьбу ввести новый ключ. Это обычный порядок, а не ошибка.</p>
 <p>Если пропал доступ к API (например, токен истёк или отозван), программа покажет сообщение об ошибке. Создайте новый токен и вставьте его в настройках.</p>`},
 {id:'pro',c:'Программа',t:'Free и Pro',k:'free pro тариф подписка пробный период 7 дней платно бесплатно оформить бот',h:`
 <p><b>Free (бесплатно)</b> — всё, что нужно для учёта портфеля: обзор, позиции, облигации, доходность, выплаты и календарь, операции, комиссии, налоги по факту (ЛДВ, ИИС, данные для декларации), ребалансировка, калькулятор, ставки, эмитенты, наблюдение, импорт отчётов и резервные копии.</p>
-<p><b>Pro</b> — инструменты анализа: скринер и сравнение облигаций, лесенка, сигналы, риски и сценарии, мониторинг, карта рынка, подсказка по оферте (держать или предъявить), прогноз налога на 31 декабря и уведомления в Telegram.</p>
+<p><b>Pro</b> — инструменты анализа: скринер и сравнение облигаций, лесенка, сигналы, риски и сценарии, мониторинг, карта рынка, сравнение доходностей по оферте, прогноз налога на 31 декабря и уведомления в Telegram.</p>
 <p><b>Пробный период.</b> Новому пользователю бот <b>@tanalyticbot</b> сам даёт 7 дней Pro после первого согласия на обработку данных. За два дня до конца и в день окончания бот пришлёт напоминание.</p>
 <p><b>Как получить Pro.</b> Оплата пока не подключена: напишите боту команду <code>/pro</code> — он покажет, что входит в Pro и к кому обратиться. После выдачи Pro программа подхватит его в течение минуты, перезапускать её не нужно.</p>
 <p><b>Токен Т-Инвестиций</b> хранится только на вашем компьютере и никогда не передаётся боту или серверу данных, на любом тарифе. Тариф влияет лишь на набор функций программы. Если Pro закончился, ваши данные остаются на месте, закрываются только страницы Pro.</p>`}
@@ -19074,12 +19353,12 @@ const PRO_FEATURES={
  scr:{t:'Скринер облигаций',ic:'scr',b:['Фильтры по доходности, сроку, рейтингу и типу выпуска','Поиск выпусков под вашу цель за секунды','Сортировка по любому столбцу','Переход в карточку выпуска в один клик'],pv:'table'},
  cmp:{t:'Сравнение облигаций',ic:'cmp',b:['До нескольких выпусков рядом: доходность, дюрация, рейтинг, купон','Подсветка лучшего и худшего значения по каждому параметру','Оферты PUT и CALL, амортизация, оборот и НКД','Добавление из карточки выпуска кнопкой «Сравнить»'],pv:'table'},
  lad:{t:'Лесенка облигаций',ic:'lad',b:['Куда и когда возвращаются деньги из вашего портфеля','Конструктор новой лесенки под сумму и горизонт','Учёт рейтинга, флоатеров и амортизации','График выплат по месяцам и кварталам'],pv:'chart'},
- sig:{t:'Сигналы',ic:'sig',b:['Бумаги портфеля, которые дешевле аналогов или дороже них','Варианты замены на похожие выпуски','Сравнение с выпусками того же рейтинга и срока','Объяснение, почему сработал сигнал'],pv:'cards'},
+ sig:{t:'Сигналы',ic:'sig',b:['Бумаги портфеля со спредом выше или ниже медианы аналогов','Похожие выпуски с другой доходностью','Сравнение с выпусками того же рейтинга и срока','Объяснение, почему сработал сигнал'],pv:'cards'},
  risk:{t:'Риски и сценарии',ic:'risk',b:['Что будет с портфелем при росте и снижении ставок','Концентрация по эмитентам, секторам и срокам','Стресс-сценарии и чувствительность цены','Кредитные риски по рейтингам'],pv:'chart'},
  mon:{t:'Мониторинг',ic:'mon',b:['Слежение за рейтингами, дефолтами и резкими движениями цен','Тревоги по вашим бумагам с объяснением','Расширение спреда и ликвидность: сколько дней на продажу','Уведомления в Telegram (тоже Pro)'],pv:'cards'},
  map:{t:'Карта рынка',ic:'map',b:['Все выпуски на одной карте: доходность против срока','Ваши бумаги на фоне рынка','Видно, какие выпуски дают больше при том же сроке','Переход в карточку выпуска с карты'],pv:'chart'},
- offers:{t:'Подсказка по оферте',ic:'off',b:['Что выгоднее: предъявить бумагу или оставить','Сравнение с доходностью похожих выпусков','Когда и как подавать заявку','Кредитные риски эмитента рядом с решением'],pv:'cards'},
- taxfc:{t:'Прогноз налога на 31.12',ic:'tax',b:['Сколько налога будет удержано на конец года','Ожидаемые купоны и дивиденды до конца года','Сбор убытков: что продать, чтобы снизить налог','Учёт ЛДВ и ставки 13 / 15 %'],pv:'table'},
+ offers:{t:'Сравнение по оферте',ic:'off',b:['Сравнение доходности к оферте и к погашению','Сравнение с доходностью похожих выпусков','Сроки и порядок подачи заявки','Кредитные риски эмитента рядом с расчётом'],pv:'cards'},
+ taxfc:{t:'Прогноз налога на 31.12',ic:'tax',b:['Сколько налога будет удержано на конец года','Ожидаемые купоны и дивиденды до конца года','Убытки, которые уменьшают налоговую базу','Учёт ЛДВ и ставки 13 / 15 %'],pv:'table'},
  tg:{t:'Уведомления в Telegram',ic:'mon',b:['Тревоги мониторинга и списка наблюдения','Пут-оферты: новый купон, открытие приёма заявок, последние дни','Возможный колл по вашим бумагам','Приходят от @tanalyticbot, ничего настраивать не нужно'],pv:'cards'}
 };
 const PRO_FREE_LIST=['Портфель, позиции, облигации и доходность','Выплаты, календарь, операции и комиссии','Налоги: факт по годам, ЛДВ, ИИС, данные для декларации','Ребалансировка, калькулятор, ставки, эмитенты, наблюдение','Импорт отчётов, резервные копии, база знаний'];
@@ -19183,9 +19462,11 @@ function obRender(){
     <div class="ob-hd"><div class="ob-t">Добро пожаловать 👋</div><p class="t2">Три шага, и вы увидите свой портфель: доходность, выплаты, оферты и риски по облигациям.</p></div>
     ${obStep(1,'done','Ключ из бота',`<p class="mu">${authOk?'Вход выполнен.':'Готово — можно переходить к следующему шагу.'}</p>`)}
     ${obStep(2,tokDone?'done':'now','Токен Т-Инвестиций «только чтение»',tokDone?'<p class="mu">Токен сохранён и проверен.</p>':`
-      <p class="mu">Он нужен, чтобы программа могла прочитать ваши счета. Покупать и продавать с ним нельзя.</p>
+      ${`<div class="ro-note">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}<div><b>Нужен токен только для чтения.</b> С ним нельзя торговать, выводить деньги или менять настройки счёта — это ограничение на стороне Т-Банка. Токен хранится только на этом компьютере.</div></div>`}
+      <p class="mu">Он нужен, чтобы программа могла прочитать ваши счета.</p>
       <div class="ob-row"><input class="in" type="password" id="ob-tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false" aria-label="API-токен Т-Инвестиций">
-        <button class="btn" id="ob-save">Сохранить и проверить</button></div>
+        <button class="btn" id="ob-save">Сохранить и проверить</button>
+        <button class="btn ghost" id="ob-demo" title="Модельный портфель — без токена и без ваших данных">Посмотреть демо-портфель</button></div>
       <div id="ob-msg" role="status">${ob.err?`<div class="msg err">${esc(ob.err)}</div>`:''}</div>
       <details class="ob-how" ${ob.help?'open':''}><summary>Где взять токен</summary><ol>
         <li>Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении: Профиль → Настройки → Токены T-Invest API).</li>
@@ -19216,6 +19497,7 @@ function obRender(){
     }
   };
   b.onclick=save;
+  const dm=$('#ob-demo');if(dm)dm.onclick=()=>demoEnter(dm);
   input.onkeydown=e=>{if(e.key==='Enter')save()};
   $('#ob-imp').onclick=()=>go('imp');
   $('#ob-all').onclick=()=>{ob.skip=true;renderSettings()};
@@ -19292,6 +19574,56 @@ document.addEventListener('keydown',e=>{
   if(t==='TEXTAREA'||t==='SELECT'||(t==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|file|color)$/.test(a.type))||(a&&a.isContentEditable))return;
   e.preventDefault();ksToggle();
 },true);
+/* ── Демо-режим: модельный портфель без токена. Плашка на каждой странице + вход/выход ── */
+const DEMO={on:false,at:0,busy:false};
+function demoReset(){S.data=S.bonds=S.hist=S.today=null;S.account='all';persist()}
+async function demoEnter(btn){
+  if(DEMO.busy)return;DEMO.busy=true;if(btn){btn.disabled=true;btn.textContent='Готовлю демо…'}
+  try{
+    await post('/api/demo/enable');
+    DEMO.on=true;DEMO.at=Date.now();demoReset();S.page='dash';persist();
+    try{S.cfg=await api('/api/config')}catch(e){}
+    renderNav();demoBar();load(true);
+  }catch(e){if(btn){btn.disabled=false;btn.textContent='Посмотреть демо-портфель'}alert('Не удалось включить демо: '+(e&&e.message||e))}
+  finally{DEMO.busy=false}
+}
+async function demoExit(){
+  if(DEMO.busy)return;DEMO.busy=true;
+  try{
+    await post('/api/demo/disable');
+    DEMO.on=false;demoReset();ob.skip=false;ob.done=false;
+    try{S.cfg=await api('/api/config')}catch(e){}
+    S.accounts=[];S.page='set';persist();demoBar();renderAccounts();renderNav();renderSettings();
+  }catch(e){alert('Не удалось выйти из демо: '+(e&&e.message||e))}
+  finally{DEMO.busy=false}
+}
+function demoBar(){
+  let el=document.getElementById('demo-bar');
+  if(!DEMO.on){if(el)el.remove();return}
+  if(!el){
+    el=document.createElement('div');el.id='demo-bar';el.className='noprint';el.setAttribute('role','status');
+    const v=document.getElementById('view');v.parentNode.insertBefore(el,v);
+    el.onclick=e=>{
+      const b=e.target.closest('button[data-d]');if(!b)return;
+      if(b.dataset.d==='exit')demoExit();
+      else if(b.dataset.d==='tok'){go('set')}
+    };
+  }
+  el.innerHTML=`<span class="dm-t"><b>Демо-режим:</b> модельный портфель, не ваши данные</span><span class="dm-b"><button class="btn ghost" data-d="tok">Ввести токен</button><button class="btn" data-d="exit">Выйти из демо</button></span>`;
+}
+/* состояние демо подтягиваем при каждой перерисовке навигации (не чаще раза в 4 секунды) */
+function demoSync(){
+  if(Date.now()-DEMO.at<4000)return;DEMO.at=Date.now();
+  api('/api/demo/status').then(r=>{
+    const on=!!(r&&r.active);
+    if(on!==DEMO.on){
+      const was=DEMO.on;DEMO.on=on;demoBar();
+      if(was&&!on){demoReset();load(true)}   /* демо убрано сервером (реальный токен или отчёт) */
+    }
+  }).catch(()=>{});
+}
+const _renderNavDemo=renderNav;
+renderNav=function(){_renderNavDemo.apply(this,arguments);demoBar();demoSync()};
 </script></body></html>
 '''
 

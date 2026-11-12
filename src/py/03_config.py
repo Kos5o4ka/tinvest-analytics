@@ -39,7 +39,7 @@ def make_backup():
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(tmp, "data.db")
             z.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
-            z.writestr("README.txt", "Резервная копия T-Invest Analytics. Токены и пароли в копию не входят.\n"
+            z.writestr("README.txt", "Резервная копия TAnalytic. Токены и пароли в копию не входят.\n"
                        "Восстановление: закройте программу и положите data.db в папку данных (%s).\n" % APP_DIR)
         return buf.getvalue()
     finally:
@@ -50,6 +50,11 @@ def make_backup():
 
 
 def save_config(cfg):
+    if (cfg.get("token") or "").strip():
+        try:
+            demo_remove()  # реальный токен заменяет демо-портфель
+        except Exception:  # noqa: BLE001
+            pass
     with _cfg_lock:
         _private_write(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"))
 

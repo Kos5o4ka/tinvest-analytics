@@ -2,7 +2,7 @@
 # Если задан «сервер данных» (настройки или TINVEST_DATA_SERVER / TINVEST_DATA_KEY), запрос идёт через него:
 # GET|POST {сервер}/v1/fetch?url=... Сервер кэширует ответы и сам ходит к источникам. При любой неудаче сервера
 # (нет связи, таймаут, 5xx, 401/403) запрос выполняется напрямую, а сервер на 5 минут считается недоступным.
-# Сервер по умолчанию — DS_DEFAULT; он требует личный ключ из Telegram-бота (24 часа), см. «вход по ключу» ниже
+# Сервер по умолчанию — DS_DEFAULT; он требует личный ключ из Telegram-бота (7 дней), см. «вход по ключу» ниже
 # (/api/auth/*). «off» в настройках или в TINVEST_DATA_SERVER отключает сервер совсем (запросы идут напрямую).
 # API Т-Инвестиций сюда НЕ входит: он всегда идёт напрямую, токен на сервер данных не передаётся. Уведомления Telegram — отдельный вызов POST /v1/notify (13j_watch.py).
 
@@ -116,6 +116,38 @@ def _ds_request(srv, key, url, data, headers, timeout):
         return None
 
 
+DS_PARSED_V = 1
+
+
+def ds_parsed(name, params=None, timeout=20):
+    """Готовый разбор страницы источника с сервера данных: GET {сервер}/v1/parsed/<name>?... -> data либо None.
+    None: сервер выключен/недоступен, старый сервер (404), ok:false, другая версия формата. Тогда вызывающий разбирает страницу сам."""
+    srv, key = ds_conf()
+    if not srv or time.time() < _ds_state["down_until"]:
+        return None
+    q = ("?" + urllib.parse.urlencode(params)) if params else ""
+    hd = {"User-Agent": EXT_UA["User-Agent"]}
+    if key:
+        hd["X-Client-Key"] = key
+    try:
+        req = urllib.request.Request(srv + "/v1/parsed/" + name + q, headers=hd)
+        with urllib.request.urlopen(req, timeout=timeout + 5, context=_ssl()) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            with _ds_lock:
+                _auth["need_login"] = e.code == 401 or _auth["need_login"]
+                _auth["res"] = None
+            _ds_down("сервер ответил %d" % e.code)
+        return None                                    # 404 (старый сервер), 5xx источника и т.п. — не «роняем» сервер
+    except Exception as e:  # noqa: BLE001
+        _ds_down("нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
+        return None
+    if not isinstance(j, dict) or j.get("ok") is not True or j.get("v") != DS_PARSED_V:
+        return None
+    return j.get("data")
+
+
 def ext_open(url, data=None, headers=None, timeout=25, jar=None):
     """Запрос публичных данных -> (статус, байты, content-type). При HTTP-ошибке источника бросает urllib.error.HTTPError
     (как и прежний urlopen). jar — dict с cookie сессии (обновляется из ответа), нужен, например, raexpert (CSRF)."""
@@ -177,7 +209,7 @@ def ds_test(cfg, body):
     except Exception as e:  # noqa: BLE001
         raise ApiError("Не удалось подключиться: %s" % (getattr(e, "reason", None) or type(e).__name__), 400)
     if not isinstance(j, dict) or not j.get("ok"):
-        raise ApiError("Это не сервер данных T-Invest Analytics.", 400)
+        raise ApiError("Это не сервер данных TAnalytic.", 400)
     return {"ok": True, "version": j.get("version", ""), "uptime": j.get("uptime", 0), "cache_items": j.get("cache_items", 0)}
 
 
