@@ -5547,8 +5547,18 @@ def pv_parse_desc(j):
             "ftype": m.get("FACEVALUE_TYPE") or "", "emitter": m.get("EMITTER_ID")}
 
 
+def pv_desc_old(d, cut):
+    """Описание выпуска с датой старта раньше окна: дата не меняется и в «первичку» выпуск уже не вернётся — хранить можно насовсем."""
+    st = (d or {}).get("issued") or (d or {}).get("start") or ""
+    return bool(st) and st < cut
+
+
 def pv_desc(secid):
     st = store()
+    cut = _day_add(pv_msk_now().date().isoformat(), -PV_DAYS)
+    e = st.get(PV_DESC_KEY + secid)
+    if e is not None and pv_desc_old(e, cut):
+        return e
     e = st.get(PV_DESC_KEY + secid, 7 * 86400)
     if e is not None:
         return e
@@ -5705,8 +5715,35 @@ def _pv_rating(isin, name):
             return None
 
 
+def pv_calendar_bg(out):
+    """Календарь investmint в фоновом потоке: результат кладём в out (cal/err), пока основной конвейер грузит MOEX."""
+    t0 = time.time()
+    try:
+        out["cal"] = primary_rows() or []
+    except Exception as ex:  # noqa: BLE001
+        out["err"] = "календарь: %s" % str(ex)[:100]
+    out["t"] = time.time() - t0
+
+
+def pv_bonds_batch():
+    """Весь рынок bonds одним запросом (~3,5 тыс. бумаг, ≈1 МБ): {secid: [marketdata-строки по площадкам]}."""
+    j = pv_json(PV_ISS + "engines/stock/markets/bonds/securities.json?iss.meta=off&iss.only=securities,marketdata"
+                "&securities.columns=%s&marketdata.columns=%s" % (_PV_LS, _PV_LM), 60)
+    return pv_live_parse(j)
+
+
 def pv_compute():
-    errs = []
+    errs, tm = [], {}
+    t0 = time.time()
+
+    def lap(name):
+        nonlocal t0
+        t1 = time.time()
+        tm[name] = round(t1 - t0, 2)
+        t0 = t1
+    cal_box = {}
+    cal_th = threading.Thread(target=pv_calendar_bg, args=(cal_box,), daemon=True)
+    cal_th.start()
     now = pv_msk_now()
     today = now.date().isoformat()
     cut = _day_add(today, -PV_DAYS)
@@ -5716,6 +5753,22 @@ def pv_compute():
     byday = pv_days_cached(dates, errs)
     day_rows = [r for d in sorted(byday) for r in byday[d]] + pv_other_boards(cut, today, errs)
     agg = pv_aggregate(day_rows)
+    lap("history")
+    descs = {}
+
+    def d1(s):
+        try:
+            return s, pv_desc(s)
+        except Exception as ex:  # noqa: BLE001
+            return s, str(ex)[:100]
+
+    def load_descs(secs, sink):
+        for s, v in pool_map(d1, sorted(secs), workers=8):
+            sink[s] = v
+    pre = set(agg)                                      # описания бумаг с историей размещения грузим параллельно «сегодняшним» запросам
+    pre_got = {}
+    pre_th = threading.Thread(target=load_descs, args=(pre, pre_got), daemon=True)
+    pre_th.start()
     _pv["phase"] = "Обороты сегодня"
     live = {}
     for mk, b in [("ndm", x) for x in PV_PLACE_NDM] + [("bonds", x) for x in PV_PLACE_BONDS]:
@@ -5724,11 +5777,23 @@ def pv_compute():
                 live.setdefault(sid, []).extend(ms)
         except Exception as ex:  # noqa: BLE001
             errs.append("сегодня %s: %s" % (b, str(ex)[:100]))
-    cal = []
+    bonds_all = None
     try:
-        cal = primary_rows()
+        bonds_all = pv_bonds_batch()
     except Exception as ex:  # noqa: BLE001
-        errs.append("календарь: %s" % str(ex)[:100])
+        errs.append("рынок bonds: %s" % str(ex)[:100])
+    lap("live")
+    _pv["phase"] = "Календарь размещений"
+    cal_th.join(60)
+    lap("calendar_wait")
+    tm["calendar"] = round(cal_box.get("t") or 0, 2)
+    cal = cal_box.get("cal") or []
+    if cal_box.get("err"):
+        errs.append(cal_box["err"])
+    elif "cal" not in cal_box:
+        errs.append("календарь размещений investmint: не ответил вовремя")
+    elif not cal:
+        errs.append("календарь размещений investmint: 0 строк — возможно, изменилась разметка сайта")
     cal_isin = {r["isin"]: r for r in cal if r.get("isin")}
     cand = set(agg)
     for sid, ms in live.items():
@@ -5736,32 +5801,33 @@ def pv_compute():
             cand.add(sid)
     cand |= set(cal_isin)
     _pv["phase"] = "Описания выпусков (%d)" % len(cand)
-
-    def d1(s):
-        try:
-            return s, pv_desc(s)
-        except Exception as ex:  # noqa: BLE001
-            return s, str(ex)[:100]
-    descs = {}
-    for s, v in pool_map(d1, sorted(cand), workers=8):
+    pre_th.join()
+    got = dict(pre_got)
+    load_descs(cand - set(pre_got), got)
+    for s, v in got.items():
         if isinstance(v, dict):
             descs[s] = v
         else:
             errs.append("описание %s: %s" % (s, v))
+    lap("desc")
     new = [s for s, d in descs.items() if (d.get("issued") or d.get("start") or "") >= cut]
     _pv["phase"] = "Вторичные торги (%d)" % len(new)
-
-    def b1(s):
-        try:
-            return s, pv_live_secid(s)
-        except Exception as ex:  # noqa: BLE001
-            return s, str(ex)[:100]
     bms = {}
-    for s, v in pool_map(b1, new, workers=8):
-        if isinstance(v, list):
-            bms[s] = v
-        else:
-            errs.append("торги %s: %s" % (s, v))
+    if bonds_all is not None:
+        for s in new:
+            bms[s] = bonds_all.get(s) or []           # нет в рынке bonds — торгов там ещё нет (как пустой ответ по бумаге)
+    else:
+        def b1(s):
+            try:
+                return s, pv_live_secid(s)
+            except Exception as ex:  # noqa: BLE001
+                return s, str(ex)[:100]
+        for s, v in pool_map(b1, new, workers=8):
+            if isinstance(v, list):
+                bms[s] = v
+            else:
+                errs.append("торги %s: %s" % (s, v))
+    lap("secondary")
     rows = []
     for s in new:
         d = descs[s]
@@ -5778,7 +5844,7 @@ def pv_compute():
     rows.sort(key=lambda r: (r["status"] != "placing", r["status"] == "upcoming", ""), reverse=False)
     rows.sort(key=lambda r: r.get("start") or "", reverse=True)
     rows.sort(key=lambda r: {"placing": 0, "upcoming": 1}.get(r["status"], 2))
-    return {"rows": rows, "today": today, "window": PV_DAYS, "errors": errs[:10], "updated": time.time(),
+    return {"rows": rows, "today": today, "window": PV_DAYS, "errors": errs[:10], "updated": time.time(), "timing": tm,
             "totals": {"placing": sum(1 for r in rows if r["status"] == "placing"), "today_rub": round(sum(r["today"] for r in rows), 2),
                        "size_rub": round(sum(r["size_rub"] or 0 for r in rows), 2)}}
 
@@ -15224,7 +15290,7 @@ function priVolHtml(){
     ${kpi('Оборот сегодня',pvRub(tot),'размещение и вторичные торги')}${kpi('Размещено за период',pvRub(plc),'по номиналу, без ожидаемых')}</div>
   <div class="row" style="padding:10px 6px"><div class="seg" id="pv-f">${seg.map(([v,t])=>`<button class="${S.priVF===v?'on':''}" data-pvf="${v}">${t}</button>`).join('')}</div>${d.loading?'<small class="mu" style="margin-left:auto">обновляю…</small>':''}</div>
   <div class="tbl" style="max-height:calc(100vh - 220px)"><table id="pv-tab"><thead><tr>${th}</tr></thead><tbody>${rows.map(r=>pvRow(r,today)).join('')||'<tr><td colspan="8" class="empty">В этой группе пусто</td></tr>'}</tbody></table></div>
-  ${(d.errors||[]).length?`<p class="note">Часть данных Мосбиржи не загрузилась (${esc(d.errors.slice(0,3).join('; '))}) — нажмите «Обновить».</p>`:''}
+  ${(d.errors||[]).length?`<p class="note">Не всё удалось загрузить: ${esc(d.errors.slice(0,3).join('; '))}. Попробуйте «Обновить» чуть позже.</p>`:''}
   <p class="note">Новые выпуски — облигации, торги которыми начались за последние 30 дней, и объявленные размещения. Объём выпуска и «размещено» — в рублях по номиналу: штуки × номинал (у части выпусков «размещено» — сумма сделок на площадке размещения Мосбиржи, а не отчёт эмитента). «Сегодня» — оборот по рыночной цене сделок, данные Мосбиржи обновляются в течение дня (при открытых торгах — раз в несколько минут). Нажмите ›, чтобы увидеть разбивку по дням и площадкам; клик по строке открывает карточку выпуска. Справочная информация, не инвестиционная рекомендация.</p></div>`;
 }
 document.addEventListener('click',e=>{

@@ -103,6 +103,67 @@ class DaysMerge(unittest.TestCase):
         self.assertEqual((days[2]["v"], days[2]["y"]), (300.0, 15.0))
 
 
+class BatchAndCalendar(unittest.TestCase):
+    BATCH = {"securities": tbl(["SECID", "BOARDID", "SHORTNAME", "ISSUESIZE", "ISSUESIZEPLACED", "FACEVALUE"],
+                               [["RU000A10AAA1", "TQCB", "Альфа1", 1000000, 500000, 1000], ["RU000A10AAA1", "TQIR", "Альфа1", 1000000, 500000, 1000]]),
+             "marketdata": tbl(["SECID", "BOARDID", "VALTODAY_RUR", "VOLTODAY", "NUMTRADES"],
+                               [["RU000A10AAA1", "TQCB", 1500.5, 15, 3], ["RU000A10AAA1", "TQIR", 0, 0, 0], ["RU000A10BBB2", "TQOB", 10, 1, 1]])}
+
+    def run_compute(self, cal=None, cal_exc=None):
+        saved = (M.pv_json, M.primary_rows, M.pv_days_cached, M.pv_other_boards, M.pv_live_board, M.pv_desc, M.pv_live_secid)
+        calls = []
+
+        def pj(url, timeout=30):
+            calls.append(url)
+            return self.BATCH
+
+        def pr():
+            if cal_exc:
+                raise cal_exc
+            return cal or []
+        try:
+            M.pv_json, M.primary_rows = pj, pr
+            M.pv_days_cached = lambda dates, errs: {}
+            M.pv_other_boards = lambda a, b, e: []
+            M.pv_live_board = lambda mk, b: {}
+            M.pv_desc = lambda s: {"issued": "2099-01-01", "name": "x", "full": "x ПАО 1", "isin": s, "face": 1000.0, "size": 1000.0}
+            M.pv_live_secid = lambda s: (_ for _ in ()).throw(AssertionError("поштучный запрос не нужен"))
+            M._pv_mem.clear()
+            return M.pv_compute(), calls
+        finally:
+            M.pv_json, M.primary_rows, M.pv_days_cached, M.pv_other_boards, M.pv_live_board, M.pv_desc, M.pv_live_secid = saved
+
+    def test_bonds_batch_parse(self):
+        saved = M.pv_json
+        M.pv_json = lambda url, timeout=30: self.BATCH
+        try:
+            b = M.pv_bonds_batch()
+        finally:
+            M.pv_json = saved
+        self.assertEqual(sorted(b), ["RU000A10AAA1", "RU000A10BBB2"])
+        self.assertEqual([m["b"] for m in b["RU000A10AAA1"]], ["TQCB", "TQIR"])
+        self.assertEqual((b["RU000A10AAA1"][0]["today"], b["RU000A10AAA1"][0]["placed"]), (1500.5, 500000))
+
+    def test_desc_old(self):
+        self.assertTrue(M.pv_desc_old({"issued": "2026-01-01"}, "2026-10-01"))
+        self.assertTrue(M.pv_desc_old({"issued": "", "start": "2026-01-01"}, "2026-10-01"))
+        self.assertFalse(M.pv_desc_old({"issued": "2026-10-05"}, "2026-10-01"))
+        self.assertFalse(M.pv_desc_old({}, "2026-10-01"))
+
+    def test_empty_calendar_reported_and_timing(self):
+        res, calls = self.run_compute(cal=[])
+        self.assertTrue(any("0 строк" in e for e in res["errors"]))
+        self.assertEqual({"history", "live", "calendar", "desc", "secondary"} - set(res["timing"]), set())
+        self.assertEqual(sum("markets/bonds/securities.json" in u for u in calls), 1)
+
+    def test_calendar_failure_and_ok(self):
+        res, _ = self.run_compute(cal_exc=OSError("boom"))
+        self.assertTrue(any("календарь" in e and "boom" in e for e in res["errors"]))
+        res, _ = self.run_compute(cal=[{"isin": "RU000A10AAA1", "start": "2099-01-01", "short": "A", "issuer": "A"}])
+        self.assertFalse(res["errors"])
+        self.assertEqual([r["secid"] for r in res["rows"]], ["RU000A10AAA1"])
+
+
 @unittest.skipUnless(os.environ.get("TINVEST_LIVE") == "1", "живые тесты: задайте TINVEST_LIVE=1")
 class LivePrimaryVolumes(unittest.TestCase):
     def test_live_compute(self):

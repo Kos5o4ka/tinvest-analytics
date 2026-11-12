@@ -145,7 +145,7 @@ function priVolHtml(){
     ${kpi('Оборот сегодня',pvRub(tot),'размещение и вторичные торги')}${kpi('Размещено за период',pvRub(plc),'по номиналу, без ожидаемых')}</div>
   <div class="row" style="padding:10px 6px"><div class="seg" id="pv-f">${seg.map(([v,t])=>`<button class="${S.priVF===v?'on':''}" data-pvf="${v}">${t}</button>`).join('')}</div>${d.loading?'<small class="mu" style="margin-left:auto">обновляю…</small>':''}</div>
   <div class="tbl" style="max-height:calc(100vh - 220px)"><table id="pv-tab"><thead><tr>${th}</tr></thead><tbody>${rows.map(r=>pvRow(r,today)).join('')||'<tr><td colspan="8" class="empty">В этой группе пусто</td></tr>'}</tbody></table></div>
-  ${(d.errors||[]).length?`<p class="note">Часть данных Мосбиржи не загрузилась (${esc(d.errors.slice(0,3).join('; '))}) — нажмите «Обновить».</p>`:''}
+  ${(d.errors||[]).length?`<p class="note">Не всё удалось загрузить: ${esc(d.errors.slice(0,3).join('; '))}. Попробуйте «Обновить» чуть позже.</p>`:''}
   <p class="note">Новые выпуски — облигации, торги которыми начались за последние 30 дней, и объявленные размещения. Объём выпуска и «размещено» — в рублях по номиналу: штуки × номинал (у части выпусков «размещено» — сумма сделок на площадке размещения Мосбиржи, а не отчёт эмитента). «Сегодня» — оборот по рыночной цене сделок, данные Мосбиржи обновляются в течение дня (при открытых торгах — раз в несколько минут). Нажмите ›, чтобы увидеть разбивку по дням и площадкам; клик по строке открывает карточку выпуска. Справочная информация, не инвестиционная рекомендация.</p></div>`;
 }
 document.addEventListener('click',e=>{
