@@ -13915,7 +13915,7 @@ tr.scr-low td{opacity:.5}
 /* ── Калькулятор инвестиций ── */
 .cl-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px 16px;align-items:end;margin-bottom:6px}
 .cl-grid>*{min-width:0}.cl-grid .sw{align-self:center}
-#cl-goalbox{grid-column:1/-1;grid-template-columns:repeat(3,minmax(0,1fr));margin:0}
+.cl-grid.cl-base{grid-template-columns:repeat(3,minmax(0,1fr))}
 .cl-sec{font-size:12px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.04em;margin:18px 0 10px}
 .cl-row{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin:10px 0}
 .cl-chips{display:flex;flex-wrap:wrap;gap:8px}
@@ -13925,14 +13925,23 @@ tr.scr-low td{opacity:.5}
 .cl-dot{margin-right:8px}
 .cl-chip input:checked+span{background:var(--card2);border-color:var(--ac);color:var(--tx)}
 #cl-years{width:100%;accent-color:var(--ac)}
+.cl-adv{margin-top:18px;border-top:1px solid var(--line);padding-top:14px}
+.cl-adv>summary{cursor:pointer;font-weight:600;color:var(--tx2);user-select:none}
+.cl-adv>summary span{margin-left:10px;font-weight:400;font-size:12px;color:var(--mu)}
+.cl-adv[open]>summary{margin-bottom:4px}
+.cl-tabs button{padding:8px 16px;font-size:14px}
+.cl-view{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--tx2);font-size:13px}
+.cl-view select{width:auto;max-width:100%}
+.cl-tbl tr[data-s]{cursor:pointer}
+.cl-tbl tr.cl-cur td{background:var(--card2)}
 .cl-ans{font-size:15px;line-height:1.6}
 .cl-goal{border-left:3px solid var(--ac)}
 .cl-disc{margin:6px 2px 24px}
 #cl-out .tbl td small{font-size:11px}
-@media(max-width:1180px){.cl-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#cl-goalbox{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:560px){.cl-grid{grid-template-columns:1fr}#cl-goalbox{grid-template-columns:1fr}}
+@media(max-width:1180px){.cl-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.cl-grid,.cl-grid.cl-base{grid-template-columns:1fr}.cl-adv>summary span{display:block;margin:4px 0 0}.cl-tabs{width:100%}.cl-tabs button{flex:1;text-align:center}}
 .cl-page{display:grid;gap:16px;min-width:0}.cl-page>*{min-width:0}
-#cl-out{display:grid;gap:16px;min-width:0}#cl-out>*{min-width:0}
+#cl-out,#cg-out{display:grid;gap:16px;min-width:0}#cl-out>*,#cg-out>*{min-width:0}
 /* оферты и лесенка */
 .of-card{margin-bottom:14px}.of-urgent{border-color:#ff6b6b55}
 .of-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;cursor:pointer;margin-bottom:12px}
@@ -16991,13 +17000,14 @@ function bindBench(){
 }
 /* калькулятор инвестиций */
 /* ── Чистая часть: модель (без DOM, считается на клиенте) ── */
-const CL_BR=[[2.4e6,.13],[5e6,.15],[20e6,.18],[50e6,.20],[Infinity,.22]];   /* шкала НДФЛ: 13 % до 2,4 млн ₽ в год, далее 15/18/20/22 % с части дохода */
+const CL_BR=[[2.4e6,.13],[Infinity,.15]];   /* шкала НДФЛ для инвестиционных доходов (купоны, продажа бумаг, проценты по вкладам): 13 % до 2,4 млн ₽ в год, 15 % с превышения */
 const CL_STR=[['dep','Вклад','#8a93a6'],['fund','Фонд ликвидности','#19a070'],['ofz','ОФЗ','#3987e5'],['aaa','Корпоративные AAA','#7ab4f5'],['aa','Корпоративные AA','#9085e9'],
   ['a','Корпоративные A','#c98500'],['hy','ВДО (BB и ниже)','#e66767'],['pf','Мой портфель','#d55181'],['own','Своя ставка','#d95926']];
 const CL_BETA={ofz:.6,aaa:.7,aa:.7,a:.7,hy:.7};
 const CL_ACC=[['plain','Обычный брокерский счёт'],['iisA','ИИС типа А (вычет с взносов)'],['iisB','ИИС типа Б (доход без налога)'],['iis3','ИИС-3 (вычет и освобождение дохода)']];
 function clNdfl(b){if(!(b>0))return 0;let t=0,lo=0;for(const[h,r]of CL_BR){if(b>lo)t+=(Math.min(b,h)-lo)*r;lo=h;if(b<=h)break}return t}
 function clTaxInc(inc,x){return clNdfl(inc+x)-clNdfl(inc)}
+const clYE=(env,k)=>(env.m0+k)%12===0;   /* шаг k приходится на 1 января: закончился календарный (налоговый) год */
 /* значения рынка по умолчанию, если сервер не ответил */
 function clDefaultParams(){
   const k=16;return{key_rate:{current:k,source:'условное значение',estimate:true,path:[]},inflation:{yearly:[],default:4,estimate:true},
@@ -17049,13 +17059,14 @@ function clFinish(r,p,env,yEnd,lossEnd){
   const fl=new Array(N+1).fill(0);for(let k=0;k<=N;k++)fl[k]-=clContrib(p,k);fl[N]+=capN;r.xirr=clIrr(fl);
   r.yEnd=yEnd;return r;
 }
-/* Вклад: ежемесячная капитализация; НДФЛ с процентов сверх необлагаемого порога (1 млн ₽ × макс. ключевая ставка года) */
+/* Вклад: ежемесячная капитализация; НДФЛ раз в год (уведомление) с процентов за календарный год сверх необлагаемой суммы: 1 млн ₽ × макс. ключевая ставка года */
 function clSimDep(p,env){
   const N=p.months;let B=0,dep=0,iy=0,mk=0;const cap=[],r={cap,deposited:0,deductions:0,taxes:0,notes:[]};
+  const due=()=>clNdfl(Math.max(0,iy-1e6*mk/100));
   for(let k=0;k<=N;k++){
-    if(k>0){const rt=env.depRate(k-1);const g=B*rt/1200;B+=g;iy+=g;mk=Math.max(mk,env.key(k-1));
-      if(k%12===0||k===N){const thr=1e6*mk/100,tx=clNdfl(Math.max(0,iy-thr));B-=tx;r.taxes+=tx;iy=0;mk=0}}
-    const c=clContrib(p,k);B+=c;dep+=c;cap.push(B);
+    if(k>0){const g=B*env.depRate(k-1)/1200;B+=g;iy+=g;mk=Math.max(mk,env.key(k-1));
+      if(clYE(env,k)||k===N){const tx=due();B-=tx;r.taxes+=tx;iy=0;mk=0}}
+    const c=clContrib(p,k);B+=c;dep+=c;cap.push(B-due());
   }
   r.deposited=dep;return clFinish(r,p,env,env.depRate(Math.max(N-1,0)),0);
 }
@@ -17081,25 +17092,32 @@ function clSimFund(p,env){
   r.taxes=saleTax(N);
   return clFinish(r,p,env,env.fundRate(Math.max(N-1,0)),0);
 }
-/* Облигации с фиксированным купоном (держим до погашения) и «ставка + купонный налог» */
+/* Облигации с фиксированным купоном (держим до погашения) и «ставка + купонный налог».
+   Купоны реинвестируются целиком; НДФЛ удерживается раз в год (конец календарного года) и при выводе в конце срока,
+   на ИИС — только при закрытии счёта. Налог платится из свободных денег, затем продажей части облигаций. */
 function clSimBond(id,p,env,seg){
   const N=p.months,ai=clAccInfo(p),RF=clRefunds(p,ai),f=p.freq,per=Math.max(1,Math.round(12/f));
   const y0=seg.yield,beta=seg.beta||0,matM=seg.dur>0?Math.max(Math.round(seg.dur*12),per):Infinity,loss=p.defaults?(seg.loss||0):0;
   const ynew=k=>k===0?y0:Math.max(.5,y0+beta*(env.key(k)-env.kr0));
-  const tr=[],cap=[],r={cap,deposited:0,deductions:0,taxes:0,notes:[]},incY={};
-  let cashInv=0,idle=0,pot=0,incTot=0;const useLot=p.lot>1;
+  const tr=[],cap=[],r={cap,deposited:0,deductions:0,taxes:0,notes:[]};
+  let cashInv=0,idle=0,pot=0,incY=0,incTot=0;const useLot=p.lot>1;
+  /* начисленный, но не удержанный налог: на ИИС — весь доход в год закрытия (ИИС Б / ИИС-3 — сверх лимита освобождения) */
+  const due=()=>ai.iis?clNdfl(ai.exempt?Math.max(0,incTot-ai.cap):incTot):clNdfl(incY);
+  const pay=x=>{if(!(x>0))return;r.taxes+=x;let t;
+    t=Math.min(idle,x);idle-=t;x-=t;t=Math.min(cashInv,x);cashInv-=t;x-=t;t=Math.min(pot,x);pot-=t;x-=t;
+    if(x>0){const sm=tr.reduce((a,q)=>a+q.amt,0);if(sm>0){const q=Math.max(0,1-x/sm);tr.forEach(z=>{z.amt*=q})}}};
   for(let k=0;k<=N;k++){
     if(k>0){
-      const yi=Math.floor((k-1)/12);incY[yi]=incY[yi]||0;
-      if(pot>0){const g=pot*env.fundRate(k-1)/1200,tx=clTaxInc(incY[yi],g);incY[yi]+=g;incTot+=g;r.taxes+=tx;pot+=g-tx}
+      if(pot>0){const g=pot*env.fundRate(k-1)/1200;pot+=g;incY+=g;incTot+=g}
       let coup=0,prin=0;
       for(let i=tr.length-1;i>=0;i--){const t=tr[i];
         if(loss)t.amt*=1-loss/1200;
         if(k>t.k0&&k<=t.mat&&(k-t.k0)%per===0)coup+=t.amt*t.y/100/f;
         if(k===t.mat){prin+=t.amt;tr.splice(i,1)}}
-      const tx=clTaxInc(incY[yi],coup);incY[yi]+=coup;incTot+=coup;r.taxes+=tx;
-      if(p.reinvest)cashInv+=coup-tx;else idle+=coup-tx;
+      incY+=coup;incTot+=coup;
+      if(p.reinvest)cashInv+=coup;else idle+=coup;
       cashInv+=prin;
+      if(k===N)pay(due());else if(!ai.iis&&clYE(env,k)){pay(clNdfl(incY));incY=0}
     }
     if(RF[k]>0){if(p.reinvDed)cashInv+=RF[k];else idle+=RF[k];r.deductions+=RF[k]}
     const c=clContrib(p,k);cashInv+=c;r.deposited+=c;
@@ -17107,10 +17125,8 @@ function clSimBond(id,p,env,seg){
     if(avail>0.005){const amt=useLot?Math.floor(avail/p.lot+1e-9)*p.lot:avail;
       if(amt>0)tr.push({k0:k,amt,y:ynew(k),mat:k+matM});
       const rem=avail-amt;if(p.lotFund){cashInv=0;pot=rem}else{cashInv=rem;pot=0}}
-    let v=idle+cashInv+pot;for(const t of tr)v+=t.amt;cap.push(v);
+    let v=idle+cashInv+pot;for(const t of tr)v+=t.amt;cap.push(k<N?v-due():v);
   }
-  /* ИИС Б / ИИС-3: налог, удержанный в течение срока, возвращается при закрытии (для ИИС-3 — до 30 млн ₽ дохода) */
-  if(ai.iis&&ai.exempt&&r.taxes>0){const share=incTot>ai.cap?ai.cap/incTot:1,rf=r.taxes*share;cap[N]+=rf;r.deductions+=rf}
   return clFinish(r,p,env,ynew(N),loss);
 }
 function clSegOf(id,P,F){
@@ -17128,8 +17144,8 @@ function clParams(F,months){
     lot:+F.lot||0,lotFund:F.lotFund==='fund',reinvDed:!!F.reinvDed,ldv:!!F.ldv,defaults:!!F.defaults};
 }
 /* Цель: нужное ежемесячное пополнение при заданном сроке или нужный срок при заданном пополнении (бисекция) */
-function clGoal(F,P,env,sid){
-  const T=+F.goalAmt||0,pas=(months,monthly)=>{const p=clParams(F,months);p.monthly=monthly;return clSim(sid,p,P,env,F).passiveReal};
+function clGoal(F,P,env,sid,real){
+  const T=+F.goalAmt||0,pas=(months,monthly)=>{const p=clParams(F,months);p.monthly=monthly;const r=clSim(sid,p,P,env,F);return real===false?r.passive:r.passiveReal};
   if(F.goalMode==='years'){
     const m=clParams(F).monthly;let lo=1,hi=600;
     if(pas(hi,m)<T)return{ok:false};
@@ -17147,7 +17163,7 @@ function clGoal(F,P,env,sid){
 
 /* ── Интерфейс ── */
 const CL_DEF={start:500000,monthly:20000,idx:5,years:10,strat:{dep:1,fund:1,ofz:1,aa:1,a:1},ownRate:15,reinvest:true,freq:4,lot:1000,lotFund:'fund',scn:'cbr',ownKey:12,
-  acct:'plain',reinvDed:true,ldv:true,defaults:true,real:true,depSpread:1.5,goalOn:false,goalAmt:100000,goalMode:'contrib',goalStrat:'ofz'};
+  acct:'plain',reinvDed:true,ldv:true,defaults:true,real:true,depSpread:1.5,goalMode:'contrib',goalStrat:'ofz',adv:false,view:''};
 let CL_F=null;
 function clLoadF(){
   if(CL_F)return CL_F;
@@ -17164,11 +17180,34 @@ function clLoad(){
 }
 const clYM=(m)=>{const y=Math.floor(m/12),mm=m%12;return(y?y+' '+(y%10===1&&y!==11?'год':y%10>=2&&y%10<=4&&(y<10||y>20)?'года':'лет'):'')+(y&&mm?' ':'')+(mm?mm+' мес.':'')||'0 мес.'};
 const clRub=v=>M(v,'rub',0);
+const clMkt=()=>(S.calcAcc===S.account&&S.calcP)||clDefaultParams();
 function clAvail(P){return CL_STR.filter(s=>s[0]!=='pf'||(P.portfolio&&P.portfolio.irr!=null))}
 function clRun(F,P){
   const env=clEnv(P,F),p=clParams(F),N=p.months,ids=clAvail(P).map(s=>s[0]).filter(id=>F.strat[id]);
   const res=ids.map(id=>{const s=CL_STR.find(x=>x[0]===id),r=clSim(id,p,P,env,F);r.id=id;r.name=s[1];r.color=s[2];return r});
   return{env,p,N,res};
+}
+/* график с накоплением: слои складываются снизу вверх */
+function clStack(el,o){
+  const W=el.clientWidth,H=o.h||280,pl=62,pr=10,pt=10,pb=26,ser=o.series,n=o.labels.length,tl=o.tipLabels||o.labels;
+  if(n<2||W<50)return emptyChart(el,H,o.empty);
+  const fa=o.fa||short,ft=o.ft||(v=>M(v)),cum=[];let acc=new Array(n).fill(0),mn=0,mx=0;
+  ser.forEach(se=>{const hi=acc.map((a,i)=>a+(se.v[i]||0));cum.push([acc,hi]);acc=hi;hi.forEach(v=>{mn=Math.min(mn,v);mx=Math.max(mx,v)})});
+  if(mx===mn)return emptyChart(el,H,o.empty);
+  const{lo,hi,step}=nice(mn,mx),pw=W-pl-pr,ph=H-pt-pb,X=i=>pl+i/(n-1)*pw,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph,pt2=(v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1);
+  let s='';
+  for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(Math.abs(v)<step/1e6?0:v)}</text>`}
+  axisTicks(o.labels,X,pl-4,W-pr+4).forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
+  cum.forEach(([a,b],j)=>{const up=b.map(pt2);
+    s+=`<polygon points="${up.concat(a.map(pt2).reverse()).join(' ')}" fill="${ser[j].c}" fill-opacity=".5"/><polyline points="${up.join(' ')}" fill="none" stroke="${ser[j].c}" stroke-width="1.6" stroke-linejoin="round"/>`});
+  let hits='';const cw=pw/(n-1);
+  for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${X(i)-cw/2}" y="${pt}" width="${cw}" height="${ph}" fill="transparent"/>`;
+  el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}">${s}<g class="hv"></g>${hits}</svg>`;
+  const hv=el.querySelector('.hv');
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`+
+    cum.map(([a,b],j)=>`<circle cx="${X(i)}" cy="${Y(b[i])}" r="4" fill="${ser[j].c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
+  bindTip(el,i=>`<b>${esc(tl[i])}</b>`+ser.slice().reverse().map(se=>tipRow(se.c,se.n,ft(se.v[i]||0))).join('')+
+    `<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${ft(acc[i])}</span></div>`);
 }
 function clSegTable(P,F,env){
   const rows=[];
@@ -17185,52 +17224,58 @@ function clSegTable(P,F,env){
     rows.map(r=>`<tr><td class="l">${r[0]}</td><td class="num">${r[1]}</td><td class="l mu">${r[2]}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function clOut(){
-  const F=clLoadF(),P=(S.calcAcc===S.account&&S.calcP)||clDefaultParams();
+  const F=clLoadF(),P=clMkt();
   const ids=clAvail(P).map(s=>s[0]).filter(id=>F.strat[id]);
   if(!ids.length)return`<div class="card empty">Выберите хотя бы одну стратегию для сравнения</div>`;
-  const run=clRun(F,P),{env,N,res,p}=run,real=F.real;
+  const run=clRun(F,P),{env,N,res,p}=run,real=F.real,dv=k=>real?env.D[k]:1,mode=real?'в сегодняшних деньгах':'в номинальных рублях';
   const labels=[],tips=[];
   for(let k=0;k<=N;k++){const d=new Date(env.y0,env.m0+k,1),mm=String(d.getMonth()+1).padStart(2,'0');labels.push(mm+'.'+d.getFullYear());tips.push(mm+'.'+d.getFullYear()+' · '+(k?clYM(k):'сейчас'))}
-  const cd=[];let acc=0;for(let k=0;k<=N;k++){acc+=real?clContrib(p,k)/env.D[k]:clContrib(p,k);cd.push(acc)}
-  const series=res.map(r=>({n:r.name,c:r.color,v:r.cap.map((v,k)=>real?v/env.D[k]:v)}));
-  series.push({n:'Внесено своих денег',c:'#9aa3b5',dash:1,w:1.6,v:cd});
-  chart('cl-chart',line,{h:320,series,labels,tipLabels:tips,fa:short,ft:v=>clRub(v),empty:'Нет данных'});
-  const best=res.slice().sort((a,b)=>b.finalReal-a.finalReal)[0],dep=res[0].deposited,defl=env.D[N];
-  const kp=`<div class="g g4">${kpi('Внесено своих денег',clRub(dep),'за '+clYM(N),null,S1)}
-    ${kpi('Лучший итог',clRub(real?best.finalReal:best.final),esc(best.name)+(real?' · в сегодняшних деньгах':' · номинал'),'pos',S3)}
-    ${kpi('Пассивный доход в месяц',clRub(real?best.passiveReal:best.passive),'после налога, '+esc(best.name),null,S4)}
-    ${kpi('Удорожание цен за срок','×'+f2(defl),'1 ₽ через '+clYM(N)+' ≈ '+f2(1/defl)+' ₽ сегодня',null,S8)}</div>`;
+  const best=res.slice().sort((a,b)=>b.finalReal-a.finalReal)[0],cur=res.find(r=>r.id===F.view)||best,defl=env.D[N];
+  /* состав капитала выбранной стратегии: внесено + вычеты ИИС + доход после налогов */
+  const RF=cur.id==='dep'?null:clRefunds(p,clAccInfo(p)),sIn=[],sDed=[],sInc=[];let ci=0,cd=0;
+  for(let k=0;k<=N;k++){ci+=clContrib(p,k)/dv(k);if(RF)cd+=RF[k]/dv(k);sIn.push(ci);sDed.push(cd);sInc.push(cur.cap[k]/dv(k)-ci-cd)}
+  const ser=[{n:'Внесено',c:'#8a93a6',v:sIn}];if(cd>0)ser.push({n:'Вычеты и возвраты ИИС',c:'#c98500',v:sDed});ser.push({n:'Доход после налогов',c:'#19a070',v:sInc});
+  chart('cl-stack',clStack,{h:300,series:ser,labels,tipLabels:tips,fa:short,ft:v=>clRub(v),empty:'Нет данных'});
+  const fin=real?cur.finalReal:cur.final,inc=sInc[N],pas=real?cur.passiveReal:cur.passive;
+  const pick=res.length>1?`<div class="cl-view"><span>Итоги и график для</span><select class="in" id="cl-view"><option value="">лучшей стратегии (${esc(best.name)})</option>${
+    res.map(r=>`<option value="${r.id}" ${r.id===F.view?'selected':''}>${esc(r.name)}</option>`).join('')}</select></div>`:'';
+  const kp=`${pick}<div class="g g4">${kpi('Итоговый капитал',clRub(fin),esc(cur.name)+' · '+(real?'в сегодняшних деньгах':'номинал'),'pos',S3)}
+    ${kpi('Чистый доход',clRub(inc),'после налогов, сверх внесённого'+(cd>0?' и вычетов':''),cls(inc),S1)}
+    ${kpi('Уплачено налогов',clRub(cur.taxes),'НДФЛ за '+clYM(N)+', номинал',null,S8)}
+    ${kpi('Пассивный доход в месяц',clRub(pas),'после налога, '+(real?'в сегодняшних деньгах':'номинал'),null,S4)}</div>`;
+  const stk=`<div class="card"><h2>Из чего состоит капитал<span class="sp">${esc(cur.name)} · ${mode}</span></h2><div id="cl-stack" class="chart"></div>
+    <div class="note" style="margin-top:10px">Цены за ${clYM(N)} вырастут в ×${f2(defl)} по прогнозу инфляции: 1 ₽ в конце срока ≈ ${f2(1/defl)} ₽ сегодня.${real?' Взносы, вычеты и доход пересчитаны в сегодняшние деньги на дату поступления.':''}</div></div>`;
   const th=['Стратегия','Итоговый капитал','Внесено','Получено дохода','Уплачено налогов','Вычеты и возвраты ИИС','Капитал в сегодняшних деньгах','Пассивный доход в месяц (после налога)','Эффективная годовая доходность'];
-  const rows=res.map(r=>`<tr><td class="l"><i class="cl-dot" style="background:${r.color}"></i>${esc(r.name)}</td><td class="num"><b>${clRub(r.final)}</b></td><td class="num">${clRub(r.deposited)}</td>
+  const rows=res.map(r=>`<tr data-s="${r.id}" class="${r===cur?'cl-cur':''}"><td class="l"><i class="cl-dot" style="background:${r.color}"></i>${esc(r.name)}${r===best?' <small class="mu">лучшая</small>':''}</td><td class="num"><b>${clRub(r.final)}</b></td><td class="num">${clRub(r.deposited)}</td>
     <td class="num ${cls(r.income)}">${clRub(r.income)}</td><td class="num">${clRub(r.taxes)}</td><td class="num">${r.deductions>0?clRub(r.deductions):'—'}</td><td class="num"><b>${clRub(r.finalReal)}</b></td>
     <td class="num">${clRub(r.passive)}<br><small class="mu">${clRub(r.passiveReal)} сегодня</small></td><td class="num">${r.xirr==null?'—':pctp(r.xirr,1)}</td></tr>`).join('');
-  const tbl=`<div class="card"><h2>Сравнение стратегий<span class="sp">через ${clYM(N)}</span></h2><div class="tbl"><table><thead><tr>${th.map((t,i)=>`<th class="${i?'':'l'}">${t}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>
-    <div class="note" style="margin-top:10px">«Итоговый капитал» — если закрыть позиции в конце срока: с уже удержанными налогами и (для фонда ликвидности) налогом при продаже. «Эффективная годовая доходность» — XIRR взносов против итога (номинальная, без учёта инфляции). «Получено дохода» = итог − внесено − вычеты.</div></div>`;
   const warn=[];
   if(F.acct!=='plain'){
     if(res.some(r=>r.id==='dep'))warn.push('Вклад лежит в банке, а не на ИИС: вычет и льготы ИИС к нему не применяются, налог считается как на обычном счёте.');
     if((p.start+p.monthly*12)>1e6)warn.push('Взносы на ИИС ограничены 1 млн ₽ в год: калькулятор этот лимит не проверяет, проверьте свои суммы.');
-    if(F.acct==='iisB'&&N<36)warn.push('Освобождение дохода на ИИС типа Б действует при сроке от 3 лет: при меньшем сроке налог не возвращается.');
-    if(F.acct==='iis3'&&N<60)warn.push('ИИС-3: освобождение дохода (до 30 млн ₽) принято при сроке владения от 5 лет; при меньшем сроке налог не возвращается.');
+    if(F.acct==='iisB'&&N<36)warn.push('Освобождение дохода на ИИС типа Б действует при сроке от 3 лет: при меньшем сроке налог удерживается при закрытии счёта.');
+    if(F.acct==='iis3'&&N<60)warn.push('ИИС-3: освобождение дохода (до 30 млн ₽) принято при сроке владения от 5 лет; при меньшем сроке налог удерживается при закрытии счёта.');
     if(F.acct==='iis3'&&N>=60)warn.push('Допущение ИИС-3: минимальный срок для освобождения дохода принят равным 5 годам, лимит освобождаемого дохода 30 млн ₽; вычет считается как на ИИС типа А (13 % от взносов до 400 тыс. ₽ в год).');
   }
   if(F.acct==='plain'&&res.some(r=>r.id==='fund')&&F.ldv)warn.push('ЛДВ для фонда ликвидности: рост пая без налога при владении 3 года и более, лимит 3 млн ₽ × число лет. Каждое пополнение учитывается отдельно по сроку владения.');
   if(P.portfolio==null&&F.strat.pf)warn.push('Нет данных о портфеле — «Мой портфель» недоступен.');
   const wn=warn.length?`<div class="note" style="margin-top:12px">${warn.map(w=>'• '+esc(w)).join('<br>')}</div>`:'';
-  return`${kp}<div class="card"><h2>Рост капитала<span class="sp">${real?'в сегодняшних деньгах (с поправкой на инфляцию)':'в номинальных рублях'}</span></h2><div id="cl-chart" class="chart"></div>${wn}</div>${tbl}${clGoalHtml(F,P,run)}
-    <div class="card"><h2>Что заложено в расчёт</h2>${clSegTable(P,F,env)}</div>`;
+  const tbl=`<div class="card"><h2>Сравнение стратегий<span class="sp">через ${clYM(N)}</span></h2><div class="tbl cl-tbl"><table><thead><tr>${th.map((t,i)=>`<th class="${i?'':'l'}">${t}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="note" style="margin-top:10px">«Итоговый капитал» — если закрыть позиции и вывести деньги в конце срока: за вычетом всех налогов, включая налог последнего года, налог при закрытии ИИС и (для фонда ликвидности) налог при продаже. «Эффективная годовая доходность» — XIRR взносов против итога (номинальная, без учёта инфляции). «Получено дохода» = итог − внесено − вычеты.${res.length>1?' Нажмите на строку, чтобы показать стратегию в итогах и на графике.':''}</div>${wn}</div>`;
+  let cmp='';
+  if(res.length>1){
+    const cdl=[];let a=0;for(let k=0;k<=N;k++){a+=clContrib(p,k)/dv(k);cdl.push(a)}
+    const series=res.map(r=>({n:r.name,c:r.color,v:r.cap.map((v,k)=>v/dv(k))}));
+    series.push({n:'Внесено своих денег',c:'#9aa3b5',dash:1,w:1.6,v:cdl});
+    chart('cl-chart',line,{h:300,series,labels,tipLabels:tips,fa:short,ft:v=>clRub(v),empty:'Нет данных'});
+    cmp=`<div class="card"><h2>Рост капитала по стратегиям<span class="sp">${mode}</span></h2><div id="cl-chart" class="chart"></div></div>`;
+  }
+  return`${kp}${stk}${tbl}${cmp}<div class="card"><h2>Что заложено в расчёт</h2>${clSegTable(P,F,env)}</div>`;
 }
-function clGoalHtml(F,P,run){
-  if(!F.goalOn)return'';
-  const ids=run.res.map(r=>r.id);if(!ids.length)return'';
-  const sid=ids.includes(F.goalStrat)?F.goalStrat:ids[0],s=CL_STR.find(x=>x[0]===sid),g=clGoal(F,P,run.env,sid);
-  let t;
-  if(!g.ok)t=`Для стратегии «${esc(s[1])}» цель ${clRub(F.goalAmt)} в месяц ${F.goalMode==='years'?'недостижима и за 50 лет при таком пополнении':'недостижима при заданном сроке даже при очень больших пополнениях'}.`;
-  else if(F.goalMode==='years')t=g.months<=1?`Цель ${clRub(F.goalAmt)} в месяц достигается сразу: стартовой суммы достаточно.`:
-    `Чтобы получать ${clRub(F.goalAmt)} в месяц (в сегодняшних деньгах, после налога) на стратегии «${esc(s[1])}», при пополнении ${clRub(F.monthly)} в месяц понадобится около <b>${clYM(g.months)}</b>.`;
-  else t=g.monthly<=0?`Цель ${clRub(F.goalAmt)} в месяц за ${clYM(run.N)} достигается и без ежемесячных пополнений: хватает стартовой суммы.`:
-    `Чтобы через ${clYM(run.N)} получать ${clRub(F.goalAmt)} в месяц (в сегодняшних деньгах, после налога) на стратегии «${esc(s[1])}», нужно пополнять примерно <b>${clRub(g.monthly)}</b> в месяц (с ежегодной индексацией ${f2(F.idx)} %).`;
-  return`<div class="card cl-goal"><h2>Цель: пассивный доход</h2><div class="cl-ans">${t}</div><div class="note" style="margin-top:8px">Пассивный доход — это проценты или купоны, которые приносит накопленный капитал в год, делённые на 12, после налога. Пересчитывается в сегодняшние деньги по прогнозу инфляции.</div></div>`;
+function clAdvSum(F){
+  const a=(CL_ACC.find(x=>x[0]===F.acct)||CL_ACC[0])[1].replace(/ \(.*\)$/,'');
+  const k={cbr:'ставка по прогнозу ЦБ',hard:'жёсткий сценарий ставки',soft:'мягкий сценарий ставки',own:'ключевая '+f2(F.ownKey)+' %'}[F.scn]||'';
+  return[a,k,F.real?'в сегодняшних деньгах':'в номинале'].join(' · ');
 }
 function pCalcInv(){
   const F=clLoadF();
@@ -17241,65 +17286,62 @@ function pCalcInv(){
   const sel=(id,l,opts,v)=>`<label class="field"><span>${l}</span><select class="in" id="cl-${id}">${opts.map(o=>`<option value="${o[0]}" ${String(o[0])===String(v)?'selected':''}>${o[1]}</option>`).join('')}</select></label>`;
   const seg=(id,opts,v)=>`<div class="seg" id="cl-${id}">${opts.map(o=>`<button data-v="${o[0]}" class="${String(o[0])===String(v)?'on':''}">${o[1]}</button>`).join('')}</div>`;
   const chips=clAvail(P).map(s=>`<label class="cl-chip"><input type="checkbox" data-s="${s[0]}" ${F.strat[s[0]]?'checked':''}><span><i style="background:${s[2]}"></i>${s[1]}</span></label>`).join('');
-  const goalOpts=clAvail(P).filter(s=>F.strat[s[0]]).map(s=>[s[0],s[1]]);
-  return`<div class="cl-page">${ld?`<div class="card">${waitBox('Загружаю параметры рынка (ставки, доходности, ваш портфель)… пока расчёт идёт на значениях по умолчанию')}</div>`:''}${fb?`<div class="msg err">Не удалось загрузить рыночные данные (${esc(S.calcErr||'нет ответа')}). Использованы значения по умолчанию, расчёт приблизителен.</div>`:''}
+  return`${ld?`<div class="card">${waitBox('Загружаю параметры рынка (ставки, доходности, ваш портфель)… пока расчёт идёт на значениях по умолчанию')}</div>`:''}${fb?`<div class="msg err">Не удалось загрузить рыночные данные (${esc(S.calcErr||'нет ответа')}). Использованы значения по умолчанию, расчёт приблизителен.</div>`:''}
   <div class="card"><h2>Параметры<span class="sp">пересчёт мгновенный</span></h2><div id="cl-form">
-   <div class="cl-grid">${num('start','Стартовая сумма, ₽',F.start,'min="0" step="10000"')}${num('monthly','Пополнение в месяц, ₽',F.monthly,'min="0" step="1000"')}
-    ${num('idx','Ежегодная индексация пополнений, %',F.idx,'min="0" max="50" step="0.5"')}
+   <div class="cl-grid cl-base">${num('start','Стартовый капитал, ₽',F.start,'min="0" step="10000"')}${num('monthly','Пополнение в месяц, ₽',F.monthly,'min="0" step="1000"')}
     <label class="field"><span>Срок: <b id="cl-yv">${F.years}</b> лет</span><input id="cl-years" type="range" min="1" max="30" step="1" value="${F.years}"></label></div>
    ${pf&&pf.value!=null?`<div class="cl-row"><button class="btn ghost" id="cl-pf">Подставить мой портфель</button><span class="note">старт ${clRub(pf.value)}${pf.monthly!=null?`, пополнение ${clRub(pf.monthly)} в месяц (среднее за 12 мес.)`:''}</span></div>`:''}
-   <div class="cl-sec">Что сравниваем</div><div class="cl-chips" id="cl-strat">${chips}</div>
-   <div class="cl-grid" id="cl-ownbox" style="${F.strat.own?'':'display:none'}">${num('ownRate','Своя ставка, % годовых',F.ownRate,'step="0.5" min="0" max="100"')}</div>
-   <div class="cl-sec">Облигации и реинвестирование</div>
-   <div class="cl-grid">${sw('reinvest','Реинвестировать купоны','иначе купоны копятся без дохода',F.reinvest)}${sel('freq','Выплаты купонов',[[12,'12 раз в год (раз в месяц)'],[4,'4 раза в год (раз в квартал)'],[2,'2 раза в год (раз в полгода)']],F.freq)}
-    ${num('lot','Цена лота (покупаем целыми бумагами), ₽',F.lot,'min="0" step="100"')}${sel('lotFund','Остаток, не хватающий на бумагу',[['fund','лежит в фонде ликвидности'],['wait','ждёт следующей покупки']],F.lotFund)}</div>
-   <div class="cl-sec">Ключевая ставка</div>
-   <div class="cl-row">${seg('scn',[['cbr','Прогноз ЦБ'],['hard','Жёсткий (+2 п.п.)'],['soft','Мягкий (−2 п.п.)'],['own','Своя постоянная']],F.scn)}
-    <label class="field" id="cl-ownkeybox" style="${F.scn==='own'?'':'display:none'}"><span>Ставка, %</span><input class="in" id="cl-ownKey" type="number" step="0.5" min="1" max="50" value="${esc(F.ownKey)}" style="width:110px"></label></div>
-   <div class="cl-sec">Налоги и поправки</div>
-   <div class="cl-grid">${sel('acct','Тип счёта',CL_ACC,F.acct)}${sw('reinvDed','Реинвестировать вычет ИИС','возвращённый налог снова вкладывается',F.reinvDed)}
-    ${sw('ldv','ЛДВ для фонда ликвидности','без налога на рост пая при владении от 3 лет',F.ldv)}${sw('defaults','Учитывать дефолты','вычитаем ожидаемые потери сегмента каждый год',F.defaults)}
-    ${num('depSpread','Вклад: ставка = ключевая минус, п.п.',F.depSpread,'step="0.1" min="0" max="10"')}</div>
-   <div class="cl-sec">Как показывать</div>
-   <div class="cl-row">${seg('real',[['1','В сегодняшних деньгах'],['0','Номинал']],F.real?'1':'0')}</div>
-   <div class="cl-sec">Цель</div>
-   <div class="cl-grid">${sw('goalOn','Режим цели','«Хочу пассивный доход N ₽ в месяц»',F.goalOn)}
-    <div id="cl-goalbox" class="cl-grid" style="${F.goalOn?'':'display:none'}">${num('goalAmt','Желаемый доход в месяц, ₽ (в сегодняшних деньгах)',F.goalAmt,'min="0" step="5000"')}
-     ${sel('goalMode','Что найти',[['contrib','нужное пополнение (срок задан)'],['years','нужный срок (пополнение задано)']],F.goalMode)}
-     <label class="field"><span>Стратегия</span><select class="in" id="cl-goalStrat">${goalOpts.map(o=>`<option value="${o[0]}" ${o[0]===F.goalStrat?'selected':''}>${o[1]}</option>`).join('')}</select></label></div></div>
+   <div class="cl-sec">Во что вкладываем</div><div class="cl-chips" id="cl-strat">${chips}</div>
+   <div class="cl-grid" id="cl-ownbox" style="margin-top:12px;${F.strat.own?'':'display:none'}">${num('ownRate','Своя ставка, % годовых',F.ownRate,'step="0.5" min="0" max="100"')}</div>
+   <details class="cl-adv" id="cl-adv" ${F.adv?'open':''}><summary>Дополнительные параметры<span id="cl-advsum">${esc(clAdvSum(F))}</span></summary>
+    <div class="cl-sec">Счёт и налоги</div>
+    <div class="cl-grid">${sel('acct','Тип счёта',CL_ACC,F.acct)}${sw('reinvDed','Реинвестировать вычет ИИС','возвращённый налог снова вкладывается',F.reinvDed)}
+     ${sw('ldv','ЛДВ для фонда ликвидности','без налога на рост пая при владении от 3 лет',F.ldv)}${sw('defaults','Учитывать дефолты','вычитаем ожидаемые потери сегмента каждый год',F.defaults)}</div>
+    <div class="cl-sec">Пополнения и вклад</div>
+    <div class="cl-grid">${num('idx','Ежегодная индексация пополнений, %',F.idx,'min="0" max="50" step="0.5"')}${num('depSpread','Вклад: ставка = ключевая минус, п.п.',F.depSpread,'step="0.1" min="0" max="10"')}</div>
+    <div class="cl-sec">Облигации и реинвестирование</div>
+    <div class="cl-grid">${sw('reinvest','Реинвестировать купоны','иначе купоны копятся без дохода',F.reinvest)}${sel('freq','Выплаты купонов',[[12,'12 раз в год (раз в месяц)'],[4,'4 раза в год (раз в квартал)'],[2,'2 раза в год (раз в полгода)']],F.freq)}
+     ${num('lot','Цена лота (покупаем целыми бумагами), ₽',F.lot,'min="0" step="100"')}${sel('lotFund','Остаток, не хватающий на бумагу',[['fund','лежит в фонде ликвидности'],['wait','ждёт следующей покупки']],F.lotFund)}</div>
+    <div class="cl-sec">Сценарий ключевой ставки</div>
+    <div class="cl-row">${seg('scn',[['cbr','Прогноз ЦБ'],['hard','Жёсткий (+2 п.п.)'],['soft','Мягкий (−2 п.п.)'],['own','Своя постоянная']],F.scn)}
+     <label class="field" id="cl-ownkeybox" style="${F.scn==='own'?'':'display:none'}"><span>Ставка, %</span><input class="in" id="cl-ownKey" type="number" step="0.5" min="1" max="50" value="${esc(F.ownKey)}" style="width:110px"></label></div>
+    <div class="cl-sec">Как показывать</div>
+    <div class="cl-row">${seg('real',[['1','В сегодняшних деньгах'],['0','Номинал']],F.real?'1':'0')}</div>
+   </details>
   </div></div>
   <div id="cl-out">${clOut()}</div>
-  <div class="card"><h2>Как это считается</h2><div class="note">Шаг расчёта — месяц; взносы вносятся в конце месяца. <b>Вклад</b>: ежемесячная капитализация по ставке «ключевая − ${f2(F.depSpread)} п.п.» по пути выбранного сценария; НДФЛ — с процентов сверх необлагаемого порога (1 млн ₽ × максимальная ключевая ставка года).
+  <div class="card"><h2>Как это считается</h2><div class="note">Шаг расчёта — месяц; взносы вносятся в конце месяца; налоговый год — календарный. Шкала НДФЛ для инвестиционных доходов (купоны, продажа бумаг, проценты по вкладам): 13 % до 2,4 млн ₽ дохода в год, 15 % с превышения.
+   <b>Вклад</b>: ежемесячная капитализация по ставке «ключевая − ${f2(F.depSpread)} п.п.» по пути выбранного сценария. НДФЛ платится раз в год по уведомлению с процентов за год сверх необлагаемой суммы (1 млн ₽ × максимальная ключевая ставка года по сценарию); в модели налог списывается со вклада в конце года (в жизни — до 1 декабря следующего года). Необлагаемая сумма общая на все вклады человека: если есть другие вклады, налог будет больше.
    <b>Фонд ликвидности</b>: ежедневное начисление приближено месячным по «ключевая − спред к ключевой»; налог только при продаже в конце срока (или ЛДВ / ИИС).
-   <b>ОФЗ, корпоративные, ВДО</b>: покупаем по текущей медианной доходности сегмента, держим до погашения (срок ≈ медианная дюрация), купоны по этой доходности; погашенный номинал и купоны вкладываются по будущей доходности ≈ текущая + β × (ключевая в тот момент − ключевая сейчас), β = 0,6 для ОФЗ и 0,7 для остальных. Налог с купонов удерживается при каждой выплате. Переоценка цены облигаций при удержании до погашения не учитывается; на конец срока позиции считаются по номиналу.
-   <b>Мой портфель</b>: доходность облигаций портфеля (IRR) используется как ставка; <b>Своя ставка</b> — постоянная ставка с купонным налогом. Налоговый год считается от начала расчёта, шкала НДФЛ: 13 % до 2,4 млн ₽ дохода в год, дальше 15 % (и по шкале 18/20/22 % для более крупных сумм). Инфляция — прогноз Банка России, после его горизонта — последнее значение.</div></div>
-  <div class="note cl-disc">Модель упрощённая. Результаты — не прогноз и не индивидуальная инвестиционная рекомендация: реальные ставки, цены, налоги и дефолты будут отличаться.</div></div>`;
+   <b>ОФЗ, корпоративные, ВДО</b>: покупаем по текущей медианной доходности сегмента, держим до погашения (срок ≈ медианная дюрация), купоны по этой доходности; погашенный номинал и купоны вкладываются по будущей доходности ≈ текущая + β × (ключевая в тот момент − ключевая сейчас), β = 0,6 для ОФЗ и 0,7 для остальных. Купоны реинвестируются целиком: брокер удерживает НДФЛ с купонов раз в год, в конце календарного года, и с остатка — при выводе денег в конце срока; налог берётся из свободных денег на счёте, а если их не хватает — продаётся часть облигаций. На ИИС налог удерживается только при закрытии счёта (весь доход попадает в базу года закрытия); на ИИС типа Б от 3 лет и ИИС-3 от 5 лет налога нет (ИИС-3 — с дохода до 30 млн ₽). Переоценка цены облигаций при удержании до погашения не учитывается; на конец срока позиции считаются по номиналу.
+   <b>Мой портфель</b>: доходность облигаций портфеля (IRR) используется как ставка; <b>Своя ставка</b> — постоянная ставка с купонным налогом. Капитал в промежуточные месяцы показан за вычетом начисленного, но ещё не удержанного налога. Инфляция — прогноз Банка России, после его горизонта — последнее значение.</div></div>
+  <div class="note cl-disc">Модель упрощённая. Результаты — не прогноз и не индивидуальная инвестиционная рекомендация: реальные ставки, цены, налоги и дефолты будут отличаться.</div>`;
 }
-function clUpdate(){
-  S.charts=[];const o=$('#cl-out');if(!o)return;o.innerHTML=clOut();mountCharts();
-  const g=$('#cl-goalStrat');if(g){const F=clLoadF(),P=(S.calcAcc===S.account&&S.calcP)||clDefaultParams(),opts=clAvail(P).filter(s=>F.strat[s[0]]);
-    g.innerHTML=opts.map(s=>`<option value="${s[0]}" ${s[0]===F.goalStrat?'selected':''}>${s[1]}</option>`).join('')}
-}
+function clUpdate(){S.charts=[];const o=$('#cl-out');if(!o)return;o.innerHTML=clOut();mountCharts()}
 function bindCalcInv(){
-  const form=$('#cl-form');if(!form)return;const F=clLoadF(),P=(S.calcAcc===S.account&&S.calcP)||clDefaultParams();
+  const form=$('#cl-form');if(!form)return;const F=clLoadF(),P=clMkt();
   const rn=(id,d,lo,hi)=>{const e=$('#cl-'+id);if(!e)return d;let v=parseFloat(String(e.value).replace(',','.'));if(!isFinite(v))v=d;if(lo!=null)v=Math.max(lo,v);if(hi!=null)v=Math.min(hi,v);return v};
   const read=()=>{
     F.start=rn('start',0,0);F.monthly=rn('monthly',0,0);F.idx=rn('idx',0,0,50);F.years=Math.round(rn('years',10,1,30));F.ownRate=rn('ownRate',15,0,100);
     F.reinvest=$('#cl-reinvest').checked;F.freq=+$('#cl-freq').value;F.lot=rn('lot',0,0);F.lotFund=$('#cl-lotFund').value;F.ownKey=rn('ownKey',12,1,50);
     F.acct=$('#cl-acct').value;F.reinvDed=$('#cl-reinvDed').checked;F.ldv=$('#cl-ldv').checked;F.defaults=$('#cl-defaults').checked;F.depSpread=rn('depSpread',1.5,0,10);
-    F.goalOn=$('#cl-goalOn').checked;F.goalAmt=rn('goalAmt',0,0);F.goalMode=$('#cl-goalMode').value;if($('#cl-goalStrat'))F.goalStrat=$('#cl-goalStrat').value;
     form.querySelectorAll('#cl-strat input').forEach(c=>{F.strat[c.dataset.s]=c.checked?1:0});
-    $('#cl-yv').textContent=F.years;
-    $('#cl-ownbox').style.display=F.strat.own?'':'none';$('#cl-ownkeybox').style.display=F.scn==='own'?'':'none';$('#cl-goalbox').style.display=F.goalOn?'':'none';
+    $('#cl-yv').textContent=F.years;$('#cl-advsum').textContent=clAdvSum(F);
+    $('#cl-ownbox').style.display=F.strat.own?'':'none';$('#cl-ownkeybox').style.display=F.scn==='own'?'':'none';
     clSave();clUpdate();
   };
   form.addEventListener('input',read);form.addEventListener('change',read);
+  const ad=$('#cl-adv');if(ad)ad.addEventListener('toggle',()=>{F.adv=ad.open;clSave()});
   [['scn',v=>{F.scn=v}],['real',v=>{F.real=v==='1'}]].forEach(([id,fn])=>{const s=$('#cl-'+id);if(s)s.onclick=e=>{const b=e.target.closest('button');if(!b)return;
     s.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));fn(b.dataset.v);read()}});
+  const o=$('#cl-out');
+  if(o){const pick=v=>{F.view=v;clSave();clUpdate()};
+    o.onchange=e=>{if(e.target.id==='cl-view')pick(e.target.value)};
+    o.onclick=e=>{const t=e.target.closest('tr[data-s]');if(t&&o.querySelectorAll('tr[data-s]').length>1)pick(t.dataset.s)}}
   const b=$('#cl-pf');if(b)b.onclick=()=>{const pf=P.portfolio;if(!pf)return;if(pf.value!=null)F.start=Math.round(pf.value);if(pf.monthly!=null)F.monthly=Math.round(pf.monthly);F.strat.pf=1;clSave();render()};
 }
 
-/* ── Режим «Цель по пассивному доходу»: математика на сервере (/api/calc/goal), здесь только ввод и вывод ── */
+/* ── Вкладка «Пассивный доход»: математика на сервере (/api/calc/goal), здесь только ввод и вывод ── */
 const CG_DEF={monthly:100000,hz:'years',years:10,date:'',yield:'',value:'',real:true,infl:''};
 let CG_F=null,CG_T=0;
 function cgLoad(){
@@ -17325,6 +17367,23 @@ function cgHints(){
   const set=(id,v,suf)=>{const e=$('#cg-'+id);if(e&&e.value==='')e.placeholder=v==null?'':(String(v)+(suf||''))};
   set('yield',d.yield==null?'':d.yield);set('value',d.value==null?'':Math.round(d.value));set('infl',S.cgData.infl?S.cgData.infl.value:'');
 }
+/* подбор на конкретной стратегии калькулятора: срок и стартовая сумма — из расчёта выше, остальные параметры — из вкладки «Накопить капитал» */
+function cgStrat(r){
+  const F=clLoadF(),P=clMkt(),av=clAvail(P),sid=av.some(s=>s[0]===F.goalStrat)?F.goalStrat:'ofz',s=CL_STR.find(x=>x[0]===sid);
+  const G=Object.assign({},F,{goalAmt:r.monthly,start:r.value||0,years:r.months/12}),g=clGoal(G,P,clEnv(P,G),sid,!!r.real),N=r.months;
+  const amt=clRub(r.monthly)+' в месяц'+(r.real?' (в сегодняшних деньгах, после налога)':' (после налога)');
+  let t;
+  if(!g.ok)t=`Для стратегии «${esc(s[1])}» цель ${amt} ${F.goalMode==='years'?'недостижима и за 50 лет при таком пополнении':'недостижима при заданном сроке даже при очень больших пополнениях'}.`;
+  else if(F.goalMode==='years')t=g.months<=1?`Цель ${amt} достигается сразу: стартовой суммы достаточно.`:
+    `Чтобы получать ${amt} на стратегии «${esc(s[1])}», при пополнении ${clRub(F.monthly)} в месяц понадобится около <b>${clYM(g.months)}</b>.`;
+  else t=g.monthly<=0?`Цель ${amt} за ${clYM(N)} достигается и без ежемесячных пополнений: хватает стартовой суммы.`:
+    `Чтобы через ${clYM(N)} получать ${amt} на стратегии «${esc(s[1])}», нужно пополнять примерно <b>${clRub(g.monthly)}</b> в месяц (с ежегодной индексацией ${f2(F.idx)} %).`;
+  const so=av.map(x=>`<option value="${x[0]}" ${x[0]===sid?'selected':''}>${x[1]}</option>`).join('');
+  return`<div class="card cl-goal"><h2>На конкретной стратегии<span class="sp">ставки, налоги и дефолты как во вкладке «Накопить капитал»</span></h2>
+   <div class="cl-grid cl-base" style="margin-bottom:12px"><label class="field"><span>Стратегия</span><select class="in" id="cg-gs">${so}</select></label>
+    <label class="field"><span>Что найти</span><select class="in" id="cg-gm"><option value="contrib" ${F.goalMode!=='years'?'selected':''}>нужное пополнение (срок задан)</option><option value="years" ${F.goalMode==='years'?'selected':''}>нужный срок (пополнение ${clRub(F.monthly)} в месяц)</option></select></label></div>
+   <div class="cl-ans">${t}</div><div class="note" style="margin-top:8px">Стартовая сумма — ${clRub(r.value||0)}, срок — ${clYM(N)}, как в расчёте выше; тип счёта, сценарий ставки, индексация и пополнение — из вкладки «Накопить капитал». Пассивный доход — проценты или купоны, которые капитал приносит в год, делённые на 12, после налога по шкале 13/15 %.</div></div>`;
+}
 function cgOut(){
   const j=S.cgData,F=cgLoad();
   if(!j)return`<div class="card">${waitBox('Считаю…')}</div>`;
@@ -17339,6 +17398,7 @@ function cgOut(){
   const cv=r.coverage;
   const cov=cv&&cv.pct!=null?`<div class="card cl-goal"><h2>Где вы сейчас</h2><div class="cl-ans">Сейчас купоны и дивиденды дают около <b>${clRub(cv.income)}</b> в месяц${d.income_src&&F.value===''?` (${esc(d.income_src)})`:''} — это <b>${f2(cv.pct)} %</b> цели. Оценка до налога и без учёта будущих изменений портфеля.</div></div>`:
     `<div class="card"><div class="note">Данных о текущем доходе нет: подключите токен или укажите стоимость портфеля.</div></div>`;
+  let st='';try{st=cgStrat(r)}catch(e){console.error(e)}
   return`<div class="g g4">${kpi('Нужный капитал сегодня',clRub(r.capital_today),`${clRub(r.monthly)} в мес. после налога`,null,S1)}
     ${kpi(r.real&&r.inflation_factor>1.001?'Нужный капитал на дату цели':'Нужный капитал к цели',clRub(r.capital_end),r.real&&r.inflation_factor>1.001?`цель с инфляцией: ${clRub(r.goal_end)} в мес.`:'без поправки на инфляцию',null,S4)}
     ${kpi('Пополнение в месяц',r.reached?'не требуется':clRub(r.contribution),r.reached?'текущего капитала достаточно':`за ${ym} внесёте ${short(r.contribution_total)} ₽`,r.reached?'pos':'',S3)}
@@ -17346,11 +17406,13 @@ function cgOut(){
   ${cov}
   <div class="card"><h2>Рост капитала и цель<span class="sp">через ${ym}</span></h2><div id="cg-chart" class="chart"></div>
    <div class="note" style="margin-top:10px">${src.length?esc(src.join('; '))+'. ':''}${r.real?`Цель задана в сегодняшних деньгах: при инфляции ${f2(r.infl_pct)} % в год к дате цели нужно ${clRub(r.goal_end)} в месяц.`:'Цель задана в номинальных рублях, без поправки на инфляцию.'}</div></div>
-  <div class="card"><h2>Как это считается</h2><div class="note">Нужный капитал = доход в месяц × 12 ÷ (доходность × (1 − 13 %)). Капитал растёт на доходность после налога, доход реинвестируется; пополнения вносятся в конце месяца и не индексируются. Ставка и налог принимаются постоянными (шкалу НДФЛ с 15 % свыше 2,4 млн ₽ дохода в год расчёт не учитывает), риски и дефолты не заложены. Расчёт информационный и не является инвестиционной рекомендацией; налоги уточняйте у брокера и в ФНС.</div></div>`;
+  ${st}
+  <div class="card"><h2>Как это считается</h2><div class="note">Нужный капитал = доход в месяц × 12 ÷ (доходность × (1 − 13 %)). Капитал растёт на доходность после налога, доход реинвестируется; пополнения вносятся в конце месяца и не индексируются. Ставка и налог принимаются постоянными (шкалу НДФЛ с 15 % свыше 2,4 млн ₽ дохода в год этот расчёт не учитывает — её учитывает блок «На конкретной стратегии»), риски и дефолты не заложены. Расчёт информационный и не является инвестиционной рекомендацией; налоги уточняйте у брокера и в ФНС.</div></div>`;
 }
 function pCalcGoal(){
   const F=cgLoad();
   const num=(id,l,v,o)=>`<label class="field"><span>${l}</span><input class="in" id="cg-${id}" type="number" inputmode="decimal" value="${esc(v)}" ${o||''}></label>`;
+  if(S.calcAcc!==S.account)clLoad();
   if(S.cgAcc!==S.account||!S.cgData){S.cgData=null;setTimeout(cgFetch,0)}
   return`<div class="card"><h2>Цель по пассивному доходу<span class="sp">сколько нужно накопить</span></h2><div id="cg-form">
     <div class="cl-grid">${num('monthly','Желаемый доход в месяц после налога, ₽',F.monthly,'min="0" step="5000"')}
@@ -17375,12 +17437,13 @@ function bindCalcGoal(){
     lsSet('ta_calc_goal',JSON.stringify(F));clearTimeout(bindCalcGoal.t);bindCalcGoal.t=setTimeout(cgFetch,250);
   };
   form.addEventListener('input',read);form.addEventListener('change',read);
+  const o=$('#cg-out');if(o)o.onchange=e=>{const t=e.target;if(t.id!=='cg-gs'&&t.id!=='cg-gm')return;const G=clLoadF();G[t.id==='cg-gs'?'goalStrat':'goalMode']=t.value;clSave();cgPaint()};
   if(S.cgData)cgHints();
 }
 function pCalc(){
   const m=cgMode();
-  const sw=`<div class="row noprint" style="margin-bottom:14px"><div class="seg">${[['inv','Инвестиционный калькулятор'],['goal','Цель по пассивному доходу']].map(([k,t])=>`<button class="${k===m?'on':''}" onclick="cgSetMode('${k}')">${t}</button>`).join('')}</div></div>`;
-  return`<div class="cl-page">${sw}${m==='goal'?pCalcGoal():pCalcInv().replace(/^<div class="cl-page">/,'').replace(/<\/div>$/,'')}</div>`;
+  const sw=`<div class="row noprint"><div class="seg cl-tabs">${[['inv','Накопить капитал'],['goal','Пассивный доход']].map(([k,t])=>`<button class="${k===m?'on':''}" onclick="cgSetMode('${k}')">${t}</button>`).join('')}</div></div>`;
+  return`<div class="cl-page">${sw}${m==='goal'?pCalcGoal():pCalcInv()}</div>`;
 }
 function bindCalc(){if(cgMode()==='goal')bindCalcGoal();else bindCalcInv()}
 /* ── Оферты: держать или предъявить ── */
