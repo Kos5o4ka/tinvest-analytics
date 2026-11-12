@@ -3876,7 +3876,7 @@ def http_text(url, timeout=25):
 RATING_CH = "https://t.me/s/issuerRatings"
 RATING_SCALE = ["AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-", "BB+", "BB", "BB-",
                 "B+", "B", "B-", "CCC", "CC", "C", "D"]
-RT_KEY, RT_DAYS, RT_MAX_PAGES, RT_TTL, RT_OLD = "ratings_v1", 430, 280, 12 * 3600, 600
+RT_KEY, RT_DAYS, RT_MAX_PAGES, RT_TTL, RT_OLD = "ratings_v2", 430, 280, 12 * 3600, 600
 _L = "[AАBВCС]"
 _NOTLET = "(?<![A-Za-zА-Яа-яЁё])"
 _RATING_PATS = [re.compile(p) for p in (
@@ -3930,12 +3930,55 @@ def _rating_issuer(t):
 
 
 def name_tokens(s):
+    """Префиксные (5 символов) токены названия: грубые ключи эмитента для группировки и журнала."""
     out = set()
     for i, t in enumerate(re.findall(r"[a-zа-я0-9]+", (s or "").lower().replace("ё", "е"))):
         if t in _LEGAL or (i == 0 and t == "банк") or len(t) < 2 or any(ch.isdigit() for ch in t):
             continue
         out.add(t[:5])
     return frozenset(out)
+
+
+def name_words(s):
+    """Полные нормализованные слова названия по порядку (без правовых форм и слов с цифрами); «Банк» в начале остаётся."""
+    out = []
+    for t in re.findall(r"[a-zа-я0-9]+", (s or "").lower().replace("ё", "е")):
+        if t in _LEGAL or len(t) < 2 or any(ch.isdigit() for ch in t):
+            continue
+        out.append(t)
+    return tuple(out)
+
+
+def _words_key(w):
+    return "".join(sorted(set(w)))
+
+
+def _words_match(bw, iw):
+    """Сравнение названий по полным словам: (100, ...) — равны; иначе приблизительный балл (<100) или None.
+    Совпадение только по префиксу допустимо, если одно слово — сокращение другого (капитал ~ кап, сбербанк ~ сберб)."""
+    bs, is_ = frozenset(bw), frozenset(iw)
+    if not bs or not is_:
+        return None
+    if bs == is_:
+        return 100.0
+    bj, ij = "".join(bw), "".join(iw)
+    lo, hi = (bj, ij) if len(bj) <= len(ij) else (ij, bj)
+    if len(lo) >= 5 and hi.startswith(lo):                          # «ГазпромКап» ~ «Газпром капитал»
+        return float(min(len(lo), 90))
+    small, big = (bs, is_) if len(bs) <= len(is_) else (is_, bs)
+    sc = 0
+    used = set()
+    for w in small:
+        hit = w if w in big else next((x for x in big if x not in used and min(len(w), len(x)) >= 4
+                                       and (x.startswith(w) or w.startswith(x))), None)
+        if hit is None:
+            return None
+        used.add(hit)
+        sc += min(len(w), len(hit))
+    rest = big - used
+    if sc < 5 or (sc < 6 and any(len(x) > 2 for x in rest)):
+        return None
+    return float(min(sc, 90))
 
 
 def parse_rating_post(text):
@@ -4118,7 +4161,7 @@ def _ratings_run():
             r = parse_rating_post(text)
             if not r:
                 continue
-            toks = "".join(sorted(name_tokens(r["issuer"])))
+            toks = _words_key(name_words(r["issuer"]))
             if not toks:
                 continue
             key = "%s|%s|%s" % (toks, r["agency"], r["level"])
@@ -4174,14 +4217,14 @@ def _rating_index():
             for k, it in src.items():
                 if it["date"] >= old and (k not in merged or it["date"] >= merged[k]["date"]):
                     merged[k] = it
-        items = [(it, name_tokens(it["issuer"])) for it in merged.values()]
+        items = [(it, name_words(it["issuer"])) for it in merged.values()]
         exact, inv = {}, {}
-        for it, toks in items:
-            if not toks:
+        for it, ws in items:
+            if not ws:
                 continue
-            exact.setdefault(toks, []).append(it)
-            for t in toks:
-                inv.setdefault(t, []).append((it, toks))
+            exact.setdefault(frozenset(ws), []).append(it)
+            for t in {w[:4] for w in ws}:                              # кандидаты по 4-символьному префиксу слова
+                inv.setdefault(t, []).append((it, ws))
         _rt_idx.clear()
         _rt_idx.update(u=stamp, items=items, exact=exact, inv=inv)
     return _rt_idx
@@ -4189,8 +4232,8 @@ def _rating_index():
 
 def rating_for(name):
     """Рейтинг эмитента по названию облигации. Точное совпадение названий — надёжно, частичное — approx."""
-    bt = name_tokens(name)
-    if not bt:
+    bw = name_words(name)
+    if not bw:
         return None
     ix = _rating_index()
     best = {}
@@ -4200,27 +4243,24 @@ def rating_for(name):
         cur = best.get(it["agency"])
         if cur is None or sc > cur[0] or (sc == cur[0] and it["date"] > cur[1]["date"]):
             best[it["agency"]] = (sc, it)
-    for it in ix.get("exact", {}).get(bt, []):
+    bset = frozenset(bw)
+    for it in ix.get("exact", {}).get(bset, []):
         put(it, 100.0)
     seen = set()
-    for t in bt:
-        for it, toks in ix.get("inv", {}).get(t, []):
-            if id(it) in seen or toks == bt:
+    for t in {w[:4] for w in bw}:
+        for it, ws in ix.get("inv", {}).get(t, []):
+            if id(it) in seen or frozenset(ws) == bset:
                 continue
             seen.add(id(it))
-            if not (toks <= bt or bt <= toks):
-                continue
-            sc = float(sum(len(x) for x in toks & bt))
-            if sc < 6 and any(len(x) > 2 for x in (toks | bt) - (toks & bt)):
-                continue
-            if sc < 5:
-                continue
-            put(it, sc)
+            sc = _words_match(bw, ws)
+            if sc:
+                put(it, sc)
     if not best:
         return None
     allr = [{"agency": a, "rating": it["rating"], "issuer": it["issuer"], "date": it["date"], "outlook": it["outlook"],
              "approx": sc < 100} for a, (sc, it) in best.items()]
-    low = max(allr, key=lambda x: RATING_SCALE.index(x["rating"]))     # консервативно: худшая из оценок
+    pool = [x for x in allr if not x["approx"]] or allr                  # приблизительные не влияют на «худший», пока есть точные
+    low = max(pool, key=lambda x: RATING_SCALE.index(x["rating"]))     # консервативно: худшая из оценок
     return {"v": low["rating"], "agency": low["agency"], "issuer": low["issuer"], "date": low["date"],
             "approx": low["approx"], "all": allr}
 
@@ -4244,7 +4284,7 @@ def rating_bucket(v):
 # АКРА и НРА с сайтов недоступны программам (у АКРА сервер отдаёт неполную цепочку сертификатов,
 # у НРА — таймауты), поэтому их рейтинги идут только из канала @issuerRatings.
 
-SITE_KEY, EXP_KEY = "ratings_site_v1", "ratings_expert_v1"
+SITE_KEY, EXP_KEY = "ratings_site_v2", "ratings_expert_v2"
 _exp_state = {"running": False}
 _SERIES_WORDS = {"бо", "бп", "кс", "обл", "серия", "серии", "выпуск"}
 
@@ -4263,7 +4303,7 @@ def nkr_fetch():
             continue
         v = _rating_token(td[1])
         dm = re.search(r"(\d\d)\.(\d\d)\.(\d{4})", td[5])
-        toks = "".join(sorted(name_tokens(td[0])))
+        toks = _words_key(name_words(td[0]))
         if not v or not dm or not toks:
             continue
         items["%s|НКР|issuer" % toks] = {"issuer": td[0], "agency": "НКР", "level": "issuer", "rating": v,
@@ -4307,7 +4347,7 @@ def expert_lookup(op, query, tokens):
         if href in seen or not name:
             continue
         seen.add(href)
-        if name_tokens(name) == tokens:
+        if frozenset(name_words(name)) == frozenset(tokens):
             link = (href, name)
             break
     if not link:
@@ -4331,10 +4371,10 @@ def _expert_run(names):
         now = time.time()
         for name in names:
             q = _bond_query(name)
-            tokens = name_tokens(q)
+            tokens = name_words(q)
             if not q or not tokens:
                 continue
-            qk = "".join(sorted(tokens))
+            qk = _words_key(tokens)
             ts = d["queried"].get(qk)
             if ts and now - ts < 3 * 86400:
                 continue
@@ -4361,7 +4401,7 @@ def expert_start(names):
         now = time.time()
         todo = []
         for n in names:
-            qk = "".join(sorted(name_tokens(_bond_query(n))))
+            qk = _words_key(name_words(_bond_query(n)))
             if qk and now - d["queried"].get(qk, 0) > 3 * 86400 and n not in todo:
                 todo.append(n)
         if not todo:
@@ -4468,7 +4508,7 @@ def best_rating(isin, name):
         return base
     allr = list(cat.values())
     for x in (base or {}).get("all") or []:
-        if x["agency"] not in cat and not x.get("approx"):
+        if x["agency"] not in cat and not x.get("approx"):     # по названию — только точные; приблизительные худший не выбирают
             allr.append(x)
     low = max(allr, key=lambda x: RATING_SCALE.index(x["rating"]))
     return {"v": low["rating"], "agency": low["agency"], "issuer": low["issuer"], "date": low["date"],
