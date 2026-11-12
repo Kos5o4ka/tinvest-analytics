@@ -3,6 +3,10 @@
 EV_KINDS = {"cbr": "Заседание ЦБ", "coupon": "Купон", "redemption": "Погашение", "amort": "Амортизация", "dividend": "Дивиденд",
             "offer": "Оферта", "primary": "Размещение", "w_coupon": "Купон (наблюдение)", "w_redemption": "Погашение (наблюдение)",
             "w_offer": "Оферта (наблюдение)"}
+# сырые виды выплат из портфеля -> виды календаря (амортизация у брокера приходит как "amortization", у Мосбиржи — "amort")
+EV_KIND_ALIAS = {"amortization": "amort", "maturity": "redemption", "repayment": "redemption"}
+EV_NOTE = {"coupon": "купонная выплата", "redemption": "погашение облигации", "dividend": "дивиденд", "amort": "частичное погашение номинала"}
+EV_MAX_DAYS = 400
 CBR_CAL_URL = "https://www.cbr.ru/dkp/cal_mp/"
 CBR_CAL_KEY = "cbr_cal_v1"
 _RU_MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6, "июля": 7, "августа": 8, "сентября": 9,
@@ -41,8 +45,14 @@ def cbr_meetings():
         return {"dates": [], "ok": False, "error": str(e)[:160]}
 
 
+def ev_kind(k):
+    """Приводит вид события к каноническому (амортизация и т.п.)."""
+    k = str(k or "")
+    return EV_KIND_ALIAS.get(k, k)
+
+
 def _ev(d, kind, title, isin=None, amount=None, note="", **kw):
-    e = {"date": d, "kind": kind, "title": title, "isin": isin or None, "amount": amount, "note": note}
+    e = {"date": d, "kind": ev_kind(kind), "title": title, "isin": isin or None, "amount": amount, "note": note}
     e.update(kw)
     return e
 
@@ -85,6 +95,10 @@ def offer_events(offs, name, isin, frm, to, pref=""):
                 out.append(_ev(d, kind, name, isin, None, "Оферта%s: тип не указан, проверьте условия в документах выпуска%s" % (price, win),
                                badge=badge, label="Оферта (тип не указан)", sub="unknown"))
     return out
+
+
+def _day_diff(a, b):
+    return (datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
 
 
 def _dmy(d):
@@ -133,7 +147,13 @@ def events_payload(cfg, acc, q):
     to = (q.get("to") or "").strip() or _day_add(frm, 92)
     if not re.match(r"^\d{4}-\d\d-\d\d$", to):
         raise ApiError("Даты нужно указывать в формате ГГГГ-ММ-ДД.", 400)
-    kinds = [k for k in (q.get("kinds") or "").split(",") if k]
+    try:
+        bad = to < frm or _day_diff(frm, to) > EV_MAX_DAYS
+    except ValueError:
+        raise ApiError("Такой даты не существует.", 400)
+    if bad:
+        raise ApiError("Период для календаря должен быть не длиннее %d дней." % EV_MAX_DAYS, 400)
+    kinds = [ev_kind(k) for k in (q.get("kinds") or "").split(",") if k]
     events, warn, src = [], [], {}
     # 1. заседания Банка России
     cb = cbr_meetings()
@@ -154,11 +174,12 @@ def events_payload(cfg, acc, q):
             if not (frm <= p["date"] <= to):
                 continue
             r = by_tk.get(p.get("ticker")) or {}
-            isin = r.get("isin") if p["kind"] != "dividend" else None
-            note = {"coupon": "купонная выплата", "redemption": "погашение облигации", "dividend": "дивиденд"}.get(p["kind"], p["kind"])
+            pk = ev_kind(p["kind"])
+            isin = r.get("isin") if pk != "dividend" else None
+            note = EV_NOTE.get(pk) or EV_KINDS.get(pk, "выплата").lower()
             if p.get("est"):
                 note += " (оценка)"
-            events.append(_ev(p["date"], p["kind"], p["name"], isin, round(p["amount"], 2), note))
+            events.append(_ev(p["date"], pk, p["name"], isin, round(p["amount"], 2), note))
         for r in rep["rows"]:
             if r.get("isin") and r.get("qty"):
                 held.add(r["isin"])
