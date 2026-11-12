@@ -101,6 +101,10 @@ function bcBody(c){
   add('Дефолт',d.HASDEFAULT==='1'?'<b class="neg">допущен</b>':d.HASTECHNICALDEFAULT==='1'?'<b class="neg">технический</b>':(d.HASDEFAULT==='0'?'нет':''));
   add('Госномер выпуска',esc(d.REGNUMBER||''));
   h+=`<div class="card bc-sec"><h2>Ключевые параметры</h2><div class="bc-par">${rows.join('')||'<span class="mu">Нет данных</span>'}</div></div>`;
+  const rk=x=>{const i=RSC.indexOf(x.rating);return i<0?99:i},ra=(c.rating&&c.rating.all||[]).slice().sort((x,y)=>rk(x)-rk(y)||String(x.agency).localeCompare(String(y.agency)));
+  h+=`<div class="card bc-sec"><h2>Кредитные рейтинги эмитента</h2>`+(ra.length?`<div class="tbl bc-rt"><table><thead><tr><th>Агентство</th><th>Рейтинг</th><th>Прогноз</th><th>Дата</th><th>Совпадение</th></tr></thead><tbody>`
+    +ra.map(x=>`<tr><td>${esc(x.agency)}</td><td><span class="tag rt rt-${esc(rBucket(x.rating).split(' ')[0])}">${esc(x.rating)}</span></td><td>${x.outlook?esc(x.outlook):'<span class="mu">—</span>'}</td><td>${x.date?ddm(x.date):'<span class="mu">—</span>'}</td><td>${x.approx?'<span class="neg" title="'+esc(x.issuer||'')+'">по названию, приблизительно</span>':'точное'}</td></tr>`).join('')
+    +`</tbody></table></div>`:'<div class="mu" style="font-size:13px">Рейтинги кредитных агентств не найдены</div>')+`</div>`;
   h+=`<div class="card bc-sec"><h2>Документы выпуска</h2>${bcDocLinks(c.isin,(c.docs||{}).inn||d.EMITTER_INN,(m&&m.id)||c.isin)}</div>`;
   h+=`<div class="card bc-sec" id="bc-iss"><h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2><div class="mu" style="font-size:13px">Загружаю отчётность эмитента…</div></div>`;
   // денежный поток

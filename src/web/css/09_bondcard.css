@@ -36,3 +36,5 @@ body.bc-open{overflow:hidden}
 }
 .bc-iss-top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
 #bc-iss .bc-kpis{margin:6px 0 10px}
+.rt-ag{font-weight:400;font-size:10px;color:var(--mu)}
+.bc-rt td,.bc-rt th{white-space:nowrap}

@@ -13810,6 +13810,8 @@ body.bc-open{overflow:hidden}
 }
 .bc-iss-top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
 #bc-iss .bc-kpis{margin:6px 0 10px}
+.rt-ag{font-weight:400;font-size:10px;color:var(--mu)}
+.bc-rt td,.bc-rt th{white-space:nowrap}
 .bc-docs{display:flex;flex-wrap:wrap;gap:8px}
 .bc-docs .btn{padding:8px 12px;font-size:13px;text-decoration:none}
 .cmp-add{position:relative;max-width:460px;margin-bottom:14px}
@@ -14862,9 +14864,10 @@ function pPos(){
 /* ── кредитные рейтинги ── */
 const RSC=['AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-','BB+','BB','BB-','B+','B','B-','CCC','CC','C','D'];
 const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
-function ratingTag(r){
-  const t=r.all.map(x=>`${x.agency}: ${x.rating} · ${x.issuer}${x.approx?' (приблизительное совпадение названия)':''} · от ${x.date}${x.outlook?' · '+x.outlook:''}`).join('\n');
-  return`<span class="tag rt rt-${rBucket(r.v).split(' ')[0]}" title="${esc(t)}">${r.approx?'≈ ':''}${esc(r.v)}</span>`;
+function ratingTag(r,short){
+  const t=r.all.map(x=>`${x.agency}: ${x.rating}${x.outlook?' · '+x.outlook:''} · от ${x.date} · ${x.issuer}${x.approx?' (приблизительное совпадение названия)':''}`).join('\n');
+  const n=r.all.length-1,ag=short||!r.agency?'':` <small class="rt-ag">· ${esc(r.agency)}${n>0?' +'+n:''}</small>`;
+  return`<span class="tag rt rt-${rBucket(r.v).split(' ')[0]}" style="white-space:nowrap" title="${esc(t)}">${r.approx?'≈ ':''}${esc(r.v)}${ag}</span>`;
 }
 function ratingsCard(b){
   const info=b.ratings_info||{},tot=(b.ratings||[]).reduce((a,x)=>a+x[1],0)||1;
@@ -16272,6 +16275,10 @@ function bcBody(c){
   add('Дефолт',d.HASDEFAULT==='1'?'<b class="neg">допущен</b>':d.HASTECHNICALDEFAULT==='1'?'<b class="neg">технический</b>':(d.HASDEFAULT==='0'?'нет':''));
   add('Госномер выпуска',esc(d.REGNUMBER||''));
   h+=`<div class="card bc-sec"><h2>Ключевые параметры</h2><div class="bc-par">${rows.join('')||'<span class="mu">Нет данных</span>'}</div></div>`;
+  const rk=x=>{const i=RSC.indexOf(x.rating);return i<0?99:i},ra=(c.rating&&c.rating.all||[]).slice().sort((x,y)=>rk(x)-rk(y)||String(x.agency).localeCompare(String(y.agency)));
+  h+=`<div class="card bc-sec"><h2>Кредитные рейтинги эмитента</h2>`+(ra.length?`<div class="tbl bc-rt"><table><thead><tr><th>Агентство</th><th>Рейтинг</th><th>Прогноз</th><th>Дата</th><th>Совпадение</th></tr></thead><tbody>`
+    +ra.map(x=>`<tr><td>${esc(x.agency)}</td><td><span class="tag rt rt-${esc(rBucket(x.rating).split(' ')[0])}">${esc(x.rating)}</span></td><td>${x.outlook?esc(x.outlook):'<span class="mu">—</span>'}</td><td>${x.date?ddm(x.date):'<span class="mu">—</span>'}</td><td>${x.approx?'<span class="neg" title="'+esc(x.issuer||'')+'">по названию, приблизительно</span>':'точное'}</td></tr>`).join('')
+    +`</tbody></table></div>`:'<div class="mu" style="font-size:13px">Рейтинги кредитных агентств не найдены</div>')+`</div>`;
   h+=`<div class="card bc-sec"><h2>Документы выпуска</h2>${bcDocLinks(c.isin,(c.docs||{}).inn||d.EMITTER_INN,(m&&m.id)||c.isin)}</div>`;
   h+=`<div class="card bc-sec" id="bc-iss"><h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2><div class="mu" style="font-size:13px">Загружаю отчётность эмитента…</div></div>`;
   // денежный поток
