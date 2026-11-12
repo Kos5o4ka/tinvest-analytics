@@ -9915,6 +9915,10 @@ API_GET["/api/issuers"] = issuers_payload
 EV_KINDS = {"cbr": "Заседание ЦБ", "coupon": "Купон", "redemption": "Погашение", "amort": "Амортизация", "dividend": "Дивиденд",
             "offer": "Оферта", "primary": "Размещение", "w_coupon": "Купон (наблюдение)", "w_redemption": "Погашение (наблюдение)",
             "w_offer": "Оферта (наблюдение)"}
+# сырые виды выплат из портфеля -> виды календаря (амортизация у брокера приходит как "amortization", у Мосбиржи — "amort")
+EV_KIND_ALIAS = {"amortization": "amort", "maturity": "redemption", "repayment": "redemption"}
+EV_NOTE = {"coupon": "купонная выплата", "redemption": "погашение облигации", "dividend": "дивиденд", "amort": "частичное погашение номинала"}
+EV_MAX_DAYS = 400
 CBR_CAL_URL = "https://www.cbr.ru/dkp/cal_mp/"
 CBR_CAL_KEY = "cbr_cal_v1"
 _RU_MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6, "июля": 7, "августа": 8, "сентября": 9,
@@ -9953,8 +9957,14 @@ def cbr_meetings():
         return {"dates": [], "ok": False, "error": str(e)[:160]}
 
 
+def ev_kind(k):
+    """Приводит вид события к каноническому (амортизация и т.п.)."""
+    k = str(k or "")
+    return EV_KIND_ALIAS.get(k, k)
+
+
 def _ev(d, kind, title, isin=None, amount=None, note="", **kw):
-    e = {"date": d, "kind": kind, "title": title, "isin": isin or None, "amount": amount, "note": note}
+    e = {"date": d, "kind": ev_kind(kind), "title": title, "isin": isin or None, "amount": amount, "note": note}
     e.update(kw)
     return e
 
@@ -9997,6 +10007,10 @@ def offer_events(offs, name, isin, frm, to, pref=""):
                 out.append(_ev(d, kind, name, isin, None, "Оферта%s: тип не указан, проверьте условия в документах выпуска%s" % (price, win),
                                badge=badge, label="Оферта (тип не указан)", sub="unknown"))
     return out
+
+
+def _day_diff(a, b):
+    return (datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
 
 
 def _dmy(d):
@@ -10045,7 +10059,13 @@ def events_payload(cfg, acc, q):
     to = (q.get("to") or "").strip() or _day_add(frm, 92)
     if not re.match(r"^\d{4}-\d\d-\d\d$", to):
         raise ApiError("Даты нужно указывать в формате ГГГГ-ММ-ДД.", 400)
-    kinds = [k for k in (q.get("kinds") or "").split(",") if k]
+    try:
+        bad = to < frm or _day_diff(frm, to) > EV_MAX_DAYS
+    except ValueError:
+        raise ApiError("Такой даты не существует.", 400)
+    if bad:
+        raise ApiError("Период для календаря должен быть не длиннее %d дней." % EV_MAX_DAYS, 400)
+    kinds = [ev_kind(k) for k in (q.get("kinds") or "").split(",") if k]
     events, warn, src = [], [], {}
     # 1. заседания Банка России
     cb = cbr_meetings()
@@ -10066,11 +10086,12 @@ def events_payload(cfg, acc, q):
             if not (frm <= p["date"] <= to):
                 continue
             r = by_tk.get(p.get("ticker")) or {}
-            isin = r.get("isin") if p["kind"] != "dividend" else None
-            note = {"coupon": "купонная выплата", "redemption": "погашение облигации", "dividend": "дивиденд"}.get(p["kind"], p["kind"])
+            pk = ev_kind(p["kind"])
+            isin = r.get("isin") if pk != "dividend" else None
+            note = EV_NOTE.get(pk) or EV_KINDS.get(pk, "выплата").lower()
             if p.get("est"):
                 note += " (оценка)"
-            events.append(_ev(p["date"], p["kind"], p["name"], isin, round(p["amount"], 2), note))
+            events.append(_ev(p["date"], pk, p["name"], isin, round(p["amount"], 2), note))
         for r in rep["rows"]:
             if r.get("isin") and r.get("qty"):
                 held.add(r["isin"])
@@ -14011,6 +14032,21 @@ tr.scr-low td{opacity:.5}
 .cal-bd{font-size:10.5px;margin-left:6px;vertical-align:1px}
 .cal-am{margin-left:auto;white-space:nowrap}
 @media(max-width:700px){.cal-c{min-height:50px;padding:4px}.cal-n{display:none}}
+.cal-vw{display:inline-flex;border:1px solid var(--line2);border-radius:999px;overflow:hidden}
+.cal-vw button{all:unset;cursor:pointer;padding:5px 13px;font-size:12.5px;font-weight:500;color:var(--mu)}
+.cal-vw button.on{background:var(--card2);color:var(--tx)}
+.cy{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.cy-m{border:1px solid var(--line);border-radius:10px;padding:8px 8px 6px;background:var(--card)}
+.cy-t{all:unset;cursor:pointer;display:block;font-weight:600;font-size:13.5px;color:var(--tx2);margin-bottom:4px}.cy-t:hover{color:var(--ac)}
+.cy-t small{font-weight:500;font-size:11px;color:var(--mu);margin-left:4px}
+.cy-g{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;text-align:center}
+.cy-h{font-style:normal;font-size:9.5px;color:var(--mu);padding-bottom:2px}
+.cy-c{font-weight:400;font-size:11px;line-height:1;color:var(--mu);padding:4px 0 2px;border-radius:5px;position:relative;min-height:22px}
+.cy-c s{display:flex;justify-content:center;gap:2px;margin-top:2px;text-decoration:none}.cy-c s i{width:5px;height:5px;border-radius:50%}
+.cy-c.has{cursor:pointer;color:var(--tx);background:var(--card2)}.cy-c.has:hover{outline:1px solid var(--line2)}
+.cy-c.today{outline:1px solid var(--ac);color:var(--ac);font-weight:600}
+@media(max-width:1100px){.cy{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:700px){.cy{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.cy-m{padding:6px 5px 4px}.cy-c{font-size:10.5px}}
 /* наблюдение */
 .wt-star{background:none;border:0;cursor:pointer;font-size:18px;line-height:1;color:var(--mu);padding:2px 6px;border-radius:6px}
 .wt-star:hover{color:var(--s4)}.wt-star.on{color:var(--s4)}
@@ -17835,21 +17871,30 @@ function bindIss(){
 /* ── Календарь событий ── */
 const CAL_KINDS=[['cbr','Заседания ЦБ','#ffdd2d',['cbr']],['coupon','Купоны','#19a070',['coupon']],['redemption','Погашения','#d95926',['redemption']],
   ['amort','Амортизации','#c98500',['amort']],['dividend','Дивиденды','#9085e9',['dividend']],['offer','Оферты','#e66767',['offer']],
-  ['primary','Размещения','#3987e5',['primary']],['watch','Наблюдение','#8d94a3',['w_coupon','w_redemption','w_offer']]];
+  ['primary','Размещения','#3987e5',['primary']],['watch','Наблюдение','#8d94a3',['w_coupon','w_redemption','w_offer']],['other','Прочее','#8d94a3',[]]];
 const CAL_NAME={cbr:'Заседание ЦБ',coupon:'Купон',redemption:'Погашение',amort:'Амортизация',dividend:'Дивиденд',offer:'Оферта',primary:'Размещение',
   w_coupon:'Купон · наблюдение',w_redemption:'Погашение · наблюдение',w_offer:'Оферта · наблюдение'};
-const calGroup=k=>(CAL_KINDS.find(g=>g[3].includes(k))||[])[0]||k;
+const CAL_ALIAS={amortization:'amort',maturity:'redemption',repayment:'redemption'};
+const calKind=k=>CAL_ALIAS[k]||k;
+/* неизвестный вид уходит в группу «other» (чип «Прочее»), чтобы фильтры его не пропускали */
+const calGroup=k=>{k=calKind(k);const g=CAL_KINDS.find(g=>g[3].includes(k));return g?g[0]:(String(k).startsWith('w_')?'watch':'other')};
 const calCol=k=>(CAL_KINDS.find(g=>g[0]===calGroup(k))||[])[2]||'#8d94a3';
-(function(){const n=new Date();S.cal={y:n.getFullYear(),m:n.getMonth(),off:{},cache:{},sel:null}})();
+const calName=k=>CAL_NAME[calKind(k)]||'Событие';
+const calVis=e=>!S.cal.off[calGroup(e.kind)];
+(function(){const n=new Date();S.cal={y:n.getFullYear(),m:n.getMonth(),off:{},cache:{},sel:null,view:'month'}})();
 try{const v=JSON.parse(localStorage.getItem('cal_off')||'null');if(v&&typeof v==='object')S.cal.off=v}catch(e){}
+try{const v=localStorage.getItem('cal_view');if(v==='year'||v==='month')S.cal.view=v}catch(e){}
 const calYm=()=>S.cal.y+'-'+String(S.cal.m+1).padStart(2,'0');
+const calYear=()=>S.cal.view==='year';
+const calKey=()=>S.account+'|'+(calYear()?'Y'+S.cal.y:calYm());
 function calRange(){
   const y=S.cal.y,m=S.cal.m,p=n=>String(n).padStart(2,'0');
+  if(calYear())return[`${y}-01-01`,`${y}-12-31`];
   const last=new Date(y,m+1,0).getDate();
   return[`${y}-${p(m+1)}-01`,`${y}-${p(m+1)}-${p(last)}`];
 }
 function loadCal(){
-  const key=S.account+'|'+calYm(),c=S.cal.cache[key];
+  const key=calKey(),c=S.cal.cache[key];
   if(c&&(c.loading||c.data||c.error))return;
   const [from,to]=calRange();
   S.cal.cache[key]={loading:true};
@@ -17860,17 +17905,47 @@ const calP2=n=>String(n).padStart(2,'0');
 const CAL_BADGE={PUT:'of-t-put','CALL':'of-t-call'};
 function calBadge(e){return e.badge?` <span class="tag ${CAL_BADGE[e.badge]||'of-t-unk'} cal-bd">${esc(e.badge)}</span>`:''}
 function calMoney(e){return e.amount!=null?M(e.amount,'rub',2):''}
+function calYearHtml(d,today){
+  const y=S.cal.y,by={};
+  (d.events||[]).filter(calVis).forEach(e=>(by[e.date]=by[e.date]||[]).push(e));
+  let h='';
+  for(let m=0;m<12;m++){
+    const lead=(new Date(y,m,1).getDay()+6)%7,days=new Date(y,m+1,0).getDate();
+    let cells='<i class="cy-h">Пн</i><i class="cy-h">Вт</i><i class="cy-h">Ср</i><i class="cy-h">Чт</i><i class="cy-h">Пт</i><i class="cy-h">Сб</i><i class="cy-h">Вс</i>';
+    for(let i=0;i<lead;i++)cells+='<span></span>';
+    let cnt=0;
+    for(let dd=1;dd<=days;dd++){
+      const ds=`${y}-${calP2(m+1)}-${calP2(dd)}`,l=by[ds]||[];cnt+=l.length;
+      const gs=[...new Set(l.map(e=>calGroup(e.kind)))].slice(0,3);
+      const tip=l.slice(0,5).map(e=>e.title+' — '+(e.label||calName(e.kind))).join('\n')+(l.length>5?`\n…и ещё ${l.length-5}`:'');
+      cells+=`<b class="cy-c ${ds===today?'today':''} ${l.length?'has':''}"${l.length?` data-day="${ds}" title="${esc(dlabel(ds)+'\n'+tip)}"`:''}>${dd}${gs.length?`<s>${gs.map(k=>`<i style="background:${(CAL_KINDS.find(g=>g[0]===k)||[])[2]||'#8d94a3'}"></i>`).join('')}</s>`:''}</b>`;
+    }
+    h+=`<div class="cy-m"><button class="cy-t" data-m="${m}">${MONF[m]}${cnt?` <small>${cnt}</small>`:''}</button><div class="cy-g">${cells}</div></div>`;
+  }
+  return`<div class="cy">${h}</div>`;
+}
+function calKpis(evs,lbl){
+  const sum={};evs.forEach(e=>{const k=calKind(e.kind);if(e.amount!=null&&['coupon','redemption','amort','dividend'].includes(k))sum[k]=(sum[k]||0)+e.amount});
+  const total=Object.values(sum).reduce((a,b)=>a+b,0),n=k=>evs.filter(e=>calKind(e.kind)===k).length;
+  return`<div class="g g4">${kpi('Событий '+(calYear()?'в году':'в месяце'),evs.length,lbl)}${kpi('Выплаты по портфелю',total?M(total,'rub',0):'—','купоны, погашения, амортизации, дивиденды')}
+    ${kpi('Заседаний ЦБ',n('cbr'),'по ключевой ставке')}${kpi('Размещений',n('primary'),'начало по объявлениям Мосбиржи')}</div>`;
+}
 function pCal(){
   loadCal();
-  const key=S.account+'|'+calYm(),c=S.cal.cache[key]||{loading:true};
+  const key=calKey(),c=S.cal.cache[key]||{loading:true},yr=calYear();
   const y=S.cal.y,m=S.cal.m,today=new Date().toISOString().slice(0,10);
-  const nav=`<div class="row cal-nav"><button class="btn ghost" id="cal-prev" title="Предыдущий месяц">‹</button><b class="cal-title">${MONF[m]} ${y}</b><button class="btn ghost" id="cal-next" title="Следующий месяц">›</button>
-    <button class="btn ghost" id="cal-today">Сегодня</button><a class="btn" id="cal-ics" href="/api/events.ics?${new URLSearchParams({account:S.account})}" download="tinvest_events.ics" style="margin-left:auto">Скачать .ics</a></div>`;
-  const chips=`<div class="cal-chips">${CAL_KINDS.map(g=>`<button class="cal-chip ${S.cal.off[g[0]]?'':'on'}" data-k="${g[0]}"><i style="background:${g[2]}"></i>${g[1]}</button>`).join('')}</div>`;
+  const nav=`<div class="row cal-nav"><button class="btn ghost" id="cal-prev" title="${yr?'Предыдущий год':'Предыдущий месяц'}">‹</button><b class="cal-title">${yr?y:MONF[m]+' '+y}</b><button class="btn ghost" id="cal-next" title="${yr?'Следующий год':'Следующий месяц'}">›</button>
+    <button class="btn ghost" id="cal-today">Сегодня</button><span class="cal-vw"><button id="cal-vm" class="${yr?'':'on'}">Месяц</button><button id="cal-vy" class="${yr?'on':''}">Год</button></span><a class="btn" id="cal-ics" href="/api/events.ics?${new URLSearchParams({account:S.account})}" download="tinvest_events.ics" style="margin-left:auto">Скачать .ics</a></div>`;
+  const hasOther=c.data&&(c.data.events||[]).some(e=>calGroup(e.kind)==='other');
+  const chips=`<div class="cal-chips">${CAL_KINDS.filter(g=>g[0]!=='other'||hasOther).map(g=>`<button class="cal-chip ${S.cal.off[g[0]]?'':'on'}" data-k="${g[0]}"><i style="background:${g[2]}"></i>${g[1]}</button>`).join('')}</div>`;
   const help=`<p class="note" style="margin:4px 4px 12px">Кнопка «Скачать .ics» сохраняет файл с событиями на год вперёд (все типы, без учёта фильтров). Его можно импортировать в Календарь Google (Настройки → Импорт) или открыть в Календаре Apple двойным щелчком. Файл формируется на вашем компьютере и никуда не отправляется.</p>`;
   if(c.loading)return`<div class="card">${nav}${waitBox('Собираю события: заседания ЦБ, выплаты, оферты, размещения…')}</div>`;
   if(c.error)return`<div class="card">${nav}<div class="msg err">${esc(c.error)} <button class="btn ghost" id="cal-r">Повторить</button></div></div>`;
-  const d=c.data,evs=(d.events||[]).filter(e=>!S.cal.off[calGroup(e.kind)]);
+  const d=c.data,evs=(d.events||[]).filter(calVis);
+  if(yr){
+    const warn=(d.warnings||[]).map(w=>`<div class="msg err" style="margin:8px 0">${esc(w)}</div>`).join('');
+    return`${calKpis(evs,'за '+y+' год')}<div class="card" style="margin-top:16px">${nav}${chips}${warn}${calYearHtml(d,today)}<p class="note" style="margin:10px 4px 0">Точки — типы событий в этот день (до трёх). Нажмите на день, чтобы открыть его в месячном виде, или на название месяца.</p></div>${help}`;
+  }
   const by={};evs.forEach(e=>(by[e.date]=by[e.date]||[]).push(e));
   const first=new Date(y,m,1),lead=(first.getDay()+6)%7,days=new Date(y,m+1,0).getDate();
   let cells='';
@@ -17883,24 +17958,25 @@ function pCal(){
   }
   const grid=`<div class="cal-grid"><div class="cal-h">Пн</div><div class="cal-h">Вт</div><div class="cal-h">Ср</div><div class="cal-h">Чт</div><div class="cal-h">Пт</div><div class="cal-h">Сб</div><div class="cal-h">Вс</div>${cells}</div>`;
   const ds=Object.keys(by).filter(x=>!S.cal.sel||x===S.cal.sel).sort();
-  const sum={};evs.forEach(e=>{if(e.amount!=null&&['coupon','redemption','amort','dividend'].includes(e.kind))sum[e.kind]=(sum[e.kind]||0)+e.amount});
-  const total=Object.values(sum).reduce((a,b)=>a+b,0);
   const list=ds.length?ds.map(dt=>`<div class="cal-day" id="cal-d-${dt}"><div class="cal-dh"><b>${dlabel(dt)}</b><span class="mu">${['вс','пн','вт','ср','чт','пт','сб'][new Date(dt+'T00:00:00').getDay()]}${dt===today?' · сегодня':''}</span></div>
-    ${by[dt].map(e=>`<div class="cal-ev"${e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:''}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}${calBadge(e)}</b><small class="mu">${esc(e.label||CAL_NAME[e.kind]||e.kind)}${e.note&&!e.label?' · '+esc(e.note):''}</small>${e.label&&e.note?`<small class="mu">${esc(e.note)}</small>`:''}</div>
+    ${by[dt].map(e=>`<div class="cal-ev"${e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:''}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}${calBadge(e)}</b><small class="mu">${esc(e.label||calName(e.kind))}${e.note&&!e.label?' · '+esc(e.note):''}</small>${e.label&&e.note?`<small class="mu">${esc(e.note)}</small>`:''}</div>
       <span class="num cal-am">${calMoney(e)}</span></div>`).join('')}</div>`).join(''):'<div class="empty" style="padding:24px">В этом месяце событий нет'+(Object.keys(S.cal.off).some(k=>S.cal.off[k])?' (часть типов скрыта фильтрами)':'')+'</div>';
   const warn=(d.warnings||[]).map(w=>`<div class="msg err" style="margin:8px 0">${esc(w)}</div>`).join('');
-  return`<div class="g g4">${kpi('Событий в месяце',evs.length,MONF[m].toLowerCase()+' '+y)}${kpi('Выплаты по портфелю',total?M(total,'rub',0):'—','купоны, погашения, амортизации, дивиденды')}
-    ${kpi('Заседаний ЦБ',evs.filter(e=>e.kind==='cbr').length,'по ключевой ставке')}${kpi('Размещений',evs.filter(e=>e.kind==='primary').length,'начало по объявлениям Мосбиржи')}</div>
+  return`${calKpis(evs,MONF[m].toLowerCase()+' '+y)}
   <div class="card" style="margin-top:16px">${nav}${chips}${warn}${grid}${S.cal.sel?`<div class="row" style="margin:10px 4px 0"><span class="mu">Показан день ${dlabel(S.cal.sel)}</span><button class="btn ghost" id="cal-all">Показать весь месяц</button></div>`:''}</div>
   <div class="card" style="margin-top:16px"><h2>События ${S.cal.sel?'за день':'месяца'}</h2>${list}</div>${help}
   <p class="note">Источники: сайт Банка России (календарь заседаний), Московская биржа (купоны, оферты, размещения), ваш портфель${(d.sources||{}).watch!=null?', список наблюдения':''}. Даты выплат, размеры будущих купонов и оферт могут измениться — сверяйтесь с решением эмитента. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
 function bindCal(){
-  const go=n=>{const d=new Date(S.cal.y,S.cal.m+n,1);S.cal.y=d.getFullYear();S.cal.m=d.getMonth();S.cal.sel=null;render()};
+  const go=n=>{if(calYear())S.cal.y+=n;else{const d=new Date(S.cal.y,S.cal.m+n,1);S.cal.y=d.getFullYear();S.cal.m=d.getMonth()}S.cal.sel=null;render()};
+  const view=(v,sel)=>{S.cal.view=v;S.cal.sel=sel||null;try{localStorage.setItem('cal_view',v)}catch(x){}render()};
   const b=(id,f)=>{const e=$(id);if(e)e.onclick=f};
   b('#cal-prev',()=>go(-1));b('#cal-next',()=>go(1));
   b('#cal-today',()=>{const n=new Date();S.cal.y=n.getFullYear();S.cal.m=n.getMonth();S.cal.sel=null;render()});
-  b('#cal-r',()=>{delete S.cal.cache[S.account+'|'+calYm()];render()});
+  b('#cal-vm',()=>view('month'));b('#cal-vy',()=>view('year'));
+  b('#cal-r',()=>{delete S.cal.cache[calKey()];render()});
+  document.querySelectorAll('.cy-t').forEach(e=>e.onclick=()=>{S.cal.m=+e.dataset.m;view('month')});
+  document.querySelectorAll('.cy-c[data-day]').forEach(e=>e.onclick=()=>{const d=e.dataset.day;S.cal.m=+d.slice(5,7)-1;view('month',d)});
   b('#cal-all',()=>{S.cal.sel=null;render()});
   document.querySelectorAll('.cal-chip').forEach(e=>e.onclick=()=>{const k=e.dataset.k;S.cal.off[k]=!S.cal.off[k];try{localStorage.setItem('cal_off',JSON.stringify(S.cal.off))}catch(x){}render()});
   document.querySelectorAll('.cal-c[data-day]').forEach(e=>e.onclick=()=>{const d=e.dataset.day;S.cal.sel=S.cal.sel===d?null:d;render()});
