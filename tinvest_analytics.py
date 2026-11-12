@@ -1334,7 +1334,7 @@ def conversions_view(events):
 
 def pos_row(info, **kw):
     info = info or {}
-    r = {"uid": info.get("uid") or kw.get("uid") or "", "ticker": info.get("ticker") or kw.get("ticker") or "",
+    r = {"uid": info.get("uid") or kw.get("uid") or "", "ticker": info.get("ticker") or kw.get("ticker") or "", "isin": info.get("isin") or "",
          "name": info.get("name") or kw.get("name") or info.get("ticker") or kw.get("ticker") or "",
          "logo": info.get("logo") or "", "color": info.get("color") or "", "sector": info.get("sector") or "",
          "type": kw.get("type") or info.get("type") or "", "qty": 0.0, "avg": 0.0, "price": 0.0, "cur": "rub",
@@ -3498,8 +3498,10 @@ def build_bonds(cfg, acc, force=False):
         return rep_
     hit = cached_result("bonds", cfg, acc, BONDS_TTL, compute, force)
     st = ratings_status()
-    if hit.get("ratings_info", {}).get("updated") != st["updated"]:
+    stamp = repr(ratings_stamp())                    # меняется и при обновлении рейтингов с сайтов агентств
+    if hit.get("ratings_stamp") != stamp:
         hit["ratings"] = apply_ratings(hit["rows"])
+        hit["ratings_stamp"] = stamp
     hit["ratings_info"] = st
     return hit
 

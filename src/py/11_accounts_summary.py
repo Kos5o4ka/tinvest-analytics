@@ -236,8 +236,10 @@ def build_bonds(cfg, acc, force=False):
         return rep_
     hit = cached_result("bonds", cfg, acc, BONDS_TTL, compute, force)
     st = ratings_status()
-    if hit.get("ratings_info", {}).get("updated") != st["updated"]:
+    stamp = repr(ratings_stamp())                    # меняется и при обновлении рейтингов с сайтов агентств
+    if hit.get("ratings_stamp") != stamp:
         hit["ratings"] = apply_ratings(hit["rows"])
+        hit["ratings_stamp"] = stamp
     hit["ratings_info"] = st
     return hit
 
