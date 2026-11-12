@@ -1,34 +1,71 @@
 /* ── Ставки: КБД и ключевая ставка ── */
 S.ratesDays=365;S.rates=null;
 const RDAYS=[[90,'3 мес'],[180,'6 мес'],[365,'Год'],[730,'2 года']];
+const RT_PRE=[1,2,3,5,10],RT_COL=['#2f6df6','#f59e0b','#8b5cf6','#e5484d','#0ea5a4','#64748b'],RT_MAX=6;
+/* выбранные сроки КБД (лет) и свои сроки; хранятся в localStorage */
+(()=>{const j=lsJson('ta_rates_terms',{}),ok=a=>Array.isArray(a)?a.map(Number).filter(t=>t>=0.25&&t<=30):[];
+  S.rTerms=[...new Set(ok(j.sel))].sort((x,y)=>x-y).slice(0,RT_MAX);if(!S.rTerms.length)S.rTerms=[2];
+  S.rCustom=[...new Set(ok(j.custom))].filter(t=>!RT_PRE.includes(t)).sort((x,y)=>x-y)})();
+const rtSave=()=>lsSet('ta_rates_terms',JSON.stringify({sel:S.rTerms,custom:S.rCustom}));
+const rtLab=t=>t<1?Math.round(t*12)+' мес':String(t).replace('.',',')+' г.';
+const rtColor=t=>RT_COL[S.rTerms.indexOf(t)%RT_COL.length];
+function rtReload(){S.rates=null;rtSave();render()}
 function loadRates(){
-  const d=S.ratesDays;
-  api('/api/rates?days='+d).then(j=>{if(d!==S.ratesDays)return;S.rates=j;if(S.page==='mkt')renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays)loadRates()},3000)})
+  const d=S.ratesDays,tm=S.rTerms.join(',');
+  api('/api/rates?days='+d+'&terms='+tm).then(j=>{if(d!==S.ratesDays||tm!==S.rTerms.join(','))return;S.rates=j;if(S.page==='mkt')renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays&&tm===S.rTerms.join(','))loadRates()},3000)})
    .catch(e=>{S.rates={error:e.message,labels:[]};if(S.page==='mkt')renderSoon()});
 }
+document.addEventListener('click',e=>{
+  const c=e.target.closest('#rterms [data-t]');
+  if(c){const t=+c.dataset.t,i=S.rTerms.indexOf(t);
+    if(i>=0){if(S.rTerms.length>1)S.rTerms.splice(i,1)}else if(S.rTerms.length<RT_MAX){S.rTerms.push(t);S.rTerms.sort((x,y)=>x-y)}else return;
+    return rtReload()}
+  const x=e.target.closest('#rterms [data-x]');
+  if(x){const t=+x.dataset.x;S.rCustom=S.rCustom.filter(v=>v!==t);const i=S.rTerms.indexOf(t);if(i>=0&&S.rTerms.length>1)S.rTerms.splice(i,1);return rtReload()}
+  if(e.target.closest('#rtadd'))rtAdd();
+});
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='rtin')rtAdd()});
+function rtAdd(){
+  const el=$('#rtin'),t=Math.round(parseFloat(String(el.value).replace(',','.'))*100)/100;
+  if(!(t>=0.25&&t<=30)){el.style.borderColor='var(--neg)';return}
+  if(!RT_PRE.includes(t)&&!S.rCustom.includes(t)){S.rCustom.push(t);S.rCustom.sort((x,y)=>x-y)}
+  if(!S.rTerms.includes(t)){if(S.rTerms.length>=RT_MAX)return;S.rTerms.push(t);S.rTerms.sort((x,y)=>x-y)}
+  rtReload();
+}
+function termChips(){
+  const all=[...RT_PRE,...S.rCustom].sort((x,y)=>x-y);
+  return`<div class="rt-bar" id="rterms">${all.map(t=>{const on=S.rTerms.includes(t),cu=S.rCustom.includes(t);
+    return`<span class="rt-chip${on?' on':''}"${on?` style="--rc:${rtColor(t)}"`:''}><button data-t="${t}">${on?'<i></i>':''}${rtLab(t)}</button>${cu?`<button class="rt-x" data-x="${t}" title="Убрать срок">×</button>`:''}</span>`}).join('')}
+    <span class="rt-add"><input id="rtin" type="number" min="0.25" max="30" step="0.5" placeholder="+ свой срок, лет"><button id="rtadd" class="btn">Добавить</button></span></div>`;
+}
 const pc1=v=>v==null?'—':(+v).toFixed(2).replace(/0$/,'').replace(/\.0$/,'').replace('.',',')+'%';
+const ppf=v=>(v>0?'+':'')+v.toFixed(2).replace('.',',')+' п.п.';
 function pMkt(){
   const r=S.rates;
   if(!r){loadRates();return`<div class="card">${waitBox('Загружаю кривую доходности и ключевую ставку…')}</div>`}
   if(r.error)return`<div class="msg err">${esc(r.error)}</div>`;
-  const n=r.labels.length,i0=n-1;
+  const n=r.labels.length,i0=n-1,tms=r.terms||S.rTerms,K=t=>(r.kbd||{})[String(t)]||[];
   const seg=`<div class="seg" id="rdays">${RDAYS.map(([d,t])=>`<button data-d="${d}" class="${d===S.ratesDays?'on':''}">${t}</button>`).join('')}</div>`;
-  if(n<2)return`<div class="card">${r.loading?waitBox('Загружаю историю КБД с Мосбиржи — первый раз это занимает до минуты…'):'<div class="empty">Нет данных. Проверьте подключение к интернету.</div>'}</div>`;
-  const lastK=r.kbd[i0],lastC=r.key[i0],first=r.kbd[0];
+  if(n<2)return`<div class="card">${termChips()}${r.loading?waitBox('Загружаю историю КБД с Мосбиржи — первый раз это занимает до минуты…'):'<div class="empty">Нет данных. Проверьте подключение к интернету.</div>'}</div>`;
+  const bt=tms.includes(2)?2:tms[0],bk=K(bt),lastK=bk[i0],lastC=r.key[i0],firstI=bk.findIndex(v=>v!=null),first=bk[firstI];
+  const hasSl=tms.includes(1)&&tms.includes(10)&&K(10)[i0]!=null&&K(1)[i0]!=null,sl=hasSl?K(10)[i0]-K(1)[i0]:null;
   chart('c-rates',line,{h:360,zero:false,labels:r.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc1(v),
-    series:[{n:'КБД · 2 года',c:'#2f6df6',hex:'#2f6df6',v:r.kbd,w:2.2},{n:'Ключевая ставка',c:'#3f7a4f',hex:'#3f7a4f',v:r.key,w:2.4,step:true}],
+    series:[{n:'Ключевая ставка',c:'#3f7a4f',hex:'#3f7a4f',v:r.key,w:2.4,step:true},...tms.map(t=>({n:'КБД · '+rtLab(t),c:rtColor(t),hex:rtColor(t),v:K(t),w:2.2}))],
     hover:i=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i)},leave:()=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i0)}});
-  return`<div class="g g4">${kpi('КБД · 2 года',pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,'#2f6df6')}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'#3f7a4f')}
-    ${kpi('КБД − ключевая',lastC!=null?((lastK-lastC>0?'+':'')+(lastK-lastC).toFixed(2).replace('.',',')+' п.п.'):'—','рынок закладывает '+(lastK>lastC?'повышение / удержание':'снижение')+' ставки',lastK>lastC?'neg':'pos')}
-    ${kpi('КБД за период',((lastK-first>0?'+':'')+(lastK-first).toFixed(2).replace('.',',')+' п.п.'),'с '+r.labels[0],lastK-first>0?'neg':'pos')}</div>
-  <div class="card rates"><h2>Доходность КБД (2 года) и ключевая ставка<span class="sp">${seg}</span></h2>
-    <p class="note rx-lead">Синяя линия — доходность 2-летних гособлигаций (КБД), зелёная — ключевая ставка. Если синяя выше зелёной — рынок ждёт, что ставка останется высокой; ниже — ждёт её снижения.</p>
+  const dk=lastK!=null&&lastC!=null?lastK-lastC:null;
+  return`<div class="g g4">${kpi('КБД · '+rtLab(bt),pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,rtColor(bt))}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'#3f7a4f')}
+    ${kpi('КБД '+rtLab(bt)+' − ключевая',dk!=null?ppf(dk):'—',dk==null?'':'рынок закладывает '+(dk>0?'повышение / удержание':'снижение')+' ставки',dk==null?null:dk>0?'neg':'pos')}
+    ${hasSl?kpi('Наклон: 10 лет − 1 год',ppf(sl),sl<0?'кривая инвертирована':'длинные ставки выше коротких',sl<0?'pos':null):
+      kpi('КБД '+rtLab(bt)+' за период',lastK!=null&&first!=null?ppf(lastK-first):'—','с '+r.labels[Math.max(0,firstI)],lastK!=null&&first!=null?(lastK-first>0?'neg':'pos'):null)}</div>
+  <div class="card rates"><h2>Доходность КБД и ключевая ставка<span class="sp">${seg}</span></h2>
+    <p class="note rx-lead">Линии КБД — доходность гособлигаций выбранных сроков, зелёная — ключевая ставка. Если линия КБД выше зелёной — рынок ждёт, что ставка останется высокой; ниже — ждёт её снижения. Сроки между точками кривой считаются линейной интерполяцией.</p>
+    ${termChips()}
     <div class="axt">Ставка, % годовых</div><div id="c-rates" class="chart"></div><div class="axt" style="text-align:center">Дата</div>
     <div class="strip" id="rstrip">${stripHtml(r,i0)}</div>${r.loading?'<p class="note">Догружаю историю…</p>':''}</div>
   ${ratesXHtml()}
-  <p class="note">КБД — кривая бескупонной доходности ОФЗ Московской биржи (срок 2 года), ключевая ставка — Банка России. Данные берутся с сайтов Мосбиржи и ЦБ при открытой программе и сохраняются локально. Справочная информация, не инвестиционная рекомендация.</p>`;
+  <p class="note">КБД — кривая бескупонной доходности ОФЗ Московской биржи (выбранные сроки), ключевая ставка — Банка России. Данные берутся с сайтов Мосбиржи и ЦБ при открытой программе и сохраняются локально. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
-function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КБД · 2 года: <b>${pc1(r.kbd[i])}</b></span><span>КС: <b>${pc1(r.key[i])}</b></span>`}
+function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КС: <b>${pc1(r.key[i])}</b></span>`+(r.terms||[]).map(t=>`<span>КБД · ${rtLab(t)}: <b>${pc1(((r.kbd||{})[String(t)]||[])[i])}</b></span>`).join('')}
 
 
 /* ── Кривая КБД: сегодня против прошлых дат; история спредов к КБД по рейтингам ── */
@@ -99,4 +136,10 @@ function curveCard(cv,its){
 .rx-tb{width:100%;margin-top:12px}.rx-tb td:first-child{text-align:left}.rx-tb td.pos{color:var(--pos)}.rx-tb td.neg{color:var(--neg)}
 .rx-sum b.pos,#tip span.pos{color:var(--pos)}.rx-sum b.neg,#tip span.neg{color:var(--neg)}
 .rx-lead{margin:2px 0 10px}
+.rt-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:4px 0 12px}
+.rt-chip{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;background:var(--card)}
+.rt-chip button{all:unset;cursor:pointer;padding:5px 12px;font-size:13px;color:var(--tx2);display:inline-flex;align-items:center;gap:6px}
+.rt-chip.on{border-color:var(--rc)}.rt-chip.on button{color:var(--tx)}.rt-chip i{width:9px;height:9px;border-radius:50%;background:var(--rc)}
+.rt-chip .rt-x{padding:5px 9px 5px 0;color:var(--mu)}.rt-chip .rt-x:hover{color:var(--neg)}
+.rt-add{display:inline-flex;gap:6px;margin-left:auto}.rt-add input{width:150px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--tx);padding:5px 8px;font-size:13px}
 `;document.head.appendChild(st)})();

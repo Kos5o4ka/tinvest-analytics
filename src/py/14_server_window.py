@@ -117,7 +117,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/ladder":
                 return self.send(200, ladder_payload(cfg, q))
             if u.path == "/api/rates":
-                return self.send(200, rates_payload(q.get("days", "365")))
+                return self.send(200, rates_payload(q.get("days", "365"), q.get("terms", "2")))
             if u.path == "/api/backup":
                 return self.send(200, make_backup(), "application/zip",
                                  {"Content-Disposition": 'attachment; filename="tinvest_backup_%s.zip"' % date.today().isoformat()})
