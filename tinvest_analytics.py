@@ -2159,6 +2159,40 @@ def _rexp(x):
     return 2.718281828459045 ** x
 
 
+def risk_pd_market(spread, R, T):
+    """Рыночная вероятность дефолта из кредитного спреда к КБД (spread, п.п.) и доли возврата R (доля): интенсивность
+    λ = s / (1 − R), PD(t) = 1 − e^(−λ·t). Возвращает (λ, PD за min(1, T) лет, PD до погашения T) или (None, None, None).
+    Отрицательный спред считается нулём."""
+    if spread is None or not T or R >= 1:
+        return None, None, None
+    lam = max(spread, 0.0) / 100.0 / (1 - R)
+    return lam, 1 - _rexp(-lam * min(1.0, T)), 1 - _rexp(-lam * T)
+
+
+def risk_pd_scale(p1, T):
+    """Годовую PD p1 (доля) приводит к горизонту min(1, T) лет: бумага, гасящаяся через 3 месяца, не может дефолтнуть позже."""
+    if p1 is None or not T or T >= 1:
+        return p1
+    return 1 - (1 - p1) ** T
+
+
+def risk_pd_explain(rows, R):
+    """Числа для блока «Как считается риск рынка»: средневзвешенный спред, λ и PD портфеля + пример самой крупной позиции со спредом."""
+    sel = [x for x in rows if x.get("spread") is not None and x.get("pd_mkt_1y") is not None and x["value_rub"] > 0]
+    out = {"recovery": R * 100.0, "count": len(sel), "total": len(rows), "no_spread": len(rows) - len(sel)}
+    if not sel:
+        return out
+    w = sum(x["value_rub"] for x in sel)
+    sp = sum(max(x["spread"], 0.0) * x["value_rub"] for x in sel) / w
+    out.update(spread=sp, lam=sp / 100.0 / (1 - R) * 100.0, pd=sum(x["pd_mkt_1y"] * x["value_rub"] for x in sel) / w * 100.0,
+               share=w / (sum(x["value_rub"] for x in rows) or 1.0) * 100.0)
+    ex = max(sel, key=lambda x: x["value_rub"])
+    out["example"] = {"name": ex["name"], "spread": ex["spread"], "ytm": ex["ytm"], "kbd": ex["ytm"] - ex["spread"], "dur": ex.get("dur"),
+                      "years": ex["years"], "lam": max(ex["spread"], 0.0) / 100.0 / (1 - R) * 100.0, "pd1": ex["pd_mkt_1y"] * 100.0,
+                      "pdT": ex["pd_mkt_T"] * 100.0 if ex.get("pd_mkt_T") is not None else None, "floating": ex["floating"]}
+    return out
+
+
 def risk_beta(t):
     (t0, b0), (t1, b1) = RISK_BETA
     if t is None or t <= t0:
@@ -2335,12 +2369,11 @@ def build_risk(cfg, acc, q=None):
         end = r.get("end") or r.get("maturity") or ""
         T = max((datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days / 365.0, 0.02) if end else None
         sp = r.get("spread")
-        lam = max(sp, 0.0) / 100.0 / (1 - R) if sp is not None else None
-        pd1 = 1 - _rexp(-lam * min(1.0, T)) if lam is not None and T else None
-        pdT = 1 - _rexp(-lam * T) if lam is not None and T else None
+        lam, pd1, pdT = risk_pd_market(sp, R, T)
         rt = (r.get("rating") or {}).get("v")
         ph = RISK_PD_HIST.get(rt) / 100.0 if rt in RISK_PD_HIST else None
-        ratio = pd1 / ph if pd1 is not None and ph else None
+        ph_h = risk_pd_scale(ph, T)          # рейтинговая PD на тот же горизонт, что и рыночная (для бумаг короче года)
+        ratio = pd1 / ph_h if pd1 is not None and ph_h else None
         basis_pd = ph if ph is not None else pd1            # без рейтинга — берём рыночную оценку
         el_pct = (basis_pd or 0.0) * (1 - R) * 100.0
         row = {"isin": isin, "name": r["name"], "ticker": r.get("ticker"), "uid": r.get("uid"), "value_rub": v,
@@ -2432,6 +2465,7 @@ def build_risk(cfg, acc, q=None):
         casino.append({"k": k, "issuers": [{"name": g["name"], "value": g["value"], "pd": g["pd"]} for g in pick],
                        "result_rub": res, "result_pct": res / tot * 100.0, "lost_rub": sum(g["value"] * (1 - R) for g in pick)})
     out["casino"] = casino
+    out["pd_explain"] = risk_pd_explain(rows, R)
     out["base_rub"] = base
     out["goal_years"] = goal
     # дюрационный разрыв: дюрация портфеля облигаций (взвешена по стоимости) против горизонта цели
@@ -7625,6 +7659,7 @@ BENCH_CATALOG = [
 ]
 BENCH_RF = {"code": "RUSFAR", "kind": "index", "group": "Ставка денежного рынка", "name": "Ставка RUSFAR (накопленная)",
             "note": "Ставка однодневного межбанковского кредита. Накопленная — как если бы деньги каждый день размещались под эту ставку."}
+BENCH_PERIODS = ("1m", "3m", "6m", "12m", "3y", "ytd", "py", "all")      # сроки сравнения (на странице свой выбор срока)
 BENCH_TTL = 6 * 3600
 BENCH_FROM_MIN = "2019-01-01"
 _bench_locks, _bench_locks_lock, _bench_fail = {}, threading.Lock(), {}
@@ -7830,8 +7865,12 @@ def _bn_window(days, period):
         s = (today - timedelta(days=30)).isoformat()
     elif period == "3m":
         s = (today - timedelta(days=91)).isoformat()
+    elif period == "6m":
+        s = (today - timedelta(days=182)).isoformat()
     elif period == "12m":
         s = (today - timedelta(days=365)).isoformat()
+    elif period == "3y":
+        s = (today - timedelta(days=1096)).isoformat()
     elif period == "ytd":
         s = "%d-01-01" % today.year
     elif period == "py":
@@ -7903,7 +7942,7 @@ def bench_premium(cfg, acc):
 def bench_payload(cfg, acc, q=None):
     q = q or {}
     period = q.get("period") or "all"
-    if period not in ("1m", "3m", "ytd", "12m", "py", "all"):
+    if period not in BENCH_PERIODS:
         period = "all"
     want = {c for c in (q.get("codes") or "").replace(";", ",").split(",") if c}
     key = ("bench", token_key(cfg), acc, period, tuple(sorted(want)))
@@ -14024,6 +14063,7 @@ tr.scr-low td{opacity:.5}
 #rk-tab tbody tr{cursor:pointer}
 #rk-tab td small.neg{color:var(--neg);font-size:11px;line-height:1.3;display:inline-block;max-width:190px;white-space:normal}
 .rk-dur p{margin:0 0 8px}.rk-dur b{color:var(--tx2)}
+.rk-how{margin-bottom:16px;font-size:13px;color:var(--tx2)}.rk-how summary{cursor:pointer;font-weight:600;color:var(--tx)}.rk-how p{margin:10px 0 0;line-height:1.5}.rk-how b{color:var(--tx)}
 /* ── Сигналы ── */
 .sg-t th,.sg-t td{white-space:nowrap}
 .sg-t tbody tr[data-isin]{cursor:pointer}
@@ -14082,6 +14122,7 @@ tr.scr-low td{opacity:.5}
 .bn-pr span{display:grid;gap:2px}.bn-pr small{font-size:11.5px}.bn-pr b{font-size:16px;white-space:nowrap}
 .bn-expl p{margin:0 0 10px}.bn-expl p:last-child{margin:0}
 @media(max-width:760px){.bn-gl{min-width:100%}.bn-chips button{padding:4px 10px}}
+.bn-per{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 14px}.bn-per .seg{flex-wrap:wrap}
 /* ── Калькулятор инвестиций ── */
 .cl-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px 16px;align-items:end;margin-bottom:6px}
 .cl-grid>*{min-width:0}.cl-grid .sw{align-self:center}
@@ -16865,6 +16906,19 @@ function rkDurBlock(d){
   return`<div class="card"><h2>Срок цели и реальная доходность<span class="sp">дюрационный разрыв, инфляция</span></h2>${kp}<div class="note rk-dur" style="margin-top:10px">${tx}${rt}
     <p>Справочная оценка по упрощённой модели, не инвестиционная рекомендация. Доходность выпусков с аномально высокой ставкой завышает общий показатель.</p></div></div>`;
 }
+/* «Как считается риск рынка»: формула и числа этого портфеля (d.pd_explain) */
+function rkHow(d){
+  const x=d.pd_explain,R=d.recovery;if(!x||!x.count)return'';
+  const n1=v=>v.toFixed(1).replace('.',','),n2=v=>v.toFixed(2).replace('.',','),e=x.example;
+  const exT=e.pdT!=null&&e.years>1?`; до погашения (${n1(e.years)} г.) — ${n1(e.pdT)} %`:'';
+  return`<details class="rk-how card"><summary>Как считается «риск рынка» (вероятность дефолта по рынку)</summary>
+   <p>Рынок «закладывает» риск дефолта в цену: облигация эмитента с риском даёт доходность выше безрискового ориентира. Эта надбавка — <b>кредитный спред</b>: доходность бумаги минус КБД (кривая безрисковой доходности ОФЗ) на сроке, равном дюрации выпуска.</p>
+   <p><b>Формула.</b> Ожидаемая потеря в год ≈ вероятность дефолта × (1 − доля возврата). Спред как раз и платит за эту потерю, поэтому:<br>
+   <b>PD в год ≈ спред / (1 − доля возврата)</b>, точнее — 1 − e<sup>−спред·t / (1 − R)</sup> (для 1 года; «до погашения» — то же на оставшийся срок). Отрицательный спред считается нулём.</p>
+   <p><b>Ваши числа.</b> Доля возврата при дефолте R = ${R.toFixed(0)} % (задаётся в параметрах выше). Средний спред вашего портфеля (взвешен по стоимости, ${x.count} из ${x.total} выпусков, ${x.share.toFixed(0)} % стоимости) — ${n2(x.spread)} п.п. → PD в среднем ≈ ${n2(x.spread)} / (1 − ${R.toFixed(0)} %) ≈ <b>${n1(x.lam)} % в год</b>; средняя PD по портфелю (с учётом срока выпусков) — ${n1(x.pd)} %.</p>
+   <p><b>Пример: ${esc(e.name)}.</b> Доходность ${n1(e.ytm)} % − КБД ${n1(e.kbd)} % (дюрация ${e.dur!=null?n1(e.dur)+' г.':'—'}) = спред ${n2(e.spread)} п.п. → ${n2(e.spread)} / (1 − ${R.toFixed(0)} %) ≈ ${n1(e.lam)} % → PD за год ${n1(e.pd1)} %${exT}.${e.floating?' У флоатера доходность и дюрация приближённые, спред менее точен.':''}</p>
+   <p><b>Как читать.</b> «PD рынка» — не прогноз дефолта, а цена риска: в спред входят также плата за низкую ликвидность и неопределённость, поэтому PD рынка обычно выше PD по рейтингу (колонка «Рынок / рейтинг»). Чем больше разница, тем сильнее рынок сомневается в эмитенте. ${x.no_spread?x.no_spread+' выпусков без спреда (нет данных для КБД) в расчёт не вошли.':''}</p></details>`;
+}
 function pRisk(){
   if(S.risk&&S.riskAcc!==S.account)S.risk=null;
   if(!S.risk){loadRisk();return`<div class="card">${waitBox('Считаю вероятности дефолта и сценарии ставки (потоки по каждому выпуску)…')}</div>`}
@@ -16905,12 +16959,12 @@ function pRisk(){
       <td class="num">${r.ratio!=null?(r.ratio>=10?Math.round(r.ratio):f2(r.ratio))+' ×':'—'}${flag}</td>
       <td class="num ${r.ey_hist<0?'neg':''}">${pctp(r.ey_hist,1)}${r.hist_basis==='market'?' <small class="mu" title="Нет рейтинга: использована рыночная вероятность дефолта">*</small>':''}</td><td class="num" title="${r.be_approx!=null?'Грубая оценка доходность / модифицированная дюрация сегодня: '+f2(r.be_approx)+' п.п. Точный расчёт учитывает, что через год дюрация короче.':''}">${be}</td></tr>`}).join('');
   chart('rk-scn',rkScnChart);
-  return ctl+kp+rkDurBlock(d)+`<div class="card"><h2>Сценарии ключевой ставки<span class="sp">доход за 12 месяцев (до ${hd}), без реинвестирования купонов</span></h2><div class="chart" id="rk-scn"></div>${scT}
+  return ctl+kp+rkHow(d)+rkDurBlock(d)+`<div class="card"><h2>Сценарии ключевой ставки<span class="sp">доход за 12 месяцев (до ${hd}), без реинвестирования купонов</span></h2><div class="chart" id="rk-scn"></div>${scT}
     <p class="note" style="margin-top:10px">Сдвиг кривой доходности = Δ ключевой ставки × β: β = 1,0 для срока до 1 года и линейно снижается до 0,5 на сроке 7 лет и дольше (длинные ставки реагируют слабее). Кредитные спреды не меняются. Выпуск переоценивается через 12 месяцев: оставшиеся потоки дисконтируются по текущей доходности со сдвигом на дюрации остатка. Купоны флоатеров следуют траектории ставки сценария плюс спред эмитента; ставка идёт линейно к целевой за 12 месяцев. Сценарий «Рынок» доступен, если получен рыночный путь ставки.</p></div>
   <div class="g c-2-1 rk-g"><div class="card"><h2>Флоатеры против фиксированного купона<span class="sp">доходность подпортфелей за 12 месяцев</span></h2>${fT}<p class="note" style="margin-top:10px">${esc(rkFloatText(d))}</p></div>
   <div class="card"><h2>Стресс-тест дефолтов: если эмитенты не вернут долг</h2>${cs}<p class="note" style="margin-top:10px">Дефолтят самые рискованные эмитенты по рыночной вероятности. Потеря = (1 − возврат ${d.recovery.toFixed(0)} %) × стоимость позиций эмитента; купоны по ним за год не учитываются. База — сценарий «ставка без изменений» (${rkRub(d.base_rub)}).</p></div></div>
   <div class="card"><h2>Выпуски: риск дефолта и запас прочности<span class="sp">нажмите на строку — карточка выпуска; заголовок — сортировка</span></h2><div class="tbl rk-tbl"><table id="rk-tab"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div>
-    <p class="note" style="margin-top:10px">PD рынка: из спреда к КБД s и доли возврата R: λ = s / (1 − R), PD(T) = 1 − e<sup>−λT</sup>. Ожидаемая доходность = доходность − PD по рейтингу (1 год) × (1 − R). Без рейтинга (*) берётся рыночная PD. Запас — на сколько п.п. должна вырасти доходность, чтобы убрать результат года (купоны + переоценка) в ноль; для коротких и плавающих бумаг запас велик.</p></div>
+    <p class="note" style="margin-top:10px">PD рынка: из спреда к КБД s и доли возврата R: λ = s / (1 − R), PD(T) = 1 − e<sup>−λT</sup> (подробнее и с вашими числами — в блоке «Как считается риск рынка» выше). «Рынок / рейтинг» сравнивает PD на одном горизонте: для бумаг короче года рейтинговая PD пересчитана на их срок. Ожидаемая доходность = доходность − PD по рейтингу (1 год) × (1 − R). Без рейтинга (*) берётся рыночная PD. Запас — на сколько п.п. должна вырасти доходность, чтобы убрать результат года (купоны + переоценка) в ноль; для коротких и плавающих бумаг запас велик.</p></div>
   <div class="card"><h2>Допущения и источники</h2><p class="note">${esc(d.sources.pd)}<br><br>${esc(d.sources.recovery)}<br><br>Таблица PD по рейтингу, % за год: ${Object.entries(d.pd_hist_table).map(([k,v])=>k+' '+String(v).replace('.',',')).join(' · ')}.
     <br><br>Оценки по упрощённой модели, справочная информация, не инвестиционная рекомендация. Рыночная PD включает премию за ликвидность и риск, поэтому её завышенное значение не всегда означает близкий дефолт.</p></div>`;
 }
@@ -17116,10 +17170,17 @@ const BN_LC={d1:'#19a070',d5:'#e3a21a',dm:'#e66767',na:'#8a90a0'};
 const bnRub=v=>bad(v)?'—':(v>0?'+':v<0?'−':'')+NF0.format(Math.abs(v))+' ₽';
 const bnPct=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' %';
 const bnPp=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' п.п.';
-function bnKey(){return S.account+'|'+S.period}
+/* срок сравнения выбирается на самой странице; при смене общего периода в шапке возвращаемся к нему */
+const BN_PER=[['1m','1 мес'],['3m','3 мес'],['6m','6 мес'],['12m','1 год'],['3y','3 года'],['ytd','С начала года'],['py','Прошлый год'],['all','Всё время']];
+function bnPer(){if(S.bnPg!==S.period){S.bnP=null;S.bnPg=S.period}return S.bnP&&BN_PER.some(x=>x[0]===S.bnP)?S.bnP:S.period}
+const bnPerName=()=>(BN_PER.find(x=>x[0]===bnPer())||['','за период'])[1].toLowerCase();
+const bnPerLbl=()=>{const k=bnPer();return k==='ytd'||k==='py'||k==='all'?bnPerName():'за '+bnPerName()};
+function bnPerSeg(){return`<div class="bn-per noprint"><span class="bn-gl">Срок сравнения</span><div class="seg" id="bn-per">${BN_PER.map(([k,t])=>`<button type="button" class="${k===bnPer()?'on':''}" data-p="${k}">${t}</button>`).join('')}</div></div>`}
+function bnSpan(a,b){const dd=(new Date(b)-new Date(a))/864e5;if(dd<75)return Math.round(dd)+' дн.';if(dd<700)return Math.round(dd/30.4)+' мес';return(dd/365.25).toFixed(1).replace('.',',')+' г.'}
+function bnKey(){return S.account+'|'+bnPer()}
 function bnLoadData(){
   const key=bnKey();if(S.bnLoad===key)return;S.bnLoad=key;
-  const p=new URLSearchParams({account:S.account,period:S.period});
+  const p=new URLSearchParams({account:S.account,period:bnPer()});
   api('/api/bench?'+p).then(j=>{if(S.bnLoad===key)S.bnLoad=null;S.bn[key]={d:j,t:Date.now()};if(S.page==='bench'&&bnKey()===key)renderSoon()})
    .catch(e=>{if(S.bnLoad===key)S.bnLoad=null;S.bn[key]={d:{error:e.message},t:Date.now(),fail:1};if(S.page==='bench'&&bnKey()===key)renderSoon()});
 }
@@ -17150,6 +17211,7 @@ function bnTable(d){
   const row=(b,isP)=>{
     const sm=b.same;
     return`<tr${isP?' class="bn-me"':''}><td class="l">${isP?'<b>Мой портфель</b>':`<b>${esc(b.name)}</b>${b.partial?`<br><small class="mu">данные с ${ddm(b.start)}</small>`:''}`}</td>
+      <td class="num mu">${bnSpan(isP?d.start:b.start,d.end)}</td>
       <td class="num ${isP?cls(b.ret):bnCmp(b.ret,p.ret,true)}">${bnPct(b.ret)}</td>
       <td class="num ${isP?'':bnCmp(b.ann,p.ann,true)}">${b.ann==null?'<span class="mu">—</span>':bnPct(b.ann)}</td>
       <td class="num ${isP?'':bnCmp(b.vol,p.vol,false)}">${f1(b.vol,' %')}</td>
@@ -17160,8 +17222,8 @@ function bnTable(d){
       <td class="num ${isP?'':sm?cls(sm.diff):''}">${isP?'—':sm?bnRub(sm.diff):'—'}</td></tr>`};
   const by={};d.bench.filter(b=>b.available).forEach(b=>{(by[b.group]=by[b.group]||[]).push(b)});
   let h=row(p,true);
-  d.groups.filter(g=>by[g]).forEach(g=>{h+=`<tr class="bn-gr"><td class="l" colspan="10">${esc(g)}</td></tr>`+by[g].map(b=>row(b,false)).join('')});
-  return`<div class="tbl"><table class="bn-t"><thead><tr><th class="l">Что сравниваем</th><th>Доходность за период</th><th>В пересчёте на год</th><th>Колебания цены за год</th><th>Макс. просадка</th><th>Шарп</th><th>Бета к портфелю</th><th>Корреляция</th><th>Было бы с теми же деньгами</th><th>Вы заработали больше (меньше)</th></tr></thead><tbody>${h}</tbody></table></div>`;
+  d.groups.filter(g=>by[g]).forEach(g=>{h+=`<tr class="bn-gr"><td class="l" colspan="11">${esc(g)}</td></tr>`+by[g].map(b=>row(b,false)).join('')});
+  return`<div class="tbl"><table class="bn-t"><thead><tr><th class="l">Что сравниваем</th><th>Срок</th><th>Доходность ${bnPerLbl()}</th><th>В пересчёте на год</th><th>Колебания цены за год</th><th>Макс. просадка</th><th>Шарп</th><th>Бета к портфелю</th><th>Корреляция</th><th>Было бы с теми же деньгами</th><th>Вы заработали больше (меньше)</th></tr></thead><tbody>${h}</tbody></table></div>`;
 }
 function bnLiquidity(d){
   const l=d.liquidity;
@@ -17197,26 +17259,26 @@ function bnPremium(d){
 }
 function pBench(){
   const e=bnCur();
-  if(!e){bnLoadData();return`<div class="card">${waitBox('Сравниваю портфель с индексами и фондами Мосбиржи. Первый раз это может занять несколько минут (загружается история цен и оценивается ликвидность), потом данные берутся из локального кэша…')}</div>`}
+  if(!e){bnLoadData();return`<div class="card">${bnPerSeg()}${waitBox('Сравниваю портфель с индексами и фондами Мосбиржи. Первый раз это может занять несколько минут (загружается история цен и оценивается ликвидность), потом данные берутся из локального кэша…')}</div>`}
   const d=e.d;
-  if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="bn-retry">Повторить</button></div>`;
+  if(d.error)return bnPerSeg()+`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="bn-retry">Повторить</button></div>`;
   const p=d.portfolio,B=c=>d.bench.find(b=>b.code===c&&b.available),lq=B('LQDT'),cb=B('RUCBTRNS');
   const l=d.liquidity,fast=l&&l.bonds_count?(l.buckets.find(b=>b.key==='d1')||{}).share:null;
   const pr=d.premium,prem=pr&&pr.lqdt!=null?(pr.prem_ytm_ex!=null?pr.prem_ytm_ex:pr.prem_ytm):null;
   const sm=lq&&lq.same;
   chart('bn-chart',bnChart);
   const kp=`<div class="g g6">
-    ${kpi('Ваша доходность',bnPct(p.ret,2),`LQDT: ${lq?bnPct(lq.ret,1):'—'} · корп. облигации: ${cb?bnPct(cb.ret,1):'—'}`,cls(p.ret),S1)}
+    ${kpi('Ваша доходность '+bnPerLbl(),bnPct(p.ret,2),`LQDT: ${lq?bnPct(lq.ret,1):'—'} · корп. облигации: ${cb?bnPct(cb.ret,1):'—'}`,cls(p.ret),S1)}
     ${kpi('Те же деньги в LQDT',sm?bnRub(sm.diff):'—',sm?(sm.diff>=0?'вы заработали больше, чем дал бы фонд ликвидности':'фонд ликвидности дал бы больше, чем вы заработали'):'нет данных по LQDT',sm?cls(sm.diff):'',S3)}
     ${kpi('Доходность в годовых (XIRR)',p.xirr==null?'—':bnPct(p.xirr,1),p.xirr==null?'период короче 3 месяцев':`LQDT с теми же вложениями: ${sm&&sm.xirr!=null?bnPct(sm.xirr,1):'—'}`,cls(p.xirr),S7)}
     ${kpi('Коэффициент Шарпа',bad(p.sharpe)?'—':f2(p.sharpe),'доходность сверх безрисковой ставки на единицу риска',p.sharpe>0?'pos':p.sharpe<0?'neg':'',S2)}
     ${kpi('Продаётся за 1 день',fast==null?'—':pctp(fast,0),'доля облигаций, которую можно продать за день',fast!=null&&fast<70?'neg':'',S5)}
     ${kpi('Премия к LQDT',prem==null?'—':bnPp(prem),pr&&pr.lqdt!=null?`LQDT даёт ≈ ${pctp(pr.lqdt,1)} годовых`:'доходность LQDT недоступна',prem==null?'':cls(prem),S4)}</div>`;
   const notes=(d.notes||[]).length?`<div class="msg info" style="margin:0 0 12px">${d.notes.map(esc).join('<br>')}</div>`:'';
-  return kp+notes+`<div class="card"><h2>Накопленная доходность<span class="sp">${periodName()}: ${ddm(d.start)} — ${ddm(d.end)}</span></h2>
+  return bnPerSeg()+kp+notes+`<div class="card"><h2>Накопленная доходность ${bnPerLbl()}<span class="sp">${ddm(d.start)} — ${ddm(d.end)}</span></h2>
     <div class="bn-sel" id="bn-sel">${bnChips(d)}</div><div id="bn-chart" class="chart"></div>
     <p class="note" style="margin-top:8px">Показано, на сколько процентов выросли вложения с начала периода. Линия портфеля — по методу TWR: пополнения и выводы не искажают результат.</p></div>
-  <div class="card"><h2>Сравнение по показателям<span class="sp">красным выделено то, в чём бенчмарк лучше вашего портфеля, зелёным — где хуже</span></h2>${bnTable(d)}
+  <div class="card"><h2>Сравнение по показателям ${bnPerLbl()}<span class="sp">красным выделено то, в чём бенчмарк лучше вашего портфеля, зелёным — где хуже</span></h2>${bnTable(d)}
     <p class="note" style="margin-top:10px">«Колебания цены» — насколько сильно портфель «качается» (годовое стандартное отклонение дневных изменений по торговым дням Мосбиржи). «Макс. просадка» — самое большое падение от пика до дна. «Шарп» — доходность сверх ставки RUSFAR (безрисковая ставка межбанка) на единицу колебаний; для фондов ликвидности он малоинформативен, потому что колебаний почти нет, а для периода короче нескольких месяцев — шумный. «Бета» показывает, на сколько процентов в среднем меняется ваш портфель при изменении бенчмарка на 1 %, «корреляция» — насколько они движутся вместе (от −1 до 1). «Было бы с теми же деньгами» — во что превратились бы стоимость портфеля на начало периода и все ваши пополнения и выводы, если бы в те же дни их вложили в этот бенчмарк.</p></div>
   <div class="g g2 bn-g">${bnLiquidity(d)}${bnPremium(d)}</div>
   <div class="card"><h2>Как читать этот раздел</h2><div class="note bn-expl">
@@ -17227,6 +17289,8 @@ function pBench(){
 }
 function bindBench(){
   const r=$('#bn-retry');if(r)r.onclick=()=>{delete S.bn[bnKey()];S.bnLoad=null;render()};
+  const per=$('#bn-per');
+  if(per)per.onclick=e=>{const b=e.target.closest('button[data-p]');if(!b||b.dataset.p===bnPer())return;S.bnP=b.dataset.p;S.bnPg=S.period;render()};
   const sel=$('#bn-sel');
   if(sel)sel.onclick=e=>{const b=e.target.closest('button[data-c]');if(!b||b.disabled)return;const c=b.dataset.c;
     if(S.bnSel.has(c))S.bnSel.delete(c);else S.bnSel.add(c);b.classList.toggle('on',S.bnSel.has(c));const el=$('#bn-chart');if(el)bnChart(el)};

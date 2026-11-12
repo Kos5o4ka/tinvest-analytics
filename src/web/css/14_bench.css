@@ -17,3 +17,4 @@
 .bn-pr span{display:grid;gap:2px}.bn-pr small{font-size:11.5px}.bn-pr b{font-size:16px;white-space:nowrap}
 .bn-expl p{margin:0 0 10px}.bn-expl p:last-child{margin:0}
 @media(max-width:760px){.bn-gl{min-width:100%}.bn-chips button{padding:4px 10px}}
+.bn-per{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 14px}.bn-per .seg{flex-wrap:wrap}

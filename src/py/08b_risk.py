@@ -23,6 +23,40 @@ def _rexp(x):
     return 2.718281828459045 ** x
 
 
+def risk_pd_market(spread, R, T):
+    """Рыночная вероятность дефолта из кредитного спреда к КБД (spread, п.п.) и доли возврата R (доля): интенсивность
+    λ = s / (1 − R), PD(t) = 1 − e^(−λ·t). Возвращает (λ, PD за min(1, T) лет, PD до погашения T) или (None, None, None).
+    Отрицательный спред считается нулём."""
+    if spread is None or not T or R >= 1:
+        return None, None, None
+    lam = max(spread, 0.0) / 100.0 / (1 - R)
+    return lam, 1 - _rexp(-lam * min(1.0, T)), 1 - _rexp(-lam * T)
+
+
+def risk_pd_scale(p1, T):
+    """Годовую PD p1 (доля) приводит к горизонту min(1, T) лет: бумага, гасящаяся через 3 месяца, не может дефолтнуть позже."""
+    if p1 is None or not T or T >= 1:
+        return p1
+    return 1 - (1 - p1) ** T
+
+
+def risk_pd_explain(rows, R):
+    """Числа для блока «Как считается риск рынка»: средневзвешенный спред, λ и PD портфеля + пример самой крупной позиции со спредом."""
+    sel = [x for x in rows if x.get("spread") is not None and x.get("pd_mkt_1y") is not None and x["value_rub"] > 0]
+    out = {"recovery": R * 100.0, "count": len(sel), "total": len(rows), "no_spread": len(rows) - len(sel)}
+    if not sel:
+        return out
+    w = sum(x["value_rub"] for x in sel)
+    sp = sum(max(x["spread"], 0.0) * x["value_rub"] for x in sel) / w
+    out.update(spread=sp, lam=sp / 100.0 / (1 - R) * 100.0, pd=sum(x["pd_mkt_1y"] * x["value_rub"] for x in sel) / w * 100.0,
+               share=w / (sum(x["value_rub"] for x in rows) or 1.0) * 100.0)
+    ex = max(sel, key=lambda x: x["value_rub"])
+    out["example"] = {"name": ex["name"], "spread": ex["spread"], "ytm": ex["ytm"], "kbd": ex["ytm"] - ex["spread"], "dur": ex.get("dur"),
+                      "years": ex["years"], "lam": max(ex["spread"], 0.0) / 100.0 / (1 - R) * 100.0, "pd1": ex["pd_mkt_1y"] * 100.0,
+                      "pdT": ex["pd_mkt_T"] * 100.0 if ex.get("pd_mkt_T") is not None else None, "floating": ex["floating"]}
+    return out
+
+
 def risk_beta(t):
     (t0, b0), (t1, b1) = RISK_BETA
     if t is None or t <= t0:
@@ -199,12 +233,11 @@ def build_risk(cfg, acc, q=None):
         end = r.get("end") or r.get("maturity") or ""
         T = max((datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days / 365.0, 0.02) if end else None
         sp = r.get("spread")
-        lam = max(sp, 0.0) / 100.0 / (1 - R) if sp is not None else None
-        pd1 = 1 - _rexp(-lam * min(1.0, T)) if lam is not None and T else None
-        pdT = 1 - _rexp(-lam * T) if lam is not None and T else None
+        lam, pd1, pdT = risk_pd_market(sp, R, T)
         rt = (r.get("rating") or {}).get("v")
         ph = RISK_PD_HIST.get(rt) / 100.0 if rt in RISK_PD_HIST else None
-        ratio = pd1 / ph if pd1 is not None and ph else None
+        ph_h = risk_pd_scale(ph, T)          # рейтинговая PD на тот же горизонт, что и рыночная (для бумаг короче года)
+        ratio = pd1 / ph_h if pd1 is not None and ph_h else None
         basis_pd = ph if ph is not None else pd1            # без рейтинга — берём рыночную оценку
         el_pct = (basis_pd or 0.0) * (1 - R) * 100.0
         row = {"isin": isin, "name": r["name"], "ticker": r.get("ticker"), "uid": r.get("uid"), "value_rub": v,
@@ -296,6 +329,7 @@ def build_risk(cfg, acc, q=None):
         casino.append({"k": k, "issuers": [{"name": g["name"], "value": g["value"], "pd": g["pd"]} for g in pick],
                        "result_rub": res, "result_pct": res / tot * 100.0, "lost_rub": sum(g["value"] * (1 - R) for g in pick)})
     out["casino"] = casino
+    out["pd_explain"] = risk_pd_explain(rows, R)
     out["base_rub"] = base
     out["goal_years"] = goal
     # дюрационный разрыв: дюрация портфеля облигаций (взвешена по стоимости) против горизонта цели
