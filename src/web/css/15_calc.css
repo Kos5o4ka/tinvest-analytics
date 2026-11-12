@@ -1,7 +1,7 @@
 /* ── Калькулятор инвестиций ── */
 .cl-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px 16px;align-items:end;margin-bottom:6px}
 .cl-grid>*{min-width:0}.cl-grid .sw{align-self:center}
-#cl-goalbox{grid-column:1/-1;grid-template-columns:repeat(3,minmax(0,1fr));margin:0}
+.cl-grid.cl-base{grid-template-columns:repeat(3,minmax(0,1fr))}
 .cl-sec{font-size:12px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.04em;margin:18px 0 10px}
 .cl-row{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin:10px 0}
 .cl-chips{display:flex;flex-wrap:wrap;gap:8px}
@@ -11,11 +11,20 @@
 .cl-dot{margin-right:8px}
 .cl-chip input:checked+span{background:var(--card2);border-color:var(--ac);color:var(--tx)}
 #cl-years{width:100%;accent-color:var(--ac)}
+.cl-adv{margin-top:18px;border-top:1px solid var(--line);padding-top:14px}
+.cl-adv>summary{cursor:pointer;font-weight:600;color:var(--tx2);user-select:none}
+.cl-adv>summary span{margin-left:10px;font-weight:400;font-size:12px;color:var(--mu)}
+.cl-adv[open]>summary{margin-bottom:4px}
+.cl-tabs button{padding:8px 16px;font-size:14px}
+.cl-view{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--tx2);font-size:13px}
+.cl-view select{width:auto;max-width:100%}
+.cl-tbl tr[data-s]{cursor:pointer}
+.cl-tbl tr.cl-cur td{background:var(--card2)}
 .cl-ans{font-size:15px;line-height:1.6}
 .cl-goal{border-left:3px solid var(--ac)}
 .cl-disc{margin:6px 2px 24px}
 #cl-out .tbl td small{font-size:11px}
-@media(max-width:1180px){.cl-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#cl-goalbox{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:560px){.cl-grid{grid-template-columns:1fr}#cl-goalbox{grid-template-columns:1fr}}
+@media(max-width:1180px){.cl-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.cl-grid,.cl-grid.cl-base{grid-template-columns:1fr}.cl-adv>summary span{display:block;margin:4px 0 0}.cl-tabs{width:100%}.cl-tabs button{flex:1;text-align:center}}
 .cl-page{display:grid;gap:16px;min-width:0}.cl-page>*{min-width:0}
-#cl-out{display:grid;gap:16px;min-width:0}#cl-out>*{min-width:0}
+#cl-out,#cg-out{display:grid;gap:16px;min-width:0}#cl-out>*,#cg-out>*{min-width:0}
