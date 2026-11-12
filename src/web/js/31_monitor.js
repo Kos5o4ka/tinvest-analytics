@@ -18,7 +18,7 @@ function monSpark(sp,w=96,h=26){
 function monAlertHtml(a){
   const[s,c]=MON_SEV[a.severity]||MON_SEV.info,n=(a.isins||[]).length;
   const nm=a.kind==='rating'?`${esc(a.name)}${n?` <small class="mu">· ${esc((a.bonds||[]).slice(0,2).join(', '))}${n>2?' и ещё '+(n-2):''}</small>`:''}`:esc(a.name||'');
-  return`<div class="mon-al ${c}" ${a.isin?`data-isin="${esc(a.isin)}"`:''}><span class="mon-sev">${s}</span><span class="mon-d num">${a.date?ddm(a.date):''}</span>
+  return`<div class="mon-al ${c}" ${a.isin?`data-isin="${esc(a.isin)}"`:''}><span class="mon-sev">${s}</span><span class="mon-d num"${a.asof?' title="Состояние на сегодня: дата события не публикуется"':''}>${a.asof?'сейчас':a.date?ddm(a.date):''}</span>
     <div class="mon-b"><b>${nm}</b><span>${esc(a.message)}</span></div>${a.url?`<a href="${esc(a.url)}" target="_blank" rel="noopener" title="Источник">↗</a>`:''}</div>`;
 }
 function monCard(){
@@ -43,11 +43,11 @@ function pMon(){
   if(!m||m.loading)return`<div class="card">${waitBox('Собираю рейтинговые события, историю цен и спредов… При первом запуске до минуты.')}</div>`;
   if(m.error)return`<div class="msg err">${esc(m.error)} <button class="btn ghost" id="mon-r">Повторить</button></div>`;
   const d=m.data,th=d.thresholds,sm=d.summary;
-  const rows=d.rows.map(r=>`<tr data-isin="${esc(r.isin)}" title="Открыть карточку"><td class="l"><b style="font-weight:600">${esc(r.name)}</b><br><small class="mu">${esc(r.ticker||r.isin)}${r.call?' · оферта '+ddm(r.call):''}</small></td>
+  const rows=d.rows.map(r=>`<tr data-isin="${esc(r.isin)}" title="Открыть карточку"><td class="l"><b style="font-weight:600">${esc(r.name)}</b><br><small class="mu">${esc(r.ticker||r.isin)}${r.call?' · оферта '+ddm(r.call):''}${r.maturity?' · погашение '+ddm(r.maturity):''}</small></td>
     <td class="num">${M(r.value_rub,'rub',0)}</td><td class="l">${monRatingTag(r.rating)}</td>
     <td class="num">${r.price!=null?f2(r.price):'—'}</td>
     <td class="num ${cls(r.chg5)}">${r.chg5!=null?pct(r.chg5,1):'—'}</td><td class="num ${cls(r.chg30)}">${r.chg30!=null?pct(r.chg30,1):'—'}</td>
-    <td class="num">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
+    <td class="num">${r.spread!=null?(r.spread>40?`<span title="Доходность по такой цене нерепрезентативна (бумага торгуется как дефолтная): ${f2(r.spread)} п.п.">&gt;40</span>`:(r.spread>0?'+':'')+f2(r.spread)):'—'}</td>
     <td class="num ${r.spread_chg30>0?'neg':r.spread_chg30<0?'pos':''}">${r.spread_chg30!=null?(r.spread_chg30>0?'+':'')+f2(r.spread_chg30):'—'}</td>
     <td>${r.floating?'<small class="mu">флоатер</small>':monSpark(r.spark)}</td>
     <td class="num">${r.turnover_avg!=null?short(r.turnover_avg)+' ₽':'—'}</td>
@@ -57,7 +57,7 @@ function pMon(){
   return`<div class="g g4">${kpi('Высокие',sm.high,'понижение рейтинга, дефолт, сильное падение','neg',S8)}${kpi('Средние',sm.medium,'наблюдение, оферты, умеренное падение','',S4)}
     ${kpi('Информационные',sm.info,'повышения, неликвидность, прогнозы',null,S1)}${kpi('Журнал рейтингов',d.log.events,d.log.since?'событий с '+ddm(d.log.since):'пока пуст',null,S2)}</div>
   ${(d.notes||[]).map(n=>`<div class="msg">${esc(n)}</div>`).join('')}
-  <div class="card"><h2>Тревоги<span class="sp">рейтинги — за 90 дней, рынок — на сегодня</span><button class="btn ghost" id="mon-r" style="margin-left:auto;padding:4px 12px;font-size:12px">Обновить</button></h2>
+  <div class="card"><h2>Тревоги<span class="sp">рейтинговые действия — за 90 дней; цены и спреды — по последним торгам; погашения, амортизации и оферты — ближайшие ${Math.max(+th.mon_offer_days||30,30)} дн., даты Мосбиржи</span><button class="btn ghost" id="mon-r" style="margin-left:auto;padding:4px 12px;font-size:12px">Обновить</button></h2>
     ${d.alerts.length?d.alerts.slice(0,S.monAll?999:12).map(monAlertHtml).join('')+(d.alerts.length>12?`<button class="btn ghost" id="mon-all" style="margin-top:6px">${S.monAll?'Свернуть':'Показать все ('+d.alerts.length+')'}</button>`:''):'<div class="mon-ok">Тревог нет</div>'}</div>
   ${watchMonGroup()}
   <div class="card"><h2>Облигации портфеля<span class="sp">цены Мосбиржи, спред — доходность минус КБД на дюрации бумаги</span></h2>
