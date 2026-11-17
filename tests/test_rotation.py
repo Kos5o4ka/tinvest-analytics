@@ -95,5 +95,24 @@ class TestRotationEngine(unittest.TestCase):
         self.assertTrue(M.rot_gap([], 3.0)["empty"])
 
 
+
+class RotBondFilterTests(unittest.TestCase):
+    def test_only_ofz_pd(self):
+        self.assertTrue(M._rot_is_pd({"id": "SU26238RMFS4", "name": "ОФЗ 26238"}))
+        self.assertFalse(M._rot_is_pd({"id": "SU52005RMFS4", "name": "ОФЗ 52005"}))
+        self.assertFalse(M._rot_is_pd({"id": "SU46020RMFS2", "name": "ОФЗ 46020"}))
+
+    def test_synth_accrued_consistent(self):
+        b = {"id": "X", "mat": "2041-05-15", "coupon": 7.1, "nominal": 1000, "price": 51.23, "yield": 16.35, "nkd": 35.0}
+        orig = M.rot_flows_moex
+        M.rot_flows_moex = lambda *a, **k: None
+        try:
+            fm = M.rot_fixed_model(b, "2026-11-17")
+        finally:
+            M.rot_flows_moex = orig
+        self.assertEqual(fm["method"], "synth")
+        self.assertAlmostEqual(fm["accr"], M.rot_accr(fm["flows"], 0.0))
+
+
 if __name__ == "__main__":
     unittest.main()

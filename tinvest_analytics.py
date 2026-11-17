@@ -1862,6 +1862,20 @@ def _bc_table(d, name):
     return [dict(zip(cols, row)) for row in t.get("data") or []]
 
 
+BC_SECID_URL = "https://iss.moex.com/iss/securities.json?q=%s&iss.meta=off&securities.columns=secid,isin"
+
+
+def _bc_secid(isin):
+    """SECID выпуска по ISIN. Для ОФЗ они различаются (SU26238RMFS4 / RU000A1038V6), а bondization по ISIN ОФЗ пуст."""
+    try:
+        for r in _bc_table(json.loads(http_text(BC_SECID_URL % isin, 20)), "securities"):
+            if str(r.get("isin") or "").upper() == isin and r.get("secid") and r["secid"].upper() != isin:
+                return r["secid"].upper()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def moex_bondization(isin):
     """Купоны, амортизации и оферты выпуска с MOEX ISS. Кэш 24 ч; ошибки/пустой ответ кэшируются на 1 ч."""
     isin = (isin or "").strip().upper()
@@ -1879,6 +1893,11 @@ def moex_bondization(isin):
         d = json.loads(http_text(BC_URL % isin, 20))
         out = {"ok": True, "ts": time.time(), "coupons": _bc_table(d, "coupons"),
                "amort": _bc_table(d, "amortizations"), "offers": _bc_table(d, "offers")}
+        if not out["coupons"] and not out["amort"]:
+            sec = _bc_secid(isin) if isin.startswith("RU") else None
+            if sec:
+                d = json.loads(http_text(BC_URL % sec, 20))
+                out.update(coupons=_bc_table(d, "coupons"), amort=_bc_table(d, "amortizations"), offers=_bc_table(d, "offers"))
         if not out["coupons"] and not out["amort"]:
             raise ValueError("пусто")
         for k in ("coupons", "amort", "offers"):      # оставляем только нужные поля
@@ -17638,9 +17657,18 @@ def rot_tr_fixed(knots, T, flows, price, accr0=0.0, betas=None, tax=True, y0=Non
     dirtyT = rot_pv(flows, T, yT)
     accT = rot_accr(flows, T)
     cleanT = max(0.0, dirtyT - accT)
-    cash = sum((c * k + p) * rot_growth(knots, t, T) for t, c, p in flows if t <= T + 1e-9)
+    # НКД, уплаченный при покупке, уменьшает налоговую базу первого купона (НДФЛ — только с разницы)
+    cash, ded = 0.0, accr0
+    for t, c, p in flows:
+        if t > T + 1e-9:
+            break
+        base_c = max(0.0, c - ded)
+        ded = max(0.0, ded - c)
+        net_c = (c - ROT_TAX * base_c) if tax else c
+        cash += (net_c + p) * rot_growth(knots, t, T)
     gain_tax = ROT_TAX * max(0.0, cleanT - price) if tax else 0.0
-    val = cleanT + accT * k + cash - gain_tax
+    acc_net = (accT - ROT_TAX * max(0.0, accT - ded)) if tax else accT     # если купона до горизонта не было
+    val = cleanT + acc_net + cash - gain_tax
     if val <= 0:
         return None
     return ((val / dirty0) ** (1.0 / T) - 1.0) * 100.0
@@ -17754,6 +17782,12 @@ def rot_flows_moex(isin, today, face):
 
 # ── вселенная бумаг (фоновая загрузка) ──
 
+def _rot_is_pd(r):
+    code = str(r.get("id") or "")
+    m = re.search(r"(\d{5})", code if code.startswith("SU") else (r.get("name") or ""))
+    return bool(m and m.group(1).startswith("26"))
+
+
 def _rot_is_floater(r):
     if r.get("floating") is not None:               # поле из screener_payload (справочник T-Invest / тип облигации ISS)
         return bool(r["floating"])
@@ -17807,7 +17841,8 @@ def _rot_build():
         if r.get("kind") == "ofz" and r.get("dur") is None:
             continue
         (floats if _rot_is_floater(r) else fixed).append(r)
-    snap["ofz"] = sorted([r for r in fixed if r["kind"] == "ofz"], key=lambda r: -(r.get("turn") or 0))
+    # только ОФЗ-ПД (SU26…): линкеры ОФЗ-ИН (SU52…) дают реальную доходность, ОФЗ-АД (SU46…) амортизируются
+    snap["ofz"] = sorted([r for r in fixed if r["kind"] == "ofz" and _rot_is_pd(r)], key=lambda r: -(r.get("turn") or 0))
     floats = [r for r in floats if r.get("fl_base") != "infl"]       # купон, привязанный к инфляции, от ставки не зависит
     snap["floats"] = sorted(floats, key=lambda r: -(r.get("turn") or 0))[:30]
     return snap
@@ -17858,15 +17893,20 @@ def rot_fixed_model(b, today):
     face = float(b.get("nominal") or 1000.0)
     price = float(b["price"])
     flows, method = None, "approx"
-    if b.get("isin"):
-        flows = rot_flows_moex(b["isin"], today, face)
-        if flows:
-            method = "moex"
+    for code in (b.get("id"), b.get("isin")):         # для ОФЗ график на Мосбирже отдаётся по SECID (SU…), по ISIN — пусто
+        if code and not flows:
+            flows = rot_flows_moex(code, today, face)
+    if flows:
+        method = "moex"
     if not flows and b.get("coupon") is not None:
         flows = rot_flows_synth(b, today)
         if flows:
             method = "synth"
-    accr = (float(b["nkd"]) / face * 100.0) if b.get("nkd") not in (None, "") else (rot_accr(flows, 0.0) if flows else 0.0)
+    # НКД биржи согласован только с биржевым графиком; для расчётного графика НКД считается по нему же
+    if method == "moex" and b.get("nkd") not in (None, ""):
+        accr = float(b["nkd"]) / face * 100.0
+    else:
+        accr = rot_accr(flows, 0.0) if flows else 0.0
     y0 = rot_ytm(flows, price + accr) if flows else None
     if y0 is None and flows:
         y0 = float(b["yield"]) / 100.0

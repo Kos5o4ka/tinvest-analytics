@@ -12,6 +12,20 @@ def _bc_table(d, name):
     return [dict(zip(cols, row)) for row in t.get("data") or []]
 
 
+BC_SECID_URL = "https://iss.moex.com/iss/securities.json?q=%s&iss.meta=off&securities.columns=secid,isin"
+
+
+def _bc_secid(isin):
+    """SECID выпуска по ISIN. Для ОФЗ они различаются (SU26238RMFS4 / RU000A1038V6), а bondization по ISIN ОФЗ пуст."""
+    try:
+        for r in _bc_table(json.loads(http_text(BC_SECID_URL % isin, 20)), "securities"):
+            if str(r.get("isin") or "").upper() == isin and r.get("secid") and r["secid"].upper() != isin:
+                return r["secid"].upper()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def moex_bondization(isin):
     """Купоны, амортизации и оферты выпуска с MOEX ISS. Кэш 24 ч; ошибки/пустой ответ кэшируются на 1 ч."""
     isin = (isin or "").strip().upper()
@@ -29,6 +43,11 @@ def moex_bondization(isin):
         d = json.loads(http_text(BC_URL % isin, 20))
         out = {"ok": True, "ts": time.time(), "coupons": _bc_table(d, "coupons"),
                "amort": _bc_table(d, "amortizations"), "offers": _bc_table(d, "offers")}
+        if not out["coupons"] and not out["amort"]:
+            sec = _bc_secid(isin) if isin.startswith("RU") else None
+            if sec:
+                d = json.loads(http_text(BC_URL % sec, 20))
+                out.update(coupons=_bc_table(d, "coupons"), amort=_bc_table(d, "amortizations"), offers=_bc_table(d, "offers"))
         if not out["coupons"] and not out["amort"]:
             raise ValueError("пусто")
         for k in ("coupons", "amort", "offers"):      # оставляем только нужные поля
