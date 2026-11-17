@@ -8,6 +8,15 @@ DBX_MAX_ISSUERS = 60
 DBX_PACE = 0.25
 
 
+
+def dbx_sane_yield(y):
+    """Доходность к оферте за несколько дней до неё (у Мосбиржи бывает ±десятки тысяч %) не информативна — скрываем."""
+    try:
+        y = float(y)
+    except (TypeError, ValueError):
+        return None
+    return y if -5.0 <= y <= 100.0 else None
+
 def _dbx_date(s):
     try:
         return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
@@ -196,7 +205,7 @@ def dbx_offers(force=False):
             return {"error": "Не удалось получить данные Мосбиржи: %s" % str(e)[:140], "rows": []}
         j.update(state="run", done=0, total=0, capped=0, t=time.time(), error=None)
         j["rows"] = [{"id": r["id"], "isin": r.get("isin"), "name": r["name"], "full": r.get("full"), "offer": r["offer"], "mat": r["mat"],
-                      "price": r["price"], "yield": r["yield"], "nominal": r.get("nominal"), "grade": "loading", "grade_label": "считаю…"}
+                      "price": r["price"], "yield": dbx_sane_yield(r["yield"]), "nominal": r.get("nominal"), "grade": "loading", "grade_label": "считаю…"}
                      for r in cands]
         threading.Thread(target=dbx_offer_work, args=(cands,), daemon=True).start()
         return dbx_offer_payload()

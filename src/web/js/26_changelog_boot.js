@@ -72,6 +72,7 @@ function roadmapHtml(){const L={now:['s-now','Сейчас'],next:['s-next','С�
   return`<div class="rm">${ROADMAP.map(([s,t,d])=>`<div><em class="${L[s][0]}">${L[s][1]}</em><span><b style="font-weight:600">${t}</b><small>${d}</small></span></div>`).join('')}</div>`}
 
 function bindPage(){
+  {const x=PAGE_EXT[S.page];if(x&&x.bind)x.bind()}
   if(S.page==='reb')bindReb();
   if(S.page==='scr')bindScr();
   if(S.page==='cmp')bindCmp();

@@ -18131,6 +18131,15 @@ DBX_MAX_ISSUERS = 60
 DBX_PACE = 0.25
 
 
+
+def dbx_sane_yield(y):
+    """Доходность к оферте за несколько дней до неё (у Мосбиржи бывает ±десятки тысяч %) не информативна — скрываем."""
+    try:
+        y = float(y)
+    except (TypeError, ValueError):
+        return None
+    return y if -5.0 <= y <= 100.0 else None
+
 def _dbx_date(s):
     try:
         return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
@@ -18319,7 +18328,7 @@ def dbx_offers(force=False):
             return {"error": "Не удалось получить данные Мосбиржи: %s" % str(e)[:140], "rows": []}
         j.update(state="run", done=0, total=0, capped=0, t=time.time(), error=None)
         j["rows"] = [{"id": r["id"], "isin": r.get("isin"), "name": r["name"], "full": r.get("full"), "offer": r["offer"], "mat": r["mat"],
-                      "price": r["price"], "yield": r["yield"], "nominal": r.get("nominal"), "grade": "loading", "grade_label": "считаю…"}
+                      "price": r["price"], "yield": dbx_sane_yield(r["yield"]), "nominal": r.get("nominal"), "grade": "loading", "grade_label": "считаю…"}
                      for r in cands]
         threading.Thread(target=dbx_offer_work, args=(cands,), daemon=True).start()
         return dbx_offer_payload()
@@ -18463,7 +18472,7 @@ API_GET["/api/dbx/fx"] = dbx_api_fx
 MM_WINDOWS = (("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365))
 MM_FUND_SEED = ("LQDT", "SBMM", "AKMM", "TMON", "AKMP", "BCSD", "FMMM", "MONY", "OLIQ", "PSMM", "CASH", "FINC", "TSAV", "AMNR", "SILA", "SCLI", "GOOD")
 MM_FUND_IN = re.compile(r"денеж|ликвид|сберегат|накопит|ежедневн", re.I)
-MM_FUND_OUT = re.compile(r"юан|золот|валют|долл|евро|облиг|usd|cny", re.I)
+MM_FUND_OUT = re.compile(r"юан|золот|валют|долл|евро|облиг|usd|cny|поток|акци|дивиденд", re.I)   # «Денежный поток» — фонд акций
 MM_OZ_G = 31.1034768                                   # граммов в тройской унции
 MM_ISS = "https://iss.moex.com/iss/"
 MM_BASIS_TTL = 600
@@ -19369,6 +19378,9 @@ def txo_harvest_calc(st, settings, fee_rate=None, min_loss=TXO_MIN_LOSS, holiday
         "Расходы: комиссия на продажу и на обратную покупку по ставке %s (%s); спред не учтён." % (txo_pct(fee_rate), fee_src),
         "Запрета на «мнимые» сделки (wash sale) в российском налоговом праве нет, но обратная покупка обнуляет срок владения: ЛДВ по новым бумагам отсчитывается заново.",
         "Продажа должна рассчитаться в текущем году: при расчётах T+1 последний день сделки показан выше; календарь торгов определяет биржа."]
+    if not settings.get("offset_coupons") and t0 > 0 and cands:
+        out["assumptions"].insert(0, "Убытки от продаж сейчас не уменьшают налог с купонов: в настройках страницы «Налоги» выключен зачёт убытков "
+                                     "против купонного дохода. Если брокер или декларация его применяют, включите настройку — экономия пересчитается.")
     return out
 
 
@@ -23287,6 +23299,7 @@ function roadmapHtml(){const L={now:['s-now','Сейчас'],next:['s-next','С�
   return`<div class="rm">${ROADMAP.map(([s,t,d])=>`<div><em class="${L[s][0]}">${L[s][1]}</em><span><b style="font-weight:600">${t}</b><small>${d}</small></span></div>`).join('')}</div>`}
 
 function bindPage(){
+  {const x=PAGE_EXT[S.page];if(x&&x.bind)x.bind()}
   if(S.page==='reb')bindReb();
   if(S.page==='scr')bindScr();
   if(S.page==='cmp')bindCmp();

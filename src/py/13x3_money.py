@@ -7,7 +7,7 @@
 MM_WINDOWS = (("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365))
 MM_FUND_SEED = ("LQDT", "SBMM", "AKMM", "TMON", "AKMP", "BCSD", "FMMM", "MONY", "OLIQ", "PSMM", "CASH", "FINC", "TSAV", "AMNR", "SILA", "SCLI", "GOOD")
 MM_FUND_IN = re.compile(r"денеж|ликвид|сберегат|накопит|ежедневн", re.I)
-MM_FUND_OUT = re.compile(r"юан|золот|валют|долл|евро|облиг|usd|cny", re.I)
+MM_FUND_OUT = re.compile(r"юан|золот|валют|долл|евро|облиг|usd|cny|поток|акци|дивиденд", re.I)   # «Денежный поток» — фонд акций
 MM_OZ_G = 31.1034768                                   # граммов в тройской унции
 MM_ISS = "https://iss.moex.com/iss/"
 MM_BASIS_TTL = 600
