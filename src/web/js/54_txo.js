@@ -101,4 +101,4 @@ function bindTxo(){
     const F=txoF();document.querySelectorAll('.txo-in').forEach(e=>{F[e.id.slice(4)]=e.value});
     S.txo.F=F;txoSave();S.txo.p=null;render()})});
 }
-regPage('txo',{title:'Налоговая оптимизация',group:'Учёт и планы',icon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16M6 16l4-5 3 3 5-7"/><circle cx="7" cy="7" r="2"/></svg>',render:pTxo,bind:bindTxo,pro:true});
+regPage('txo',{title:'Налоговая оптимизация',group:'Учёт и планы',icon:'<path d="M4 20h16M6 16l4-5 3 3 5-7"/><circle cx="7" cy="7" r="2"/>',render:pTxo,bind:bindTxo,pro:true});
