@@ -81,13 +81,17 @@ function bindPage(){
   if(S.page==='off')bindOff();
   if(S.page==='lad')bindLad();
   if(S.page==='iss')bindIss();
+  if(S.page==='dfl')bindDfl();
+  if(S.page==='flw')bindFlw();
   if(S.page==='cal')bindCal();
   if(S.page==='watch')bindWatch();
+  if(S.page==='stk')bindStk();
+  if(S.page==='sst')bindSst();
   if($('#pri-r'))$('#pri-r').onclick=()=>{S.pri=null;render()};
   if($('#pdays'))$('#pdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.payDays=+b.dataset.d;render()};
   if($('#rdays'))$('#rdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.ratesDays=+b.dataset.d;S.rates=null;render()};
   if($('#rt-ref'))$('#rt-ref').onclick=async e=>{e.currentTarget.disabled=true;try{await post('/api/ratings/refresh');S.bonds=await api('/api/bonds?'+new URLSearchParams({account:S.account}));render()}catch(x){}};
-  document.querySelectorAll('#view [data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));
+  document.querySelectorAll('#view [data-go]').forEach(b=>b.onclick=()=>{if(b.classList.contains('td-mv'))S.scrTab='mv';go(b.dataset.go)});
   const sortable=(id,key)=>{const t=$(id);if(t)t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;
     S[key]={k,d:S[key].k===k?-S[key].d:(['name','type','risk','maturity','next'].includes(k)?1:-1)};render()}};
   if(S.page==='pos'){sortable('#ptab','sort');const pt=$('#ptype');if(pt)pt.onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;S.posType=b.dataset.t;render()}}

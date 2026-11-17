@@ -57,17 +57,30 @@ def td_ratings(events, rows_keys, today, days=TD_RATING_DAYS):
             "items": [{"date": a["date"], "name": a["name"], "message": a["message"], "severity": a["severity"]} for a in al[:5]]}
 
 
-def td_digest(pays, pairs, events, rows_keys, today, alerts=None):
+TD_MV_N, TD_MV_TURN = 5, 1_000_000
+
+
+def td_movers(rows, n=TD_MV_N, min_turn=TD_MV_TURN):
+    """Лидеры падения облигаций за день: топ-n по падению цены среди выпусков с оборотом >= min_turn ₽ (отсекаем шум)."""
+    down = sorted((r for r in rows or [] if (r.get("chg") or 0) < 0 and (r.get("turn") or 0) >= min_turn), key=lambda r: r["chg"])
+    return {"count": len(down), "n": n, "min_turn": min_turn,
+            "items": [{"name": r.get("name"), "isin": r.get("isin") or r.get("id"), "chg": r["chg"], "price": r.get("price"),
+                       "turnover": r.get("turn")} for r in down[:n]]}
+
+
+def td_digest(pays, pairs, events, rows_keys, today, alerts=None, movers=None):
     """Собирает сводку; пустые разделы выбрасываются, empty=True — показывать карточку нечего."""
     d = {"today": today, "payments": td_payments(pays, today), "offers": td_offers(pairs, today),
          "ratings": td_ratings(events, rows_keys, today)}
     if alerts is not None:
         d["alerts"] = {"count": sum(1 for a in alerts if a.get("severity") in ("high", "medium")),
                        "high": sum(1 for a in alerts if a.get("severity") == "high")}
-    for k in ("payments", "offers", "ratings", "alerts"):
+    if movers is not None:
+        d["movers"] = movers
+    for k in ("payments", "offers", "ratings", "alerts", "movers"):
         if k in d and not d[k]["count"]:
             del d[k]
-    d["empty"] = not any(k in d for k in ("payments", "offers", "ratings", "alerts"))
+    d["empty"] = not any(k in d for k in ("payments", "offers", "ratings", "alerts", "movers"))
     return d
 
 
@@ -78,6 +91,13 @@ def td_empty():
 def _td_warm_monitor(cfg, acc):
     try:
         build_monitor(cfg, acc)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _td_warm_screener():
+    try:
+        screener_rows()
     except Exception:  # noqa: BLE001
         pass
 
@@ -105,7 +125,15 @@ def td_build(cfg, acc):
             threading.Thread(target=_td_warm_monitor, args=(cfg, acc), daemon=True).start()
     except Exception:  # noqa: BLE001
         alerts = None
-    return td_digest(rep.get("payments") or [], pairs, events, rows_keys, today, alerts)
+    movers = None
+    try:                                  # рынок: берём готовые строки скринера; если их ещё нет — прогреваем в фоне
+        if _scr["rows"] and time.time() - _scr["t"] < 6 * 3600:
+            movers = td_movers(_scr["rows"])
+        else:
+            threading.Thread(target=_td_warm_screener, daemon=True).start()
+    except Exception:  # noqa: BLE001
+        movers = None
+    return td_digest(rep.get("payments") or [], pairs, events, rows_keys, today, alerts, movers)
 
 
 def today_get(cfg, acc, q, force):

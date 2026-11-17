@@ -107,6 +107,9 @@ function todayCard(){
     if(d.alerts){const x=d.alerts;
       lines.push(tdLine('mon','<path d="M18 16v-5a6 6 0 0 0-12 0v5l-2 3h16z"/><path d="M10 21h4"/>',
         `Тревоги мониторинга: <b>${x.count}</b>${x.high?` <span class="neg">· ${x.high} ${obPl(x.high,'высокая','высокие','высоких')}</span>`:''}`,tdTag()));}
+    if(d.movers&&d.movers.items&&d.movers.items.length){const x=d.movers;
+      lines.push(`<div class="td-grp"><div class="mu td-more" style="margin:2px 0 0">Лидеры падения облигаций · оборот от ${M(x.min_turn,'rub',0)}</div>${x.items.map(o=>tdLine('scr','<path d="M3 7l6 6 4-4 8 8"/><path d="M15 17h6v-6"/>',
+        `<b>${esc(o.name||'')}</b> <small class="mu num">${esc(o.isin||'')}</small> · <b class="num neg">${f2(o.chg)} %</b>`,'','td-mv')).join('')}<div class="mu td-more">Полный список — в «Скринере», вкладка «Лидеры»</div></div>`);}
   }else if(t&&t.loading&&!lines.length)return`<div class="card td-card noprint"><h2>Сегодня</h2><div class="sk" style="height:46px;border-radius:10px"></div></div>`;
   if(!lines.length)return'';
   return`<div class="card td-card noprint"><h2>Сегодня<span class="sp">${new Date().toLocaleDateString('ru-RU',{day:'numeric',month:'long'})}</span>${t&&t.loading?'<span class="td-ld">обновляю…</span>':''}</h2>${lines.join('')}</div>`;

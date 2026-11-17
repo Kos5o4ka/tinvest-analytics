@@ -18,6 +18,16 @@ healthy() {   # $1 — имя сервиса
     return 0
 }
 
+restart() {   # $1 — сервис; вместе с сервером данных перезапускается сборщик раскрытий (если включён)
+    systemctl restart "$1"
+    if [ "$1" = tinvest-server ] && systemctl is-enabled --quiet tinvest-disclosure 2>/dev/null; then
+        systemctl restart tinvest-disclosure
+    fi
+    if [ "$1" = tinvest-server ] && systemctl is-enabled --quiet tinvest-flows 2>/dev/null; then
+        systemctl restart tinvest-flows
+    fi
+}
+
 update() {    # $1 — каталог, $2 — сервис, $3 — файл, который должен компилироваться
     dir=$1 svc=$2 main=$3
     if [ ! -d "$dir/.git" ]; then echo "$svc: $dir не git-клон, пропуск"; return 0; fi
@@ -29,14 +39,14 @@ update() {    # $1 — каталог, $2 — сервис, $3 — файл, к�
     if ! python3 -m py_compile "$dir/$main"; then
         echo "$svc: $main не компилируется, откат"; git -C "$dir" reset -q --hard "$old"; return 1
     fi
-    systemctl restart "$svc"
+    restart "$svc"
     if healthy "$svc"; then
         echo "$svc: обновлён $(echo "$old" | cut -c1-7) -> $(echo "$new" | cut -c1-7)"
         return 0
     fi
     echo "$svc: после обновления не поднялся, откат на $(echo "$old" | cut -c1-7)"
     git -C "$dir" reset -q --hard "$old"
-    systemctl restart "$svc"
+    restart "$svc"
     return 1
 }
 

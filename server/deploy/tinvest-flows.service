@@ -1,0 +1,24 @@
+[Unit]
+Description=TAnalytic money flows collector (T-Invest + MOEX ISS -> flows.sqlite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tinvest
+Group=tinvest
+# Токен владельца (только чтение): /etc/tanalytic/tinvest_token, root:root 600. «+» — копирование от root вне песочницы в /run/tinvest-flows
+# (доступно только пользователю сервиса). Нет файла — сборщик работает по ISS (задержка ~15 минут).
+RuntimeDirectory=tinvest-flows
+RuntimeDirectoryMode=0700
+ExecStartPre=+/bin/sh -c 'if [ -r /etc/tanalytic/tinvest_token ]; then install -m 600 -o tinvest -g tinvest /etc/tanalytic/tinvest_token /run/tinvest-flows/tinvest_token; fi'
+ExecStart=/usr/bin/python3 /opt/tinvest-analytics/server/flows_worker.py --data /var/lib/tinvest-server --token-file /run/tinvest-flows/tinvest_token
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tinvest-server
+
+[Install]
+WantedBy=multi-user.target

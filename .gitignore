@@ -1,6 +1,10 @@
 # Секреты и личные данные — никогда не коммитить
 .env
 *.env
+secrets/
+tinvest_token
+tinvest_token.*
+*.token
 config.json
 *.db
 *.sqlite

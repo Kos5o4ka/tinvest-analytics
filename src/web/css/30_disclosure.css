@@ -1,0 +1,23 @@
+/* раскрытие информации: карточка облигации, выплаты эмитента, техдефолты */
+.bc-out{padding:10px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;margin-bottom:12px;line-height:1.5}
+.iss-fl-h{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin:4px 0 8px}
+.iss-fl-h b{font-size:15px}
+.iss-fl-chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.iss-fl-chips button{all:unset;cursor:pointer;padding:4px 12px;border-radius:999px;border:1px solid var(--line);color:var(--tx2);font-size:12.5px}
+.iss-fl-chips button:hover{color:var(--tx)}
+.iss-fl-chips button.on{background:var(--card2);color:var(--tx);border-color:var(--line2)}
+.iss-fl-leg{margin-bottom:6px}
+.iss-hatch{background:repeating-linear-gradient(45deg,var(--s4) 0 2px,transparent 2px 5px);border:1px solid var(--s4)}
+.dfl-bar{display:flex;gap:12px;flex-wrap:wrap;margin:6px 0 12px}
+.dfl-b{display:inline-block;padding:2px 9px;border-radius:7px;font-size:12px;white-space:nowrap}
+.dfl-t{background:#c985001f;color:#c98500}
+.dfl-d{background:#e5484d1f;color:var(--neg)}
+#dfl-tab td{vertical-align:top}
+.dfl-wrap{overflow-x:auto;max-width:100%}
+#dfl-tab{table-layout:auto;min-width:760px}
+#dfl-tab th,#dfl-tab td{padding:8px 8px}
+#dfl-tab td{white-space:normal;line-height:1.35}
+#dfl-tab td:nth-child(1),#dfl-tab td:nth-child(2),#dfl-tab td:nth-child(5){white-space:nowrap}
+#dfl-tab .dfl-is{min-width:170px;max-width:300px;overflow-wrap:anywhere}
+#dfl-tab .dfl-bs{min-width:120px}
+@media(max-width:700px){.dfl-b{white-space:normal}}

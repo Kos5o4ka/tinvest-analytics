@@ -4,7 +4,7 @@ _bc_univ = {"t": 0, "rows": []}
 _bc_lock = threading.Lock()
 BC_DESC = ("ISSUENAME", "ISSUEDATE", "MATDATE", "ISSUESIZE", "FACEVALUE", "INITIALFACEVALUE", "COUPONFREQUENCY",
            "COUPONPERCENT", "COUPONVALUE", "COUPONDATE", "BOND_TYPE", "BOND_SUBTYPE", "FACEVALUE_TYPE", "LISTLEVEL",
-           "ISQUALIFIEDINVESTORS", "HASDEFAULT", "HASTECHNICALDEFAULT", "REGNUMBER", "TYPENAME", "EMITTER_ID")
+           "ISQUALIFIEDINVESTORS", "ISSUESIZEPLACED", "HASDEFAULT", "HASTECHNICALDEFAULT", "REGNUMBER", "TYPENAME", "EMITTER_ID")
 
 
 def _bc_json(url, timeout=25):
@@ -76,7 +76,7 @@ def _bc_flows(isin):
             j = fn(isin)
         except Exception:  # noqa: BLE001
             j = None
-    if not isinstance(j, dict) or not any(k in j for k in ("coupons", "amortizations", "offers")):
+    if not isinstance(j, dict) or not any(k in j for k in ("coupons", "amort", "amortizations", "offers")):
         j = _bc_json("https://iss.moex.com/iss/securities/%s/bondization.json?iss.meta=off&limit=unlimited"
                      "&iss.only=coupons,amortizations,offers" % isin, timeout=30)
     today = date.today().isoformat()
@@ -86,10 +86,13 @@ def _bc_flows(isin):
         if d and d >= today:
             ev.append({"d": d, "t": "coupon", "amt": c.get("value_rub") if c.get("value_rub") is not None else c.get("value"),
                        "pct": c.get("valueprc")})
-    for a in _bc_norm_table(j.get("amortizations")):
-        d = a.get("amortdate")
-        if d and d >= today:
-            ev.append({"d": d, "t": "redemption" if a.get("data_source") == "maturity" else "amort",
+    # moex_bondization отдаёт график под ключом "amort" (ISS — "amortizations"); последняя строка графика — погашение
+    am = [a for a in _bc_norm_table(j.get("amort") if j.get("amort") is not None else j.get("amortizations")) if a.get("amortdate")]
+    last = max((a["amortdate"] for a in am), default=None)
+    for a in am:
+        d = a["amortdate"]
+        if d >= today:
+            ev.append({"d": d, "t": "redemption" if d == last else "amort",
                        "amt": a.get("value_rub") if a.get("value_rub") is not None else a.get("value"),
                        "pct": a.get("valueprc")})
     for o in _bc_norm_table(j.get("offers")):
@@ -294,6 +297,17 @@ def bond_card(isin):
             card["keyrate"] = {"source": info["source"], "name": info["source_name"], "as_of": info["as_of"]}
     except Exception as e:  # noqa: BLE001
         errors.append("прогноз купонов: %s" % str(e)[:120])
+    try:        # «КС + x %» для флоатера: из кэша спредов, иначе считаем по графику выплат (он уже в кэше после _bc_mark_est)
+        if (ci or {}).get("floating"):
+            fsp = fl_spread_cached([isin]).get(isin)
+            if fsp is None:
+                face2 = (desc or {}).get("FACEVALUE") or (me or {}).get("nominal")
+                fsp = fl_spread_put(isin, (me or {}).get("full") or (desc or {}).get("NAME") or card.get("name"),
+                                    moex_bondization(isin), float(face2) if face2 else None, (me or {}).get("kind"))
+            card["fl_spread"] = fsp
+            card["fl_label"] = fl_label(fsp, True)
+    except Exception as e:  # noqa: BLE001
+        errors.append("спред флоатера: %s" % str(e)[:120])
     try:
         rt = (me["_rt"] if me else None) or best_rating(isin, (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or "")
     except Exception as e:  # noqa: BLE001
@@ -323,6 +337,11 @@ def bond_card(isin):
         card["issuer_curve"] = None
         if not errors:
             errors.append("нет торгов на основных режимах Мосбиржи — показаны только справочные данные")
+    try:
+        card["disclosure"] = disclosure_for_bond(isin, desc=desc)
+    except Exception as e:  # noqa: BLE001
+        card["disclosure"] = None
+        errors.append("раскрытие: %s" % str(e)[:120])
     card["docs"] = bond_doc_links(isin, (me or {}).get("id") or isin, (desc or {}).get("EMITTER_INN"))
     card["name"] = (me or {}).get("full") or (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or isin
     card["short"] = (me or {}).get("name") or (ci or {}).get("name") or isin

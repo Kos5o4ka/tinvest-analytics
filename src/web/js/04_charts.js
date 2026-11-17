@@ -126,3 +126,86 @@ function chart(id,fn,o){S.charts.push([id,fn,o])}
 function mountCharts(){S.charts.forEach(([id,fn,o])=>{const el=document.getElementById(id);if(el)try{fn(el,o)}catch(e){console.error(e);el.innerHTML='<div class="empty">Не удалось построить график</div>'}})}
 let rT;addEventListener('resize',()=>{clearTimeout(rT);rT=setTimeout(mountCharts,120)});
 
+
+/* ── столбцы по месяцам, сложенные по сериям (выпускам); прогнозная часть светлее, CALL — отдельный столбец со штриховкой ──
+   o: {h, labels:[...], months:[{segs:[{k,v,est}], call:number}], colors:{k:цвет}, names:{k:имя}, fa, ft, empty,
+       vl:true — подписи значений над столбцами (итог месяца; CALL — фиолетовым), fv — формат подписи (по умолчанию short)} */
+/* выбор подписей, которые не налезают друг на друга: items [{x,y,w,v}] — центр, базовая линия, ширина; важнее те, что больше */
+function barLabelsPick(items,lh){
+  const keep=[],ok=(a,b)=>Math.abs(a.x-b.x)<(a.w+b.w)/2+3&&Math.abs(a.y-b.y)<lh;
+  items.slice().sort((a,b)=>b.v-a.v).forEach(it=>{if(!keep.some(k=>ok(k,it)))keep.push(it)});
+  return keep;
+}
+function stackedMonths(el,o){
+  const W=el.clientWidth,H=o.h||260,pl=58,pr=6,pt=o.vl?22:8,pb=26,n=o.labels.length,fa=o.fa||short,ft=o.ft||(v=>short(v)+' ₽');
+  if(!n||W<50)return emptyChart(el,H,o.empty);
+  const tot=m=>m.segs.reduce((a,s)=>a+s.v,0);
+  let mx=0;o.months.forEach(m=>{mx=Math.max(mx,tot(m),m.call||0)});
+  if(!mx)return emptyChart(el,H,o.empty);
+  const{lo,hi,step}=nice(0,mx),pw=W-pl-pr,ph=H-pt-pb,gw=pw/n,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
+  const hasCall=o.months.some(m=>m.call>0),cols=hasCall?2:1,gap=2,bw=Math.max(3,Math.min(26,(gw*.8-(cols-1)*gap)/cols));
+  const uid='sm'+Math.random().toString(36).slice(2,7);
+  let s=`<defs><pattern id="${uid}" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="var(--card)"/><rect width="2.6" height="6" fill="var(--s4)"/></pattern></defs>`,marks='',hits='';
+  for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(v)}</text>`}
+  const bt=axisTicks(o.labels,i=>pl+gw*i+gw/2,pl-4,W-pr+4);
+  const vls=[];
+  o.months.forEach((m,i)=>{
+    const gx=pl+gw*i,x0=gx+(gw-(cols*bw+(cols-1)*gap))/2;let acc=0;
+    m.segs.forEach(sg=>{if(!(sg.v>0))return;const y1=Y(acc+sg.v),y0=Y(acc),h=Math.max(0,y0-y1-.5),c=o.colors[sg.k]||'var(--s1)';
+      marks+=`<rect class="bm" data-g="${i}" x="${x0}" y="${y1}" width="${bw}" height="${h}" fill="${c}"${sg.est?' opacity=".5"':''}/>`;acc+=sg.v});
+    if(m.call>0){const x=x0+(cols-1)*(bw+gap),y=Y(m.call);marks+=`<rect class="bm" data-g="${i}" x="${x}" y="${y}" width="${bw}" height="${Math.max(0,Y(0)-y)}" fill="url(#${uid})" stroke="var(--s4)" stroke-width="1"/>`}
+    hits+=`<rect data-i="${i}" x="${gx}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
+    if(o.vl){const fv=o.fv||short,cw=11*.56,t=tot(m);
+      if(t>0){const tx=fv(t);vls.push({x:x0+bw/2,y:Y(t)-4,w:tx.length*cw,v:t,tx,c:''})}
+      if(m.call>0){const tx=fv(m.call);vls.push({x:x0+(cols-1)*(bw+gap)+bw/2,y:Y(m.call)-4,w:tx.length*cw,v:m.call,tx,c:' vl-call'})}}
+  });
+  bt.forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
+  let vt='';
+  if(o.vl)barLabelsPick(vls,13).forEach(l=>{const x=Math.max(pl+l.w/2,Math.min(W-pr-l.w/2,l.x));vt+=`<text class="ax num vl${l.c}" x="${x}" y="${l.y}" text-anchor="middle"${l.c?' style="fill:var(--s7)"':''}>${esc(l.tx)}</text>`});
+  el.innerHTML=`<svg width="${W}" height="${H}">${s}<g>${marks}</g>${vt}${hits}</svg>`;
+  const mk=el.querySelectorAll('.bm');
+  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.3);
+  bindTip(el,i=>{const m=o.months[i];let h=`<b>${esc(o.tipLabels?o.tipLabels[i]:o.labels[i])}</b>`;
+    m.segs.filter(x=>x.v>0).forEach(x=>{h+=tipRow(o.colors[x.k]||'var(--s1)',(o.names[x.k]||x.k)+(x.est?' (прогноз)':''),ft(x.v))});
+    if(m.call>0)h+=tipRow('var(--s4)','возможный CALL',ft(m.call));
+    h+=`<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${ft(tot(m))}</span></div>`;return h});
+}
+
+
+/* ── свечной график: candles(id|элемент, data, opts) ──
+   data: [{t,o,h,l,c,v}]. opts: {h, volume:false — без объёма, lines:[{v:[…по свечам],c,n,w}], band:{up:[…],low:[…],c}, levels:[{p,kind:'s'|'r'}],
+   labelOf(t) — подпись оси X, fmt(v) — формат цены, ft(i) — свой HTML подсказки, hover(i), empty}. Рост — var(--pos), падение — var(--neg). */
+function candles(id,data,o){
+  o=o||{};const el=typeof id==='string'?document.getElementById(id):id;if(!el)return;
+  const W=el.clientWidth,H=o.h||380,pl=58,pr=10,pt=10,pb=24,n=(data||[]).length;
+  if(n<2||W<80)return emptyChart(el,H,o.empty);
+  const fmt=o.fmt||(v=>(+v).toLocaleString('ru-RU',{maximumFractionDigits:v>=100?2:4})),lab=o.labelOf||(t=>t);
+  const vh=o.volume===false?0:Math.round((H-pt-pb)*.2),ph=H-pt-pb-vh-(vh?8:0),pw=W-pl-pr;
+  let mn=Infinity,mx=-Infinity;
+  data.forEach(c=>{mn=Math.min(mn,c.l);mx=Math.max(mx,c.h)});
+  if(o.band){o.band.up.forEach(v=>{if(v!=null)mx=Math.max(mx,v)});o.band.low.forEach(v=>{if(v!=null)mn=Math.min(mn,v)})}
+  if(mx===mn){mx=mn*1.01+1e-6}
+  const padv=(mx-mn)*.03,{lo,hi,step}=nice(mn-padv,mx+padv,5),Y=v=>pt+ph-(v-lo)/(hi-lo)*ph,X=i=>pl+(i+.5)/n*pw,gw=pw/n,bw=Math.max(1,Math.min(14,gw*.7));
+  let s='';
+  for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-8}" y="${y+4}" text-anchor="end">${fmt(+v.toFixed(6))}</text>`}
+  axisTicks(data.map(c=>lab(c.t)),X,pl-4,W-pr+4,18).forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(lab(data[i].t))}</text>`);
+  if(o.band){const pts=[],bt=[];for(let i=0;i<n;i++){const u=o.band.up[i],l=o.band.low[i];if(u==null||l==null)continue;pts.push(X(i).toFixed(1)+','+Y(u).toFixed(1));bt.push(X(i).toFixed(1)+','+Y(l).toFixed(1))}
+    if(pts.length>1)s+=`<polygon points="${pts.join(' ')} ${bt.reverse().join(' ')}" fill="${o.band.c||'#7a8cff'}" fill-opacity=".1" stroke="${o.band.c||'#7a8cff'}" stroke-opacity=".5" stroke-width="1"/>`}
+  (o.levels||[]).forEach(L=>{if(L.p<lo||L.p>hi)return;const c=L.kind==='r'?'var(--neg)':'var(--pos)',y=Y(L.p);
+    s+=`<line x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}" stroke="${c}" stroke-opacity=".6" stroke-dasharray="5 4"/><text class="ax num" x="${W-pr-4}" y="${y-4}" text-anchor="end" style="fill:${c}">${fmt(L.p)}</text>`});
+  let marks='',vol='';
+  if(vh){const vm=Math.max(...data.map(c=>c.v||0),1),vy=pt+ph+8;
+    data.forEach((c,i)=>{const h=Math.max(1,(c.v||0)/vm*vh);vol+=`<rect x="${X(i)-bw/2}" y="${vy+vh-h}" width="${bw}" height="${h}" fill="${c.c>=c.o?'var(--pos)':'var(--neg)'}" opacity=".45"/>`})}
+  data.forEach((c,i)=>{const up=c.c>=c.o,col=up?'var(--pos)':'var(--neg)',x=X(i),yo=Y(c.o),yc=Y(c.c);
+    marks+=`<line x1="${x}" x2="${x}" y1="${Y(c.h)}" y2="${Y(c.l)}" stroke="${col}" stroke-width="1"/><rect x="${x-bw/2}" y="${Math.min(yo,yc)}" width="${bw}" height="${Math.max(1,Math.abs(yc-yo))}" fill="${col}"/>`});
+  (o.lines||[]).forEach(L=>{const pts=[];L.v.forEach((v,i)=>{if(v!=null&&v>=lo&&v<=hi)pts.push(X(i).toFixed(1)+','+Y(v).toFixed(1))});
+    if(pts.length>1)s+=`<polyline points="${pts.join(' ')}" fill="none" stroke="${L.c}" stroke-width="${L.w||1.5}" stroke-linejoin="round"/>`});
+  let hits='';for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${pl+gw*i}" y="${pt}" width="${gw}" height="${H-pt-pb}" fill="transparent"/>`;
+  el.innerHTML=`<svg width="${W}" height="${H}">${s}${vol}${marks}<g class="hv"></g>${hits}</svg>`;
+  const hv=el.querySelector('.hv');
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph+vh+8}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`};
+  bindTip(el,i=>{o.hover&&o.hover(i);if(o.ft)return o.ft(i);const c=data[i],up=c.c>=c.o;
+    let h=`<b>${esc(lab(c.t))}</b>`+tipRow(up?'var(--pos)':'var(--neg)','Закрытие',fmt(c.c))+tipRow('var(--mu)','Открытие',fmt(c.o))+tipRow('var(--mu)','Максимум',fmt(c.h))+tipRow('var(--mu)','Минимум',fmt(c.l));
+    if(c.v)h+=tipRow('var(--mu)','Объём',short(c.v));
+    (o.lines||[]).forEach(L=>{if(L.v[i]!=null)h+=tipRow(L.c,L.n,fmt(L.v[i]))});return h});
+}

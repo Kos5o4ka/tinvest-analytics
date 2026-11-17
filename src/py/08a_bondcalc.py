@@ -98,6 +98,102 @@ def fl_estimates(bz, today, face, path=None):
     return out
 
 
+FL_SPREAD_KEY, FL_SPREAD_TTL, FL_SPREAD_RPS = "fl_spread1:", 30 * 86400, 4
+
+
+def fl_base_kind(name, kind=None, details=None):
+    """База флоатера, если она видна: сначала поле ISS COUPON_DETAILS («Ключевая ставка», «ИПЦ», «RUONIA»), затем по названию:
+    ruonia (ОФЗ-ПК — все плавающие ОФЗ привязаны к RUONIA; «RUONIA» в названии), infl (ОФЗ-ИН, «инфляц»), иначе key."""
+    d = (details or "").upper()
+    if "RUONIA" in d:
+        return "ruonia"
+    if "ИПЦ" in d or "ИНФЛ" in d:
+        return "infl"
+    if "КЛЮЧЕВ" in d:
+        return "key"
+    n = (name or "").upper()
+    if kind == "ofz" or "RUONIA" in n or re.search(r"ОФЗ[\s-]*ПК", n):
+        return "ruonia"
+    if "ИНФЛ" in n or re.search(r"ОФЗ[\s-]*ИН\b", n):
+        return "infl"
+    return "key"
+
+
+def fl_spread_calc(bz, face, today=None):
+    """Спред флоатера к ключевой ставке, п.п. (медиана по последним FL_SPREAD_N известным купонам; как в fl_estimates, но
+    не требует будущих купонов без ставки). None — вывести нельзя."""
+    if not bz or not face:
+        return None
+    today = today or date.today().isoformat()
+    try:
+        ser = key_rate_series()
+    except Exception:  # noqa: BLE001
+        return None
+    if not ser:
+        return None
+    cps = sorted((c["coupondate"], c.get("value"), c.get("valueprc")) for c in bz.get("coupons") or [] if c.get("coupondate"))
+    am_all = sorted((a["amortdate"], a.get("value")) for a in bz.get("amort") or [] if a.get("amortdate") and a.get("value"))
+    samples = []
+    for i, (d, v, vp) in enumerate(cps):
+        if not v or i == 0 or d > today:
+            continue
+        p0 = cps[i - 1][0]
+        k = key_rate_on(ser, p0)
+        days = (datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(p0, "%Y-%m-%d")).days
+        if k is None or days <= 0:
+            continue
+        fa = face + sum(x for da, x in am_all if d <= da <= today)
+        samples.append((vp if vp else v / max(fa, 1e-9) * 365.0 / days * 100.0) - k)
+    samples = sorted(samples[-FL_SPREAD_N:])
+    if not samples:
+        return None
+    n = len(samples)
+    sp = samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2.0
+    return round(sp, 2) if FL_SPREAD_RANGE[0] <= sp <= FL_SPREAD_RANGE[1] else None
+
+
+def fl_spread_put(isin, name, bz, face, kind=None, details=None):
+    """Считает и кладёт в kv fl_spread1:<isin> -> {spread, base, ts}; для не ключевой базы спред не показываем."""
+    base = fl_base_kind(name, kind, details)
+    if base == "key" and not bz:
+        return None                       # нет графика выплат — не кэшируем на 30 суток, повторим позже
+    sp = fl_spread_calc(bz, face) if base == "key" else None
+    v = {"spread": sp, "base": base, "ts": time.time()}
+    store().put(FL_SPREAD_KEY + isin, v)
+    return v
+
+
+def fl_spread_cached(isins=None):
+    """Синхронное чтение кэша спредов: {isin: {spread, base}}; без сети. Просроченные (> 30 сут) пропускаются."""
+    out, now = {}, time.time()
+    try:
+        for k, v, t in store().conn().execute("SELECT k, v, t FROM kv WHERE k LIKE ?", (FL_SPREAD_KEY + "%",)):
+            if now - t > FL_SPREAD_TTL:
+                continue
+            isin = k[len(FL_SPREAD_KEY):]
+            if isins is None or isin in isins:
+                out[isin] = json.loads(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def fl_label(info, floating=True):
+    """Подпись типа купона: «КС + 3,50%» / «RUONIA» / «ИНФЛЯЦИЯ» / «ФЛОАТЕР»; фикс — «ФИКС»."""
+    if not floating:
+        return "ФИКС"
+    info = info or {}
+    b = info.get("base")
+    if b == "ruonia":
+        return "RUONIA"
+    if b == "infl":
+        return "ИНФЛЯЦИЯ"
+    sp = info.get("spread")
+    if b == "key" and sp is not None:
+        return "КС %s %s%%" % ("+" if sp >= 0 else "−", ("%.2f" % abs(sp)).replace(".", ","))
+    return "ФЛОАТЕР"
+
+
 def bond_flows(bz, today, face, mode="auto", floating=False, est_out=None, cut=None):
     """Будущие потоки на одну облигацию: [(дата, купон, номинал)] и признак окончания ('offer'/'maturity').
     face — текущий номинал. Неизвестные купоны флоатера (floating=True) оцениваются по прогнозу ключевой ставки

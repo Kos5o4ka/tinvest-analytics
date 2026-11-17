@@ -1,0 +1,19 @@
+[Unit]
+Description=TAnalytic disclosure collector (e-disclosure.azipi.ru -> disclosure.sqlite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tinvest
+Group=tinvest
+ExecStart=/usr/bin/python3 /opt/tinvest-analytics/server/disclosure_worker.py --data /var/lib/tinvest-server
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tinvest-server
+
+[Install]
+WantedBy=multi-user.target

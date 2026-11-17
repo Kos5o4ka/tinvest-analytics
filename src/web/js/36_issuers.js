@@ -147,6 +147,50 @@ function issIfrsBlock(ib){
     <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. LTM — последние 12 месяцев по квартальной отчётности (если новее годовой). Рост выручки считается по годовым данным. <a href="${esc(ib.url)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a> — данные агрегатора, могут отличаться от официальной отчётности.</p>`;
   return h;
 }
+/* ── Выплаты эмитента по месяцам: «Рублёвый эквивалент» (число бумаг в рынке x выплата на бумагу, по всем торгуемым выпускам) ── */
+const ISS_FL_CH=[['all','Все'],['coupon','Купоны'],['amort','Амортизации'],['redemption','Погашения'],['put','PUT'],['call','CALL']];
+const ISS_FL_T={all:['coupon','amort','redemption'],coupon:['coupon'],amort:['amort'],redemption:['redemption'],put:['put'],call:[]};
+const ISS_MN=['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
+const issPl=(n,a,b,c)=>{const m=n%100,d=n%10;return m>10&&m<20?c:d===1?a:d>1&&d<5?b:c};
+function loadIssFlows(inn,force){
+  const I=S.iss;I.fl=I.fl||{};if(I.fl[inn]&&!force)return;I.fl[inn]={loading:1};
+  api('/api/issuer_flows?inn='+encodeURIComponent(inn)).then(j=>{I.fl[inn]=j}).catch(e=>{I.fl[inn]={error:e.message||String(e)}})
+   .then(()=>{if(S.page==='iss')render()});
+}
+function issFlowsHtml(inn){
+  if(!inn)return'';
+  const I=S.iss;I.fl=I.fl||{};I.fchip=I.fchip||'all';
+  let h=`<h3 class="iss-h">Выплаты по выпускам эмитента</h3>`;
+  if(!I.fl[inn]){loadIssFlows(inn);return h+waitBox('Собираю графики выплат выпусков…')}
+  const d=I.fl[inn];
+  if(d.loading)return h+waitBox('Собираю графики выплат выпусков…');
+  if(d.error)return h+`<div class="msg err">${esc(d.error)}</div>`;
+  if(!d.bonds||!d.bonds.length)return h+`<div class="mu" style="font-size:13px">Нет торгуемых выпусков с известным графиком выплат.${(d.warnings||[]).length?'<br>'+d.warnings.slice(0,3).map(esc).join('<br>'):''}</div>`;
+  const t=d.totals||{},ft=v=>short(v)+' ₽';
+  h+=`<div class="iss-fl-h"><b>Рублёвый эквивалент</b><span class="mu">${d.n_months} ${issPl(d.n_months,'месяц','месяца','месяцев')} · ${d.dates} ${issPl(d.dates,'дата','даты','дат')} · выплаты ${ft(t.payments||0)} · возможный CALL ${ft(t.call||0)}</span></div>
+    <div class="iss-fl-chips" id="iss-fl-chips">${ISS_FL_CH.map(([k,n])=>`<button data-fc="${k}" class="${I.fchip===k?'on':''}">${n}</button>`).join('')}</div>
+    <div class="legend iss-fl-leg">${d.bonds.map((b,i)=>`<span title="${esc(b.isin)}"><i style="background:${PAL[i%PAL.length]}"></i>${esc(b.name)}</span>`).join('')}<span><i class="iss-hatch"></i>возможный CALL</span><span><i style="background:var(--s1);opacity:.5"></i>прогноз ставки</span></div>
+    <div id="iss-fl-ch" class="bc-ch"></div>`;
+  chart('iss-fl-ch',issFlowChart,{d,chip:I.fchip});
+  const est=d.bonds.filter(b=>/^issue_/.test(b.method||'')).length,w=d.warnings||[];
+  h+=`<p class="note" style="margin-top:6px">Число бумаг в рынке берётся из раскрытий эмитента (по последнему купону), а если их нет — из объёма выпуска Мосбиржи${est?` (так посчитано выпусков: ${est}, оценка может быть завышена из-за выкупов)`:''}. Прогноз — купоны флоатеров с ещё не объявленной ставкой. Выплаты после даты возможного CALL показаны как объявленные. Валютные выпуски пересчитаны по текущему курсу ЦБ.${w.length?` Не учтено: ${w.slice(0,3).map(esc).join('; ')}${w.length>3?' и ещё '+(w.length-3):''}.`:''}</p>`;
+  return h;
+}
+function issFlowChart(el,o){
+  const d=o.d,types=ISS_FL_T[o.chip]||[],showCall=o.chip==='all'||o.chip==='call',cols={},names={};
+  d.bonds.forEach((b,i)=>{cols[b.isin]=PAL[i%PAL.length];names[b.isin]=b.name});
+  const labels=d.months.map(m=>ISS_MN[+m.m.slice(5)-1]+(m.m.slice(5)==='01'||m===d.months[0]?' '+m.m.slice(2,4):''));
+  const months=d.months.map(m=>{
+    const segs=[];
+    d.bonds.forEach(b=>{
+      const v=types.reduce((a,t)=>a+((m.parts&&m.parts[t]&&m.parts[t][b.isin])||0),0);if(!v)return;
+      const e=types.includes('coupon')?Math.min((m.est_by_bond||{})[b.isin]||0,v):0;
+      if(v-e>0)segs.push({k:b.isin,v:v-e});if(e>0)segs.push({k:b.isin,v:e,est:true});
+    });
+    return{segs,call:showCall?m.call:0};
+  });
+  stackedMonths(el,{h:260,vl:true,labels,tipLabels:d.months.map(m=>ISS_MN[+m.m.slice(5)-1]+' '+m.m.slice(0,4)),months,colors:cols,names,fa:short,ft:v=>short(v)+' ₽',empty:'Нет выплат в выбранной категории'});
+}
 function issDetail(isin){
   const I=S.iss,c=I.cards[isin];
   const bar=`<div class="row" style="justify-content:flex-end"><button class="btn ghost" id="iss-close" style="padding:4px 12px;font-size:12px">Свернуть ✕</button></div>`;
@@ -174,6 +218,7 @@ function issDetail(isin){
       <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. EBIT здесь — прибыль до налогообложения плюс проценты к уплате (если строки нет — прибыль от продаж). Источник: бухгалтерская отчётность по РСБУ, ГИР БО ФНС (отчётность отдельной компании, не группы).</p>`;
   }
   }
+  h+=issFlowsHtml(is.inn);
   h+=`<h3 class="iss-h">Рынок и отчётность</h3><div class="bc-rel">`;
   if(m.key)h+=`<b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b><br>`;else h+=esc(m.text||'');
   const ms=c.basis==='ifrs'?ib.score:s;
@@ -197,6 +242,7 @@ function bindIss(){
     t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;I.sort={k,d:I.sort.k===k?-I.sort.d:(k==='name'?1:-1)};render()};
     t.querySelector('tbody').onclick=e=>{const r=e.target.closest('[data-iss]');if(!r)return;I.sel=I.sel===r.dataset.iss?null:r.dataset.iss;I.scroll=I.sel?1:0;render()};
   }
+  const fc=$('#iss-fl-chips');if(fc)fc.onclick=e=>{const b=e.target.closest('[data-fc]');if(!b)return;I.fchip=b.dataset.fc;render()};
   const rt=$('#iss-retry');if(rt)rt.onclick=()=>{I.data=null;render()};
   const rf=$('#iss-ref');if(rf)rf.onclick=()=>{I.data=null;I.cards={};loadIss(true);render()};
   const cl=$('#iss-close');if(cl)cl.onclick=()=>{I.sel=null;render()};

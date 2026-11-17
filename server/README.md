@@ -134,6 +134,46 @@ python3 server/tinvest_server.py --version
 Если сервер уже работал по старой схеме (`/opt/tinvest-server/tinvest_server.py`), остановите и отключите старый юнит перед шагом 5,
 кэш в `/var/lib/tinvest-server` подхватится новым сервисом.
 
+## Сборщик сообщений о раскрытии (`disclosure_worker.py`)
+
+Отдельный процесс (тоже только stdlib), который собирает сообщения эмитентов по облигациям (выплаченные и начисленные доходы, неисполнение
+обязательств, итоги приобретения, досрочное погашение) и раскладывает их в факты по ISIN. Сервер данных отдаёт их клиентам из готовой базы.
+
+- **Откуда:** `e-disclosure.azipi.ru` (открытое зеркало; лента сообщений по дням `/messages/list/day-ДД.ММ.ГГГГ/…` и страницы сообщений `/messages/<id>/`).
+  `e-disclosure.ru` не используется. Универсум эмитентов — ИНН облигаций, торгуемых на MOEX (ISS `securities.json`, обновляется раз в сутки).
+- **Как часто:** один поток, не чаще 1 запроса в 1,5 с к azipi (`--pace`), к ISS — 0,3 с. Честный `User-Agent: TAnalytic-disclosure/1.0 (+репозиторий)`.
+  При 429/5xx/сетевых ошибках — повтор с растущей паузой (уважает `Retry-After`), после 5 ошибок подряд — пауза 10 минут.
+- **Режимы:** *live* — каждые `--interval` (60 с) читает ленту сегодняшнего дня с первой страницы, пока не встретит страницу с уже известными id; после полуночи по Москве
+  один раз дособирает вчерашний день; качает тексты нужных сообщений (`wanted`: ИНН из универсума и подходящий заголовок, список `WANTED_TITLES` в коде).
+  *backfill* — история от вчера назад по дням до `--since` (по умолчанию 2015-01-01) или до 60 календарных дней подряд без сообщений (конец архива запоминается).
+  Live-цикл имеет приоритет: между днями истории проверяется, не пора ли его запустить.
+- **База:** `<--data>/disclosure.sqlite` (WAL): `universe`, `feed` (все элементы ленты — метаданные), `docs` (тексты), `facts` (разобранные факты, `parser_ver`), `days` (прогресс истории), `meta`.
+  Разбор текста делают те же `doc_text`/`dc_extract`, что в клиенте: воркер подгружает собранный `tinvest_analytics.py` из корня репозитория (`--lib`), поэтому в репозитории он должен быть собран (`python3 build.py`).
+- **Сколько собирается история:** будний день ≈ 64 страницы ленты (10 сообщений на странице; 470–640 сообщений) + 30–60 текстов нужных сообщений: около 100–160 запросов,
+  то есть ≈ 2,5–4 минуты при `--pace 1.5`. Выходные пустые (1 запрос). С 2015 года ~3100 будних дней, более ранние годы заметно короче: порядка 5–7 суток непрерывной работы. Live при этом не страдает.
+  Оценка по фактическим данным: `--stats` (поле `eta_days`).
+- **Чтение клиентами** (тот же ключ, что у остальных `/v1/parsed/…`, ответ не кэшируется, нет базы — пустой результат):
+  - `/v1/parsed/disclosure/facts?isin=RU000A10B024` или `?inn=7703104630` (+ `kind=coupon_paid|coupon_declared|default|buyback_result|other`, `limit`, по умолчанию 200) — факты, новые первыми:
+    `{doc_id, title, published, url, isin, inn, kind, event_date, due_date, conf, data}`;
+  - `/v1/parsed/disclosure/defaults?since=ГГГГ-ММ-ДД` (по умолчанию 30 дней назад) — факты о неисполнении обязательств;
+  - `/v1/parsed/disclosure/status` — счётчики и диапазон истории (то же, что `--stats`).
+
+Запуск и установка:
+
+```
+python3 server/disclosure_worker.py --data DIR                 # постоянный режим (live + история)
+python3 server/disclosure_worker.py --data DIR --once --days 2 # один live-цикл + 2 дня истории и выход (для проверки/cron)
+python3 server/disclosure_worker.py --data DIR --stats         # счётчики, диапазон истории, оценка времени до конца
+python3 server/disclosure_worker.py --data DIR --reparse       # заново разобрать сохранённые тексты после обновления парсера
+sudo cp /opt/tinvest-analytics/server/deploy/tinvest-disclosure.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now tinvest-disclosure
+journalctl -u tinvest-disclosure -f                            # строки «день …: страниц, элементов, новых, нужных», «тексты: загружено»
+```
+
+Остальные флаги: `--pace`, `--interval`, `--since ГГГГ-ММ-ДД`, `--no-backfill` (только live), `--lib PATH`, `--verbose`. SIGTERM останавливает процесс корректно.
+Юнит работает от `tinvest` и пишет только в `/var/lib/tinvest-server`; ночное обновление `tinvest-update.sh` перезапускает его вместе с сервером данных, если он включён.
+После обновления парсера (`src/py/12c_disclosure_parse.py`, пересобранный `tinvest_analytics.py`) выполните `--reparse` (остановите сервис на время или запускайте от того же пользователя: SQLite WAL терпит параллельное чтение, но запись одна).
+
 ## Cloudflare Tunnel
 
 Сервер слушает только `127.0.0.1`, наружу его выставляет именованный туннель `cloudflared`: открывать порты на VPS не нужно.
@@ -234,3 +274,42 @@ keys(key_hash TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, created REAL NOT NULL, e
 ## На будущее
 
 Проверка доступа вынесена в функцию `authorize_ex()` / `authorize()` в `tinvest_server.py`.
+
+## Потоки денег и стакан («Кто покупает»): `flows_worker.py`, `tinvest_md.py`
+
+Экран «Кто покупает»: куда идут деньги (акции / облигации / фонды / сектора), крупные сделки, всплески объёма и стакан.
+
+**Токен владельца (только чтение).** Нужен для реального времени (сделки и стакан T-Invest). Без токена всё работает по ISS Мосбиржи
+с задержкой ~15 минут, стакан в клиенте берётся по токену самого пользователя. Токен **только на VPS, в git его нет**; он должен быть
+*только для чтения* (не «полный доступ», не «торговый»). Установка:
+
+```sh
+sudo install -d -m 700 /etc/tanalytic
+sudo install -m 600 -o root /dev/stdin /etc/tanalytic/tinvest_token     # вставьте токен, Enter, Ctrl+D
+sudo cp server/deploy/tinvest-flows.service /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl enable --now tinvest-flows && sudo systemctl restart tinvest-server
+```
+
+Порядок поиска токена (`tinvest_md.load_token`): `$CREDENTIALS_DIRECTORY/tinvest_token` -> `$TINVEST_SERVER_TOKEN` -> файл `--token-file`.
+В юнитах выбран вариант без `LoadCredential=` (он роняет юнит, если файла нет): перед запуском `ExecStartPre=+…` (от root) копирует
+`/etc/tanalytic/tinvest_token`, если он есть, в `/run/tinvest-{server,flows}/tinvest_token` (tmpfs, 600, владелец — пользователь сервиса),
+а `--token-file` указывает туда. Нет файла — функции T-Invest выключены, всё остальное работает.
+
+**Защита.** `tinvest_md.py` вызывает только методы из белого списка (MarketData: GetCandles, GetLastTrades, GetOrderBook, GetLastPrices,
+GetTradingStatus; Instruments: Shares, Bonds, Etfs, GetAssetFundamentals, GetAssetReports, GetDividends, GetBondCoupons, FindInstrument,
+GetInstrumentBy); счета, портфель, операции и заявки недоступны. Токен маскируется (`t.***1234`) в журналах и ошибках и никогда не
+попадает в ответы. Тест `tests/test_flows.py` сканирует репозиторий на строки вида токена. Лимиты (токен-бакет): MarketData сборщик
+200/мин (`--md-rate`) + сервер 100/мин на живые запросы; Instruments 100/мин (сервер 30/мин); интерактивные запросы имеют приоритет.
+
+**Сборщик** (`python3 server/flows_worker.py --data DIR [--token-file F] [--once] [--stats] [--verbose]`, юнит `tinvest-flows.service`):
+универсум — акции TQBR + ~150 облигаций (TQCB/TQOB) + ~40 фондов (TQTF и ETF в TQBR) по обороту дня, обновляется раз в 30 минут.
+Сделки: T-Invest `GetLastTrades` по кругу (весь список за ~2–3 минуты) и ISS `trades.json` по курсору `TRADENO` (поле `BUYSELL`).
+Хранятся только агрегаты по 5 минутам (45 дней), крупные сделки (30 дней) и всплески. Крупная сделка = не меньше max(5 млн ₽ акции/фонды,
+10 млн ₽ облигации; 99-й перцентиль сумм сделок бумаги за 20 дней). Всплеск = оборот 10 минут >= 3× медианы того же слота за 20 торговых
+дней (10-минутные свечи ISS) и >= 1 млн ₽. База `flows.sqlite`.
+
+**Чтение (через `/v1/parsed/`):** `flows/summary?period=5m|1h|day`, `flows/instrument?secid=&period=`, `flows/large?since=&class=share|bond|fund&min=&secids=&isins=`,
+`flows/spikes?since=`, `flows/instruments`, `flows/status` — из базы, без кэша; живые `md/orderbook?secid=&depth=20` и `md/trades?secid=&minutes=60`
+(кэш 1,5 с на бумагу, single-flight; без токена — 404 `no_token`).
+Дивиденды и фундаментал акций TQBR для клиентов без своего токена: `md/dividends?secid=` (кэш 12 ч), `md/fundamentals` (все акции, пачки по 100,
+кэш 6 ч, фоновый приоритет), `md/reports?secid=` (следующая отчётность, кэш 24 ч); список акций (тикер → uid/assetUid) кэшируется на сутки.

@@ -39,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from html.parser import HTMLParser
+import socket
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -515,6 +516,30 @@ class TInvest:
                 if k and p.get("price"):
                     out[k] = qf(p["price"])
         return out
+
+    # — отчётность, фундаментальные показатели, стакан и обезличенные сделки (акции) —
+    def asset_reports(self, asset_uid, frm, to):
+        """Даты отчётности эмитента: [{reportDate, periodYear, periodNum, periodType, createdAt}]. frm/to — RFC 3339."""
+        return self.call("InstrumentsService", "GetAssetReports",
+                         {"instrumentId": asset_uid, "from": frm, "to": to}, timeout=30).get("reports") or []
+
+    def asset_fundamentals(self, asset_uids):
+        """Фундаментальные показатели активов (до 100 за вызов): [{assetUid, peRatioTtm, priceToBookTtm, evToEbitdaMrq, ...}]."""
+        out = []
+        uids = [u for u in asset_uids if u]
+        for i in range(0, len(uids), 100):
+            out.extend(self.call("InstrumentsService", "GetAssetFundamentals", {"assets": uids[i:i + 100]},
+                                 timeout=60).get("fundamentals") or [])
+        return out
+
+    def order_book(self, instrument_id, depth=20):
+        """Стакан: {bids: [{price, quantity}], asks: [...], lastPrice, limitUp, limitDown, ...}; depth — 1, 10, 20, 30, 40 или 50."""
+        return self.call("MarketDataService", "GetOrderBook", {"instrumentId": instrument_id, "depth": int(depth)}, timeout=20)
+
+    def last_trades(self, instrument_id, frm, to):
+        """Обезличенные сделки за интервал (до часа): [{price, quantity, direction, time, ...}]. frm/to — RFC 3339."""
+        return self.call("MarketDataService", "GetLastTrades",
+                         {"instrumentId": instrument_id, "from": frm, "to": to}, timeout=30).get("trades") or []
 
 
 def pool_map(fn, items, workers=8):
@@ -1920,6 +1945,102 @@ def fl_estimates(bz, today, face, path=None):
         rate = max(0.0, base + spread)
         out[d] = {"rate": rate, "base": base, "spread": spread, "amt": rate / 100.0 * face_at(d) * ndays(p0, d) / 365.0}
     return out
+
+
+FL_SPREAD_KEY, FL_SPREAD_TTL, FL_SPREAD_RPS = "fl_spread1:", 30 * 86400, 4
+
+
+def fl_base_kind(name, kind=None, details=None):
+    """База флоатера, если она видна: сначала поле ISS COUPON_DETAILS («Ключевая ставка», «ИПЦ», «RUONIA»), затем по названию:
+    ruonia (ОФЗ-ПК — все плавающие ОФЗ привязаны к RUONIA; «RUONIA» в названии), infl (ОФЗ-ИН, «инфляц»), иначе key."""
+    d = (details or "").upper()
+    if "RUONIA" in d:
+        return "ruonia"
+    if "ИПЦ" in d or "ИНФЛ" in d:
+        return "infl"
+    if "КЛЮЧЕВ" in d:
+        return "key"
+    n = (name or "").upper()
+    if kind == "ofz" or "RUONIA" in n or re.search(r"ОФЗ[\s-]*ПК", n):
+        return "ruonia"
+    if "ИНФЛ" in n or re.search(r"ОФЗ[\s-]*ИН\b", n):
+        return "infl"
+    return "key"
+
+
+def fl_spread_calc(bz, face, today=None):
+    """Спред флоатера к ключевой ставке, п.п. (медиана по последним FL_SPREAD_N известным купонам; как в fl_estimates, но
+    не требует будущих купонов без ставки). None — вывести нельзя."""
+    if not bz or not face:
+        return None
+    today = today or date.today().isoformat()
+    try:
+        ser = key_rate_series()
+    except Exception:  # noqa: BLE001
+        return None
+    if not ser:
+        return None
+    cps = sorted((c["coupondate"], c.get("value"), c.get("valueprc")) for c in bz.get("coupons") or [] if c.get("coupondate"))
+    am_all = sorted((a["amortdate"], a.get("value")) for a in bz.get("amort") or [] if a.get("amortdate") and a.get("value"))
+    samples = []
+    for i, (d, v, vp) in enumerate(cps):
+        if not v or i == 0 or d > today:
+            continue
+        p0 = cps[i - 1][0]
+        k = key_rate_on(ser, p0)
+        days = (datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(p0, "%Y-%m-%d")).days
+        if k is None or days <= 0:
+            continue
+        fa = face + sum(x for da, x in am_all if d <= da <= today)
+        samples.append((vp if vp else v / max(fa, 1e-9) * 365.0 / days * 100.0) - k)
+    samples = sorted(samples[-FL_SPREAD_N:])
+    if not samples:
+        return None
+    n = len(samples)
+    sp = samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2.0
+    return round(sp, 2) if FL_SPREAD_RANGE[0] <= sp <= FL_SPREAD_RANGE[1] else None
+
+
+def fl_spread_put(isin, name, bz, face, kind=None, details=None):
+    """Считает и кладёт в kv fl_spread1:<isin> -> {spread, base, ts}; для не ключевой базы спред не показываем."""
+    base = fl_base_kind(name, kind, details)
+    if base == "key" and not bz:
+        return None                       # нет графика выплат — не кэшируем на 30 суток, повторим позже
+    sp = fl_spread_calc(bz, face) if base == "key" else None
+    v = {"spread": sp, "base": base, "ts": time.time()}
+    store().put(FL_SPREAD_KEY + isin, v)
+    return v
+
+
+def fl_spread_cached(isins=None):
+    """Синхронное чтение кэша спредов: {isin: {spread, base}}; без сети. Просроченные (> 30 сут) пропускаются."""
+    out, now = {}, time.time()
+    try:
+        for k, v, t in store().conn().execute("SELECT k, v, t FROM kv WHERE k LIKE ?", (FL_SPREAD_KEY + "%",)):
+            if now - t > FL_SPREAD_TTL:
+                continue
+            isin = k[len(FL_SPREAD_KEY):]
+            if isins is None or isin in isins:
+                out[isin] = json.loads(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def fl_label(info, floating=True):
+    """Подпись типа купона: «КС + 3,50%» / «RUONIA» / «ИНФЛЯЦИЯ» / «ФЛОАТЕР»; фикс — «ФИКС»."""
+    if not floating:
+        return "ФИКС"
+    info = info or {}
+    b = info.get("base")
+    if b == "ruonia":
+        return "RUONIA"
+    if b == "infl":
+        return "ИНФЛЯЦИЯ"
+    sp = info.get("spread")
+    if b == "key" and sp is not None:
+        return "КС %s %s%%" % ("+" if sp >= 0 else "−", ("%.2f" % abs(sp)).replace(".", ","))
+    return "ФЛОАТЕР"
 
 
 def bond_flows(bz, today, face, mode="auto", floating=False, est_out=None, cut=None):
@@ -3869,6 +3990,12 @@ def _auth_reset():
         _auth["res"] = None
 
 
+def _ds_is_timeout(e):
+    """Тайм-аут чтения (сервер жив, но этот ответ долгий), а не отказ соединения."""
+    r = getattr(e, "reason", None)
+    return isinstance(e, (TimeoutError, socket.timeout)) or isinstance(r, (TimeoutError, socket.timeout)) or "timed out" in str(e)
+
+
 def _ds_down(msg):
     with _ds_lock:
         _ds_state["down_until"] = time.time() + DS_DOWN_SECS
@@ -3928,6 +4055,8 @@ def _ds_request(srv, key, url, data, headers, timeout):
         _ds_down("сервер ответил %d%s" % (e.code, " (неверный ключ)" if e.code in (401, 403) else ""))
         return None
     except Exception as e:  # noqa: BLE001
+        if _ds_is_timeout(e):                          # медленный ответ одного запроса — не повод отключать сервер для всех
+            return None
         _ds_down("нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
         return None
 
@@ -3957,6 +4086,8 @@ def ds_parsed(name, params=None, timeout=20):
             _ds_down("сервер ответил %d" % e.code)
         return None                                    # 404 (старый сервер), 5xx источника и т.п. — не «роняем» сервер
     except Exception as e:  # noqa: BLE001
+        if _ds_is_timeout(e):                          # медленный ответ одного запроса — не повод отключать сервер для всех
+            return None
         _ds_down("нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
         return None
     if not isinstance(j, dict) or j.get("ok") is not True or j.get("v") != DS_PARSED_V:
@@ -4817,6 +4948,921 @@ def best_rating(isin, name):
     low = max(allr, key=lambda x: RATING_SCALE.index(x["rating"]))
     return {"v": low["rating"], "agency": low["agency"], "issuer": low["issuer"], "date": low["date"],
             "approx": low["approx"], "all": allr}
+# ═══════════════════════════════ документы раскрытия: извлечение текста ═══════════════════════════════
+# doc_text(bytes, ctype, name) -> {"text", "kind": html|pdf|docx|rtf|txt, "needs_ocr"}. Только stdlib, без сети.
+# Вид определяется по сигнатуре (%PDF, PK + word/document.xml, {\rtf), затем по ctype/расширению, затем по началу текста.
+# Весь текст после извлечения приводится к одному виду (_dt_norm): пробелы схлопнуты, табы между ячейками таблиц сохранены,
+# нумерация пунктов («2.4.») остаётся в начале строки.
+import codecs
+
+_DT_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_DT_BLOCK = frozenset(("p", "div", "br", "tr", "li", "ul", "ol", "table", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "section", "article"))
+_DT_SKIP = frozenset(("script", "style", "noscript", "head", "template"))
+
+
+def _dt_norm(text):
+    """Единая нормализация: неразрывные пробелы, схлопывание пробелов, не более одной пустой строки подряд."""
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x0b", "\n").replace("\x0c", "\n")
+    t = re.sub("[\u200b\u200c\u200d\ufeff\u00ad]", "", t)
+    t = re.sub("[\u00a0\u2000-\u200a\u202f\u205f\u3000]", " ", t)
+    out = []
+    for ln in t.split("\n"):
+        ln = re.sub(r"[ \t]*\t[ \t]*", "\t", re.sub(r" {2,}", " ", ln)).strip(" \t")
+        out.append(ln)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+class _DtHtml(HTMLParser):
+    """HTML -> текст: блочные теги дают перевод строки, ячейки таблиц — табуляцию."""
+
+    def __init__(self):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.out = []
+        self.stack = []        # открытые «скрываемые» теги
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "body":
+            self.stack = []    # незакрытый <head> не должен съесть тело
+        if tag in _DT_SKIP:
+            self.stack.append(tag)
+        elif not self.stack and tag in _DT_BLOCK:
+            self.out.append("\n")
+
+    def handle_endtag(self, tag):
+        if self.stack:
+            if tag == self.stack[-1]:
+                self.stack.pop()
+            return
+        if tag in ("td", "th"):
+            self.out.append("\t")
+        elif tag in _DT_BLOCK and tag != "br":
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if not self.stack:
+            self.out.append(re.sub(r"\s+", " ", data))
+
+
+def _dt_html_text(s):
+    p = _DtHtml()
+    try:
+        p.feed(s)
+        p.close()
+    except Exception:
+        pass
+    return "".join(p.out)
+
+
+def _dt_decode(data, ctype=""):
+    """Байты -> строка: BOM, charset из ctype / <meta>, затем utf-8, затем cp1251."""
+    if data[:3] == b"\xef\xbb\xbf":
+        return data[3:].decode("utf-8", "replace")
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", "replace")
+    cands = []
+    m = re.search(r"charset\s*=\s*[\"']?([\w.-]+)", ctype or "", re.I)
+    if not m:
+        m = re.search(rb"charset\s*=\s*[\"']?([\w.-]+)", data[:4096], re.I)
+    if m:
+        cs = m.group(1)
+        cands.append(cs.decode("ascii", "ignore") if isinstance(cs, bytes) else cs)
+    cands += ["utf-8", "cp1251"]
+    for cs in cands:
+        try:
+            codecs.lookup(cs)
+            return data.decode(cs)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("cp1251", "replace")
+
+
+def _dt_is_docx(data):
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            return "word/document.xml" in z.namelist()
+    except Exception:
+        return False
+
+
+def _dt_kind(data, ctype="", name=""):
+    head = data[:1024].lstrip()
+    if head[:4] == b"%PDF":
+        return "pdf"
+    if data[:4] == b"PK\x03\x04" and _dt_is_docx(data):
+        return "docx"
+    if head[:5] == b"{\\rtf":
+        return "rtf"
+    ct = (ctype or "").lower()
+    ext = os.path.splitext((name or "").lower().split("?")[0])[1]
+    if "pdf" in ct or ext == ".pdf":
+        return "pdf"
+    if "wordprocessingml" in ct or ext == ".docx":
+        return "docx"
+    if "rtf" in ct or ext == ".rtf":
+        return "rtf"
+    if "html" in ct or ext in (".htm", ".html", ".xhtml"):
+        return "html"
+    if "text/plain" in ct or ext == ".txt":
+        return "txt"
+    low = data[:2048].lower()
+    if any(t in low for t in (b"<html", b"<body", b"<div", b"<p>", b"<p ")):
+        return "html"
+    return "txt"
+
+
+def _dt_pdf(data):
+    try:
+        frags = pdf_text_fragments(data)
+    except Exception:
+        return ""
+    lines, cur, last_y = [], [], None
+    for f in frags:
+        try:
+            y, txt = float(f[1]), f[3]
+        except Exception:
+            continue
+        if last_y is not None and abs(y - last_y) > 2.0:
+            lines.append(" ".join(cur))
+            cur = []
+        cur.append(txt)
+        last_y = y
+    if cur:
+        lines.append(" ".join(cur))
+    return "\n".join(lines)
+
+
+def _dt_docx_par(p):
+    s = []
+    for e in p.iter():
+        if e.tag == _DT_W + "t":
+            s.append(e.text or "")
+        elif e.tag == _DT_W + "tab":
+            s.append("\t")
+        elif e.tag in (_DT_W + "br", _DT_W + "cr"):
+            s.append("\n")
+        elif e.tag == _DT_W + "noBreakHyphen":
+            s.append("-")
+    return "".join(s)
+
+
+def _dt_docx_walk(el, out):
+    for ch in el:
+        if ch.tag == _DT_W + "p":
+            out.append(_dt_docx_par(ch))
+        elif ch.tag == _DT_W + "tr":
+            cells = []
+            for tc in ch.findall(_DT_W + "tc"):
+                cells.append(" ".join(_dt_docx_par(p) for p in tc.iter(_DT_W + "p")))
+            out.append("\t".join(cells))
+        else:
+            _dt_docx_walk(ch, out)
+
+
+def _dt_docx(data):
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            root = ET.fromstring(z.read("word/document.xml"))
+    except Exception:
+        return ""
+    out = []
+    _dt_docx_walk(root, out)
+    return "\n".join(out)
+
+
+_DT_RTF_TOK = re.compile(r"\\'([0-9a-fA-F]{2})|\\([a-zA-Z]+)(-?\d+)? ?|\\([^a-zA-Z])|([{}])|([^\\{}]+)", re.S)
+_DT_RTF_DEST = frozenset(("fonttbl", "colortbl", "stylesheet", "info", "pict", "header", "footer", "headerl", "headerr", "footerl", "footerr",
+                          "footnote", "filetbl", "listtable", "listoverridetable", "generator", "themedata", "colorschememapping",
+                          "datastore", "latentstyles", "rsidtbl", "xmlnstbl", "object", "fldinst", "revtbl", "template"))
+_DT_RTF_SYM = {"emdash": "\u2014", "endash": "\u2013", "bullet": "\u2022", "lquote": "\u2018", "rquote": "\u2019",
+               "ldblquote": "\u201c", "rdblquote": "\u201d", "emspace": " ", "enspace": " ", "qmspace": " "}
+_DT_RTF_NL = frozenset(("par", "line", "sect", "page", "row"))
+
+
+def _dt_rtf(data):
+    """Минимальный разбор RTF: \\'xx (кодовая страница), \\uN?, абзацы, табы; служебные группы отбрасываются."""
+    s = data.decode("latin-1")
+    m = re.search(r"\\ansicpg(\d+)", s[:4096])
+    cp = "cp" + m.group(1) if m else "cp1251"
+    try:
+        codecs.lookup(cp)
+    except LookupError:
+        cp = "cp1251"
+
+    def byte(b):
+        return bytes([b]).decode(cp, "replace")
+
+    out = []
+    stack = []
+    skip, uc, skip_n, at_start = False, 1, 0, False
+    for m in _DT_RTF_TOK.finditer(s):
+        hx, word, num, sym, br, txt = m.groups()
+        if br == "{":
+            stack.append((skip, uc))
+            at_start = True
+            continue
+        if br == "}":
+            if stack:
+                skip, uc = stack.pop()
+            at_start = False
+            continue
+        first, at_start = at_start, False
+        if hx is not None:
+            if skip:
+                continue
+            if skip_n:
+                skip_n -= 1
+                continue
+            out.append(byte(int(hx, 16)))
+        elif word is not None:
+            if first and word in _DT_RTF_DEST:
+                skip = True
+            if skip:
+                continue
+            if word == "u" and num is not None:
+                n = int(num)
+                out.append(chr(n + 65536 if n < 0 else n))
+                skip_n = uc
+            elif word == "uc" and num is not None:
+                uc = int(num)
+            elif word in _DT_RTF_NL:
+                out.append("\n")
+            elif word in ("tab", "cell"):
+                out.append("\t")
+            elif word in _DT_RTF_SYM:
+                out.append(_DT_RTF_SYM[word])
+        elif sym is not None:
+            if sym == "*" and first:
+                skip = True
+            if skip:
+                continue
+            if sym in "\\{}":
+                out.append(sym)
+            elif sym == "~":
+                out.append(" ")
+            elif sym in "\n\r":
+                out.append("\n")
+        elif txt is not None:
+            if skip:
+                continue
+            txt = txt.replace("\r", "").replace("\n", "")
+            if skip_n:
+                k = min(skip_n, len(txt))
+                txt, skip_n = txt[k:], skip_n - k
+            out.append("".join(byte(ord(c)) if 0x80 <= ord(c) < 0x100 else c for c in txt))
+    return "".join(out)
+
+
+def doc_text(data, ctype="", name=""):
+    """Байты документа -> {"text", "kind", "needs_ocr"}. Не бросает исключений на мусоре."""
+    data = data or b""
+    kind = _dt_kind(data, ctype, name)
+    needs_ocr = False
+    try:
+        if kind == "pdf":
+            raw = _dt_pdf(data)
+            needs_ocr = len(re.findall(r"[^\W\d_]", raw)) < 20
+        elif kind == "docx":
+            raw = _dt_docx(data)
+        elif kind == "rtf":
+            raw = _dt_rtf(data)
+        elif kind == "html":
+            raw = _dt_html_text(_dt_decode(data, ctype))
+        else:
+            raw = _dt_decode(data, ctype)
+    except Exception:
+        raw = ""
+    return {"text": _dt_norm(raw), "kind": kind, "needs_ocr": needs_ocr}
+# ═══════════════════════════════ сообщения о раскрытии (714-П): классификация и поля ═══════════════════════════════
+# Вход — уже извлечённый текст (doc_text из 12b). dc_extract(text, title, meta) -> {"kind", "inn", "ogrn", "event_date", "facts": [...], "warnings": [...]}.
+# Виды: coupon_paid (выплаченные доходы), coupon_declared (начисленные/объявленные), default (неисполнение обязательств),
+# buyback_result (итоги приобретения облигаций), other. Нумерация пунктов в разных формах отличается, поэтому нужный пункт
+# ищется по тексту его заголовка (до двоеточия), а номер — запасной вариант.
+# TODO: при нескольких ISIN в одном сообщении числа не делятся по блокам — каждому ISIN достаются общие значения (+ warning).
+
+DC_PARSER_VERSION = "2"   # повышать при изменении логики разбора: сборщик (--reparse) перечитывает старые записи
+
+_DC_MONTHS = {"янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5, "июн": 6, "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12}
+_DC_DATE_TXT = re.compile(r"(?<!\d)(\d{1,2})\s*[»\"”’']?\s*(январ[яь]|феврал[яь]|марта?|апрел[яь]|ма[йя]|июн[яь]|июл[яь]|август[а]?|сентябр[яь]|октябр[яь]|ноябр[яь]|декабр[яь])\s*(\d{4})", re.I)
+_DC_DATE_NUM = re.compile(r"(?<![\d.])(\d{1,2})\.(\d{2})\.(\d{4})(?!\d)")
+_DC_NUM = re.compile(r"\d{1,3}(?:[  ]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?")
+_DC_ISIN = re.compile(r"\b(?:RU|SU)[0-9A-Z]{9}[0-9]\b")
+_DC_ITEM = re.compile(r"^([1-4]\.\d{1,2})(?:\.(?=\s|$)|(?=\s|$))\s*")
+_DC_RUB_AMT = re.compile(r"\d[\d  ]*(?:[.,]\d+)?\s*(?:\([^)]*\)\s*)?руб")
+_DC_RATE = re.compile(r"(\d+(?:[.,]\d+)?)\s*%?\s*(?:\([^)]*\)\s*)?(?:процент\w*\s*)?годов", re.I)
+_DC_ORD = (("девятнадцат", 19), ("восемнадцат", 18), ("семнадцат", 17), ("шестнадцат", 16), ("пятнадцат", 15), ("четырнадцат", 14),
+           ("тринадцат", 13), ("двенадцат", 12), ("одиннадцат", 11), ("девяност", 90), ("девяно", 90), ("восьмидесят", 80), ("восемьдесят", 80),
+           ("семидесят", 70), ("семьдесят", 70), ("шестидесят", 60), ("шестьдесят", 60), ("пятидесят", 50), ("пятьдесят", 50),
+           ("сороков", 40), ("сорок", 40), ("тридцат", 30), ("двадцат", 20), ("сотый", 100), ("сто", 100), ("десят", 10),
+           ("девят", 9), ("восьм", 8), ("седьм", 7), ("шест", 6), ("пят", 5), ("четв", 4), ("трет", 3), ("втор", 2), ("перв", 1))
+
+
+def dc_parse_number(s):
+    """Первое число в строке: пробелы/nbsp — разделители тысяч, запятая или точка — десятичные."""
+    m = _DC_NUM.search(s or "")
+    if not m:
+        return None
+    try:
+        return float(re.sub(r"[  ]", "", m.group(0)).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def dc_parse_rub(s):
+    """Рубли: «80 620 552,40 рублей», «18 (Восемнадцать) рублей 32 копейки», «10 170 000 рублей 00 копеек»."""
+    s2 = re.sub(r"\([^)]*\)", " ", s or "")
+    m = _DC_NUM.search(s2)
+    if not m:
+        return None
+    v = dc_parse_number(m.group(0))
+    if v is None:
+        return None
+    if not re.search(r"[.,]", m.group(0)):
+        k = re.match(r"\s*(?:руб\w*\.?)?\s*(\d{1,2})\s*коп", s2[m.end():], re.I)
+        if k:
+            v += int(k.group(1)) / 100.0
+    return v
+
+
+def _dc_dates(s):
+    """Все даты строки [(позиция, 'YYYY-MM-DD')] в порядке появления."""
+    res = []
+    for m in _DC_DATE_TXT.finditer(s or ""):
+        res.append((m.start(), int(m.group(3)), _DC_MONTHS.get(m.group(2).lower()[:3]), int(m.group(1))))
+    for m in _DC_DATE_NUM.finditer(s or ""):
+        res.append((m.start(), int(m.group(3)), int(m.group(2)), int(m.group(1))))
+    out = []
+    for pos, y, mo, d in sorted(res):
+        try:
+            out.append((pos, date(y, mo, d).isoformat()))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def dc_parse_date(s):
+    """Первая дата в строке -> 'YYYY-MM-DD' (месяцы словами в родительном, «16», г./года, dd.mm.yyyy)."""
+    d = _dc_dates(s)
+    return d[0][1] if d else None
+
+
+def dc_sections(text):
+    """{'2.4': текст пункта}: пункт длится до следующей строки, начинающейся с номера (в т.ч. «2.1\\t», «2.1 »)."""
+    secs, cur = {}, None
+    for ln in (text or "").split("\n"):
+        m = _DC_ITEM.match(ln.strip())
+        if m:
+            cur = m.group(1)
+            if cur in secs:
+                cur = "~" + cur            # повтор номера не затирает первый пункт
+            secs[cur] = [ln.strip()[m.end():]]
+        elif re.match(r"^[1-4]\.\s+[А-ЯЁ]", ln.strip()):
+            cur = None                     # заголовок раздела («3. Подпись») закрывает пункт
+        elif cur is not None:
+            secs[cur].append(ln.strip())
+    return {k: "\n".join(v).strip() for k, v in secs.items()}
+
+
+def dc_classify(title, text):
+    s = ((title or "") + " " + (text or "")[:600]).lower()
+    s = re.sub(r"\s+", " ", s)
+    if "итогах приобретения" in s:
+        return "buyback_result"
+    if "неисполнение обязательств" in s:
+        return "default"
+    if "выплаченные доходы" in s or "выплаченных доходах" in s:
+        return "coupon_paid"
+    if "начисленные доходы" in s or "начисленных (объявленных) доходах" in s:
+        return "coupon_declared"
+    return "other"
+
+
+def dc_load_fixture(path):
+    """Файл фикстуры: строки «ключ: значение» (source, published, code, company, title), строка «---», затем текст."""
+    with open(path, encoding="utf-8") as f:
+        raw = f.read()
+    head, sep, body = raw.partition("\n---\n")
+    if not sep:
+        return {}, raw
+    meta = {}
+    for ln in head.split("\n"):
+        k, _, v = ln.partition(":")
+        if _ and k.strip():
+            meta[k.strip()] = v.strip()
+    return meta, body.strip("\n")
+
+
+def _dc_split(sec):
+    """Пункт -> (заголовок, значение): по первому «:» (значение может идти со следующей строки), либо по «).» после
+    стандартного заголовка без двоеточия (в нём нет цифр), либо по табу; иначе заголовок пуст."""
+    i = sec.find(":")
+    j = -1
+    m = re.search(r"\)\s*\.\s", sec[:801])
+    if m and m.start() >= 40 and not re.search(r"\d", sec[:m.start()]) and (i < 0 or m.start() < i):
+        j = m.end()
+    if j >= 0:
+        return sec[:j], sec[j:]
+    if 0 <= i <= 800:
+        return sec[:i], sec[i + 1:]
+    i = sec.find("\t")
+    if i >= 0:
+        return sec[:i], sec[i + 1:]
+    return "", sec
+
+
+def _dc_pick(secs, label_re, key=None):
+    """Значение пункта по заголовку (регулярка, регистр не важен); не нашлось — по номеру key; иначе None."""
+    for k, v in secs.items():
+        if k[0] == "~":
+            continue
+        lab, val = _dc_split(v)
+        if lab and re.search(label_re, lab, re.I | re.S):
+            return val.strip()
+    if key and key in secs:
+        return _dc_split(secs[key])[1].strip()
+    return None
+
+
+def _dc_ordinal_words(s):
+    """«Пятьдесят третий купонный период» -> 53 (слова непосредственно перед «купонн»); перебор с конца, пока слова — порядковое."""
+    for m in reversed(list(re.finditer(r"((?:[а-яё]+\s+){1,3})купонн", s or "", re.I))):
+        tot = 0
+        for w in reversed(m.group(1).lower().split()):
+            v = next((n for st, n in _DC_ORD if w.startswith(st)), None)
+            if v is None:
+                break
+            tot += v
+        if tot:
+            return tot
+    return None
+
+
+def _dc_coupon_no(*texts):
+    for t in texts:
+        if not t:
+            continue
+        m = re.search(r"(?<![\d.])(\d+)\s*(?:-\s*\w{1,3})?\s*(?:\([^)]*\)\s*)?(?:отч[её]тн\w*\s*)?\(?купон", t, re.I)
+        if m:
+            return int(m.group(1))
+        n = _dc_ordinal_words(t)
+        if n:
+            return n
+    return None
+
+
+def _dc_period(v):
+    d = _dc_dates(v or "")
+    if len(d) >= 2 and re.search(r"\bпо\b|оконч|[–—-]", v):
+        return d[0][1], d[1][1]
+    return None, None
+
+
+def _dc_due(v):
+    d = _dc_dates(v or "")
+    if not d:
+        return None
+    if len(d) >= 2 and re.search(r"\bс\b.*\bпо\b", v, re.S):
+        return d[-1][1]
+    return d[0][1]
+
+
+_DC_PCT = re.compile(r"(?<![\w.,])(\d+(?:[.,]\d+)?)\s*(?:\([^)]*\)\s*)?(?:%|процент)", re.I)
+
+
+def _dc_rate(*texts):
+    """Процентная ставка: число перед «%» / «процент…» (в т.ч. «15 (пятнадцать) процентов годовых»)."""
+    for t in texts:
+        m = _DC_PCT.search(t or "") or _DC_RATE.search(t or "")
+        if m:
+            return float(m.group(1).replace(",", "."))
+    return None
+
+
+_DC_AMT = re.compile(r"(?<![\w.,])(\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)")
+_DC_CUR_TAIL = re.compile(r"\s*(?:(?:российск|китайск|американск|европейск)\w*\s+)?(руб|юан|долл|евро|коп)\w*\.?", re.I)
+_DC_CUR_STEM = (("юан", "CNY"), ("долл", "USD"), ("евро", "EUR"), ("руб", "RUB"))
+
+
+def _dc_cur_code(w):
+    w = (w or "").lower()
+    return next((c for st, c in _DC_CUR_STEM if w.startswith(st)), None)
+
+
+def dc_amounts(s):
+    """Денежные суммы строки [{v, cur, pos, end}]: число, за которым (после скобок со словами) следует руб/юан/долл/евро,
+    либо скобка со словами «… рублей …». Числа с «%»/«процент» (ставки), копейки и номера периодов не считаются суммами."""
+    s = s or ""
+    out = []
+    for m in _DC_AMT.finditer(s):
+        tok = m.group(1)
+        tail = s[m.end():m.end() + 400]
+        if re.match(r"\s*%", tail):
+            continue
+        pm = re.match(r"\s*\(([^)]*)\)", tail)
+        pw = pm.group(1) if pm else None
+        rest_off = pm.end() if pm else 0
+        if re.match(r"\s*процент", tail[rest_off:], re.I):
+            continue
+        cm = _DC_CUR_TAIL.match(tail, rest_off)
+        if cm:
+            if cm.group(1).lower() == "коп":
+                continue
+            cur = _dc_cur_code(cm.group(1))
+            end_off = cm.end()
+        elif pw and re.search(r"рубл|юан|доллар|евро", pw, re.I):
+            cur = _dc_cur_code(re.search(r"рубл|юан|доллар|евро", pw, re.I).group(0))
+            end_off = rest_off
+        else:
+            continue
+        try:
+            v = float(re.sub(r"[ \u00a0\u202f]", "", tok).replace(",", "."))
+        except ValueError:
+            continue
+        if cur == "RUB" and not re.search(r"[.,]", tok):
+            k = re.match(r"\s*\.?\s*(\d{1,2})\s*(?:\([^)]*\)\s*)?коп", tail[end_off:], re.I)
+            if k:
+                v += int(k.group(1)) / 100.0
+        out.append({"v": v, "cur": cur, "pos": m.start(), "end": m.end() + end_off})
+    return out
+
+
+def _dc_ctx_kind(ctx):
+    """Что описывает сумма по предшествующему тексту: 'coupon' / 'face' / None (последнее ключевое слово побеждает)."""
+    sent = re.split(r"[.;\n]\s+(?=[А-ЯA-Z«\"])|\n", (ctx or "").strip())[-1].lower()   # начало последнего предложения важнее хвоста:
+    head = sent[:70]                                                                       # «Размер части номинальной … купонного периода»
+    if re.search(r"номинальн|погашен|амортиз", head) and not re.search(r"купон\w*\s+доход|процент", head):
+        return "face"
+    lc = (ctx or "").lower()[-160:]
+    ci = max(lc.rfind("купон"), lc.rfind("процент"), lc.rfind("доход"))
+    fi = max(lc.rfind("номинальн"), lc.rfind("погашен"), lc.rfind("амортиз"))
+    if fi > ci:
+        return "face"
+    return "coupon" if ci >= 0 else None
+
+
+def _dc_pay_kinds(*texts):
+    """Виды выплат из текста категории: (купон, часть номинала, погашение номинала)."""
+    lc = " ".join(t or "" for t in texts).lower()
+    has_c = bool(re.search(r"купон|процент|доход", lc))
+    has_a = bool(re.search(r"част\w*\s+номинальн|частичн|амортиз", lc))
+    has_r = bool(re.search(r"погашени", lc)) or (bool(re.search(r"номинальн", lc)) and not has_a)
+    return has_c, has_a, has_r
+
+
+_DC_NUMQ = re.compile(r"(?<![\w.,\-–])(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?![\w\-]|[.,]\d)")
+
+
+def dc_parse_qty(s):
+    """Количество бумаг: «в количестве N», число перед «штук/облигаций/бумаг», иначе первое отдельное число
+    (номера вида 002P-03, БО-03 не берутся). Целое или None."""
+    s2 = re.sub(r"\([^)]*\)", " ", s or "")
+    m = re.search(r"количеств\w*\s*[:\-–]?\s*(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?![\w\-]|[.,]\d)", s2, re.I)
+    if not m:
+        for c in _DC_NUMQ.finditer(s2):
+            if re.match(r"\s*(?:шт|штук|облигац|бумаг|ценн|биржев|ед\b)", s2[c.end():c.end() + 30], re.I):
+                m = c
+                break
+    if not m:
+        m = _DC_NUMQ.search(s2)
+    if not m:
+        return None
+    return int(re.sub(r"[ \u00a0\u202f]", "", m.group(1)))
+
+
+def _dc_qty(total, per_bond, qty, qty_tol=0.0051):
+    """Производные поля и проверки: qty_derived, total_matches, qty_integer, qty_out. Допуск на округление копеек
+    на бумагу: qty_tol * qty."""
+    r = {"qty_derived": None, "qty_out": qty, "checks": {}}
+    if total and per_bond:
+        ratio = total / per_bond
+        r["qty_derived"] = int(round(ratio))
+        r["checks"]["qty_integer"] = abs(ratio - round(ratio)) < 0.01
+    if qty is not None and total is not None and per_bond is not None:
+        r["checks"]["total_matches"] = abs(per_bond * qty - total) <= max(1.0, 0.5 * per_bond, qty_tol * qty)
+    if qty is None:
+        r["qty_out"] = r["qty_derived"]
+    return r
+
+
+def _dc_isins(*texts):
+    out = []
+    for t in texts:
+        for m in _DC_ISIN.finditer(t or ""):
+            if m.group(0) not in out:
+                out.append(m.group(0))
+    return out
+
+
+def _dc_int(v):
+    return None if v is None else int(round(v))
+
+
+def _dc_paid(secs, text):
+    cat = _dc_pick(secs, r"категория выплат", "2.2") or ""
+    per_v = _dc_pick(secs, r"отчетный|отчётный", "2.3") or ""
+    tot_v = _dc_pick(secs, r"общий размер выплаченных", "2.4") or ""
+    pb_v = _dc_pick(secs, r"в расчете на одну|в расчёте на одну", "2.5") or ""
+    qty_v = _dc_pick(secs, r"общее количество", "2.6") or ""
+    due_v = _dc_pick(secs, r"дата, в которую", "2.9") or ""
+    pct_v = _dc_pick(secs, r"^\s*(?:объем|объём|доля)\b", "2.10") or ""
+    has_c, has_a, has_r = _dc_pay_kinds(cat)
+    if not (has_c or has_a or has_r):
+        has_c, has_a, has_r = _dc_pay_kinds(pb_v)
+    has_face = has_a or has_r
+    kinds = (["coupon"] if has_c else []) + (["amortization"] if has_a else []) + (["redemption"] if has_r and not has_a else [])
+    pay = "+".join(kinds) or "other"
+    warn = []
+    f = {"payment": pay, "coupon_no": _dc_coupon_no(per_v)}
+    f["period_from"], f["period_to"] = _dc_period(per_v)
+    ta, pa = dc_amounts(tot_v), dc_amounts(pb_v)
+    cur = (ta or pa or [{"cur": "RUB"}])[0]["cur"]
+    t_cur = [a for a in ta if a["cur"] == cur]
+    f["currency"] = cur
+    f["total"] = t_cur[0]["v"] if t_cur else (dc_parse_rub(tot_v) if not ta and re.fullmatch(r"[\s\d.,\u00a0\u202f]*", tot_v.split("(")[0]) else None)
+    comp = {"coupon": None, "face": None}
+    prev = 0
+    for a in pa:
+        ctx, prev = pb_v[prev:a["pos"]], a["end"]
+        if a["cur"] != cur:
+            continue
+        k = _dc_ctx_kind(ctx)
+        if not has_c:
+            k = "face"
+        elif not has_face:
+            k = "coupon"
+        elif k is None:
+            k = "coupon" if comp["coupon"] is None else "face"
+        if comp[k] is None:
+            comp[k] = a["v"]
+        elif has_face and has_c:                          # слот уже занят — вторая сумма относится к другой части выплаты
+            other = "face" if k == "coupon" else "coupon"
+            if comp[other] is None:
+                comp[other] = a["v"]
+    if not pa and pb_v:
+        m = re.match(r"\s*[-–—]?\s*(\d[\d \u00a0\u202f]*(?:[.,]\d+)?)\s*(?:\(|$|\.|;)", pb_v)
+        if m:
+            comp["face" if (has_face and not has_c) else "coupon"] = dc_parse_number(m.group(1))
+    f["coupon_per_bond"], f["face_per_bond"] = comp["coupon"], comp["face"]
+    f["per_bond"] = comp["coupon"] if comp["coupon"] is not None else comp["face"]
+    parts = [x for x in (comp["coupon"], comp["face"]) if x is not None]
+    f["per_bond_total"] = round(sum(parts), 6) if parts else None
+    f["per_bond_rub"] = next((a["v"] for a in pa if a["cur"] == "RUB"), None) if cur != "RUB" else None
+    f["total_rub"] = next((a["v"] for a in ta if a["cur"] == "RUB"), None) if cur != "RUB" else None
+    f["qty"] = dc_parse_qty(qty_v)
+    f["rate"] = _dc_rate(tot_v, pb_v)
+    f["due_date"] = _dc_due(due_v)
+    f["paid_pct"] = dc_parse_number(pct_v)
+    q = _dc_qty(f["total"], f["per_bond_total"], f["qty"])
+    f.update(qty_derived=q["qty_derived"], qty_out=q["qty_out"], checks=q["checks"])
+    ck = q["checks"]
+    if cur != "RUB" and f["per_bond_rub"] and f["total_rub"] and f["qty"] and f["total"] and f["per_bond_total"]:
+        # выплата частью бумаг в валюте, частью — в рублях: количества складываются
+        n = f["total"] / f["per_bond_total"] + f["total_rub"] / f["per_bond_rub"]
+        if abs(n - f["qty"]) <= 1.5:
+            ck["total_matches"] = True
+            ck["split_currency"] = True
+    qv = f["qty"]
+    if qv is not None and qv > 0:
+        if ck.get("total_matches"):
+            f["conf"] = 1.0
+        else:
+            f["conf"] = 0.8
+            warn.append("суммы не сходятся" if "total_matches" in ck else "суммы не извлечены")
+    elif qv is None and ck.get("qty_integer"):
+        f["conf"] = 0.8
+    else:
+        f["conf"] = 0.4
+        if qv is None:
+            warn.append("количество не найдено")
+    f["warn"] = warn
+    return f
+
+
+_DC_PER_BOND_CTX = re.compile(r"на\s+одну|на\s+1\s|одн(?:ой|у)\s+(?:биржев\w+\s+)?облигаци|по\s+одной|на\s+каждую", re.I)
+
+
+def _dc_decl_amounts(tot_v, pb_v):
+    """(общая сумма, сумма на облигацию) для объявленных доходов. Берутся рублёвые суммы (число + руб), а не первое число
+    пункта (номер периода, ставка). Если оба значения лежат в одном пункте — делим по словам «на одну облигацию»."""
+    def first(v):
+        a = [x for x in dc_amounts(v) if x["cur"] == "RUB"]
+        return a[0]["v"] if a else None
+    t, p = first(tot_v), first(pb_v)
+    if tot_v and (not pb_v or pb_v == tot_v or p is None) and _DC_PER_BOND_CTX.search(tot_v):
+        t = p = None
+        prev = 0
+        for a in dc_amounts(tot_v):
+            ctx, prev = tot_v[prev:a["pos"]], a["end"]
+            if a["cur"] != "RUB":
+                continue
+            if _DC_PER_BOND_CTX.search(ctx):
+                p = a["v"] if p is None else p
+            elif t is None:
+                t = a["v"]
+    if t is None and p is None and not dc_amounts(tot_v) and not dc_amounts(pb_v):
+        t, p = dc_parse_rub(tot_v) if re.match(r"\s*\d", tot_v or "") else None, dc_parse_rub(pb_v) if re.match(r"\s*\d", pb_v or "") else None
+    return t, p
+
+
+def _dc_declared(secs, text):
+    per_v = _dc_pick(secs, r"отчетный|отчётный", "2.5") or ""
+    tot_v = _dc_pick(secs, r"^\s*общий размер", "2.6") or ""
+    pb_v = _dc_pick(secs, r"в расчете на одну|в расчёте на одну|по одной облигации", "2.7") or ""
+    due_v = _dc_pick(secs, r"дата, в которую", "2.9") or ""
+    low = re.sub(r"\s+", " ", text.lower())
+    undet = bool(re.search(r"не\s+определен", text, re.I))
+    f = {"coupon_no": _dc_coupon_no(per_v, text)}
+    f["period_from"], f["period_to"] = _dc_period(per_v)
+    tot_a, pb_a = _dc_decl_amounts(tot_v, pb_v)
+    f["total"] = None if undet else tot_a
+    f["per_bond"] = None if undet else pb_a
+    f["rate"] = _dc_rate(tot_v, pb_v)
+    f["due_date"] = _dc_due(due_v)
+    fm = re.search(r"по следующей формуле:?\s*(.+?)\s*(?:,\s*где\b|\n|$)", text)
+    f["formula"] = fm.group(1).strip() if fm else None
+    f["base"], f["spread"] = None, None
+    if fm:
+        blk = next((v for v in secs.values() if "по следующей формуле" in v), text)
+        bl = blk.lower()
+        f["base"] = "refinancing" if "ставки рефинансирования" in bl else "key" if "ключевой ставки" in bl else None
+        sm = re.search(r"([+\-–−])\s*(\d+(?:[.,]\d+)?)\s*%", f["formula"])
+        if sm:
+            f["spread"] = float(sm.group(2).replace(",", ".")) * (1 if sm.group(1) == "+" else -1)
+    f["undetermined"] = undet
+    pm = re.search(r"[^\n]*обязан\w*\s+приобрести[^\n]*", text, re.I)
+    f["put_note"] = re.sub(r"^\d+\.\d+\.?\s*", "", pm.group(0).strip()) if pm else None
+    q = _dc_qty(f["total"], f["per_bond"], None)
+    f.update(qty_derived=q["qty_derived"], qty_out=q["qty_out"], checks=q["checks"])
+    if q["checks"].get("qty_integer"):
+        f["conf"] = 0.9
+    elif undet and f["period_from"]:
+        f["conf"] = 0.7
+    else:
+        f["conf"] = 0.4
+    return f
+
+
+def _dc_obl_kind(seg):
+    """Вид обязательства по тексту одного пункта. Частичное погашение проверяется раньше купона: в нём часто написано
+    «в дату окончания N-го купонного периода»."""
+    lo = (seg or "").lower()
+    if re.search(r"амортизац|частичн\w*\s+(досрочн\w*\s+)?погашени|погашени\w*\s+част|част\w*\s+номинальн", lo):
+        return "amortization"
+    if re.search(r"приобретени|оферт", lo):
+        return "offer"
+    if "погашени" in lo and "номинал" in lo:
+        return "redemption"
+    if "купон" in lo or "процент" in lo:
+        return "coupon"
+    if "погашени" in lo:
+        return "redemption"
+    return "other"
+
+
+def _dc_obligations(ob_v):
+    """Несколько обязательств в одном сообщении («– Выплата купона … в размере X; – Частичное погашение … в размере Y») ->
+    [{obligation, amount}] в порядке текста. Пусто — пункт не делится на части с суммами."""
+    parts = [p for p in re.split(r"(?:^|\n)\s*[–—-]\s+|;\s*\n", ob_v or "") if p and p.strip()]
+    out = []
+    for p in parts:
+        am = dc_amounts(p)
+        if not am:
+            continue
+        out.append({"obligation": _dc_obl_kind(p), "amount": am[0]["v"]})
+    return out if len(out) > 1 else ([{"obligation": _dc_obl_kind(parts[0] if parts else ob_v), "amount": out[0]["amount"]}] if out else [])
+
+
+def _dc_default(secs, text):
+    ob_v = _dc_pick(secs, r"содержание обязательства", "2.2") or ""
+    due_v = _dc_pick(secs, r"дата, в которую", "2.3") or ""
+    st_v = _dc_pick(secs, r"сведения о неисполнении", "2.4") or ""
+    rs_v = _dc_pick(secs, r"причина неисполнения", "2.5") or ""
+    obligations = _dc_obligations(ob_v)
+    ob = obligations[0]["obligation"] if obligations else _dc_obl_kind(ob_v)
+    amount = None
+    # суммы — только через dc_amounts (числа рядом с «руб»), иначе «15-й купонный период: 681 890 рублей» дало бы 15
+    m = re.search(r"общий размер[^:\n]*:\s*(.{0,200})", ob_v, re.I | re.S)
+    if m:
+        am = dc_amounts(m.group(1))
+        amount = am[0]["v"] if am else None
+    if amount is None:
+        m = re.search(r"в размере\s+(.{0,160})", ob_v, re.I | re.S)
+        am = dc_amounts(m.group(1)) if m else []
+        amount = am[0]["v"] if am else None
+    if amount is None:
+        m = _DC_RUB_AMT.search(ob_v)
+        amount = dc_parse_rub(ob_v[m.start():]) if m else None
+    per_bond = None
+    m = re.search(r"в расчете на одну[^:\n]*:([^\n]*)", ob_v, re.I)
+    if m:
+        mm = _DC_RUB_AMT.search(m.group(1))
+        per_bond = dc_parse_rub(m.group(1)[mm.start():]) if mm else None
+    qty = None
+    m = re.search(r"общее количество[^:\n]*:\s*([^\n]*)", ob_v, re.I)
+    if m:
+        qty = dc_parse_qty(m.group(1))
+    sl = st_v.lower()
+    status = "default" if ("дефолт" in sl and "технический дефолт" not in sl) else "technical"
+    if "технический дефолт" in text.lower():
+        status = "technical"
+    if len(obligations) > 1:
+        amount = obligations[0]["amount"]
+    f = {"obligation": ob, "obligations": obligations, "coupon_no": _dc_coupon_no(ob_v), "amount": amount, "per_bond": per_bond, "qty": qty,
+         "rate": _dc_rate(ob_v), "due_date": _dc_due(due_v), "status": status, "reason": re.sub(r"\s+", " ", rs_v).strip()[:300]}
+    q = _dc_qty(amount, per_bond, qty)
+    f.update(qty_derived=q["qty_derived"], qty_out=q["qty_out"], checks=q["checks"])
+    f["conf"] = 0.95 if amount is not None and due_v else 0.5
+    return f
+
+
+def _dc_bdays(a, b):
+    """Рабочие дни (пн–пт, без праздников) между датами YYYY-MM-DD: (a, b]."""
+    import datetime as _d
+    x, y = _d.date.fromisoformat(a), _d.date.fromisoformat(b)
+    n = 0
+    while x < y:
+        x += _d.timedelta(days=1)
+        n += x.weekday() < 5
+    return n
+
+
+def _dc_default_age(f, ref_date):
+    """Без явного слова «дефолт»: просрочка больше 10 рабочих дней от даты платежа — уже дефолт (ст. 17.1 39-ФЗ)."""
+    f["overdue_bdays"] = None
+    if f.get("due_date") and ref_date:
+        f["overdue_bdays"] = _dc_bdays(f["due_date"], ref_date)
+        if f["status"] == "technical" and f["overdue_bdays"] > 10:
+            f["status"] = "default"
+
+
+def _dc_buyback(secs, text, event_date):
+    body = (secs.get("2.1") or "") + " " + (secs.get("2.2") or "")
+    m = re.search(r"в количестве\s+(\d[\d  ]*)", body, re.I)
+    qty = _dc_int(dc_parse_number(m.group(1))) if m else None
+    lb = body.lower()
+    basis = "put" if "по требованию владельцев" in lb else "issuer" if ("по соглашению с владельцами" in lb or "по усмотрению" in lb) else None
+    d3 = dc_parse_date(_dc_pick(secs, r"дата наступления события", "2.3") or "")
+    return {"qty_bought": qty, "basis": basis, "date": event_date or d3, "conf": 1.0 if qty else 0.5, "checks": {}}
+
+
+def dc_extract(text, title="", meta=None):
+    """Главная точка входа: классификация, реквизиты эмитента и факты по каждому ISIN."""
+    meta = meta or {}
+    title = title or meta.get("title", "")
+    text = text or ""
+    # «15, 47 руб.» — опечатка с пробелом после запятой: склеиваем, иначе сумма прочиталась бы как 47
+    text = re.sub(r"(\d),[ \u00a0](\d{2})(?=\s*(?:руб|коп|\())", r"\1,\2", text)
+    kind = dc_classify(title, text)
+    secs = dc_sections(text)
+    warnings = []
+    m = re.search(r"(?<!\d)(\d{12}|\d{10})(?!\d)", secs.get("1.4", ""))
+    if not m:
+        m = re.search(r"ИНН[^\d]{0,80}(?<!\d)(\d{12}|\d{10})(?!\d)", text)
+    inn = m.group(1) if m else None
+    m = re.search(r"(?<!\d)(\d{15}|\d{13})(?!\d)", secs.get("1.3", ""))
+    if not m:
+        m = re.search(r"ОГРН[^\d]{0,80}(?<!\d)(\d{15}|\d{13})(?!\d)", text)
+    ogrn = m.group(1) if m else None
+    event_date = dc_parse_date(secs.get("1.7", ""))
+    res = {"kind": kind, "inn": inn, "ogrn": ogrn, "event_date": event_date, "published": meta.get("published"),
+           "code": meta.get("code"), "company": meta.get("company"), "facts": [], "warnings": warnings}
+    if kind == "buyback_result":
+        isins = _dc_isins(secs.get("2.1"), secs.get("2.2"))
+    elif kind == "other":
+        isins = _dc_isins(secs.get("2.4"), secs.get("2.1"))
+    else:
+        isins = _dc_isins(secs.get("2.1"))
+    if not isins and kind != "other":
+        isins = _dc_isins(text)
+        if isins:
+            warnings.append("ISIN найден вне пункта идентификации")
+    if kind == "other":
+        res["facts"] = [{"isin": i, "kind": kind, "conf": 0.0, "checks": {}} for i in isins]
+        return res
+    if not isins:
+        warnings.append("ISIN не найден")
+        return res
+    if len(isins) > 1:
+        warnings.append("несколько ISIN (%d): значения не разделены по блокам" % len(isins))
+    if kind == "coupon_paid":
+        f = _dc_paid(secs, text)
+    elif kind == "coupon_declared":
+        f = _dc_declared(secs, text)
+    elif kind == "default":
+        f = _dc_default(secs, text)
+        _dc_default_age(f, event_date or dc_parse_date(meta.get("published") or ""))
+    else:
+        f = _dc_buyback(secs, text, event_date)
+    for w in f.get("warn") or []:
+        warnings.append(w)
+    if kind == "coupon_paid" and f["paid_pct"] is not None and f["paid_pct"] < 100:
+        warnings.append("выплачено не полностью: %s%%" % f["paid_pct"])
+    for i in isins:
+        d = dict(f)
+        d.pop("warn", None)
+        d["checks"] = dict(f["checks"])
+        d["isin"], d["kind"] = i, kind
+        res["facts"].append(d)
+    return res
 # ── курс КБД сегодня, спред к КБД ──
 
 _kbd_now = {"t": 0, "pts": []}
@@ -4853,13 +5899,47 @@ def kbd_at(years):
 
 _scr = {"t": 0, "rows": []}
 SCR_COLS_S = ("SECID,SHORTNAME,SECNAME,ISIN,FACEVALUE,FACEUNIT,COUPONPERCENT,NEXTCOUPON,MATDATE,OFFERDATE,"
-              "LISTLEVEL,PREVLEGALCLOSEPRICE,YIELDATPREVWAPRICE,COUPONPERIOD,BONDSUBTYPE,ISSUESIZE,ACCRUEDINT")
-SCR_COLS_M = "SECID,LAST,YIELD,WAPRICE,DURATION,VALTODAY,NUMTRADES,ZSPREAD,YIELDATWAPRICE"
+              "LISTLEVEL,PREVLEGALCLOSEPRICE,YIELDATPREVWAPRICE,COUPONPERIOD,BONDSUBTYPE,ISSUESIZE,ACCRUEDINT,COUPONVALUE,PREVPRICE,BONDTYPE,COUPON_DETAILS")
+SCR_COLS_M = "SECID,LAST,YIELD,WAPRICE,DURATION,VALTODAY,NUMTRADES,ZSPREAD,YIELDATWAPRICE,LASTCHANGEPRCNT"
 
 
 def _iss_table(j, name):
     t = j[name]
     return [dict(zip(t["columns"], r)) for r in t["data"]]
+
+
+def bond_cy(coupon_value, period, face, price):
+    """Текущая доходность, %: годовой купон / чистая цена. Цена — в % номинала."""
+    try:
+        if not (coupon_value and period and face and price):
+            return None
+        return round(float(coupon_value) * (365.0 / float(period)) / float(face) * 100.0 / float(price) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def bond_chg(m, s, price):
+    """Изменение цены за день, %: LASTCHANGEPRCNT, иначе LAST к предыдущей цене."""
+    v = m.get("LASTCHANGEPRCNT")
+    if v:
+        return round(float(v), 2)
+    prev = s.get("PREVPRICE") or s.get("PREVLEGALCLOSEPRICE")
+    last = m.get("LAST")
+    if prev and last:
+        return round((float(last) / float(prev) - 1) * 100, 2)
+    return 0.0
+
+
+def liq_tiers(rows):
+    """L1 — верхние 20% по обороту среди торгуемых, L2 — следующие 40%, L3 — остальные и без оборота."""
+    traded = sorted((r["turn"] for r in rows if (r.get("turn") or 0) > 0), reverse=True)
+    n = len(traded)
+    c1 = traded[max(0, int(n * 0.2 + 0.999999) - 1)] if n else None
+    c2 = traded[max(0, int(n * 0.6 + 0.999999) - 1)] if n else None
+    for r in rows:
+        t = r.get("turn") or 0
+        r["liq"] = "L1" if t > 0 and t >= c1 else "L2" if t > 0 and t >= c2 else "L3"
+    return rows
 
 
 def screener_rows():
@@ -4888,12 +5968,15 @@ def screener_rows():
                 "price": round(price, 3), "yield": round(float(yld), 2), "dur": round(dur, 2) if dur else None,
                 "coupon": s.get("COUPONPERCENT"), "next": s.get("NEXTCOUPON"), "mat": end, "offer": of,
                 "level": s.get("LISTLEVEL"), "turn": round(m.get("VALTODAY") or 0), "trades": m.get("NUMTRADES") or 0,
-                "zs": m.get("ZSPREAD"), "sub": s.get("BONDSUBTYPE"), "size": s.get("ISSUESIZE"), "nkd": s.get("ACCRUEDINT")}
+                "zs": m.get("ZSPREAD"), "cy": bond_cy(s.get("COUPONVALUE"), s.get("COUPONPERIOD"), s.get("FACEVALUE"), m.get("LAST") or price),
+                "macdur": round(dur, 2) if dur else None, "chg": bond_chg(m, s, price), "sub": s.get("BONDSUBTYPE"), "size": s.get("ISSUESIZE"), "nkd": s.get("ACCRUEDINT"),
+                "btype": s.get("BONDTYPE"), "cpn_det": s.get("COUPON_DETAILS")}
     rows = list(out.values())
     for r in rows:
         k = kbd_at(r["dur"]) if r["dur"] else None
         r["spread"] = round(r["yield"] - k, 2) if k is not None and r["cur"] == "RUB" else None
         r["rating"] = None
+    liq_tiers(rows)
     _scr.update(t=time.time(), rows=rows)
     return rows
 
@@ -4975,6 +6058,37 @@ def _stats_history(stats):
     return hist
 
 
+_fl_job = {"running": False}
+
+
+def fl_spread_job(todo):
+    """Фон: для флоатеров скринера без свежего кэша тянет график выплат (moex_bondization, кэш 24 ч) не чаще FL_SPREAD_RPS в секунду
+    и кладёт спред в kv fl_spread1:<isin> (30 сут). Скринер читает кэш синхронно и ничего не ждёт."""
+    try:
+        for r in todo:
+            isin = r["isin"]
+            fresh = store().get("bondiz2:" + isin, ttl=BC_TTL) is not None
+            try:
+                bz = moex_bondization(isin)
+                fl_spread_put(isin, r.get("full") or r.get("name"), bz, float(r.get("nominal") or 0) or None, r.get("kind"), r.get("cpn_det"))
+            except Exception:  # noqa: BLE001
+                pass
+            if not fresh:
+                time.sleep(1.0 / FL_SPREAD_RPS)
+    finally:
+        _fl_job["running"] = False
+
+
+def fl_spread_kick(rows, cached):
+    """Запускает фоновый расчёт спредов для флоатеров без кэша; одновременно не больше одного задания."""
+    todo = [r for r in rows if r.get("floating") and r.get("isin") and r["isin"] not in cached and r.get("cur") == "RUB"]
+    if not todo or _fl_job["running"]:
+        return False
+    _fl_job["running"] = True
+    threading.Thread(target=fl_spread_job, args=(todo,), daemon=True, name="fl-spread").start()
+    return True
+
+
 def screener_payload():
     rows = screener_rows()
     br, ti = globals().get("best_rating"), globals().get("tcat_info")
@@ -4999,7 +6113,17 @@ def screener_payload():
                 info = None
         r["sector"] = info.get("sector") if info else None
         r["floating"] = info.get("floating") if info else None
+        if r["floating"] is None and r.get("btype"):      # без справочника T-Invest — по типу облигации из ISS
+            r["floating"] = "плава" in r["btype"].lower()
         r["amort"] = info.get("amort") if info else None
+    try:        # спред флоатера к КС из кэша (без ожидания); недостающее считает фоновое задание
+        fsp = fl_spread_cached()
+        for r in rows:
+            r["fl_label"] = fl_label(fsp.get(r.get("isin")), True) if r.get("floating") else None
+            r["fl_base"] = (fsp.get(r.get("isin")) or {}).get("base") if r.get("floating") else None
+        fl_spread_kick(rows, fsp)
+    except Exception:  # noqa: BLE001
+        pass
     stats = market_stats(rows)
     try:
         hist = _stats_history(stats)
@@ -5011,6 +6135,38 @@ def screener_payload():
         lq = None
     return {"rows": rows, "kbd": kbd_curve(), "updated": _scr["t"], "ratings": ratings_status(), "stats": stats, "stats_hist": hist,
             "floor": {"lqdt": lq}}
+
+
+def bond_movers(n=50):
+    """Лидеры падения/роста цены за день по облигациям (из тех же данных, что и скринер)."""
+    rows = screener_rows()
+    mv = [r for r in rows if r.get("chg")]
+    br = globals().get("best_rating")
+
+    def item(r):
+        rt = r.get("rating")
+        if rt is None and br:
+            try:
+                x = br(r.get("isin"), r["name"])
+                rt = x["v"] if x else None
+            except Exception:  # noqa: BLE001
+                rt = None
+        return {"name": r["name"], "isin": r.get("isin") or r["id"], "chg": r["chg"], "price": r["price"],
+                "turnover": r["turn"], "trades": r["trades"], "rating": rt}
+    down = [item(r) for r in sorted(mv, key=lambda r: r["chg"])[:n]]
+    up = [item(r) for r in sorted(mv, key=lambda r: -r["chg"])[:n]]
+    return {"down": down, "up": up, "total": len(mv), "n": n, "updated": _scr["t"]}
+
+
+def _api_movers(cfg, acc, q, force):
+    try:
+        n = max(5, min(200, int(q.get("n", 50))))
+    except (TypeError, ValueError):
+        n = 50
+    return bond_movers(n)
+
+
+API_GET["/api/movers"] = _api_movers
 
 
 # ── первичные размещения (по объявлениям Мосбиржи; сводка investmint.ru) ──
@@ -6307,7 +7463,7 @@ _bc_univ = {"t": 0, "rows": []}
 _bc_lock = threading.Lock()
 BC_DESC = ("ISSUENAME", "ISSUEDATE", "MATDATE", "ISSUESIZE", "FACEVALUE", "INITIALFACEVALUE", "COUPONFREQUENCY",
            "COUPONPERCENT", "COUPONVALUE", "COUPONDATE", "BOND_TYPE", "BOND_SUBTYPE", "FACEVALUE_TYPE", "LISTLEVEL",
-           "ISQUALIFIEDINVESTORS", "HASDEFAULT", "HASTECHNICALDEFAULT", "REGNUMBER", "TYPENAME", "EMITTER_ID")
+           "ISQUALIFIEDINVESTORS", "ISSUESIZEPLACED", "HASDEFAULT", "HASTECHNICALDEFAULT", "REGNUMBER", "TYPENAME", "EMITTER_ID")
 
 
 def _bc_json(url, timeout=25):
@@ -6379,7 +7535,7 @@ def _bc_flows(isin):
             j = fn(isin)
         except Exception:  # noqa: BLE001
             j = None
-    if not isinstance(j, dict) or not any(k in j for k in ("coupons", "amortizations", "offers")):
+    if not isinstance(j, dict) or not any(k in j for k in ("coupons", "amort", "amortizations", "offers")):
         j = _bc_json("https://iss.moex.com/iss/securities/%s/bondization.json?iss.meta=off&limit=unlimited"
                      "&iss.only=coupons,amortizations,offers" % isin, timeout=30)
     today = date.today().isoformat()
@@ -6389,10 +7545,13 @@ def _bc_flows(isin):
         if d and d >= today:
             ev.append({"d": d, "t": "coupon", "amt": c.get("value_rub") if c.get("value_rub") is not None else c.get("value"),
                        "pct": c.get("valueprc")})
-    for a in _bc_norm_table(j.get("amortizations")):
-        d = a.get("amortdate")
-        if d and d >= today:
-            ev.append({"d": d, "t": "redemption" if a.get("data_source") == "maturity" else "amort",
+    # moex_bondization отдаёт график под ключом "amort" (ISS — "amortizations"); последняя строка графика — погашение
+    am = [a for a in _bc_norm_table(j.get("amort") if j.get("amort") is not None else j.get("amortizations")) if a.get("amortdate")]
+    last = max((a["amortdate"] for a in am), default=None)
+    for a in am:
+        d = a["amortdate"]
+        if d >= today:
+            ev.append({"d": d, "t": "redemption" if d == last else "amort",
                        "amt": a.get("value_rub") if a.get("value_rub") is not None else a.get("value"),
                        "pct": a.get("valueprc")})
     for o in _bc_norm_table(j.get("offers")):
@@ -6597,6 +7756,17 @@ def bond_card(isin):
             card["keyrate"] = {"source": info["source"], "name": info["source_name"], "as_of": info["as_of"]}
     except Exception as e:  # noqa: BLE001
         errors.append("прогноз купонов: %s" % str(e)[:120])
+    try:        # «КС + x %» для флоатера: из кэша спредов, иначе считаем по графику выплат (он уже в кэше после _bc_mark_est)
+        if (ci or {}).get("floating"):
+            fsp = fl_spread_cached([isin]).get(isin)
+            if fsp is None:
+                face2 = (desc or {}).get("FACEVALUE") or (me or {}).get("nominal")
+                fsp = fl_spread_put(isin, (me or {}).get("full") or (desc or {}).get("NAME") or card.get("name"),
+                                    moex_bondization(isin), float(face2) if face2 else None, (me or {}).get("kind"))
+            card["fl_spread"] = fsp
+            card["fl_label"] = fl_label(fsp, True)
+    except Exception as e:  # noqa: BLE001
+        errors.append("спред флоатера: %s" % str(e)[:120])
     try:
         rt = (me["_rt"] if me else None) or best_rating(isin, (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or "")
     except Exception as e:  # noqa: BLE001
@@ -6626,6 +7796,11 @@ def bond_card(isin):
         card["issuer_curve"] = None
         if not errors:
             errors.append("нет торгов на основных режимах Мосбиржи — показаны только справочные данные")
+    try:
+        card["disclosure"] = disclosure_for_bond(isin, desc=desc)
+    except Exception as e:  # noqa: BLE001
+        card["disclosure"] = None
+        errors.append("раскрытие: %s" % str(e)[:120])
     card["docs"] = bond_doc_links(isin, (me or {}).get("id") or isin, (desc or {}).get("EMITTER_INN"))
     card["name"] = (me or {}).get("full") or (desc or {}).get("ISSUENAME") or (ci or {}).get("name") or isin
     card["short"] = (me or {}).get("name") or (ci or {}).get("name") or isin
@@ -11164,6 +12339,45 @@ def _tg_dispatch(cfg, title, alerts, sent, now):
     return sent_n
 
 
+_TG_KIND["default_ok"] = "✅"
+TG_DFL_DAYS = 30
+
+
+def defaults_alerts(cfg, sent=None, rows=None, isins=None):
+    """Тревоги о техдефолте/дефолте по бумагам портфеля и списка наблюдения (лента defaults_feed) и «исполнено» после него.
+    Неисполненное -> kind default, severity high, id dfl|isin|дата|обязательство (один раз). Исполненное -> kind default_ok,
+    id dflx|... — только если о дефолте по этой записи мы уже сообщали (ключ dfl|... есть в sent). Бумаги вне портфеля/наблюдения
+    не трогаем. rows/isins передаются в тестах, иначе берутся из defaults_feed и _disc_own_isins."""
+    sent = sent or {}
+    own = list(isins) if isins is not None else _disc_own_isins(cfg, "all")
+    if not own:
+        return []
+    if rows is None:
+        rows = defaults_feed((date.today() - timedelta(days=TG_DFL_DAYS)).isoformat(), own)
+    mine = set(own)
+    out = []
+    for r in rows:
+        isin = r.get("isin")
+        if isin not in mine:
+            continue
+        tail = "%s|%s" % (r.get("date") or r.get("basis") or "", r.get("obligation") or r.get("status"))
+        base = {"isin": isin, "isins": [isin], "name": r.get("issuer") or isin, "bonds": [r.get("issuer") or isin],
+                "date": r.get("date") or date.today().isoformat(), "url": r.get("url") or ""}
+        what = "дефолт" if r.get("status") == "default" else "технический дефолт"
+        ob = (r.get("obligation") or "обязательство").lower()
+        amt = (", %s ₽" % "{:,.0f}".format(r["amount"]).replace(",", " ")) if r.get("amount") else ""
+        due = (", срок %s" % _tg_dmy(r["due_date"])) if r.get("due_date") else ""
+        kd, kx = "dfl|%s|%s" % (isin, tail), "dflx|%s|%s" % (isin, tail)
+        if r.get("executed"):
+            if kd in sent:
+                out.append(dict(base, id=kx, kind="default_ok", severity="medium",
+                                message="%s по бумаге исполнен(о): %s%s, раскрытие о выплате от %s" % (what, ob, amt, _tg_dmy(r["executed"]))))
+        else:
+            out.append(dict(base, id=kd, kind="default", severity="high",
+                            message="%s по бумаге: %s%s%s (%s)" % (what, ob, amt, due, r.get("basis") or "")))
+    return out
+
+
 TG_OFR_CALL_DAYS, TG_OFR_CLOSE_DAYS, TG_OFR_PUT_HORIZON = 14, 2, 120
 
 
@@ -11315,6 +12529,16 @@ def tg_tick(force_digest=False, manual=False):
             if cfg.get("tg_on_watch", True) and (watch_isins() or notes_all()):
                 al = [a for a in watch_payload(cfg)["alerts"] if a["severity"] != "info"]
                 n += _tg_dispatch(cfg, "Наблюдение и цели", al, sent, now)
+        except Exception:  # noqa: BLE001
+            pass
+        try:        # крупные сделки и всплески объёма по бумагам списка (13v_flows.py; ключ дедупликации — id тревоги)
+            if cfg.get("tg_on_watch", True) and watch_isins() and "flows_watch_alerts" in globals():
+                n += _tg_dispatch(cfg, "Потоки по списку наблюдения", flows_watch_alerts(cfg), sent, now)
+        except Exception:  # noqa: BLE001
+            pass
+        try:        # техдефолты/дефолты по бумагам портфеля и списка наблюдения + «исполнено» (13q_disclosure.py)
+            if cfg.get("tg_on_mon", True) or cfg.get("tg_on_watch", True):
+                n += _tg_dispatch(cfg, "Дефолты по бумагам портфеля и наблюдения", defaults_alerts(cfg, sent), sent, now)
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -13395,6 +14619,42 @@ def ifrs_bundle(isin, em=None):
     nm = (em or {}).get("title") or mp.get("group") or ""
     sc = iss_score_ifrs(fin, bool(IFRS_FIN_RE.search(nm)))
     return {"ticker": mp["ticker"], "how": mp["how"], "group": mp["group"], "kind": mp["kind"], "fin": fin, "score": sc, "url": fin.get("url") or IFRS_BASE % mp["ticker"]}
+
+
+# ── мультипликаторы по МСФО (для карточки акции и скринера без токена T-Invest) ──
+
+def ifrs_multiples(fin, cap):
+    """ifrs_fin + рыночная капитализация (₽) -> {pe, pb, ev_ebitda, roe, nd_ebitda, rev_growth, ni_growth, period, source}; доли роста — в процентах.
+    Берётся LTM, если он есть (иначе последний год). Что посчитать нельзя (убыток, нет данных, банк без EBITDA) — None."""
+    out = {"pe": None, "pb": None, "ev_ebitda": None, "roe": None, "nd_ebitda": None, "rev_growth": None, "ni_growth": None,
+           "period": None, "source": "ifrs"}
+    if not fin or fin.get("status") != "ok" or not fin.get("years"):
+        return out
+    yrs = fin["years"]
+    c = fin.get("ltm") or yrs[-1]
+    last = yrs[-1]
+    prev = yrs[-2] if len(yrs) > 1 and yrs[-2]["y"] == last["y"] - 1 else None
+    out["period"] = c.get("y") if c.get("y") == "LTM" else str(c.get("y"))
+    mcap = (cap or 0) / 1e6                       # суммы МСФО — в млн ₽
+    net, eq, ebitda, nd = c.get("net"), c.get("equity"), c.get("ebitda"), c.get("net_debt")
+    if mcap > 0:
+        if net is not None and net > 0:
+            out["pe"] = mcap / net
+        if eq is not None and eq > 0:
+            out["pb"] = mcap / eq
+        if not fin.get("bank") and ebitda is not None and ebitda > 0 and nd is not None:
+            out["ev_ebitda"] = (mcap + nd) / ebitda
+    roe = c.get("roe")
+    if roe is None and net is not None and eq and eq > 0:
+        roe = net / eq
+    out["roe"] = None if roe is None else roe * 100
+    if c.get("nd_ebitda") is not None:
+        out["nd_ebitda"] = c["nd_ebitda"]
+    if last.get("growth") is not None:
+        out["rev_growth"] = last["growth"] * 100
+    if prev and prev.get("net") and prev["net"] > 0 and last.get("net") is not None:
+        out["ni_growth"] = (last["net"] / prev["net"] - 1) * 100
+    return out
 # ═══════════════════════════════ Данные на компьютере (раздел «Настройки») ═══════════════════════════════
 # Размер и состав папки данных, открытие папки, очистка кэша и полное удаление данных.
 # Все пути строятся только от APP_DIR; символические ссылки никогда не разворачиваются (удаляется сама ссылка).
@@ -13634,17 +14894,30 @@ def td_ratings(events, rows_keys, today, days=TD_RATING_DAYS):
             "items": [{"date": a["date"], "name": a["name"], "message": a["message"], "severity": a["severity"]} for a in al[:5]]}
 
 
-def td_digest(pays, pairs, events, rows_keys, today, alerts=None):
+TD_MV_N, TD_MV_TURN = 5, 1_000_000
+
+
+def td_movers(rows, n=TD_MV_N, min_turn=TD_MV_TURN):
+    """Лидеры падения облигаций за день: топ-n по падению цены среди выпусков с оборотом >= min_turn ₽ (отсекаем шум)."""
+    down = sorted((r for r in rows or [] if (r.get("chg") or 0) < 0 and (r.get("turn") or 0) >= min_turn), key=lambda r: r["chg"])
+    return {"count": len(down), "n": n, "min_turn": min_turn,
+            "items": [{"name": r.get("name"), "isin": r.get("isin") or r.get("id"), "chg": r["chg"], "price": r.get("price"),
+                       "turnover": r.get("turn")} for r in down[:n]]}
+
+
+def td_digest(pays, pairs, events, rows_keys, today, alerts=None, movers=None):
     """Собирает сводку; пустые разделы выбрасываются, empty=True — показывать карточку нечего."""
     d = {"today": today, "payments": td_payments(pays, today), "offers": td_offers(pairs, today),
          "ratings": td_ratings(events, rows_keys, today)}
     if alerts is not None:
         d["alerts"] = {"count": sum(1 for a in alerts if a.get("severity") in ("high", "medium")),
                        "high": sum(1 for a in alerts if a.get("severity") == "high")}
-    for k in ("payments", "offers", "ratings", "alerts"):
+    if movers is not None:
+        d["movers"] = movers
+    for k in ("payments", "offers", "ratings", "alerts", "movers"):
         if k in d and not d[k]["count"]:
             del d[k]
-    d["empty"] = not any(k in d for k in ("payments", "offers", "ratings", "alerts"))
+    d["empty"] = not any(k in d for k in ("payments", "offers", "ratings", "alerts", "movers"))
     return d
 
 
@@ -13655,6 +14928,13 @@ def td_empty():
 def _td_warm_monitor(cfg, acc):
     try:
         build_monitor(cfg, acc)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _td_warm_screener():
+    try:
+        screener_rows()
     except Exception:  # noqa: BLE001
         pass
 
@@ -13682,7 +14962,15 @@ def td_build(cfg, acc):
             threading.Thread(target=_td_warm_monitor, args=(cfg, acc), daemon=True).start()
     except Exception:  # noqa: BLE001
         alerts = None
-    return td_digest(rep.get("payments") or [], pairs, events, rows_keys, today, alerts)
+    movers = None
+    try:                                  # рынок: берём готовые строки скринера; если их ещё нет — прогреваем в фоне
+        if _scr["rows"] and time.time() - _scr["t"] < 6 * 3600:
+            movers = td_movers(_scr["rows"])
+        else:
+            threading.Thread(target=_td_warm_screener, daemon=True).start()
+    except Exception:  # noqa: BLE001
+        movers = None
+    return td_digest(rep.get("payments") or [], pairs, events, rows_keys, today, alerts, movers)
 
 
 def today_get(cfg, acc, q, force):
@@ -13701,6 +14989,2404 @@ def today_get(cfg, acc, q, force):
 
 
 API_GET["/api/today"] = today_get
+# ═══════════════ раскрытие информации эмитентов: клиент (факты с сервера данных, объём в рынке, потоки эмитента, техдефолты) ═══════════════
+# Факты разбирает сервер данных (disclosure/facts, disclosure/defaults); здесь — только потребление: объём выпуска в обращении,
+# рублёвый эквивалент будущих выплат эмитента по всем его выпускам, лента дефолтов. Сервер выключен/недоступен -> пустые списки.
+
+DISC_TTL, DISC_ERR_TTL = 6 * 3600, 15 * 60
+DISC_KIND_RU = {"coupon_paid": "Выплата купона", "coupon_declared": "Ставка купона", "default": "Неисполнение обязательства",
+                "buyback_result": "Итоги выкупа"}
+DISC_OBL_RU = {"coupon": "Купон", "amortization": "Амортизация", "redemption": "Погашение", "offer": "Выкуп по оферте", "other": "Обязательство"}
+DISC_FX_RUB = ("", "RUB", "RUR", "SUR")
+
+
+def _disc_num(x):
+    try:
+        return None if x is None or isinstance(x, bool) else float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _disc_ru(n):
+    return ("{:,.0f}".format(n)).replace(",", " ")
+
+
+def disc_facts(isin=None, inn=None, kind=None):
+    """Факты раскрытия по ISIN или ИНН, новые сверху: [{doc_id, title, published, url, isin, inn, kind, event_date, due_date, conf, data}].
+    Кэш в kv: 6 ч, ошибка/выключенный сервер — 15 мин. Пусто, если сервер данных недоступен."""
+    isin = (isin or "").strip().upper() or None
+    inn = (inn or "").strip() or None
+    if not isin and not inn:
+        return []
+    params = {"isin": isin} if isin else {"inn": inn}
+    if kind:
+        params["kind"] = kind
+    key = "disc1:%s:%s" % (isin or inn, kind or "")
+    st = store()
+    hit = st.get(key)
+    if isinstance(hit, dict) and time.time() - hit.get("ts", 0) < (DISC_TTL if hit.get("ok") else DISC_ERR_TTL):
+        return hit.get("data") or []
+    try:
+        res = ds_parsed("disclosure/facts", params)
+    except Exception:  # noqa: BLE001
+        res = None
+    ok = isinstance(res, list)
+    data = [x for x in res if isinstance(x, dict)] if ok else []
+    st.put(key, {"ok": ok, "ts": time.time(), "data": data})
+    return data
+
+
+def _disc_issue_desc(isin):
+    """Объём выпуска из описания Мосбиржи: {issue_size, placed, face, cur, name}; кэш сутки. {} при ошибке."""
+    isin = (isin or "").strip().upper()
+    if not isin:
+        return {}
+    key = "disc_desc1:" + isin
+    hit = store().get(key, ttl=DAY)
+    if hit is not None:
+        return hit
+    try:
+        j = json.loads(http_text("https://iss.moex.com/iss/securities/%s.json?iss.meta=off&iss.only=description" % isin, 20))
+        d = {r[0]: r[2] for r in j["description"]["data"]}
+    except Exception:  # noqa: BLE001
+        return {}
+    n = lambda k: (int(_disc_num(d.get(k))) if _disc_num(d.get(k)) else None)      # noqa: E731
+    out = {"issue_size": n("ISSUESIZE"), "placed": n("ISSUESIZEPLACED"), "face": _disc_num(d.get("FACEVALUE")),
+           "cur": d.get("FACEUNIT") or "SUR", "name": d.get("SHORTNAME") or d.get("NAME") or isin}
+    if d:
+        store().put(key, out)
+    return out
+
+
+def _disc_fdate(f):
+    d = f.get("data") or {}
+    return d.get("due_date") or d.get("date") or f.get("due_date") or f.get("event_date") or (f.get("published") or "")[:10] or None
+
+
+def _disc_conf(f):
+    d = f.get("data") or {}
+    c = d.get("conf") if d.get("conf") is not None else f.get("conf")
+    return _disc_num(c) or 0.0
+
+
+def bond_outstanding(isin, today=None, desc=None):
+    """Сколько бумаг выпуска в обращении: по последнему раскрытию (купон -> число бумаг), иначе по объёму выпуска Мосбиржи.
+    -> {qty, issue_size, placed, share, method, as_of, coupon_no, doc_url, buybacks_after, conf}."""
+    isin = (isin or "").strip().upper()
+    today = today or date.today().isoformat()
+    try:
+        facts = disc_facts(isin=isin)
+    except Exception:  # noqa: BLE001
+        facts = []
+    try:
+        desc = desc or _disc_issue_desc(isin) or {}
+    except Exception:  # noqa: BLE001
+        desc = {}
+    size, placed = desc.get("issue_size"), desc.get("placed")
+    if desc.get("ISSUESIZE") is not None or desc.get("ISSUESIZEPLACED") is not None:       # передан сырой словарь ISS (_bc_desc)
+        size = int(_disc_num(desc.get("ISSUESIZE")) or 0) or None
+        placed = int(_disc_num(desc.get("ISSUESIZEPLACED")) or 0) or None
+    out = {"qty": None, "issue_size": size, "placed": placed, "share": None, "method": None, "as_of": None, "coupon_no": None,
+           "doc_url": None, "buybacks_after": 0, "conf": None}
+
+    def dated(kind):
+        rows = [f for f in facts if f.get("kind") == kind and isinstance(f.get("data"), dict)]
+        rows = [f for f in rows if (_disc_fdate(f) or "") <= today]
+        return sorted(rows, key=lambda f: _disc_fdate(f) or "", reverse=True)
+    pick = None
+    for f in dated("coupon_paid"):
+        d = f["data"]
+        if _disc_conf(f) < 0.5:
+            continue
+        if d.get("qty") is not None and _disc_num(d["qty"]) is not None:
+            pick = (f, int(d["qty"]), "coupon_explicit")
+        elif d.get("qty_derived") is not None and (d.get("checks") or {}).get("qty_integer"):
+            pick = (f, int(d["qty_derived"]), "coupon_derived")
+        if pick:
+            break
+    if not pick:
+        for f in dated("coupon_declared"):
+            d = f["data"]
+            if d.get("qty_derived") is not None and (d.get("checks") or {}).get("qty_integer"):
+                pick = (f, int(d["qty_derived"]), "declared_derived")
+                break
+    if pick:
+        f, qty, method = pick
+        as_of = _disc_fdate(f)
+        n_bb = 0
+        for b in dated("buyback_result"):
+            bd = b["data"].get("date") or b.get("event_date") or (b.get("published") or "")[:10]
+            if as_of and bd and bd > as_of:
+                n_bb += 1
+                qb = _disc_num(b["data"].get("qty_bought"))
+                if qb:
+                    qty = max(0, qty - int(qb))
+        if size and qty > size:
+            qty = size
+        out.update(qty=qty, method=method, as_of=as_of, coupon_no=f["data"].get("coupon_no"), doc_url=f.get("url"),
+                   buybacks_after=n_bb, conf=_disc_conf(f))
+    elif placed:
+        out.update(qty=placed, method="issue_placed", conf=0.3)
+    elif size:
+        out.update(qty=size, method="issue_size", conf=0.2)
+    if out["qty"] is not None and size:
+        out["share"] = round(out["qty"] / float(size), 4)
+    return out
+
+
+def disc_brief(f):
+    """Краткая строка по факту для карточки: {date, kind, label, text, url, title}."""
+    d = f.get("data") or {}
+    k = f.get("kind")
+    bits = []
+    if k == "coupon_paid":
+        if d.get("coupon_no"):
+            bits.append("купон №%s" % d["coupon_no"])
+        if d.get("total") is not None:
+            bits.append("выплачено %s ₽" % _disc_ru(d["total"]))
+        q = d.get("qty") if d.get("qty") is not None else d.get("qty_derived")
+        if q is not None:
+            bits.append("%s шт." % _disc_ru(q))
+    elif k == "coupon_declared":
+        if d.get("coupon_no"):
+            bits.append("купон №%s" % d["coupon_no"])
+        if d.get("undetermined"):
+            bits.append("ставка не определена" + (": " + d["formula"] if d.get("formula") else ""))
+        elif d.get("per_bond") is not None:
+            bits.append("%s ₽ на бумагу" % ("%.2f" % d["per_bond"]).replace(".", ","))
+        elif d.get("rate") is not None:
+            bits.append("ставка %s %%" % ("%g" % d["rate"]).replace(".", ","))
+    elif k == "default":
+        bits.append("технический дефолт" if d.get("status") == "technical" else "дефолт")
+        bits.append(DISC_OBL_RU.get(d.get("obligation"), "обязательство").lower() + (" №%s" % d["coupon_no"] if d.get("coupon_no") else ""))
+        if d.get("amount") is not None:
+            bits.append("%s ₽" % _disc_ru(d["amount"]))
+    elif k == "buyback_result":
+        if d.get("qty_bought") is not None:
+            bits.append("выкуплено %s шт." % _disc_ru(d["qty_bought"]))
+        bits.append({"put": "по требованию владельцев", "issuer": "по соглашению"}.get(d.get("basis"), ""))
+    return {"date": (f.get("published") or "")[:10] or _disc_fdate(f), "kind": k, "label": DISC_KIND_RU.get(k, k),
+            "text": ", ".join(b for b in bits if b), "url": f.get("url"), "title": f.get("title")}
+
+
+def disclosure_for_bond(isin, desc=None, n=5):
+    facts = [f for f in disc_facts(isin=isin) if f.get("kind") in DISC_KIND_RU]
+    return {"outstanding": bond_outstanding(isin, desc=desc), "facts": [disc_brief(f) for f in facts[:n]], "n_facts": len(facts)}
+
+
+# ───────────────────────── денежные потоки эмитента ─────────────────────────
+
+def _disc_add_month(ym, k):
+    y, m = int(ym[:4]), int(ym[5:7]) - 1 + k
+    return "%04d-%02d" % (y + m // 12, m % 12 + 1)
+
+
+def _disc_days(a, b):
+    return (datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
+
+
+def _disc_bond_flows(isin, today, last_ym, warns):
+    """Будущие потоки одного выпуска в рублях на ВСЕ бумаги: [{d, t: coupon|amort|redemption|put|call, amt, est}] + qty/method."""
+    bz = moex_bondization(isin)
+    if not bz:
+        warns.append("%s: нет графика выплат Мосбиржи" % isin)
+        return None
+    o = bond_outstanding(isin, today)
+    qty = o.get("qty")
+    if not qty:
+        warns.append("%s: не удалось определить число бумаг" % isin)
+        return None
+    desc = _disc_issue_desc(isin) or {}
+    face = desc.get("face") or 0.0
+    cur = (desc.get("cur") or "SUR").upper()
+    fx = 1.0
+    if cur not in DISC_FX_RUB:
+        fx = tax_cbr_rate(cur, today)
+        if not fx:
+            warns.append("%s: нет курса ЦБ для %s, выпуск пропущен" % (isin, cur))
+            return None
+    decl = {}
+    try:
+        for f in disc_facts(isin=isin, kind="coupon_declared"):
+            d = f.get("data") or {}
+            dd = d.get("due_date") or f.get("due_date")
+            if dd and not d.get("undetermined") and _disc_conf(f) >= 0.5:
+                pb = _disc_num(d.get("per_bond"))
+                if pb is None and d.get("rate") and d.get("period_from") and d.get("period_to") and face:
+                    pb = face * d["rate"] / 100.0 * max(_disc_days(d["period_from"], d["period_to"]), 0) / 365.0
+                if pb:
+                    decl.setdefault(dd, pb)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        est = fl_estimates(bz, today, float(face), None) if face else {}
+    except Exception:  # noqa: BLE001
+        est = {}
+    in_h = lambda d: bool(d) and today <= d and d[:7] <= last_ym        # noqa: E731
+    am = sorted((a["amortdate"], _disc_num(a.get("value"))) for a in bz.get("amort") or [] if a.get("amortdate"))
+    last_am = am[-1][0] if am else None
+    cps = sorted((c["coupondate"], _disc_num(c.get("value"))) for c in bz.get("coupons") or [] if c.get("coupondate"))
+    flows, known = [], [v for _, v in cps if v]
+    last_known = [v for d, v in cps if v and d <= today]
+    prev = last_known[-1] if last_known else (known[-1] if known else None)
+    for d, v in cps:
+        if not in_h(d):
+            if v:
+                prev = v
+            continue
+        e = False
+        if not v:
+            near = [x for x in decl if abs(_disc_days(x, d)) <= 4]
+            if near:
+                v = decl[near[0]]
+            elif d in est:
+                v, e = est[d]["amt"], True
+            elif prev:
+                v, e = prev, True
+        else:
+            prev = v
+        if v:
+            flows.append({"d": d, "t": "coupon", "amt": v * qty * fx, "est": e})
+    for d, v in am:
+        if in_h(d) and v:
+            flows.append({"d": d, "t": "redemption" if d == last_am else "amort", "amt": v * qty * fx, "est": False})
+
+    def face_on(d):
+        return max(face - sum(v for da, v in am if v and today < da < d), 0.0)
+    try:
+        opt = moex_bond_options(isin) or {}
+    except Exception:  # noqa: BLE001
+        opt = {}
+    calls = [d for d in opt.get("call") or [] if in_h(d)]
+    put_seen = set()
+    for of in bz.get("offers") or []:
+        d = of.get("offerdate")
+        if not in_h(d) or d in put_seen:
+            continue
+        if d in (opt.get("call") or []) and d not in (opt.get("put") or []):       # дата только колл — не пут
+            continue
+        put_seen.add(d)
+        px = _disc_num(of.get("price")) or 100.0
+        flows.append({"d": d, "t": "put", "amt": face_on(d) * px / 100.0 * qty * fx, "est": False})
+    for d in calls:
+        flows.append({"d": d, "t": "call", "amt": face_on(d) * qty * fx, "est": False})
+    return {"flows": flows, "qty": qty, "method": o.get("method"), "call_date": min(calls) if calls else None}
+
+
+def issuer_cashflows(inn, horizon_months=25, today=None):
+    """Месячный ряд будущих выплат эмитента по всем торгуемым выпускам в рублях (число бумаг x выплата на бумагу)."""
+    inn = (inn or "").strip()
+    today = today or date.today().isoformat()
+    n = max(1, int(horizon_months))
+    first = today[:7]
+    mkeys = [_disc_add_month(first, i) for i in range(n)]
+    months = {m: {"m": m, "coupon": 0.0, "amort": 0.0, "redemption": 0.0, "put": 0.0, "call": 0.0, "est": False, "est_amt": 0.0,
+                  "after_call": False, "by_bond": {}, "call_by_bond": {}, "parts": {t: {} for t in ("coupon", "amort", "redemption", "put")},
+                  "est_by_bond": {}} for m in mkeys}
+    warns, bonds, dates = [], [], set()
+    try:
+        lst = [b for b in _iss_bonds_of(inn) if b.get("traded") and b.get("isin")]
+    except Exception as e:  # noqa: BLE001
+        lst = []
+        warns.append("список выпусков эмитента недоступен: %s" % str(e)[:80])
+
+    def one(b):
+        w = []
+        try:
+            return b, _disc_bond_flows(b["isin"], today, mkeys[-1], w), w
+        except Exception as e:  # noqa: BLE001
+            return b, None, w + ["%s: %s" % (b["isin"], str(e)[:80])]
+    for b, res, w in pool_map(one, lst, workers=4) if lst else []:
+        warns += w
+        if not res:
+            continue
+        bonds.append({"isin": b["isin"], "secid": b.get("secid"), "name": b.get("name") or b["isin"], "qty": res["qty"],
+                      "method": res["method"], "call_date": res["call_date"]})
+        for f in res["flows"]:
+            m = months.get(f["d"][:7])
+            if not m:
+                continue
+            a = round(f["amt"], 2)
+            dates.add(f["d"])
+            m[f["t"]] += a
+            if f["t"] == "call":
+                m["call_by_bond"][b["isin"]] = round(m["call_by_bond"].get(b["isin"], 0.0) + a, 2)
+                continue
+            m["by_bond"][b["isin"]] = round(m["by_bond"].get(b["isin"], 0.0) + a, 2)
+            pt = m["parts"][f["t"]]
+            pt[b["isin"]] = round(pt.get(b["isin"], 0.0) + a, 2)
+            if f["est"]:
+                m["est_by_bond"][b["isin"]] = round(m["est_by_bond"].get(b["isin"], 0.0) + a, 2)
+                m["est"] = True
+                m["est_amt"] += a
+            if res["call_date"] and f["d"] > res["call_date"]:
+                m["after_call"] = True
+    series = []
+    for k in mkeys:
+        m = months[k]
+        for x in ("coupon", "amort", "redemption", "put", "call", "est_amt"):
+            m[x] = round(m[x], 2)
+        series.append(m)
+    name = None
+    try:
+        em = issuer_of(bonds[0]["isin"]) if bonds else None
+        name = (em or {}).get("short") or (em or {}).get("title")
+    except Exception:  # noqa: BLE001
+        pass
+    pay = sum(m["coupon"] + m["amort"] + m["redemption"] for m in series)
+    return {"inn": inn, "name": name or inn, "months": series, "bonds": bonds, "warnings": warns,
+            "totals": {"payments": round(pay, 2), "call": round(sum(m["call"] for m in series), 2),
+                       "put": round(sum(m["put"] for m in series), 2)},
+            "dates": len(dates), "n_months": sum(1 for m in series if m["coupon"] or m["amort"] or m["redemption"] or m["put"] or m["call"]),
+            "today": today}
+
+
+# ───────────────────────── лента техдефолтов ─────────────────────────
+
+_DFL_PAY_OF = {"coupon": ("coupon", "coupon+amortization", "coupon+redemption"),
+               "amortization": ("amortization", "coupon+amortization"),
+               "redemption": ("redemption", "coupon+redemption")}
+
+
+def _dfl_executed(isin, f):
+    """Дата исполнения просроченного обязательства по раскрытию о выплате (coupon_paid) того же ISIN, вышедшему не раньше
+    сообщения о неисполнении. Купон: тот же номер и paid_pct >= 100 (или не указан). Амортизация/погашение: payment того же вида
+    (в т.ч. «купон + амортизация»), выплата не позднее срока не считается — нужна публикация после срока обязательства.
+    None — не найдено."""
+    d = f.get("data") or {}
+    ob = d.get("obligation")
+    if ob not in _DFL_PAY_OF:
+        return None
+    if ob == "coupon" and not d.get("coupon_no"):
+        return None
+    due = d.get("due_date") or f.get("due_date") or ""
+    since = (f.get("published") or "")[:10]
+    for p in sorted(disc_facts(isin=isin, kind="coupon_paid"), key=lambda x: x.get("published") or ""):
+        pd_ = p.get("data") or {}
+        pub = (p.get("published") or "")[:10]
+        if pd_.get("paid_pct") is not None and pd_["paid_pct"] < 100:
+            continue
+        if ob == "coupon":
+            if pd_.get("coupon_no") == d["coupon_no"] and pub >= since:
+                return pub or _disc_fdate(p)
+        elif pd_.get("payment") in _DFL_PAY_OF[ob] and pub and pub >= since and (not due or pub >= due):
+            return pub
+    return None
+
+
+def defaults_feed(since=None, isins=None):
+    """Лента неисполненных обязательств: сообщения эмитентов (сервер данных) + флаги Мосбиржи по бумагам из isins.
+    [{date, status, issuer, inn, isin, obligation, amount, executed, basis, url}], новые сверху."""
+    since = since or (date.today() - timedelta(days=30)).isoformat()
+    try:
+        raw = ds_parsed("disclosure/defaults", {"since": since})
+    except Exception:  # noqa: BLE001
+        raw = None
+    raw = [f for f in raw if isinstance(f, dict)] if isinstance(raw, list) else []
+
+    def one(f):
+        d = f.get("data") or {}
+        isin = f.get("isin")
+        name = None
+        try:
+            em = issuer_of(isin) if isin else None
+            name = (em or {}).get("short") or (em or {}).get("title")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ex = _dfl_executed(isin, f) if isin else None
+        except Exception:  # noqa: BLE001
+            ex = None
+        obls = d.get("obligations") or [{"obligation": d.get("obligation"), "amount": d.get("amount")}]
+        out = []
+        for o in obls:            # одно сообщение может описывать несколько обязательств (купон + частичное погашение) — по строке на каждое
+            ob = DISC_OBL_RU.get(o.get("obligation"), "Обязательство")
+            num = " №%s" % d["coupon_no"] if d.get("coupon_no") and o.get("obligation") == "coupon" else ""
+            out.append({"date": (f.get("published") or "")[:10] or None, "due_date": d.get("due_date") or f.get("due_date"),
+                        "status": "default" if d.get("status") == "default" else "technical", "issuer": name or f.get("title") or "",
+                        "inn": f.get("inn"), "isin": isin, "obligation": ob + num,
+                        "amount": o.get("amount"), "executed": ex, "basis": "Сообщение эмитента", "url": f.get("url")})
+        return out
+    rows = [r for part in (pool_map(one, raw[:300], workers=6) if raw else []) for r in part]
+    have = {r["isin"] for r in rows if r.get("isin")}
+    extra = [i for i in dict.fromkeys(isins or []) if i and i not in have]
+
+    def flag(isin):
+        try:
+            fl = _mon_flags(isin)
+            if not (fl.get("tech") or fl.get("default")):
+                return None
+            em = issuer_of(isin) or {}
+            return {"date": None, "due_date": None, "status": "default" if fl.get("default") else "technical",
+                    "issuer": em.get("short") or em.get("title") or isin, "inn": em.get("inn"), "isin": isin, "obligation": "",
+                    "amount": None, "executed": None, "basis": "Флаг Мосбиржи", "url": None}
+        except Exception:  # noqa: BLE001
+            return None
+    rows += [r for r in (pool_map(flag, extra, workers=6) if extra else []) if r]
+    rows.sort(key=lambda r: r["date"] or "", reverse=True)
+    return rows
+
+
+def _disc_own_isins(cfg, acc):
+    out = []
+    try:
+        out += list(watch_isins())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if cfg.get("token") or imports_list():
+            out += [r["isin"] for r in (build_bonds(cfg, acc).get("rows") or []) if r.get("isin") and r.get("qty")]
+    except Exception:  # noqa: BLE001
+        pass
+    return list(dict.fromkeys(out))
+
+
+# ───────────────────────── маршруты ─────────────────────────
+
+def disclosure_get(cfg, acc, q, force):
+    isin = (q.get("isin") or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{6,14}", isin):
+        return {"error": "некорректный ISIN"}
+    d = disclosure_for_bond(isin, n=20)
+    d.update(isin=isin, configured=bool(ds_conf()[0]))
+    return d
+
+
+def issuer_flows_get(cfg, acc, q, force):
+    inn = (q.get("inn") or "").strip()
+    if not re.fullmatch(r"\d{10,12}", inn):
+        return {"error": "некорректный ИНН"}
+    try:
+        h = max(1, min(60, int(q.get("months") or 25)))
+    except ValueError:
+        h = 25
+    key = ("issflows", inn, h, date.today().isoformat())
+    if not force:
+        hit = mem_get(key, 1800)
+        if hit:
+            return hit
+    return mem_put(key, issuer_cashflows(inn, h))
+
+
+def defaults_get(cfg, acc, q, force):
+    try:
+        days = max(1, min(365, int(q.get("days") or 30)))
+    except ValueError:
+        days = 30
+    since = (q.get("since") or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+        since = (date.today() - timedelta(days=days)).isoformat()
+    own = str(q.get("own", "1")) != "0"
+    key = ("defaults", since, own, bool(cfg.get("sandbox")), hash(cfg.get("token") or ""), acc)
+    if not force:
+        hit = mem_get(key, 900)
+        if hit:
+            return hit
+    rows = defaults_feed(since, _disc_own_isins(cfg, acc) if own else None)
+    return mem_put(key, {"since": since, "rows": rows, "configured": bool(ds_conf()[0])})
+
+
+API_GET["/api/disclosure"] = disclosure_get
+API_GET["/api/issuer_flows"] = issuer_flows_get
+API_GET["/api/defaults"] = defaults_get
+# ── недельная инфляция (Росстат): еженедельные заметки «Об оценке индекса потребительских цен с … по …» ──
+# Источник: https://rosstat.gov.ru/central-news (постраничный список «Новости статистики», ?page=N, новые сверху).
+# Заметка — PDF (с 2026 г.) или HTML; в тексте: «индекс потребительских цен, по оценке Росстата, составил 100,12%».
+# Прошлые недели не меняются: разобранные заметки хранятся в kv навсегда, свежие страницы перечитываются раз в 12 ч,
+# история докачивается в фоне (≤1 запрос/с). Мёртвые ссылки старых заметок запоминаются и не перезапрашиваются.
+
+import html
+import urllib.parse
+
+ROSSTAT_NEWS = "https://rosstat.gov.ru/central-news"
+_WI_KEY = "weekly_cpi_notes_v1"
+_WI_TTL = 12 * 3600
+_WI_FLOOR = date(2017, 1, 1)
+_WI_MAX_PAGES = 100
+_WI_DEAD_STOP = 8            # подряд недоступных старых заметок — дальше архив не углубляем
+_WI_PACE = 1.0
+_wi_lock = threading.Lock()
+_wi = {"running": False, "err": None, "last": 0}
+_RU_MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+              "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12}
+_MON_RE = "|".join(_RU_MONTHS)
+
+
+# --- минимальное извлечение текста из PDF (Flate + ToUnicode, без сторонних библиотек) ---
+
+def _pdf_stream(body):
+    m = re.search(rb"stream\r?\n(.*)endstream", body, re.S)
+    if not m:
+        return b""
+    d = m.group(1)
+    if b"FlateDecode" in body[:m.start()]:
+        try:
+            d = zlib.decompressobj().decompress(d)
+        except Exception:  # noqa: BLE001
+            return b""
+    return d
+
+
+def _pdf_cmap(data):
+    mp, t = {}, data.decode("latin1")
+    for blk in re.findall(r"beginbfchar(.*?)endbfchar", t, re.S):
+        for a, c in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", blk):
+            mp[int(a, 16)] = bytes.fromhex(c).decode("utf-16-be", "replace")
+    for blk in re.findall(r"beginbfrange(.*?)endbfrange", t, re.S):
+        for a, c, d in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", blk):
+            a, c, d = int(a, 16), int(c, 16), int(d, 16)
+            for i in range(a, c + 1):
+                mp[i] = chr(d + i - a)
+    return mp
+
+
+def pdf_first_page_text(b):
+    objs = {int(m.group(1)): m.group(2) for m in re.finditer(rb"(\d+)\s+0\s+obj\b(.*?)endobj", b, re.S)}
+    page = next((body for body in objs.values() if re.search(rb"/Type\s*/Page\b", body) and b"/Contents" in body), None)
+    if page is None:
+        return ""
+    fonts = {}
+    fm = re.search(rb"/Font\s*<<(.*?)>>", page, re.S)
+    for name, num in re.findall(rb"/(\w+)\s+(\d+)\s+0\s+R", fm.group(1) if fm else b""):
+        tu = re.search(rb"/ToUnicode\s+(\d+)\s+0\s+R", objs.get(int(num), b""))
+        fonts[name.decode()] = _pdf_cmap(_pdf_stream(objs[int(tu.group(1))])) if tu and int(tu.group(1)) in objs else None
+    cm = re.search(rb"/Contents\s*(\[[^\]]*\]|\d+\s+0\s+R)", page)
+    out = []
+    for r in [int(x) for x in re.findall(rb"(\d+)\s+0\s+R", cm.group(1))] if cm else []:
+        c, cur = _pdf_stream(objs.get(r, b"")), None
+        for tok in re.finditer(rb"/(\w+)\s+[\d.]+\s+Tf|\[(.*?)\]\s*TJ|<([0-9A-Fa-f]*)>\s*Tj|\((.*?)(?<!\\)\)\s*Tj|(ET)", c, re.S):
+            if tok.group(1):
+                cur = fonts.get(tok.group(1).decode())
+                continue
+            if tok.group(5):
+                out.append(" ")
+                continue
+            if tok.group(2) is not None:
+                parts = re.findall(rb"<([0-9A-Fa-f]*)>|\(((?:\\.|[^\\)])*)\)", tok.group(2))
+            elif tok.group(3) is not None:
+                parts = [(tok.group(3), b"")]
+            else:
+                parts = [(b"", tok.group(4))]
+            for h, lit in parts:
+                if h and cur is not None:
+                    hb = bytes.fromhex(h.decode())
+                    out.append("".join(cur.get(int.from_bytes(hb[i:i + 2], "big"), "") for i in range(0, len(hb), 2)))
+                elif h:
+                    out.append(bytes.fromhex(h.decode()).decode("cp1251", "replace"))
+                else:
+                    out.append(re.sub(rb"\\(.)", rb"\1", lit).decode("cp1252", "replace"))
+    return "".join(out)
+
+
+# --- разбор заметки и списка ---
+
+def _wi_num(a, b):
+    return float(a + "." + b)
+
+
+def weekly_note_parse(data, title=""):
+    """Заметка (PDF или HTML, bytes) -> {date, pct, ytd} либо None. pct — недельный прирост в %, ytd — с начала года."""
+    if data[:4] == b"%PDF":
+        text = pdf_first_page_text(data)
+    else:
+        text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", data.decode("utf-8", "replace"), flags=re.S | re.I)
+        text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    t = re.sub(r"\s+", " ", text.replace("\xa0", " "))
+    # индекс потребительских цен (сноска-цифра), по оценке Росстата, составил 100,12%  /  цены выросли на 0,12%
+    m = re.search(r"индекс\s+потребительских\s+цен[^.]{0,40}?составил\s*(\d{2,3})\s*[,.]\s*(\d{1,2})\s*%", t, re.I)
+    pct = round(_wi_num(m.group(1), m.group(2)) - 100.0, 2) if m else None
+    if pct is None:
+        m = re.search(r"(?:цены|потребительские цены)\s+(выросли|снизились|увеличились|сократились)\s+на\s*(\d+)\s*[,.]\s*(\d{1,2})\s*%", t, re.I)
+        if m:
+            pct = _wi_num(m.group(2), m.group(3)) * (1 if m.group(1).lower() in ("выросли", "увеличились") else -1)
+    if pct is None:
+        return None
+    my = re.search(r"с\s+начала\s+года\s*[–—-]?\s*(\d{2,3})\s*[,.]\s*(\d{1,2})\s*%", t, re.I)
+    ytd = round(_wi_num(my.group(1), my.group(2)) - 100.0, 2) if my else None
+    d = weekly_end_date(t) or weekly_end_date(title)
+    return {"date": d.isoformat(), "pct": pct, "ytd": ytd} if d else None
+
+
+def weekly_end_date(text):
+    """Дата конца недели: «… по 9 ноября 2026 г.» (год может быть разорван пробелом: «202 6»)."""
+    m = re.search(r"\bпо\s+(\d{1,2})\s+(%s)\s+(20\d)\s?(\d)\b" % _MON_RE, text, re.I)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(3) + m.group(4)), _RU_MONTHS[m.group(2).lower()], int(m.group(1)))
+    except ValueError:
+        return None
+
+
+def weekly_listing_parse(page_html):
+    """Страница списка новостей -> [(url, заголовок)] только заметок «Об оценке индекса потребительских цен …», новые сверху."""
+    out = []
+    for h, t in re.findall(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page_html, re.S):
+        t = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", t)).replace("\xa0", " ")).strip()
+        if re.match(r"Об\s+оценке\s+индекса\s+потребительских\s+цен", t, re.I):
+            u = urllib.parse.urljoin(ROSSTAT_NEWS, h)
+            if all(u != x[0] for x in out):
+                out.append((u, t))
+    return out
+
+
+def weekly_avg_by_week(rows, y0=2017, y1=2021):
+    """Среднее по номеру недели за y0..y1: ([(неделя, среднее)], [годы, по которым есть данные])."""
+    acc, ys = {}, set()
+    for r in rows:
+        if y0 <= r["year"] <= y1:
+            acc.setdefault(r["week"], []).append(r["pct"])
+            ys.add(r["year"])
+    return [(w, round(sum(v) / len(v), 3)) for w, v in sorted(acc.items())], sorted(ys)
+
+
+def _wi_state():
+    st = store().get(_WI_KEY) or {}
+    st.setdefault("weeks", {})
+    st.setdefault("dead", [])
+    st.setdefault("t", 0)
+    st.setdefault("deep", False)       # история докачана до конца архива
+    return st
+
+
+def weekly_collect(fetch=None, pace=_WI_PACE, deep=False, max_pages=_WI_MAX_PAGES, save=None):
+    """Обходит страницы списка (новые -> старые) и разбирает ещё неизвестные заметки.
+    deep=False: только свежие страницы — останов, когда на странице нет новых заметок.
+    deep=True: пока не упрёмся в _WI_FLOOR, конец списка или _WI_DEAD_STOP недоступных заметок подряд."""
+    fetch = fetch or (lambda u: http_bytes(u, timeout=60))
+    st = _wi_state()
+    known = {v["url"] for v in st["weeks"].values()}
+    dead = set(st["dead"])
+    dead_run = 0
+    for p in range(1, max_pages + 1):
+        try:
+            page = fetch(ROSSTAT_NEWS + ("?page=%d" % p if p > 1 else "")).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            break
+        items = weekly_listing_parse(page)
+        fresh = 0
+        for u, title in items:
+            if u in known or u in dead:
+                dead_run = dead_run + 1 if u in dead else 0
+                continue
+            time.sleep(pace)
+            try:
+                rec = weekly_note_parse(fetch(u), title)
+            except Exception:  # noqa: BLE001
+                rec = None
+            fresh += 1
+            if rec is None:
+                dead.add(u)
+                dead_run += 1
+                continue
+            dead_run = 0
+            rec["url"] = u
+            st["weeks"][rec["date"]] = rec
+            known.add(u)
+        st["dead"] = sorted(dead)
+        if save:
+            save(st)
+        if not items and p > 1:
+            st["deep"] = True
+            break
+        if not deep and not fresh:
+            break
+        if deep and (dead_run >= _WI_DEAD_STOP or (st["weeks"] and min(st["weeks"]) < _WI_FLOOR.isoformat())):
+            st["deep"] = True
+            break
+        time.sleep(pace)
+    if deep and not st["deep"] and p >= max_pages:
+        st["deep"] = True
+    st["t"] = time.time()
+    return st
+
+
+def _wi_run():
+    try:
+        st = weekly_collect(deep=not _wi_state()["deep"], save=lambda s: store().put(_WI_KEY, s))
+        store().put(_WI_KEY, st)
+        _wi["err"] = None
+    except Exception as e:  # noqa: BLE001
+        _wi["err"] = str(e)[:200]
+    finally:
+        with _wi_lock:
+            _wi["running"] = False
+
+
+def weekly_payload(st, loading=False, err=None):
+    rows = []
+    for d, v in sorted(st["weeks"].items()):
+        dt = date.fromisoformat(d)
+        rows.append({"year": dt.year, "date": d, "week": min(52, dt.isocalendar()[1]), "pct": v["pct"], "ytd": v.get("ytd")})
+    years = {}
+    for r in rows:
+        years.setdefault(str(r["year"]), []).append(r)
+    avg, ys = weekly_avg_by_week(rows)
+    label = ("%d–%d" % (ys[0], ys[-1]) if ys[0] != ys[-1] else str(ys[0])) if ys else "2017–2021"
+    return {"years": years, "avg": avg, "avg_label": label, "avg_years": ys, "empty": not rows, "loading": loading,
+            "history_from": rows[0]["date"] if rows else None, "updated": st.get("t") or None, "error": err,
+            "sources": [ROSSTAT_NEWS]}
+
+
+def weekly_inflation(force=False):
+    """Отдаёт то, что уже разобрано; недостающее (свежие недели раз в 12 ч, история при первом запуске) докачивается в фоне."""
+    st = _wi_state()
+    with _wi_lock:
+        stale = force or (time.time() - st["t"] > _WI_TTL or not st["deep"]) and time.time() - _wi["last"] > 600
+        if stale and not _wi["running"]:
+            _wi["running"] = True
+            _wi["last"] = time.time()
+            threading.Thread(target=_wi_run, daemon=True).start()
+        running = _wi["running"]
+    return weekly_payload(st, running, _wi["err"])
+
+
+API_GET["/api/inflation_weekly"] = lambda cfg, acc, q, force: weekly_inflation(force)
+# ═══════════════════════════════ акции Мосбиржи: котировки, свечи, карточка, скринер ═══════════════════════════════
+# Источники: ISS Мосбиржи (котировки TQBR, дневная история для недельной/месячной динамики, свечи, дивиденды) и, если задан токен,
+# T-Invest API (сектор, дивиденды GetDividends, фундаментальные показатели GetAssetFundamentals, даты отчётности GetAssetReports).
+# Без токена мультипликаторы считаются по МСФО из smart-lab (13m_ifrs.ifrs_multiples), дата отчётности неизвестна.
+# Проценты везде — числами в процентных пунктах (12.5 = 12,5 %), как и chg_d/chg_w/chg_m.
+# Контракт для других модулей: stocks_universe, funds_universe, stock_candles, stock_history_closes.
+
+STK_ISS = "https://iss.moex.com/iss/"
+STK_SH = "engines/stock/markets/shares/boards/%s/securities.json?iss.meta=off&iss.only=securities,marketdata"
+STK_HIST = "history/engines/stock/markets/shares/boards/TQBR/securities.json?iss.meta=off&iss.only=history,history.cursor&history.columns=SECID,CLOSE&date=%s&start=%d"
+STK_WEEK, STK_MONTH = 5, 21                    # торговых дней назад для chg_w / chg_m
+STK_DEFAULT_SECTOR = "Прочее"
+_stk_lock = threading.Lock()
+
+_STK_SECTOR_SRC = {
+    "Нефть и газ": "GAZP LKOH ROSN NVTK SIBN TATN TATNP SNGS SNGSP BANE BANEP TRNFP RNFT KRKNP JNOS JNOSP",
+    "Банки и финансы": "SBER SBERP VTBR T TCSG CBOM BSPB BSPBP SVCB MBNK MOEX SPBE RENI LEAS SFIN ZAYM MGKL KUZB",
+    "Металлы и добыча": "GMKN NLMK CHMF MAGN MTLR MTLRP ALRS PLZL RUAL TRMK SELG UGLD VSMO CHMK RASP ENPG LNZL LNZLP",
+    "Телеком": "RTKM RTKMP MTSS MGTS MGTSP TTLK CNTL CNTLP",
+    "IT": "YDEX YNDX VKCO OZON POSI HEAD ASTR DIAS CIAN WUSH SOFL",
+    "Потребительский сектор": "MGNT X5 FIXP LENT MVID BELU GCHE ABRD DELI OZPH APTK HNFG KROT RAGR AQUA ABIO MDMG GEMC ROST",
+    "Электроэнергетика": "IRAO HYDR FEES MSNG MSRS MRKC MRKP MRKU MRKV MRKS MRKZ MRKY LSNG LSNGP TGKA TGKB TGKBP TGKN OGKB UPRO ELFV KLSB YKEN YKENP ENRU DVEC",
+    "Химия": "AKRN PHOR KAZT KAZTP NKNC NKNCP KZOS KZOSP",
+    "Транспорт": "AFLT FLOT NMTP FESH GLTR NKHP EUTR UNAC",
+    "Строительство и девелопмент": "PIKK SMLT LSRG ETLN",
+}
+STK_SECTORS = {k: s for s, t in _STK_SECTOR_SRC.items() for k in t.split()}
+STK_API_SECTORS = {"energy": "Нефть и газ", "financial": "Банки и финансы", "materials": "Металлы и добыча", "telecom": "Телеком", "it": "IT",
+                   "consumer": "Потребительский сектор", "utilities": "Электроэнергетика", "real_estate": "Строительство и девелопмент",
+                   "industrials": "Прочее", "health_care": "Потребительский сектор", "other": "Прочее"}
+STK_SECTOR_NAMES = ["Нефть и газ", "Банки и финансы", "Металлы и добыча", "Телеком", "IT", "Потребительский сектор", "Электроэнергетика",
+                    "Химия", "Транспорт", "Строительство и девелопмент", "Прочее"]
+
+
+def _stk_f(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if x == x and x not in (float("inf"), float("-inf")) else None
+
+
+def _stk_msk_now():
+    return datetime.now(timezone(timedelta(hours=3)))
+
+
+def _stk_trading(now=None):
+    n = now or _stk_msk_now()
+    return n.weekday() < 5 and 9 <= n.hour < 24
+
+
+def _stk_ttl(now=None):
+    return 120 if _stk_trading(now) else 3600
+
+
+def _stk_iss(path, timeout=25):
+    return json.loads(http_text(STK_ISS + path, timeout=timeout))
+
+
+def _stk_tab(j, name):
+    t = (j or {}).get(name) or {}
+    cols = t.get("columns") or []
+    return [dict(zip(cols, r)) for r in t.get("data") or []]
+
+
+def stk_rows_from_iss(j, sector_of=None, default_sector=STK_DEFAULT_SECTOR):
+    """Ответ ISS (securities + marketdata одной доски) -> список бумаг в формате stocks_universe (chg_w, chg_m = None)."""
+    md = {}
+    for r in _stk_tab(j, "marketdata"):
+        if r.get("SECID"):
+            md[r["SECID"]] = r
+    out = []
+    for r in _stk_tab(j, "securities"):
+        sid = r.get("SECID")
+        if not sid:
+            continue
+        m = md.get(sid) or {}
+        prev = _stk_f(r.get("PREVPRICE")) or _stk_f(r.get("PREVWAPRICE"))
+        price = _stk_f(m.get("LAST")) or _stk_f(m.get("MARKETPRICE")) or _stk_f(m.get("LCURRENTPRICE")) or prev
+        if not price:
+            continue
+        chg = (price / prev - 1) * 100 if prev else _stk_f(m.get("LASTTOPREVPRICE"))
+        cap = _stk_f(m.get("ISSUECAPITALIZATION"))
+        if not cap and r.get("ISSUESIZE"):
+            cap = price * float(r["ISSUESIZE"])
+        out.append({"secid": sid, "isin": r.get("ISIN") or "", "name": r.get("SECNAME") or r.get("SHORTNAME") or sid,
+                    "shortname": r.get("SHORTNAME") or sid,
+                    "sector": (sector_of or {}).get(sid) or default_sector, "price": price, "prev": prev,
+                    "chg_d": None if chg is None else round(chg, 2),
+                    "value_today": _stk_f(m.get("VALTODAY_RUR")) or _stk_f(m.get("VALTODAY")) or 0.0,
+                    "cap": cap or None, "lot": int(r.get("LOTSIZE") or 1), "chg_w": None, "chg_m": None})
+    return out
+
+
+def stock_history_closes(date_s):
+    """Цены закрытия всех акций TQBR за один день: {secid: close}. Прошлые даты кэшируются навсегда; нет торгов — {}."""
+    key = "stk_hist_v1_" + date_s
+    past = date_s < date.today().isoformat()
+    hit = store().get(key, None if past else 300)
+    if hit is not None:
+        return hit
+    j = _stk_iss(STK_HIST % (date_s, 0))
+    cur = (_stk_tab(j, "history.cursor") or [{}])[0] if "history.cursor" in j else {}
+    rows = _stk_tab(j, "history")
+    total, size = int(cur.get("TOTAL") or len(rows)), int(cur.get("PAGESIZE") or 100) or 100
+    starts = list(range(size, total, size))
+    for part in pool_map(lambda s: _stk_tab(_stk_iss(STK_HIST % (date_s, s)), "history"), starts, workers=4):
+        rows.extend(part)
+    out = {r["SECID"]: float(r["CLOSE"]) for r in rows if r.get("SECID") and _stk_f(r.get("CLOSE"))}
+    if out or past:
+        store().put(key, out)
+    return out
+
+
+def _stk_sessions():
+    """Даты последних торговых сессий (по свечам SBER), по возрастанию."""
+    cs = stock_candles("SBER", 24, 60)
+    return [c["t"][:10] for c in cs]
+
+
+def _stk_changes(rows):
+    """Дописывает chg_w / chg_m: цена сейчас к закрытию 5 и 21 торговый день назад. Ошибки сети не критичны."""
+    try:
+        ses = _stk_sessions()
+    except Exception:  # noqa: BLE001
+        return
+    for field, n in (("chg_w", STK_WEEK), ("chg_m", STK_MONTH)):
+        if len(ses) <= n:
+            continue
+        try:
+            base = stock_history_closes(ses[-1 - n])
+        except Exception:  # noqa: BLE001
+            continue
+        for r in rows:
+            b = base.get(r["secid"])
+            if b and r.get("price"):
+                r[field] = round((r["price"] / b - 1) * 100, 2)
+
+
+def stk_api_map(cfg):
+    """Справочник T-Invest по акциям TQBR: {тикер: {uid, asset_uid, sector}}; пусто без токена или при ошибке. Кэш 7 дней."""
+    if not cfg or not (cfg.get("token") or "").strip():
+        return {}
+    key = "stk_tmap_v1"
+    hit = store().get(key, 7 * DAY)
+    if hit is not None:
+        return hit
+    try:
+        out = {}
+        for i in TInvest(cfg).instruments_all("Shares"):
+            t = i.get("ticker")
+            if t and i.get("classCode") == "TQBR" and t not in out:
+                out[t] = {"uid": i.get("uid") or "", "asset_uid": i.get("assetUid") or "", "sector": i.get("sector") or ""}
+        if out:
+            store().put(key, out)
+        return out
+    except ApiError:
+        return {}
+
+
+def stocks_universe(force=False, cfg=None):
+    """Акции TQBR: [{secid, isin, name, shortname, sector, price, prev, chg_d, value_today, cap, lot, chg_w, chg_m}].
+    Сектор: встроенный справочник, для остальных — сектор T-Invest (если передан cfg с токеном), иначе «Прочее».
+    Кэш 2 минуты в торговые часы, иначе час. Кэш общий, возвращается копия строк."""
+    key = ("stk_universe",)
+    rows = None if force else mem_get(key, _stk_ttl())
+    if rows is None:
+        with key_lock("stk_universe"):
+            rows = None if force else mem_get(key, _stk_ttl())
+            if rows is None:
+                rows = stk_rows_from_iss(_stk_iss(STK_SH % "TQBR", 40), STK_SECTORS)
+                _stk_changes(rows)
+                mem_put(key, rows)
+    out = [dict(r) for r in rows]
+    tm = stk_api_map(cfg) if cfg else {}
+    for r in out:
+        a = tm.get(r["secid"])
+        if a:
+            r["uid"], r["asset_uid"] = a["uid"], a["asset_uid"]
+            if r["secid"] not in STK_SECTORS and a["sector"]:
+                r["sector"] = STK_API_SECTORS.get(a["sector"], STK_DEFAULT_SECTOR)
+    return out
+
+
+def funds_universe():
+    """Фонды (доска TQTF) в том же формате, что stocks_universe; сектор — «Фонды»."""
+    key = ("stk_funds",)
+    rows = mem_get(key, _stk_ttl())
+    if rows is None:
+        rows = stk_rows_from_iss(_stk_iss(STK_SH % "TQTF", 40), None, "Фонды")
+        mem_put(key, rows)
+    return [dict(r) for r in rows]
+
+
+STK_IV = {"H": 60, "D": 24, "W": 7, "M": 31}
+STK_DAYS = {60: 45, 24: 650, 7: 1700, 31: 3000}
+
+
+def stk_candles_from_iss(rows, interval):
+    """Строки таблицы candles ISS -> [{t, o, h, l, c, v}]; t — дата (дневные и крупнее) или «ГГГГ-ММ-ДД ЧЧ:ММ»."""
+    out = []
+    for r in rows:
+        o, h, l, c = (_stk_f(r.get(k)) for k in ("open", "high", "low", "close"))
+        if None in (o, h, l, c) or not r.get("begin"):
+            continue
+        b = str(r["begin"])
+        out.append({"t": b[:16] if interval in (1, 10, 60) else b[:10], "o": o, "h": h, "l": l, "c": c, "v": _stk_f(r.get("volume")) or 0.0})
+    return out
+
+
+def stock_candles(secid, interval=24, days=400):
+    """Свечи ISS (interval: 1, 10, 60, 24, 7, 31) за последние days дней; страницы по 500. Кэш по (бумага, интервал, дата)."""
+    secid = (secid or "").strip().upper()
+    interval = int(interval)
+    today = date.today().isoformat()
+    key = "stk_c_v1_%s_%d_%d_%s" % (secid, interval, days, today)
+    hit = store().get(key, 300 if _stk_trading() else None)
+    if hit is not None:
+        return hit
+    frm = (date.today() - timedelta(days=days)).isoformat()
+    out, start = [], 0
+    for _ in range(40):
+        j = _stk_iss("engines/stock/markets/shares/securities/%s/candles.json?iss.meta=off&interval=%d&from=%s&till=%s&start=%d"
+                     % (urllib.parse.quote(secid), interval, frm, today, start), 30)
+        rows = _stk_tab(j, "candles")
+        out.extend(stk_candles_from_iss(rows, interval))
+        if len(rows) < 500:
+            break
+        start += len(rows)
+    if out:
+        store().put(key, out)
+    return out
+
+
+# ── дивиденды ──
+
+def stk_iss_dividends(j):
+    """Таблица dividends ISS -> [{record, payment, declared, value, cur}] (ISS может не отдавать таблицу — тогда пусто)."""
+    out = []
+    for r in _stk_tab(j, "dividends"):
+        d, v = (r.get("registryclosedate") or "")[:10], _stk_f(r.get("value"))
+        if d and v:
+            out.append({"record": d, "payment": None, "declared": None, "last_buy": None, "value": v, "cur": (r.get("currencyid") or "RUB").upper(), "src": "iss"})
+    return out
+
+
+def stk_api_dividends(items):
+    """GetDividends -> тот же формат."""
+    out = []
+    for x in items or []:
+        v = qf(x.get("dividendNet")) if x.get("dividendNet") else None
+        d = iso_date(x.get("recordDate"))
+        if not v or not d:
+            continue
+        out.append({"record": d, "payment": iso_date(x.get("paymentDate")), "declared": iso_date(x.get("declaredDate")),
+                    "last_buy": iso_date(x.get("lastBuyDate")), "value": v, "cur": cur_of(x.get("dividendNet"), "rub").upper(), "src": "tinvest"})
+    return out
+
+
+def stk_srv_dividends(items):
+    """md/dividends сервера данных -> внутренний формат (как stk_api_dividends)."""
+    out = []
+    for x in items or []:
+        v = _stk_f(x.get("value"))
+        if v and x.get("record"):
+            out.append({"record": x["record"], "payment": x.get("payment"), "declared": x.get("declared"), "last_buy": x.get("last_buy"),
+                        "value": v, "cur": str(x.get("currency") or "RUB").upper(), "src": "tinvest"})
+    return out
+
+
+def stk_dividends_build(items, price, today=None):
+    """Сводка по дивидендам: объединение источников по дате фиксации, доходность к текущей цене, годовая (TTM) и ближайшая будущая выплата."""
+    today = today or date.today().isoformat()
+    by = {}
+    for it in items:
+        if it["record"] not in by or it.get("src") == "tinvest":
+            by[it["record"]] = it
+    rows = sorted(by.values(), key=lambda x: x["record"], reverse=True)
+    y1 = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
+    for r in rows:
+        r["yield_pct"] = round(r["value"] / price * 100, 2) if price and r["cur"] in ("RUB", "RUR") else None
+        r["future"] = r["record"] >= today
+    ttm = sum(r["value"] for r in rows if y1 < r["record"] <= today and r["cur"] in ("RUB", "RUR"))
+    fut = sorted((r for r in rows if r["future"]), key=lambda x: x["record"])
+    return {"items": rows[:30], "ttm_value": round(ttm, 4), "yield_ttm": round(ttm / price * 100, 2) if price and ttm else None,
+            "next": fut[0] if fut else None}
+
+
+def stock_dividends(secid, price, uid=None, cfg=None):
+    items = []
+    try:
+        items.extend(stk_iss_dividends(_stk_iss("securities/%s/dividends.json?iss.meta=off&iss.only=dividends" % urllib.parse.quote(secid), 20)))
+    except Exception:  # noqa: BLE001
+        pass
+    source = "iss"
+    if uid and cfg and (cfg.get("token") or "").strip():
+        try:
+            now = datetime.now(timezone.utc)
+            items.extend(stk_api_dividends(TInvest(cfg).dividends(uid, (now - timedelta(days=6 * 365)).strftime("%Y-%m-%dT00:00:00Z"),
+                                                                  (now + timedelta(days=400)).strftime("%Y-%m-%dT00:00:00Z"))))
+            source = "tinvest"
+        except ApiError:
+            pass
+    else:
+        srv = ds_parsed("md/dividends", {"secid": secid})
+        if srv and srv.get("items") is not None:
+            items.extend(stk_srv_dividends(srv["items"]))
+            source = "tinvest-server"
+    res = stk_dividends_build(items, price)
+    res["source"] = source
+    return res
+
+
+# ── мультипликаторы, отчётность ──
+
+def stk_from_fund(f):
+    """GetAssetFundamentals (один актив) -> мультипликаторы. Проценты API приходят в процентных пунктах. 0 = «нет данных»."""
+    def g(k, zero_none=True):
+        v = _stk_f((f or {}).get(k))
+        return None if v is None or (zero_none and v == 0) else v
+    dy = g("dividendYieldDailyTtm", False)
+    if not dy:
+        dy = g("forwardAnnualDividendYield", False)
+    return {"pe": g("peRatioTtm"), "pb": g("priceToBookTtm"), "ev_ebitda": g("evToEbitdaMrq"), "div_yield": dy,
+            "rev_growth": g("oneYearAnnualRevenueGrowthRate", False), "ni_growth": None, "roe": g("roe", False),
+            "nd_ebitda": g("netDebtToEbitda", False), "period": "TTM", "source": "tinvest"}
+
+
+def stk_srv_fund(f, source="tinvest-server"):
+    """Строка md/fundamentals сервера -> мультипликаторы."""
+    out = {k: _stk_f((f or {}).get(k)) for k in ("pe", "pb", "ev_ebitda", "div_yield", "rev_growth", "roe", "nd_ebitda")}
+    out.update(ni_growth=None, period="TTM", source=source)
+    return out
+
+
+def stock_multiples(secid, cap, asset_uid=None, cfg=None):
+    if cfg and (cfg.get("token") or "").strip():
+        if asset_uid:
+            try:
+                fs = TInvest(cfg).asset_fundamentals([asset_uid])
+                if fs:
+                    return stk_from_fund(fs[0])
+            except ApiError:
+                pass
+    else:
+        srv = ds_parsed("md/fundamentals")
+        if srv and srv.get(secid):
+            return stk_srv_fund(srv[secid])
+    m = ifrs_multiples(ifrs_fin(secid), cap)
+    m["div_yield"] = None
+    return m
+
+
+def stock_next_report(uid, cfg, secid=None):
+    """Ближайшая будущая дата отчётности из T-Invest или None. uid — UID инструмента (по assetUid API отвечает 404).
+    Без своего токена — через сервер данных (md/reports по тикеру)."""
+    if not (cfg and (cfg.get("token") or "").strip()) and secid:
+        srv = ds_parsed("md/reports", {"secid": secid})
+        if srv is not None:
+            if srv.get("date"):
+                return {"date": srv["date"], "year": srv.get("year"), "num": srv.get("num"), "type": srv.get("type"), "note": None,
+                        "source": "tinvest-server"}
+            return {"date": None, "note": "Дата следующей отчётности пока не опубликована.", "source": "tinvest-server"}
+    if not (uid and cfg and (cfg.get("token") or "").strip()):
+        return {"date": None, "note": "Даты отчётности доступны при подключённом токене T-Invest."}
+    try:
+        now = datetime.now(timezone.utc)
+        rs = TInvest(cfg).asset_reports(uid, now.strftime("%Y-%m-%dT00:00:00Z"), (now + timedelta(days=400)).strftime("%Y-%m-%dT00:00:00Z"))
+    except ApiError as e:
+        return {"date": None, "note": str(e)[:120]}
+    today = date.today().isoformat()
+    fut = sorted((iso_date(r.get("reportDate")), r) for r in rs if iso_date(r.get("reportDate")) and iso_date(r.get("reportDate")) >= today)
+    if not fut:
+        return {"date": None, "note": "Дата следующей отчётности пока не опубликована."}
+    r = fut[0][1]
+    return {"date": fut[0][0], "year": r.get("periodYear"), "num": r.get("periodNum"), "type": r.get("periodType"), "note": None}
+
+
+# ── карточка ──
+
+def stock_card(secid, interval="D", cfg=None):
+    """Карточка акции: котировка, свечи (D/W/H), индикаторы и сводный сигнал, уровни, мультипликаторы, дивиденды, дата отчётности."""
+    secid = (secid or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9._-]{1,16}", secid):
+        raise ApiError("Некорректный тикер.", 400)
+    iv = STK_IV.get(str(interval).upper(), STK_IV.get("D")) if not str(interval).isdigit() else int(interval)
+    q = next((r for r in stocks_universe(cfg=cfg) if r["secid"] == secid), None)
+    if q is None:
+        raise ApiError("Акция %s не найдена среди торгуемых на Мосбирже (TQBR)." % secid, 404)
+    cs = stock_candles(secid, iv, STK_DAYS.get(iv, 650))
+    ser = ta_series(cs) if cs else {}
+    view = {"D": 220, "W": 200, "H": 260, "M": 120}.get({v: k for k, v in STK_IV.items()}.get(iv, "D"), 220)
+    k0 = max(0, len(cs) - view)
+    r4 = lambda a: [None if v is None else round(v, 4) for v in a[k0:]]  # noqa: E731
+    summ = ta_summary(cs) if cs else {"signal": None, "votes": [], "last": {}}
+    uid, auid = q.get("uid"), q.get("asset_uid")
+    return {"secid": secid, "quote": q, "interval": iv, "candles": cs[k0:], "series": {k: r4(v) for k, v in ser.items()},
+            "levels": levels(cs) if cs else {"support": [], "resistance": []}, "ta": summ,
+            "multiples": stock_multiples(secid, q.get("cap"), auid, cfg), "dividends": stock_dividends(secid, q["price"], uid, cfg),
+            "report": stock_next_report(uid, cfg, secid), "token": bool(cfg and (cfg.get("token") or "").strip()), "updated": time.time()}
+
+
+# ── скринер ──
+
+STK_CHEAP_PE, STK_HIGH_DIV, STK_FAST_GROWTH = "cheap_pe", "high_div", "fast_growth"
+STK_PRESETS = [{"id": STK_CHEAP_PE, "name": "Дешёвые по P/E", "hint": "P/E больше 0 и ниже медианы сектора"},
+               {"id": STK_HIGH_DIV, "name": "Высокие дивиденды", "hint": "дивидендная доходность выше 10 %"},
+               {"id": STK_FAST_GROWTH, "name": "Быстрый рост", "hint": "рост выручки больше 20 %"}]
+STK_SCR_TTL = DAY
+STK_SCR_MAX = 250
+
+
+def stk_median(vals):
+    v = sorted(vals)
+    n = len(v)
+    return None if not n else v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+def stk_tags(rows):
+    """Каждой строке: pe_sector (медиана P/E сектора, при < 3 значений — по всему рынку) и теги пресетов."""
+    pes = {}
+    for r in rows:
+        if r.get("pe") and r["pe"] > 0:
+            pes.setdefault(r["sector"], []).append(r["pe"])
+    allm = stk_median([x for v in pes.values() for x in v])
+    med = {s: (stk_median(v) if len(v) >= 3 else allm) for s, v in pes.items()}
+    for r in rows:
+        m = med.get(r["sector"], allm)
+        r["pe_sector"] = m
+        t = []
+        if r.get("pe") and 0 < r["pe"] and m and r["pe"] < m:
+            t.append(STK_CHEAP_PE)
+        if r.get("div_yield") is not None and r["div_yield"] > 10:
+            t.append(STK_HIGH_DIV)
+        if r.get("rev_growth") is not None and r["rev_growth"] > 20:
+            t.append(STK_FAST_GROWTH)
+        r["tags"] = t
+    return rows
+
+
+_stk_scr = {"running": False, "res": None, "t": 0.0, "done": 0, "total": 0, "err": None}
+_stk_scr_lock = threading.Lock()
+
+
+def _stk_scr_pick(cfg=None):
+    rows = [r for r in stocks_universe(cfg=cfg) if r.get("cap")]
+    rows.sort(key=lambda r: -(r["cap"] or 0))
+    return rows[:STK_SCR_MAX]
+
+
+def stk_screener_build(cfg, progress=None):
+    base = _stk_scr_pick(cfg)
+    token = bool(cfg and (cfg.get("token") or "").strip())
+    api_ok = False
+    fund = {}
+    srv = None if token else ds_parsed("md/fundamentals")
+    if srv:
+        fund = {r["secid"]: stk_srv_fund(srv[r["secid"]]) for r in base if srv.get(r["secid"])}
+        api_ok = bool(fund)
+    if token:
+        try:
+            for f in TInvest(cfg).asset_fundamentals([r.get("asset_uid") for r in base]):
+                fund[f.get("assetUid")] = stk_from_fund(f)
+            api_ok = bool(fund)
+        except ApiError:
+            api_ok = False
+    rows = []
+    for i, r in enumerate(base):
+        m = (fund.get(r["secid"]) if srv else fund.get(r.get("asset_uid"))) if api_ok else None
+        if m is None:
+            try:
+                m = ifrs_multiples(ifrs_fin(r["secid"]), r["cap"])
+                m["div_yield"] = None
+            except Exception:  # noqa: BLE001
+                m = {}
+            if progress:
+                progress(i + 1, len(base))
+        row = {k: r[k] for k in ("secid", "name", "shortname", "sector", "price", "chg_d", "chg_w", "chg_m", "cap", "value_today")}
+        row.update({k: m.get(k) for k in ("pe", "pb", "ev_ebitda", "div_yield", "rev_growth", "ni_growth", "roe", "nd_ebitda")})
+        rows.append(row)
+    return {"rows": stk_tags(rows), "source": ("tinvest-server" if srv else "tinvest") if api_ok else "ifrs", "presets": STK_PRESETS,
+            "sectors": sorted({r["sector"] for r in rows}), "updated": time.time()}
+
+
+def _stk_scr_run(cfg):
+    def prog(d, n):
+        _stk_scr.update(done=d, total=n)
+    try:
+        res = stk_screener_build(cfg, prog)
+        with _stk_scr_lock:
+            _stk_scr.update(res=res, t=time.time(), err=None)
+        try:
+            store().put("stk_scr_v1", res)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        _stk_scr["err"] = str(e)[:200]
+    finally:
+        _stk_scr.update(running=False)
+
+
+def _stk_scr_server(force):
+    """Без своего токена, но сервер данных отдаёт фундаментал: расчёт сразу (без фонового задания smart-lab). None — сервера нет."""
+    if ds_parsed("md/fundamentals") is None:
+        return None
+    key = ("stk_scr_srv",)
+    res = None if force else mem_get(key, 300)
+    if res is None:
+        res = stk_screener_build({})
+        if res.get("source") != "tinvest-server":
+            return None
+        mem_put(key, res)
+    return dict(res, loading=False, progress={"done": 0, "total": 0}, error=None, stale_error=None)
+
+
+def stock_screener(cfg=None, force=False):
+    """Скринер акций. С токеном — показатели T-Invest (быстро); без — МСФО smart-lab фоновым заданием (первый расчёт — минуты, кэш сутки).
+    -> {rows, source, presets, sectors, updated, loading, progress:{done,total}, error}."""
+    if not (cfg and (cfg.get("token") or "").strip()):
+        fast = _stk_scr_server(force)
+        if fast:
+            return fast
+    with _stk_scr_lock:
+        if _stk_scr["res"] is None and not force:
+            old = store().get("stk_scr_v1")
+            if old:
+                _stk_scr.update(res=old, t=old.get("updated") or 0)
+        has_tok = bool(cfg and (cfg.get("token") or "").strip())
+        src_ok = not has_tok or (_stk_scr["res"] or {}).get("source") == "tinvest"   # появился токен — пересчитать по T-Invest
+        fresh = _stk_scr["res"] is not None and time.time() - _stk_scr["t"] < STK_SCR_TTL and not force and src_ok
+        if not fresh and not _stk_scr["running"]:
+            _stk_scr.update(running=True, done=0, total=0)
+            threading.Thread(target=_stk_scr_run, args=(cfg,), daemon=True).start()
+        res, running, err = _stk_scr["res"], _stk_scr["running"], _stk_scr["err"]
+        prog = {"done": _stk_scr["done"], "total": _stk_scr["total"]}
+    if res is None:
+        return {"rows": [], "presets": STK_PRESETS, "sectors": [], "loading": running, "progress": prog, "source": None,
+                "error": None if running else (err or "нет данных")}
+    return dict(res, loading=running, progress=prog, error=None, stale_error=err)
+
+
+# ── маршруты ──
+
+def stocks_get(cfg, acc, q, force):
+    if q.get("kind") == "funds":
+        return {"rows": funds_universe()}
+    rows = stocks_universe(force=bool(force), cfg=cfg)
+    return {"rows": [{k: r.get(k) for k in ("secid", "isin", "name", "shortname", "sector", "price", "chg_d", "value_today", "cap", "chg_w", "chg_m")} for r in rows]}
+
+
+def stock_get(cfg, acc, q, force):
+    secid = (q.get("secid") or "").strip().upper()
+    if not secid:
+        raise ApiError("Не указан тикер.", 400)
+    key = ("stk_card", secid, q.get("tf") or "D", token_key(cfg))
+    if not force:
+        hit = mem_get(key, 60)
+        if hit:
+            return hit
+    return mem_put(key, stock_card(secid, q.get("tf") or "D", cfg))
+
+
+def stock_screener_get(cfg, acc, q, force):
+    return stock_screener(cfg, bool(force))
+
+
+API_GET["/api/stocks"] = stocks_get
+API_GET["/api/stock"] = stock_get
+API_GET["/api/stock_screener"] = stock_screener_get
+# ═══════════════════════════════ технический анализ: чистые функции (без сети) ═══════════════════════════════
+# Ряды — списки чисел; свечи — [{t, o, h, l, c, v}]. Периоды, где индикатор ещё не определён, заполнены None.
+# Скользящие и RSI/ATR — как в большинстве терминалов: SMA — простое среднее; EMA — со сглаживанием 2/(n+1), старт со среднего первых n;
+# RSI и ATR — сглаживание Уайлдера; Боллинджер — среднее ± k·стандартное отклонение (по генеральной совокупности).
+
+
+def sma(vals, n):
+    out = [None] * len(vals)
+    if n <= 0 or len(vals) < n:
+        return out
+    s = sum(vals[:n])
+    out[n - 1] = s / n
+    for i in range(n, len(vals)):
+        s += vals[i] - vals[i - n]
+        out[i] = s / n
+    return out
+
+
+def ema(vals, n):
+    out = [None] * len(vals)
+    if n <= 0 or len(vals) < n:
+        return out
+    k = 2.0 / (n + 1)
+    e = sum(vals[:n]) / n
+    out[n - 1] = e
+    for i in range(n, len(vals)):
+        e = vals[i] * k + e * (1 - k)
+        out[i] = e
+    return out
+
+
+def rsi(vals, n=14):
+    out = [None] * len(vals)
+    if len(vals) <= n:
+        return out
+    gains = losses = 0.0
+    for i in range(1, n + 1):
+        d = vals[i] - vals[i - 1]
+        gains += max(d, 0)
+        losses += max(-d, 0)
+    ag, al = gains / n, losses / n
+
+    def val(a, b):
+        return 100.0 if b == 0 and a > 0 else 50.0 if b == 0 else 100.0 - 100.0 / (1 + a / b)
+    out[n] = val(ag, al)
+    for i in range(n + 1, len(vals)):
+        d = vals[i] - vals[i - 1]
+        ag = (ag * (n - 1) + max(d, 0)) / n
+        al = (al * (n - 1) + max(-d, 0)) / n
+        out[i] = val(ag, al)
+    return out
+
+
+def macd(vals, fast=12, slow=26, sig=9):
+    """-> (линия MACD, сигнальная линия, гистограмма) — три списка длины len(vals)."""
+    ef, es = ema(vals, fast), ema(vals, slow)
+    line = [(a - b) if a is not None and b is not None else None for a, b in zip(ef, es)]
+    first = next((i for i, v in enumerate(line) if v is not None), None)
+    signal = [None] * len(vals)
+    if first is not None:
+        part = ema([v for v in line[first:]], sig)
+        signal[first:] = part
+    hist = [(a - b) if a is not None and b is not None else None for a, b in zip(line, signal)]
+    return line, signal, hist
+
+
+def bollinger(vals, n=20, k=2.0):
+    """-> (середина, верх, низ)."""
+    mid = sma(vals, n)
+    up, lo = [None] * len(vals), [None] * len(vals)
+    for i in range(n - 1, len(vals)):
+        w = vals[i - n + 1:i + 1]
+        m = mid[i]
+        sd = (sum((x - m) ** 2 for x in w) / n) ** 0.5
+        up[i], lo[i] = m + k * sd, m - k * sd
+    return mid, up, lo
+
+
+def atr(candles, n=14):
+    out = [None] * len(candles)
+    if len(candles) <= n:
+        return out
+    tr = [candles[0]["h"] - candles[0]["l"]]
+    for i in range(1, len(candles)):
+        c, p = candles[i], candles[i - 1]["c"]
+        tr.append(max(c["h"] - c["l"], abs(c["h"] - p), abs(c["l"] - p)))
+    a = sum(tr[1:n + 1]) / n
+    out[n] = a
+    for i in range(n + 1, len(candles)):
+        a = (a * (n - 1) + tr[i]) / n
+        out[i] = a
+    return out
+
+
+def levels(candles, wing=3, top=3):
+    """Уровни поддержки/сопротивления: локальные экстремумы (максимум/минимум среди wing свечей по обе стороны),
+    сгруппированные так, что ширина группы не больше 1,5·ATR. -> {support: [{price, touches}], resistance: [...]}; по близости к текущей цене, не больше top с каждой стороны."""
+    candles = candles[-250:]                          # уровни по последним ~250 свечам: старые экстремумы уже не работают
+    n = len(candles)
+    if n < 2 * wing + 2:
+        return {"support": [], "resistance": []}
+    a = [x for x in atr(candles) if x is not None]
+    tol = 1.5 * (a[-1] if a else (sum(c["h"] - c["l"] for c in candles) / n))
+    pts = []
+    for i in range(wing, n - wing):
+        hs = [candles[j]["h"] for j in range(i - wing, i + wing + 1)]
+        ls = [candles[j]["l"] for j in range(i - wing, i + wing + 1)]
+        if candles[i]["h"] == max(hs):
+            pts.append(candles[i]["h"])
+        if candles[i]["l"] == min(ls):
+            pts.append(candles[i]["l"])
+    pts.sort()
+    clusters = []
+    for p in pts:
+        if clusters and p - clusters[-1][0] <= tol:           # ширина группы не больше tol (без «цепочек»)
+            clusters[-1].append(p)
+        else:
+            clusters.append([p])
+    last = candles[-1]["c"]
+    lv = [{"price": sum(c) / len(c), "touches": len(c)} for c in clusters]
+    sup = sorted((x for x in lv if x["price"] <= last), key=lambda x: -x["price"])[:top]
+    res = sorted((x for x in lv if x["price"] > last), key=lambda x: x["price"])[:top]
+    return {"support": sup, "resistance": res}
+
+
+def _vote(i, name, v, text):
+    return {"id": i, "name": name, "vote": v, "text": text}
+
+
+def ta_summary(candles):
+    """Сводный сигнал голосованием: цена против SMA50 и SMA200, RSI(14), пересечение MACD, положение в полосах Боллинджера.
+    Каждый индикатор даёт +1 (покупать), 0 или −1 (продавать); итог ≥ +2 — «покупать», ≤ −2 — «продавать», иначе «нейтрально».
+    -> {signal, score, votes: [...], last: {c, sma50, sma200, rsi, macd, macd_signal, bb_up, bb_low, atr}} или {signal: None} при коротком ряде."""
+    closes = [c["c"] for c in candles]
+    if len(closes) < 30:
+        return {"signal": None, "score": 0, "votes": [], "last": {}, "note": "Мало истории для расчёта индикаторов."}
+    price = closes[-1]
+    s50, s200 = sma(closes, 50)[-1], sma(closes, 200)[-1]
+    r = rsi(closes)[-1]
+    ml, sl, _ = macd(closes)
+    mm, ms = ml[-1], sl[-1]
+    _, bu, bl = bollinger(closes)
+    bu, bl = bu[-1], bl[-1]
+    at = atr(candles)[-1]
+    votes = []
+    if s50 is not None:
+        votes.append(_vote("sma50", "Цена и SMA50", 1 if price > s50 else -1, "цена %s SMA50" % ("выше" if price > s50 else "ниже")))
+    if s200 is not None:
+        votes.append(_vote("sma200", "Цена и SMA200", 1 if price > s200 else -1, "цена %s SMA200" % ("выше" if price > s200 else "ниже")))
+    if r is not None:
+        votes.append(_vote("rsi", "RSI (14)", 1 if r < 30 else -1 if r > 70 else 0,
+                           "перепроданность (RSI < 30)" if r < 30 else "перекупленность (RSI > 70)" if r > 70 else "нейтральная зона 30–70"))
+    if mm is not None and ms is not None:
+        votes.append(_vote("macd", "MACD", 1 if mm > ms else -1, "MACD %s сигнальной линии" % ("выше" if mm > ms else "ниже")))
+    if bu is not None:
+        votes.append(_vote("bb", "Полосы Боллинджера", 1 if price < bl else -1 if price > bu else 0,
+                           "цена ниже нижней полосы" if price < bl else "цена выше верхней полосы" if price > bu else "цена внутри полос"))
+    score = sum(v["vote"] for v in votes)
+    signal = "покупать" if score >= 2 else "продавать" if score <= -2 else "нейтрально"
+    return {"signal": signal, "score": score, "votes": votes,
+            "last": {"c": price, "sma50": s50, "sma200": s200, "rsi": r, "macd": mm, "macd_signal": ms, "bb_up": bu, "bb_low": bl, "atr": at}}
+
+
+def ta_series(candles):
+    """Ряды индикаторов для графика, выровненные по свечам."""
+    closes = [c["c"] for c in candles]
+    ml, sl, hl = macd(closes)
+    bm, bu, bl = bollinger(closes)
+    return {"sma50": sma(closes, 50), "sma200": sma(closes, 200), "bb_mid": bm, "bb_up": bu, "bb_low": bl,
+            "rsi": rsi(closes), "macd": ml, "macd_signal": sl, "macd_hist": hl}
+# ── Тепловая карта рынка: акции / облигации / фонды ──
+HM_BUCKETS = ["AAA", "AA", "A", "BBB", "≤BB", "без рейтинга"]
+
+
+def treemap_layout(values, x, y, w, h):
+    """Squarified treemap (Bruls et al.). Возвращает список (x, y, w, h) в порядке входных значений;
+    для значений <= 0 — нулевой прямоугольник. Используется только в тестах: боевая раскладка — JS hmSquarify в
+    46_heatmap.js. При изменении алгоритма менять ОБЕ реализации синхронно."""
+    n = len(values)
+    out = [(x, y, 0.0, 0.0)] * n
+    idx = sorted((i for i in range(n) if values[i] and values[i] > 0), key=lambda i: -values[i])
+    total = float(sum(values[i] for i in idx))
+    if not idx or total <= 0 or w <= 0 or h <= 0:
+        return out
+    k = w * h / total
+    areas = [values[i] * k for i in idx]
+    cx, cy, cw, ch = float(x), float(y), float(w), float(h)
+
+    def worst(row, side):
+        s = sum(row)
+        return max(max(side * side * max(row) / (s * s), s * s / (side * side * min(row))), 0)
+
+    pos = 0
+    while pos < len(areas):
+        side = min(cw, ch)
+        row = [areas[pos]]
+        j = pos + 1
+        while j < len(areas) and worst(row + [areas[j]], side) <= worst(row, side):
+            row.append(areas[j])
+            j += 1
+        s = sum(row)
+        if cw >= ch:                      # колонка слева, элементы сверху вниз
+            colw = s / ch
+            yy = cy
+            for t, a in enumerate(row):
+                hh = a / colw
+                out[idx[pos + t]] = (cx, yy, colw, hh)
+                yy += hh
+            cx += colw
+            cw -= colw
+        else:                             # строка сверху, элементы слева направо
+            rowh = s / cw
+            xx = cx
+            for t, a in enumerate(row):
+                ww = a / rowh
+                out[idx[pos + t]] = (xx, cy, ww, rowh)
+                xx += ww
+            cy += rowh
+            ch -= rowh
+        pos = j
+    return out
+
+
+def _hm_num(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v else None
+
+
+def _hm_stats(items):
+    up = sum(1 for i in items if i["chg"] > 0.005)
+    dn = sum(1 for i in items if i["chg"] < -0.005)
+    tot = sum(i["size"] for i in items)
+    turn = sum(i.get("value") or 0 for i in items)
+    wch = sum(i["chg"] * i["size"] for i in items) / tot if tot > 0 else 0.0
+    return {"up": up, "down": dn, "flat": len(items) - up - dn, "n": len(items),
+            "turnover": round(turn), "wchg": round(wch, 2)}
+
+
+def _hm_group(items, key):
+    groups = {}
+    for it in items:
+        groups.setdefault(key(it), []).append(it)
+    out = []
+    for name, its in groups.items():
+        its.sort(key=lambda i: -i["size"])
+        tot = sum(i["size"] for i in its)
+        wch = sum(i["chg"] * i["size"] for i in its) / tot if tot > 0 else 0.0
+        out.append({"name": name, "size": tot, "chg": round(wch, 2), "items": its})
+    out.sort(key=lambda g: -g["size"])
+    return out
+
+
+def _hm_equities(kind, period, size):
+    fn = globals().get("stocks_universe" if kind == "stocks" else "funds_universe")
+    if not fn:
+        return {"error": "Данные по акциям и фондам недоступны"}
+    rows = fn() or []
+    ck = {"d": "chg_d", "w": "chg_w", "m": "chg_m"}[period]
+    items = []
+    for r in rows:
+        chg = _hm_num(r.get(ck))
+        cap, val = _hm_num(r.get("cap")) or 0, _hm_num(r.get("value_today")) or 0
+        sz = val if size == "value" else (cap if cap > 0 else (val if kind == "funds" else 0))
+        if sz <= 0:
+            continue
+        sid = r.get("secid")
+        items.append({"id": sid, "label": sid, "name": r.get("shortname") or r.get("name") or sid, "size": sz,
+                      "chg": chg if chg is not None else 0.0, "price": _hm_num(r.get("price")),
+                      "value": val, "cap": cap or None, "sector": r.get("sector") or "Прочее"})
+    groups = _hm_group(items, lambda i: i["sector"])
+    return {"groups": groups, "stats": _hm_stats(items)}
+
+
+def _hm_bucket(rating):
+    if not rating:
+        return "без рейтинга"
+    b = rating_bucket(rating)
+    return "≤BB" if b == "BB и ниже" else ("без рейтинга" if b == "нет рейтинга" else b)
+
+
+def _hm_bonds():
+    rows = screener_rows() or []
+    br = globals().get("best_rating")
+    rows = sorted((r for r in rows if (r.get("turn") or 0) > 0), key=lambda r: -r["turn"])[:300]
+    items = []
+    for r in rows:
+        rt = r.get("rating")
+        if rt is None and br:
+            try:
+                x = br(r.get("isin"), r.get("name"))
+                rt = x["v"] if x else None
+            except Exception:  # noqa: BLE001
+                rt = None
+        isin = r.get("isin") or r["id"]
+        items.append({"id": isin, "label": r.get("name") or r["id"], "name": r.get("full") or r.get("name"),
+                      "size": r["turn"], "chg": _hm_num(r.get("chg")) or 0.0, "price": r.get("price"),
+                      "value": r["turn"], "cap": None, "yield": r.get("yield"), "rating": rt,
+                      "bucket": _hm_bucket(rt)})
+    groups = _hm_group(items, lambda i: i["bucket"])
+    groups.sort(key=lambda g: HM_BUCKETS.index(g["name"]) if g["name"] in HM_BUCKETS else 99)
+    return {"groups": groups, "stats": _hm_stats(items)}
+
+
+def heatmap_payload(kind="stocks", period="d", size="cap"):
+    kind = kind if kind in ("stocks", "bonds", "funds") else "stocks"
+    period = period if period in ("d", "w", "m") else "d"
+    size = size if size in ("cap", "value") else "cap"
+    if kind == "bonds":
+        period, size = "d", "value"
+        res = _hm_bonds()
+    else:
+        res = _hm_equities(kind, period, size)
+    res.update(kind=kind, period=period, size=size, updated=time.time())
+    return res
+
+
+def _api_heatmap(cfg, acc, q, force):
+    return heatmap_payload(q.get("kind", "stocks"), q.get("period", "d"), q.get("size", "cap"))
+
+
+API_GET["/api/heatmap"] = _api_heatmap
+# ═══════════════ «Кто покупает»: потоки денег, крупные сделки, всплески объёма, стакан ═══════════════
+# Данные считает сборщик на сервере данных (flows/*, md/*); здесь — обёртки с коротким кэшем, расчёт показателей стакана
+# (дисбаланс, «плотности», баланс ленты) и тревоги по списку наблюдения. Нет сервера данных — пустые состояния; стакан и лента без
+# токена сервера берутся по собственному токену пользователя (TInvest.order_book / last_trades, если эти методы есть в клиенте).
+
+FLW_TTL = 30
+FLW_BOOK_TTL = 1.5
+FLW_WALL_MULT, FLW_IMB_LEVELS = 5.0, 10
+FLW_PERIODS = ("5m", "1h", "day")
+FLW_SRC = {"tinvest": "T-Invest, реальное время", "iss": "Мосбиржа, задержка 15 мин"}
+_flw_cache, _flw_lock = {}, threading.Lock()
+_flw_uid = {}
+
+
+def _flw_ds(name, params, ttl=FLW_TTL):
+    """ds_parsed с кэшем в памяти (≤ ttl секунд). None — сервер выключен/старый/нет данных."""
+    key = name + "?" + "&".join("%s=%s" % kv for kv in sorted((params or {}).items()))
+    now = time.time()
+    with _flw_lock:
+        c = _flw_cache.get(key)
+        if c and now - c[0] < ttl:
+            return c[1]
+    try:
+        v = ds_parsed(name, params or {}, timeout=8)
+    except Exception:  # noqa: BLE001
+        v = None
+    with _flw_lock:
+        if len(_flw_cache) > 400:
+            _flw_cache.clear()
+        _flw_cache[key] = (now, v)
+    return v
+
+
+def _flw_secid(q):
+    s = str((q or {}).get("secid") or "").strip()
+    return s if re.fullmatch(r"[A-Za-z0-9_.\-]{1,24}", s) else ""
+
+
+def _flw_src_label(d):
+    src = (d or {}).get("source") or ""
+    return {"source": src, "source_label": FLW_SRC.get(src, ""), "delay_min": (d or {}).get("delay_min", 15 if src == "iss" else None)}
+
+
+# ───────────────────────── математика стакана ─────────────────────────
+def _flw_median(v):
+    v = sorted(v)
+    n = len(v)
+    if not n:
+        return 0.0
+    return float(v[n // 2]) if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
+
+def flows_book_metrics(bids, asks, levels=FLW_IMB_LEVELS, wall_mult=FLW_WALL_MULT):
+    """bids/asks — [[цена, количество]] от лучшей цены. Возвращает:
+    imbalance — (Σbid − Σask)/(Σbid + Σask) по первым `levels` уровням, от −1 (давят продавцы) до +1 (давят покупатели);
+    walls — «плотности»: уровни с количеством ≥ wall_mult × медианы количества по всем уровням стакана;
+    spread, mid, bid_qty, ask_qty."""
+    bids = [[float(p), float(q)] for p, q in (bids or [])]
+    asks = [[float(p), float(q)] for p, q in (asks or [])]
+    bq = sum(q for _p, q in bids[:levels])
+    aq = sum(q for _p, q in asks[:levels])
+    tot = bq + aq
+    med = _flw_median([q for _p, q in bids + asks])
+    walls = []
+    if med > 0:
+        for side, rows in (("bid", bids), ("ask", asks)):
+            for p, q in rows:
+                if q >= wall_mult * med:
+                    walls.append({"side": side, "price": p, "qty": q, "mult": round(q / med, 1)})
+    spread = mid = None
+    if bids and asks:
+        spread = asks[0][0] - bids[0][0]
+        mid = (asks[0][0] + bids[0][0]) / 2.0
+    return {"imbalance": round((bq - aq) / tot, 4) if tot > 0 else 0.0, "bid_qty": bq, "ask_qty": aq, "median_qty": med,
+            "walls": walls, "spread": spread, "mid": mid}
+
+
+def flows_tape_net(trades):
+    """Баланс ленты: [{side, price, qty, value?}] -> {buy, sell, net, n} в рублях (value, иначе price × qty)."""
+    buy = sell = 0.0
+    for t in trades or []:
+        v = t.get("value")
+        v = float(v) if v is not None else float(t.get("price") or 0) * float(t.get("qty") or 0)
+        if t.get("side") == "buy":
+            buy += v
+        elif t.get("side") == "sell":
+            sell += v
+    return {"buy": round(buy, 2), "sell": round(sell, 2), "net": round(buy - sell, 2), "n": len(trades or [])}
+
+
+# ───────────────────────── стакан по собственному токену ─────────────────────────
+def _flw_q(x):
+    """Quotation/MoneyValue {units, nano} или число -> float."""
+    if isinstance(x, dict):
+        try:
+            return int(x.get("units") or 0) + int(x.get("nano") or 0) / 1e9
+        except (TypeError, ValueError):
+            return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _flw_levels(rows):
+    out = []
+    for r in rows or []:
+        if isinstance(r, dict):
+            p, q = _flw_q(r.get("price")), _flw_q(r.get("quantity"))
+        else:
+            p, q = _flw_q(r[0]), _flw_q(r[1])
+        if p is not None and q:
+            out.append([p, q])
+    return out
+
+
+def _flw_trade_rows(rows):
+    out = []
+    for t in rows or []:
+        side = t.get("side") or str(t.get("direction") or "")
+        side = "buy" if side == "buy" or side.endswith("BUY") else "sell" if side == "sell" or side.endswith("SELL") else ""
+        p, q = _flw_q(t.get("price")), _flw_q(t.get("qty") if t.get("qty") is not None else t.get("quantity"))
+        ts = t.get("ts")
+        if ts is None and t.get("time"):
+            try:
+                ts = datetime.fromisoformat(str(t["time"]).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = None
+        if side and p is not None and q:
+            out.append({"ts": ts, "side": side, "price": p, "qty": q, "value": round(p * q, 2)})
+    return out
+
+
+def _flw_own_uid(cli, secid):
+    if secid in _flw_uid:
+        return _flw_uid[secid]
+    best = None
+    for i in cli.find(secid) or []:
+        if str(i.get("ticker") or "").upper() == secid.upper() and str(i.get("classCode") or "").startswith("TQ"):
+            best = i
+            break
+        if best is None and str(i.get("ticker") or "").upper() == secid.upper():
+            best = i
+    uid = (best or {}).get("uid")
+    if uid:
+        _flw_uid[secid] = uid
+    return uid
+
+
+def _flw_own(cfg, secid, depth):
+    """Стакан и лента по токену пользователя; None, если токена нет или методов в клиенте нет."""
+    if not cfg.get("token"):
+        return None
+    cli = TInvest(cfg)
+    ob, lt = getattr(cli, "order_book", None), getattr(cli, "last_trades", None)
+    if not ob:
+        return None
+    uid = _flw_own_uid(cli, secid)
+    if not uid:
+        return None
+    raw = ob(uid, depth)
+    book = {"bids": _flw_levels(raw.get("bids")), "asks": _flw_levels(raw.get("asks")), "ts": time.time()}
+    trades = []
+    if lt:
+        now = datetime.now(timezone.utc)
+        try:
+            r = lt(uid, (now - timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ"), now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+            trades = _flw_trade_rows(r.get("trades") if isinstance(r, dict) else r)
+        except ApiError:
+            trades = []
+    return book, trades
+
+
+# ───────────────────────── маршруты ─────────────────────────
+def flows_get(cfg, acc, q, force):
+    period = q.get("period") if q.get("period") in FLW_PERIODS else "1h"
+    d = _flw_ds("flows/summary", {"period": period}, 0 if force else FLW_TTL)
+    if d is None:
+        return {"configured": False, "period": period, "data": None}
+    return dict(d, configured=True, **_flw_src_label(d))
+
+
+def flows_instrument_get(cfg, acc, q, force):
+    secid = _flw_secid(q)
+    if not secid:
+        raise ApiError("Не указана бумага.", 400)
+    period = q.get("period") if q.get("period") in FLW_PERIODS else "5m"
+    d = _flw_ds("flows/instrument", {"secid": secid, "period": period}, 0 if force else FLW_TTL)
+    if d is None:
+        return {"configured": False, "series": []}
+    return dict(d, configured=True)
+
+
+def _flw_since_arg(q):
+    s = str(q.get("since") or "").strip()
+    return s if re.fullmatch(r"\d{4}-\d{2}-\d{2}|\d{9,11}(\.\d+)?", s) else ""
+
+
+def large_trades_get(cfg, acc, q, force):
+    p = {"limit": 200}
+    if _flw_since_arg(q):
+        p["since"] = _flw_since_arg(q)
+    if q.get("class") in ("share", "bond", "fund"):
+        p["class"] = q["class"]
+    try:
+        mv = float(q.get("min") or 0)
+        if mv > 0:
+            p["min"] = int(mv)
+    except ValueError:
+        pass
+    d = _flw_ds("flows/large", p, 0 if force else FLW_TTL)
+    if d is None:
+        return {"configured": False, "rows": []}
+    return {"configured": True, "rows": d}
+
+
+def spikes_get(cfg, acc, q, force):
+    p = {"limit": 200}
+    if _flw_since_arg(q):
+        p["since"] = _flw_since_arg(q)
+    d = _flw_ds("flows/spikes", p, 0 if force else FLW_TTL)
+    if d is None:
+        return {"configured": False, "rows": []}
+    return {"configured": True, "rows": d}
+
+
+def flows_instruments_get(cfg, acc, q, force):
+    d = _flw_ds("flows/instruments", {}, 300)
+    if d is not None:
+        return {"configured": True, "rows": d}
+    rows = []
+    try:
+        u = globals().get("stocks_universe")
+        for r in (u() if u else [])[:150]:
+            rows.append({"secid": r.get("secid"), "name": r.get("shortname") or r.get("name") or r.get("secid"), "cls": "share",
+                         "isin": r.get("isin") or ""})
+    except Exception:  # noqa: BLE001
+        rows = []
+    return {"configured": False, "rows": rows}
+
+
+def orderbook_get(cfg, acc, q, force):
+    secid = _flw_secid(q)
+    if not secid:
+        raise ApiError("Не указана бумага.", 400)
+    try:
+        depth = max(1, min(50, int(q.get("depth") or 20)))
+    except ValueError:
+        depth = 20
+    book = _flw_ds("md/orderbook", {"secid": secid, "depth": depth}, FLW_BOOK_TTL)
+    trades, src = None, None
+    if book:
+        tr = _flw_ds("md/trades", {"secid": secid, "minutes": 60}, FLW_BOOK_TTL)
+        trades = (tr or {}).get("trades") or []
+        src = "tinvest"
+    else:
+        try:
+            own = _flw_own(cfg, secid, depth)
+        except ApiError as e:
+            return {"ok": False, "error": str(e), "secid": secid}
+        if own:
+            book, trades = own
+            book = dict(book)
+            src = "tinvest"
+    if not book:
+        return {"ok": False, "secid": secid, "error": "Стакан недоступен: на сервере данных нет токена T-Invest, а собственный токен не задан.",
+                "source_label": ""}
+    bids, asks = _flw_levels(book.get("bids")), _flw_levels(book.get("asks"))
+    return {"ok": True, "secid": secid, "bids": bids, "asks": asks, "ts": book.get("ts") or time.time(), "source": src,
+            "source_label": FLW_SRC["tinvest"], "metrics": flows_book_metrics(bids, asks), "trades": (trades or [])[:100],
+            "tape": flows_tape_net(trades)}
+
+
+API_GET["/api/flows"] = flows_get
+API_GET["/api/flows_instrument"] = flows_instrument_get
+API_GET["/api/flows_instruments"] = flows_instruments_get
+API_GET["/api/large_trades"] = large_trades_get
+API_GET["/api/spikes"] = spikes_get
+API_GET["/api/orderbook"] = orderbook_get
+
+
+# ───────────────────────── тревоги по списку наблюдения ─────────────────────────
+_TG_KIND.update({"flow_large": "💰", "flow_spike": "📊"})      # значки для Telegram (_TG_KIND задан в 13j_watch)
+FLW_ALERT_HOURS, FLW_ALERT_MAX = 6, 10
+
+
+def _flw_hhmm(ts):
+    return datetime.fromtimestamp(ts, timezone(timedelta(hours=3))).strftime("%H:%M")
+
+
+def flows_alerts_from(large, spikes):
+    """Крупные сделки и всплески по бумагам списка -> тревоги в формате мониторинга (id служит ключом дедупликации)."""
+    out = []
+    for r in large or []:
+        side = "покупка" if r.get("side") == "buy" else "продажа"
+        out.append({"id": "flow_large|%s|%d|%s|%s" % (r.get("secid"), int(r.get("ts") or 0), r.get("side"), int(r.get("value") or 0)),
+                    "kind": "flow_large", "severity": "medium", "isin": r.get("isin"), "name": r.get("name") or r.get("secid"),
+                    "message": "крупная %s %s ₽ по %s (%s МСК)" % (side, _disc_ru(r.get("value") or 0), r.get("price"), _flw_hhmm(r.get("ts") or 0))})
+    for r in spikes or []:
+        out.append({"id": "flow_spike|%s|%d" % (r.get("secid"), int(r.get("ts") or 0)), "kind": "flow_spike", "severity": "medium",
+                    "isin": r.get("isin"), "name": r.get("name") or r.get("secid"),
+                    "message": "всплеск объёма ×%.1f: %s ₽ за 10 минут (%s МСК)" % (r.get("ratio") or 0, _disc_ru(r.get("value") or 0), _flw_hhmm(r.get("ts") or 0))})
+    return out[:FLW_ALERT_MAX * 3]
+
+
+def flows_watch_alerts(cfg):
+    """Тревоги «крупная покупка/продажа» и «всплеск объёма» по бумагам из списка наблюдения за последние часы."""
+    isins = [i for i in watch_isins() if _isin_ok(i)][:50]
+    if not isins:
+        return []
+    p = {"isins": ",".join(isins), "since": str(int(time.time() - FLW_ALERT_HOURS * 3600)), "limit": 100}
+    large, spikes = _flw_ds("flows/large", p, 0), _flw_ds("flows/spikes", p, 0)
+    return flows_alerts_from(large, spikes)
+# ═══════════════════════════════ индекс страха и жадности российского рынка ═══════════════════════════════
+# 0 — крайний страх, 100 — крайняя жадность. Семь компонентов, у каждого оценка 0–100 = процентный ранг сегодняшнего значения
+# среди значений за последние 2 года; итог — среднее по доступным компонентам. Наружу уходят только обезличенные GET-запросы
+# к iss.moex.com (история индексов и закрытия акций TQBR); данные портфеля не используются.
+import bisect
+from collections import deque
+
+FNG_WINDOW_DAYS = 730            # окно для процентного ранга
+FNG_FULL_PTS = 120               # меньше точек истории -> низкая достоверность
+FNG_MIN_PTS = 10                 # меньше точек оценку не считаем
+FNG_DAYS = 930                   # глубина загрузки закрытий акций (~2,5 года)
+FNG_HIST_DAYS = 400              # сколько дней своей истории индекса считаем
+FNG_CL_KEY = "fng_cl1:"          # закрытия TQBR за день: {secid: close}, по ключу на дату
+FNG_SP_KEY = "fng_sp1"           # спред ВДО к КБД по дням: {дата: п.п.}
+FNG_FL_KEY = "fng_fl1"           # поток «акции минус фонды денежного рынка» по дням
+FNG_TTL = 1800
+FNG_COMPS = [
+    ("mom", "Моментум", False), ("breadth", "Ширина рынка", False), ("hl", "Новые максимумы и минимумы", False),
+    ("vol", "Волатильность", True), ("safe", "Спрос на защитные активы", True), ("spread", "Спрос на риск в долге", True),
+    ("flow", "Поток денег", False)]
+FNG_LABELS = [(24, "Крайний страх"), (44, "Страх"), (55, "Нейтрально"), (75, "Жадность"), (100, "Крайняя жадность")]
+_fng = {"running": False, "res": None, "t": 0.0, "err": None, "have": 0, "need": 0, "cl": {}, "phase": ""}
+_fng_lock = threading.Lock()
+_fng_rl = {"t": 0.0, "lock": threading.Lock()}
+
+
+def fng_label(v):
+    if v is None:
+        return None
+    v = round(v)
+    for hi, t in FNG_LABELS:
+        if v <= hi:
+            return t
+    return FNG_LABELS[-1][1]
+
+
+def fng_pct(v, hist):
+    """Процентный ранг v среди hist (hist включает v): доля меньших + половина равных, 0–100."""
+    n = len(hist)
+    if not n:
+        return None
+    less = sum(1 for x in hist if x < v)
+    eq = sum(1 for x in hist if x == v)
+    return 100.0 * (less + 0.5 * eq) / n
+
+
+def _fng_dadd(d, n):
+    return (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def fng_asof(keys, ser, d, gap=5):
+    """Значение ряда на дату d или последнее известное не старше gap дней; keys — отсортированные даты ряда."""
+    i = bisect.bisect_right(keys, d) - 1
+    if i < 0:
+        return None
+    k = keys[i]
+    if k != d and (datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(k, "%Y-%m-%d")).days > gap:
+        return None
+    return ser[k]
+
+
+# ── ряды компонентов (чистые функции: словарь {дата: значение} -> словарь {дата: сырое значение}) ──
+
+def fng_sma_dev(ser, n):
+    """Отклонение закрытия от скользящей средней за n наблюдений, %."""
+    ks = sorted(ser)
+    out, s, win = {}, 0.0, deque()
+    for k in ks:
+        v = ser[k]
+        win.append(v)
+        s += v
+        if len(win) > n:
+            s -= win.popleft()
+        if len(win) == n and s:
+            out[k] = (v / (s / n) - 1) * 100.0
+    return out
+
+
+def fng_safe_series(bonds, stocks, n=20):
+    """Доходность гособлигаций за n торговых дней минус доходность акций, п.п. (календарь — даты индекса акций)."""
+    ks = sorted(stocks)
+    bk = sorted(bonds)
+    out = {}
+    for i in range(n, len(ks)):
+        d, d0 = ks[i], ks[i - n]
+        b1, b0 = fng_asof(bk, bonds, d), fng_asof(bk, bonds, d0)
+        if not b1 or not b0 or not stocks[d0]:
+            continue
+        out[d] = (b1 / b0 - 1) * 100.0 - (stocks[d] / stocks[d0] - 1) * 100.0
+    return out
+
+
+def fng_breadth_hl(closes, min_stocks=30):
+    """closes: {дата: {secid: close}}. Возвращает ({дата: % акций выше своей SMA50}, {дата: (макс. за 52 нед. − мин.) / число, %})."""
+    dates = sorted(d for d, c in closes.items() if c and len(c) >= min_stocks)
+    obs = {}
+    for i, d in enumerate(dates):
+        for s, c in closes[d].items():
+            if c:
+                obs.setdefault(s, []).append((i, float(c)))
+    n = len(dates)
+    ab, n50, hi, lo, n250 = [0] * n, [0] * n, [0] * n, [0] * n, [0] * n
+    for lst in obs.values():
+        w50, s50 = deque(), 0.0
+        mx, mn = deque(), deque()          # монотонные очереди (индекс наблюдения, значение), окно 250
+        for j, (i, c) in enumerate(lst):
+            w50.append(c)
+            s50 += c
+            if len(w50) > 50:
+                s50 -= w50.popleft()
+            if len(w50) >= 40:
+                n50[i] += 1
+                if c > s50 / len(w50):
+                    ab[i] += 1
+            while mx and mx[-1][1] <= c:
+                mx.pop()
+            mx.append((j, c))
+            while mx[0][0] <= j - 250:
+                mx.popleft()
+            while mn and mn[-1][1] >= c:
+                mn.pop()
+            mn.append((j, c))
+            while mn[0][0] <= j - 250:
+                mn.popleft()
+            if j + 1 >= 120:
+                n250[i] += 1
+                if c >= mx[0][1]:
+                    hi[i] += 1
+                if c <= mn[0][1]:
+                    lo[i] += 1
+    br, hl = {}, {}
+    for i, d in enumerate(dates):
+        if n50[i] >= min_stocks:
+            br[d] = 100.0 * ab[i] / n50[i]
+        if n250[i] >= min_stocks:
+            hl[d] = 100.0 * (hi[i] - lo[i]) / n250[i]
+    return br, hl
+
+
+def fng_flow_parse(j):
+    """Поток в акции минус потоки в фонды денежного рынка из ответа flows/summary (формат сервера разбираем терпимо). None — не нашли."""
+    rows = j
+    if isinstance(j, dict):
+        for k in ("rows", "items", "classes", "data", "flows"):
+            if isinstance(j.get(k), (list, dict)):
+                rows = j[k]
+                break
+    if isinstance(rows, dict):
+        rows = [dict(v, name=k) if isinstance(v, dict) else {"name": k, "net": v} for k, v in rows.items()]
+    if not isinstance(rows, list):
+        return None
+    sh, mm, fs, fm = 0.0, 0.0, False, False
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        lab = " ".join(str(r.get(k) or "") for k in ("key", "class", "name", "title", "label", "asset")).lower()
+        val = None
+        for k in ("net", "net_flow", "netflow", "flow", "delta", "value"):
+            if isinstance(r.get(k), (int, float)):
+                val = float(r[k])
+                break
+        if val is None:
+            continue
+        if any(w in lab for w in ("ликвид", "денеж", "money", "lqdt", "tmon", "sbmm", "akmm")):
+            mm += val
+            fm = True
+        elif any(w in lab for w in ("акци", "share", "equity", "stock")):
+            sh += val
+            fs = True
+    return sh - mm if fs and fm else None
+
+
+def fng_score(ser, d, invert, gap=5):
+    """(оценка 0–100, число точек истории, сырое значение) компонента на дату d; None — нет значения."""
+    ks = sorted(ser)
+    v = fng_asof(ks, ser, d, gap)
+    if v is None:
+        return None
+    lo = bisect.bisect_right(ks, _fng_dadd(d, -FNG_WINDOW_DAYS))
+    hi = bisect.bisect_right(ks, d)
+    hist = [ser[k] for k in ks[lo:hi]]
+    if v not in hist:
+        hist.append(v)
+    if len(hist) < FNG_MIN_PTS:
+        return None
+    sc = fng_pct(v, hist)
+    return (100.0 - sc if invert else sc), len(hist), v
+
+
+def fng_mean(scores):
+    """Среднее по доступным компонентам (веса перенормируются)."""
+    xs = [s for s in scores if s is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+FNG_GAP = {"spread": 10, "flow": 10}
+
+
+def fng_note(key, raw, score):
+    f = lambda x, p=1: ("%+." + str(p) + "f") % x
+    if key == "mom":
+        return "IMOEX %s%% к 125-дневной средней: %s" % (f(raw), "рынок растёт выше своего тренда" if raw > 0 else "рынок ниже своего тренда")
+    if key == "breadth":
+        return "%.0f%% акций торгуются выше своей 50-дневной средней" % raw
+    if key == "hl":
+        return "Разница между долей акций на годовых максимумах и минимумах: %s п.п." % f(raw)
+    if key == "vol":
+        return "Индекс волатильности RVI на %s%% относительно 50-дневной средней: %s" % (f(raw), "тревога растёт" if raw > 0 else "спокойнее обычного")
+    if key == "safe":
+        return "Гособлигации за 20 дней обогнали акции на %s п.п." % f(raw) if raw > 0 else "Акции за 20 дней обогнали гособлигации на %.1f п.п." % -raw
+    if key == "spread":
+        return "Спред ВДО к кривой ОФЗ %.2f п.п.: %s" % (raw, "шире обычного, инвесторы требуют больше за риск" if score < 50 else "уже обычного")
+    return "Чистый поток в акции за вычетом фондов денежного рынка за день: %s" % f(raw, 0)
+
+
+def fng_assemble(imoex, rvi, rgb, closes, spread, flow, today=None):
+    """Собирает результат из рядов. imoex/rvi/rgb/spread/flow — {дата: значение}; closes — {дата: {secid: close}}. Чистая функция."""
+    raw = {}
+    if len(imoex) >= 20:
+        raw["mom"] = fng_sma_dev(imoex, 125)
+        if rvi:
+            raw["vol"] = fng_sma_dev(rvi, 50)
+        if rgb:
+            raw["safe"] = fng_safe_series(rgb, imoex)
+    if closes:
+        raw["breadth"], raw["hl"] = fng_breadth_hl(closes)
+    if spread:
+        raw["spread"] = dict(spread)
+    if flow:
+        raw["flow"] = dict(flow)
+    raw = {k: v for k, v in raw.items() if v}
+    cal = sorted(imoex)
+    if not cal:
+        return {"value": None, "label": None, "ts": None, "components": [], "history": [], "prev": {}, "low_conf": False}
+    last = cal[-1]
+    meta = {k: (n, inv) for k, n, inv in FNG_COMPS}
+    comps = []
+    for k, n, inv in FNG_COMPS:
+        if k not in raw:
+            continue
+        r = fng_score(raw[k], last, inv, FNG_GAP.get(k, 5))
+        if r:
+            sc, npts, v = r
+            comps.append({"key": k, "name": n, "raw": round(v, 3), "score": round(sc, 1), "conf": "ok" if npts >= FNG_FULL_PTS else "low",
+                          "pts": npts, "note": fng_note(k, v, sc)})
+    val = fng_mean([c["score"] for c in comps])
+    for c in comps:
+        c["weight"] = round(1.0 / len(comps), 4)
+    # собственная история индекса: прошлые даты считаем только по компонентам с достаточной историей
+    hist = []
+    for d in [x for x in cal if x >= _fng_dadd(last, -FNG_HIST_DAYS)]:
+        sc = []
+        for k, ser in raw.items():
+            if d == last:
+                continue
+            r = fng_score(ser, d, meta[k][1], FNG_GAP.get(k, 5))
+            if r and r[1] >= FNG_FULL_PTS:
+                sc.append(r[0])
+        v = val if d == last else (fng_mean(sc) if len(sc) >= 3 else None)
+        if v is not None:
+            hist.append({"d": d, "v": round(v, 1)})
+    prev = {}
+    for name, n in (("day", 1), ("week", 7), ("month", 30), ("year", 365)):
+        tgt = _fng_dadd(last, -n)
+        c = [h for h in hist if h["d"] <= tgt]
+        prev[name] = c[-1] if c else None
+    return {"value": None if val is None else round(val, 1), "label": fng_label(val), "ts": last, "components": comps, "history": hist,
+            "prev": prev, "low_conf": any(c["conf"] == "low" for c in comps) or len(comps) < 4}
+
+
+# ── загрузка данных ──
+
+def _fng_throttle():
+    with _fng_rl["lock"]:
+        w = _fng_rl["t"] + 0.5 - time.time()
+        if w > 0:
+            time.sleep(w)
+        _fng_rl["t"] = time.time()
+
+
+def fng_fetch_day(d):
+    """Закрытия акций TQBR за день: {secid: close}. Сначала общий сборщик (если есть), иначе страницы ISS не чаще 2 запросов/с."""
+    fn = globals().get("stock_history_closes")
+    if fn:
+        try:
+            r = fn(d)
+            if isinstance(r, dict):
+                return {k: float(v) for k, v in r.items() if v}
+        except Exception:  # noqa: BLE001
+            pass
+    out, start = {}, 0
+    for _ in range(10):
+        _fng_throttle()
+        j = json.loads(http_text(
+            "https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities.json?iss.meta=off&date=%s&start=%d"
+            "&iss.only=history,history.cursor&history.columns=SECID,CLOSE,NUMTRADES" % (d, start), 40))
+        rows = (j.get("history") or {}).get("data") or []
+        for s, c, nt in rows:
+            if c and (nt or 0) > 0:
+                out[s] = float(c)
+        cur = ((j.get("history.cursor") or {}).get("data") or [[0, 0, 100]])[0]
+        start = cur[0] + len(rows)
+        if not rows or start >= cur[1]:
+            break
+    return out
+
+
+def fng_universe():
+    fn = globals().get("stocks_universe")
+    if not fn:
+        return None
+    try:
+        u = fn()
+        if isinstance(u, dict):
+            u = list(u)
+        s = {x if isinstance(x, str) else (x.get("secid") or x.get("id") or x.get("SECID")) for x in u}
+        s.discard(None)
+        return s or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fng_spread_points():
+    """Спред ВДО (рейтинг BB и ниже, иначе BBB) к КБД по дням из накопленной истории раздела «Ставки»."""
+    st = store()
+    acc = st.get(FNG_SP_KEY) or {}
+    f = globals().get("spreads_history_payload")
+    if f:
+        try:
+            h = f()
+            for b in ("BB и ниже", "BBB"):
+                v = (h.get("series") or {}).get(b)
+                if v and any(x is not None for x in v):
+                    for d, x in zip(h["dates"], v):
+                        if x is not None and d not in acc:
+                            acc[d] = x
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+    rows = (globals().get("_scr") or {}).get("rows") or []
+    if rows and any(r.get("rating") for r in rows):
+        xs = [r["spread"] for r in rows if r.get("kind") == "corp" and r.get("spread") is not None and r.get("cur") == "RUB"
+              and r.get("rating") and rating_bucket(r["rating"]) == "BB и ниже"]
+        if len(xs) >= 3:
+            acc[date.today().isoformat()] = _med(xs)
+    st.put(FNG_SP_KEY, acc)
+    return acc
+
+
+def _fng_flow_points():
+    st = store()
+    acc = st.get(FNG_FL_KEY) or {}
+    try:
+        j = ds_parsed("flows/summary", {"period": "day"})
+        v = fng_flow_parse(j) if j is not None else None
+        if v is not None:
+            acc[date.today().isoformat()] = v
+            st.put(FNG_FL_KEY, acc)
+    except Exception:  # noqa: BLE001
+        pass
+    return acc
+
+
+def _fng_publish(imoex, rvi, rgb, closes):
+    uni = fng_universe()
+    cl = {d: ({s: c for s, c in v.items() if s in uni} if uni else v) for d, v in closes.items()} if closes else {}
+    res = fng_assemble(imoex, rvi, rgb, cl, _fng_spread_points(), _fng_flow_points())
+    res["updated"] = time.time()
+    with _fng_lock:
+        _fng["res"] = res
+        _fng["t"] = time.time()
+
+
+def _fng_run():
+    try:
+        st = store()
+        frm = _fng_dadd(date.today().isoformat(), -FNG_DAYS)
+        ser = {}
+        _fng["phase"] = "индексы"
+        for k, code in (("imoex", "IMOEX"), ("rvi", "RVI"), ("rgb", "RGBITR")):
+            try:
+                ser[k] = bench_history(code, frm) or {}
+            except Exception:  # noqa: BLE001
+                ser[k] = {}
+        closes = _fng["cl"]
+        for d in [d for d in closes if d >= _fng_dadd(date.today().isoformat(), -3)]:
+            del closes[d]                                # свежие дни перечитываем: закрытие сегодняшнего дня появляется вечером
+        _fng_publish(ser["imoex"], ser["rvi"], ser["rgb"], closes)
+        _fng["phase"] = "закрытия акций"
+        today = date.today()
+        days = [(today - timedelta(days=i)) for i in range(FNG_DAYS + 1)]
+        days = [d.isoformat() for d in days if d.weekday() < 5]
+        _fng["need"] = len(days)
+        fetched = 0
+        for d in days:                                   # от свежих к старым: непрерывный «хвост» уже даёт текущее значение
+            if d in closes:
+                continue
+            v = st.get(FNG_CL_KEY + d)
+            if v is None:
+                try:
+                    v = fng_fetch_day(d)
+                except Exception:  # noqa: BLE001
+                    continue
+                recent = d >= _fng_dadd(today.isoformat(), -3)
+                if v or not recent:
+                    if d < today.isoformat():
+                        st.put(FNG_CL_KEY + d, v)
+                fetched += 1
+            closes[d] = v
+            _fng["have"] = sum(1 for x in closes.values() if x)
+            if fetched and (fetched == 60 or fetched % 150 == 0):
+                _fng_publish(ser["imoex"], ser["rvi"], ser["rgb"], {k: x for k, x in closes.items() if x})
+        _fng["have"] = sum(1 for x in closes.values() if x)
+        _fng_publish(ser["imoex"], ser["rvi"], ser["rgb"], {k: x for k, x in closes.items() if x})
+        _fng["err"] = None
+    except Exception as e:  # noqa: BLE001
+        _fng["err"] = str(e)[:200]
+    finally:
+        _fng.update(running=False, phase="", t=time.time())
+
+
+def _fng_kick(force=False):
+    with _fng_lock:
+        if _fng["running"] or (not force and _fng["res"] is not None and time.time() - _fng["t"] < FNG_TTL):
+            return
+        _fng["running"] = True
+    threading.Thread(target=_fng_run, daemon=True).start()
+
+
+def fng_payload(force=False):
+    _fng_kick(force)
+    with _fng_lock:
+        res, running, err = _fng["res"], _fng["running"], _fng["err"]
+    out = dict(res) if res else {"value": None, "label": None, "ts": None, "components": [], "history": [], "prev": {}, "low_conf": True}
+    out.update(loading=running, progress={"have": _fng["have"], "need": _fng["need"], "phase": _fng["phase"]}, error=None if res or running else err)
+    return out
+
+
+API_GET["/api/fng"] = lambda cfg, acc, q, force: fng_payload(force)
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -14871,6 +18557,110 @@ tr.scr-low td{opacity:.5}
 .ro-note{display:flex;gap:10px;align-items:flex-start;padding:11px 14px;border-radius:12px;background:#3ecf8e1a;border:1px solid #3ecf8e55;color:var(--tx);font-size:13.5px;line-height:1.5;margin:6px 0}
 .ro-note svg{width:18px;height:18px;flex:none;margin-top:2px;color:var(--pos)}
 @media print{#demo-bar{display:none}}
+/* раскрытие информации: карточка облигации, выплаты эмитента, техдефолты */
+.bc-out{padding:10px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;margin-bottom:12px;line-height:1.5}
+.iss-fl-h{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin:4px 0 8px}
+.iss-fl-h b{font-size:15px}
+.iss-fl-chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.iss-fl-chips button{all:unset;cursor:pointer;padding:4px 12px;border-radius:999px;border:1px solid var(--line);color:var(--tx2);font-size:12.5px}
+.iss-fl-chips button:hover{color:var(--tx)}
+.iss-fl-chips button.on{background:var(--card2);color:var(--tx);border-color:var(--line2)}
+.iss-fl-leg{margin-bottom:6px}
+.iss-hatch{background:repeating-linear-gradient(45deg,var(--s4) 0 2px,transparent 2px 5px);border:1px solid var(--s4)}
+.dfl-bar{display:flex;gap:12px;flex-wrap:wrap;margin:6px 0 12px}
+.dfl-b{display:inline-block;padding:2px 9px;border-radius:7px;font-size:12px;white-space:nowrap}
+.dfl-t{background:#c985001f;color:#c98500}
+.dfl-d{background:#e5484d1f;color:var(--neg)}
+#dfl-tab td{vertical-align:top}
+.dfl-wrap{overflow-x:auto;max-width:100%}
+#dfl-tab{table-layout:auto;min-width:760px}
+#dfl-tab th,#dfl-tab td{padding:8px 8px}
+#dfl-tab td{white-space:normal;line-height:1.35}
+#dfl-tab td:nth-child(1),#dfl-tab td:nth-child(2),#dfl-tab td:nth-child(5){white-space:nowrap}
+#dfl-tab .dfl-is{min-width:170px;max-width:300px;overflow-wrap:anywhere}
+#dfl-tab .dfl-bs{min-width:120px}
+@media(max-width:700px){.dfl-b{white-space:normal}}
+/* ── Акции: карточка и скринер ── */
+.stk-top{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;margin-bottom:16px;overflow:visible}
+.stk-sw{position:relative;flex:1 1 320px;max-width:520px}
+.stk-res{position:absolute;left:0;right:0;top:100%;z-index:20;margin-top:4px;background:var(--card);border-radius:10px;box-shadow:0 12px 32px #0006;overflow:hidden}
+.stk-res:empty{display:none}
+.stk-res button{all:unset;box-sizing:border-box;width:100%;display:flex;gap:10px;align-items:center;padding:9px 14px;cursor:pointer;font-size:13px}
+.stk-res button:hover{background:#ffffff0c}.stk-res button span{color:var(--mu);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stk-chips{display:flex;flex-wrap:wrap;gap:8px}
+.stk-chips .btn{font-size:12.5px}
+.stk-hd{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;flex-wrap:wrap;margin-bottom:16px}
+.stk-nm{font-size:22px;font-weight:700;margin-bottom:4px}.stk-nm .mu{font-size:15px;font-weight:500}
+.stk-px{font-size:26px;font-weight:700;display:flex;align-items:baseline;gap:12px}.stk-px .num:last-child{font-size:16px;font-weight:600}
+.stk-verdict{display:flex;align-items:center;gap:14px;margin-bottom:14px}
+.stk-sig{font-size:20px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:6px 16px;border-radius:10px;background:#ffffff0c}
+.stk-sig.pos{background:#3ecf8e1c}.stk-sig.neg{background:#ff6b6b1c}
+.stk-votes{display:grid;gap:7px;font-size:13px;margin-bottom:14px}
+.stk-votes div{display:flex;gap:8px;align-items:baseline}.stk-votes b{font-weight:550;min-width:150px}
+.stk-lv{display:grid;gap:8px;font-size:13px;margin-bottom:10px}.stk-lv .tag{margin-left:2px}
+.stk-lv .tag.neg{background:#ff6b6b17;color:var(--neg)}.stk-lv .tag.pos{background:#3ecf8e17;color:var(--pos)}
+@media(max-width:860px){.stk-votes b{min-width:0}.stk-px{font-size:22px}}
+[data-theme=light] .stk-res{box-shadow:0 12px 32px #0002}[data-theme=light] .stk-res button:hover{background:#0000000a}[data-theme=light] .stk-sig{background:#0000000a}
+.hm-bar{display:flex;flex-wrap:wrap;gap:4px 18px;align-items:center}
+.hm-st{display:flex;flex-wrap:wrap;gap:4px 18px;font-size:13px;color:var(--mu);margin:2px 0 12px}
+.hm-st b{color:var(--tx);font-weight:600}.hm-st b.pos{color:var(--pos)}.hm-st b.neg{color:var(--neg)}
+.hm-wrap{width:100%;overflow:hidden;border-radius:8px;min-height:200px}
+.hm-svg{display:block;max-width:100%}
+.hm-g{fill:var(--card2);stroke:var(--card);stroke-width:1}
+.hm-gl{fill:var(--tx2);font-size:11px;font-weight:600;pointer-events:none}
+.hm-t{cursor:pointer}.hm-t:hover rect{stroke:var(--tx);stroke-width:1.5}
+.hm-l,.hm-p{fill:#fff;pointer-events:none;font-weight:600}.hm-p{font-weight:500;opacity:.92}
+[data-theme=light] .hm-l,[data-theme=light] .hm-p{fill:#1b1f27}
+.hm-leg{margin-top:12px}
+.flw-bar2{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:6px 0 12px}
+.flw-meta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:4px 0 12px;font-size:12px}
+.flw-meta .btn{margin-left:auto}
+.flw-src{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500}
+.flw-src.live{background:#3ecf8e1f;color:var(--pos)}.flw-src.delay{background:#c985001f;color:#c98500}
+.flw-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+.flw-big{font-size:22px;font-weight:600;margin-bottom:10px}
+.flw-bar{display:flex;height:10px;border-radius:6px;overflow:hidden;background:var(--line)}
+.flw-bar i.p{background:var(--pos)}.flw-bar i.n{background:var(--neg)}
+.flw-leg{display:flex;justify-content:space-between;gap:8px;font-size:12px;margin-top:8px}
+.flw-sr{display:grid;grid-template-columns:minmax(110px,200px) 1fr 110px;gap:10px;align-items:center;padding:4px 0;font-size:13px}
+.flw-sb{height:8px;background:var(--line);border-radius:5px;overflow:hidden}
+.flw-sb i{display:block;height:100%}.flw-sb i.p{background:var(--pos)}.flw-sb i.n{background:var(--neg)}
+.flw-sv{text-align:right;white-space:nowrap}
+.flw-two{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+.flw-t th,.flw-t td{white-space:nowrap}.flw-row{cursor:pointer}.flw-row:hover td{background:#ffffff08}
+.flw-b{display:inline-block;padding:2px 9px;border-radius:7px;font-size:12px}
+.flw-b.buy{background:#3ecf8e1f;color:var(--pos)}.flw-b.sell{background:#ff6b6b1f;color:var(--neg)}
+.flw-min{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--tx2)}
+.flw-min select{background:var(--card);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 8px}
+.flw-book{display:grid;grid-template-columns:minmax(260px,1fr) minmax(260px,1fr);gap:14px}
+.flw-ladder{font-variant-numeric:tabular-nums;font-size:13px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.flw-l{position:relative;display:flex;justify-content:space-between;padding:3px 10px;gap:10px}
+.flw-l i{position:absolute;top:0;bottom:0;right:0;opacity:.22;z-index:0}
+.flw-l.ask i{background:var(--neg)}.flw-l.bid i{background:var(--pos)}
+.flw-l span,.flw-l em{position:relative;z-index:1}.flw-l.ask .p{color:var(--neg)}.flw-l.bid .p{color:var(--pos)}
+.flw-l em{font-style:normal;font-size:11px;color:var(--ac)}.flw-l.wall{outline:1px solid var(--ac);outline-offset:-1px;font-weight:600}
+.flw-mid{text-align:center;padding:6px;background:var(--card);border-block:1px solid var(--line);font-weight:600}
+.flw-gauge{position:relative;height:10px;border-radius:6px;background:linear-gradient(90deg,var(--neg),var(--line) 50%,var(--pos));margin:12px 0 4px}
+.flw-gk{position:absolute;top:-4px;width:4px;height:18px;margin-left:-2px;background:var(--tx);border-radius:2px}
+.flw-tape{max-height:300px;overflow:auto;font-size:12.5px;font-variant-numeric:tabular-nums}
+.flw-tape div{display:flex;justify-content:space-between;padding:2px 4px}.flw-tape .buy b{color:var(--pos)}.flw-tape .sell b{color:var(--neg)}
+@media(max-width:760px){.flw-book{grid-template-columns:1fr}.flw-sr{grid-template-columns:90px 1fr 90px}}
+.fg-top{display:grid;grid-template-columns:minmax(260px,340px) 1fr;gap:24px;align-items:center;margin-top:8px}
+.fg-g{text-align:center}.fg-gauge{width:100%;max-width:340px;height:auto;display:block;margin:0 auto}
+.fg-big{font-size:46px;font-weight:700;font-variant-numeric:tabular-nums}.fg-tk{font-size:10px;fill:var(--mu)}
+.fg-lbl{font-size:19px;font-weight:650;margin-top:-4px}.fg-ts{font-size:12px;color:var(--mu);margin-top:2px}
+.fg-chips{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.fg-chip{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:grid;gap:2px}
+.fg-chip small{color:var(--mu);font-size:12px}.fg-chip b{font-size:28px;font-weight:700;font-variant-numeric:tabular-nums}.fg-chip span{font-size:12.5px;color:var(--tx2)}
+.fg-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;margin-top:8px}
+.fg-cc{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.fg-ch{display:flex;align-items:baseline;gap:8px}.fg-ch b{font-size:13.5px;font-weight:600;flex:1}.fg-ch span{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+.fg-ch em{font-style:normal;font-size:10.5px;color:var(--mu);border:1px solid var(--line2);border-radius:6px;padding:1px 5px}
+.fg-bar{position:relative;height:6px;border-radius:3px;margin:9px 0 8px;background:linear-gradient(90deg,#e5484d,#f08a4b 30%,#9aa1ae 50%,#7cc36e 70%,#2fb36e);opacity:.9}
+.fg-bar i{position:absolute;top:-4px;width:4px;height:14px;margin-left:-2px;border-radius:2px;border:1.5px solid var(--card2);box-sizing:content-box}
+.fg-cc p{margin:0;font-size:12.5px;line-height:1.5;color:var(--tx2)}
+.fg-note p{font-size:13px;line-height:1.6;color:var(--tx2);margin:8px 0 0}.fg-note .mu{color:var(--mu)}
+@media(max-width:760px){.fg-top{grid-template-columns:1fr}}
 </style></head>
 <body>
 <aside>
@@ -14962,7 +18752,10 @@ const IC={
  cmp:'<path d="M8 4v16M16 4v16M4 8h8M12 16h8"/>',
  scr:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/>',
  risk:'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
+ hm:'<rect x="3" y="3" width="10" height="11"/><rect x="13" y="3" width="8" height="6"/><rect x="13" y="9" width="8" height="5"/><rect x="3" y="14" width="18" height="7"/>',
  sig:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+ flw:'<path d="M3 20V10M9 20V4M15 20v-7M21 20V8"/>',
+ dfl:'<path d="M12 3l9 16H3z"/><path d="M9 15l6-5M9 10l6 5"/>',
  mon:'<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/>',
  map:'<circle cx="7" cy="16" r="2"/><circle cx="12" cy="9" r="2.5"/><circle cx="18" cy="13" r="1.6"/><path d="M3 3v18h18"/>',
  pri:'<path d="M12 2l2.6 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.4 6.1 20.1l1.6-6.7L2.5 8.9l6.9-.6z"/>',
@@ -14976,12 +18769,13 @@ const IC={
  cal:'<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M12 14l1.2 2.4 2.6.4-1.9 1.8.5 2.6-2.4-1.3-2.4 1.3.5-2.6-1.9-1.8 2.6-.4z"/>',
  watch:'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
  kb:'<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5M9 8h6M9 12h4"/>',
+ fng:'<path d="M4 17a8 8 0 0 1 16 0"/><path d="M12 17l4-5"/><circle cx="12" cy="17" r="1.2"/>',
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['cmp','Сравнение облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['pri','Первичка'],['cal','Календарь событий'],null,['kb','База знаний'],['imp','Импорт отчётов'],['set','Настройки']];
+const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['cmp','Сравнение облигаций'],['map','Карта рынка'],['hm','Тепловая карта'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['dfl','Техдефолты'],['flw','Кто покупает'],['pri','Первичка'],['fng','Страх и жадность'],['cal','Календарь событий'],null,['kb','База знаний'],['imp','Импорт отчётов'],['set','Настройки']];
 /* группы меню: ключи страниц остаются прежними, PAGES — плоский список для поиска названий */
 const NAV_GROUPS=[['Портфель',['dash','ret','bench','pos','bonds','pay','off','ops','fees']],['Учёт и планы',['tax','reb','calc','lad']],
-  ['Рынок',['mkt','scr','cmp','map','sig','pri','cal']],['Риски и контроль',['risk','mon','watch','iss']]];
+  ['Рынок',['mkt','fng','scr','cmp','map','hm','sig','pri','cal','dfl','flw']],['Риски и контроль',['risk','mon','watch','iss']]];
 const NAV_FIXED=['imp','kb','set'],NAV_PINNED=['dash','set'];
 function lsJson(k,d){try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}}
 function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}
@@ -15167,6 +18961,89 @@ function chart(id,fn,o){S.charts.push([id,fn,o])}
 function mountCharts(){S.charts.forEach(([id,fn,o])=>{const el=document.getElementById(id);if(el)try{fn(el,o)}catch(e){console.error(e);el.innerHTML='<div class="empty">Не удалось построить график</div>'}})}
 let rT;addEventListener('resize',()=>{clearTimeout(rT);rT=setTimeout(mountCharts,120)});
 
+
+/* ── столбцы по месяцам, сложенные по сериям (выпускам); прогнозная часть светлее, CALL — отдельный столбец со штриховкой ──
+   o: {h, labels:[...], months:[{segs:[{k,v,est}], call:number}], colors:{k:цвет}, names:{k:имя}, fa, ft, empty,
+       vl:true — подписи значений над столбцами (итог месяца; CALL — фиолетовым), fv — формат подписи (по умолчанию short)} */
+/* выбор подписей, которые не налезают друг на друга: items [{x,y,w,v}] — центр, базовая линия, ширина; важнее те, что больше */
+function barLabelsPick(items,lh){
+  const keep=[],ok=(a,b)=>Math.abs(a.x-b.x)<(a.w+b.w)/2+3&&Math.abs(a.y-b.y)<lh;
+  items.slice().sort((a,b)=>b.v-a.v).forEach(it=>{if(!keep.some(k=>ok(k,it)))keep.push(it)});
+  return keep;
+}
+function stackedMonths(el,o){
+  const W=el.clientWidth,H=o.h||260,pl=58,pr=6,pt=o.vl?22:8,pb=26,n=o.labels.length,fa=o.fa||short,ft=o.ft||(v=>short(v)+' ₽');
+  if(!n||W<50)return emptyChart(el,H,o.empty);
+  const tot=m=>m.segs.reduce((a,s)=>a+s.v,0);
+  let mx=0;o.months.forEach(m=>{mx=Math.max(mx,tot(m),m.call||0)});
+  if(!mx)return emptyChart(el,H,o.empty);
+  const{lo,hi,step}=nice(0,mx),pw=W-pl-pr,ph=H-pt-pb,gw=pw/n,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
+  const hasCall=o.months.some(m=>m.call>0),cols=hasCall?2:1,gap=2,bw=Math.max(3,Math.min(26,(gw*.8-(cols-1)*gap)/cols));
+  const uid='sm'+Math.random().toString(36).slice(2,7);
+  let s=`<defs><pattern id="${uid}" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="var(--card)"/><rect width="2.6" height="6" fill="var(--s4)"/></pattern></defs>`,marks='',hits='';
+  for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(v)}</text>`}
+  const bt=axisTicks(o.labels,i=>pl+gw*i+gw/2,pl-4,W-pr+4);
+  const vls=[];
+  o.months.forEach((m,i)=>{
+    const gx=pl+gw*i,x0=gx+(gw-(cols*bw+(cols-1)*gap))/2;let acc=0;
+    m.segs.forEach(sg=>{if(!(sg.v>0))return;const y1=Y(acc+sg.v),y0=Y(acc),h=Math.max(0,y0-y1-.5),c=o.colors[sg.k]||'var(--s1)';
+      marks+=`<rect class="bm" data-g="${i}" x="${x0}" y="${y1}" width="${bw}" height="${h}" fill="${c}"${sg.est?' opacity=".5"':''}/>`;acc+=sg.v});
+    if(m.call>0){const x=x0+(cols-1)*(bw+gap),y=Y(m.call);marks+=`<rect class="bm" data-g="${i}" x="${x}" y="${y}" width="${bw}" height="${Math.max(0,Y(0)-y)}" fill="url(#${uid})" stroke="var(--s4)" stroke-width="1"/>`}
+    hits+=`<rect data-i="${i}" x="${gx}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
+    if(o.vl){const fv=o.fv||short,cw=11*.56,t=tot(m);
+      if(t>0){const tx=fv(t);vls.push({x:x0+bw/2,y:Y(t)-4,w:tx.length*cw,v:t,tx,c:''})}
+      if(m.call>0){const tx=fv(m.call);vls.push({x:x0+(cols-1)*(bw+gap)+bw/2,y:Y(m.call)-4,w:tx.length*cw,v:m.call,tx,c:' vl-call'})}}
+  });
+  bt.forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
+  let vt='';
+  if(o.vl)barLabelsPick(vls,13).forEach(l=>{const x=Math.max(pl+l.w/2,Math.min(W-pr-l.w/2,l.x));vt+=`<text class="ax num vl${l.c}" x="${x}" y="${l.y}" text-anchor="middle"${l.c?' style="fill:var(--s7)"':''}>${esc(l.tx)}</text>`});
+  el.innerHTML=`<svg width="${W}" height="${H}">${s}<g>${marks}</g>${vt}${hits}</svg>`;
+  const mk=el.querySelectorAll('.bm');
+  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.3);
+  bindTip(el,i=>{const m=o.months[i];let h=`<b>${esc(o.tipLabels?o.tipLabels[i]:o.labels[i])}</b>`;
+    m.segs.filter(x=>x.v>0).forEach(x=>{h+=tipRow(o.colors[x.k]||'var(--s1)',(o.names[x.k]||x.k)+(x.est?' (прогноз)':''),ft(x.v))});
+    if(m.call>0)h+=tipRow('var(--s4)','возможный CALL',ft(m.call));
+    h+=`<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${ft(tot(m))}</span></div>`;return h});
+}
+
+
+/* ── свечной график: candles(id|элемент, data, opts) ──
+   data: [{t,o,h,l,c,v}]. opts: {h, volume:false — без объёма, lines:[{v:[…по свечам],c,n,w}], band:{up:[…],low:[…],c}, levels:[{p,kind:'s'|'r'}],
+   labelOf(t) — подпись оси X, fmt(v) — формат цены, ft(i) — свой HTML подсказки, hover(i), empty}. Рост — var(--pos), падение — var(--neg). */
+function candles(id,data,o){
+  o=o||{};const el=typeof id==='string'?document.getElementById(id):id;if(!el)return;
+  const W=el.clientWidth,H=o.h||380,pl=58,pr=10,pt=10,pb=24,n=(data||[]).length;
+  if(n<2||W<80)return emptyChart(el,H,o.empty);
+  const fmt=o.fmt||(v=>(+v).toLocaleString('ru-RU',{maximumFractionDigits:v>=100?2:4})),lab=o.labelOf||(t=>t);
+  const vh=o.volume===false?0:Math.round((H-pt-pb)*.2),ph=H-pt-pb-vh-(vh?8:0),pw=W-pl-pr;
+  let mn=Infinity,mx=-Infinity;
+  data.forEach(c=>{mn=Math.min(mn,c.l);mx=Math.max(mx,c.h)});
+  if(o.band){o.band.up.forEach(v=>{if(v!=null)mx=Math.max(mx,v)});o.band.low.forEach(v=>{if(v!=null)mn=Math.min(mn,v)})}
+  if(mx===mn){mx=mn*1.01+1e-6}
+  const padv=(mx-mn)*.03,{lo,hi,step}=nice(mn-padv,mx+padv,5),Y=v=>pt+ph-(v-lo)/(hi-lo)*ph,X=i=>pl+(i+.5)/n*pw,gw=pw/n,bw=Math.max(1,Math.min(14,gw*.7));
+  let s='';
+  for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-8}" y="${y+4}" text-anchor="end">${fmt(+v.toFixed(6))}</text>`}
+  axisTicks(data.map(c=>lab(c.t)),X,pl-4,W-pr+4,18).forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(lab(data[i].t))}</text>`);
+  if(o.band){const pts=[],bt=[];for(let i=0;i<n;i++){const u=o.band.up[i],l=o.band.low[i];if(u==null||l==null)continue;pts.push(X(i).toFixed(1)+','+Y(u).toFixed(1));bt.push(X(i).toFixed(1)+','+Y(l).toFixed(1))}
+    if(pts.length>1)s+=`<polygon points="${pts.join(' ')} ${bt.reverse().join(' ')}" fill="${o.band.c||'#7a8cff'}" fill-opacity=".1" stroke="${o.band.c||'#7a8cff'}" stroke-opacity=".5" stroke-width="1"/>`}
+  (o.levels||[]).forEach(L=>{if(L.p<lo||L.p>hi)return;const c=L.kind==='r'?'var(--neg)':'var(--pos)',y=Y(L.p);
+    s+=`<line x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}" stroke="${c}" stroke-opacity=".6" stroke-dasharray="5 4"/><text class="ax num" x="${W-pr-4}" y="${y-4}" text-anchor="end" style="fill:${c}">${fmt(L.p)}</text>`});
+  let marks='',vol='';
+  if(vh){const vm=Math.max(...data.map(c=>c.v||0),1),vy=pt+ph+8;
+    data.forEach((c,i)=>{const h=Math.max(1,(c.v||0)/vm*vh);vol+=`<rect x="${X(i)-bw/2}" y="${vy+vh-h}" width="${bw}" height="${h}" fill="${c.c>=c.o?'var(--pos)':'var(--neg)'}" opacity=".45"/>`})}
+  data.forEach((c,i)=>{const up=c.c>=c.o,col=up?'var(--pos)':'var(--neg)',x=X(i),yo=Y(c.o),yc=Y(c.c);
+    marks+=`<line x1="${x}" x2="${x}" y1="${Y(c.h)}" y2="${Y(c.l)}" stroke="${col}" stroke-width="1"/><rect x="${x-bw/2}" y="${Math.min(yo,yc)}" width="${bw}" height="${Math.max(1,Math.abs(yc-yo))}" fill="${col}"/>`});
+  (o.lines||[]).forEach(L=>{const pts=[];L.v.forEach((v,i)=>{if(v!=null&&v>=lo&&v<=hi)pts.push(X(i).toFixed(1)+','+Y(v).toFixed(1))});
+    if(pts.length>1)s+=`<polyline points="${pts.join(' ')}" fill="none" stroke="${L.c}" stroke-width="${L.w||1.5}" stroke-linejoin="round"/>`});
+  let hits='';for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${pl+gw*i}" y="${pt}" width="${gw}" height="${H-pt-pb}" fill="transparent"/>`;
+  el.innerHTML=`<svg width="${W}" height="${H}">${s}${vol}${marks}<g class="hv"></g>${hits}</svg>`;
+  const hv=el.querySelector('.hv');
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph+vh+8}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`};
+  bindTip(el,i=>{o.hover&&o.hover(i);if(o.ft)return o.ft(i);const c=data[i],up=c.c>=c.o;
+    let h=`<b>${esc(lab(c.t))}</b>`+tipRow(up?'var(--pos)':'var(--neg)','Закрытие',fmt(c.c))+tipRow('var(--mu)','Открытие',fmt(c.o))+tipRow('var(--mu)','Максимум',fmt(c.h))+tipRow('var(--mu)','Минимум',fmt(c.l));
+    if(c.v)h+=tipRow('var(--mu)','Объём',short(c.v));
+    (o.lines||[]).forEach(L=>{if(L.v[i]!=null)h+=tipRow(L.c,L.n,fmt(L.v[i]))});return h});
+}
 /* ── logos ── */
 const LOGO_BAD=new Set();
 function colorFor(t){return HEX[(t||'?').split('').reduce((a,ch)=>a+ch.charCodeAt(0),0)%8]}
@@ -15267,7 +19144,7 @@ function renderNow(){
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${S.page==='dash'?proBanner():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,cmp:pCmp,map:pMap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,cal:pCal,watch:pWatch})[S.page]()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${S.page==='dash'?proBanner():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,cmp:pCmp,map:pMap,hm:pHeatmap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,fng:pFng,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,dfl:pDfl,flw:pFlw,cal:pCal,watch:pWatch,stk:pStk,sst:pSst})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -15762,7 +19639,7 @@ document.addEventListener('click',e=>{
   if(h){const kk=h.dataset.pvs;S.priVSort={k:kk,d:S.priVSort.k===kk?-S.priVSort.d:(['name','coupon','rating'].includes(kk)?1:-1)};render()}
 });
 /* ── Скринер облигаций ── */
-S.scr=null;S.sf={q:'',cur:'RUB',kind:'all',sector:'',rmin:'',rated:false,ymin:'',ymax:'60',tmax:'',turn:'',spmin:'',noOffer:false,toOffer:false,fl:'all'};S.ssort={k:'yield',d:-1};S.sn=150;
+S.scr=null;S.sf={q:'',cur:'RUB',kind:'all',sector:'',rmin:'',rated:false,ymin:'',ymax:'60',tmax:'',turn:'',spmin:'',noOffer:false,toOffer:false,fl:'all',liq:''};S.ssort={k:'yield',d:-1};S.sn=150;
 function loadScr(){api('/api/screener').then(j=>{const t=Date.now();j.rows.forEach(r=>{r.years=(new Date(r.mat)-t)/315576e5;const yo=r.offer?(new Date(r.offer)-t)/315576e5:null;r.yoff=yo!=null&&yo>0&&yo<r.years?yo:null});S.scr=j;if(S.page==='scr'||S.page==='map')renderSoon()}).catch(e=>{S.scr={error:e.message,rows:[]};if(S.page==='scr'||S.page==='map')renderSoon()})}
 function scrRows(){
   const f=S.sf,q=f.q.trim().toLowerCase(),ri=f.rmin?RSC.indexOf(f.rmin):-1;
@@ -15781,29 +19658,63 @@ function scrRows(){
     if(turn!=null&&r.turn<turn*1e6)return false;
     if(spmin!=null&&!(r.spread!=null&&r.spread>=spmin))return false;
     if(f.noOffer&&r.offer)return false;
+    if(f.liq&&!(r.liq==='L1'||(f.liq==='L2'&&r.liq==='L2')))return false;
     return r.years>0;
   });
   const{k,d}=S.ssort;
-  rs.sort((a,b)=>{let x=a[k],y=b[k];if(k==='rating'){x=x?RSC.indexOf(x):null;y=y?RSC.indexOf(y):null;return -d*((x??99)-(y??99))}
+  rs.sort((a,b)=>{let x=a[k==='liq'?'turn':k],y=b[k==='liq'?'turn':k];if(k==='rating'){x=x?RSC.indexOf(x):null;y=y?RSC.indexOf(y):null;return -d*((x??99)-(y??99))}
     if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
   return rs;
 }
 function drawScr(){
   const rs=scrRows(),n=Math.min(rs.length,S.sn),fl=S.scr.floor&&S.scr.floor.lqdt;
-  const cols=[['_w','★','l'],['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield','Доходность'],['spread','Спред к КБД'],['coupon','Купон, %'],['years','До погашения'],['dur','Дюрация'],['turn','Оборот сегодня']];
+  const cols=[['_w','★','l'],['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield','Доходность'],['cy','CY, %'],['spread','Спред к КБД'],['coupon','Купон, %'],['floating','Тип'],['years','До погашения'],['macdur','MacDur, лет'],['liq','Ликвидность']];
   const {k,d}=S.ssort;
   $('#scr-head').innerHTML=cols.map(([kk,t,c])=>kk==='_w'?`<th class="wt-sth" title="Список наблюдения">${t}</th>`:`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   $('#scr-body').innerHTML=rs.slice(0,n).map(r=>`<tr${fl>0&&r.yield<fl?' class="scr-low" title="Доходность ниже, чем у фонда ликвидности"':''} data-isin="${esc(r.isin||r.id)}"><td class="wt-std">${watchStar(r.isin||r.id)}</td><td class="l"><b>${esc(r.name)}</b><br><small class="mu num">${isinTxt(r.isin||r.id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></td>
     <td class="l">${r.rating?`<span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}" title="${esc(r.rt_agency||'')}${r.rt_approx?' (приблизительное совпадение названия)':''}">${r.rt_approx?'≈ ':''}${esc(r.rating)}</span>`:'<span class="mu">—</span>'}</td>
     <td class="l">${r.sector?esc(SECT[r.sector]||r.sector):'<span class="mu">—</span>'}</td>
-    <td class="num">${f2(r.price)}</td><td class="num"><b>${pctp(r.yield,2)}</b></td>
+    <td class="num">${f2(r.price)}</td><td class="num"><b>${pctp(r.yield,2)}</b></td><td class="num">${r.cy!=null?f2(r.cy):'—'}</td>
     <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
-    <td class="num">${r.coupon!=null?f2(r.coupon):'—'}</td><td class="num">${ddm(r.mat)}<br><small class="mu">${(S.sf.toOffer&&r.yoff!=null?r.yoff:r.years).toFixed(1).replace('.',',')} г${S.sf.toOffer&&r.yoff!=null?' до оферты':''}</small></td>
-    <td class="num">${r.dur!=null?r.dur.toFixed(2).replace('.',','):'—'}</td><td class="num">${r.turn?short(r.turn):'—'}</td></tr>`).join('');
+    <td class="num">${r.coupon!=null?f2(r.coupon):'—'}</td><td class="l">${r.floating?'<span class="tag scr-fl-t" title="'+(r.fl_label&&r.fl_label!=='ФЛОАТЕР'?'Плавающий купон: '+esc(r.fl_label)+' (спред эмитента по последним купонам)':'Плавающий купон (привязан к ключевой ставке или RUONIA)')+'">'+esc(r.fl_label||'ФЛОАТЕР')+'</span>':'<span class="tag" title="Фиксированный купон">ФИКС</span>'}</td><td class="num">${ddm(r.mat)}<br><small class="mu">${(S.sf.toOffer&&r.yoff!=null?r.yoff:r.years).toFixed(1).replace('.',',')} г${S.sf.toOffer&&r.yoff!=null?' до оферты':''}</small></td>
+    <td class="num">${r.macdur!=null?r.macdur.toFixed(2).replace('.',','):'—'}</td><td class="l"><span class="tag liq liq-${r.liq||'L3'}" title="Ликвидность по обороту за день: L1 — верхние 20%, L2 — следующие 40%, L3 — остальные">${r.liq||'L3'}</span> <small class="mu num">${r.turn?short(r.turn):'—'}</small></td></tr>`).join('');
   $('#scr-cnt').textContent=`Найдено: ${rs.length}${rs.length>n?' · показано '+n:''}`;
   $('#scr-more').style.display=rs.length>n?'':'none';
 }
+S.scrTab='scr';S.mvDir='down';S.mvSort={k:'chg',d:0};S.mv=null;
+function scrTabs(){return`<div class="seg" id="scr-tabs" style="margin-bottom:12px"><button data-t="scr" class="${S.scrTab==='scr'?'on':''}">Скринер</button><button data-t="mv" class="${S.scrTab==='mv'?'on':''}">Лидеры</button></div>`}
+function loadMv(){api('/api/movers?n=50').then(j=>{S.mv=j;if(S.page==='scr')renderSoon()}).catch(e=>{S.mv={error:e.message,down:[],up:[]};if(S.page==='scr')renderSoon()})}
+function mvRows(){
+  const d=S.mv,rs=(S.mvDir==='down'?d.down:d.up).slice(),{k}=S.mvSort,dir=S.mvSort.d||(S.mvDir==='down'?1:-1);
+  rs.sort((a,b)=>{let x=a[k],y=b[k];if(k==='rating'){x=x?RSC.indexOf(x):99;y=y?RSC.indexOf(y):99}return dir*((x??-Infinity)-(y??-Infinity))});
+  return rs;
+}
+function drawMv(){
+  const d=S.mv,rs=mvRows(),cols=[['name','Инструмент','l'],['chg','За день, %'],['price','Цена, %'],['turnover','Оборот, ₽'],['trades','Сделок'],['rating','Рейтинг','l']],{k}=S.mvSort,dir=S.mvSort.d||(S.mvDir==='down'?1:-1);
+  $('#mv-head').innerHTML=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(dir>0?'↑':'↓'):''}</span></th>`).join('');
+  $('#mv-body').innerHTML=rs.map(r=>`<tr data-isin="${esc(r.isin)}"><td class="l"><b>${esc(r.name)}</b><br><small class="mu num">${isinTxt(r.isin)}</small></td><td class="num ${r.chg>0?'pos':'neg'}"><b>${r.chg>0?'+':''}${f2(r.chg)}</b></td><td class="num">${f2(r.price)}</td><td class="num">${r.turnover?short(r.turnover):'—'}</td><td class="num">${r.trades||'—'}</td>
+    <td class="l">${r.rating?`<span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}">${esc(r.rating)}</span>`:'<span class="mu">—</span>'}</td></tr>`).join('');
+}
+function pMv(){
+  if(!S.mv){loadMv();return`<div class="card">${waitBox('Загружаю лидеров роста и падения…')}</div>`}
+  if(S.mv.error)return`<div class="msg err">${esc(S.mv.error)}</div>`;
+  const d=S.mv;
+  return`<div class="card"><h2>Лидеры ${S.mvDir==='down'?'падения':'роста'}<span class="sp">${d.n} из ${d.total}</span></h2>
+    <div class="seg" id="mv-dir" style="margin-bottom:10px"><button data-d="down" class="${S.mvDir==='down'?'on':''}">Падение</button><button data-d="up" class="${S.mvDir==='up'?'on':''}">Рост</button></div>
+    <div class="tbl" style="max-height:calc(100vh - 300px)"><table><thead><tr id="mv-head"></tr></thead><tbody id="mv-body"></tbody></table></div></div>
+  <p class="note">Изменение цены облигации за торговый день по данным Мосбиржи (ISS). «${d.n} из ${d.total}» — показано выпусков из тех, цена которых сегодня изменилась. Не инвестиционная рекомендация.</p>`;
+}
+function bindMv(){
+  if(!S.mv||S.mv.error)return;
+  $('#mv-dir').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.mvDir=b.dataset.d;S.mvSort={k:'chg',d:0};render()};
+  $('#mv-head').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s,cur=S.mvSort.d||(S.mvDir==='down'?1:-1);S.mvSort={k,d:S.mvSort.k===k?-cur:(k==='name'||k==='rating'?1:-1)};drawMv()};
+  drawMv();
+}
 function pScr(){
+  if(S.scrTab==='mv')return scrTabs()+pMv();
+  return scrTabs()+pScr0();
+}
+function pScr0(){
   const d=S.scr;
   if(!d){loadScr();return`<div class="card">${waitBox('Загружаю торги облигациями с Мосбиржи и сопоставляю рейтинги…')}</div>`}
   if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="scr-r">Повторить</button></div>`;
@@ -15822,6 +19733,7 @@ function pScr(){
     <label class="field"><span>Спред к КБД от, п.п.</span><input class="in num" id="f-spmin" value="${esc(f.spmin)}" inputmode="decimal"></label>
     <label class="field"><span>До погашения, лет не более</span><input class="in num" id="f-tmax" value="${esc(f.tmax)}" inputmode="decimal"></label>
     <label class="field"><span>Ликвидность (оборот за день)</span><select class="in" id="f-turn">${opt('','любая',f.turn)}${opt('1','от 1 млн ₽',f.turn)}${opt('10','от 10 млн ₽',f.turn)}</select></label>
+    <label class="field"><span>Ликвидность не ниже</span><select class="in" id="f-liq">${opt('','любая',f.liq)}${opt('L2','L2',f.liq)}${opt('L1','L1',f.liq)}</select></label>
     <label class="field"><span>Купон</span><select class="in" id="f-fl">${opt('all','любой',f.fl)}${opt('fix','фиксированный',f.fl)}${opt('float','флоатер',f.fl)}</select></label>
     <label class="sw"><input type="checkbox" id="f-toff" ${f.toOffer?'checked':''}><i></i><div><b>Считать до оферты</b><small>срок — до ближайшей оферты или погашения</small></div></label>
     <label class="sw"><input type="checkbox" id="f-noffer" ${f.noOffer?'checked':''}><i></i><div><b>Без оферт</b></div></label>
@@ -15832,17 +19744,21 @@ function pScr(){
   <p class="note">Данные — Московская биржа (ISS, режимы торгов Т+ для корпоративных облигаций и ОФЗ; с задержкой, как в бесплатном доступе). Доходность — по цене последних торгов, спред — к кривой КБД при той же дюрации. Рейтинг найден у ${rated} из ${d.rows.length} выпусков: эмитенты без рейтинга в базе не обязательно ненадёжны. По умолчанию скрыты выпуски с доходностью выше 60% (обычно это дефолтные или почти не торгуемые бумаги) — поле «Доходность до» можно очистить. </p>${NIR_NOTE}`;
 }
 function bindScr(){
+  const tb=$('#scr-tabs');if(tb)tb.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===S.scrTab)return;S.scrTab=b.dataset.t;render()};
+  if(S.scrTab==='mv')return bindMv();
   if(!S.scr||S.scr.error){const b=$('#scr-r');if(b)b.onclick=()=>{S.scr=null;render()};return}
-  const map={'f-q':'q','f-cur':'cur','f-kind':'kind','f-sector':'sector','f-rmin':'rmin','f-ymin':'ymin','f-ymax':'ymax','f-spmin':'spmin','f-tmax':'tmax','f-turn':'turn','f-fl':'fl'};
+  const map={'f-q':'q','f-cur':'cur','f-kind':'kind','f-sector':'sector','f-rmin':'rmin','f-ymin':'ymin','f-ymax':'ymax','f-spmin':'spmin','f-tmax':'tmax','f-turn':'turn','f-fl':'fl','f-liq':'liq'};
   let to;Object.entries(map).forEach(([id,k])=>{const e=$('#'+id);if(!e)return;e.oninput=e.onchange=()=>{S.sf[k]=e.value;S.sn=150;clearTimeout(to);to=setTimeout(drawScr,150)}});
   $('#f-toff').onchange=e=>{S.sf.toOffer=e.target.checked;S.sn=150;drawScr()};
   $('#f-noffer').onchange=e=>{S.sf.noOffer=e.target.checked;S.sn=150;drawScr()};
-  $('#f-reset').onclick=()=>{S.sf={q:'',cur:'RUB',kind:'all',sector:'',rmin:'',rated:false,ymin:'',ymax:'60',tmax:'',turn:'',spmin:'',noOffer:false,toOffer:false,fl:'all'};render()};
+  $('#f-reset').onclick=()=>{S.sf={q:'',cur:'RUB',kind:'all',sector:'',rmin:'',rated:false,ymin:'',ymax:'60',tmax:'',turn:'',spmin:'',noOffer:false,toOffer:false,fl:'all',liq:''};render()};
   $('#scr-more').onclick=()=>{S.sn+=200;drawScr()};
   $('#scr-head').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;S.ssort={k,d:S.ssort.k===k?-S.ssort.d:(['name'].includes(k)?1:-1)};drawScr()};
   drawScr();
 }
 
+
+(()=>{const st=document.createElement('style');st.textContent=`.tag.liq-L1{background:#3ecf8e26;color:var(--pos)}.tag.liq-L2{background:#ffdd2d26}.tag.liq-L3{opacity:.7}.scr-fl-t{background:#3987e526}`;document.head.appendChild(st)})();
 /* ── Выплаты по дням (столбики с разбивкой по выпускам) ── */
 const colAt=i=>i<HEX.length?HEX[i]:`hsl(${(i*137.5)%360},55%,52%)`;
 function dayBars(el,o){
@@ -16559,6 +20475,7 @@ function pMkt(){
     ${termChips()}
     <div class="axt">Ставка, % годовых</div><div id="c-rates" class="chart"></div><div class="axt" style="text-align:center">Дата</div>
     <div class="strip" id="rstrip">${stripHtml(r,i0)}</div>${r.loading?'<p class="note">Догружаю историю…</p>':''}</div>
+  ${inflWeekHtml()}
   ${ratesXHtml()}
   <p class="note">КБД — кривая бескупонной доходности ОФЗ Московской биржи (выбранные сроки), ключевая ставка — Банка России. Данные берутся с сайтов Мосбиржи и ЦБ при открытой программе и сохраняются локально. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
@@ -16640,6 +20557,28 @@ function curveCard(cv,its){
 .rt-chip .rt-x{padding:5px 9px 5px 0;color:var(--mu)}.rt-chip .rt-x:hover{color:var(--neg)}
 .rt-add{display:inline-flex;gap:6px;margin-left:auto}.rt-add input{width:150px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--tx);padding:5px 8px;font-size:13px}
 `;document.head.appendChild(st)})();
+
+/* ── Недельная инфляция (Росстат): текущий и прошлый год против средней 2017–2021 ── */
+S.infl=null;
+function loadInfl(){if(S._inflL)return;S._inflL=1;api('/api/inflation_weekly').then(j=>{S._inflL=0;S.infl=j;if(S.page==='mkt'){renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadInfl()},6000)}}).catch(e=>{S._inflL=0;S.infl={error:e.message,empty:true,years:{},avg:[]}})}
+function inflWeekHtml(){
+  if(!S.infl){loadInfl();return`<div class="card rates">${waitBox('Загружаю недельную инфляцию Росстата…')}</div>`}
+  const x=S.infl,ys=Object.keys(x.years||{}).sort();
+  if((x.empty||!ys.length)&&x.loading)return`<div class="card rates"><h2>Недельная инфляция</h2>${waitBox('Собираю недельные оценки Росстата — в первый раз это занимает пару минут…')}</div>`;
+  if(x.empty||!ys.length)return`<div class="card rates"><h2>Недельная инфляция</h2><div class="empty">нет данных Росстата</div></div>`;
+  const cy=ys[ys.length-1],py=String(+cy-1),W=Array.from({length:52},(_,i)=>i+1);
+  const byW=y=>{const a=Array(52).fill(null);(x.years[y]||[]).forEach(r=>{if(r.week>=1&&r.week<=52)a[r.week-1]=r.pct});return a};
+  const av=Array(52).fill(null);(x.avg||[]).forEach(([w,v])=>{if(w>=1&&w<=52)av[w-1]=v});
+  const A='#ffdd2d',series=[{n:cy,c:A,hex:A,v:byW(cy),w:3}];
+  if(x.years[py])series.push({n:py,c:'#3987e5',hex:'#3987e5',v:byW(py),w:2});
+  if(av.some(v=>v!=null))series.push({n:'Среднее '+(x.avg_label||'2017–2021'),c:'#8d95a6',hex:'#8d95a6',v:av,w:2,dash:true});
+  const last=(x.years[cy]||[]).slice(-1)[0],f=v=>(+v).toFixed(2).replace('.',',')+'%';
+  chart('c-infl-w',line,{h:300,zero:true,labels:W.map(String),fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:f,series});
+  return`<div class="card rates"><h2>Недельная инфляция<span class="sp">${last?'последняя ('+ddm(last.date)+'): <b>'+f(last.pct)+'</b>':''}</span></h2>
+    <div class="legend rx-lg">${series.map(s=>`<span><i style="background:${s.hex}"></i>${esc(s.n)}</span>`).join('')}</div>
+    <div class="axt">Прирост цен за неделю, %</div><div id="c-infl-w" class="chart"></div><div class="axt" style="text-align:center">Номер недели года</div>
+    <p class="note">Росстат, оценка индекса потребительских цен за неделю (к предыдущей дате регистрации). Данные с ${x.history_from?esc(ddm(x.history_from)+' '+x.history_from.slice(0,4)):'—'}${(x.avg||[]).length?'; пунктир — среднее за '+esc(x.avg_label)+' по номеру недели':'; для среднего за 2017–2021 в архиве Росстата нет доступных заметок'}.${x.loading?' Историю ещё докачиваю…':''}</p></div>`;
+}
 /* ── Ребалансировка ── */
 S.reb={contrib:'',buyOnly:true,draft:null,tax:null};S.payDays=90;
 /* налог при продаже (маршрут /api/tax/reb): сначала продаём бумаги с убытком и с наступившей ЛДВ */
@@ -16795,13 +20734,17 @@ function bindPage(){
   if(S.page==='off')bindOff();
   if(S.page==='lad')bindLad();
   if(S.page==='iss')bindIss();
+  if(S.page==='dfl')bindDfl();
+  if(S.page==='flw')bindFlw();
   if(S.page==='cal')bindCal();
   if(S.page==='watch')bindWatch();
+  if(S.page==='stk')bindStk();
+  if(S.page==='sst')bindSst();
   if($('#pri-r'))$('#pri-r').onclick=()=>{S.pri=null;render()};
   if($('#pdays'))$('#pdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.payDays=+b.dataset.d;render()};
   if($('#rdays'))$('#rdays').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;S.ratesDays=+b.dataset.d;S.rates=null;render()};
   if($('#rt-ref'))$('#rt-ref').onclick=async e=>{e.currentTarget.disabled=true;try{await post('/api/ratings/refresh');S.bonds=await api('/api/bonds?'+new URLSearchParams({account:S.account}));render()}catch(x){}};
-  document.querySelectorAll('#view [data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));
+  document.querySelectorAll('#view [data-go]').forEach(b=>b.onclick=()=>{if(b.classList.contains('td-mv'))S.scrTab='mv';go(b.dataset.go)});
   const sortable=(id,key)=>{const t=$(id);if(t)t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;
     S[key]={k,d:S[key].k===k?-S[key].d:(['name','type','risk','maturity','next'].includes(k)?1:-1)};render()}};
   if(S.page==='pos'){sortable('#ptab','sort');const pt=$('#ptype');if(pt)pt.onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;S.posType=b.dataset.t;render()}}
@@ -16890,13 +20833,36 @@ function bcDocLinks(isin,inn,secid){
 }
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
 function bcKpi(k,v,s,cls){return`<div class="card"><div class="k">${k}</div><div class="v num ${cls||''}">${v}</div>${s?`<div class="s">${s}</div>`:''}</div>`}
+/* Раскрытие информации: сколько бумаг в рынке (по последнему купону, иначе по объёму выпуска) и последние факты с сервера данных */
+const BC_DISC_KIND={coupon_paid:'Купон выплачен',coupon_declared:'Ставка купона',default:'Неисполнение',buyback_result:'Итоги выкупа'};
+function bcOutLine(o){
+  if(!o||o.qty==null)return'';
+  const sh=o.share!=null?` (${Math.round(o.share*100)} % выпуска)`:'';
+  const src=o.doc_url?`<a href="${esc(o.doc_url)}" target="_blank" rel="noopener">источник ↗</a>`:'';
+  const M={coupon_explicit:'купону',coupon_derived:'купону (число бумаг выведено из суммы)',declared_derived:'объявлению о купоне (число бумаг выведено из суммы)'};
+  let how;
+  if(M[o.method])how=`по ${M[o.method]}${o.coupon_no?' №'+esc(String(o.coupon_no)):''}${o.as_of?' от '+ddm(o.as_of):''}`;
+  else how=o.method==='issue_placed'?'по размещённому объёму выпуска (Мосбиржа)':'по объёму выпуска (Мосбиржа)';
+  const bb=o.buybacks_after?` · с учётом выкупов после этой даты: ${o.buybacks_after}`:'';
+  return`<div class="bc-out"><b>В рынке:</b> <span class="num">${o.qty.toLocaleString('ru-RU')} шт.</span>${sh} · <span class="mu">${how}${bb}</span>${src?' · '+src:''}</div>`;
+}
+function bcDisclosure(dc){
+  if(!dc)return'';
+  const o=bcOutLine(dc.outstanding),fs=dc.facts||[];
+  if(!o&&!fs.length)return'';
+  let h=`<div class="card bc-sec"><h2>Раскрытие эмитента<span class="sp">сообщения на e-disclosure, разбор сервера данных</span></h2>${o}`;
+  if(fs.length)h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Данные</th><th></th></tr></thead><tbody>`
+    +fs.map(f=>`<tr><td class="l">${f.date?ddm(f.date):'—'}</td><td class="l">${esc(BC_DISC_KIND[f.kind]||f.label||f.kind)}</td><td class="l">${esc(f.text||'')}</td><td>${f.url?`<a href="${esc(f.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`).join('')+`</tbody></table></div>`;
+  else h+=`<div class="mu" style="font-size:13px">Раскрытий по выпуску пока нет (сервер данных не подключён или сообщений не найдено).</div>`;
+  return h+`</div>`;
+}
 function bcBody(c){
   const m=c.market,ci=c.catalog||{},d=c.desc||{},cur=(m&&m.cur||ci.currency||'RUB').toLowerCase();
   const sec=ci.sector?BC_SEC[ci.sector]||ci.sector:null;
   let h=`<div class="bc-h"><h1>${esc(c.name||c.isin)}</h1><div class="row2"><code>${esc(c.isin)}</code>`
     +(c.rating?ratingTag(c.rating):'<span class="tag">нет рейтинга</span>')
     +(sec?`<span class="tag">${esc(sec)}</span>`:'')
-    +(ci.floating?'<span class="tag">флоатер</span>':'')+(ci.amort||(d.AMORTBOND==='1')?'<span class="tag">амортизация</span>':'')
+    +(ci.floating?`<span class="tag"${c.fl_label&&c.fl_label!=='ФЛОАТЕР'?' title="Спред эмитента к базе по последним купонам"':''}>${c.fl_label&&c.fl_label!=='ФЛОАТЕР'?'флоатер · '+esc(c.fl_label):'флоатер'}</span>`:'')+(ci.amort||(d.AMORTBOND==='1')?'<span class="tag">амортизация</span>':'')
     +(ci.subordinated?'<span class="tag">субординированная</span>':'')+(ci.perpetual?'<span class="tag">бессрочная</span>':'')
     +`<a href="https://www.moex.com/ru/issue.aspx?code=${encodeURIComponent(c.isin)}" target="_blank" rel="noopener" style="margin-left:auto">Страница на Мосбирже ↗</a></div></div>`;
   if(c.errors&&c.errors.length)h+=`<div class="bc-warn">${c.errors.map(esc).join('<br>')}</div>`;
@@ -16930,6 +20896,7 @@ function bcBody(c){
     +ra.map(x=>`<tr><td>${esc(x.agency)}</td><td><span class="tag rt rt-${esc(rBucket(x.rating).split(' ')[0])}">${esc(x.rating)}</span></td><td>${x.outlook?esc(x.outlook):'<span class="mu">—</span>'}</td><td>${x.date?ddm(x.date):'<span class="mu">—</span>'}</td><td>${x.approx?'<span class="neg" title="'+esc(x.issuer||'')+'">по названию, приблизительно</span>':'точное'}</td></tr>`).join('')
     +`</tbody></table></div>`:'<div class="mu" style="font-size:13px">Рейтинги кредитных агентств не найдены</div>')+`</div>`;
   h+=`<div class="card bc-sec"><h2>Документы выпуска</h2>${bcDocLinks(c.isin,(c.docs||{}).inn||d.EMITTER_INN,(m&&m.id)||c.isin)}</div>`;
+  h+=bcDisclosure(c.disclosure);
   h+=`<div class="card bc-sec" id="bc-iss"><h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2><div class="mu" style="font-size:13px">Загружаю отчётность эмитента…</div></div>`;
   // денежный поток
   const fl=c.flows||[],lim=BC.all?fl.length:12;
@@ -18503,6 +22470,50 @@ function issIfrsBlock(ib){
     <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. LTM — последние 12 месяцев по квартальной отчётности (если новее годовой). Рост выручки считается по годовым данным. <a href="${esc(ib.url)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a> — данные агрегатора, могут отличаться от официальной отчётности.</p>`;
   return h;
 }
+/* ── Выплаты эмитента по месяцам: «Рублёвый эквивалент» (число бумаг в рынке x выплата на бумагу, по всем торгуемым выпускам) ── */
+const ISS_FL_CH=[['all','Все'],['coupon','Купоны'],['amort','Амортизации'],['redemption','Погашения'],['put','PUT'],['call','CALL']];
+const ISS_FL_T={all:['coupon','amort','redemption'],coupon:['coupon'],amort:['amort'],redemption:['redemption'],put:['put'],call:[]};
+const ISS_MN=['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
+const issPl=(n,a,b,c)=>{const m=n%100,d=n%10;return m>10&&m<20?c:d===1?a:d>1&&d<5?b:c};
+function loadIssFlows(inn,force){
+  const I=S.iss;I.fl=I.fl||{};if(I.fl[inn]&&!force)return;I.fl[inn]={loading:1};
+  api('/api/issuer_flows?inn='+encodeURIComponent(inn)).then(j=>{I.fl[inn]=j}).catch(e=>{I.fl[inn]={error:e.message||String(e)}})
+   .then(()=>{if(S.page==='iss')render()});
+}
+function issFlowsHtml(inn){
+  if(!inn)return'';
+  const I=S.iss;I.fl=I.fl||{};I.fchip=I.fchip||'all';
+  let h=`<h3 class="iss-h">Выплаты по выпускам эмитента</h3>`;
+  if(!I.fl[inn]){loadIssFlows(inn);return h+waitBox('Собираю графики выплат выпусков…')}
+  const d=I.fl[inn];
+  if(d.loading)return h+waitBox('Собираю графики выплат выпусков…');
+  if(d.error)return h+`<div class="msg err">${esc(d.error)}</div>`;
+  if(!d.bonds||!d.bonds.length)return h+`<div class="mu" style="font-size:13px">Нет торгуемых выпусков с известным графиком выплат.${(d.warnings||[]).length?'<br>'+d.warnings.slice(0,3).map(esc).join('<br>'):''}</div>`;
+  const t=d.totals||{},ft=v=>short(v)+' ₽';
+  h+=`<div class="iss-fl-h"><b>Рублёвый эквивалент</b><span class="mu">${d.n_months} ${issPl(d.n_months,'месяц','месяца','месяцев')} · ${d.dates} ${issPl(d.dates,'дата','даты','дат')} · выплаты ${ft(t.payments||0)} · возможный CALL ${ft(t.call||0)}</span></div>
+    <div class="iss-fl-chips" id="iss-fl-chips">${ISS_FL_CH.map(([k,n])=>`<button data-fc="${k}" class="${I.fchip===k?'on':''}">${n}</button>`).join('')}</div>
+    <div class="legend iss-fl-leg">${d.bonds.map((b,i)=>`<span title="${esc(b.isin)}"><i style="background:${PAL[i%PAL.length]}"></i>${esc(b.name)}</span>`).join('')}<span><i class="iss-hatch"></i>возможный CALL</span><span><i style="background:var(--s1);opacity:.5"></i>прогноз ставки</span></div>
+    <div id="iss-fl-ch" class="bc-ch"></div>`;
+  chart('iss-fl-ch',issFlowChart,{d,chip:I.fchip});
+  const est=d.bonds.filter(b=>/^issue_/.test(b.method||'')).length,w=d.warnings||[];
+  h+=`<p class="note" style="margin-top:6px">Число бумаг в рынке берётся из раскрытий эмитента (по последнему купону), а если их нет — из объёма выпуска Мосбиржи${est?` (так посчитано выпусков: ${est}, оценка может быть завышена из-за выкупов)`:''}. Прогноз — купоны флоатеров с ещё не объявленной ставкой. Выплаты после даты возможного CALL показаны как объявленные. Валютные выпуски пересчитаны по текущему курсу ЦБ.${w.length?` Не учтено: ${w.slice(0,3).map(esc).join('; ')}${w.length>3?' и ещё '+(w.length-3):''}.`:''}</p>`;
+  return h;
+}
+function issFlowChart(el,o){
+  const d=o.d,types=ISS_FL_T[o.chip]||[],showCall=o.chip==='all'||o.chip==='call',cols={},names={};
+  d.bonds.forEach((b,i)=>{cols[b.isin]=PAL[i%PAL.length];names[b.isin]=b.name});
+  const labels=d.months.map(m=>ISS_MN[+m.m.slice(5)-1]+(m.m.slice(5)==='01'||m===d.months[0]?' '+m.m.slice(2,4):''));
+  const months=d.months.map(m=>{
+    const segs=[];
+    d.bonds.forEach(b=>{
+      const v=types.reduce((a,t)=>a+((m.parts&&m.parts[t]&&m.parts[t][b.isin])||0),0);if(!v)return;
+      const e=types.includes('coupon')?Math.min((m.est_by_bond||{})[b.isin]||0,v):0;
+      if(v-e>0)segs.push({k:b.isin,v:v-e});if(e>0)segs.push({k:b.isin,v:e,est:true});
+    });
+    return{segs,call:showCall?m.call:0};
+  });
+  stackedMonths(el,{h:260,vl:true,labels,tipLabels:d.months.map(m=>ISS_MN[+m.m.slice(5)-1]+' '+m.m.slice(0,4)),months,colors:cols,names,fa:short,ft:v=>short(v)+' ₽',empty:'Нет выплат в выбранной категории'});
+}
 function issDetail(isin){
   const I=S.iss,c=I.cards[isin];
   const bar=`<div class="row" style="justify-content:flex-end"><button class="btn ghost" id="iss-close" style="padding:4px 12px;font-size:12px">Свернуть ✕</button></div>`;
@@ -18530,6 +22541,7 @@ function issDetail(isin){
       <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. EBIT здесь — прибыль до налогообложения плюс проценты к уплате (если строки нет — прибыль от продаж). Источник: бухгалтерская отчётность по РСБУ, ГИР БО ФНС (отчётность отдельной компании, не группы).</p>`;
   }
   }
+  h+=issFlowsHtml(is.inn);
   h+=`<h3 class="iss-h">Рынок и отчётность</h3><div class="bc-rel">`;
   if(m.key)h+=`<b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b><br>`;else h+=esc(m.text||'');
   const ms=c.basis==='ifrs'?ib.score:s;
@@ -18553,6 +22565,7 @@ function bindIss(){
     t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;I.sort={k,d:I.sort.k===k?-I.sort.d:(k==='name'?1:-1)};render()};
     t.querySelector('tbody').onclick=e=>{const r=e.target.closest('[data-iss]');if(!r)return;I.sel=I.sel===r.dataset.iss?null:r.dataset.iss;I.scroll=I.sel?1:0;render()};
   }
+  const fc=$('#iss-fl-chips');if(fc)fc.onclick=e=>{const b=e.target.closest('[data-fc]');if(!b)return;I.fchip=b.dataset.fc;render()};
   const rt=$('#iss-retry');if(rt)rt.onclick=()=>{I.data=null;render()};
   const rf=$('#iss-ref');if(rf)rf.onclick=()=>{I.data=null;I.cards={};loadIss(true);render()};
   const cl=$('#iss-close');if(cl)cl.onclick=()=>{I.sel=null;render()};
@@ -18992,6 +23005,8 @@ function kpSecurities(q){
     let n=0;for(const r of S.scr.rows){if(n>=8)break;const i=r.isin||r.id;if(seen.has(i))continue;
       const before=out.length;add(r.name,r.id,i,'каталог',openB(i));if(out.length>before)n++}
   }
+  if(typeof stkSearch==='function'&&q.length>=1)stkSearch(q,6).forEach(r=>{const k='stk:'+r.secid;if(seen.has(k))return;seen.add(k);
+    out.push({g:'Бумаги',t:r.shortname||r.secid,s:[r.secid,'акция · '+r.sector].join(' · '),sc:Math.max(kpScore(r.secid,q),kpScore(r.shortname,q),kpScore(r.name,q))-0.01,run:()=>openStock(r.secid)})});
   return out.sort((a,b)=>b.sc-a.sc).slice(0,12);
 }
 function kpBuild(raw){
@@ -19023,6 +23038,7 @@ function kpOpen(){
   const q=$('#kp-q');
   q.oninput=()=>{KP.items=kpBuild(q.value);KP.sel=0;kpDraw()};
   KP.items=kpBuild('');KP.sel=0;kpDraw();q.focus();
+  if(typeof stkEnsureList==='function')stkEnsureList(()=>{if(KP.open&&q.value.trim()){KP.items=kpBuild(q.value);KP.sel=0;kpDraw()}});
 }
 function kpClose(){KP.open=false;const o=$('#kp-ov');if(o)o.remove()}
 function kpRun(i){const it=KP.items[i];if(!it)return;kpClose();it.run()}
@@ -19348,7 +23364,7 @@ function renderKb(){
 /* ── Тарифы Free / Pro ──
    Тариф приходит из /api/auth/status (plan, pro_until). Без сервера данных, с общим ключом и на старом сервере всё доступно (plan='pro').
    Клиентские блокировки — это UX: код программы открыт и обходится правкой. Принудительно сервер проверяет Pro только для уведомлений в Telegram (402). */
-const PRO_PAGES=['scr','cmp','lad','sig','risk','mon','map'];
+const PRO_PAGES=['scr','cmp','lad','sig','risk','mon','map','dfl','flw'];
 const PRO_FEATURES={
  scr:{t:'Скринер облигаций',ic:'scr',b:['Фильтры по доходности, сроку, рейтингу и типу выпуска','Поиск выпусков под вашу цель за секунды','Сортировка по любому столбцу','Переход в карточку выпуска в один клик'],pv:'table'},
  cmp:{t:'Сравнение облигаций',ic:'cmp',b:['До нескольких выпусков рядом: доходность, дюрация, рейтинг, купон','Подсветка лучшего и худшего значения по каждому параметру','Оферты PUT и CALL, амортизация, оборот и НКД','Добавление из карточки выпуска кнопкой «Сравнить»'],pv:'table'},
@@ -19357,6 +23373,8 @@ const PRO_FEATURES={
  risk:{t:'Риски и сценарии',ic:'risk',b:['Что будет с портфелем при росте и снижении ставок','Концентрация по эмитентам, секторам и срокам','Стресс-сценарии и чувствительность цены','Кредитные риски по рейтингам'],pv:'chart'},
  mon:{t:'Мониторинг',ic:'mon',b:['Слежение за рейтингами, дефолтами и резкими движениями цен','Тревоги по вашим бумагам с объяснением','Расширение спреда и ликвидность: сколько дней на продажу','Уведомления в Telegram (тоже Pro)'],pv:'cards'},
  map:{t:'Карта рынка',ic:'map',b:['Все выпуски на одной карте: доходность против срока','Ваши бумаги на фоне рынка','Видно, какие выпуски дают больше при том же сроке','Переход в карточку выпуска с карты'],pv:'chart'},
+ dfl:{t:'Техдефолты',ic:'dfl',b:['Лента неисполненных обязательств эмитентов по сообщениям о раскрытии','Технический дефолт или дефолт, обязательство, сумма и дата исполнения','Фильтр по периоду и статусу','Ссылка на сообщение эмитента'],pv:'table'},
+ flw:{t:'Кто покупает',ic:'flw',b:['Куда идут деньги: акции, облигации, фонды и сектора','Крупные сделки и всплески объёма по ликвидным бумагам','Стакан с плотностями, дисбалансом и лентой сделок','Данные T-Invest в реальном времени или Мосбиржа с задержкой'],pv:'table'},
  offers:{t:'Сравнение по оферте',ic:'off',b:['Сравнение доходности к оферте и к погашению','Сравнение с доходностью похожих выпусков','Сроки и порядок подачи заявки','Кредитные риски эмитента рядом с расчётом'],pv:'cards'},
  taxfc:{t:'Прогноз налога на 31.12',ic:'tax',b:['Сколько налога будет удержано на конец года','Ожидаемые купоны и дивиденды до конца года','Убытки, которые уменьшают налоговую базу','Учёт ЛДВ и ставки 13 / 15 %'],pv:'table'},
  tg:{t:'Уведомления в Telegram',ic:'mon',b:['Тревоги мониторинга и списка наблюдения','Пут-оферты: новый купон, открытие приёма заявок, последние дни','Возможный колл по вашим бумагам','Приходят от @tanalyticbot, ничего настраивать не нужно'],pv:'cards'}
@@ -19546,6 +23564,9 @@ function todayCard(){
     if(d.alerts){const x=d.alerts;
       lines.push(tdLine('mon','<path d="M18 16v-5a6 6 0 0 0-12 0v5l-2 3h16z"/><path d="M10 21h4"/>',
         `Тревоги мониторинга: <b>${x.count}</b>${x.high?` <span class="neg">· ${x.high} ${obPl(x.high,'высокая','высокие','высоких')}</span>`:''}`,tdTag()));}
+    if(d.movers&&d.movers.items&&d.movers.items.length){const x=d.movers;
+      lines.push(`<div class="td-grp"><div class="mu td-more" style="margin:2px 0 0">Лидеры падения облигаций · оборот от ${M(x.min_turn,'rub',0)}</div>${x.items.map(o=>tdLine('scr','<path d="M3 7l6 6 4-4 8 8"/><path d="M15 17h6v-6"/>',
+        `<b>${esc(o.name||'')}</b> <small class="mu num">${esc(o.isin||'')}</small> · <b class="num neg">${f2(o.chg)} %</b>`,'','td-mv')).join('')}<div class="mu td-more">Полный список — в «Скринере», вкладка «Лидеры»</div></div>`);}
   }else if(t&&t.loading&&!lines.length)return`<div class="card td-card noprint"><h2>Сегодня</h2><div class="sk" style="height:46px;border-radius:10px"></div></div>`;
   if(!lines.length)return'';
   return`<div class="card td-card noprint"><h2>Сегодня<span class="sp">${new Date().toLocaleDateString('ru-RU',{day:'numeric',month:'long'})}</span>${t&&t.loading?'<span class="td-ld">обновляю…</span>':''}</h2>${lines.join('')}</div>`;
@@ -19624,6 +23645,574 @@ function demoSync(){
 }
 const _renderNavDemo=renderNav;
 renderNav=function(){_renderNavDemo.apply(this,arguments);demoBar();demoSync()};
+/* ── Акция: карточка с графиком, техническим анализом, мультипликаторами и дивидендами ──
+   Регистрация экранов stk и sst (меню, Pro, иконки) — здесь, чтобы не трогать общие списки. openStock(secid) — вход для других экранов. */
+IC.stk='<path d="M7 4v3M7 17v3M17 8v3M17 18v2"/><rect x="5" y="7" width="4" height="10" rx="1"/><rect x="15" y="11" width="4" height="7" rx="1"/>';
+IC.sst='<path d="M3 5h18l-7 8v6l-4-2v-4z"/>';
+PAGES.push(['stk','Акция'],['sst','Скринер акций']);
+NAV_GROUPS.splice(Math.max(0,NAV_GROUPS.findIndex(g=>g[0]==='Рынок')+1),0,['Акции',['stk','sst']]);
+PRO_PAGES.push('sst');
+PRO_FEATURES.sst={t:'Скринер акций',ic:'sst',b:['Акции Мосбиржи с P/E, P/B, EV/EBITDA, дивидендной доходностью и ростом','Готовые подборки: дешёвые по P/E, высокие дивиденды, быстрый рост','Фильтры по сектору, капитализации и показателям','Переход в карточку акции в один клик'],pv:'table'};
+
+S.stk={secid:null,tf:'D',card:null,cardTf:null,err:null,loading:false,ind:{s50:true,s200:true,bb:false,lv:true}};
+S.stkList=null;
+const stkN=(v,d=2)=>v==null||isNaN(v)?'—':(+v).toLocaleString('ru-RU',{minimumFractionDigits:d,maximumFractionDigits:d});
+const stkPrice=v=>v==null?'—':stkN(v,v>=100?2:v>=1?3:4);
+const stkPc=(v,d=2)=>v==null||isNaN(v)?'<span class="mu">—</span>':`<span class="${v>0?'pos':v<0?'neg':''}">${v>0?'+':v<0?'−':''}${stkN(Math.abs(v),d)} %</span>`;
+const stkCap=v=>{if(v==null||!isFinite(v))return'—';const a=Math.abs(v);return a>=1e12?stkN(v/1e12,2)+' трлн ₽':a>=1e9?stkN(v/1e9,1)+' млрд ₽':a>=1e6?stkN(v/1e6,1)+' млн ₽':stkN(v,0)+' ₽'};
+function stkEnsureList(cb){
+  if(S.stkList){cb&&cb();return}
+  if(S._stkListL){if(cb)(S._stkListCb=S._stkListCb||[]).push(cb);return}
+  S._stkListL=1;if(cb)S._stkListCb=[cb];
+  api('/api/stocks').then(j=>{S.stkList=(j.rows||[]).slice().sort((a,b)=>(b.value_today||0)-(a.value_today||0))}).catch(e=>{S.stkList=[]})
+   .then(()=>{S._stkListL=0;(S._stkListCb||[]).forEach(f=>{try{f()}catch(e){}});S._stkListCb=[]});
+}
+/* поиск по тикеру и названию: для строки поиска экрана и палитры Ctrl+K */
+function stkSearch(q,n){
+  const l=S.stkList||[];q=kpNorm(q).trim();if(!q)return l.slice(0,n||8);
+  const out=[];
+  for(const r of l){const sc=Math.max(r.secid.toLowerCase()===q?9:kpScore(r.secid,q),kpScore(r.shortname,q),kpScore(r.name,q)*.8);if(sc)out.push([sc,r])}
+  return out.sort((a,b)=>b[0]-a[0]).slice(0,n||8).map(x=>x[1]);
+}
+function openStock(secid){
+  secid=String(secid||'').trim().toUpperCase();if(!secid)return;
+  const st=S.stk;if(st.secid!==secid){st.secid=secid;st.card=null;st.err=null;st.cardTf=null}
+  go('stk');
+}
+function loadStk(force){
+  const st=S.stk,sec=st.secid,tf=st.tf;if(!sec||(st.loading&&!force))return;st.loading=true;st.err=null;
+  api('/api/stock?'+new URLSearchParams({secid:sec,tf})+(force?'&force=1':'')).then(j=>{
+    st.loading=false;if(st.secid!==sec||st.tf!==tf){loadStk();return}
+    st.card=j;st.cardTf=tf;if(S.page==='stk')renderSoon();
+  }).catch(e=>{st.loading=false;if(st.secid!==sec)return;st.err=e.message;if(S.page==='stk')renderSoon()});
+}
+function stkSearchBox(){
+  const tfs=[['D','День'],['W','Неделя'],['H','Час']];
+  return`<div class="card stk-top"><div class="stk-sw"><input class="in" id="stk-q" placeholder="Тикер или название: SBER, Сбербанк…" autocomplete="off" spellcheck="false" value=""><div id="stk-res" class="stk-res"></div></div>
+    ${S.stk.secid?`<div class="seg" id="stk-tf" title="Таймфрейм свечей">${tfs.map(([k,t])=>`<button data-t="${k}" class="${S.stk.tf===k?'on':''}">${t}</button>`).join('')}</div>`:''}</div>`;
+}
+function stkHome(){
+  const l=(S.stkList||[]).slice(0,16);
+  if(!S.stkList)stkEnsureList(()=>{if(S.page==='stk'&&!S.stk.secid)renderSoon()});
+  return`<div class="card"><h2>Самые торгуемые акции<span class="sp">по обороту за день</span></h2>${S.stkList?`<div class="stk-chips">${l.map(r=>`<button class="btn ghost" data-stk="${esc(r.secid)}"><b>${esc(r.secid)}</b> <span class="mu">${esc(r.shortname)}</span> ${stkPc(r.chg_d,1)}</button>`).join('')}</div>`:waitBox('Загружаю список акций…')}</div>
+    <p class="note">Введите тикер или название в поле выше (или нажмите Ctrl+K) — откроется карточка с графиком, техническим анализом, мультипликаторами и дивидендами.</p>`;
+}
+function stkLabel(tf){return tf==='H'?(t=>{const[d,h]=t.split(' ');return d.slice(8)+'.'+d.slice(5,7)+' '+(h||'')}):ddm}
+/* вспомогательные панели RSI и MACD под свечным графиком (та же сетка по X, что у candles) */
+function stkSub(el,o){
+  const W=el.clientWidth,H=o.h||110,pl=58,pr=10,pt=8,pb=18,n=o.labels.length;
+  if(n<2||W<80)return emptyChart(el,H,'');
+  const ph=H-pt-pb,pw=W-pl-pr,gw=pw/n,X=i=>pl+(i+.5)/n*pw;
+  let lo,hi,s='';
+  if(o.kind==='rsi'){lo=0;hi=100}
+  else{let mn=0,mx=0;[o.macd,o.sig,o.hist].forEach(a=>a.forEach(v=>{if(v!=null){mn=Math.min(mn,v);mx=Math.max(mx,v)}}));const p=Math.max(Math.abs(mn),Math.abs(mx),1e-9)*1.1;lo=-p;hi=p}
+  const Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
+  const ticks=o.kind==='rsi'?[30,50,70]:[lo/1.1,0,hi/1.1];
+  ticks.forEach(v=>{s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}"${o.kind==='rsi'&&v!==50?' stroke-dasharray="4 4"':''}/><text class="ax num" x="${pl-8}" y="${Y(v)+4}" text-anchor="end">${o.kind==='rsi'?v:stkN(v,Math.abs(v)<1?3:2)}</text>`});
+  const poly=(a,c,w)=>{const p=[];a.forEach((v,i)=>{if(v!=null)p.push(X(i).toFixed(1)+','+Y(v).toFixed(1))});return p.length>1?`<polyline points="${p.join(' ')}" fill="none" stroke="${c}" stroke-width="${w||1.5}" stroke-linejoin="round"/>`:''};
+  if(o.kind==='rsi')s+=poly(o.rsi,'#9085e9',1.6);
+  else{const bw=Math.max(1,Math.min(10,gw*.6));o.hist.forEach((v,i)=>{if(v==null)return;const y0=Y(0),y1=Y(v);s+=`<rect x="${X(i)-bw/2}" y="${Math.min(y0,y1)}" width="${bw}" height="${Math.max(1,Math.abs(y1-y0))}" fill="${v>=0?'var(--pos)':'var(--neg)'}" opacity=".55"/>`});
+    s+=poly(o.macd,'#3987e5',1.5)+poly(o.sig,'#d95926',1.3)}
+  s+=`<text class="ax" x="${pl+4}" y="${pt+9}" style="fill:var(--tx2)">${o.kind==='rsi'?'RSI (14)':'MACD (12, 26, 9)'}</text>`;
+  let hits='';for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${pl+gw*i}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
+  el.innerHTML=`<svg width="${W}" height="${H}">${s}<g class="hv"></g>${hits}</svg>`;
+  const hv=el.querySelector('.hv');
+  el._hl=i=>{hv.innerHTML=i<0?'':`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`};
+  bindTip(el,i=>`<b>${esc(o.labels[i])}</b>`+(o.kind==='rsi'?tipRow('#9085e9','RSI',stkN(o.rsi[i],1)):tipRow('#3987e5','MACD',stkN(o.macd[i],3))+tipRow('#d95926','Сигнальная',stkN(o.sig[i],3))+tipRow('var(--mu)','Гистограмма',stkN(o.hist[i],3))));
+}
+function stkTaCard(c){
+  const ta=c.ta||{},cls={'покупать':'pos','продавать':'neg'}[ta.signal]||'mu';
+  if(!ta.signal)return`<div class="card"><h2>Технический анализ</h2><div class="empty" style="padding:24px">${esc(ta.note||'Мало истории для расчёта индикаторов.')}</div></div>`;
+  const ic=v=>v>0?'<span class="pos">▲</span>':v<0?'<span class="neg">▼</span>':'<span class="mu">●</span>';
+  const lv=c.levels||{support:[],resistance:[]},L=(a,k)=>a.length?a.map(x=>`<span class="tag ${k}" title="касаний: ${x.touches}">${stkPrice(x.price)}</span>`).join(' '):'<span class="mu">—</span>';
+  return`<div class="card"><h2>Технический анализ<span class="sp">сводка по ${ta.votes.length} индикаторам</span></h2>
+    <div class="stk-verdict"><span class="stk-sig ${cls}">${esc(ta.signal)}</span><span class="mu">баланс голосов: ${ta.score>0?'+':''}${ta.score}</span></div>
+    <div class="stk-votes">${ta.votes.map(v=>`<div>${ic(v.vote)}<b>${esc(v.name)}</b><span class="mu">${esc(v.text)}</span></div>`).join('')}</div>
+    <div class="stk-lv"><div><span class="mu">Сопротивление</span> ${L(lv.resistance,'neg')}</div><div><span class="mu">Поддержка</span> ${L(lv.support,'pos')}</div></div>
+    <p class="note">Голосование: цена против SMA50 и SMA200, RSI (&lt; 30 — покупать, &gt; 70 — продавать), пересечение MACD, выход за полосы Боллинджера. Сумма ≥ +2 — «покупать», ≤ −2 — «продавать». Это формальный расчёт, а не рекомендация.</p></div>`;
+}
+function stkMulCard(c){
+  const m=c.multiples||{},x=(v,d=2,u='')=>v==null?'<span class="mu">—</span>':stkN(v,d)+u;
+  const src=m.source==='tinvest-server'?'T-Invest через сервер (TTM)':m.source==='tinvest'?'T-Invest (TTM)':'МСФО, smart-lab'+(m.period?' ('+(m.period==='LTM'?'последние 12 мес.':m.period+' год')+')':'');
+  const rows=[['P/E',x(m.pe,1),'цена к прибыли'],['P/B',x(m.pb),'цена к балансовой стоимости'],['EV/EBITDA',x(m.ev_ebitda,1),'стоимость бизнеса к EBITDA'],['ROE',x(m.roe,1,' %'),'рентабельность капитала'],
+    ['Чистый долг / EBITDA',x(m.nd_ebitda,2),''],['Рост выручки',m.rev_growth==null?'<span class="mu">—</span>':stkPc(m.rev_growth,1),'за год'],['Рост прибыли',m.ni_growth==null?'<span class="mu">—</span>':stkPc(m.ni_growth,1),'за год'],
+    ['Дивидендная доходность',x(m.div_yield==null?(c.dividends||{}).yield_ttm:m.div_yield,2,' %'),'за последние 12 месяцев']];
+  return`<div class="card"><h2>Мультипликаторы<span class="sp">${esc(src)}</span></h2><div class="tbl"><table><tbody>${rows.map(r=>`<tr><td class="l">${r[0]}${r[2]?`<br><small class="mu">${r[2]}</small>`:''}</td><td class="num"><b>${r[1]}</b></td></tr>`).join('')}</tbody></table></div>
+    ${c.token||m.source==='tinvest-server'?'':'<p class="note">Без токена T-Invest мультипликаторы считаются по отчётности МСФО с smart-lab; дивиденды и даты отчётности могут быть недоступны.</p>'}</div>`;
+}
+function stkDivCard(c){
+  const d=c.dividends||{items:[]};
+  const body=d.items.map(r=>`<tr class="${r.future?'pnew':''}"><td class="l">${ddm(r.record)}${r.future?' <small class="pos">будущая</small>':''}</td><td class="num">${r.payment?ddm(r.payment):'—'}</td><td class="num"><b>${stkN(r.value,r.value<1?4:2)} ${r.cur==='RUB'?'₽':esc(r.cur)}</b></td><td class="num">${r.yield_pct==null?'—':stkN(r.yield_pct,2)+' %'}</td></tr>`).join('');
+  return`<div class="card"><h2>Дивиденды<span class="sp">${d.yield_ttm!=null?'доходность за 12 мес.: '+stkN(d.yield_ttm,2)+' %':''}</span></h2>
+    ${d.items.length?`<div class="tbl" style="max-height:340px"><table><thead><tr><th class="l">Закрытие реестра</th><th>Выплата</th><th>На акцию</th><th>Доходность к цене</th></tr></thead><tbody>${body}</tbody></table></div>`
+      :`<div class="empty" style="padding:24px">Нет данных о дивидендах.${c.token?'':'<br><small class="mu">Мосбиржа не отдаёт историю бесплатно — подключите токен T-Invest.</small>'}</div>`}</div>`;
+}
+function stkRepCard(c){
+  const r=c.report||{};let v;
+  if(r.date){const dd=Math.ceil((new Date(r.date)-new Date(new Date().toISOString().slice(0,10)))/864e5);
+    v=`<div class="v num" style="font-size:22px;font-weight:700">${ddm(r.date)}</div><div class="s mu">${dd>0?'через '+dd+' дн.':dd===0?'сегодня':''}${r.year?' · отчёт за '+(r.num?r.num+' кв. ':'')+r.year:''}</div>`}
+  else v=`<div class="mu" style="padding:6px 0">${esc(r.note||'Дата неизвестна')}</div>`;
+  return`<div class="card"><h2>Следующая отчётность</h2>${v}</div>`;
+}
+function pStk(){
+  const st=S.stk,head=stkSearchBox();
+  if(!st.secid)return head+stkHome();
+  if(st.err)return head+`<div class="msg err">${esc(st.err)} <button class="btn ghost" id="stk-r">Повторить</button></div>`;
+  const c=st.card;
+  if(!c||c.secid!==st.secid||st.cardTf!==st.tf){loadStk();return head+`<div class="card">${waitBox('Загружаю '+esc(st.secid)+'…')}</div>`}
+  const q=c.quote,cs=c.candles,sr=c.series||{},ind=st.ind,lab=stkLabel(st.tf);
+  const lines=[];
+  if(ind.s50)lines.push({v:sr.sma50||[],c:'#f0b429',n:'SMA 50',w:1.5});
+  if(ind.s200)lines.push({v:sr.sma200||[],c:'#7a8cff',n:'SMA 200',w:1.5});
+  const lv=[];if(ind.lv&&c.levels)c.levels.resistance.forEach(x=>lv.push({p:x.price,kind:'r'})),c.levels.support.forEach(x=>lv.push({p:x.price,kind:'s'}));
+  chart('c-stk',(el,o)=>candles(el,cs,o),{h:380,lines,band:ind.bb?{up:sr.bb_up||[],low:sr.bb_low||[],c:'#7a8cff'}:null,levels:lv,labelOf:lab,fmt:stkPrice});
+  chart('c-stk-rsi',stkSub,{kind:'rsi',h:100,labels:cs.map(x=>lab(x.t)),rsi:sr.rsi||[]});
+  chart('c-stk-macd',stkSub,{kind:'macd',h:120,labels:cs.map(x=>lab(x.t)),macd:sr.macd||[],sig:sr.macd_signal||[],hist:sr.macd_hist||[]});
+  const tg=(id,t,on)=>`<label class="sw"><input type="checkbox" id="${id}" ${on?'checked':''}><i></i><div><b>${t}</b></div></label>`;
+  return head+`<div class="card stk-hd"><div><h1 class="stk-nm">${esc(q.shortname)} <span class="mu">${esc(q.secid)}</span></h1><div class="note">${esc(q.name)} · ${esc(q.sector)} · ${esc(q.isin)}</div></div>
+      <div class="stk-px"><span class="num">${stkPrice(q.price)} ₽</span> <span class="num">${stkPc(q.chg_d)}</span></div></div>
+    <div class="g g4">${kpi('За неделю',stkPc(q.chg_w,1),'5 торговых дней')}${kpi('За месяц',stkPc(q.chg_m,1),'21 торговый день')}${kpi('Капитализация',stkCap(q.cap),'лот: '+q.lot+' шт.')}${kpi('Оборот за день',stkCap(q.value_today),'Мосбиржа, TQBR')}</div>
+    <div class="card" style="margin-top:16px"><div class="row" style="margin-bottom:8px">${tg('stk-s50','SMA 50',ind.s50)}${tg('stk-s200','SMA 200',ind.s200)}${tg('stk-bb','Боллинджер',ind.bb)}${tg('stk-lv','Уровни',ind.lv)}
+        <button class="btn ghost" id="stk-r" style="margin-left:auto">Обновить</button></div>
+      <div id="c-stk" class="chart"></div><div id="c-stk-rsi" class="chart"></div><div id="c-stk-macd" class="chart"></div></div>
+    <div class="g g2" style="margin-top:16px">${stkTaCard(c)}${stkMulCard(c)}</div>
+    <div class="g c-2-1" style="margin-top:16px">${stkDivCard(c)}${stkRepCard(c)}</div>
+    <p class="note">Котировки — Московская биржа (ISS, с задержкой). Индикаторы считаются по ${esc(({D:'дневным',W:'недельным',H:'часовым'})[st.tf])} свечам. ${NIR_NOTE}</p>`;
+}
+function bindStk(){
+  const st=S.stk,q=$('#stk-q'),res=$('#stk-res');
+  const show=()=>{const l=stkSearch(q.value,8);res.innerHTML=q.value.trim()?l.map(r=>`<button data-stk="${esc(r.secid)}"><b>${esc(r.secid)}</b><span>${esc(r.shortname)}</span>${stkPc(r.chg_d,1)}</button>`).join('')||'<div class="kp-e">Не найдено</div>':''};
+  q.oninput=()=>stkEnsureList(show);
+  q.onkeydown=e=>{if(e.key==='Enter'){const v=q.value.trim();const l=stkSearch(v,1);openStock(l.length?l[0].secid:v)}else if(e.key==='Escape'){q.value='';res.innerHTML=''}};
+  stkEnsureList();
+  res.onclick=e=>{const b=e.target.closest('[data-stk]');if(b)openStock(b.dataset.stk)};
+  document.querySelectorAll('#view [data-stk]').forEach(b=>b.onclick=()=>openStock(b.dataset.stk));
+  const tf=$('#stk-tf');if(tf)tf.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===st.tf)return;st.tf=b.dataset.t;st.card=null;render()};
+  const r=$('#stk-r');if(r)r.onclick=()=>{st.err=null;st.card=null;st.loading=false;loadStk(true);render()};
+  [['stk-s50','s50'],['stk-s200','s200'],['stk-bb','bb'],['stk-lv','lv']].forEach(([id,k])=>{const e=$('#'+id);if(e)e.onchange=()=>{st.ind[k]=e.checked;render()}});
+}
+/* ── Скринер акций: подборки, фильтры, сортируемая таблица; клик по строке открывает карточку акции ── */
+S.sst=null;S.ssf={q:'',preset:'',sector:'',pemax:'',pbmax:'',dymin:'',gmin:'',capmin:''};S.sssort={k:'cap',d:-1};S.ssn=200;
+function loadSst(force){
+  if(S._sstL&&!force)return;S._sstL=1;
+  api('/api/stock_screener'+(force?'?force=1':'')).then(j=>{S._sstL=0;S.sst=j;if(S.page==='sst'){renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='sst')loadSst(false)},4000)}})
+   .catch(e=>{S._sstL=0;S.sst={error:e.message,rows:[],presets:[]};if(S.page==='sst')renderSoon()});
+}
+function sstRows(){
+  const f=S.ssf,q=f.q.trim().toLowerCase(),nv=x=>x===''||isNaN(parseFloat(String(x).replace(',','.')))?null:parseFloat(String(x).replace(',','.'));
+  const pemax=nv(f.pemax),pbmax=nv(f.pbmax),dymin=nv(f.dymin),gmin=nv(f.gmin),capmin=nv(f.capmin);
+  const rs=S.sst.rows.filter(r=>{
+    if(f.preset&&!(r.tags||[]).includes(f.preset))return false;
+    if(f.sector&&r.sector!==f.sector)return false;
+    if(q&&!(r.secid.toLowerCase().includes(q)||(r.name||'').toLowerCase().includes(q)||(r.shortname||'').toLowerCase().includes(q)))return false;
+    if(pemax!=null&&!(r.pe!=null&&r.pe>0&&r.pe<=pemax))return false;
+    if(pbmax!=null&&!(r.pb!=null&&r.pb>0&&r.pb<=pbmax))return false;
+    if(dymin!=null&&!(r.div_yield!=null&&r.div_yield>=dymin))return false;
+    if(gmin!=null&&!(r.rev_growth!=null&&r.rev_growth>=gmin))return false;
+    if(capmin!=null&&!(r.cap!=null&&r.cap>=capmin*1e9))return false;
+    return true;
+  });
+  const{k,d}=S.sssort;
+  rs.sort((a,b)=>{const x=a[k],y=b[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
+  return rs;
+}
+function drawSst(){
+  const rs=sstRows(),n=Math.min(rs.length,S.ssn),{k,d}=S.sssort;
+  const cols=[['secid','Акция','l'],['sector','Сектор','l'],['price','Цена, ₽'],['chg_d','День'],['chg_w','Неделя'],['chg_m','Месяц'],['cap','Капитализация'],['pe','P/E'],['pb','P/B'],['ev_ebitda','EV/EBITDA'],['div_yield','Дивиденды'],['rev_growth','Рост выручки'],['roe','ROE']];
+  $('#sst-head').innerHTML=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
+  const x=(v,dg=1)=>v==null?'<span class="mu">—</span>':stkN(v,dg),pc=(v)=>v==null?'<span class="mu">—</span>':stkPc(v,1);
+  $('#sst-body').innerHTML=rs.slice(0,n).map(r=>`<tr data-stk="${esc(r.secid)}" style="cursor:pointer" title="Открыть карточку"><td class="l"><b>${esc(r.shortname||r.secid)}</b><br><small class="mu">${esc(r.shortname?r.secid:'')}</small></td><td class="l"><small>${esc(r.sector)}</small></td>
+    <td class="num">${stkPrice(r.price)}</td><td class="num">${pc(r.chg_d)}</td><td class="num">${pc(r.chg_w)}</td><td class="num">${pc(r.chg_m)}</td><td class="num">${stkCap(r.cap)}</td>
+    <td class="num ${r.pe!=null&&r.pe_sector&&r.pe>0&&r.pe<r.pe_sector?'pos':''}" title="${r.pe_sector?'медиана сектора: '+stkN(r.pe_sector,1):''}">${r.pe!=null&&r.pe>0?stkN(r.pe,1):'<span class="mu">—</span>'}</td>
+    <td class="num">${r.pb!=null&&r.pb>0?stkN(r.pb,2):'<span class="mu">—</span>'}</td><td class="num">${r.ev_ebitda!=null&&r.ev_ebitda>0?stkN(r.ev_ebitda,1):'<span class="mu">—</span>'}</td>
+    <td class="num">${r.div_yield==null?'<span class="mu">—</span>':'<b>'+stkN(r.div_yield,1)+' %</b>'}</td><td class="num">${pc(r.rev_growth)}</td><td class="num">${r.roe==null?'<span class="mu">—</span>':stkN(r.roe,1)+' %'}</td></tr>`).join('')||`<tr><td colspan="13" class="empty">Ничего не найдено — ослабьте фильтры</td></tr>`;
+  $('#sst-cnt').textContent=`Найдено: ${rs.length}${rs.length>n?' · показано '+n:''}`;
+  $('#sst-more').style.display=rs.length>n?'':'none';
+}
+function pSst(){
+  const d=S.sst;
+  if(!d){loadSst();return`<div class="card">${waitBox('Загружаю акции Мосбиржи и показатели…')}</div>`}
+  if(d.error&&!d.rows.length&&!d.loading)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="sst-r">Повторить</button></div>`;
+  if(!d.rows.length){
+    const p=d.progress||{};
+    return`<div class="card">${waitBox('Считаю мультипликаторы по отчётности МСФО'+(p.total?` — ${p.done} из ${p.total}`:'')+'. Первый расчёт без токена T-Invest занимает несколько минут, потом результат хранится сутки.')}</div>`;
+  }
+  const f=S.ssf,fld=(id,t,v)=>`<label class="field"><span>${t}</span><input class="in num" id="${id}" value="${esc(v)}" inputmode="decimal"></label>`;
+  const presets=[{id:'',name:'Все акции',hint:''}].concat(d.presets||[]);
+  const src=d.source==='tinvest-server'?'Данные T-Invest (через сервер), TTM.':d.source==='tinvest'?'Показатели — T-Invest API (TTM).':'Показатели рассчитаны по отчётности МСФО (smart-lab) и капитализации Мосбиржи; дивидендная доходность без токена T-Invest недоступна.';
+  return`<div class="card"><h2>Подбор акций<span class="sp" id="sst-cnt"></span></h2>
+    <div class="seg" id="sst-pre" style="margin-bottom:12px">${presets.map(p=>`<button data-p="${esc(p.id)}" class="${f.preset===p.id?'on':''}" title="${esc(p.hint||'')}">${esc(p.name)}</button>`).join('')}</div>
+    <div class="flt"><label class="field"><span>Поиск</span><input class="in" id="ss-q" value="${esc(f.q)}" placeholder="тикер или название"></label>
+      <label class="field"><span>Сектор</span><select class="in" id="ss-sector"><option value="">любой</option>${(d.sectors||[]).map(x=>`<option value="${esc(x)}" ${f.sector===x?'selected':''}>${esc(x)}</option>`).join('')}</select></label>
+      ${fld('ss-pemax','P/E не больше',f.pemax)}${fld('ss-pbmax','P/B не больше',f.pbmax)}${fld('ss-dymin','Дивиденды от, %',f.dymin)}${fld('ss-gmin','Рост выручки от, %',f.gmin)}${fld('ss-capmin','Капитализация от, млрд ₽',f.capmin)}
+      <button class="btn ghost" id="ss-reset">Сбросить</button><button class="btn ghost" id="sst-r">Обновить</button></div>
+    ${d.loading?`<p class="note">Показатели обновляются в фоне…</p>`:''}
+    <div class="tbl" style="max-height:calc(100vh - 340px)"><table><thead><tr id="sst-head"></tr></thead><tbody id="sst-body"></tbody></table></div>
+    <div class="row" style="margin-top:12px"><button class="btn ghost" id="sst-more">Показать ещё</button></div></div>
+  <p class="note">${esc(src)} «Дешёвые по P/E» — P/E больше 0 и ниже медианы сектора. Сектор — по справочнику программы и T-Invest. ${NIR_NOTE}</p>`;
+}
+function bindSst(){
+  const r=$('#sst-r');if(r)r.onclick=()=>{S.sst=null;S._sstL=0;loadSst(true);render()};
+  if(!S.sst||!S.sst.rows.length)return;
+  const map={'ss-q':'q','ss-sector':'sector','ss-pemax':'pemax','ss-pbmax':'pbmax','ss-dymin':'dymin','ss-gmin':'gmin','ss-capmin':'capmin'};
+  let to;for(const[id,k]of Object.entries(map)){const e=$('#'+id);if(e)e.oninput=e.onchange=()=>{S.ssf[k]=e.value;S.ssn=200;clearTimeout(to);to=setTimeout(drawSst,120)}}
+  $('#sst-pre').onclick=e=>{const b=e.target.closest('[data-p]');if(!b)return;S.ssf.preset=b.dataset.p;S.ssn=200;$('#sst-pre').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));drawSst()};
+  $('#ss-reset').onclick=()=>{S.ssf={q:'',preset:'',sector:'',pemax:'',pbmax:'',dymin:'',gmin:'',capmin:''};render()};
+  $('#sst-head').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;S.sssort={k,d:S.sssort.k===k?-S.sssort.d:(['secid','sector'].includes(k)?1:-1)};drawSst()};
+  $('#sst-body').onclick=e=>{const t=e.target.closest('[data-stk]');if(t)openStock(t.dataset.stk)};
+  $('#sst-more').onclick=()=>{S.ssn+=200;drawSst()};
+  drawSst();
+}
+/* ── Тепловая карта рынка: squarified treemap (акции / облигации / фонды) ── */
+const HM_KINDS=[['stocks','Акции'],['bonds','Облигации'],['funds','Фонды']],HM_PER=[['d','День'],['w','Неделя'],['m','Месяц']],HM_SZ=[['cap','Капитализация'],['value','Оборот']];
+const HM_LIM={d:3,w:7,m:15};
+S.hm={kind:'stocks',period:'d',size:'cap',d:null,loading:'',err:null};
+/* Раскладка squarified — зеркало Python treemap_layout (13u_heatmap.py); менять обе реализации синхронно. */
+function hmSquarify(vals,x,y,w,h){
+  const n=vals.length,out=vals.map(()=>[x,y,0,0]);
+  const idx=[];vals.forEach((v,i)=>{if(v>0)idx.push(i)});idx.sort((a,b)=>vals[b]-vals[a]);
+  const tot=idx.reduce((a,i)=>a+vals[i],0);if(!idx.length||tot<=0||w<=0||h<=0)return out;
+  const k=w*h/tot,ar=idx.map(i=>vals[i]*k),sum=r=>r.reduce((a,b)=>a+b,0);
+  const worst=(r,s)=>{const t=sum(r);return Math.max(s*s*Math.max(...r)/(t*t),t*t/(s*s*Math.min(...r)))};
+  let cx=x,cy=y,cw=w,ch=h,pos=0;
+  while(pos<ar.length){
+    const side=Math.min(cw,ch),row=[ar[pos]];let j=pos+1;
+    while(j<ar.length&&worst(row.concat(ar[j]),side)<=worst(row,side)){row.push(ar[j]);j++}
+    const s=sum(row);
+    if(cw>=ch){const colw=s/ch;let yy=cy;row.forEach((a,t)=>{const hh=a/colw;out[idx[pos+t]]=[cx,yy,colw,hh];yy+=hh});cx+=colw;cw-=colw}
+    else{const rh=s/cw;let xx=cx;row.forEach((a,t)=>{const ww=a/rh;out[idx[pos+t]]=[xx,cy,ww,rh];xx+=ww});cy+=rh;ch-=rh}
+    pos=j;
+  }
+  return out;
+}
+function hmKey(){const f=S.hm;return f.kind+'|'+f.period+'|'+f.size}
+function hmTrading(){const d=new Date(Date.now()+3*36e5),w=d.getUTCDay(),h=d.getUTCHours();return w>=1&&w<=5&&h>=7&&h<24}
+function hmLoad(){
+  const f=S.hm,key=hmKey();if(f.loading===key)return;f.loading=key;
+  api('/api/heatmap?'+new URLSearchParams({kind:f.kind,period:f.period,size:f.size})).then(j=>{
+    if(f.loading===key)f.loading='';if(hmKey()!==key)return;j._k=key;f.d=j;f.err=null;if(S.page==='hm')renderSoon()
+  }).catch(e=>{if(f.loading===key)f.loading='';f.err=e.message;if(S.page==='hm')renderSoon()});
+}
+function hmColor(chg,lim){
+  const t=Math.max(-1,Math.min(1,(chg||0)/lim)),lt=document.documentElement.dataset.theme==='light';
+  const n=lt?[226,229,236]:[52,58,71],g=lt?[46,170,112]:[31,160,104],r=lt?[222,84,84]:[214,68,68],e=t>=0?g:r,a=Math.abs(t);
+  return`rgb(${n.map((c,i)=>Math.round(c+(e[i]-c)*a)).join(',')})`;
+}
+function hmFmt(c){return c==null?'—':(c>0?'+':c<0?'−':'')+Math.abs(c).toFixed(2).replace('.',',')+' %'}
+function drawHm(el){
+  const f=S.hm,d=f.d;if(!d||d._k!==hmKey())return;
+  const W=Math.floor(el.clientWidth);if(W<50)return;
+  if(d.error||!d.groups||!d.groups.length){el.innerHTML=`<div class="empty" style="padding:40px">${esc(d.error||'Нет данных для карты')}</div>`;return}
+  const H=W<560?Math.round(W*1.35):Math.max(460,Math.min(720,Math.round(W*.52))),lim=HM_LIM[d.period]||3,tiles=[];
+  const gr=hmSquarify(d.groups.map(g=>g.size),0,0,W,H);let s='';
+  d.groups.forEach((g,gi)=>{
+    const [gx,gy,gw,gh]=gr[gi];if(gw<1||gh<1)return;
+    const hd=gw>=56&&gh>=44?16:0,ix=gx+1,iy=gy+1+hd,iw=gw-2,ih=gh-2-hd;
+    s+=`<rect class="hm-g" x="${gx.toFixed(1)}" y="${gy.toFixed(1)}" width="${gw.toFixed(1)}" height="${gh.toFixed(1)}"/>`;
+    if(hd){const mc=Math.max(3,Math.floor((gw-8)/6.4));s+=`<text class="hm-gl" x="${(gx+5).toFixed(1)}" y="${(gy+12).toFixed(1)}">${esc(g.name.length>mc?g.name.slice(0,mc-1)+'…':g.name)}</text>`}
+    if(iw<2||ih<2)return;
+    const ir=hmSquarify(g.items.map(i=>i.size),ix,iy,iw,ih);
+    g.items.forEach((it,k)=>{
+      const [x,y,w,h]=ir[k];if(w<.8||h<.8)return;
+      const ti=tiles.length;tiles.push(it);
+      let txt='';
+      if(w>=30&&h>=20){
+        const lb=String(it.label||it.id),fs=Math.max(8,Math.min(24,w/(lb.length*.62+.6),h*.38));
+        if(fs>=8.5){const two=h>=fs*2.5&&w>=40;
+          txt=`<text class="hm-l" x="${(x+w/2).toFixed(1)}" y="${(y+h/2+(two?-fs*.1:fs*.35)).toFixed(1)}" font-size="${fs.toFixed(1)}" text-anchor="middle">${esc(lb.length*fs*.62>w?lb.slice(0,Math.max(2,Math.floor(w/(fs*.62))-1))+'…':lb)}</text>`;
+          if(two){const fp=Math.max(8,fs*.75);txt+=`<text class="hm-p" x="${(x+w/2).toFixed(1)}" y="${(y+h/2+fs*.1+fp).toFixed(1)}" font-size="${fp.toFixed(1)}" text-anchor="middle">${hmFmt(it.chg).replace(' %','%')}</text>`}}
+      }
+      s+=`<g data-i="${ti}" class="hm-t"><rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(0,w-1).toFixed(1)}" height="${Math.max(0,h-1).toFixed(1)}" fill="${hmColor(it.chg,lim)}"/>${txt}</g>`;
+    });
+  });
+  el.innerHTML=`<svg class="hm-svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${s}</svg>`;
+  el.onmousemove=e=>{const t=e.target.closest('[data-i]');if(!t||!el.contains(t)){hideTip();return}
+    const it=tiles[+t.dataset.i];if(!it)return;const c=hmColor(it.chg,lim),bd=d.kind==='bonds';
+    showTip(`<b>${esc(it.name||it.label)}</b><div style="color:var(--mu)">${esc(bd?(it.rating||'без рейтинга'):it.id)}</div>`+
+      tipRow(c,'Цена',it.price!=null?(f2(it.price)+(bd?' %':' ₽')):'—')+tipRow(c,d.period==='d'?'За день':d.period==='w'?'За неделю':'За месяц',hmFmt(it.chg))+
+      (bd&&it.yield!=null?tipRow(c,'Доходность',pctp(it.yield,2)):'')+tipRow(c,'Оборот за день',it.value?short(it.value)+' ₽':'—')+(it.cap?tipRow(c,'Капитализация',short(it.cap)+' ₽'):'')+
+      '<div style="color:var(--mu);margin-top:5px">нажмите — карточка</div>',e)};
+  el.onmouseleave=hideTip;
+  el.onclick=e=>{const t=e.target.closest('[data-i]');if(!t)return;const it=tiles[+t.dataset.i];if(!it)return;
+    if(d.kind==='bonds'){if(typeof openBond==='function')openBond(it.id)}else if(typeof openStock==='function')openStock(it.id)};
+}
+function pHeatmap(){
+  const f=S.hm,d=f.d,ok=d&&d._k===hmKey(),bd=f.kind==='bonds',lim=HM_LIM[bd?'d':f.period];
+  if(!ok)hmLoad();
+  chart('hm-map',drawHm);chart('hm-root',bindHm);
+  const seg=(arr,cur,attr)=>arr.map(([k,t])=>`<button type="button" data-${attr}="${k}" class="${k===cur?'on':''}">${t}</button>`).join('');
+  const st=ok&&d.stats,leg=[-lim,-lim/2,0,lim/2,lim];
+  return`<div id="hm-root"><div class="card"><h2>Тепловая карта рынка<span class="sp">${bd?'размер — оборот за день, цвет — изменение цены за день':'размер и цвет плиток — по выбранным параметрам'}</span></h2>
+    <div class="hm-bar"><div class="mp-chips" id="hm-kind">${seg(HM_KINDS,f.kind,'k')}</div>
+    ${bd?'':`<div class="mp-chips" id="hm-per">${seg(HM_PER,f.period,'p')}</div><div class="mp-chips" id="hm-sz">${seg(HM_SZ,f.size,'s')}</div>`}</div>
+    ${st?`<div class="hm-st"><span>Растут: <b class="pos">${st.up}</b></span><span>Падают: <b class="neg">${st.down}</b></span><span>Без изм.: <b>${st.flat}</b></span><span>Оборот: <b>${short(st.turnover)} ₽</b></span><span>Взвешенное изменение: <b class="${st.wchg>0?'pos':st.wchg<0?'neg':''}">${hmFmt(st.wchg)}</b></span></div>`:''}
+    ${f.err&&!ok?`<div class="msg err">${esc(f.err)} <button class="btn ghost" id="hm-r">Повторить</button></div>`:ok?'<div class="hm-wrap" id="hm-map"></div>':waitBox('Загружаю данные Мосбиржи…')}
+    <div class="legend hm-leg">${leg.map(v=>`<span><i style="background:${hmColor(v,lim)}"></i>${v>0?'+':v<0?'−':''}${(+Math.abs(v).toFixed(1))}%</span>`).join('')}<span class="mu">цвет ограничен значением ±${lim}%${ok&&d.updated?' · обновлено '+new Date(d.updated*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}):''}</span></div></div></div>`;
+}
+function bindHm(){
+  const f=S.hm,pick=(id,attr,key)=>{const e=$(id);if(e)e.onclick=ev=>{const b=ev.target.closest('[data-'+attr+']');if(!b||b.dataset[attr]===f[key])return;f[key]=b.dataset[attr];f.d=null;f.err=null;render()}};
+  pick('#hm-kind','k','kind');pick('#hm-per','p','period');pick('#hm-sz','s','size');
+  const r=$('#hm-r');if(r)r.onclick=()=>{f.err=null;render()};
+  if(!window._hmTm){window._hmTm=setInterval(()=>{if(S.page==='hm'&&!document.hidden&&hmTrading())hmLoad()},60000)}
+}
+/* ── Техдефолты: лента неисполненных обязательств эмитентов (сообщения раскрытия, сервер данных) + флаги Мосбиржи по бумагам портфеля ── */
+S.dfl={days:30,status:'all',data:null,loading:false,key:null};
+const DFL_ST={technical:['Технический дефолт','dfl-t'],default:['Дефолт','dfl-d']};
+function loadDfl(force){
+  const D=S.dfl,key=D.days+'|'+S.account;if(D.loading)return;D.loading=true;
+  const p=new URLSearchParams({days:D.days,account:S.account});if(force)p.set('force','1');
+  api('/api/defaults?'+p).then(j=>{D.data=j;D.key=key}).catch(e=>{D.data={error:e.message||String(e),rows:[]};D.key=key})
+   .then(()=>{D.loading=false;if(S.page==='dfl')render()});
+}
+function pDfl(){
+  const D=S.dfl,key=D.days+'|'+S.account;
+  let h=`<div class="card"><h2>Техдефолты<span class="sp">неисполненные в срок обязательства по облигациям</span></h2>
+    <div class="dfl-bar"><div class="seg" id="dfl-days">${[[7,'7 дней'],[30,'30 дней'],[90,'90 дней']].map(([n,t])=>`<button data-d="${n}" class="${D.days===n?'on':''}">${t}</button>`).join('')}</div>
+    <div class="seg" id="dfl-st">${[['all','Все'],['technical','Технический дефолт'],['default','Дефолт']].map(([k,t])=>`<button data-st="${k}" class="${D.status===k?'on':''}">${t}</button>`).join('')}</div></div>`;
+  if(D.key!==key&&!D.loading){D.data=null;loadDfl()}
+  if(!D.data||D.key!==key)return h+waitBox('Загружаю ленту…')+`</div>`;
+  const d=D.data;
+  if(d.error)return h+`<div class="msg err">${esc(d.error)}</div></div>`;
+  const rows=(d.rows||[]).filter(r=>D.status==='all'||r.status===D.status);
+  if(!d.configured)h+=`<div class="msg" style="margin:10px 0">Сервер данных не подключён: сообщения эмитентов недоступны. Ниже только флаги Мосбиржи по бумагам портфеля и списка наблюдения. Подключить сервер можно в настройках.</div>`;
+  if(!rows.length)return h+`<div class="empty" style="padding:28px 12px">${d.configured?'За выбранный период неисполненных обязательств не найдено.':'Нет данных для показа.'}</div></div>`;
+  h+=`<div class="tbl dfl-wrap"><table id="dfl-tab"><thead><tr><th class="l">Дата</th><th class="l">Статус</th><th class="l">Эмитент · бумага</th><th class="l">Обязательство</th><th>Сумма</th><th class="l">Исполнение</th><th class="l">Основание</th></tr></thead><tbody>`
+    +rows.map(r=>{const st=DFL_ST[r.status]||DFL_ST.technical;
+      return`<tr${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l">${r.date?ddm(r.date):'—'}</td><td class="l"><span class="dfl-b ${st[1]}">${st[0]}</span></td>
+        <td class="l dfl-is"><b>${esc(r.issuer||'—')}</b><br><small class="mu num">${r.isin?esc(r.isin):''}${r.isin&&r.inn?' · ':''}${r.inn?'ИНН '+esc(r.inn):''}</small></td>
+        <td class="l">${esc(r.obligation||'—')}${r.due_date?`<br><small class="mu">срок ${ddm(r.due_date)}</small>`:''}</td><td class="num">${r.amount==null?'—':short(r.amount)+' ₽'}</td>
+        <td class="l">${r.executed?`<span class="pos">исполнено ${ddm(r.executed)}</span>`:'<span class="mu">нет данных</span>'}</td>
+        <td class="l dfl-bs">${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
+  return h+`<p class="note" style="margin-top:10px">Технический дефолт — просрочка платежа до 10 рабочих дней, затем дефолт. «Исполнение» подбирается по раскрытию о выплате: для купона — с тем же номером, для амортизации и погашения — по выплате того же вида после срока. Справочная информация, не инвестиционная рекомендация. <button class="btn ghost" id="dfl-ref" style="padding:3px 10px;font-size:12px;margin-left:6px">Обновить</button></p></div>`;
+}
+function bindDfl(){
+  const D=S.dfl,d=$('#dfl-days'),s=$('#dfl-st'),r=$('#dfl-ref');
+  if(d)d.onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;D.days=+b.dataset.d;D.data=null;render()};
+  if(s)s.onclick=e=>{const b=e.target.closest('[data-st]');if(!b)return;D.status=b.dataset.st;render()};
+  if(r)r.onclick=()=>{D.data=null;D.key=null;loadDfl(true);render()};
+}
+/* ── «Кто покупает»: потоки денег по классам и секторам, крупные сделки, всплески объёма, стакан (сервер данных, /api/flows*) ── */
+S.flw={period:'1h',tab:'flow',data:null,key:null,loading:false,large:{cls:'',min:0,data:null,key:null,loading:false},
+  spikes:{data:null,loading:false,key:null},book:{secid:'SBER',depth:20,data:null,err:'',busy:false,list:null,inst:null}};
+const FLW_CLS={share:'Акции',bond:'Облигации',fund:'Фонды'};
+const FLW_SRC={tinvest:'T-Invest, реальное время',iss:'Мосбиржа, задержка 15 мин'};
+let _flwTimer=null;
+const flwMsk=(ts,full)=>{try{return new Date(ts*1000).toLocaleString('ru-RU',Object.assign({timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit'},full?{second:'2-digit'}:{day:'2-digit',month:'2-digit'}))}catch(e){return''}};
+const flwRub=n=>bad(n)?'—':short(n)+' ₽';
+const flwNet=n=>`<span class="${n>0?'pos':n<0?'neg':'mu'}">${n>0?'+':''}${flwRub(n)}</span>`;
+const flwSide=s=>s==='buy'?'<span class="flw-b buy">покупка</span>':'<span class="flw-b sell">продажа</span>';
+const flwPx=p=>bad(p)?'—':(+p).toLocaleString('ru-RU',{maximumFractionDigits:4});
+function flwSrcLine(d){
+  if(!d||!d.source)return'';
+  return`<span class="flw-src ${d.source==='tinvest'?'live':'delay'}" title="Источник сделок">${FLW_SRC[d.source]||esc(d.source)}</span>`;
+}
+function flwOpen(secid,cls,isin){
+  if(cls==='share'&&typeof openStock==='function')openStock(secid);
+  else if(cls==='bond'&&isin&&typeof openBond==='function')openBond(isin);
+  else{S.flw.tab='book';S.flw.book.secid=secid;S.flw.book.data=null;render()}
+}
+function flwEmpty(d){
+  return`<div class="empty" style="padding:28px 12px">${d&&d.configured===false?'Сервер данных не подключён: потоки денег считаются на сервере. Подключите сервер в «Настройках» (раздел «Сервер данных»).':'Данных пока нет: сборщик ещё накапливает сделки (в нерабочее время биржи данных нет).'}</div>`;
+}
+/* ── потоки ── */
+function loadFlw(force){
+  const D=S.flw,key=D.period;if(D.loading)return;D.loading=true;
+  api('/api/flows?'+new URLSearchParams({period:D.period,force:force?1:''})).then(j=>{D.data=j;D.key=key}).catch(e=>{D.data={error:e.message||String(e)};D.key=key})
+    .then(()=>{D.loading=false;if(S.page==='flw'&&S.flw.tab==='flow')render()});
+}
+function flwBars(rows,keyF,nameF){
+  const mx=Math.max(1,...rows.map(r=>Math.abs(r.net)));
+  return rows.map(r=>`<div class="flw-sr"><span class="flw-sn">${esc(nameF(r))}</span><div class="flw-sb"><i class="${r.net>=0?'p':'n'}" style="width:${(Math.abs(r.net)/mx*100).toFixed(1)}%"></i></div><span class="flw-sv">${flwNet(r.net)}</span></div>`).join('');
+}
+function flwTop(rows,title){
+  if(!rows||!rows.length)return`<div class="card"><h2>${title}</h2><div class="mu" style="padding:14px 0">Нет данных</div></div>`;
+  return`<div class="card"><h2>${title}</h2><div class="tbl"><table class="flw-t"><thead><tr><th class="l">Бумага</th><th>Покупки</th><th>Продажи</th><th>Баланс</th></tr></thead><tbody>`
+    +rows.map(r=>`<tr data-secid="${esc(r.secid)}" data-cls="${esc(r.cls)}" data-isin="${esc(r.isin||'')}" class="flw-row"><td class="l"><b>${esc(r.name||r.secid)}</b> <small class="mu">${esc(r.name?r.secid:'')}</small></td><td class="num">${flwRub(r.buy)}</td><td class="num">${flwRub(r.sell)}</td><td class="num">${flwNet(r.net)}</td></tr>`).join('')+`</tbody></table></div></div>`;
+}
+function flwTabFlow(){
+  const D=S.flw;
+  if(D.key!==D.period&&!D.loading){D.data=null;loadFlw()}
+  if(!D.data||D.key!==D.period)return waitBox('Загружаю потоки…');
+  const d=D.data;
+  if(d.error)return`<div class="msg err">${esc(d.error)}</div>`;
+  if(d.configured===false||d.empty)return flwEmpty(d);
+  const cls=['share','bond','fund'].map(k=>d.by_class.find(x=>x.cls===k)||{cls:k,buy:0,sell:0,net:0,n:0});
+  return`<div class="flw-meta">${flwSrcLine(d)}<span class="mu">данные на ${flwMsk(d.asof)} МСК</span><button class="btn" id="flw-ref">Обновить</button></div>
+  <div class="flw-cards">${cls.map(c=>{const t=c.buy+c.sell||1;return`<div class="card flw-c"><h2>${FLW_CLS[c.cls]}<span class="sp">${c.n||0} сделок</span></h2>
+    <div class="flw-big">${flwNet(c.net)}</div>
+    <div class="flw-bar"><i class="p" style="width:${(c.buy/t*100).toFixed(1)}%"></i><i class="n" style="width:${(c.sell/t*100).toFixed(1)}%"></i></div>
+    <div class="flw-leg"><span class="pos">покупки ${flwRub(c.buy)}</span><span class="neg">продажи ${flwRub(c.sell)}</span></div></div>`}).join('')}</div>
+  <div class="card" style="margin-top:14px"><h2>По секторам<span class="sp">баланс покупок и продаж</span></h2>${flwBars(d.by_sector.slice(0,14),'sector',r=>r.sector)}</div>
+  <div class="flw-two" style="margin-top:14px">${flwTop(d.top_buy,'Чаще покупают')}${flwTop(d.top_sell,'Чаще продают')}</div>
+  <p class="note" style="margin-top:10px">Сторона сделки — по данным биржи (кто был инициатором). Баланс = покупки − продажи за период; это поток сделок, а не прогноз цены. Не является индивидуальной инвестиционной рекомендацией.</p>`;
+}
+/* ── крупные сделки ── */
+function loadFlwLarge(force){
+  const L=S.flw.large,key=L.cls+'|'+L.min;if(L.loading)return;L.loading=true;
+  api('/api/large_trades?'+new URLSearchParams({class:L.cls,min:L.min||'',force:force?1:''})).then(j=>{L.data=j;L.key=key}).catch(e=>{L.data={error:e.message||String(e),rows:[]};L.key=key})
+    .then(()=>{L.loading=false;if(S.page==='flw'&&S.flw.tab==='large')render()});
+}
+function flwTabLarge(){
+  const L=S.flw.large,key=L.cls+'|'+L.min;
+  if(L.key!==key&&!L.loading){L.data=null;loadFlwLarge()}
+  let h=`<div class="flw-bar2"><div class="seg" id="flw-cls">${[['','Все'],['share','Акции'],['bond','Облигации'],['fund','Фонды']].map(([k,t])=>`<button data-c="${k}" class="${L.cls===k?'on':''}">${t}</button>`).join('')}</div>
+    <label class="flw-min">от <select id="flw-min">${[[0,'любая сумма'],[5e6,'5 млн ₽'],[10e6,'10 млн ₽'],[50e6,'50 млн ₽'],[100e6,'100 млн ₽']].map(([v,t])=>`<option value="${v}"${+L.min===v?' selected':''}>${t}</option>`).join('')}</select></label></div>`;
+  if(!L.data||L.key!==key)return h+waitBox('Загружаю сделки…');
+  if(L.data.error)return h+`<div class="msg err">${esc(L.data.error)}</div>`;
+  const rows=L.data.rows||[];
+  if(!rows.length)return h+flwEmpty(L.data);
+  return h+`<div class="tbl"><table class="flw-t"><thead><tr><th class="l">Время (МСК)</th><th class="l">Бумага</th><th class="l">Сторона</th><th>Цена</th><th>Кол-во</th><th>Сумма</th><th class="l">Источник</th></tr></thead><tbody>`
+    +rows.map(r=>`<tr class="flw-row" data-secid="${esc(r.secid)}" data-cls="${esc(r.cls)}" data-isin="${esc(r.isin||'')}"><td class="l">${flwMsk(r.ts)}<small class="mu"> ${flwMsk(r.ts,1).slice(-8)}</small></td><td class="l"><b>${esc(r.name||r.secid)}</b> <small class="mu">${esc(r.name?r.secid:'')}</small></td><td class="l">${flwSide(r.side)}</td><td class="num">${flwPx(r.price)}</td><td class="num">${(+r.qty).toLocaleString('ru-RU')}</td><td class="num"><b>${flwRub(r.value)}</b></td><td class="l mu">${r.src==='tinvest'?'T-Invest':'Мосбиржа, −15 мин'}</td></tr>`).join('')+`</tbody></table></div>
+    <p class="note" style="margin-top:10px">Крупная сделка — не меньше 5 млн ₽ (облигации 10 млн ₽) и выше 99-го перцентиля сделок бумаги за 20 дней.</p>`;
+}
+/* ── всплески ── */
+function flwSlot(ts){const a=new Date(ts*1000+3*3600e3),h=a.getUTCHours(),m=Math.floor(a.getUTCMinutes()/10)*10,p=n=>String(n).padStart(2,'0');return`${p(h)}:${p(m)}–${p(m+10>=60?(h+1)%24:h)}:${p((m+10)%60)}`}
+function loadFlwSpikes(force){
+  const L=S.flw.spikes;if(L.loading)return;L.loading=true;
+  api('/api/spikes?'+new URLSearchParams({force:force?1:''})).then(j=>{L.data=j}).catch(e=>{L.data={error:e.message||String(e),rows:[]}})
+    .then(()=>{L.loading=false;L.key=1;if(S.page==='flw'&&S.flw.tab==='spikes')render()});
+}
+function flwTabSpikes(){
+  const L=S.flw.spikes;
+  if(!L.data&&!L.loading)loadFlwSpikes();
+  if(!L.data)return waitBox('Загружаю всплески…');
+  if(L.data.error)return`<div class="msg err">${esc(L.data.error)}</div>`;
+  const rows=L.data.rows||[];
+  if(!rows.length)return flwEmpty(L.data);
+  return`<div class="tbl"><table class="flw-t"><thead><tr><th class="l">Бумага</th><th class="l">День</th><th class="l">Слот (МСК)</th><th>Всплеск</th><th>Оборот</th><th>Медиана слота</th></tr></thead><tbody>`
+    +rows.map(r=>`<tr class="flw-row" data-secid="${esc(r.secid)}" data-cls="${esc(r.cls)}" data-isin="${esc(r.isin||'')}"><td class="l"><b>${esc(r.name||r.secid)}</b> <small class="mu">${esc(r.name?r.secid:'')}</small></td><td class="l">${flwMsk(r.ts)}</td><td class="l">${flwSlot(r.ts)}</td><td class="num"><b class="${r.ratio>=6?'neg':'pos'}">×${(+r.ratio).toFixed(1).replace('.',',')}</b></td><td class="num">${flwRub(r.value)}</td><td class="num mu">${flwRub(r.median)}</td></tr>`).join('')+`</tbody></table></div>
+    <p class="note" style="margin-top:10px">Всплеск — оборот за 10 минут не меньше чем в 3 раза выше медианы этого же слота за 20 торговых дней и не меньше 1 млн ₽.</p>`;
+}
+/* ── стакан ── */
+function flwBookHtml(B){
+  const d=B.data;
+  if(!d)return B.err?`<div class="msg err">${esc(B.err)}</div>`:waitBox('Загружаю стакан…');
+  if(!d.ok)return`<div class="empty" style="padding:28px 12px">${esc(d.error||'Стакан недоступен')}</div>`;
+  const m=d.metrics||{},asks=d.asks.slice(0,B.depth).slice().reverse(),bids=d.bids.slice(0,B.depth);
+  const mx=Math.max(1,...d.asks.slice(0,B.depth).map(x=>x[1]),...bids.map(x=>x[1]));
+  const wall=(side,p)=>(m.walls||[]).find(w=>w.side===side&&w.price===p);
+  const row=(side)=>([p,q])=>{const w=wall(side,p);return`<div class="flw-l ${side}${w?' wall':''}"><i style="width:${(q/mx*100).toFixed(1)}%"></i><span class="p">${flwPx(p)}</span><span class="q">${(+q).toLocaleString('ru-RU')}</span>${w?`<em>×${w.mult}</em>`:''}</div>`};
+  const imb=m.imbalance||0,pos=((imb+1)/2*100).toFixed(1);
+  const t=d.tape||{};
+  return`<div class="flw-book"><div class="flw-ladder">${asks.map(row('ask')).join('')}<div class="flw-mid">${m.mid!=null?flwPx(m.mid):'—'}<small class="mu"> спред ${m.spread!=null?flwPx(m.spread):'—'}</small></div>${bids.map(row('bid')).join('')}</div>
+    <div class="flw-side"><div class="card"><h2>Дисбаланс<span class="sp">первые 10 уровней</span></h2>
+      <div class="flw-gauge"><div class="flw-gk" style="left:${pos}%"></div></div>
+      <div class="flw-leg"><span class="neg">продавцы</span><b class="${imb>0.05?'pos':imb<-0.05?'neg':''}">${(imb*100>0?'+':'')+(imb*100).toFixed(0)} %</b><span class="pos">покупатели</span></div>
+      <p class="note" style="margin-top:8px">Плотности — уровни, где заявок не меньше чем в 5 раз больше медианы уровня${(m.walls||[]).length?': '+m.walls.length:''}.</p></div>
+    <div class="card" style="margin-top:12px"><h2>Лента сделок<span class="sp">${flwNet(t.net||0)} за час</span></h2>
+      <div class="flw-tape">${(d.trades||[]).slice(0,40).map(x=>`<div class="${x.side}"><span>${x.ts?flwMsk(x.ts,1).slice(-8):''}</span><b>${flwPx(x.price)}</b><span>${(+x.qty).toLocaleString('ru-RU')}</span></div>`).join('')||'<div class="mu">Сделок за час нет</div>'}</div></div></div></div>
+    <div class="flw-meta" style="margin-top:8px"><span class="flw-src live">${d.source_label||FLW_SRC.tinvest}</span><span class="mu">обновлено ${flwMsk(d.ts,1).slice(-8)}</span></div>`;
+}
+function flwBookLoad(){
+  const B=S.flw.book;if(B.busy)return;B.busy=true;
+  const secid=B.secid;
+  api('/api/orderbook?'+new URLSearchParams({secid,depth:B.depth})).then(j=>{if(secid===B.secid){B.data=j;B.err=''}}).catch(e=>{B.err=e.message||String(e)})
+    .then(()=>{B.busy=false;const el=$('#flw-bookbox');if(el&&S.page==='flw'&&S.flw.tab==='book')el.innerHTML=flwBookHtml(B)});
+}
+function flwBookStop(){if(_flwTimer){clearInterval(_flwTimer);_flwTimer=null}}
+function flwBookStart(){
+  flwBookStop();flwBookLoad();
+  _flwTimer=setInterval(()=>{if(S.page!=='flw'||S.flw.tab!=='book'){flwBookStop();return}if(document.hidden)return;flwBookLoad()},2500);
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&S.page==='flw'&&S.flw.tab==='book'&&!_flwTimer)flwBookStart()});
+function flwTabBook(){
+  const B=S.flw.book;
+  if(!B.inst&&!B.list){B.list='loading';api('/api/flows_instruments').then(j=>{B.inst=j.rows||[];B.list=null;if(S.page==='flw'&&S.flw.tab==='book')render()}).catch(()=>{B.inst=[];B.list=null})}
+  const opts=(B.inst||[]).slice();if(!opts.some(r=>r.secid===B.secid))opts.unshift({secid:B.secid,name:'',cls:''});
+  return`<div class="flw-bar2"><label class="flw-min">Бумага <select id="flw-sec">${opts.map(r=>`<option value="${esc(r.secid)}"${r.secid===B.secid?' selected':''}>${esc(r.secid)} ${esc(r.name||'')}</option>`).join('')}</select></label>
+    <input id="flw-q" class="inp" placeholder="Тикер, например GAZP" style="width:170px" value=""><label class="flw-min">Глубина <select id="flw-dep">${[10,20,30,50].map(n=>`<option${n===B.depth?' selected':''}>${n}</option>`).join('')}</select></label></div>
+    <div id="flw-bookbox">${flwBookHtml(B)}</div>`;
+}
+/* ── страница ── */
+function pFlw(){
+  const D=S.flw;
+  const body=D.tab==='large'?flwTabLarge():D.tab==='spikes'?flwTabSpikes():D.tab==='book'?flwTabBook():flwTabFlow();
+  return`<div class="card"><h2>Кто покупает<span class="sp">потоки денег по сделкам Мосбиржи</span></h2>
+    <div class="flw-bar2"><div class="seg" id="flw-tab">${[['flow','Потоки'],['large','Крупные сделки'],['spikes','Всплески объёма'],['book','Стакан']].map(([k,t])=>`<button data-t="${k}" class="${D.tab===k?'on':''}">${t}</button>`).join('')}</div>
+    ${D.tab==='flow'?`<div class="seg" id="flw-per">${[['5m','5 мин'],['1h','1 час'],['day','День']].map(([k,t])=>`<button data-p="${k}" class="${D.period===k?'on':''}">${t}</button>`).join('')}</div>`:''}</div>
+    ${body}</div>`;
+}
+function bindFlw(){
+  const D=S.flw,on=(id,f)=>{const e=$(id);if(e)e.onclick=f};
+  if(D.tab!=='book')flwBookStop();
+  on('#flw-tab',e=>{const b=e.target.closest('[data-t]');if(!b)return;D.tab=b.dataset.t;render()});
+  on('#flw-per',e=>{const b=e.target.closest('[data-p]');if(!b)return;D.period=b.dataset.p;D.data=null;render()});
+  on('#flw-ref',()=>{D.data=null;D.key=null;loadFlw(true);render()});
+  on('#flw-cls',e=>{const b=e.target.closest('[data-c]');if(!b)return;D.large.cls=b.dataset.c;D.large.data=null;render()});
+  const mn=$('#flw-min');if(mn)mn.onchange=e=>{D.large.min=+e.target.value;D.large.data=null;render()};
+  document.querySelectorAll('#view .flw-row').forEach(tr=>tr.onclick=()=>flwOpen(tr.dataset.secid,tr.dataset.cls,tr.dataset.isin));
+  const sec=$('#flw-sec');if(sec)sec.onchange=e=>{D.book.secid=e.target.value;D.book.data=null;render()};
+  const dep=$('#flw-dep');if(dep)dep.onchange=e=>{D.book.depth=+e.target.value;D.book.data=null;render()};
+  const q=$('#flw-q');if(q)q.onkeydown=e=>{if(e.key!=='Enter')return;const v=q.value.trim().toUpperCase();if(/^[A-Z0-9_.\-]{1,24}$/.test(v)){D.book.secid=v;D.book.data=null;render()}};
+  if(D.tab==='book')flwBookStart();
+}
+/* ── Страх и жадность: индекс настроений российского рынка (0 — крайний страх, 100 — крайняя жадность) ── */
+S.fng={data:null,loading:false,t:0};
+const FNG_ZONES=[[0,25,'Крайний страх','#e5484d'],[25,45,'Страх','#f08a4b'],[45,56,'Нейтрально','#9aa1ae'],[56,76,'Жадность','#7cc36e'],[76,100,'Крайняя жадность','#2fb36e']];
+const fngColor=v=>{const z=FNG_ZONES.find(z=>v<z[1])||FNG_ZONES[4];return z[3]};
+const fngNum=v=>bad(v)?'—':String(Math.round(v));
+function loadFng(force){
+  const F=S.fng;if(F.loading)return;F.loading=true;
+  api('/api/fng'+(force?'?force=1':'')).then(j=>{F.data=j}).catch(e=>{F.data={error:e.message||String(e),components:[],history:[]}})
+   .then(()=>{F.loading=false;F.t=Date.now();if(S.page==='fng'){renderSoon();if(F.data&&F.data.loading)setTimeout(()=>{if(S.page==='fng')loadFng()},8000)}});
+}
+/* полукруг: 0 слева, 100 справа; дуга с градиентом красный → серый → зелёный и стрелка */
+function fngGauge(v){
+  const cx=150,cy=140,r=112,pt=(a,rr)=>[cx+rr*Math.cos(Math.PI*(1-a/100)),cy-rr*Math.sin(Math.PI*(1-a/100))];
+  const arc=(a0,a1,rr)=>{const p0=pt(a0,rr),p1=pt(a1,rr);return`M${p0[0].toFixed(1)} ${p0[1].toFixed(1)}A${rr} ${rr} 0 0 1 ${p1[0].toFixed(1)} ${p1[1].toFixed(1)}`};
+  const has=!bad(v),ang=has?v:50,n=pt(ang,r-16),b1=pt(ang+50,6),b2=pt(ang-50,6);
+  const ticks=[0,25,50,75,100].map(a=>{const p=pt(a,r+13);return`<text class="fg-tk" x="${p[0].toFixed(1)}" y="${(p[1]+4).toFixed(1)}" text-anchor="middle">${a}</text>`}).join('');
+  return`<svg class="fg-gauge" viewBox="0 0 300 172" role="img" aria-label="Индекс страха и жадности ${has?Math.round(v):'нет данных'}">
+    <defs><linearGradient id="fg-gr" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#e5484d"/><stop offset=".3" stop-color="#f08a4b"/><stop offset=".5" stop-color="#9aa1ae"/><stop offset=".7" stop-color="#7cc36e"/><stop offset="1" stop-color="#2fb36e"/></linearGradient></defs>
+    <path d="${arc(0,100,r)}" fill="none" stroke="url(#fg-gr)" stroke-width="22" stroke-linecap="butt"/>${ticks}
+    ${has?`<g class="fg-needle"><polygon points="${n[0].toFixed(1)},${n[1].toFixed(1)} ${b1[0].toFixed(1)},${b1[1].toFixed(1)} ${b2[0].toFixed(1)},${b2[1].toFixed(1)}" fill="var(--tx)"/><circle cx="${cx}" cy="${cy}" r="7" fill="var(--tx)"/></g>`:''}
+    <text class="fg-big" x="${cx}" y="${cy-30}" text-anchor="middle" fill="${has?fngColor(v):'var(--mu)'}">${fngNum(v)}</text></svg>`;
+}
+function fngChips(d){
+  const P=[['day','Вчера'],['week','Неделю назад'],['month','Месяц назад'],['year','Год назад']];
+  return`<div class="fg-chips">${P.map(([k,t])=>{const p=d.prev&&d.prev[k];
+    return p?`<div class="fg-chip" title="${esc(dlabel(p.d))}"><small>${t}</small><b style="color:${fngColor(p.v)}">${fngNum(p.v)}</b><span>${esc(fngLabel(p.v))}</span></div>`
+      :`<div class="fg-chip"><small>${t}</small><b class="mu">—</b><span>нет данных</span></div>`}).join('')}</div>`;
+}
+function fngLabel(v){return(FNG_ZONES.find(z=>Math.round(v)<z[1])||FNG_ZONES[4])[2]}
+function fngCards(d){
+  return`<div class="fg-cards">${d.components.map(c=>`<div class="fg-cc"><div class="fg-ch"><b>${esc(c.name)}</b>${c.conf==='low'?`<em title="Истории пока мало (${c.pts} точек из 120): оценка приблизительная">мало истории</em>`:''}<span style="color:${fngColor(c.score)}">${fngNum(c.score)}</span></div>
+    <div class="fg-bar"><i style="left:${Math.max(0,Math.min(100,c.score))}%;background:${fngColor(c.score)}"></i></div>
+    <p>${esc(c.note)}</p></div>`).join('')}</div>`;
+}
+function fngChart(el){
+  const d=S.fng.data,h=(d&&d.history||[]).filter(x=>x.d>=new Date(Date.now()-366*864e5).toISOString().slice(0,10));
+  if(h.length<2){emptyChart(el,260,'История индекса пока накапливается');return}
+  const W=el.clientWidth,H=260,pl=34,pr=10,pt=10,pb=26,n=h.length,pw=W-pl-pr,ph=H-pt-pb,X=i=>pl+i/(n-1)*pw,Y=v=>pt+ph-v/100*ph;
+  let s=FNG_ZONES.map(z=>`<rect x="${pl}" y="${Y(z[1])}" width="${pw}" height="${Y(z[0])-Y(z[1])}" fill="${z[3]}" fill-opacity=".13"/>`).join('');
+  [0,25,50,75,100].forEach(v=>s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}"/><text class="ax num" x="${pl-8}" y="${Y(v)+4}" text-anchor="end">${v}</text>`);
+  let last=-99;h.forEach((x,i)=>{const m=x.d.slice(0,7);if(m!==last&&X(i)>pl+14&&X(i)<W-pr-20){const[y,mm]=m.split('-');s+=`<text class="ax" x="${X(i)}" y="${H-6}" text-anchor="middle">${MON[+mm-1]} ${y.slice(2)}</text>`}last=m});
+  s+=`<polyline points="${h.map((x,i)=>X(i).toFixed(1)+','+Y(x.v).toFixed(1)).join(' ')}" fill="none" stroke="var(--tx)" stroke-width="1.8" stroke-linejoin="round"/>`;
+  let hits='';const cw=pw/(n-1);for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${X(i)-cw/2}" y="${pt}" width="${cw}" height="${ph}" fill="transparent"/>`;
+  el.innerHTML=`<svg width="${W}" height="${H}">${s}<g class="hv"></g>${hits}</svg>`;
+  const hv=el.querySelector('.hv');
+  el._hl=i=>{hv.innerHTML=i<0?'':`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--mu)" stroke-dasharray="3 3"/><circle cx="${X(i)}" cy="${Y(h[i].v)}" r="4.5" fill="${fngColor(h[i].v)}" stroke="var(--card)" stroke-width="2"/>`};
+  bindTip(el,i=>`<b>${esc(dlabel(h[i].d))}</b>`+tipRow(fngColor(h[i].v),fngLabel(h[i].v),fngNum(h[i].v)));
+}
+function pFng(){
+  const F=S.fng;
+  if(!F.data||Date.now()-F.t>10*60*1000){if(!F.loading)loadFng()}
+  const d=F.data;
+  let h=`<div class="card"><h2>Страх и жадность<span class="sp">настроения российского рынка акций и облигаций</span></h2>`;
+  if(!d)return h+waitBox('Считаю индекс…')+`</div>`;
+  if(d.error)return h+`<div class="msg err">${esc(d.error)}</div></div>`;
+  const pr=d.progress||{};
+  if(d.value==null)return h+waitBox(d.loading?'Загружаю историю рынка с Мосбиржи… это займёт несколько минут, страница обновится сама.':'Нет данных для расчёта индекса.')+`</div>`;
+  h+=`<div class="fg-top"><div class="fg-g">${fngGauge(d.value)}<div class="fg-lbl" style="color:${fngColor(d.value)}">${esc(d.label)}</div><div class="fg-ts">по закрытию ${esc(dlabel(d.ts))}</div></div>${fngChips(d)}</div>`;
+  if(d.loading)h+=`<div class="msg" style="margin:12px 0">Идёт загрузка истории акций (${pr.have||0} из ~${pr.need||'?'} торговых дней): значения уточняются по мере загрузки.</div>`;
+  else if(d.low_conf)h+=`<div class="msg" style="margin:12px 0">Часть компонентов считается по короткой истории или недоступна, поэтому индекс приблизительный. Значение уточняется по мере накопления данных.</div>`;
+  h+=`</div><div class="card"><h2>Из чего складывается<span class="sp">оценка каждого компонента: 0 — страх, 100 — жадность; индекс — их среднее</span></h2>${fngCards(d)}</div>
+    <div class="card"><h2>История за год<span class="sp">зоны: страх (красные), нейтрально (серая), жадность (зелёные)</span></h2><div class="chart" id="fg-chart"></div></div>
+    <div class="card fg-note"><h2>Как считается</h2><p>Для каждого компонента берётся сегодняшнее значение и сравнивается с его историей за последние два года: оценка — процент дней, когда значение было ниже сегодняшнего (для волатильности, спроса на защитные активы и спредов шкала перевёрнута: рост означает страх). Индекс — среднее оценок доступных компонентов. Компоненты: отклонение IMOEX от 125-дневной средней; доля акций выше 50-дневной средней; новые годовые максимумы минус минимумы; индекс волатильности RVI к 50-дневной средней; доходность ОФЗ минус акций за 20 дней; спред высокодоходных облигаций к кривой ОФЗ; поток денег в акции против фондов денежного рынка (если доступен).</p>
+    <p class="mu">Индекс отражает настроения участников рынка и не является инвестиционной рекомендацией. Крайний страх не гарантирует разворот вверх, а крайняя жадность — падение.</p></div>`;
+  chart('fg-chart',fngChart);
+  return h;
+}
 </script></body></html>
 '''
 
