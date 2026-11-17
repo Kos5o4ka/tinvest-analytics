@@ -291,6 +291,8 @@ def rot_flows_moex(isin, today, face):
 # ── вселенная бумаг (фоновая загрузка) ──
 
 def _rot_is_floater(r):
+    if r.get("floating") is not None:               # поле из screener_payload (справочник T-Invest / тип облигации ISS)
+        return bool(r["floating"])
     nm = (r.get("name") or "")
     if r.get("kind") == "ofz":
         return "ПК" in nm.upper()
@@ -305,7 +307,11 @@ def _rot_build():
     snap = {"t": time.time(), "errors": []}
     rows = []
     try:
-        rows = [r for r in screener_rows() if r.get("cur") == "RUB"]
+        try:
+            allr = screener_payload()["rows"]          # с признаком floating, fl_label и fl_base
+        except Exception:  # noqa: BLE001
+            allr = screener_rows()
+        rows = [r for r in allr if r.get("cur") == "RUB"]
     except Exception as e:  # noqa: BLE001
         snap["errors"].append("торги Мосбиржи: %s" % (str(e)[:100] or e.__class__.__name__))
     try:
@@ -338,6 +344,7 @@ def _rot_build():
             continue
         (floats if _rot_is_floater(r) else fixed).append(r)
     snap["ofz"] = sorted([r for r in fixed if r["kind"] == "ofz"], key=lambda r: -(r.get("turn") or 0))
+    floats = [r for r in floats if r.get("fl_base") != "infl"]       # купон, привязанный к инфляции, от ставки не зависит
     snap["floats"] = sorted(floats, key=lambda r: -(r.get("turn") or 0))[:30]
     return snap
 
@@ -455,8 +462,9 @@ def rot_fl_lag(r, kn, k0, today):
     c0 = r.get("coupon")
     if c0 is None or not r.get("price"):
         return None
-    ru = r.get("kind") == "ofz"
-    P = 0.5 if ru else 0.25
+    base = r.get("fl_base")
+    ru = base == "ruonia" if base else r.get("kind") == "ofz"
+    P = 0.5 if r.get("kind") == "ofz" else 0.25
     try:
         nxt = (datetime.strptime(r["next"], "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days / 365.0
     except Exception:  # noqa: BLE001
@@ -477,7 +485,7 @@ def rot_fl_lag(r, kn, k0, today):
     avg = sum(use) / len(use)
     cy0 = c0 / r["price"] * 100.0
     cyf = avg / r["price"] * 100.0
-    return {"id": r["id"], "isin": r.get("isin"), "name": r.get("name"), "link": "RUONIA" if ru else "КС / RUONIA (не определено)",
+    return {"id": r["id"], "isin": r.get("isin"), "name": r.get("name"), "link": r.get("fl_label") or ("RUONIA" if ru else "КС / RUONIA (не определено)"),
             "coupon": round(c0, 2), "next": r.get("next"), "price": r.get("price"), "yield": r.get("yield"),
             "future": [round(x, 2) for x in cps[1:4]], "avg12": round(avg, 2), "cy_now": round(cy0, 2), "cy_fwd": round(cyf, 2),
             "delta": round(cyf - cy0, 2), "turn": r.get("turn")}
