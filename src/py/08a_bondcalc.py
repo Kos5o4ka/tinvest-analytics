@@ -410,4 +410,6 @@ def yields_by_kind(bz, today, face, dirty, offers, floating=False, est_out=None,
                    flows=call_fl[res["ytw_date"]] if k == "call" else full, end=res["ytw_date"], end_kind="offer" if k == "call" else "maturity")
     elif res["yto"] is not None:
         res.update(basis="unknown", flows=uf, end=res["yto_date"], end_kind="offer", to_kind="unknown", y=res["yto"])
+    basis_price = price if price is not None else dirty
+    res["y_tax"] = cf_ytm(dirty, res["flows"], today, tax=True, basis=basis_price)
     return res

@@ -62,6 +62,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ok_host():
             return self.send(403, {"error": "forbidden"})
         u = urlparse(self.path)
+        if u.path.startswith("/api/") and self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none"):
+            return self.send(403, {"error": "forbidden"})
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
 
         def run():
@@ -203,7 +205,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"started": ratings_start(force=True), **ratings_status()})
             client = TInvest(cfg)
             if path == "/api/test":
-                return self.send(200, {"ok": True, "accounts": len(client.accounts())})
+                tcli = client
+                if body.get("token"):
+                    tcfg = dict(cfg, token="".join(str(body["token"]).split()))
+                    if "sandbox" in body:
+                        tcfg["sandbox"] = bool(body["sandbox"])
+                    tcli = TInvest(tcfg)
+                return self.send(200, {"ok": True, "accounts": len(tcli.accounts())})
             if path == "/api/cache/clear":
                 store().wipe_cache()
                 shutil.rmtree(LOGO_DIR, ignore_errors=True)

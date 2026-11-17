@@ -52,7 +52,8 @@ def op_key(o):
 
 def op_qty(o):
     try:
-        return int(Decimal(str(o.get("quantityDone") or o.get("quantity") or 0)))
+        d = Decimal(str(o.get("quantityDone") or o.get("quantity") or 0))
+        return int(d) if d == d.to_integral_value() else float(d)
     except Exception:  # noqa: BLE001
         return 0
 

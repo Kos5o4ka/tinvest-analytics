@@ -114,7 +114,28 @@ def _flw_levels(rows):
     return out
 
 
-def _flw_trade_rows(rows):
+def _flw_iso_ts(s):
+    """Разбор ISO-времени (в т.ч. с 9-значными наносекундами в Python 3.8–3.10) -> Unix timestamp или None."""
+    s = str(s or "").strip().replace("Z", "+00:00")
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s)
+    except ValueError:
+        m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?", s)
+        if not m:
+            return None
+        d = datetime.fromisoformat(m.group(1))
+        if m.group(2):
+            d = d.replace(microsecond=int(float(m.group(2)) * 1e6))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.timestamp()
+
+
+def _flw_trade_rows(rows, lot=1, face=None, is_bond=False):
+    lot = max(1, int(lot or 1))
+    k = (float(face) / 100.0) if (is_bond and face) else (10.0 if is_bond else 1.0)
     out = []
     for t in rows or []:
         side = t.get("side") or str(t.get("direction") or "")
@@ -122,18 +143,17 @@ def _flw_trade_rows(rows):
         p, q = _flw_q(t.get("price")), _flw_q(t.get("qty") if t.get("qty") is not None else t.get("quantity"))
         ts = t.get("ts")
         if ts is None and t.get("time"):
-            try:
-                ts = datetime.fromisoformat(str(t["time"]).replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                ts = None
+            ts = _flw_iso_ts(t["time"])
         if side and p is not None and q:
-            out.append({"ts": ts, "side": side, "price": p, "qty": q, "value": round(p * q, 2)})
+            pieces = q * lot
+            out.append({"ts": ts, "side": side, "price": p, "qty": pieces, "value": round(p * pieces * k, 2)})
     return out
 
 
-def _flw_own_uid(cli, secid):
+def _flw_own_meta(cli, secid):
     if secid in _flw_uid:
-        return _flw_uid[secid]
+        m = _flw_uid[secid]
+        return m if isinstance(m, dict) else {"uid": m, "lot": 1, "face": None, "is_bond": False}
     best = None
     for i in cli.find(secid) or []:
         if str(i.get("ticker") or "").upper() == secid.upper() and str(i.get("classCode") or "").startswith("TQ"):
@@ -142,9 +162,36 @@ def _flw_own_uid(cli, secid):
         if best is None and str(i.get("ticker") or "").upper() == secid.upper():
             best = i
     uid = (best or {}).get("uid")
-    if uid:
-        _flw_uid[secid] = uid
-    return uid
+    if not uid:
+        return None
+    itype = str((best or {}).get("instrumentType") or "").lower()
+    is_bond = itype == "bond" or str((best or {}).get("classCode") or "") in ("TQCB", "TQOB", "TQIR")
+    lot = int((best or {}).get("lot") or 1)
+    face = None
+    if is_bond:
+        try:
+            bi = bond_info(cli, uid)
+            if bi:
+                face = bi.get("nominal")
+                lot = int(bi.get("lot") or lot or 1)
+        except Exception:  # noqa: BLE001
+            pass
+    elif lot <= 1:
+        try:
+            u = globals().get("stocks_universe")
+            hit = next((r for r in (u() if u else []) if r.get("secid") == secid.upper()), None)
+            if hit and hit.get("lot"):
+                lot = int(hit["lot"])
+        except Exception:  # noqa: BLE001
+            pass
+    meta = {"uid": uid, "lot": max(1, lot), "face": face, "is_bond": is_bond}
+    _flw_uid[secid] = meta
+    return meta
+
+
+def _flw_own_uid(cli, secid):
+    m = _flw_own_meta(cli, secid)
+    return m["uid"] if m else None
 
 
 def _flw_own(cfg, secid, depth):
@@ -155,9 +202,10 @@ def _flw_own(cfg, secid, depth):
     ob, lt = getattr(cli, "order_book", None), getattr(cli, "last_trades", None)
     if not ob:
         return None
-    uid = _flw_own_uid(cli, secid)
-    if not uid:
+    meta = _flw_own_meta(cli, secid)
+    if not meta or not meta.get("uid"):
         return None
+    uid = meta["uid"]
     raw = ob(uid, depth)
     book = {"bids": _flw_levels(raw.get("bids")), "asks": _flw_levels(raw.get("asks")), "ts": time.time()}
     trades = []
@@ -165,7 +213,8 @@ def _flw_own(cfg, secid, depth):
         now = datetime.now(timezone.utc)
         try:
             r = lt(uid, (now - timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ"), now.strftime("%Y-%m-%dT%H:%M:%SZ"))
-            trades = _flw_trade_rows(r.get("trades") if isinstance(r, dict) else r)
+            trades = _flw_trade_rows(r.get("trades") if isinstance(r, dict) else r,
+                                     lot=meta.get("lot", 1), face=meta.get("face"), is_bond=meta.get("is_bond", False))
         except ApiError:
             trades = []
     return book, trades

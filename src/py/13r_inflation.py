@@ -36,7 +36,7 @@ def _pdf_stream(body):
     return d
 
 
-def _pdf_cmap(data):
+def _cpi_pdf_cmap(data):
     mp, t = {}, data.decode("latin1")
     for blk in re.findall(r"beginbfchar(.*?)endbfchar", t, re.S):
         for a, c in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", blk):
@@ -58,7 +58,7 @@ def pdf_first_page_text(b):
     fm = re.search(rb"/Font\s*<<(.*?)>>", page, re.S)
     for name, num in re.findall(rb"/(\w+)\s+(\d+)\s+0\s+R", fm.group(1) if fm else b""):
         tu = re.search(rb"/ToUnicode\s+(\d+)\s+0\s+R", objs.get(int(num), b""))
-        fonts[name.decode()] = _pdf_cmap(_pdf_stream(objs[int(tu.group(1))])) if tu and int(tu.group(1)) in objs else None
+        fonts[name.decode()] = _cpi_pdf_cmap(_pdf_stream(objs[int(tu.group(1))])) if tu and int(tu.group(1)) in objs else None
     cm = re.search(rb"/Contents\s*(\[[^\]]*\]|\d+\s+0\s+R)", page)
     out = []
     for r in [int(x) for x in re.findall(rb"(\d+)\s+0\s+R", cm.group(1))] if cm else []:

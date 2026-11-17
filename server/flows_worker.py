@@ -55,15 +55,15 @@ log = logging.getLogger("flows")
 # Секторы акций (ISS их не отдаёт): тикер -> сектор. Остальное — «Прочее».
 SECTORS = {}
 for _s, _t in (
-        ("Банки и финансы", "SBER SBERP VTBR T TCSG TRMK BSPB CBOM MBNK SVCB MOEX RENI LEAS SFIN ZAYM DOMRF"),
-        ("Нефть и газ", "GAZP LKOH ROSN NVTK SIBN TATN TATNP SNGS SNGSP TRNFP BANE BANEP RNFT TNFT"),
-        ("Металлы и добыча", "GMKN NLMK CHMF MAGN PLZL ALRS RUAL MTLR MTLRP SELG UGLD POLY RASP"),
+        ("Банки и финансы", "SBER SBERP VTBR T TCSG BSPB CBOM MBNK SVCB MOEX SPBE RENI LEAS SFIN ZAYM DOMRF"),
+        ("Нефть и газ", "GAZP LKOH ROSN NVTK SIBN TATN TATNP SNGS SNGSP TRNFP BANE BANEP RNFT"),
+        ("Металлы и добыча", "GMKN NLMK CHMF MAGN PLZL ALRS RUAL TRMK MTLR MTLRP SELG UGLD POLY RASP"),
         ("Электроэнергетика", "IRAO HYDR FEES UPRO MSRS MRKC MRKP MRKU MRKV ENPG LSNG MSNG ELFV TGKA"),
         ("Телеком и IT", "MTSS RTKM RTKMP YDEX YNDX OZON VKCO HEAD POSI CIAN ASTR DIAS WUSH SOFL"),
-        ("Ритейл и потребление", "MGNT FIVE LENT FESH APTK BELU AQUA HNFG SVAV GCHE MVID DELI"),
-        ("Транспорт", "AFLT FLOT NMTP NKHP GLTR"),
+        ("Ритейл и потребление", "MGNT FIVE X5 LENT APTK BELU AQUA HNFG SVAV GCHE MVID DELI"),
+        ("Транспорт", "AFLT FLOT NMTP FESH NKHP GLTR"),
         ("Химия и удобрения", "PHOR AKRN KZOS NKNC"),
-        ("Строительство и девелопмент", "PIKK SMLT LSRG ETLN SPBE")):
+        ("Строительство и девелопмент", "PIKK SMLT LSRG ETLN")):
     for _x in _t.split():
         SECTORS[_x] = _s
 

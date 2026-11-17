@@ -199,13 +199,28 @@ class TInvest:
                          {"instrumentId": instrument_id, "from": frm, "to": to}, timeout=30).get("trades") or []
 
 
+_POOL_LOCK = threading.Lock()
+_SHARED_POOL = None
+
+
+def _get_pool():
+    global _SHARED_POOL
+    with _POOL_LOCK:
+        if _SHARED_POOL is None:
+            _SHARED_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="_pm_")
+        return _SHARED_POOL
+
+
 def pool_map(fn, items, workers=8):
     items = list(items)
     if not items:
         return []
     if len(items) == 1:
         return [fn(items[0])]
-    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
-        return list(ex.map(fn, items))
+    # Вложенный вызов внутри рабочего потока пула использует локальный пул во избежание взаимоблокировки.
+    if threading.current_thread().name.startswith("_pm_") or workers > 12:
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
+            return list(ex.map(fn, items))
+    return list(_get_pool().map(fn, items))
 
 

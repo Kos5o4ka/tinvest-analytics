@@ -62,12 +62,12 @@ def _rating_issuer(t):
 
 
 def name_tokens(s):
-    """Префиксные (5 символов) токены названия: грубые ключи эмитента для группировки и журнала."""
+    """Нормализованные полные слова названия: ключи эмитента для группировки и журнала (без 5-буквенных коллизий)."""
     out = set()
     for i, t in enumerate(re.findall(r"[a-zа-я0-9]+", (s or "").lower().replace("ё", "е"))):
         if t in _LEGAL or (i == 0 and t == "банк") or len(t) < 2 or any(ch.isdigit() for ch in t):
             continue
-        out.add(t[:5])
+        out.add(t)
     return frozenset(out)
 
 
