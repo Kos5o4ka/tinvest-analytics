@@ -17462,6 +17462,2325 @@ def fng_payload(force=False):
 
 
 API_GET["/api/fng"] = lambda cfg, acc, q, force: fng_payload(force)
+# ── Флоатеры или фиксы: модель ротации (полная доходность, сценарии ставки, точка безубыточности, лесенка, лаг фиксации, дюрационный разрыв) ──
+
+ROT_TAX = 0.13
+ROT_FLOOR = 4.0                       # нижняя граница ключевой ставки в сценариях, %
+ROT_HORIZONS = [(0.25, "3 мес"), (0.5, "6 мес"), (1.0, "1 год"), (2.0, "2 года"), (3.0, "3 года")]
+ROT_SCN = [("flat", "Ставка без изменений"), ("cbr", "Прогноз ЦБ"), ("smooth", "Плавное снижение"),
+           ("fast", "Быстрое снижение"), ("up", "Повышение")]
+ROT_SCN_NOTE = {"flat": "ключевая ставка остаётся на текущем уровне", "cbr": "траектория из прогноза Банка России (или выбранного в настройках источника)",
+                "smooth": "минус 50 б.п. на каждом заседании, около −4 п.п. в год", "fast": "около −8 п.п. в год",
+                "up": "+2 п.п. за первый год, затем без изменений"}
+ROT_BETA = {"long": 0.5, "mid": 0.7, "short": 0.9}     # доля изменения ключевой ставки, передающаяся доходности ОФЗ: >5 лет, 2–5 лет, <2 лет
+ROT_FL_DUR = 0.25                     # эффективная дюрация флоатера (до ближайшей фиксации купона), лет
+ROT_RU_LAG = 7.0 / 365.0              # сдвиг окна усреднения RUONIA в купонных периодах, лет
+ROT_STEP = 1.0 / 12.0
+ROT_TTL = 600
+_rot_state = {"t": 0.0, "snap": None, "busy": False, "err": ""}
+_rot_lock = threading.Lock()
+
+
+def _rot_clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _rot_num(x, lo, hi, dflt):
+    try:
+        v = float(str(x).replace(",", "."))
+    except (TypeError, ValueError):
+        return dflt
+    return v if lo <= v <= hi else dflt
+
+
+# ── траектории ключевой ставки ──
+
+def rot_path(kind, k0, fpath=None, today=None, floor=ROT_FLOOR, cut=0.0, years=3.5):
+    """Узлы траектории ключевой ставки [(t лет от сегодня, % годовых)] с шагом месяц.
+    kind: flat | cbr | smooth | fast | up | cut (параллельное снижение на cut п.п. за год, потом без изменений).
+    Для cbr нужен fpath [(дата ISO, %)]; без него возвращается None."""
+    n = int(round(years / ROT_STEP))
+    if kind == "cbr":
+        if not fpath:
+            return None
+        d0 = today or date.today().isoformat()
+        out = []
+        for i in range(n + 1):
+            t = i * ROT_STEP
+            d = (datetime.strptime(d0, "%Y-%m-%d") + timedelta(days=t * 365.0)).strftime("%Y-%m-%d")
+            v = keyrate_at(fpath, d)
+            out.append((t, max(min(floor, k0), v if v is not None else k0)))
+        out[0] = (0.0, k0)
+        return out
+    out = []
+    for i in range(n + 1):
+        t = i * ROT_STEP
+        if kind == "smooth":
+            v = k0 - 4.0 * t
+        elif kind == "fast":
+            v = k0 - 8.0 * t
+        elif kind == "up":
+            v = k0 + 2.0 * min(t, 1.0)
+        elif kind == "cut":
+            v = k0 - cut * min(t, 1.0)
+        else:
+            v = k0
+        out.append((t, max(min(floor, k0), v)))
+    out[0] = (0.0, k0)
+    return out
+
+
+def rot_rate(knots, t):
+    if t <= knots[0][0]:
+        return knots[0][1]
+    for (t0, v0), (t1, v1) in zip(knots, knots[1:]):
+        if t <= t1:
+            return v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+    return knots[-1][1]
+
+
+def rot_avg(knots, a, b, n=24):
+    """Средняя ставка пути на отрезке [a, b] (лет), %."""
+    if b <= a:
+        return rot_rate(knots, a)
+    return sum(rot_rate(knots, a + (b - a) * (i + 0.5) / n) for i in range(n)) / n
+
+
+def rot_growth(knots, a, b):
+    """Множитель реинвестирования от a до b по средней ставке пути на этом отрезке."""
+    if b <= a:
+        return 1.0
+    return (1.0 + rot_avg(knots, a, b) / 100.0) ** (b - a)
+
+
+# ── полная доходность ──
+
+def rot_tr_floater(knots, T, spread, tax=True, period=0.25):
+    """Годовая полная доходность флоатера, % годовых: купон = ставка на начало купонного периода + спред, цена ~ номинал,
+    купоны реинвестируются по средней ставке пути, НДФЛ 13% с купонов."""
+    k = (1.0 - ROT_TAX) if tax else 1.0
+    v, t = 0.0, 0.0
+    while t < T - 1e-9:
+        e = min(t + period, T)
+        c = (rot_rate(knots, t) + spread) / 100.0 * (e - t)
+        v += c * k * rot_growth(knots, e, T)
+        t = e
+    return ((1.0 + v) ** (1.0 / T) - 1.0) * 100.0
+
+
+def rot_pv(flows, t0, y):
+    """Приведённая стоимость потоков [(t, купон, номинал)] после момента t0 при доходности y (дробью, годовая)."""
+    return sum((c + p) / (1.0 + y) ** (t - t0) for t, c, p in flows if t > t0 + 1e-9)
+
+
+def rot_ytm(flows, dirty, t0=0.0):
+    """Доходность (дробью), при которой PV потоков равна грязной цене; None, если корня нет."""
+    if not flows or not dirty or dirty <= 0:
+        return None
+    lo, hi = -0.5, 5.0
+    flo, fhi = rot_pv(flows, t0, lo) - dirty, rot_pv(flows, t0, hi) - dirty
+    if flo * fhi > 0:
+        return None
+    for _ in range(100):
+        mid = (lo + hi) / 2
+        fm = rot_pv(flows, t0, mid) - dirty
+        if flo * fm <= 0:
+            hi = mid
+        else:
+            lo, flo = mid, fm
+        if hi - lo < 1e-10:
+            break
+    return (lo + hi) / 2
+
+
+def rot_dur_conv(flows, y, t0=0.0):
+    """(дюрация Маколея, модифицированная, выпуклость) потоков при доходности y; выпуклость всегда положительна."""
+    pv = [(t - t0, (c + p) / (1.0 + y) ** (t - t0)) for t, c, p in flows if t > t0 + 1e-9]
+    tot = sum(v for _, v in pv)
+    if not tot:
+        return None, None, None
+    mac = sum(t * v for t, v in pv) / tot
+    conv = sum(t * (t + 1.0) * v for t, v in pv) / tot / (1.0 + y) ** 2
+    return mac, mac / (1.0 + y), conv
+
+
+def rot_accr(flows, t):
+    """НКД на момент t по линейному накоплению внутри купонного периода (в тех же единицах, что и потоки)."""
+    nx = [i for i, f in enumerate(flows) if f[0] > t + 1e-9]
+    if not nx:
+        return 0.0
+    i = nx[0]
+    t1, c1 = flows[i][0], flows[i][1]
+    t0 = flows[i - 1][0] if i > 0 else t1 - 0.5
+    if t1 - t0 <= 0 or not c1:
+        return 0.0
+    return c1 * _rot_clamp((t - t0) / (t1 - t0), 0.0, 1.0)
+
+
+def rot_beta(years, betas=None):
+    b = betas or ROT_BETA
+    return b["long"] if years > 5 else (b["mid"] if years >= 2 else b["short"])
+
+
+def rot_tr_fixed(knots, T, flows, price, accr0=0.0, betas=None, tax=True, y0=None):
+    """Годовая полная доходность фиксированной бумаги, % годовых.
+    flows — [(t лет, купон, номинал)] в % номинала; price — чистая цена, % номинала; accr0 — НКД, % номинала.
+    Доходность на горизонте = y0 + бета x (изменение ключевой ставки за горизонт); цена — полная переоценка потоков."""
+    dirty0 = price + accr0
+    if y0 is None:
+        y0 = rot_ytm(flows, dirty0)
+    if y0 is None or dirty0 <= 0:
+        return None
+    k = (1.0 - ROT_TAX) if tax else 1.0
+    life = max(f[0] for f in flows)
+    dk = rot_rate(knots, T) - knots[0][1]
+    yT = max(0.001, y0 + rot_beta(life, betas) * dk / 100.0)
+    dirtyT = rot_pv(flows, T, yT)
+    accT = rot_accr(flows, T)
+    cleanT = max(0.0, dirtyT - accT)
+    cash = sum((c * k + p) * rot_growth(knots, t, T) for t, c, p in flows if t <= T + 1e-9)
+    gain_tax = ROT_TAX * max(0.0, cleanT - price) if tax else 0.0
+    val = cleanT + accT * k + cash - gain_tax
+    if val <= 0:
+        return None
+    return ((val / dirty0) ** (1.0 / T) - 1.0) * 100.0
+
+
+def rot_tr_fixed_approx(knots, T, y0, mdur, conv, betas=None, tax=True, life=None):
+    """То же приближённо — по модифицированной дюрации и выпуклости (когда графика купонов нет). y0 — % годовых."""
+    k = (1.0 - ROT_TAX) if tax else 1.0
+    dy = max(-y0 / 100.0 + 0.001, rot_beta(life or mdur or 5.0, betas) * (rot_rate(knots, T) - knots[0][1]) / 100.0)
+    dp = -mdur * dy + 0.5 * (conv or 0.0) * dy * dy        # изменение цены дробью (бумага у номинала)
+    inc = 0.0
+    t = 0.0
+    while t < T - 1e-9:
+        e = min(t + 0.5, T)
+        inc += y0 / 100.0 * (e - t) * k * rot_growth(knots, e, T)
+        t = e
+    val = 1.0 + dp + inc - (ROT_TAX * max(0.0, dp) if tax else 0.0)
+    return ((val ** (1.0 / T)) - 1.0) * 100.0 if val > 0 else None
+
+
+def rot_breakeven(k0, T, spread, fixed_fn, tax=True, floor=ROT_FLOOR, hi=None):
+    """Параллельное снижение ключевой ставки за год (п.п.), при котором доходность фикса равна доходности флоатера.
+    fixed_fn(knots, T) -> % годовых. Возвращает {"value": X|None, "state": "ok"|"always"|"never"}:
+    always — фикс впереди даже при росте ставки на 5 п.п.; never — не догоняет даже при снижении до нижней границы."""
+    top = hi if hi is not None else max(0.0, k0 - floor)
+
+    def diff(cut):
+        kn = rot_path("cut", k0, floor=floor, cut=cut)
+        f = fixed_fn(kn, T)
+        if f is None:
+            return None
+        return f - rot_tr_floater(kn, T, spread, tax)
+    lo = -5.0
+    dl, dh = diff(lo), diff(top)
+    if dl is None or dh is None:
+        return {"value": None, "state": "none"}
+    if dl >= 0:
+        return {"value": lo, "state": "always"}
+    if dh < 0:
+        return {"value": top, "state": "never"}
+    a, b = lo, top
+    for _ in range(60):
+        m = (a + b) / 2
+        dm = diff(m)
+        if dm is None:
+            break
+        if dm < 0:
+            a = m
+        else:
+            b = m
+        if b - a < 1e-4:
+            break
+    return {"value": round((a + b) / 2, 2), "state": "ok"}
+
+
+def rot_indicator(kbd10, kbd1, key):
+    """Индикатор 0–100: 50 + 4 x A + 3 x S, где A = КБД 10 лет − ключевая (п.п., ограничено ±8), S = КБД 10 лет − КБД 1 год (п.п., ±6).
+    Описывает, насколько длинный конец выше ключевой ставки и насколько кривая крута. Это не сигнал к сделке."""
+    if kbd10 is None or kbd1 is None or key is None:
+        return None
+    a, s = kbd10 - key, kbd10 - kbd1
+    score = _rot_clamp(50.0 + 4.0 * _rot_clamp(a, -8.0, 8.0) + 3.0 * _rot_clamp(s, -6.0, 6.0), 0.0, 100.0)
+    if score < 35:
+        lab = "Кривая обратная: длинные ставки ниже ключевой, снижение во многом уже заложено в цены."
+    elif score > 65:
+        lab = "Длинные ставки заметно выше ключевой, кривая крутая: фикс даёт больший текущий доход."
+    else:
+        lab = "Нейтральная зона: длинные ставки близки к ключевой, кривая умеренная."
+    return {"score": round(score, 1), "a": round(a, 2), "s": round(s, 2), "label": lab}
+
+
+# ── графики потоков ──
+
+def rot_flows_synth(b, today, years_max=None):
+    """Расчётный график: полугодовые купоны назад от даты погашения. b: mat (ISO), coupon (% годовых), nominal.
+    Возвращает [(t лет, купон % номинала, номинал %)]."""
+    try:
+        mat = datetime.strptime(b["mat"], "%Y-%m-%d")
+        t0 = datetime.strptime(today, "%Y-%m-%d")
+    except Exception:  # noqa: BLE001
+        return []
+    c = (b.get("coupon") or 0.0) / 2.0
+    out, k = [], 0
+    while True:
+        d = mat - timedelta(days=round(182.625 * k))
+        t = (d - t0).days / 365.0
+        if t <= 0:
+            break
+        out.append((t, c, 100.0 if k == 0 else 0.0))
+        k += 1
+        if k > 80:
+            break
+    return sorted(out)
+
+
+def rot_flows_moex(isin, today, face):
+    """Потоки по графику выпуска на Мосбирже, % номинала; None, если получить не удалось."""
+    try:
+        bz = moex_bondization(isin)
+        if not bz:
+            return None
+        fl, _k, _e = bond_flows(bz, today, face)
+        if not fl:
+            return None
+        t0 = datetime.strptime(today, "%Y-%m-%d")
+        sc = 100.0 / face
+        return [((datetime.strptime(d, "%Y-%m-%d") - t0).days / 365.0, (c or 0.0) * sc, (p or 0.0) * sc) for d, c, p in fl]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ── вселенная бумаг (фоновая загрузка) ──
+
+def _rot_is_floater(r):
+    if r.get("floating") is not None:               # поле из screener_payload (справочник T-Invest / тип облигации ISS)
+        return bool(r["floating"])
+    nm = (r.get("name") or "")
+    if r.get("kind") == "ofz":
+        return "ПК" in nm.upper()
+    try:
+        info = tcat_info(r.get("isin")) if r.get("isin") else None
+    except Exception:  # noqa: BLE001
+        info = None
+    return bool(info and info.get("floating"))
+
+
+def _rot_build():
+    snap = {"t": time.time(), "errors": []}
+    rows = []
+    try:
+        try:
+            allr = screener_payload()["rows"]          # с признаком floating, fl_label и fl_base
+        except Exception:  # noqa: BLE001
+            allr = screener_rows()
+        rows = [r for r in allr if r.get("cur") == "RUB"]
+    except Exception as e:  # noqa: BLE001
+        snap["errors"].append("торги Мосбиржи: %s" % (str(e)[:100] or e.__class__.__name__))
+    try:
+        ser = key_rate_series()
+        snap["k0"] = ser[-1][1] if ser else None
+    except Exception as e:  # noqa: BLE001
+        snap["k0"] = None
+        snap["errors"].append("ключевая ставка: %s" % (str(e)[:100] or e.__class__.__name__))
+    try:
+        info = keyrate_forecast_info()
+        snap["fpath"] = info.get("path") or []
+        snap["fsrc"] = info.get("source_name") or ""
+        if snap["k0"] is None:
+            snap["k0"] = info.get("key_rate")
+    except Exception:  # noqa: BLE001
+        snap["fpath"], snap["fsrc"] = [], ""
+    try:
+        snap["kbd"] = kbd_curve()
+    except Exception:  # noqa: BLE001
+        snap["kbd"] = []
+    try:
+        snap["meet"] = (cbr_meetings() or {}).get("dates") or []
+    except Exception:  # noqa: BLE001
+        snap["meet"] = []
+    fixed, floats = [], []
+    for r in rows:
+        if r.get("kind") not in ("ofz", "corp"):
+            continue
+        if r.get("kind") == "ofz" and r.get("dur") is None:
+            continue
+        (floats if _rot_is_floater(r) else fixed).append(r)
+    snap["ofz"] = sorted([r for r in fixed if r["kind"] == "ofz"], key=lambda r: -(r.get("turn") or 0))
+    floats = [r for r in floats if r.get("fl_base") != "infl"]       # купон, привязанный к инфляции, от ставки не зависит
+    snap["floats"] = sorted(floats, key=lambda r: -(r.get("turn") or 0))[:30]
+    return snap
+
+
+def _rot_worker():
+    try:
+        snap = _rot_build()
+        err = ""
+    except Exception as e:  # noqa: BLE001
+        snap, err = None, str(e)[:160] or e.__class__.__name__
+    with _rot_lock:
+        if snap is not None:
+            _rot_state["snap"], _rot_state["t"] = snap, time.time()
+        _rot_state["err"], _rot_state["busy"] = err, False
+
+
+def rot_snapshot(wait=0.0):
+    """(снимок, идёт ли загрузка). Снимок обновляется в фоне; устаревший отдаётся, пока считается новый."""
+    with _rot_lock:
+        fresh = _rot_state["snap"] is not None and time.time() - _rot_state["t"] < ROT_TTL
+        if not fresh and not _rot_state["busy"]:
+            _rot_state["busy"] = True
+            threading.Thread(target=_rot_worker, daemon=True).start()
+    if wait:
+        end = time.time() + wait
+        while time.time() < end and _rot_state["busy"] and _rot_state["snap"] is None:
+            time.sleep(0.05)
+    with _rot_lock:
+        return _rot_state["snap"], _rot_state["busy"], _rot_state["err"]
+
+
+# ── модельные расчёты на основе снимка ──
+
+def rot_default_bond(ofz):
+    """Самая длинная ликвидная фиксированная ОФЗ: оборот не ниже трети медианного среди ОФЗ."""
+    cand = [r for r in ofz if r.get("mat") and r.get("price") and r.get("yield")]
+    if not cand:
+        return None
+    turns = sorted(r.get("turn") or 0 for r in cand)
+    thr = turns[len(turns) // 2] / 3.0
+    liq = [r for r in cand if (r.get("turn") or 0) >= thr] or cand
+    return max(liq, key=lambda r: r["mat"])
+
+
+def rot_fixed_model(b, today):
+    """Параметры фикса для расчёта: потоки, цена, НКД, y0 и метод. b — строка скринера."""
+    face = float(b.get("nominal") or 1000.0)
+    price = float(b["price"])
+    flows, method = None, "approx"
+    if b.get("isin"):
+        flows = rot_flows_moex(b["isin"], today, face)
+        if flows:
+            method = "moex"
+    if not flows and b.get("coupon") is not None:
+        flows = rot_flows_synth(b, today)
+        if flows:
+            method = "synth"
+    accr = (float(b["nkd"]) / face * 100.0) if b.get("nkd") not in (None, "") else (rot_accr(flows, 0.0) if flows else 0.0)
+    y0 = rot_ytm(flows, price + accr) if flows else None
+    if y0 is None and flows:
+        y0 = float(b["yield"]) / 100.0
+    return {"flows": flows, "price": price, "accr": accr, "y0": y0, "method": method, "face": face}
+
+
+def rot_matrix(k0, fpath, spread, fm, bond, betas, tax, today):
+    """Матрица сценарий x горизонт."""
+    rows = []
+    for key, name in ROT_SCN:
+        kn = rot_path(key, k0, fpath, today)
+        row = {"key": key, "name": name, "note": ROT_SCN_NOTE[key], "cells": [], "avail": kn is not None}
+        for T, lab in ROT_HORIZONS:
+            if kn is None:
+                row["cells"].append(None)
+                continue
+            fl = rot_tr_floater(kn, T, spread, tax)
+            fx = rot_tr_fixed(kn, T, fm["flows"], fm["price"], fm["accr"], betas, tax, fm["y0"]) if fm["flows"] else (
+                rot_tr_fixed_approx(kn, T, bond["yield"], (bond.get("dur") or 5.0) / (1 + bond["yield"] / 100.0), (bond.get("dur") or 5.0) ** 2, betas, tax))
+            row["cells"].append({"T": T, "fixed": None if fx is None else round(fx, 2), "float": round(fl, 2),
+                                 "diff": None if fx is None else round(fx - fl, 2),
+                                 "win": None if fx is None else ("fixed" if fx > fl else "float")})
+        rows.append(row)
+    return rows
+
+
+def rot_meeting_dates(meet, n, today):
+    """n ближайших заседаний ЦБ после сегодня; если календаря нет — ориентировочно каждые 6 недель."""
+    fut = [d for d in meet if d > today][:n]
+    approx = len(fut) < n
+    d0 = datetime.strptime(fut[-1] if fut else today, "%Y-%m-%d")
+    while len(fut) < n:
+        d0 += timedelta(days=42)
+        fut.append(d0.strftime("%Y-%m-%d"))
+    return fut, approx
+
+
+def rot_ladder(amount, n, mode, dates, d_fixed, d_float=ROT_FL_DUR):
+    """Модельный план: перекладка суммы во флоатерах в фикс траншами по заседаниям.
+    equal — равные доли; front — убывающие (n, n-1, ..., 1 долей). Возвращает список траншей с дюрацией портфеля после каждого."""
+    n = max(1, int(n))
+    wts = [float(n - i) for i in range(n)] if mode == "front" else [1.0] * n
+    s = sum(wts)
+    out, cum = [], 0.0
+    for d, w in zip(dates, wts):
+        part = w / s
+        cum += part
+        out.append({"date": d, "share": round(part * 100, 1), "rub": round(amount * part, 2), "cum_share": round(cum * 100, 1),
+                    "duration": round(cum * d_fixed + (1 - cum) * d_float, 2)})
+    return out
+
+
+def rot_fl_lag(r, kn, k0, today):
+    """Ожидаемые купоны флоатера на 12 месяцев вперёд с учётом лага фиксации.
+    КС: ставка купона фиксируется на начало периода; RUONIA: среднее за период, сдвинутое на ~7 дней назад.
+    Спред оценивается как текущий купон минус текущая ставка."""
+    c0 = r.get("coupon")
+    if c0 is None or not r.get("price"):
+        return None
+    base = r.get("fl_base")
+    ru = base == "ruonia" if base else r.get("kind") == "ofz"
+    P = 0.5 if r.get("kind") == "ofz" else 0.25
+    try:
+        nxt = (datetime.strptime(r["next"], "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days / 365.0
+    except Exception:  # noqa: BLE001
+        nxt = P
+    nxt = _rot_clamp(nxt, 0.0, P)
+    cps = [c0]
+    s = nxt
+    while s < 1.0 - 1e-9 and len(cps) < 8:
+        if ru:
+            a = max(0.0, s - ROT_RU_LAG)
+            dlt = rot_avg(kn, a, a + P) - k0
+        else:
+            dlt = rot_rate(kn, s) - k0
+        cps.append(c0 + dlt)
+        s += P
+    n = max(1, int(round(1.0 / P)))
+    use = cps[:n] if len(cps) >= n else cps
+    avg = sum(use) / len(use)
+    cy0 = c0 / r["price"] * 100.0
+    cyf = avg / r["price"] * 100.0
+    return {"id": r["id"], "isin": r.get("isin"), "name": r.get("name"), "link": r.get("fl_label") or ("RUONIA" if ru else "КС / RUONIA (не определено)"),
+            "coupon": round(c0, 2), "next": r.get("next"), "price": r.get("price"), "yield": r.get("yield"),
+            "future": [round(x, 2) for x in cps[1:4]], "avg12": round(avg, 2), "cy_now": round(cy0, 2), "cy_fwd": round(cyf, 2),
+            "delta": round(cyf - cy0, 2), "turn": r.get("turn")}
+
+
+def rot_payload(cfg, acc, q, force=False):
+    q = q or {}
+    snap, busy, err = rot_snapshot()
+    if snap is None:
+        return {"loading": bool(busy), "error": err} if err else {"loading": True}
+    k0 = snap.get("k0")
+    if k0 is None or not snap.get("ofz"):
+        msg = "; ".join(snap.get("errors") or []) or "нет данных о торгах ОФЗ или ключевой ставке"
+        with _rot_lock:
+            _rot_state["t"] = 0.0                      # следующая загрузка повторит попытку
+        return {"error": "Не удалось получить данные: " + msg}
+    today = date.today().isoformat()
+    spread = _rot_num(q.get("spread"), 0.0, 10.0, 2.0)
+    tax = q.get("tax") != "0"
+    betas = {"long": _rot_num(q.get("b_long"), 0.0, 1.5, ROT_BETA["long"]), "mid": _rot_num(q.get("b_mid"), 0.0, 1.5, ROT_BETA["mid"]),
+             "short": _rot_num(q.get("b_short"), 0.0, 1.5, ROT_BETA["short"])}
+    ofz = snap["ofz"]
+    bond = next((r for r in ofz if r["id"] == q.get("bond")), None) or rot_default_bond(ofz)
+    if bond is None:
+        return {"error": "Нет подходящих фиксированных ОФЗ в торгах."}
+    fm = rot_fixed_model(bond, today)
+    method = {"moex": "полная переоценка по графику купонов выпуска (Мосбиржа)",
+              "synth": "полная переоценка по расчётному графику (полугодовые купоны до погашения)",
+              "approx": "приближение: модифицированная дюрация и выпуклость"}[fm["method"]]
+    matrix = rot_matrix(k0, snap.get("fpath"), spread, fm, bond, betas, tax, today)
+    be = []
+    for T, lab in ROT_HORIZONS:
+        if fm["flows"]:
+            fn = lambda kn, TT: rot_tr_fixed(kn, TT, fm["flows"], fm["price"], fm["accr"], betas, tax, fm["y0"])
+        else:
+            md = (bond.get("dur") or 5.0) / (1 + bond["yield"] / 100.0)
+            fn = lambda kn, TT, md=md: rot_tr_fixed_approx(kn, TT, bond["yield"], md, md * md, betas, tax)
+        b = rot_breakeven(k0, T, spread, fn, tax)
+        be.append(dict(b, T=T, label=lab))
+    kb = snap.get("kbd") or []
+    interp = lambda y: _interp(kb, y) if kb else None
+    ind = rot_indicator(interp(10.0), interp(1.0), k0)
+    if ind:
+        ind.update(kbd10=round(interp(10.0), 2), kbd1=round(interp(1.0), 2), key=k0)
+    # лаг фиксации флоатеров
+    scn = q.get("scn") if q.get("scn") in dict(ROT_SCN) else ("cbr" if snap.get("fpath") else "smooth")
+    kn = rot_path(scn, k0, snap.get("fpath"), today) or rot_path("flat", k0)
+    lag = [x for x in (rot_fl_lag(r, kn, k0, today) for r in snap.get("floats") or []) if x]
+    # лесенка
+    amount = _rot_num(q.get("amount"), 0.0, 1e12, 1000000.0)
+    n = int(_rot_num(q.get("n"), 1, 12, 6))
+    mode = "front" if q.get("mode") == "front" else "equal"
+    dates, approx = rot_meeting_dates(snap.get("meet") or [], n, today)
+    d_fixed = bond.get("dur") or (rot_dur_conv(fm["flows"], fm["y0"])[0] if fm["flows"] and fm["y0"] is not None else 5.0)
+    ladder = rot_ladder(amount, n, mode, dates, d_fixed)
+    lst = [{"id": r["id"], "name": r["name"], "mat": r["mat"], "yield": r["yield"], "dur": r.get("dur"), "turn": r.get("turn")} for r in ofz
+           if r.get("mat") and (r.get("turn") or 0) > 0][:40]
+    if not any(x["id"] == bond["id"] for x in lst):
+        lst.insert(0, {"id": bond["id"], "name": bond["name"], "mat": bond["mat"], "yield": bond["yield"], "dur": bond.get("dur"), "turn": bond.get("turn")})
+    return {"loading": False, "today": today, "key_rate": k0, "forecast_src": snap.get("fsrc"), "forecast_ok": bool(snap.get("fpath")),
+            "spread": spread, "tax": tax, "betas": betas, "floor": ROT_FLOOR,
+            "bond": {"id": bond["id"], "name": bond["name"], "isin": bond.get("isin"), "mat": bond["mat"], "price": bond["price"], "yield": bond["yield"],
+                     "dur": bond.get("dur"), "coupon": bond.get("coupon"), "beta": rot_beta(max([f[0] for f in fm["flows"]] or [0]) if fm["flows"] else (bond.get("dur") or 5) * 1.5, betas)},
+            "bonds": lst, "method": method, "method_key": fm["method"], "horizons": [{"T": T, "label": l} for T, l in ROT_HORIZONS],
+            "scenarios": [{"key": k, "name": n_, "note": ROT_SCN_NOTE[k]} for k, n_ in ROT_SCN],
+            "matrix": matrix, "breakeven": be, "indicator": ind,
+            "lag": {"scn": scn, "rows": lag}, "ladder": {"rows": ladder, "amount": amount, "n": n, "mode": mode, "approx_dates": approx,
+                                                        "d_fixed": round(d_fixed, 2), "d_float": ROT_FL_DUR},
+            "errors": snap.get("errors") or []}
+
+
+# ── дюрационный разрыв по портфелю ──
+
+ROT_GAP_SCN = [("p+100", "Параллельно +100 б.п.", 1.0, None), ("p-100", "Параллельно −100 б.п.", -1.0, None),
+               ("p+300", "Параллельно +300 б.п.", 3.0, None), ("p-300", "Параллельно −300 б.п.", -3.0, None),
+               ("steep", "Крутизна: длинный конец +100 б.п.", 1.0, "long"), ("flat", "Выполаживание: длинный конец −100 б.п.", -1.0, "long")]
+
+
+def rot_value_change(mdur, conv, dy):
+    """Относительное изменение цены (дробью) при сдвиге доходности на dy (дробью): -D*dy + C*dy^2/2."""
+    return -mdur * dy + 0.5 * conv * dy * dy
+
+
+def rot_gap(rows, goal):
+    """Дюрационный разрыв и стресс-сценарии по строкам облигаций портфеля (value_rub, dur, mdur, convexity, ytm, floating)."""
+    items = []
+    for r in rows:
+        v = r.get("value_rub") or 0.0
+        if v <= 0:
+            continue
+        fl = bool(r.get("floating"))
+        md = ROT_FL_DUR if fl else (r.get("mdur") if r.get("mdur") is not None else
+                                    (r.get("dur") / (1 + (r.get("ytm") or 0) / 100.0) if r.get("dur") else None))
+        if md is None:
+            continue
+        cv = 0.0 if fl else (r.get("convexity") if r.get("convexity") is not None else md * md + md)
+        items.append({"name": r.get("name"), "v": v, "md": md, "cv": cv, "dur": ROT_FL_DUR if fl else (r.get("dur") or md), "fl": fl})
+    tot = sum(x["v"] for x in items)
+    if not tot:
+        return {"empty": True}
+    dur = sum(x["v"] * x["dur"] for x in items) / tot
+    mdur = sum(x["v"] * x["md"] for x in items) / tot
+    gap = dur - goal
+    kind, text = _risk_gap_text(gap)
+    sc = []
+    for key, name, dy, part in ROT_GAP_SCN:
+        d = 0.0
+        for x in items:
+            if x["fl"]:
+                continue
+            w = 1.0 if part is None else _rot_clamp((x["dur"] - 2.0) / 8.0, 0.0, 1.0)
+            d += x["v"] * rot_value_change(x["md"], x["cv"], dy * w / 100.0)
+        sc.append({"key": key, "name": name, "pct": d / tot * 100.0, "rub": d})
+    return {"empty": False, "value": tot, "duration": dur, "mdur": mdur, "goal": goal, "gap": gap, "gap_kind": kind, "gap_text": text,
+            "floating_share": sum(x["v"] for x in items if x["fl"]) / tot * 100.0, "scenarios": sc, "count": len(items)}
+
+
+def rot_gap_payload(cfg, acc, q, force=False):
+    q = q or {}
+    goal = _rot_num(q.get("horizon"), 0.1, 50.0, 3.0)
+    try:
+        rep = build_bonds(cfg, acc)
+    except Exception as e:  # noqa: BLE001
+        return {"empty": True, "error": "Позиции по облигациям недоступны: %s" % (str(e)[:120] or e.__class__.__name__)}
+    out = rot_gap((rep or {}).get("rows") or [], goal)
+    out["goal"] = goal
+    return out
+
+
+API_GET["/api/rot"] = rot_payload
+API_GET["/api/rot/gap"] = rot_gap_payload
+# ── долговой рынок: линкеры (ОФЗ-ИН), радар оферт, валютные облигации после налога ──
+# Все расчёты — модельные, не рекомендации. Источники: Мосбиржа (скринер), КБД, прогноз Банка России, отчётность РСБУ (ГИР БО), курсы ЦБ.
+
+DBX_LINKER_RE = re.compile(r"^SU52\d{3}")
+DBX_FIN_RE = re.compile(r"банк|страхов|\bНКО\b|лизинг|факторинг|микрофин|МФК|МКК|кредитн|ипотечн|коллектор|ломбард|финанс", re.I)
+DBX_OFFER_DAYS = 365
+DBX_MAX_ISSUERS = 60
+DBX_PACE = 0.25
+
+
+def _dbx_date(s):
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ── 1. линкеры ──
+
+def dbx_fisher(nominal_pct, real_pct):
+    """Инфляция безубыточности по Фишеру: (1+n)/(1+r)-1, в процентах; None если нет данных."""
+    if nominal_pct is None or real_pct is None:
+        return None
+    return ((1 + nominal_pct / 100.0) / (1 + real_pct / 100.0) - 1) * 100.0
+
+
+def dbx_avg_forecast(yearly, dur, today=None):
+    """Средняя прогнозная инфляция на горизонте dur лет: годы из прогноза взвешены днями пересечения, дальше — последнее значение.
+    -> (значение %, источник 'cbr'|'assumed'). Без прогноза — допущение 4 % (цель Банка России)."""
+    today = today or date.today()
+    pts = {int(y["year"]): y["mid"] for y in (yearly or []) if y.get("mid") is not None}
+    if not pts or not dur or dur <= 0:
+        return 4.0, "assumed"
+    end = today + timedelta(days=int(dur * 365.25))
+    last = pts[max(pts)]
+    tot = acc = 0.0
+    y = today.year
+    while y <= end.year:
+        a, b = max(today, date(y, 1, 1)), min(end, date(y, 12, 31))
+        days = (b - a).days + 1
+        if days > 0:
+            acc += days * pts.get(y, last)
+            tot += days
+        y += 1
+    return (acc / tot if tot else last), "cbr"
+
+
+def dbx_linkers():
+    rows = [r for r in screener_rows() if r.get("kind") == "ofz" and DBX_LINKER_RE.match(r.get("id") or "")]
+    try:
+        fc = inflation_forecast()
+    except Exception:  # noqa: BLE001
+        fc = {"source": "none", "yearly": []}
+    out = []
+    for r in rows:
+        d = r.get("dur")
+        if not d:
+            continue
+        nom = kbd_at(d)
+        be = dbx_fisher(nom, r["yield"])
+        fcv, src = dbx_avg_forecast(fc.get("yearly"), d)
+        out.append({"id": r["id"], "name": r["name"], "isin": r.get("isin"), "mat": r["mat"], "price": r["price"], "real": r["yield"], "dur": d,
+                    "nominal": round(nom, 2) if nom is not None else None, "be": round(be, 2) if be is not None else None,
+                    "diff": round(nom - r["yield"], 2) if nom is not None else None, "fc": round(fcv, 2), "fc_src": src,
+                    "gap": round(be - fcv, 2) if be is not None else None, "turn": r.get("turn")})
+    out.sort(key=lambda x: x["dur"])
+    return {"rows": out, "forecast": {"source": fc.get("source"), "as_of": fc.get("as_of"), "url": fc.get("url"), "yearly": fc.get("yearly")},
+            "updated": time.time()}
+
+
+def dbx_api_linkers(cfg, acc, q, force):
+    try:
+        return dbx_linkers()
+    except Exception as e:  # noqa: BLE001
+        return {"error": "Не удалось получить данные Мосбиржи: %s" % str(e)[:140], "rows": []}
+
+
+# ── 2. радар оферт ──
+
+def dbx_grade(ratio, is_fin=False):
+    """Оценка покрытия оферты деньгами эмитента. ratio = (деньги + краткосрочные вложения) / объём выпуска."""
+    if is_fin:
+        return "na", "показатель неприменим"
+    if ratio is None:
+        return "nodata", "нет данных"
+    if ratio >= 1.0:
+        return "high", "покрытие высокое"
+    if ratio >= 0.4:
+        return "mid", "покрытие среднее"
+    return "low", "покрытие низкое"
+
+
+def dbx_offer_candidates(rows, today=None, days=DBX_OFFER_DAYS):
+    today = today or date.today()
+    lim = today + timedelta(days=days)
+    out = []
+    for r in rows:
+        if r.get("kind") != "corp" or r.get("cur") != "RUB" or not r.get("offer"):
+            continue
+        d = _dbx_date(r["offer"])
+        if d and today <= d <= lim:
+            out.append(dict(r, _od=d))
+    out.sort(key=lambda r: r["_od"])
+    return out
+
+
+_dbx_off = {"state": "idle", "done": 0, "total": 0, "rows": [], "t": 0, "capped": 0}
+_dbx_lock = threading.Lock()
+
+
+def _dbx_volume(r):
+    """Объём выпуска в рублях (по номиналу): число бумаг в обращении, иначе объём выпуска Мосбиржи. -> (руб, метод)."""
+    nom = r.get("nominal") or 1000
+    try:
+        o = bond_outstanding(r.get("isin"))
+        if o and o.get("qty"):
+            return o["qty"] * nom, "в обращении"
+    except Exception:  # noqa: BLE001
+        pass
+    if r.get("size"):
+        return r["size"] * nom, "объём выпуска"
+    return None, None
+
+
+def dbx_offer_work(cands):
+    job = _dbx_off
+    try:
+        byid = {r["id"]: r for r in cands}
+        for it in job["rows"]:
+            try:
+                em = issuer_of(it["isin"]) if it.get("isin") else None
+            except Exception:  # noqa: BLE001
+                em = None
+            it["inn"] = (em or {}).get("inn")
+            it["issuer"] = (em or {}).get("title") or (em or {}).get("short") or it["name"]
+            it["is_fin"] = bool(DBX_FIN_RE.search(it["issuer"] or "") or DBX_FIN_RE.search(it.get("full") or ""))
+            it["volume"], it["vol_how"] = _dbx_volume(byid[it["id"]])
+            time.sleep(DBX_PACE / 2)
+        fin_inn = []
+        for it in job["rows"]:
+            if it.get("inn") and not it["is_fin"] and it["inn"] not in fin_inn:
+                fin_inn.append(it["inn"])
+        job["capped"] = max(0, len(fin_inn) - DBX_MAX_ISSUERS)
+        use = fin_inn[:DBX_MAX_ISSUERS]
+        job["total"] = len(use)
+        info = {}
+        for inn in use:
+            try:
+                f = issuer_fin(inn)
+                y = (f.get("years") or [None])[-1] if f.get("status") == "ok" else None
+                info[inn] = {"cash": y.get("cash") if y else None, "year": y.get("y") if y else None, "status": f.get("status"), "note": f.get("note")}
+            except Exception as e:  # noqa: BLE001
+                info[inn] = {"cash": None, "year": None, "status": "err", "note": str(e)[:80]}
+            job["done"] += 1
+            time.sleep(DBX_PACE)
+        dbx_offer_fill(job["rows"], info, set(use))
+    except Exception as e:  # noqa: BLE001
+        job["error"] = str(e)[:160]
+    job["state"] = "done"
+    job["t"] = time.time()
+
+
+def dbx_offer_fill(items, info, used=None):
+    """Покрытие считается по эмитенту: все оферты эмитента в горизонте суммируются (деньги одни на все выпуски).
+    cash — млн ₽ (деньги 1250 + краткосрочные вложения 1240, последний год РСБУ), volume — ₽."""
+    tot = {}
+    for it in items:
+        if it.get("volume"):
+            k = it.get("inn") or it["id"]
+            tot[k] = tot.get(k, 0) + it["volume"]
+    for it in items:
+        inn = it.get("inn")
+        i = info.get(inn) if inn else None
+        it["cash"] = i["cash"] if i else None
+        it["fin_year"] = i["year"] if i else None
+        it["fin_note"] = (i or {}).get("note")
+        vol, all_vol = it.get("volume"), tot.get(inn or it["id"])
+        it["cover"] = (it["cash"] * 1e6 / vol) if it["cash"] is not None and vol else None
+        it["cover_all"] = (it["cash"] * 1e6 / all_vol) if it["cash"] is not None and all_vol else None
+        it["issuer_total"] = all_vol
+        it["grade"], it["grade_label"] = dbx_grade(it["cover_all"], it.get("is_fin"))
+        if used is not None and inn and inn not in used and not it.get("is_fin"):
+            it["fin_note"] = "Лимит запуска (%d эмитентов): отчётность не запрашивалась." % DBX_MAX_ISSUERS
+
+
+def dbx_offers(force=False):
+    with _dbx_lock:
+        j = _dbx_off
+        if j["state"] == "run":
+            return dbx_offer_payload()
+        if j["state"] == "done" and not force and time.time() - j["t"] < 6 * 3600:
+            return dbx_offer_payload()
+        try:
+            cands = dbx_offer_candidates(screener_rows())
+        except Exception as e:  # noqa: BLE001
+            return {"error": "Не удалось получить данные Мосбиржи: %s" % str(e)[:140], "rows": []}
+        j.update(state="run", done=0, total=0, capped=0, t=time.time(), error=None)
+        j["rows"] = [{"id": r["id"], "isin": r.get("isin"), "name": r["name"], "full": r.get("full"), "offer": r["offer"], "mat": r["mat"],
+                      "price": r["price"], "yield": r["yield"], "nominal": r.get("nominal"), "grade": "loading", "grade_label": "считаю…"}
+                     for r in cands]
+        threading.Thread(target=dbx_offer_work, args=(cands,), daemon=True).start()
+        return dbx_offer_payload()
+
+
+def dbx_offer_payload():
+    j = _dbx_off
+    return {"pending": j["state"] == "run", "done": j["done"], "total": j["total"], "rows": j["rows"], "capped": j["capped"],
+            "error": j.get("error"), "updated": j["t"]}
+
+
+# ── 3. валютные облигации после налога ──
+
+def dbx_xirr(flows):
+    """Годовая эффективная ставка по потокам [(date, сумма)]; None, если знаки не меняются."""
+    if not flows or not any(a < 0 for _, a in flows) or not any(a > 0 for _, a in flows):
+        return None
+    t0 = flows[0][0]
+
+    def npv(r):
+        return sum(a / (1 + r) ** ((d - t0).days / 365.0) for d, a in flows)
+    lo, hi = -0.95, 10.0
+    if npv(lo) * npv(hi) > 0:
+        return None
+    for _ in range(100):
+        mid = (lo + hi) / 2
+        if npv(lo) * npv(mid) <= 0:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def dbx_coupon_dates(today, mat, freq):
+    """Даты купонов назад от погашения шагом 12/freq месяцев; только после today."""
+    step = max(1, int(round(12.0 / max(1, freq))))
+    out, k = [], 0
+    while k < 400:
+        y, mo = divmod(mat.year * 12 + mat.month - 1 - k * step, 12)
+        mo += 1
+        ml = [31, 29 if (y % 4 == 0 and (y % 100 or y % 400 == 0)) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1]
+        d = date(y, mo, min(mat.day, ml))
+        if d <= today:
+            break
+        out.append(d)
+        k += 1
+    return sorted(out)
+
+
+def dbx_fx_calc(p, today=None):
+    """Модель: p = {nominal, price (% номинала), coupon (% годовых), freq, mat, buy_fx, qty, nkd (в валюте на бумагу), other (прочий налоговый доход года, ₽),
+    scenarios [% изменения курса к сегодня на дату погашения]}. Курс идёт линейно от buy_fx к сценарному. База: купоны по курсу на дату выплаты +
+    (погашение по курсу на дату − цена покупки по курсу на дату покупки − НКД). Ставка — прогрессивная НДФЛ по году погашения."""
+    today = today or date.today()
+    mat = p["mat"]
+    if mat <= today:
+        raise ValueError("Дата погашения должна быть в будущем")
+    q, nom, fx0 = p["qty"], p["nominal"], p["buy_fx"]
+    cost_cur = (nom * p["price"] / 100.0 + p.get("nkd", 0.0)) * q
+    cpn_cur = nom * p["coupon"] / 100.0 / p["freq"] * q
+    dates = dbx_coupon_dates(today, mat, p["freq"])
+    span = float((mat - today).days)
+    res = []
+    for s in p["scenarios"]:
+        fxm = fx0 * (1 + s / 100.0)
+
+        def fx_at(d, fxm=fxm):
+            return fx0 + (fxm - fx0) * ((d - today).days / span)
+        cpn_rub = sum(cpn_cur * fx_at(d) for d in dates)
+        red_cur = nom * q
+        red_rub = red_cur * fxm
+        cost_rub = cost_cur * fx0
+        base = cpn_rub + red_rub - cost_rub
+        other = p.get("other", 0.0)
+        tax = max(0.0, tx_ndfl(other + max(0.0, base), mat.year)[0] - tx_ndfl(other, mat.year)[0])
+        flows_c = [(today, -cost_cur)] + [(d, cpn_cur) for d in dates] + [(mat, red_cur)]
+        flows_r = [(today, -cost_rub)] + [(d, cpn_cur * fx_at(d)) for d in dates] + [(mat, red_rub)]
+        post_c = dbx_xirr(flows_c[:-1] + [(mat, red_cur - tax / fxm)])
+        post_r = dbx_xirr(flows_r[:-1] + [(mat, red_rub - tax)])
+        pre_c, pre_r = dbx_xirr(flows_c), dbx_xirr(flows_r)
+        profit_c = cpn_cur * len(dates) + red_cur - cost_cur
+        rd = lambda x: None if x is None else round(x * 100, 2)      # noqa: E731
+        res.append({"scenario": s, "fx_mat": round(fxm, 4), "profit_cur": round(profit_c, 2), "base_rub": round(base, 2), "tax_rub": round(tax, 2),
+                    "tax_rate": round(tax / base, 4) if base > 0 else 0.0, "tax_cur": round(tax / fxm, 2),
+                    "pre_cur": rd(pre_c), "post_cur": rd(post_c), "pre_rub": rd(pre_r), "post_rub": rd(post_r),
+                    "trap": bool(tax > 0 and profit_c <= 0.02 * cost_cur)})
+    return {"cost_cur": round(cost_cur, 2), "cost_rub": round(cost_cur * fx0, 2), "n_coupons": len(dates), "coupon_cur": round(cpn_cur, 2),
+            "scenarios": res, "mat": mat.isoformat(), "year": mat.year}
+
+
+def dbx_api_fxbonds(cfg, acc, q, force):
+    try:
+        rows = [r for r in screener_rows() if r.get("cur") not in ("RUB", None)]
+    except Exception as e:  # noqa: BLE001
+        return {"error": "Не удалось получить данные Мосбиржи: %s" % str(e)[:140], "rows": []}
+    rows.sort(key=lambda r: (r["cur"], r["mat"]))
+    return {"rows": [{k: r.get(k) for k in ("id", "name", "isin", "cur", "nominal", "price", "yield", "coupon", "mat", "kind")} for r in rows]}
+
+
+def _dbx_f(q, k, d=None):
+    try:
+        v = str(q.get(k, "")).replace(",", ".").strip()
+        return float(v) if v != "" else d
+    except ValueError:
+        return d
+
+
+def dbx_api_fx(cfg, acc, q, force):
+    try:
+        cur = (q.get("cur") or "USD").upper()
+        mat = _dbx_date(q.get("mat"))
+        if not mat:
+            return {"error": "Укажите дату погашения (ГГГГ-ММ-ДД)."}
+        fx_now = tax_cbr_rate(cur, date.today().isoformat())
+        buy = _dbx_f(q, "buy_fx", None) or fx_now
+        if not buy:
+            return {"error": "Курс ЦБ недоступен — введите курс покупки вручную.", "fx_now": None}
+        sc = [float(x.replace(",", ".")) for x in (q.get("scenarios") or "-20,-10,0,10,20,40").split(",") if x.strip()][:12]
+        p = {"nominal": _dbx_f(q, "nominal", 1000.0), "price": _dbx_f(q, "price", 100.0), "coupon": _dbx_f(q, "coupon", 0.0),
+             "freq": max(1, min(12, int(_dbx_f(q, "freq", 2)))), "mat": mat, "buy_fx": buy, "qty": max(1.0, _dbx_f(q, "qty", 1.0)),
+             "nkd": _dbx_f(q, "nkd", 0.0), "other": _dbx_f(q, "other", 0.0), "scenarios": sc}
+        if p["nominal"] <= 0 or p["price"] <= 0:
+            return {"error": "Номинал и цена должны быть положительными."}
+        out = dbx_fx_calc(p)
+        out.update(cur=cur, fx_now=fx_now, buy_fx=buy)
+        return out
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:160] or "Ошибка расчёта"}
+
+
+API_GET["/api/dbx/linkers"] = dbx_api_linkers
+API_GET["/api/dbx/offers"] = lambda cfg, acc, q, force: dbx_offers(force)
+API_GET["/api/dbx/fxbonds"] = dbx_api_fxbonds
+API_GET["/api/dbx/fx"] = dbx_api_fx
+# ═══════════════════════════ деньги и базис: фонды ликвидности и базис фьючерсов (cash & carry) ═══════════════════════════
+# Фонды ликвидности: дневные цены паёв (свечи ISS) -> реализованная доходность в годовом выражении, отставание от ставки RUSFAR
+# (или ключевой), доходность после НДФЛ для заданного срока. Базис: фьючерсы FORTS (ISS) против спота; дивиденды до экспирации.
+# Все числа — модельные оценки по заявленным допущениям; процентные значения — в процентных пунктах (12.5 = 12,5 %).
+# Эндпоинты: /api/mm/funds, /api/mm/basis. Префикс имён mm_ / MM_.
+
+MM_WINDOWS = (("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365))
+MM_FUND_SEED = ("LQDT", "SBMM", "AKMM", "TMON", "AKMP", "BCSD", "FMMM", "MONY", "OLIQ", "PSMM", "CASH", "FINC", "TSAV", "AMNR", "SILA", "SCLI", "GOOD")
+MM_FUND_IN = re.compile(r"денеж|ликвид|сберегат|накопит|ежедневн", re.I)
+MM_FUND_OUT = re.compile(r"юан|золот|валют|долл|евро|облиг|usd|cny", re.I)
+MM_OZ_G = 31.1034768                                   # граммов в тройской унции
+MM_ISS = "https://iss.moex.com/iss/"
+MM_BASIS_TTL = 600
+MM_BASIS_SANITY = 15.0                                 # |базис| больше стольких % — единицы не сошлись, строка скрывается
+MM_UNDERLYINGS = (
+    {"asset": ("SBRF",), "name": "Сбербанк (акции)", "kind": "share", "spot": "SBER"},
+    {"asset": ("GAZR",), "name": "Газпром (акции)", "kind": "share", "spot": "GAZP"},
+    {"asset": ("LKOH",), "name": "Лукойл (акции)", "kind": "share", "spot": "LKOH"},
+    {"asset": ("GOLD",), "name": "Золото (унция)", "kind": "gold", "spot": "GLDRUB_TOM"},
+    {"asset": ("Si",), "name": "Доллар США", "kind": "fx", "spot": "USD000UTSTOM"},
+    {"asset": ("CNY", "CR"), "name": "Юань", "kind": "fx", "spot": "CNYRUB_TOM"},
+)
+MM_NOTE_FUNDS = ("Доходность считается по изменению цены пая (фонды ликвидности накапливают доход в цене и выплат не делают). "
+                 "Отставание от ставки включает комиссии фонда и проскальзывание, а также разницу между ставкой RUSFAR и фактической доходностью портфеля фонда; "
+                 "отдельно размер комиссий программа не определяет. Прошлая доходность не гарантирует будущую.")
+MM_NOTE_BASIS = ("Модель: покупка базового актива и продажа фьючерса, удержание до экспирации. Не учтены комиссии, налоги, проскальзывание, "
+                 "ставка по обеспечению и риск изменения гарантийного обеспечения; дивиденды — только уже объявленные (дата отсечки до экспирации). "
+                 "Доходность на капитал с обеспечением консервативно считает, что гарантийное обеспечение (ГО) вносится сверх стоимости актива.")
+
+
+def mm_f(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if x == x and x not in (float("inf"), float("-inf")) else None
+
+
+def mm_d(s):
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+# ── расчёты (чистые функции) ──
+
+def mm_ann(p0, p1, days):
+    """Годовая доходность по росту цены, %: (P1/P0)^(365/дни) − 1. Дневная капитализация подразумевается самим законом роста цены."""
+    if not p0 or not p1 or p0 <= 0 or p1 <= 0 or not days or days <= 0:
+        return None
+    return ((p1 / p0) ** (365.0 / days) - 1) * 100
+
+
+def mm_window_return(closes, days, max_gap=7):
+    """closes — [(ISO-дата, цена)] по возрастанию. Окно в days календарных дней, оканчивающееся последней точкой.
+    Начальная точка — последнее закрытие не позже (конец − days); если истории не хватает (первая точка позже этой даты
+    больше чем на max_gap дней) — None. Возвращает {ret, total, days, start, end} (ret — годовая, %)."""
+    pts = [(mm_d(d), p) for d, p in closes if mm_d(d) and mm_f(p)]
+    if len(pts) < 2:
+        return None
+    end_d, p1 = pts[-1]
+    target = end_d - timedelta(days=days)
+    p0 = None
+    for d, p in pts:
+        if d <= target:
+            p0 = (d, p)
+        else:
+            break
+    if p0 is None:
+        first = pts[0]
+        if (first[0] - target).days > max_gap or first[0] >= end_d:
+            return None
+        p0 = first
+    d0, v0 = p0
+    n = (end_d - d0).days
+    if n < max(5, days // 3):
+        return None
+    return {"ret": mm_ann(v0, p1, n), "total": (p1 / v0 - 1) * 100, "days": n, "start": d0.isoformat(), "end": end_d.isoformat()}
+
+
+def mm_rate_factor(rates, d0, d1):
+    """Накопленный множитель при размещении по ставке (% годовых, ежедневная капитализация на календарный день) от d0 (искл.) до d1 (вкл.).
+    rates — [(ISO-дата, ставка %)] по возрастанию; между точками ставка переносится вперёд. None — ставки на d0 нет в данных."""
+    rs = [(mm_d(d), mm_f(v)) for d, v in rates]
+    rs = [(d, v) for d, v in rs if d and v is not None]
+    if not rs or rs[0][0] > d0 + timedelta(days=7):
+        return None
+    j, cur, f, d = 0, rs[0][1], 1.0, d0
+    while j < len(rs) and rs[j][0] <= d0:
+        cur = rs[j][1]
+        j += 1
+    while d < d1:
+        d += timedelta(days=1)
+        while j < len(rs) and rs[j][0] <= d:
+            cur = rs[j][1]
+            j += 1
+        f *= 1 + cur / 100.0 / 365.0
+    return f
+
+
+def mm_bench_ann(rates, d0, d1):
+    """Годовая доходность ставки за окно [d0, d1] с ежедневной капитализацией, %."""
+    n = (d1 - d0).days
+    f = mm_rate_factor(rates, d0, d1)
+    if f is None or n <= 0:
+        return None
+    return (f ** (365.0 / n) - 1) * 100
+
+
+def mm_gap(fund_ann, bench_ann):
+    """Отставание от ставки, п.п.: доходность фонда минус ставка (отрицательное — фонд отстаёт). Неявные издержки (комиссия, проскальзывание)."""
+    if fund_ann is None or bench_ann is None:
+        return None
+    return fund_ann - bench_ann
+
+
+def mm_after_tax(amount, days, gross_ann, fee_pct=0.0, year=None):
+    """Результат вложения amount ₽ на days календарных дней при годовой доходности gross_ann (эффективная, %).
+    Комиссия брокера fee_pct % берётся с оборота покупки и продажи; налог по tx_ndfl (13 %, 15 % с превышения порога) с дохода
+    после вычета комиссий; ЛДВ — если срок больше трёх лет: освобождается доход до 3 млн ₽ за каждый полный год владения (приближённо)."""
+    if not amount or amount <= 0 or not days or days <= 0 or gross_ann is None or gross_ann <= -100:
+        return None
+    year = year or date.today().year
+    f = max(0.0, fee_pct or 0.0) / 100.0
+    invested = amount / (1 + f)
+    proceeds = invested * (1 + gross_ann / 100.0) ** (days / 365.0)
+    sell_fee = proceeds * f
+    base = proceeds - sell_fee - amount
+    full_years = days // 365
+    ldv = days > 3 * 365
+    exempt = 3e6 * full_years if ldv else 0.0
+    taxable = max(0.0, base - exempt)
+    tax = tx_ndfl(taxable, year)[0]
+    net = proceeds - sell_fee - tax
+    net_total = net / amount - 1
+    ann = ((net / amount) ** (365.0 / days) - 1) * 100 if net > 0 else None
+    return {"amount": amount, "days": days, "gross_gain": proceeds - invested, "fees": (amount - invested) + sell_fee, "tax": tax,
+            "net_gain": net - amount, "net_total_pct": net_total * 100, "net_ann": ann, "ldv": ldv, "ldv_exempt": min(exempt, max(0.0, base))}
+
+
+def mm_contract_rub(price, step_price, min_step):
+    """Стоимость контракта в рублях по котировке: цена × (стоимость шага / шаг цены). Для акций это сама цена (шаг 1 ₽ = 1 ₽),
+    для юаня (шаг 0,001 = 1 ₽) — цена × 1000, для золота и Si — через курс, заложенный биржей в стоимость шага."""
+    p, sp, ms = mm_f(price), mm_f(step_price), mm_f(min_step)
+    if p is None or not sp or not ms:
+        return None
+    return p * sp / ms
+
+
+def mm_basis(fut_rub, lot, spot_unit, days, divs=0.0, margin=None):
+    """Cash & carry: купить lot единиц базового актива по spot_unit ₽ за единицу и продать фьючерс (fut_rub ₽ за контракт).
+    divs — ожидаемые дивиденды на единицу до экспирации. Базис = F − S·lot; доходность годовых по простой формуле (F/S − 1)·365/дни.
+    Доходность на капитал с ГО: прибыль / (стоимость актива + ГО)."""
+    if not fut_rub or not lot or not spot_unit or not days or days <= 0 or spot_unit <= 0:
+        return None
+    f_unit = fut_rub / lot
+    spot_val = spot_unit * lot
+    basis = fut_rub - spot_val
+    basis_pct = (f_unit / spot_unit - 1) * 100
+    k = 365.0 / days
+    raw_ann = basis_pct * k
+    div_total = (divs or 0.0) * lot
+    pnl = basis + div_total
+    adj_ann = pnl / spot_val * 100 * k
+    cap = spot_val + (margin or 0.0)
+    roc_ann = pnl / cap * 100 * k if margin else None
+    return {"f_unit": f_unit, "spot_unit": spot_unit, "basis": basis, "basis_pct": basis_pct, "ann_raw": raw_ann, "div_unit": divs or 0.0,
+            "div_total": div_total, "ann_adj": adj_ann, "pnl": pnl, "capital": cap, "ann_roc": roc_ann, "days": days}
+
+
+# ── фонды: поиск, история, ставки ──
+
+def mm_fund_names():
+    """{тикер: название} кандидатов по названию в списке бумаг ISS (фонды денежного рынка, рублёвые), кэш на сутки; при сбое — известные тикеры."""
+    key = "mm_fund_names_v1"
+    hit = store().get(key, 24 * 3600)
+    if hit:
+        return hit
+    out = {}
+    try:
+        j = json.loads(http_text(MM_ISS + "engines/stock/markets/shares/securities.json?iss.meta=off&iss.only=securities&securities.columns=SECID,SECNAME,SHORTNAME", timeout=40))
+        for r in _iss_table(j, "securities"):
+            sid, nm = r.get("SECID") or "", r.get("SECNAME") or ""
+            if sid and len(sid) <= 5 and not sid.startswith("RU0") and MM_FUND_IN.search(nm) and not MM_FUND_OUT.search(nm):
+                out[sid] = nm
+            elif sid in MM_FUND_SEED:
+                out[sid] = nm or sid
+    except Exception:  # noqa: BLE001
+        return {s: s for s in MM_FUND_SEED[:4]}
+    for s in MM_FUND_SEED[:4]:
+        out.setdefault(s, s)
+    if out:
+        store().put(key, out)
+    return out
+
+
+def mm_rate_series():
+    """(rusfar, key): RUSFAR [(дата, %)] и ключевая ставка [(дата, %)]; недоступное — []."""
+    rf, kr = [], []
+    try:
+        rf = sorted(bench_history("RUSFAR", (date.today() - timedelta(days=430)).isoformat()).items())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        kr = [(d, v) for d, v in key_rate_series()]
+    except Exception:  # noqa: BLE001
+        pass
+    return rf, kr
+
+
+def mm_fund_row(secid, name):
+    try:
+        cs = stock_candles(secid, 24, 400)
+    except Exception:  # noqa: BLE001
+        return None
+    closes = [(c["t"], c["c"]) for c in cs if c.get("c")]
+    if len(closes) < 10:
+        return None
+    return {"secid": secid, "name": name, "closes": closes}
+
+
+def mm_funds_base():
+    """Тяжёлая часть (сеть): список фондов с доходностями по окнам и отставанием от ставки. Кэш в памяти 10 минут."""
+    key = ("mm_funds_base",)
+    hit = mem_get(key, 600)
+    if hit is not None:
+        return hit
+    with key_lock("mm_funds_base"):
+        hit = mem_get(key, 600)
+        if hit is not None:
+            return hit
+        names = mm_fund_names()
+        rows = [r for r in pool_map(lambda kv: mm_fund_row(kv[0], kv[1]), sorted(names.items()), workers=6) if r]
+        rf, kr = mm_rate_series()
+        out = []
+        for r in rows:
+            last = mm_d(r["closes"][-1][0])
+            if not last or (date.today() - last).days > 10:
+                continue
+            wins = {}
+            for wk, n in MM_WINDOWS:
+                w = mm_window_return(r["closes"], n)
+                if w and w["ret"] is not None:
+                    d0, d1 = mm_d(w["start"]), mm_d(w["end"])
+                    b_rf, b_kr = mm_bench_ann(rf, d0, d1), mm_bench_ann(kr, d0, d1)
+                    b, bn = (b_rf, "RUSFAR") if b_rf is not None else (b_kr, "ключевая ставка")
+                    w.update(bench=b, bench_name=bn if b is not None else None, gap=mm_gap(w["ret"], b),
+                             key=b_kr, rusfar=b_rf)
+                wins[wk] = w
+            if not any(wins.values()):
+                continue
+            out.append({"secid": r["secid"], "name": r["name"], "last": r["closes"][-1][1], "last_date": r["closes"][-1][0], "wins": wins})
+        out.sort(key=lambda x: -((x["wins"].get("3m") or {}).get("ret") or -999))
+        return mem_put(key, {"funds": out, "rusfar": rf[-1][1] if rf else None, "rusfar_date": rf[-1][0] if rf else None,
+                             "key": kr[-1][1] if kr else None, "key_date": kr[-1][0] if kr else None})
+
+
+def mm_funds_payload(q):
+    def num(k, d, lo, hi):
+        v = mm_f(str(q.get(k, "")).replace(",", "."))
+        return d if v is None else max(lo, min(hi, v))
+    amount = num("amount", 1000000.0, 1000.0, 1e10)
+    days = int(num("days", 365, 1, 3650))
+    fee = num("fee", 0.0, 0.0, 5.0)
+    win = q.get("win") if q.get("win") in ("1m", "3m", "6m", "1y") else "3m"
+    base = mm_funds_base()
+    funds = base["funds"]
+    if not funds:
+        return {"error": "Не удалось загрузить историю цен фондов с Мосбиржи. Повторите позже.", "funds": []}
+    fund = (q.get("fund") or "").strip().upper()
+    sel = next((f for f in funds if f["secid"] == fund), None) or next((f for f in funds if f["secid"] == "LQDT"), funds[0])
+    key_now = base["key"]
+    save = num("save", (key_now - 2.0) if key_now is not None else 10.0, 0.0, 100.0)
+    year = date.today().year
+    fw = (sel["wins"].get(win) or next((w for w in sel["wins"].values() if w), None))
+    cmp_rows = []
+
+    def add(kind, title, gross, note=""):
+        at = mm_after_tax(amount, days, gross, fee if kind in ("fund", "ofz") else 0.0, year) if gross is not None else None
+        cmp_rows.append({"kind": kind, "title": title, "gross": gross, "after": at, "note": note})
+
+    if fw:
+        add("fund", "Фонд %s (доходность за %s)" % (sel["secid"], {"1m": "месяц", "3m": "3 месяца", "6m": "6 месяцев", "1y": "год"}[win]), fw["ret"],
+            "реализованная доходность, прошлое не гарантирует будущее")
+    add("save", "Накопительный счёт (ставка введена вами)", save, "ставка принята эффективной годовой; необлагаемый лимит процентов не учтён")
+    for y in (0.25, 0.5, 1.0):
+        v = None
+        for _ in range(2):
+            try:
+                v = kbd_at(y)
+            except Exception:  # noqa: BLE001
+                v = None
+            if v is not None:
+                break
+        add("ofz", "ОФЗ со сроком до %s г. (кривая бескупонной доходности)" % ("%g" % y).replace(".", ","), v,
+            "ориентир по КБД: реальные выпуски торгуются с отклонением; купонный доход и цена облагаются так же")
+    if base["rusfar"] is not None:
+        add("rate", "Ставка RUSFAR (ориентир)", base["rusfar"], "не инструмент: показывает уровень денежного рынка")
+    if key_now is not None:
+        add("rate", "Ключевая ставка (ориентир)", key_now, "не инструмент")
+    # ставки-ориентиры без комиссии
+    return {"funds": [{"secid": f["secid"], "name": f["name"], "last": f["last"], "last_date": f["last_date"], "wins": f["wins"]} for f in funds],
+            "selected": sel["secid"], "win": win, "amount": amount, "days": days, "fee": fee, "save": save,
+            "rusfar": base["rusfar"], "rusfar_date": base["rusfar_date"], "key": key_now, "key_date": base["key_date"],
+            "compare": cmp_rows, "note": MM_NOTE_FUNDS, "ldv_note": "Льгота долгосрочного владения (ЛДВ) применяется при владении более трёх лет, до 3 млн ₽ дохода за каждый полный год; "
+                                                                      "выше порога годового дохода (в 2025 и позже — 2,4 млн ₽) налог 15 % вместо 13 %."}
+
+
+# ── базис фьючерсов ──
+
+def mm_pick_price(md):
+    """Цена контракта из marketdata: LAST при наличии сделок сегодня, иначе расчётная цена, иначе None. Возвращает (цена, источник)."""
+    last, settle, vol = mm_f(md.get("LAST")), mm_f(md.get("SETTLEPRICE")), mm_f(md.get("VOLTODAY")) or 0
+    if last and vol > 0:
+        return last, "последняя сделка"
+    if settle:
+        return settle, "расчётная цена"
+    return None, None
+
+
+def mm_nearest(secs, md, assets, today):
+    """Два ближайших ещё не истёкших срочных контракта по коду актива -> [{secid, expiry, ...}]."""
+    rows = []
+    for s in secs:
+        if s.get("ASSETCODE") not in assets:
+            continue
+        exp = mm_d(s.get("LASTTRADEDATE"))
+        if not exp or exp.year > 2090 or exp <= today:
+            continue
+        m = md.get(s.get("SECID")) or {}
+        price, src = mm_pick_price(m)
+        if price is None:
+            price, src = mm_f(s.get("PREVSETTLEPRICE")), "прошлая расчётная цена"
+        rows.append({"secid": s["SECID"], "short": s.get("SHORTNAME") or s["SECID"], "expiry": exp, "price": price, "src": src,
+                     "lot": mm_f(s.get("LOTVOLUME")), "margin": mm_f(s.get("INITIALMARGIN")), "step_price": mm_f(s.get("STEPPRICE")),
+                     "min_step": mm_f(s.get("MINSTEP")), "oi": mm_f(m.get("OPENPOSITION"))})
+    rows.sort(key=lambda r: r["expiry"])
+    return rows[:2]
+
+
+def mm_spots():
+    """Спот: {тикер: цена ₽} — акции TQBR и валютная секция (CETS: USD000UTSTOM, CNYRUB_TOM, GLDRUB_TOM за грамм)."""
+    out = {}
+    try:
+        for r in stocks_universe():
+            if r["secid"] in ("SBER", "GAZP", "LKOH"):
+                out[r["secid"]] = r["price"]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        j = json.loads(http_text(MM_ISS + "engines/currency/markets/selt/boards/CETS/securities.json?iss.meta=off&iss.only=marketdata"
+                                 "&marketdata.columns=SECID,LAST,WAPRICE,MARKETPRICE", timeout=30))
+        for r in _iss_table(j, "marketdata"):
+            if r["SECID"] in ("USD000UTSTOM", "CNYRUB_TOM", "GLDRUB_TOM"):
+                v = mm_f(r.get("LAST")) or mm_f(r.get("MARKETPRICE")) or mm_f(r.get("WAPRICE"))
+                if v:
+                    out[r["SECID"]] = v
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def mm_divs_until(secid, price, today, expiry, cfg=None):
+    """Объявленные дивиденды с датой фиксации в (сегодня, экспирация], ₽ на акцию: (сумма, [{record, value}], есть_ли_данные_о_дивидендах)."""
+    try:
+        uid = (stk_api_map(cfg) or {}).get(secid, {}).get("uid") if cfg and (cfg.get("token") or "").strip() else None
+        res = stock_dividends(secid, price, uid, cfg)
+    except Exception:  # noqa: BLE001
+        return 0.0, [], False
+    its = res.get("items") or []
+    items = [{"record": x["record"], "value": x["value"]} for x in its
+             if x.get("cur") in ("RUB", "RUR") and today.isoformat() < x["record"] <= expiry.isoformat()]
+    return sum(i["value"] for i in items), sorted(items, key=lambda i: i["record"]), bool(its)
+
+
+def mm_basis_build(secs, md, spots, rate_ref, today, divs_fn=None):
+    """Строки базиса по набору базовых активов. Контракты с несошедшимися единицами (|базис| > MM_BASIS_SANITY %) пропускаются."""
+    rows, skipped = [], []
+    divs_fn = divs_fn or mm_divs_until
+    for u in MM_UNDERLYINGS:
+        futs = mm_nearest(secs, md, u["asset"], today)
+        spot = spots.get(u["spot"])
+        if not futs or not spot:
+            skipped.append("%s: нет данных (%s)" % (u["name"], "котировки спота" if not spot else "контрактов"))
+            continue
+        spot_unit = spot * MM_OZ_G if u["kind"] == "gold" else spot
+        for f in futs:
+            fr = mm_contract_rub(f["price"], f["step_price"], f["min_step"])
+            days = (f["expiry"] - today).days
+            if fr is None or not f["lot"] or days < 1:
+                continue
+            dsum, ditems, dknown = divs_fn(u["spot"], spot, today, f["expiry"]) if u["kind"] == "share" else (0.0, [], True)
+            b = mm_basis(fr, f["lot"], spot_unit, days, dsum, f["margin"])
+            if not b:
+                continue
+            if abs(b["basis_pct"]) > MM_BASIS_SANITY:
+                skipped.append("%s %s: базис %.1f %% — единицы контракта не удалось согласовать, строка скрыта" % (u["name"], f["short"], b["basis_pct"]))
+                continue
+            b.update(asset=u["name"], kind=u["kind"], secid=f["secid"], short=f["short"], expiry=f["expiry"].isoformat(), price=f["price"], price_src=f["src"],
+                     lot=f["lot"], margin=f["margin"], contract_rub=fr, divs=ditems, divs_known=dknown,
+                     unit={"share": "акция", "gold": "унция", "fx": "ед. валюты"}[u["kind"]],
+                     excess=(b["ann_adj"] - rate_ref) if rate_ref is not None else None)
+            rows.append(b)
+    return rows, skipped
+
+
+def mm_basis_payload(force=False, cfg=None):
+    key = ("mm_basis",)
+    if not force:
+        hit = mem_get(key, MM_BASIS_TTL)
+        if hit is not None:
+            return hit
+    with key_lock("mm_basis"):
+        if not force:
+            hit = mem_get(key, MM_BASIS_TTL)
+            if hit is not None:
+                return hit
+        try:
+            j = json.loads(http_text(MM_ISS + "engines/futures/markets/forts/securities.json?iss.meta=off&iss.only=securities,marketdata"
+                                     "&securities.columns=SECID,SHORTNAME,ASSETCODE,LASTTRADEDATE,PREVSETTLEPRICE,LOTVOLUME,INITIALMARGIN,MINSTEP,STEPPRICE"
+                                     "&marketdata.columns=SECID,LAST,SETTLEPRICE,VOLTODAY,OPENPOSITION", timeout=45))
+            secs = _iss_table(j, "securities")
+            md = {r["SECID"]: r for r in _iss_table(j, "marketdata")}
+        except Exception as e:  # noqa: BLE001
+            return {"error": "Не удалось загрузить срочный рынок Мосбиржи: %s" % e, "rows": [], "note": MM_NOTE_BASIS}
+        spots = mm_spots()
+        rf, kr = mm_rate_series()
+        today = date.today()
+        rusfar = rf[-1][1] if rf else None
+        keyr = kr[-1][1] if kr else None
+        ref = rusfar if rusfar is not None else keyr
+        rows, skipped = mm_basis_build(secs, md, spots, ref, today, lambda sid, p, t, e: mm_divs_until(sid, p, t, e, cfg))
+        out = {"rows": rows, "skipped": skipped, "rusfar": rusfar, "key": keyr, "ref": ref, "ref_name": "RUSFAR" if rusfar is not None else "ключевая ставка",
+               "asof": datetime.now().strftime("%Y-%m-%d %H:%M"), "note": MM_NOTE_BASIS}
+        if not rows:
+            out["error"] = "Нет данных для расчёта базиса (биржа не отдала котировки)."
+            return out
+        return mem_put(key, out)
+
+
+def mm_api_funds(cfg, acc, q, force):
+    try:
+        return mm_funds_payload(q)
+    except Exception as e:  # noqa: BLE001
+        return {"error": "Не удалось рассчитать фонды ликвидности: %s" % e, "funds": []}
+
+
+def mm_api_basis(cfg, acc, q, force):
+    try:
+        return mm_basis_payload(bool(force), cfg)
+    except Exception as e:  # noqa: BLE001
+        return {"error": "Не удалось рассчитать базис: %s" % e, "rows": [], "note": MM_NOTE_BASIS}
+
+
+API_GET["/api/mm/funds"] = mm_api_funds
+API_GET["/api/mm/basis"] = mm_api_basis
+# ═══════════════════ устойчивость эмитентов: банкротные модели, расширенный долг, риск размытия ═══════════════════
+# Всё считается по РСБУ из ГИР БО (суммы в тыс. ₽). Это приближённая модель, а не заключение о платёжеспособности.
+
+CRP_CODES_BS = ("1100", "1200", "1300", "1400", "1410", "1450", "1500", "1510", "1540", "1550", "1600")
+CRP_CODES_FR = ("2110", "2200", "2400")
+CRP_TTL = 7 * 86400
+_crp_jobs = {}
+_crp_jobs_lock = threading.Lock()
+
+CRP_DILUTION = [
+    ("spo", "Допэмиссия / SPO", re.compile(r"допол\w*\s+(?:выпуск\w*|эмисси\w*)\s*(?:обыкн\w*\s+|привилег\w*\s+)?(?:акци|ценных)|допол\w+\s+эмисси|\bSPO\b|вторичн\w+\s+(?:публичн\w+\s+)?размещени\w+\s+акци|размещени\w+\s+(?:допол\w+\s+)?акци|увеличени\w+\s+уставн\w+\s+капитал", re.I)),
+    ("convert", "Конвертируемые бумаги", re.compile(r"конвертируем\w+\s+(?:облигац|ценн|бумаг)|конвертаци\w+\s+(?:облигац|в\s+акци)|облигац\w+,?\s+конвертируем", re.I)),
+    ("option", "Опционная программа", re.compile(r"опцион\w*\s+(?:программ|план)|программ\w+\s+опцион|мотивационн\w+\s+программ|\bESOP\b|\bMSOP\b|\bLTI\b", re.I)),
+    ("buyback", "Выкуп / размещение акций", re.compile(r"выкуп\w*\s+(?:собственн\w+\s+)?акци|buy-?back|обратн\w+\s+выкуп|приобретени\w+\s+(?:эмитентом\s+)?собственн\w+\s+акци", re.I)),
+    ("lockup", "Ограничение продажи (lock-up)", re.compile(r"lock-?up|лок-?ап|локап|ограничени\w+\s+на\s+продаж\w+\s+акци", re.I)),
+]
+
+
+def crp_dilution_match(text):
+    """Список ключей категорий риска размытия, найденных в заголовке/тексте раскрытия."""
+    t = text or ""
+    return [k for k, _n, rx in CRP_DILUTION if rx.search(t)]
+
+
+def crp_dilution_scan(items):
+    """items: [{title, date, url}] -> совпадения [{kind, label, title, date, url}], свежие сверху."""
+    names = {k: n for k, n, _rx in CRP_DILUTION}
+    out = []
+    for it in items or []:
+        for k in crp_dilution_match(it.get("title") or ""):
+            out.append({"kind": k, "label": names[k], "title": it.get("title"), "date": it.get("date"), "url": it.get("url")})
+    out.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return out
+
+
+def _crp_div(a, b):
+    return a / b if a is not None and b not in (None, 0) else None
+
+
+def _crp_sub(a, b):
+    return None if a is None or b is None else a - b
+
+
+def crp_savitskaya(c, prev=None):
+    """Модель Савицкой. c, prev — {код РСБУ: значение}. Возвращает {ok, z, x:{X1..X5}, zone, key}."""
+    ca, nca, eq, assets = c.get("1200"), c.get("1100"), c.get("1300"), c.get("1600")
+    pa = (prev or {}).get("1600")
+    avg = (assets + pa) / 2.0 if assets is not None and pa is not None else assets
+    x = {"X1": _crp_div(_crp_sub(eq, nca), ca), "X2": _crp_div(ca, nca), "X3": _crp_div(c.get("2110"), avg),
+         "X4": _crp_div(c.get("2400"), assets), "X5": _crp_div(eq, assets)}
+    if any(v is None for v in x.values()):
+        return {"ok": False, "x": x, "reason": "не хватает строк отчётности"}
+    z = 0.111 * x["X1"] + 13.239 * x["X2"] + 1.676 * x["X3"] + 0.515 * x["X4"] + 3.80 * x["X5"]
+    hi = z < 8
+    return {"ok": True, "z": z, "x": x, "key": "high" if hi else "ok", "zone": "высокий риск (Z < 8)" if hi else "ниже высокого риска (Z ≥ 8)",
+            "avg_prev": pa is not None}
+
+
+def crp_saifullin(c, prev=None):
+    """Модель Сайфуллина–Кадыкова: R = 2K1 + 0,1K2 + 0,08K3 + 0,45K4 + K5."""
+    ca, nca, eq, assets = c.get("1200"), c.get("1100"), c.get("1300"), c.get("1600")
+    pa = (prev or {}).get("1600")
+    avg = (assets + pa) / 2.0 if assets is not None and pa is not None else assets
+    rev = c.get("2110")
+    k = {"K1": _crp_div(_crp_sub(eq, nca), ca), "K2": _crp_div(ca, c.get("1500")), "K3": _crp_div(rev, avg),
+         "K4": _crp_div(c.get("2200"), rev), "K5": _crp_div(c.get("2400"), eq)}
+    if any(v is None for v in k.values()):
+        return {"ok": False, "x": k, "reason": "не хватает строк отчётности"}
+    r = 2 * k["K1"] + 0.1 * k["K2"] + 0.08 * k["K3"] + 0.45 * k["K4"] + k["K5"]
+    bad = r < 1
+    return {"ok": True, "r": r, "x": k, "key": "high" if bad else "ok",
+            "zone": "неудовлетворительное состояние (R < 1)" if bad else "удовлетворительное состояние (R ≥ 1)", "avg_prev": pa is not None}
+
+
+CRP_EXT_FLAG = 0.25
+
+
+def crp_ext_debt(c):
+    """Расширенная долговая нагрузка по балансу (тыс. ₽). Возвращает компоненты, итоги и коэффициенты."""
+    g = c.get
+    if g("1410") is None and g("1510") is None and all(g(k) is None for k in ("1450", "1550", "1540")):
+        return {"ok": False}
+    rep = (g("1410") or 0) + (g("1510") or 0)
+    extra = sum(g(k) or 0 for k in ("1450", "1550", "1540"))
+    ext = rep + extra
+    ebit, eq = g("2200"), g("1300")
+    flag = extra > 0 and ext >= rep * (1 + CRP_EXT_FLAG)
+    names = [("1410", "Долгосрочные заимствования"), ("1510", "Краткосрочные заимствования"), ("1450", "Прочие долгосрочные обязательства"),
+             ("1550", "Прочие краткосрочные обязательства"), ("1540", "Оценочные обязательства")]
+    return {"ok": True, "reported": rep, "extra": extra, "extended": ext,
+            "uplift": (ext / rep - 1) if rep > 0 else None, "flag": bool(flag),
+            "components": [{"code": k, "name": n, "value": g(k)} for k, n in names],
+            "ext_ebit": ext / ebit if ebit and ebit > 0 else None, "rep_ebit": rep / ebit if ebit and ebit > 0 else None,
+            "ext_eq": ext / eq if eq and eq > 0 else None, "rep_eq": rep / eq if eq and eq > 0 else None,
+            "ebit": ebit, "equity": eq}
+
+
+def crp_is_fin(name, sector=None):
+    return bool(ISS_FIN_RE.search(name or "") or re.search(r"банк|страхов|\bНКО\b", name or "", re.I) or sector == "financial")
+
+
+def crp_analyze_years(years, is_fin):
+    """years: {год: {код: значение}} -> строки по годам (последние 5)."""
+    rows = []
+    for y in sorted(years)[-5:]:
+        c, prev = years[y], years.get(y - 1)
+        row = {"y": y, "debt": crp_ext_debt(c), "fin": bool(is_fin)}
+        if is_fin:
+            na = {"ok": False, "na": True, "reason": "неприменимо к банкам, лизингу, МФО и другим финансовым компаниям"}
+            row["sav"], row["sk"] = dict(na), dict(na)
+        else:
+            row["sav"], row["sk"] = crp_savitskaya(c, prev), crp_saifullin(c, prev)
+        rows.append(row)
+    return rows
+
+
+def _crp_parse(lst):
+    """Список отчётов ФНС -> {год: {код: тыс. ₽}} с расширенным набором строк (логика как в _iss_parse_bfo)."""
+    years, prio = {}, {}
+    for y in lst or []:
+        try:
+            per = int(y.get("period"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        cor = None
+        for tc in y.get("typeCorrections") or []:
+            c = (tc or {}).get("correction")
+            if isinstance(c, dict) and (c.get("balance") or c.get("financialResult")):
+                cor = c
+                if c.get("periodType") in (12, None):
+                    break
+        if not cor:
+            continue
+        for off in (0, 1, 2):
+            for kind, codes in (("financialResult", CRP_CODES_FR), ("balance", CRP_CODES_BS)):
+                if kind == "financialResult" and off == 2:
+                    continue
+                for code in codes:
+                    v = _iss_pick(cor, kind, code, off)
+                    if v is None:
+                        continue
+                    k = (per - off, code)
+                    if k not in prio or off < prio[k]:
+                        prio[k] = off
+                        years.setdefault(per - off, {})[code] = v
+    return years
+
+
+def crp_raw(inn, name=""):
+    """Сырые строки РСБУ по годам из ГИР БО (кэш 7 суток). {status, years:{y:{код:знач}}, note}."""
+    key = "crp_raw_v1_" + inn
+    hit = store().get(key, ttl=CRP_TTL)
+    if hit:
+        return {"status": hit["status"], "years": {int(k): v for k, v in hit["years"].items()}, "note": hit.get("note")}
+    fin = issuer_fin(inn, name)
+    if fin.get("status") != "ok" or not fin.get("org_id"):
+        return {"status": fin.get("status") or "nf", "years": {}, "note": fin.get("note") or "Отчётность не найдена."}
+    lst = _iss_fns_get("/nbo/organizations/%s/bfo/" % fin["org_id"])
+    ys = _crp_parse(lst if isinstance(lst, list) else [])
+    res = {"status": "ok" if ys else "nobfo", "years": ys, "note": None if ys else "Отчётность в ГИР БО пустая или в нестандартной форме."}
+    store().put(key, {"status": res["status"], "years": {str(k): v for k, v in ys.items()}, "note": res["note"]})
+    return res
+
+
+def crp_events(isin, inn):
+    """Факты раскрытия эмитента (disc_facts: по ISIN, иначе по ИНН) -> ([{title, date, url}], источники). Без дублей по документу."""
+    try:
+        lst = disc_facts(isin, None if isin else inn) or []
+    except Exception:  # noqa: BLE001
+        return [], []
+    out, seen = [], set()
+    for it in lst:
+        if not isinstance(it, dict):
+            continue
+        k = it.get("doc_id") or (it.get("title"), it.get("published"))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({"title": it.get("title") or "", "date": it.get("published") or it.get("event_date"), "url": it.get("url")})
+    return out, ["раскрытие информации (disc_facts)"]
+
+
+def crp_resolve(q):
+    """ISIN / тикер / ИНН -> {inn, name, isin} или {error}."""
+    s = (q or "").strip().upper()
+    if not s:
+        return {"error": "Введите ISIN, тикер или ИНН эмитента."}
+    if s.isdigit() and len(s) in (10, 12):
+        return {"inn": s, "name": "", "isin": None}
+    em = issuer_of(s)
+    if not em or not em.get("inn"):
+        return {"error": "Не удалось определить эмитента (нужен ИНН: иностранные эмитенты и государство не поддерживаются)."}
+    return {"inn": em["inn"], "name": em.get("short") or em.get("title") or "", "isin": s if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}\d", s) else None,
+            "full": em.get("title")}
+
+
+def crp_card(q):
+    r = crp_resolve(q)
+    if r.get("error"):
+        return {"ok": False, "error": r["error"]}
+    inn, name, isin = r["inn"], r.get("full") or r.get("name") or "", r.get("isin")
+    sector = (tcat_info(isin or (q or "").strip().upper()) or {}).get("sector")
+    is_fin = crp_is_fin(name, sector)
+    raw = crp_raw(inn, name)
+    out = {"ok": True, "inn": inn, "name": r.get("name") or name, "is_fin": is_fin, "status": raw["status"], "note": raw.get("note"), "years": []}
+    if raw["years"]:
+        out["years"] = crp_analyze_years(raw["years"], is_fin)
+    items, srcs = crp_events(isin, inn)
+    out["dilution"] = {"matches": crp_dilution_scan(items), "n_scanned": len(items), "sources": srcs,
+                       "links": bond_doc_links(isin or "", None, inn)}
+    return out
+
+
+def crp_api(cfg, acc, q, force):
+    s = (q.get("q") or "").strip()
+    key = "crp_card_v1_" + s.upper()
+    if not force:
+        hit = store().get(key, ttl=6 * 3600)
+        if hit:
+            return hit
+    try:
+        c = crp_card(s)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "Ошибка расчёта: %s" % str(e)[:120]}
+    if c.get("ok") and c["years"]:
+        store().put(key, c)
+    return c
+
+
+def crp_summary_row(c):
+    """Краткая строка пакетного режима из карточки."""
+    ys = c.get("years") or []
+    last = ys[-1] if ys else None
+    return {"inn": c.get("inn"), "name": c.get("name"), "is_fin": c.get("is_fin"), "year": last and last["y"],
+            "sav": last and last["sav"].get("z"), "sav_key": last and last["sav"].get("key"),
+            "sk": last and last["sk"].get("r"), "sk_key": last and last["sk"].get("key"),
+            "uplift": last and last["debt"].get("uplift"), "flag": bool(last and last["debt"].get("flag")),
+            "ext_ebit": last and last["debt"].get("ext_ebit"), "n_dil": len((c.get("dilution") or {}).get("matches") or []),
+            "note": c.get("note") or c.get("error")}
+
+
+def _crp_my_issuers(cfg, acc):
+    """Эмитенты облигаций и акций портфеля: [(идентификатор для разбора, название)]."""
+    out, seen = [], set()
+    try:
+        for r in build_bonds(cfg, acc).get("rows", []):
+            if r.get("isin") and r.get("sector") != "government" and r["isin"] not in seen:
+                seen.add(r["isin"])
+                out.append((r["isin"], r.get("name") or r["isin"]))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for r in build_summary(cfg, acc, "all")["portfolio"]["positions"]:
+            if r.get("type") == "share" and (r.get("qty") or 0) > 0:
+                k = r.get("isin") or r.get("ticker")
+                if k and k not in seen:
+                    seen.add(k)
+                    out.append((k, r.get("name") or k))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def crp_batch(cfg, acc, q, force):
+    key = (token_key(cfg), acc)
+    with _crp_jobs_lock:
+        job = _crp_jobs.get(key)
+        if job and job["state"] == "run":
+            return {"pending": True, "done": job["done"], "total": job["total"]}
+        if job and job["state"] == "done" and not force and time.time() - job["t"] < 1800:
+            return job["res"]
+        job = {"state": "run", "done": 0, "total": 0, "t": time.time(), "res": None}
+        _crp_jobs[key] = job
+
+    def work():
+        try:
+            lst = _crp_my_issuers(cfg, acc)
+            job["total"] = len(lst)
+            rows, seen = [], set()
+            for ident, nm in lst:           # последовательно: ГИР БО и так ограничен по частоте
+                try:
+                    c = crp_card(ident)
+                    if c.get("ok"):
+                        if c["inn"] in seen:
+                            job["done"] += 1
+                            continue
+                        seen.add(c["inn"])
+                        row = crp_summary_row(c)
+                        row["name"] = row["name"] or nm
+                    else:
+                        row = {"name": nm, "note": c.get("error")}
+                    row["q"] = ident
+                    rows.append(row)
+                except Exception as e:  # noqa: BLE001
+                    rows.append({"name": nm, "q": ident, "note": "Ошибка: %s" % str(e)[:80]})
+                job["done"] += 1
+            job["res"] = {"rows": rows, "n": len(rows), "updated": datetime.now().strftime("%H:%M")}
+        except Exception as e:  # noqa: BLE001
+            job["res"] = {"error": str(e)[:200] or "Не удалось собрать эмитентов"}
+        job["state"] = "done"
+        job["t"] = time.time()
+    threading.Thread(target=work, daemon=True).start()
+    return {"pending": True, "done": 0, "total": 0}
+
+
+def crp_batch_status(cfg, acc, q, force):
+    with _crp_jobs_lock:
+        job = _crp_jobs.get((token_key(cfg), acc))
+    if not job:
+        return {"state": "none"}
+    return {"state": job["state"], "done": job["done"], "total": job["total"]}
+
+
+API_GET["/api/crp"] = crp_api
+API_GET["/api/crp/batch"] = crp_batch
+API_GET["/api/crp/batch/status"] = crp_batch_status
+# ═══════════════════════════════ налоговая оптимизация: сбор убытков по лотам FIFO и планировщик ИИС-3 ═══════════════════════════════
+# Справочный расчёт по модели; налог удерживает брокер, итог за год определяется декларацией. Не индивидуальная рекомендация.
+
+# ИИС-3 (НК РФ ст. 219.1 — вычет на взносы; ст. 219.2 — освобождение положительного финансового результата).
+TXO_IIS_LIMIT = 400000.0          # взносы, с которых предоставляется вычет, за год
+TXO_IIS_EXEMPT_CAP = 30000000.0   # предел освобождаемого финансового результата за всё время
+TXO_IIS_RATE_LO, TXO_IIS_RATE_HI = 0.13, 0.15
+TXO_HI_THRESHOLD = 2400000.0      # доход в год, выше которого применяется ставка 15 %
+TXO_IIS_TERMS = ((2024, 2026, 5), (2027, 2027, 6), (2028, 2028, 7), (2029, 2029, 8), (2030, 2030, 9))   # (с года, по год, срок лет); с 2031 — 10
+TXO_MIN_LOSS = 50.0
+
+
+def txo_iis3_term(open_year):
+    """Минимальный срок ИИС-3 (лет) по году открытия: 2024–2026 — 5, 2027 — 6, 2028 — 7, 2029 — 8, 2030 — 9, с 2031 — 10."""
+    for a, b, t in TXO_IIS_TERMS:
+        if a <= open_year <= b:
+            return t
+    return 10 if open_year > 2030 else 5
+
+
+def txo_num(q, key, dflt, lo, hi):
+    try:
+        v = float(str(q.get(key)).replace(",", ".").replace(" ", ""))
+    except (TypeError, ValueError):
+        return dflt
+    return min(hi, max(lo, v))
+
+
+def txo_tax(base, year, rate15):
+    """Налог с положительной базы: при ставке 15 % плательщика — плоско 15 %, иначе прогрессия tx_ndfl."""
+    base = max(0.0, base)
+    return base * TXO_IIS_RATE_HI if rate15 else tx_ndfl(base, year)[0]
+
+
+# ── сбор убытков ──
+
+def txo_best_prefix(lots, price, fee_rate):
+    """Лоты продаются от старых к новым (FIFO), поэтому доступны только префиксы. Результат кусочно-линеен по количеству,
+    значит минимум достигается на границе лота. Возвращает (количество, результат) префикса с наибольшим убытком."""
+    best_q, best_r, cq, cr = 0.0, 0.0, 0.0, 0.0
+    for l in sorted(lots, key=lambda l: l["date"] or date(1970, 1, 1)):
+        cq += l["qty"]
+        cr += l["qty"] * (price * (1.0 - fee_rate) - l["unit"])
+        if cr < best_r - 1e-9:
+            best_q, best_r = cq, cr
+    return best_q, best_r
+
+
+def txo_ldv_flags(rows, lots, today, rate):
+    out = []
+    blind = {l["date"] for l in lots if l.get("blind")}
+    for r in rows:
+        if r["result"] <= 0 or r["type"] not in TAX_LDV_TYPES or r["bdate"] is None or r["bdate"] in blind or r["bdate"] < TAX_LDV_FROM:
+            continue
+        if r["ldv"]:
+            out.append({"status": "reached", "bdate": r["bdate"].isoformat(), "days": 0, "qty": r["qty"], "gain": r["result"], "tax_at_stake": 0.0})
+            continue
+        days = (tx_add_years(r["bdate"], 3) + timedelta(days=1) - today).days
+        if 0 < days <= 365:
+            out.append({"status": "close", "bdate": r["bdate"].isoformat(), "days": days, "qty": r["qty"], "gain": r["result"], "tax_at_stake": r["result"] * rate})
+    return out
+
+
+def txo_harvest_calc(st, settings, fee_rate=None, min_loss=TXO_MIN_LOSS, holidays=()):
+    today, cy = st["today"], st["today"].year
+    fee_src = "заданная" if fee_rate is not None else "по истории сделок"
+    if fee_rate is None:
+        fee_rate = st["eng"]["fee_rate"]
+    sale_day, last_day = tx_last_sale_day(cy, holidays)
+    out = {"available": False, "year": cy, "today": today.isoformat(), "fee_rate": fee_rate, "fee_source": fee_src, "candidates": [], "iis_excluded": [],
+           "deadline": {"sale_day": sale_day.isoformat(), "last_trading_day": last_day.isoformat(), "days": (sale_day - today).days, "passed": today > sale_day},
+           "totals": {"saving": 0.0, "fees": 0.0, "net": 0.0, "n": 0}, "warnings": list(st["eng"].get("warnings") or []), "reason": "",
+           "iis_prefill": txo_iis_prefill(st)}
+    for g in st["groups"]:
+        if g["kind"] == "iis":
+            out["iis_excluded"].append({"name": g["name"], "reason": "ИИС — отдельная налоговая база: убыток внутри счёта не уменьшает налог по обычным счетам "
+                                        "(тип А — налог считается при закрытии счёта, тип Б и ИИС-3 при соблюдённом сроке освобождены), поэтому сбор убытков здесь не моделируется."})
+    gen = [g for g in st["groups"] if g["kind"] == "gen"]
+    if not gen:
+        out["reason"] = "Среди выбранных счетов нет обычных брокерских счетов (только ИИС)."
+        return out
+    if not st["pos"]:
+        out["reason"] = "Нет данных о текущих позициях и ценах (нет токена, пустой портфель или демо-режим без позиций)."
+        return out
+    g = gen[0]
+    out["available"] = True
+    t0, row0 = tx_cur_tax(g, [], cy, settings)
+    base0 = (row0 or {}).get("base", 0.0)
+    thr = TXO_HI_THRESHOLD if cy >= 2025 else 5000000.0
+    rate0 = 0.15 if base0 > thr else 0.13
+    out.update(tax_before=t0, base_before=base0, rate_now=rate0, threshold=thr)
+    cands = []
+    for uid, lots in tx_group_open(st, g).items():
+        pr = tx_pos_price(st["pos"].get(uid))
+        if not pr or lots[0]["type"] in TAX_SKIP_TYPES or lots[0]["type"] == "option":
+            continue
+        q, res = txo_best_prefix(lots, pr, fee_rate)
+        if q <= 0 or res > -min_loss:
+            continue
+        base = {"acc": lots[0]["acc"], "uid": uid, "name": lots[0]["name"], "ticker": lots[0]["ticker"], "type": lots[0]["type"], "bucket": "sec",
+                "kind": "sell", "bdate": None}
+        rows = tx_fee_sim(lots, q, pr, fee_rate, today, base)
+        res = sum(r["result"] for r in rows)
+        total_q = sum(l["qty"] for l in lots)
+        value = q * pr
+        t1, row1 = tx_cur_tax(g, rows, cy, settings)
+        base1 = (row1 or {}).get("base", 0.0)
+        fee_sell = sum(r["fee"] for r in rows)
+        fee_buy = value * fee_rate
+        saving = t0 - t1
+        carry = max(0.0, ((row1 or {}).get("loss_new", 0.0)) - ((row0 or {}).get("loss_new", 0.0)))
+        cands.append({"uid": uid, "name": base["name"], "ticker": base["ticker"], "type": base["type"], "qty": q, "qty_total": total_q, "partial": q < total_q - 1e-9,
+                      "price": pr, "value": value, "loss": -res, "gain_in_prefix": sum(r["result"] for r in rows if r["result"] > 0),
+                      "base_before": base0, "base_after": base1, "tax_before": t0, "tax_after": t1, "saving": saving,
+                      "marginal_rate": (saving / (base0 - base1)) if base0 - base1 > 1 else None, "carry_forward": carry,
+                      "fees": fee_sell + fee_buy, "net": saving - fee_sell - fee_buy, "ldv": txo_ldv_flags(rows, lots, today, rate0),
+                      "blind": any(l.get("blind") for l in lots), "rows": rows})
+    cands.sort(key=lambda c: -c["net"])
+    extra, tot_fee = [], 0.0
+    for c in cands:
+        c["selected"], c["saving_marginal"] = False, 0.0
+        if c["net"] <= 1:
+            continue
+        tp, _ = tx_cur_tax(g, extra, cy, settings)
+        tn, _ = tx_cur_tax(g, extra + c["rows"], cy, settings)
+        c["saving_marginal"] = tp - tn
+        if c["saving_marginal"] - c["fees"] > 1:
+            c["selected"] = True
+            extra = extra + c["rows"]
+            tot_fee += c["fees"]
+    t_all, _ = tx_cur_tax(g, extra, cy, settings)
+    n_sel = sum(1 for c in cands if c["selected"])
+    out["totals"] = {"saving": t0 - t_all, "fees": tot_fee, "net": (t0 - t_all) - tot_fee, "n": n_sel, "tax_after": t_all}
+    for c in cands:
+        c.pop("rows", None)
+    out["candidates"] = cands[:30]
+    out["assumptions"] = [
+        "Продажа списывает лоты по FIFO (старые первыми), поэтому для каждой бумаги берётся такой префикс лотов, при котором реализованный убыток наибольший; прибыльные лоты внутри префикса уже учтены в расчёте.",
+        "Экономия = налог года до сделок минус налог после (по движку страницы «Налоги»: сальдирование внутри группы обычных счетов, ставки 13 % и 15 %, ЛДВ, перенос убытков). Убыток сверх налоговой базы налог года не снижает, а переносится на будущие годы — показан отдельно.",
+        "Расходы: комиссия на продажу и на обратную покупку по ставке %s (%s); спред не учтён." % (txo_pct(fee_rate), fee_src),
+        "Запрета на «мнимые» сделки (wash sale) в российском налоговом праве нет, но обратная покупка обнуляет срок владения: ЛДВ по новым бумагам отсчитывается заново.",
+        "Продажа должна рассчитаться в текущем году: при расчётах T+1 последний день сделки показан выше; календарь торгов определяет биржа."]
+    return out
+
+
+def txo_pct(x):
+    return ("%.2f %%" % (x * 100.0)).replace(".", ",")
+
+
+def txo_iis_prefill(st):
+    for i in st.get("iis") or []:
+        if i.get("opened"):
+            return {"open_year": int(i["opened"][:4]), "type": i["type"], "name": i["name"], "opened": i["opened"]}
+    return None
+
+
+def txo_harvest_get(cfg, acc, q, force):
+    st, settings = tax_state(cfg, acc, force)
+    fr = txo_num(q, "fee", -1.0, -1.0, 5.0) if q.get("fee") not in (None, "") else -1.0
+    return txo_harvest_calc(st, settings, fr / 100.0 if fr >= 0 else None, txo_num(q, "min_loss", TXO_MIN_LOSS, 0.0, 1e9))
+
+
+# ── планировщик ИИС-3 ──
+
+def txo_iis3_calc(open_year, contrib, yield_pct, years, income=0.0, rate15=None, reinvest=True, coupon_share=0.5, ldv=True):
+    """Сравнение ИИС-3 и обычного брокерского счёта. Модель: взнос в начале года, доходность начисляется в конце года, вычет за год i
+    поступает в начале года i+1 (вычет последнего года — наличными после горизонта). Реинвестированный вычет считается взносом сверх плана.
+    income > 0 — годовой доход плательщика: определяет ставку (15 % выше 2,4 млн) и ограничивает вычет уплаченным НДФЛ."""
+    years = max(1, int(years))
+    open_year = int(open_year)
+    y = yield_pct / 100.0
+    if income > 0:
+        rate15 = income > TXO_HI_THRESHOLD
+    rate15 = bool(rate15)
+    rate = TXO_IIS_RATE_HI if rate15 else TXO_IIS_RATE_LO
+    term = txo_iis3_term(open_year)
+    ded_base = min(contrib, TXO_IIS_LIMIT)
+    # ИИС
+    cap, dep, cash, refunds, rows, ref_prev = 0.0, 0.0, 0.0, [], [], 0.0
+    # обычный счёт: лоты (стоимость, оценка, год покупки)
+    lots, paid_tax = [], 0.0
+    for i in range(1, years + 1):
+        yr = open_year + i - 1
+        if ref_prev > 0:
+            if reinvest:
+                cap += ref_prev
+                dep += ref_prev
+            else:
+                cash += ref_prev
+        cap += contrib
+        dep += contrib
+        cap *= 1.0 + y
+        ref = ded_base * rate
+        if income > 0:
+            ref = min(ref, tx_ndfl(income, yr)[0])
+        refunds.append(ref)
+        ref_prev = ref
+        # обычный счёт
+        lots.append([contrib, contrib, i])
+        cp_tax = 0.0
+        for l in lots:
+            coupon = l[1] * y * coupon_share
+            t = txo_tax(coupon, yr, rate15)
+            cp_tax += t
+            l[1] += l[1] * y * (1.0 - coupon_share) + coupon - t
+            l[0] += coupon - t       # реинвестированный купон после налога — новая стоимость покупки
+        paid_tax += cp_tax
+        rows.append({"year": yr, "n": i, "contribution": contrib, "deduct_base": ded_base, "refund": ref, "iis_capital": cap, "iis_deposits": dep,
+                     "broker_capital": sum(l[1] for l in lots), "broker_coupon_tax": cp_tax, "own": contrib * i})
+
+    def broker_exit(k, cur_lots):
+        gain_all, gain_ldv, wy_num, wy_den = 0.0, 0.0, 0.0, 0.0
+        for cost, val, i0 in cur_lots:
+            g = max(0.0, val - cost)
+            gain_all += g
+            held = k - i0 + 1      # покупка в начале года, продажа в конце года k: срок больше 3 лет только при held >= 4
+            if ldv and held > 3:
+                gain_ldv += g
+                wy_num += max(cost, 0.0) * held
+                wy_den += max(cost, 0.0)
+        wy = (wy_num / wy_den) if wy_den > 0 else 0.0
+        exempt = min(gain_ldv, TAX_LDV_LIMIT * wy)
+        return txo_tax(gain_all - exempt, open_year + k - 1, rate15), exempt
+
+    fin_year = open_year + years - 1
+    own = contrib * years
+    bt, bex = broker_exit(years, lots)
+    broker_net = sum(l[1] for l in lots) - bt
+    met = years >= term
+    gain = cap - dep
+    if met:
+        over = max(0.0, gain - TXO_IIS_EXEMPT_CAP)
+        iis_tax = txo_tax(over, fin_year, rate15)
+        returned = 0.0
+        iis_net = cap + cash + refunds[-1] - iis_tax      # вычет последнего года приходит наличными после горизонта
+    else:
+        iis_tax = txo_tax(gain, fin_year, rate15)
+        returned = sum(refunds[:-1])                      # полученные вычеты возвращаются, вычет последнего года не заявляется
+        iis_net = cap + cash - iis_tax - returned
+    # досрочное закрытие в каждый год до срока
+    early = []
+    for k in range(1, min(years, term - 1) + 1):
+        r = rows[k - 1]
+        cap_k, dep_k = r["iis_capital"], r["iis_deposits"]
+        ref_got = sum(refunds[:k - 1])
+        cash_k = 0.0 if reinvest else ref_got
+        tax_k = txo_tax(cap_k - dep_k, open_year + k - 1, rate15)
+        early.append({"year": r["year"], "n": k, "capital": cap_k, "deposits": dep_k, "refunds_returned": ref_got, "tax": tax_k,
+                      "net": cap_k + cash_k - tax_k - ref_got, "own": contrib * k, "extra_cost": tax_k + ref_got})
+    out = {"inputs": {"open_year": open_year, "contribution": contrib, "yield_pct": yield_pct, "years": years, "income": income, "rate15": rate15,
+                      "reinvest": bool(reinvest), "coupon_share": coupon_share, "ldv": bool(ldv)},
+           "rules": {"limit": TXO_IIS_LIMIT, "rate": rate, "max_refund": TXO_IIS_LIMIT * rate, "exempt_cap": TXO_IIS_EXEMPT_CAP, "term": term,
+                     "term_ok": met, "term_end_year": open_year + term - 1,
+                     "terms": [{"from": a, "to": b, "years": t} for a, b, t in TXO_IIS_TERMS] + [{"from": 2031, "to": None, "years": 10}]},
+           "rows": rows, "early": early, "warnings": [],
+           "iis": {"capital": cap, "deposits": dep, "tax": iis_tax, "refunds_total": sum(refunds), "refunds_returned": returned, "net": iis_net,
+                   "result_over_own": iis_net - own, "term_met": met},
+           "broker": {"capital": sum(l[1] for l in lots), "coupon_tax": paid_tax, "exit_tax": bt, "ldv_exempt": bex, "net": broker_net,
+                      "result_over_own": broker_net - own},
+           "own": own, "advantage": iis_net - broker_net}
+    if open_year < 2024:
+        out["warnings"].append("ИИС-3 открывают с 2024 года: для более ранних лет срок принят как для 2024–2026 (5 лет).")
+    if contrib > TXO_IIS_LIMIT:
+        out["warnings"].append("Взносы свыше 400 000 ₽ в год вычет не увеличивают: в расчёт вычета идёт только 400 000 ₽.")
+    if not met:
+        out["warnings"].append("Горизонт короче минимального срока (%d лет): счёт закрывается досрочно, вычеты возвращаются, налог платится с дохода." % term)
+    return out
+
+
+def txo_iis3_get(cfg, acc, q, force):
+    now = date.today().year
+    rate15 = None
+    if q.get("bracket") in ("13", "15"):
+        rate15 = q.get("bracket") == "15"
+    flag = lambda k, d: (q.get(k) if q.get(k) not in (None, "") else d) not in ("0", "false", "")
+    return txo_iis3_calc(int(txo_num(q, "open_year", now, 2000, 2100)), txo_num(q, "contribution", 400000.0, 0.0, 1e9),
+                         txo_num(q, "yield", 12.0, -50.0, 100.0), int(txo_num(q, "years", 10, 1, 40)), txo_num(q, "income", 0.0, 0.0, 1e10), rate15,
+                         flag("reinvest", "1"), txo_num(q, "coupon_share", 50.0, 0.0, 100.0) / 100.0, flag("ldv", "1"))
+
+
+API_GET["/api/txo/harvest"] = txo_harvest_get
+API_GET["/api/txo/iis3"] = txo_iis3_get
+# ═══════════════ «Стакан: ликвидность»: проскальзывание крупной заявки и эвристика скрытой (айсберг) ликвидности ═══════════════
+# Стакан и сделки — те же источники, что у «Кто покупает» (сервер данных md/* либо собственный токен T-Invest); бесплатные данные
+# Мосбиржи (ISS) для стакана не используются. Окно снимков стакана и сделок хранится в памяти и копится только пока экран опрашивают.
+
+MIC_PRESETS = (1e6, 5e6, 10e6)
+MIC_BAND = (0.005, 0.01)                   # глубина в пределах ±0,5 % и ±1 % от середины
+MIC_WINDOW = 600                           # окно наблюдения за стаканом и сделками, с
+MIC_IDLE = 120                             # без опроса столько секунд — бумагу перестаём отслеживать
+MIC_MAX_TRACKED = 5
+MIC_TOP_LEVELS = 5
+MIC_FACTOR = 2.0                           # исполнено не менее чем в 2 раза больше максимального видимого размера уровня
+MIC_PERSIST = 0.7                          # доля снимков, в которых уровень присутствовал
+MIC_MIN_SNAPS, MIC_MIN_SPAN = 3, 20        # минимум снимков и секунд наблюдения для вывода
+MIC_DEPTH = 50
+_mic_state, _mic_lock = {}, threading.Lock()
+
+
+def _mic_rub(x):
+    return format(int(round(x)), ",").replace(",", " ")
+
+
+def _mic_f(x):
+    try:
+        return ("%.2f" % float(x)).rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return "—"
+
+
+# ───────────────────────── параметры бумаги ─────────────────────────
+def _mic_screener_hit(secid):
+    try:
+        rows = screener_rows() or []
+    except Exception:  # noqa: BLE001
+        return None
+    u = secid.upper()
+    return next((r for r in rows if str(r.get("id") or "").upper() == u or str(r.get("isin") or "").upper() == u), None)
+
+
+def _mic_mdur(secid):
+    """Модифицированная дюрация (годы) по строке скринера облигаций или None."""
+    r = _mic_screener_hit(secid)
+    if not r or not r.get("dur"):
+        return None
+    y = r.get("yield")
+    return float(r["dur"]) / (1 + (float(y) / 100 if y is not None else 0))
+
+
+def _mic_meta(cfg, secid):
+    """{lot, face, is_bond[, face_assumed]} или None, если размер лота определить нельзя."""
+    if cfg.get("token"):
+        try:
+            m = _flw_own_meta(TInvest(cfg), secid)
+        except ApiError:
+            m = None
+        if m:
+            m = dict(m)
+            if m.get("is_bond") and not m.get("face"):
+                m["face"], m["face_assumed"] = 1000.0, True
+            return m
+    hit = _mic_screener_hit(secid)
+    if hit:
+        return {"lot": 1, "face": float(hit.get("nominal") or 1000), "is_bond": True, "face_assumed": not hit.get("nominal")}
+    try:
+        u = globals().get("stocks_universe")
+        h = next((r for r in (u() if u else []) if r.get("secid") == secid.upper()), None)
+        if h and h.get("lot"):
+            return {"lot": max(1, int(h["lot"])), "face": None, "is_bond": False}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _mic_norm_trades(rows, lot):
+    """Сделки -> [{ts, side, price, lots}]; qty в штуках делится на лот."""
+    out = []
+    for t in rows or []:
+        try:
+            ts, p, q = t.get("ts"), float(t.get("price")), float(t.get("qty"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if ts is None or t.get("side") not in ("buy", "sell") or q <= 0:
+            continue
+        out.append({"ts": float(ts), "side": t["side"], "price": p, "lots": q / max(1, lot)})
+    return out
+
+
+def _mic_fetch(cfg, secid, depth=MIC_DEPTH):
+    """Стакан и сделки. -> {ok, bids, asks, trades (в лотах, None — сделки недоступны), source, source_label, ts, meta}."""
+    meta = _mic_meta(cfg, secid)
+    book = _flw_ds("md/orderbook", {"secid": secid, "depth": depth}, FLW_BOOK_TTL)
+    trades, src = None, ""
+    if book:
+        tr = _flw_ds("md/trades", {"secid": secid, "minutes": 60}, FLW_BOOK_TTL)
+        if tr is not None:
+            trades = _mic_norm_trades(tr.get("trades"), 1)              # сделки сервера данных — в лотах
+        src = "server"
+    else:
+        try:
+            own = _flw_own(cfg, secid, depth)
+        except ApiError as e:
+            return {"ok": False, "error": str(e)}
+        if own:
+            book, raw = own
+            trades = _mic_norm_trades(raw, (meta or {}).get("lot") or 1) if hasattr(TInvest, "last_trades") else None
+            src = "own"
+    if not book:
+        return {"ok": False, "error": "Стакан недоступен: на сервере данных нет токена T-Invest, а собственный токен не задан. "
+                                       "Бесплатные данные Мосбиржи (ISS) стакан не содержат."}
+    label = {"server": "T-Invest через сервер данных, реальное время", "own": "T-Invest по вашему токену, реальное время"}[src]
+    return {"ok": True, "bids": _flw_levels(book.get("bids")), "asks": _flw_levels(book.get("asks")), "trades": trades,
+            "source": src, "source_label": label, "ts": book.get("ts") or time.time(), "meta": meta}
+
+
+# ───────────────────────── проскальзывание ─────────────────────────
+def mic_rub_per_lot(meta):
+    """Рублей на один лот при цене 1: акции — штук в лоте; облигации — лот × номинал / 100 (цена в % от номинала)."""
+    lot = max(1, int(meta.get("lot") or 1))
+    if meta.get("is_bond"):
+        return lot * float(meta.get("face") or 1000.0) / 100.0
+    return float(lot)
+
+
+def mic_walk(levels, target_rub, k):
+    """Проход по видимым уровням от лучшего; levels — [[цена, лоты]], k — рублей на лот при цене 1. Заявка — целое число лотов."""
+    remaining, lots, spent, steps = float(target_rub), 0, 0.0, []
+    stopped = False
+    for p, q in levels:
+        per = p * k
+        if per <= 0:
+            continue
+        n = min(int(q), int(remaining // per))
+        if n > 0:
+            lots += n
+            spent += n * per
+            remaining -= n * per
+            steps.append({"price": p, "lots": n, "rub": round(n * per, 2)})
+        if n < int(q):
+            stopped = True                      # на этом уровне денег хватило не на весь объём: заявка исполнена
+            break
+    min_per = min((p * k for p, _ in levels if p > 0), default=0.0)
+    complete = lots > 0 and (stopped or remaining < min_per)
+    return {"lots": lots, "rub": round(spent, 2), "unfilled_rub": round(max(0.0, remaining), 2), "complete": complete,
+            "levels_used": len(steps), "steps": steps, "visible_lots": sum(int(q) for _, q in levels),
+            "vwap": (spent / (lots * k)) if lots else None}
+
+
+def mic_impact(book, meta, side, target_rub, mdur=None):
+    """Расчёт заявки по стакану {bids, asks}: покупка идёт по продавцам (asks), продажа — по покупателям (bids)."""
+    bids = sorted(book.get("bids") or [], key=lambda x: -x[0])
+    asks = sorted(book.get("asks") or [], key=lambda x: x[0])
+    if not bids or not asks:
+        return {"ok": False, "error": "В стакане нет заявок с одной из сторон."}
+    if side not in ("buy", "sell"):
+        return {"ok": False, "error": "Сторона заявки: покупка или продажа."}
+    k = mic_rub_per_lot(meta)
+    bb, ba = bids[0][0], asks[0][0]
+    mid = (bb + ba) / 2.0
+    levels = asks if side == "buy" else bids
+    w = mic_walk(levels, target_rub, k)
+    out = {"ok": True, "side": side, "target_rub": target_rub, "mid": mid, "best_bid": bb, "best_ask": ba,
+           "spread": ba - bb, "spread_bp": (ba - bb) / mid * 1e4, "crossed": bb >= ba, "is_bond": bool(meta.get("is_bond")),
+           "lot": meta.get("lot"), "face": meta.get("face"), "filled_lots": w["lots"], "filled_rub": w["rub"],
+           "unfilled_rub": w["unfilled_rub"], "complete": w["complete"], "levels_used": w["levels_used"], "steps": w["steps"],
+           "visible_lots": w["visible_lots"], "visible_levels": len(levels), "vwap": w["vwap"]}
+    if w["lots"]:
+        sg = 1 if side == "buy" else -1
+        out["slip_mid_bp"] = sg * (w["vwap"] - mid) / mid * 1e4
+        out["slip_mid_rub"] = sg * (w["vwap"] - mid) * w["lots"] * k
+        out["slip_best_bp"] = sg * (w["vwap"] - levels[0][0]) / levels[0][0] * 1e4
+        out["depth_share"] = w["lots"] / w["visible_lots"] if w["visible_lots"] else None
+        if meta.get("is_bond") and mdur:
+            out["yield_bp"] = out["slip_mid_bp"] / mdur         # Δдоходности ≈ Δцены% / модифицированная дюрация
+            out["mdur"] = mdur
+    if not w["complete"]:
+        total = sum(p * q * k for p, q in levels)
+        out["warning"] = "Видимой ликвидности не хватает: исполнится %s из %s ₽ (видно %d ур., всего %s ₽ на этой стороне)." % (
+            _mic_rub(w["rub"]), _mic_rub(target_rub), len(levels), _mic_rub(total))
+    band = {}
+    for x in MIC_BAND:
+        band[str(x)] = {"bid_lots": sum(q for p, q in bids if p >= mid * (1 - x)), "ask_lots": sum(q for p, q in asks if p <= mid * (1 + x)),
+                        "bid_rub": round(sum(p * q * k for p, q in bids if p >= mid * (1 - x))),
+                        "ask_rub": round(sum(p * q * k for p, q in asks if p <= mid * (1 + x)))}
+    out["depth_band"] = band
+    return out
+
+
+def mic_impact_get(cfg, acc, q, force):
+    secid = _flw_secid(q)
+    if not secid:
+        raise ApiError("Не указана бумага.", 400)
+    side = q.get("side") if q.get("side") in ("buy", "sell") else "buy"
+    try:
+        rub = float(str(q.get("rub") or 1e6).replace(",", "."))
+    except ValueError:
+        rub = 1e6
+    rub = min(max(rub, 1000.0), 1e10)
+    f = _mic_fetch(cfg, secid)
+    if not f["ok"]:
+        return {"ok": False, "secid": secid, "error": f["error"]}
+    meta = f.get("meta")
+    if not meta:
+        return {"ok": False, "secid": secid, "error": "Не удалось определить размер лота бумаги: пересчёт в рубли невозможен."}
+    mdur = _mic_mdur(secid) if meta.get("is_bond") else None
+    book = {"bids": f["bids"], "asks": f["asks"]}
+    res = mic_impact(book, meta, side, rub, mdur)
+    if not res["ok"]:
+        return dict(res, secid=secid, source_label=f["source_label"])
+    keep = ("complete", "vwap", "slip_mid_bp", "slip_mid_rub", "depth_share", "filled_rub", "yield_bp")
+    presets = []
+    for p in MIC_PRESETS:
+        r = mic_impact(book, meta, side, p, mdur)
+        presets.append(dict({k: r.get(k) for k in keep}, rub=p))
+    notes = ["Расчёт по видимому стакану (до %d уровней) на момент запроса: скрытый объём и изменение стакана при исполнении не учтены; комиссия не учтена. "
+             "Проскальзывание — отклонение средневзвешенной цены исполнения от середины между лучшей покупкой и лучшей продажей." % MIC_DEPTH]
+    if meta.get("is_bond"):
+        notes.append("Облигации: цена в %% от номинала (%s ₽), сумма = цена × номинал / 100 × количество; накопленный купонный доход оплачивается сверху." % _mic_f(meta.get("face")))
+        if meta.get("face_assumed"):
+            notes.append("Номинал не получен, принят 1000 ₽.")
+        if mdur is None:
+            notes.append("Влияние на доходность не показано: модифицированная дюрация выпуска не найдена в скринере.")
+    return dict(res, secid=secid, source=f["source"], source_label=f["source_label"], ts=f["ts"], presets=presets, notes=notes)
+
+
+# ───────────────────────── эвристика скрытой ликвидности ─────────────────────────
+def mic_ice_update(secid, book, trades, now=None):
+    """Добавляет снимок стакана и сделки в окно бумаги. trades=None — сделки недоступны. Вызывается только при опросе."""
+    now = time.time() if now is None else now
+    with _mic_lock:
+        for s in [s for s, st in _mic_state.items() if now - st["polled"] > MIC_IDLE]:
+            del _mic_state[s]
+        st = _mic_state.get(secid)
+        if st is None:
+            if len(_mic_state) >= MIC_MAX_TRACKED:
+                del _mic_state[min(_mic_state, key=lambda s: _mic_state[s]["polled"])]
+            st = _mic_state[secid] = {"snaps": [], "trades": {}, "polled": now, "have_trades": True}
+        st["polled"] = now
+        st["have_trades"] = trades is not None
+        st["snaps"].append({"ts": now, "bids": {p: q for p, q in book.get("bids") or []}, "asks": {p: q for p, q in book.get("asks") or []}})
+        first = st["snaps"][0]["ts"]
+        cnt = {}
+        for t in trades or []:
+            if t["ts"] < first - 1 or t["ts"] > now + 5:
+                continue
+            key = (t["ts"], t["side"], t["price"], t["lots"])
+            cnt[key] = cnt.get(key, 0) + 1
+        for key, n in cnt.items():
+            st["trades"][key] = max(st["trades"].get(key, 0), n)
+        cut = now - MIC_WINDOW
+        st["snaps"] = [s for s in st["snaps"] if s["ts"] >= cut]
+        st["trades"] = {k: n for k, n in st["trades"].items() if k[0] >= cut}
+    return st
+
+
+def mic_ice_report(secid, now=None):
+    """Разбор окна. Статусы: unavailable (нет сделок), collecting (мало данных), ready."""
+    now = time.time() if now is None else now
+    with _mic_lock:
+        st = _mic_state.get(secid)
+        if not st or now - st["polled"] > MIC_IDLE:
+            return {"status": "collecting", "snapshots": 0, "observed_sec": 0, "window_sec": MIC_WINDOW, "candidates": []}
+        snaps, trades, have = list(st["snaps"]), dict(st["trades"]), st["have_trades"]
+    span = snaps[-1]["ts"] - snaps[0]["ts"]
+    base = {"snapshots": len(snaps), "observed_sec": round(span), "window_sec": MIC_WINDOW, "candidates": []}
+    if not have:
+        return dict(base, status="unavailable", message="Детектор недоступен: для этого источника нет ленты сделок.")
+    if len(snaps) < MIC_MIN_SNAPS or span < MIC_MIN_SPAN:
+        return dict(base, status="collecting", message="Накапливаю наблюдения: нужно не менее %d снимков за %d с." % (MIC_MIN_SNAPS, MIC_MIN_SPAN))
+    last = snaps[-1]
+    cands, checked = [], 0
+    for side, key, aggr in (("ask", "asks", "buy"), ("bid", "bids", "sell")):
+        for p in sorted(last[key], reverse=(side == "bid"))[:MIC_TOP_LEVELS]:
+            checked += 1
+            series = [(s["ts"], s[key].get(p)) for s in snaps]
+            i0 = next(i for i, (_, q) in enumerate(series) if q)
+            tail = series[i0:]
+            frac = sum(1 for _, q in tail if q) / len(tail)
+            vmax = max(q for _, q in tail if q)
+            drops, prev = 0, None
+            for _, q in tail:
+                if prev and q is not None and q < prev:
+                    drops += prev - q
+                prev = q or prev
+            ex = sorted((k[0], k[3]) for k, n in trades.items() if k[1] == aggr and k[2] == p and k[0] >= series[i0][0] - 1 for _ in range(n))
+            executed = sum(l for _, l in ex)
+            hidden = max(0.0, executed - drops)
+            if executed >= MIC_FACTOR * vmax and frac >= MIC_PERSIST and hidden > 0:
+                cands.append({"side": side, "price": p, "executed_lots": round(executed, 2), "visible_max_lots": vmax,
+                              "visible_now_lots": series[-1][1], "visible_consumed_lots": round(drops, 2),
+                              "hidden_est_lots": round(hidden, 2), "factor": round(executed / vmax, 1), "persist": round(frac, 2),
+                              "first_seen": series[i0][0], "last_seen": series[-1][0],
+                              "evidence": {"book": [[round(ts, 1), q] for ts, q in tail[-8:]], "trades": [[round(ts, 1), round(l, 2)] for ts, l in ex[-8:]]}})
+    cands.sort(key=lambda c: -c["hidden_est_lots"])
+    return dict(base, status="ready", candidates=cands, levels_checked=checked)
+
+
+def mic_iceberg_get(cfg, acc, q, force):
+    secid = _flw_secid(q)
+    if not secid:
+        raise ApiError("Не указана бумага.", 400)
+    f = _mic_fetch(cfg, secid, 10)
+    if not f["ok"]:
+        return {"ok": False, "secid": secid, "error": f["error"]}
+    mic_ice_update(secid, {"bids": f["bids"], "asks": f["asks"]}, f["trades"])
+    rep = mic_ice_report(secid)
+    return dict(rep, ok=True, secid=secid, source=f["source"], source_label=f["source_label"], ts=f["ts"],
+                note="Эвристика, а не факт: уровень, на котором исполнено не менее чем в %d раза больше его максимального видимого размера и который держался "
+                     "не менее %d %% снимков, может скрывать часть объёма. Результат зависит от свежести данных и частоты опроса; "
+                     "окно — до %d мин и копится только пока экран открыт." % (MIC_FACTOR, MIC_PERSIST * 100, MIC_WINDOW // 60))
+
+
+API_GET["/api/mic/impact"] = mic_impact_get
+API_GET["/api/mic/iceberg"] = mic_iceberg_get
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -18761,6 +21080,47 @@ tr.scr-low td{opacity:.5}
 .fg-cc p{margin:0;font-size:12.5px;line-height:1.5;color:var(--tx2)}
 .fg-note p{font-size:13px;line-height:1.6;color:var(--tx2);margin:8px 0 0}.fg-note .mu{color:var(--mu)}
 @media(max-width:760px){.fg-top{grid-template-columns:1fr}}
+.rot-hm td.rot-c{white-space:nowrap}
+.rot-hm td.rot-fx,.rot-key.rot-fx{background:color-mix(in srgb,var(--ac-tx) var(--k,30%),transparent)}
+.rot-hm td.rot-fl,.rot-key.rot-fl{background:color-mix(in srgb,var(--pos) var(--k,30%),transparent)}
+.rot-key{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;--k:35%}
+.rot-ind{display:flex;align-items:center;gap:18px;margin:6px 0 10px}
+.rot-gauge{position:relative;flex:1;max-width:420px;height:10px;border-radius:6px;background:linear-gradient(90deg,var(--pos),var(--mu),var(--ac-tx))}
+.rot-gauge i{position:absolute;top:-4px;width:4px;height:18px;margin-left:-2px;border-radius:2px;background:var(--tx)}
+.rot-sc b{font-size:28px}
+.rot-sc small{color:var(--mu)}
+.dbx-trap td{background:color-mix(in srgb,var(--neg) 9%,transparent)}
+#dbx-tabs{width:fit-content;max-width:100%}
+.tag.pos{color:var(--pos)}
+.tag.neg{color:var(--neg)}
+.tag.mu{color:var(--mu)}
+.tbl-w{overflow-x:auto}
+/* ── Деньги и базис ── */
+.mm-ref{display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-bottom:12px;font-size:13.5px;color:var(--tx2)}
+.mm-ref b{color:var(--tx)}
+.tbl tr.mm-sel td{background:var(--card2)}
+.tbl tr.mm-sel td:first-child{box-shadow:inset 3px 0 0 var(--ac-tx)}
+#mm-tabs button{white-space:normal}
+.crp-h td{background:var(--card2,var(--card));font-weight:600;font-size:12.5px;color:var(--tx2)}
+.crp-s td{font-size:12px;color:var(--tx2)}
+.crp-r:hover{background:var(--card2,var(--card))}
+/* ── Налоговая оптимизация ── */
+.txo .txo-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin:10px 0}
+.txo .txo-form .field .in{width:100%}
+.txo .txo-sub{margin:14px 0 6px;font-size:14px;color:var(--text)}
+.txo .txo-warn{color:var(--neg)}
+.txo ul.txo-ul{margin:6px 0 0;padding-left:20px;line-height:1.6}
+.txo .tag.txo-ldv{border:1px solid var(--neg);color:var(--neg)}
+.txo .txo-chart{min-height:240px}
+@media print{.txo .txo-form{display:none}}
+.mic-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.mic-c{margin:0}
+.mic-big{font-size:24px;font-weight:600;margin:4px 0 10px}
+.mic-kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid var(--line);font-size:13px}
+.mic-kv:last-child{border-bottom:0}.mic-kv span{color:var(--tx2)}
+.mic-warn{margin-bottom:12px}
+.mic-meta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:12px}
+.mic-ev{font-size:12px;color:var(--tx2);white-space:normal;min-width:240px}
 </style></head>
 <body>
 <aside>
@@ -24384,6 +26744,627 @@ function pFng(){
   chart('fg-chart',fngChart);
   return h;
 }
+/* ── Флоатеры или фиксы: модельная ротация ── */
+S.rot={d:null,err:null,busy:false,gap:null,gapBusy:false,tm:0,
+  p:{spread:'2',tax:'1',bond:'',b_long:'0.5',b_mid:'0.7',b_short:'0.9',scn:'',amount:'1000000',n:'6',mode:'equal',goal:'3'}};
+const ROT_INFO={fixed:'фикс',float:'флоатер'};
+function rotQs(){const p=S.rot.p,o={};['spread','tax','bond','b_long','b_mid','b_short','scn','amount','n','mode'].forEach(k=>{if(p[k]!=='')o[k]=String(p[k]).replace(',','.')});return new URLSearchParams(o).toString()}
+function rotLoad(){
+  const R=S.rot;clearTimeout(R.tm);R.busy=true;
+  api('/api/rot?'+rotQs()).then(j=>{
+    if(j.loading){R.tm=setTimeout(()=>{if(S.page==='rot')rotLoad()},2500);if(S.page==='rot')renderSoon();return}
+    R.busy=false;R.err=j.error||null;if(!j.error){R.d=j;if(!R.p.bond)R.p.bond=j.bond.id;if(!R.p.scn)R.p.scn=j.lag.scn}
+    if(S.page==='rot')renderSoon();
+  }).catch(e=>{R.busy=false;R.err=e.message;if(S.page==='rot')renderSoon()});
+}
+function rotGapLoad(){
+  const R=S.rot;R.gapBusy=true;
+  api('/api/rot/gap?horizon='+encodeURIComponent(String(R.p.goal).replace(',','.'))).then(j=>{R.gap=j;R.gapBusy=false;if(S.page==='rot')renderSoon()})
+    .catch(e=>{R.gap={empty:true,error:e.message};R.gapBusy=false;if(S.page==='rot')renderSoon()});
+}
+const rotF=(v,d=2)=>v==null||isNaN(v)?'—':(+v).toFixed(d).replace('.',',');
+const rotSg=(v,d=2)=>v==null||isNaN(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',');
+function rotMatrix(d){
+  const mx=Math.max(1,...d.matrix.flatMap(r=>r.cells.map(c=>c&&c.diff!=null?Math.abs(c.diff):0)));
+  return`<div class="tbl"><table class="hm rot-hm"><thead><tr><th class="l">Сценарий ключевой ставки</th>${d.horizons.map(h=>`<th>${esc(h.label)}</th>`).join('')}</tr></thead><tbody>${d.matrix.map(r=>
+    `<tr><td class="y l"><b>${esc(r.name)}</b><br><small class="mu">${esc(r.note)}</small></td>${r.cells.map(c=>{
+      if(!c)return`<td class="mu" title="${r.avail?'':'Прогноз недоступен'}">—</td>`;
+      const k=c.diff==null?0:Math.round(14+Math.min(1,Math.abs(c.diff)/mx)*36);
+      return`<td class="rot-c ${c.win==='fixed'?'rot-fx':c.win==='float'?'rot-fl':''}" style="--k:${k}%" title="${esc(c.win==='fixed'?'фикс выше':'флоатер выше')}: разница ${rotSg(c.diff)} п.п."><b>${rotF(c.fixed,1)}</b> / ${rotF(c.float,1)}</td>`}).join('')}</tr>`).join('')}</tbody></table></div>
+  <p class="note"><span class="rot-key rot-fx"></span> выше доходность фикса &nbsp; <span class="rot-key rot-fl"></span> выше доходность флоатера. В ячейке: <b>фикс</b> / флоатер, % годовых (полная доходность${S.rot.d.tax?', после НДФЛ 13%':', до налогов'}).${d.forecast_ok?'':' Источник прогноза ЦБ сейчас недоступен — строка «Прогноз ЦБ» не рассчитана.'}</p>`;
+}
+function rotBreakeven(d){
+  return`<div class="tbl"><table><thead><tr><th class="l">Горизонт</th><th>Снижение ставки за год, п.п.</th><th class="l">Вывод по модели</th></tr></thead><tbody>${d.breakeven.map(b=>{
+    const t=b.state==='ok'?`Фикс обгоняет флоатер, если ставка снизится больше чем на <b>${rotF(b.value,1)} п.п.</b>`:b.state==='always'?`Фикс впереди даже при росте ставки на ${rotF(-b.value,0)} п.п.`:b.state==='never'?`Даже при снижении ставки до ${rotF(d.floor,0)} % фикс не догоняет флоатер`:'Не рассчитано';
+    return`<tr><td class="l"><b>${esc(b.label)}</b></td><td class="num">${b.state==='ok'?rotF(b.value,1):'—'}</td><td class="l">${t}</td></tr>`}).join('')}</tbody></table></div>
+  <p class="note">Снижение — параллельное, равномерно в течение первого года, затем ставка остаётся на достигнутом уровне; нижняя граница ставки — ${rotF(d.floor,0)} %.</p>`;
+}
+function rotIndicator(d){
+  const i=d.indicator;if(!i)return`<p class="mu">Кривая бескупонной доходности (КБД) недоступна — индикатор не рассчитан.</p>`;
+  return`<div class="rot-ind"><div class="rot-gauge"><i style="left:${i.score}%"></i></div><div class="rot-sc"><b>${rotF(i.score,0)}</b><small> из 100</small></div></div>
+    <p>${esc(i.label)}</p>
+    <div class="tbl"><table><tbody><tr><td class="l">Ключевая ставка</td><td class="num">${rotF(i.key)} %</td></tr><tr><td class="l">КБД 1 год</td><td class="num">${rotF(i.kbd1)} %</td></tr><tr><td class="l">КБД 10 лет</td><td class="num">${rotF(i.kbd10)} %</td></tr>
+    <tr><td class="l">A = КБД 10 лет − ключевая</td><td class="num">${rotSg(i.a)} п.п.</td></tr><tr><td class="l">S = КБД 10 лет − КБД 1 год</td><td class="num">${rotSg(i.s)} п.п.</td></tr></tbody></table></div>
+    <p class="note">Формула: индикатор = 50 + 4 × A + 3 × S, где A ограничено ±8 п.п., S ограничено ±6 п.п.; результат в пределах 0–100. Он описывает форму кривой: насколько длинные ставки выше ключевой и насколько кривая крута. Это справочная характеристика рынка, а не сигнал к сделке.</p>`;
+}
+function rotLadder(d){
+  const L=d.ladder;
+  return`<div class="tbl"><table><thead><tr><th class="l">Дата заседания</th><th>Доля транша</th><th>Сумма</th><th>Всего в фиксе</th><th>Дюрация портфеля, лет</th></tr></thead><tbody>${L.rows.map(r=>
+    `<tr><td class="l">${ddm(r.date)}${L.approx_dates?' <small class="mu">≈</small>':''}</td><td class="num">${rotF(r.share,1)} %</td><td class="num">${M(r.rub,'rub',0)}</td><td class="num">${rotF(r.cum_share,1)} %</td><td class="num"><b>${rotF(r.duration)}</b></td></tr>`).join('')}</tbody></table></div>
+  <p class="note">Модельный план: сумма во флоатерах переводится в выбранную фиксированную ОФЗ траншами в даты заседаний Банка России${L.approx_dates?' (часть дат ориентировочная — календарь ЦБ получен не полностью)':''}. Дюрация фикса ${rotF(L.d_fixed)} лет, флоатера — ${rotF(L.d_float)} года. Это иллюстрация расчёта, а не рекомендация по срокам и долям.</p>`;
+}
+function rotLag(d){
+  const rs=d.lag.rows,nm=(d.scenarios.find(s=>s.key===d.lag.scn)||{}).name||'';
+  if(!rs.length)return`<p class="mu">Нет данных по флоатерам.</p>`;
+  return`<div class="tbl" style="max-height:480px"><table><thead><tr><th class="l">Выпуск</th><th class="l">Привязка</th><th>Купон сейчас, %</th><th>Следующие купоны по модели, %</th><th>Средний купон 12 мес</th><th>Текущая доходность по купону</th><th>Через 12 мес по модели</th><th>Изменение, п.п.</th></tr></thead><tbody>${rs.map(r=>
+    `<tr><td class="l"><b>${esc(r.name)}</b><br><small class="mu num">${esc(r.isin||r.id)}</small></td><td class="l"><small>${esc(r.link)}</small></td><td class="num">${rotF(r.coupon)}</td><td class="num">${r.future.map(x=>rotF(x)).join(' → ')||'—'}</td><td class="num">${rotF(r.avg12)}</td><td class="num">${rotF(r.cy_now)}</td><td class="num">${rotF(r.cy_fwd)}</td><td class="num ${r.delta<0?'neg':'pos'}">${rotSg(r.delta)}</td></tr>`).join('')}</tbody></table></div>
+  <p class="note">Сценарий: ${esc(nm)}. Купон КС-флоатера определяется ставкой на начало купонного периода, купон RUONIA-флоатера — средней за период со сдвигом около 7 дней назад, поэтому купоны реагируют на изменение ставки с задержкой. Спред к ставке оценён как текущий купон минус текущая ставка; период купона принят 6 месяцев для ОФЗ и 3 месяца для корпоративных; выпуски с привязкой к инфляции исключены, а если база купона неизвестна, считается по правилу КС.</p>`;
+}
+function rotGap(){
+  const R=S.rot,g=R.gap;
+  if(R.gapBusy&&!g)return waitBox('Считаю дюрацию портфеля…');
+  if(!g)return`<button class="btn ghost" id="rot-gap-go">Рассчитать по моему портфелю</button>`;
+  if(g.empty)return`<p class="mu">${esc(g.error||'В портфеле нет облигаций с данными для расчёта (в демо-режиме или без токена расчёт недоступен).')}</p><button class="btn ghost" id="rot-gap-go">Повторить</button>`;
+  return`<div class="row" style="gap:20px;flex-wrap:wrap"><div><small class="mu">Дюрация портфеля облигаций</small><br><b style="font-size:20px">${rotF(g.duration)} лет</b></div>
+    <div><small class="mu">Цель</small><br><b style="font-size:20px">${rotF(g.goal,1)} лет</b></div>
+    <div><small class="mu">Разрыв</small><br><b style="font-size:20px" class="${Math.abs(g.gap)>0.5?'neg':'pos'}">${rotSg(g.gap)} года</b></div>
+    <div><small class="mu">Флоатеры в портфеле</small><br><b style="font-size:20px">${rotF(g.floating_share,0)} %</b></div></div>
+    <p>${esc(g.gap_text)}</p>
+    <div class="tbl"><table><thead><tr><th class="l">Сценарий сдвига доходностей</th><th>Изменение стоимости</th><th>В рублях</th></tr></thead><tbody>${g.scenarios.map(s=>
+      `<tr><td class="l">${esc(s.name)}</td><td class="num ${s.pct<0?'neg':'pos'}">${rotSg(s.pct)} %</td><td class="num">${M(s.rub,'rub',0)}</td></tr>`).join('')}</tbody></table></div>
+    <p class="note">Оценка по модифицированной дюрации и выпуклости: ΔV/V ≈ −D·Δy + C·Δy²/2. Флоатеры приняты с дюрацией около 0,25 года. Изменение «длинного конца» применяется с весом от 0 (дюрация до 2 лет) до 1 (дюрация от 10 лет). Кредитный спред и реинвестирование не учитываются.</p>
+    <button class="btn ghost" id="rot-gap-go">Пересчитать</button>`;
+}
+function pRot(){
+  const R=S.rot,d=R.d,p=R.p;
+  if(!d&&!R.err&&!R.busy)rotLoad();
+  if(R.err&&!d)return`<div class="msg err">${esc(R.err)} <button class="btn ghost" id="rot-retry">Повторить</button></div>`;
+  if(!d)return`<div class="card">${waitBox('Загружаю торги ОФЗ, кривую КБД и прогноз ключевой ставки…')}</div>`;
+  const opt=(v,t,cur)=>`<option value="${esc(v)}" ${String(cur)===String(v)?'selected':''}>${esc(t)}</option>`;
+  const b=d.bond;
+  return`<div class="card"><h2>Флоатеры или фиксы<span class="sp">${R.busy?'пересчитываю…':'ключевая ставка '+rotF(d.key_rate)+' %'}</span></h2>
+    <p class="mu">Модель сравнивает полную доходность флоатера (купон = ставка + спред) и фиксированной ОФЗ при разных траекториях ключевой ставки.</p>
+    <div class="flt">
+      <label class="field"><span>Спред флоатера к ставке, п.п.</span><input class="in num" id="rot-spread" value="${esc(p.spread)}" inputmode="decimal"></label>
+      <label class="field"><span>Фиксированная ОФЗ</span><select class="in" id="rot-bond">${d.bonds.map(x=>opt(x.id,`${x.name} · до ${ddm(x.mat)} · ${rotF(x.yield,1)} %`,p.bond)).join('')}</select></label>
+      <label class="field"><span>β: срок больше 5 лет</span><input class="in num" id="rot-bl" value="${esc(p.b_long)}" inputmode="decimal"></label>
+      <label class="field"><span>β: 2–5 лет</span><input class="in num" id="rot-bm" value="${esc(p.b_mid)}" inputmode="decimal"></label>
+      <label class="field"><span>β: меньше 2 лет</span><input class="in num" id="rot-bs" value="${esc(p.b_short)}" inputmode="decimal"></label>
+      <label class="sw"><input type="checkbox" id="rot-tax" ${p.tax==='1'?'checked':''}><i></i><div><b>НДФЛ 13%</b><small>с купонов и положительной переоценки</small></div></label>
+      <button class="btn" id="rot-go">Пересчитать</button></div>
+    <p class="note">Допущения. Флоатер: купон = ключевая ставка на начало квартала + спред, цена около номинала. Фикс — ${esc(b.name)} (погашение ${ddm(b.mat)}, цена ${rotF(b.price)} %, доходность ${rotF(b.yield)} %): к горизонту доходность сдвигается на β × изменение ключевой ставки (β для этой бумаги — ${rotF(b.beta,1)}), цена пересчитывается полностью по оставшимся потокам. Метод: ${esc(d.method)}. Купоны реинвестируются по средней ставке сценария. Курсовой эффект спреда флоатера и комиссии не учитываются.</p></div>
+  <div class="card"><h2>Сценарии и горизонты</h2>${rotMatrix(d)}</div>
+  <div class="card"><h2>Точка безубыточности</h2>${rotBreakeven(d)}</div>
+  <div class="card"><h2>Индикатор формы кривой</h2>${rotIndicator(d)}</div>
+  <div class="card"><h2>Модельный план перекладки</h2>
+    <div class="flt"><label class="field"><span>Сумма во флоатерах, ₽</span><input class="in num" id="rot-amt" value="${esc(p.amount)}" inputmode="decimal"></label>
+      <label class="field"><span>Число траншей (заседаний)</span><input class="in num" id="rot-n" value="${esc(p.n)}" inputmode="numeric"></label>
+      <label class="field"><span>Распределение</span><select class="in" id="rot-mode">${opt('equal','Равными долями',p.mode)}${opt('front','Больше в начале',p.mode)}</select></label>
+      <button class="btn ghost" id="rot-go2">Пересчитать</button></div>${rotLadder(d)}</div>
+  <div class="card"><h2>Лаг фиксации купонов флоатеров</h2>
+    <div class="flt"><label class="field"><span>Сценарий ставки</span><select class="in" id="rot-scn">${d.scenarios.filter(s=>s.key!=='cbr'||d.forecast_ok).map(s=>opt(s.key,s.name,p.scn||d.lag.scn)).join('')}</select></label></div>${rotLag(d)}</div>
+  <div class="card"><h2>Дюрационный разрыв портфеля</h2>
+    <div class="flt"><label class="field"><span>Горизонт цели, лет</span><input class="in num" id="rot-goal" value="${esc(p.goal)}" inputmode="decimal"></label></div>${rotGap()}</div>
+  <p class="note">Все результаты — расчёты по модели при заданных допущениях; реальные траектории ставок, спреды и ликвидность будут другими. Прогноз ключевой ставки: ${esc(d.forecast_src||'нет данных')}. Расчёт не учитывает кредитный риск эмитентов, комиссии и налоговые льготы (ЛДВ, ИИС).${(d.errors||[]).length?' Часть данных получить не удалось: '+esc(d.errors.join('; '))+'.':''}</p>${NIR_NOTE}`;
+}
+function bindRot(){
+  const R=S.rot,p=R.p,$$=id=>document.getElementById(id);
+  const rb=$$('rot-retry');if(rb)rb.onclick=()=>{R.err=null;R.d=null;renderSoon()};
+  if(!R.d)return;
+  const read=()=>{p.spread=$$('rot-spread').value;p.bond=$$('rot-bond').value;p.b_long=$$('rot-bl').value;p.b_mid=$$('rot-bm').value;p.b_short=$$('rot-bs').value;p.tax=$$('rot-tax').checked?'1':'0';
+    p.amount=$$('rot-amt').value;p.n=$$('rot-n').value;p.mode=$$('rot-mode').value;p.scn=$$('rot-scn').value;p.goal=$$('rot-goal').value};
+  const go=()=>{read();rotLoad();renderSoon()};
+  ['rot-go','rot-go2'].forEach(id=>{const e=$$(id);if(e)e.onclick=go});
+  ['rot-bond','rot-tax','rot-mode','rot-scn'].forEach(id=>{const e=$$(id);if(e)e.onchange=go});
+  ['rot-spread','rot-bl','rot-bm','rot-bs','rot-amt','rot-n'].forEach(id=>{const e=$$(id);if(e)e.onkeydown=ev=>{if(ev.key==='Enter')go()}});
+  const g=$$('rot-gap-go');if(g)g.onclick=()=>{read();R.gap=null;rotGapLoad();renderSoon()};
+  const gi=$$('rot-goal');if(gi)gi.onkeydown=ev=>{if(ev.key==='Enter'){read();R.gap=null;rotGapLoad();renderSoon()}};
+}
+regPage('rot',{title:'Флоатеры или фиксы',group:'Рынок',icon:'<path d="M3 17c4 0 4-10 9-10s5 10 9 10"/><path d="M3 12h18"/>',render:pRot,bind:bindRot,pro:true});
+/* ── Линкеры, оферты, валютные и замещающие облигации ── */
+S.dbx={tab:'lnk',lnk:null,lnkLoad:false,off:null,offLoad:false,offGrade:'',offTimer:0,fxb:null,fxbLoad:false,fxRes:null,fxLoad:false,fxErr:null,
+  f:{cur:'USD',nominal:'1000',price:'100',coupon:'5',freq:'2',mat:'',buy_fx:'',qty:'10',nkd:'0',other:'0',scenarios:'-20, -10, 0, 10, 20, 40'}};
+const DBX_GR={high:['pos','покрытие высокое'],mid:['','покрытие среднее'],low:['neg','покрытие низкое'],nodata:['mu','нет данных'],na:['mu','показатель неприменим'],loading:['mu','считаю…']};
+const dbxN=(v,d=2)=>bad(v)?'—':v.toFixed(d).replace('.',',');
+const dbxM=v=>bad(v)?'—':short(v);
+const dbxMl=v=>bad(v)?'—':Math.round(v).toLocaleString('ru-RU');
+function dbxLoadJ(key,flag,url){
+  const D=S.dbx;if(D[flag])return;D[flag]=true;
+  api(url).then(j=>{D[key]=j}).catch(e=>{D[key]={error:e.message||String(e),rows:[]}}).then(()=>{D[flag]=false;if(S.page==='dbx'){renderSoon();dbxPoll()}});
+}
+function dbxLinkers(){
+  const D=S.dbx;
+  if(!D.lnk){dbxLoadJ('lnk','lnkLoad','/api/dbx/linkers');return waitBox('Загружаю ОФЗ-ИН с Мосбиржи…')}
+  const d=D.lnk;if(d.error)return`<div class="msg err">${esc(d.error)}</div>`;
+  const fc=d.forecast||{},fy=(fc.yearly||[]).map(y=>`${y.year}: ${dbxN(y.mid,1)} %`).join(' · ');
+  let h=`<div class="card"><h2>Линкеры (ОФЗ-ИН): какую инфляцию закладывает рынок<span class="sp">модельный расчёт по данным Мосбиржи и КБД</span></h2>`;
+  if(!d.rows.length)return h+`<div class="empty">Выпуски ОФЗ-ИН на Мосбирже не найдены.</div></div>`;
+  h+=`<div class="tbl-w"><table class="tbl"><thead><tr><th class="l">Выпуск</th><th>Погашение</th><th>Дюрация, лет</th><th>Реальная доходность</th><th>Номинальная (КБД) на той же дюрации</th><th>Разница</th><th>Безубыточная инфляция (Фишер)</th><th>Прогноз инфляции</th><th>Безубыточная − прогноз</th></tr></thead><tbody>`;
+  h+=d.rows.map(r=>`<tr><td class="l"><b>${esc(r.name)}</b> <small class="mu">${esc(r.id)}</small></td><td>${esc(dlabel(r.mat))}</td><td class="num">${dbxN(r.dur)}</td><td class="num">${pctp(r.real,2)}</td><td class="num">${pctp(r.nominal,2)}</td><td class="num">${dbxN(r.diff)} п.п.</td><td class="num"><b>${pctp(r.be,2)}</b></td><td class="num" title="${r.fc_src==='cbr'?'среднее по прогнозу Банка России на горизонте дюрации':'допущение 4 % — прогноз недоступен'}">${pctp(r.fc,2)}${r.fc_src==='cbr'?'':' *'}</td><td class="num ${r.gap>0.3?'pos':r.gap<-0.3?'neg':''}">${r.gap>0?'+':''}${dbxN(r.gap)} п.п.</td></tr>`).join('')+`</tbody></table></div>`;
+  h+=`<p class="note" style="margin-top:12px">Как читать. Безубыточная инфляция по Фишеру: (1 + номинальная) / (1 + реальная) − 1; простая разница — номинальная минус реальная. Если инфляция в среднем окажется выше этого уровня, линкер при прочих равных даст больше обычной ОФЗ с той же дюрацией, ниже — меньше. «Безубыточная − прогноз» больше нуля означает, что рынок закладывает инфляцию выше прогноза.</p>
+    <p class="note">Ограничения: индексация номинала идёт с лагом около трёх месяцев к ИПЦ, поэтому на коротких выпусках результат чувствителен к недавней инфляции. Реальная доходность линкера и КБД рассчитываются по-разному, в безубыточной инфляции есть премия за ликвидность и за риск инфляции; ликвидность ОФЗ-ИН ниже, чем у обычных ОФЗ. Прогноз — Банка России${fc.as_of?' от '+esc(dlabel(fc.as_of)):''}${fy?` (середина диапазона, декабрь к декабрю: ${esc(fy)})`:' (недоступен, использовано допущение 4 %, отмечено звёздочкой)'}; за пределами горизонта прогноза берётся последнее значение.</p></div>`;
+  return h;
+}
+function dbxOffers(){
+  const D=S.dbx;
+  if(!D.off){dbxLoadJ('off','offLoad','/api/dbx/offers');return waitBox('Ищу облигации с офертой в ближайшие 12 месяцев…')}
+  const d=D.off;if(d.error&&!(d.rows||[]).length)return`<div class="msg err">${esc(d.error)}</div>`;
+  const rows=(d.rows||[]).filter(r=>!D.offGrade||r.grade===D.offGrade);
+  let h=`<div class="card"><h2>Радар оферт: хватит ли денег у эмитента<span class="sp">корпоративные рублёвые выпуски с put-офертой в ближайшие 12 месяцев</span></h2>`;
+  if(d.pending)h+=`<div class="msg" style="margin-bottom:12px">Загружаю отчётность эмитентов: ${d.total?`${d.done} из ${d.total}`:'определяю эмитентов…'}. Страница обновится сама.</div>`;
+  if(d.capped)h+=`<div class="msg" style="margin-bottom:12px">За один запуск запрашивается отчётность не более 60 эмитентов; ещё ${d.capped} остались без данных.</div>`;
+  h+=`<div class="flt"><label class="field"><span>Оценка покрытия</span><select class="in" id="dbx-gr"><option value="">все</option>${['low','mid','high','nodata','na'].map(k=>`<option value="${k}" ${D.offGrade===k?'selected':''}>${DBX_GR[k][1]}</option>`).join('')}</select></label>
+    <button class="btn ghost" id="dbx-off-re">Обновить</button></div>`;
+  if(!rows.length)return h+`<div class="empty">Подходящих выпусков нет.</div></div>`;
+  h+=`<div class="tbl-w"><table class="tbl"><thead><tr><th class="l">Выпуск / эмитент</th><th>Дата оферты</th><th>Доходность</th><th>Объём выпуска, млн ₽</th><th>Деньги и вложения, млн ₽</th><th>Покрытие выпуска</th><th>Покрытие по эмитенту</th><th class="l">Оценка</th></tr></thead><tbody>`;
+  h+=rows.map(r=>{const g=DBX_GR[r.grade]||DBX_GR.nodata;
+    return`<tr><td class="l"><b>${esc(r.name)}</b><br><small class="mu">${esc(r.issuer||'')}</small></td><td>${esc(dlabel(r.offer))}</td><td class="num">${pctp(r.yield,2)}</td>
+    <td class="num" title="${esc(r.vol_how||'')}">${r.volume?dbxMl(r.volume/1e6):'—'}</td><td class="num">${r.is_fin?'—':dbxMl(r.cash)}${r.fin_year?` <small class="mu">${r.fin_year}</small>`:''}</td>
+    <td class="num">${r.is_fin||bad(r.cover)?'—':dbxN(r.cover)+'×'}</td><td class="num" title="${r.issuer_total?'суммарный объём оферт эмитента: '+dbxMl(r.issuer_total/1e6)+' млн ₽':''}">${r.is_fin||bad(r.cover_all)?'—':dbxN(r.cover_all)+'×'}</td>
+    <td class="l"><span class="tag ${g[0]}" ${r.fin_note?`title="${esc(r.fin_note)}"`:''}>${g[1]}</span></td></tr>`}).join('')+`</tbody></table></div>`;
+  h+=`<p class="note" style="margin-top:12px">Покрытие = (денежные средства 1250 + краткосрочные финансовые вложения 1240 по балансу РСБУ за последний год) / объём выпуска в обращении; оценка берётся по эмитенту целиком: деньги одни на все его оферты в горизонте. Градация: от 1× — высокое, от 0,4× — среднее, ниже — низкое. Это модельная оценка, а не прогноз события.</p>
+    <p class="note">Ограничения. РСБУ — отчётность отдельной компании, не группы, и может быть старше года; на дату оферты денег может быть больше или меньше. Данных о денежных потоках от операционной деятельности в используемом источнике нет, поэтому они не показаны. Держатели не обязаны предъявлять облигации к оферте, фактический выкуп обычно меньше объёма выпуска. Для банков, лизинга, МФО и прочих финансовых компаний показатель неприменим: деньги и долг — часть их бизнеса.</p></div>`;
+  return h;
+}
+function dbxPoll(){
+  const D=S.dbx;
+  if(D.offTimer||!D.off||!D.off.pending||S.page!=='dbx'||D.tab!=='off')return;
+  D.offTimer=setTimeout(()=>{D.offTimer=0;if(S.page!=='dbx')return;
+    api('/api/dbx/offers').then(j=>{D.off=j}).catch(()=>{}).then(()=>{if(S.page==='dbx'){renderSoon();dbxPoll()}})},3000);
+}
+function dbxFx(){
+  const D=S.dbx,f=D.f;
+  if(!D.fxb)dbxLoadJ('fxb','fxbLoad','/api/dbx/fxbonds');
+  const bs=D.fxb&&D.fxb.rows||[];
+  const fld=(id,t,v,ph)=>`<label class="field"><span>${t}</span><input class="in num" id="dbx-${id}" value="${esc(v)}" ${ph?`placeholder="${esc(ph)}"`:''} inputmode="decimal"></label>`;
+  let h=`<div class="card"><h2>Валютные и замещающие облигации: доходность после налога<span class="sp">налог считается в рублях по курсам ЦБ на даты операций (ст. 214.1, 212 НК РФ)</span></h2>
+   <div class="flt"><label class="field"><span>Выпуск (подставит данные)</span><select class="in" id="dbx-bond"><option value="">— вручную —</option>${bs.map(b=>`<option value="${esc(b.id)}">${esc(b.name)} · ${esc(b.cur)} · до ${esc(b.mat)}</option>`).join('')}</select></label>
+   <label class="field"><span>Валюта</span><select class="in" id="dbx-cur">${['USD','EUR','CNY','AED','HKD','KZT'].map(c=>`<option ${f.cur===c?'selected':''}>${c}</option>`).join('')}</select></label>
+   ${fld('nominal','Номинал, в валюте',f.nominal)}${fld('price','Цена, % номинала',f.price)}${fld('nkd','НКД при покупке, в валюте',f.nkd)}</div>
+   <div class="flt">${fld('coupon','Купон, % годовых',f.coupon)}${fld('freq','Купонов в год',f.freq)}${fld('mat','Погашение (ГГГГ-ММ-ДД)',f.mat,'2028-06-15')}${fld('buy_fx','Курс ЦБ на покупку, ₽',f.buy_fx,'по умолчанию — текущий')}${fld('qty','Количество бумаг',f.qty)}</div>
+   <div class="flt">${fld('other','Прочий налоговый доход года, ₽',f.other)}<label class="field" style="flex:2;min-width:240px"><span>Изменение курса к погашению, % (через запятую)</span><input class="in num" id="dbx-scenarios" value="${esc(f.scenarios)}"></label>
+   <button class="btn" id="dbx-run">${D.fxLoad?'Считаю…':'Рассчитать'}</button></div>`;
+  if(D.fxErr)h+=`<div class="msg err" style="margin-top:12px">${esc(D.fxErr)}</div>`;
+  const r=D.fxRes;
+  if(r){
+    h+=`<p class="note" style="margin:12px 0 6px">Вложения: ${dbxN(r.cost_cur)} ${esc(r.cur)} = ${dbxM(r.cost_rub)} ₽ по курсу ${dbxN(r.buy_fx,4)}; купонов до погашения: ${r.n_coupons}, по ${dbxN(r.coupon_cur)} ${esc(r.cur)}. Налоговый год погашения: ${r.year}.</p>
+    <div class="tbl-w"><table class="tbl"><thead><tr><th>Курс к погашению</th><th>Курс, ₽</th><th>Доход в валюте</th><th>До налога, ${esc(r.cur)}</th><th>После налога, ${esc(r.cur)}</th><th>До налога, ₽</th><th>После налога, ₽</th><th>Налоговая база, ₽</th><th>Налог, ₽</th></tr></thead><tbody>`;
+    h+=r.scenarios.map(s=>`<tr class="${s.trap?'dbx-trap':''}"><td class="num">${s.scenario>0?'+':''}${dbxN(s.scenario,0)} %</td><td class="num">${dbxN(s.fx_mat)}</td><td class="num">${dbxN(s.profit_cur)} ${esc(r.cur)}</td>
+      <td class="num">${pctp(s.pre_cur,2)}</td><td class="num"><b>${pctp(s.post_cur,2)}</b></td><td class="num">${pctp(s.pre_rub,2)}</td><td class="num"><b>${pctp(s.post_rub,2)}</b></td><td class="num">${dbxM(s.base_rub)}</td>
+      <td class="num ${s.tax_rub>0?'neg':''}">${dbxM(s.tax_rub)}${s.tax_rub>0?` <small class="mu">${dbxN(s.tax_rate*100,1)} %</small>`:''}${s.trap?' <span class="tag neg" title="Доход в валюте около нуля, но налог начислен из-за ослабления рубля">налог без дохода</span>':''}</td></tr>`).join('')+`</tbody></table></div>`;
+    if(r.scenarios.some(s=>s.trap))h+=`<div class="msg" style="margin-top:12px">Выделенные сценарии показывают налоговую ловушку: в валюте дохода почти нет, но рубль ослабел, и разница курсов при погашении облагается налогом как доход в рублях.</div>`;
+  }
+  h+=`<p class="note" style="margin-top:12px">Модель: налоговая база в рублях = купоны по курсу ЦБ на дату выплаты + погашение по курсу на дату погашения − (цена покупки + НКД) по курсу на дату покупки. Курс до сценарного значения движется линейно от курса покупки; купоны приближённо распределены равными долями назад от даты погашения. Ставка — 13 % до порога и 15 % с превышения (2,4 млн ₽ с 2025 года) с учётом введённого «прочего дохода»; налог условно удержан при погашении и пересчитан в валюту по курсу погашения. Не учтены: ЛДВ, убытки прошлых лет, комиссии, налоги иностранных источников, реальная схема выплаты купонов, выплата в рублях вместо валюты.</p></div>`;
+  return h;
+}
+function pDbx(){
+  const D=S.dbx;
+  const tabs=[['lnk','Линкеры'],['off','Оферты'],['fx','Валютные и замещающие']];
+  const body=D.tab==='lnk'?dbxLinkers():D.tab==='off'?dbxOffers():dbxFx();
+  return`<div class="seg" id="dbx-tabs" style="margin-bottom:14px">${tabs.map(([k,t])=>`<button data-t="${k}" class="${D.tab===k?'on':''}">${t}</button>`).join('')}</div>${body}${NIR_NOTE}`;
+}
+function dbxRun(){
+  const D=S.dbx,f=D.f;D.fxLoad=true;D.fxErr=null;renderSoon();
+  const p=new URLSearchParams({cur:f.cur,nominal:f.nominal,price:f.price,coupon:f.coupon,freq:f.freq,mat:f.mat,qty:f.qty,nkd:f.nkd,other:f.other,scenarios:f.scenarios});
+  if(f.buy_fx)p.set('buy_fx',f.buy_fx);
+  api('/api/dbx/fx?'+p).then(j=>{if(j.error){D.fxErr=j.error;D.fxRes=null}else D.fxRes=j}).catch(e=>{D.fxErr=e.message||String(e)}).then(()=>{D.fxLoad=false;if(S.page==='dbx')renderSoon()});
+}
+function bindDbx(){
+  const D=S.dbx,el=id=>document.getElementById(id);
+  document.querySelectorAll('#dbx-tabs button').forEach(b=>b.onclick=()=>{D.tab=b.dataset.t;renderSoon()});
+  const g=el('dbx-gr');if(g)g.onchange=()=>{D.offGrade=g.value;renderSoon()};
+  const re=el('dbx-off-re');if(re)re.onclick=()=>{api('/api/dbx/offers?force=1').then(j=>{D.off=j}).catch(()=>{}).then(()=>{renderSoon();dbxPoll()})};
+  ['nominal','price','nkd','coupon','freq','mat','buy_fx','qty','other','scenarios'].forEach(k=>{const e=el('dbx-'+k);if(e)e.oninput=()=>{D.f[k]=e.value}});
+  const cu=el('dbx-cur');if(cu)cu.onchange=()=>{D.f.cur=cu.value};
+  const bo=el('dbx-bond');
+  if(bo)bo.onchange=()=>{const b=((D.fxb&&D.fxb.rows)||[]).find(x=>x.id===bo.value);if(!b)return;
+    Object.assign(D.f,{cur:b.cur,nominal:String(b.nominal||1000),price:String(b.price),coupon:String(b.coupon||0),mat:b.mat,buy_fx:''});renderSoon()};
+  const run=el('dbx-run');if(run)run.onclick=dbxRun;
+  dbxPoll();
+}
+regPage('dbx',{title:'Линкеры, оферты, валютные',group:'Рынок',icon:'<path d="M3 17l5-5 4 4 8-9"/><path d="M15 7h5v5"/>',render:pDbx,bind:bindDbx,pro:true});
+/* ── Деньги и базис: фонды ликвидности (доходность, отставание от ставки, после налога) и базис фьючерсов (cash & carry) ── */
+S.mm={tab:'funds',f:null,b:null,fl:0,bl:0,fseq:0,q:{amount:'1000000',days:'365',fee:'0',save:'',fund:'LQDT',win:'3m'}};
+const MM_WINS=[['1m','Месяц'],['3m','3 мес'],['6m','6 мес'],['1y','Год']];
+const mmPc=(v,d=2)=>bad(v)?'—':v.toFixed(d).replace('.',',')+' %';
+const mmPp=v=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(2).replace('.',',')+' п.п.';
+const mmCls=v=>bad(v)?'':v>0?'pos':v<0?'neg':'';
+const mmNum=(v,d=2)=>bad(v)?'—':v.toLocaleString('ru-RU',{minimumFractionDigits:d,maximumFractionDigits:d});
+function mmQs(){return Object.entries(S.mm.q).filter(([k,v])=>String(v).trim()!=='').map(([k,v])=>k+'='+encodeURIComponent(String(v).replace(',','.'))).join('&')}
+function loadMmF(){
+  const m=S.mm,seq=++m.fseq;m.fl=1;
+  api('/api/mm/funds?'+mmQs()).then(j=>{if(seq===m.fseq)m.f=j}).catch(e=>{if(seq===m.fseq)m.f={error:e.message||String(e),funds:[]}})
+   .then(()=>{if(seq!==m.fseq)return;m.fl=0;if(S.page==='mm')renderSoon()});
+}
+function loadMmB(force){
+  const m=S.mm;if(m.bl)return;m.bl=1;
+  api('/api/mm/basis'+(force?'?force=1':'')).then(j=>{m.b=j}).catch(e=>{m.b={error:e.message||String(e),rows:[]}})
+   .then(()=>{m.bl=0;if(S.page==='mm')renderSoon()});
+}
+function mmFundsTable(d){
+  const sel=d.selected;
+  const cell=w=>!w||bad(w.ret)?'<td class="num"><span class="mu">—</span></td>'
+    :`<td class="num"><b>${mmPc(w.ret)}</b><br><small class="${mmCls(w.gap)}" title="${w.bench_name?'Отставание от ставки ('+esc(w.bench_name)+') за то же окно':''}">${mmPp(w.gap)}</small></td>`;
+  return`<div class="tbl"><table><thead><tr><th class="l">Фонд</th><th>Цена пая, ₽</th>${MM_WINS.map(([k,t])=>`<th>${t}</th>`).join('')}</tr></thead><tbody>${
+    d.funds.map(f=>`<tr data-mmf="${esc(f.secid)}" style="cursor:pointer" class="${f.secid===sel?'mm-sel':''}" title="Выбрать для сравнения ниже"><td class="l"><b>${esc(f.secid)}</b><br><small class="mu">${esc(f.name)}</small></td>
+      <td class="num">${mmNum(f.last,4)}<br><small class="mu">${esc(dlabel(f.last_date))}</small></td>${MM_WINS.map(([k])=>cell(f.wins[k])).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
+function mmCompare(d){
+  const fld=(id,t,v,hint)=>`<label class="field"><span>${t}</span><input class="in num" id="${id}" value="${esc(v)}" inputmode="decimal" ${hint?`title="${esc(hint)}"`:''}></label>`;
+  const q=S.mm.q;
+  const rows=d.compare.map(r=>{const a=r.after;
+    return`<tr><td class="l">${esc(r.title)}<br><small class="mu">${esc(r.note||'')}</small></td><td class="num">${mmPc(r.gross)}</td>
+      <td class="num">${a&&a.net_ann!=null?'<b>'+mmPc(a.net_ann)+'</b>':'<span class="mu">—</span>'}</td>
+      <td class="num">${a?M(a.net_gain,'rub',0):'—'}</td><td class="num">${a?M(a.tax,'rub',0):'—'}</td></tr>`}).join('');
+  const l=d.compare.find(r=>r.after&&r.after.ldv);
+  return`<div class="flt"><label class="field"><span>Фонд</span><select class="in" id="mm-fund">${d.funds.map(f=>`<option value="${esc(f.secid)}" ${f.secid===d.selected?'selected':''}>${esc(f.secid)}</option>`).join('')}</select></label>
+    <div class="field"><span>Окно доходности фонда</span><div class="seg" id="mm-win">${MM_WINS.map(([k,t])=>`<button data-w="${k}" class="${d.win===k?'on':''}">${t}</button>`).join('')}</div></div>
+    ${fld('mm-amount','Сумма, ₽',q.amount)}${fld('mm-days','Срок, дней',q.days)}${fld('mm-fee','Комиссия брокера, % с оборота',q.fee,'Берётся с покупки и с продажи; для фонда и ОФЗ')}
+    ${fld('mm-save','Ставка накопительного счёта, % год.',q.save||(d.save==null?'':d.save.toFixed(1).replace('.',',')),'Эффективная годовая ставка; по умолчанию ключевая минус 2 п.п. — только для примера')}</div>
+    <div class="tbl"><table><thead><tr><th class="l">Инструмент</th><th>До налога, % год.</th><th>После налога и комиссии, % год.</th><th>Итого за срок, ₽</th><th>Налог, ₽</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <p class="note">${l?'Срок больше трёх лет: учтена льгота долгосрочного владения (до 3 млн ₽ дохода за каждый полный год). ':''}${esc(d.ldv_note)} Налог рассчитан по ставке 13 % (15 % с превышения порога) на доход после вычета комиссий; другие доходы за год не учитываются. Доходность ОФЗ и фонда за срок принята равной показанной (допущение).</p>`;
+}
+function pMmFunds(){
+  const m=S.mm,d=m.f;
+  if(!d){if(!m.fl)loadMmF();return waitBox('Загружаю цены фондов с Мосбиржи… первый расчёт занимает до полуминуты.')}
+  if(d.error&&!d.funds.length)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="mm-r">Повторить</button></div>`;
+  const rf=d.rusfar,kr=d.key;
+  return`<div class="card"><h2>Фонды ликвидности<span class="sp">реализованная доходность в годовом выражении; под ней — отставание от ставки</span></h2>
+    <div class="mm-ref"><span>RUSFAR: <b>${mmPc(rf)}</b>${d.rusfar_date?` <small class="mu">на ${esc(dlabel(d.rusfar_date))}</small>`:''}</span><span>Ключевая ставка: <b>${mmPc(kr)}</b></span>
+      <button class="btn ghost" id="mm-r" style="margin-left:auto">Обновить</button></div>
+    ${mmFundsTable(d)}
+    <p class="note">«Отставание от ставки» — доходность фонда минус накопленная ставка RUSFAR за то же окно (при её отсутствии — ключевая): это неявные издержки фонда (комиссия, проскальзывание, разница с реальным портфелем). ${esc(d.note)}</p></div>
+  <div class="card"><h2>Сравнение после налога<span class="sp">фонд, накопительный счёт, короткие ОФЗ и ставки денежного рынка</span></h2>${mmCompare(d)}</div>`;
+}
+function mmBasisTable(d){
+  const sign=v=>bad(v)?'—':(v>0?'+':v<0?'−':'')+NF2.format(Math.abs(+v.toFixed(2)));
+  const rows=d.rows.map(r=>{
+    const dv=r.divs&&r.divs.length?r.divs.map(x=>`${mmNum(x.value,2)} ₽ · ${esc(dlabel(x.record))}`).join('<br>'):(r.kind==='share'?(r.divs_known?'<span class="mu">нет до экспирации</span>':'<span class="mu" title="Источники не вернули данных о дивидендах: ожидаемую отсечку программа не видит">нет данных</span>'):'<span class="mu">—</span>');
+    const warn=r.kind==='share'&&r.basis_pct<0&&!(r.divs&&r.divs.length)?' <span class="tag" title="Отрицательный базис по акции часто означает ожидаемые дивиденды, которых нет в источниках">дивиденды?</span>':'';
+    return`<tr><td class="l"><b>${esc(r.asset)}</b>${warn}<br><small class="mu">${esc(r.short)} · лот ${NF2.format(r.lot)} ${esc(r.unit)}</small></td>
+      <td class="num">${esc(dlabel(r.expiry))}<br><small class="mu">${r.days} дн.</small></td>
+      <td class="num">${mmNum(r.f_unit,r.f_unit<100?3:2)}<br><small class="mu" title="${esc(r.price_src)}">за ${esc(r.unit)}</small></td><td class="num">${mmNum(r.spot_unit,r.spot_unit<100?3:2)}</td>
+      <td class="num ${mmCls(r.basis)}">${sign(r.basis)} ₽<br><small>${mmPc(r.basis_pct)}</small></td><td class="num">${mmPc(r.ann_raw,1)}</td>
+      <td class="num l"><small>${dv}</small></td><td class="num"><b>${mmPc(r.ann_adj,1)}</b></td>
+      <td class="num">${r.ann_roc==null?'—':mmPc(r.ann_roc,1)}<br><small class="mu">ГО ${r.margin?M(r.margin,'rub',0):'—'}</small></td>
+      <td class="num ${mmCls(r.excess)}">${mmPp(r.excess)}</td></tr>`}).join('');
+  return`<div class="tbl"><table><thead><tr><th class="l">Актив / контракт</th><th>Экспирация</th><th>Фьючерс</th><th>Спот</th><th>Базис за контракт</th><th>Годовых, простая</th><th class="l">Дивиденды до экспирации</th><th>Годовых с дивидендами</th><th>На капитал с ГО</th><th>К ставке ${esc(d.ref_name||'')}</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+function pMmBasis(){
+  const m=S.mm,d=m.b;
+  if(!d){loadMmB();return waitBox('Загружаю срочный рынок Мосбиржи…')}
+  if(d.error&&!d.rows.length)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="mm-br">Повторить</button></div>`;
+  return`<div class="card"><h2>Базис фьючерсов<span class="sp">два ближайших контракта; данные на ${esc(d.asof||'')}</span></h2>
+    <div class="mm-ref"><span>RUSFAR: <b>${mmPc(d.rusfar)}</b></span><span>Ключевая ставка: <b>${mmPc(d.key)}</b></span><button class="btn ghost" id="mm-br" style="margin-left:auto">Обновить</button></div>
+    ${mmBasisTable(d)}
+    <p class="note">Базис = цена фьючерса − цена базового актива × размер контракта. «Годовых» = (F/S − 1) · 365 / дни до экспирации; «с дивидендами» добавляет объявленные дивиденды с датой отсечки до экспирации; «на капитал с ГО» — прибыль, делённая на стоимость актива плюс гарантийное обеспечение. Золото пересчитано из ₽/г в ₽/унцию, стоимость контракта — через курс, заложенный биржей в шаг цены.</p>
+    ${(d.skipped||[]).length?`<p class="note">Пропущено: ${d.skipped.map(esc).join('; ')}.</p>`:''}
+    <p class="note">${esc(d.note)}</p></div>`;
+}
+function pMm(){
+  const m=S.mm;
+  return`<div class="seg" id="mm-tabs" style="margin-bottom:12px"><button data-t="funds" class="${m.tab==='funds'?'on':''}">Фонды ликвидности</button><button data-t="basis" class="${m.tab==='basis'?'on':''}">Базис фьючерсов (cash &amp; carry)</button></div>`
+    +(m.tab==='funds'?pMmFunds():pMmBasis())+NIR_NOTE;
+}
+function bindMm(){
+  const m=S.mm,$$=id=>document.getElementById(id);
+  const t=$$('mm-tabs');if(t)t.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===m.tab)return;m.tab=b.dataset.t;render()};
+  const r=$$('mm-r');if(r)r.onclick=()=>{m.f=null;loadMmF();render()};
+  const br=$$('mm-br');if(br)br.onclick=()=>{m.b=null;m.bl=0;loadMmB(true);render()};
+  document.querySelectorAll('[data-mmf]').forEach(tr=>tr.onclick=()=>{m.q.fund=tr.dataset.mmf;loadMmF();renderSoon()});
+  const win=$$('mm-win');if(win)win.onclick=e=>{const b=e.target.closest('[data-w]');if(!b)return;m.q.win=b.dataset.w;loadMmF()};
+  const fs=$$('mm-fund');if(fs)fs.onchange=()=>{m.q.fund=fs.value;loadMmF()};
+  for(const[id,k]of[['mm-amount','amount'],['mm-days','days'],['mm-fee','fee'],['mm-save','save']]){const e=$$(id);if(e)e.onchange=()=>{m.q[k]=e.value;loadMmF()}}
+}
+regPage('mm',{title:'Деньги и базис',group:'Рынок',icon:'<circle cx="9" cy="9" r="6"/><path d="M15.5 9.5A6 6 0 1 1 9.5 15.5"/><path d="M9 7v4M7.5 9h3"/>',render:pMm,bind:bindMm,pro:true});
+/* ── Устойчивость эмитентов: банкротные модели, расширенный долг, риск размытия ── */
+S.crp={q:'',card:null,loading:false,batch:null,bLoading:false,prog:null,err:null};
+const crpN=(v,d=2)=>v==null||isNaN(v)?'—':v.toFixed(d).replace('.',',');
+const crpM=v=>v==null?'—':short(v*1000);           /* тыс. ₽ -> ₽ */
+const crpX=v=>v==null?'—':crpN(v,1)+'×';
+const crpZone=m=>!m||m.na?'<span class="mu" title="Модель не рассчитывается для банков, лизинга, МФО и других финансовых компаний">неприменимо</span>':!m.ok?`<span class="mu" title="${esc(m.reason||'')}">нет данных</span>`:`<span class="tag ${m.key==='high'?'neg':'pos'}">${esc(m.zone)}</span>`;
+function crpFmtDate(s){return s?String(s).slice(0,10).split('-').reverse().join('.'):'—'}
+
+function loadCrp(q,force){
+  if(S.crp.loading)return;S.crp.loading=true;S.crp.err=null;S.crp.card=null;S.crp.q=q;
+  api('/api/crp?q='+encodeURIComponent(q)+(force?'&force=1':'')).then(c=>{S.crp.card=c}).catch(e=>{S.crp.err=e.message||String(e)})
+   .then(()=>{S.crp.loading=false;if(S.page==='crp')renderSoon()});
+}
+function loadCrpBatch(force){
+  if(S.crp.bLoading)return;S.crp.bLoading=true;S.crp.prog=null;const acc=S.account;let first=true;
+  const tick=async()=>{
+    try{
+      const p=new URLSearchParams({account:acc});if(force&&first)p.set('force','1');first=false;
+      const j=await api('/api/crp/batch?'+p);
+      if(j.pending){S.crp.prog=j;const e=document.getElementById('crp-prog');if(e)e.textContent=j.total?`${j.done} из ${j.total}`:'определяю эмитентов…';setTimeout(tick,2500);return}
+      S.crp.batch=j;S.crp.bLoading=false;if(S.page==='crp')renderSoon();
+    }catch(e){S.crp.batch={error:e.message||String(e)};S.crp.bLoading=false;if(S.page==='crp')renderSoon()}
+  };
+  tick();
+}
+function crpModelTable(c){
+  const ys=c.years;
+  const head=`<tr><th class="l">Показатель</th>${ys.map(y=>`<th>${y.y}</th>`).join('')}</tr>`;
+  const sv=(f)=>ys.map(y=>`<td class="num">${f(y)}</td>`).join('');
+  const z=y=>y.sav.ok?`<b>${crpN(y.sav.z)}</b>`:'—',r=y=>y.sk.ok?`<b>${crpN(y.sk.r)}</b>`:'—';
+  const xs=(m,k)=>y=>m(y).ok?crpN(m(y).x[k]):'—';
+  let h=`<div class="tbl"><table><thead>${head}</thead><tbody>
+    <tr class="crp-h"><td class="l" colspan="${ys.length+1}">Савицкая: Z = 0,111·X1 + 13,239·X2 + 1,676·X3 + 0,515·X4 + 3,80·X5; Z &lt; 8 — высокий риск</td></tr>
+    <tr><td class="l"><b>Z</b></td>${sv(z)}</tr>
+    <tr><td class="l">Зона</td>${sv(y=>crpZone(y.sav))}</tr>`;
+  [['X1','X1 · (капитал − внеоборотные) / оборотные активы'],['X2','X2 · оборотные / внеоборотные активы'],['X3','X3 · выручка / средние активы'],['X4','X4 · чистая прибыль / активы'],['X5','X5 · капитал / активы']].forEach(([k,t])=>{
+    h+=`<tr class="crp-s"><td class="l">${t}</td>${sv(xs(y=>y.sav,k))}</tr>`});
+  h+=`<tr class="crp-h"><td class="l" colspan="${ys.length+1}">Сайфуллин–Кадыков: R = 2·K1 + 0,1·K2 + 0,08·K3 + 0,45·K4 + K5; R &lt; 1 — неудовлетворительное состояние</td></tr>
+    <tr><td class="l"><b>R</b></td>${sv(r)}</tr><tr><td class="l">Зона</td>${sv(y=>crpZone(y.sk))}</tr>`;
+  [['K1','K1 · (капитал − внеоборотные) / оборотные активы'],['K2','K2 · оборотные активы / краткосрочные обязательства'],['K3','K3 · выручка / средние активы'],['K4','K4 · прибыль от продаж / выручка'],['K5','K5 · чистая прибыль / капитал']].forEach(([k,t])=>{
+    h+=`<tr class="crp-s"><td class="l">${t}</td>${sv(xs(y=>y.sk,k))}</tr>`});
+  return h+'</tbody></table></div>';
+}
+function crpDebtTable(c){
+  const ys=c.years.filter(y=>y.debt&&y.debt.ok);
+  if(!ys.length)return'<div class="mu">В отчётности нет строк с обязательствами.</div>';
+  const row=(t,f,cl)=>`<tr class="${cl||''}"><td class="l">${t}</td>${ys.map(y=>`<td class="num">${f(y.debt)}</td>`).join('')}</tr>`;
+  let h=`<div class="tbl"><table><thead><tr><th class="l">млн ₽ (РСБУ)</th>${ys.map(y=>`<th>${y.y}</th>`).join('')}</tr></thead><tbody>`;
+  const comp=(code)=>d=>{const x=d.components.find(z=>z.code===code);return x&&x.value!=null?crpM(x.value):'—'};
+  h+=row('1410 Долгосрочные заимствования',comp('1410'))+row('1510 Краткосрочные заимствования',comp('1510'))+row('<b>Отражённый долг</b>',d=>`<b>${crpM(d.reported)}</b>`);
+  h+=row('1450 Прочие долгосрочные обязательства (часто аренда)',comp('1450'),'crp-s')+row('1550 Прочие краткосрочные обязательства',comp('1550'),'crp-s')+row('1540 Оценочные обязательства',comp('1540'),'crp-s');
+  h+=row('<b>Расширенный долг</b>',d=>`<b>${crpM(d.extended)}</b>`)+row('Превышение над отражённым',d=>d.uplift==null?(d.flag?'есть':'—'):`<span class="${d.flag?'neg':''}">+${crpN(d.uplift*100,0)} %</span>`);
+  h+=row('Отражённый долг / EBIT',d=>crpX(d.rep_ebit))+row('Расширенный долг / EBIT',d=>crpX(d.ext_ebit))+row('Отражённый долг / капитал',d=>crpX(d.rep_eq))+row('Расширенный долг / капитал',d=>crpX(d.ext_eq));
+  h+=row('EBIT (стр. 2200, прибыль от продаж)',d=>crpM(d.ebit),'crp-s');
+  return h+'</tbody></table></div>';
+}
+function crpDilution(c){
+  const d=c.dilution||{},m=d.matches||[],lk=d.links||{};
+  let h='';
+  if(!d.n_scanned)h+=`<div class="mu">Данных для проверки нет: в приложении нет потока раскрытий по акциям этого эмитента (покрытие — только выпуски облигаций, и то не для всех).</div>`;
+  else if(!m.length)h+=`<div class="mu">Проверено заголовков раскрытий: ${d.n_scanned}. Упоминаний допэмиссии, конвертируемых облигаций, опционных программ, выкупа акций и lock-up не найдено.</div>`;
+  else h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Признак</th><th class="l">Раскрытие</th></tr></thead><tbody>${m.map(x=>`<tr><td class="l">${crpFmtDate(x.date)}</td><td class="l"><span class="tag">${esc(x.label)}</span></td><td class="l">${x.url?`<a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.title)}</a>`:esc(x.title)}</td></tr>`).join('')}</tbody></table></div>`;
+  h+=`<p class="note">Поиск по ключевым словам в заголовках — это грубый признак, а не оценка вероятности размытия. `+(lk.edisclosure?`Первоисточник: <a href="${esc(lk.edisclosure)}" target="_blank" rel="noopener">раскрытие информации эмитента</a>.`:'')+`</p>`;
+  return h;
+}
+function crpCard(c){
+  if(!c.ok)return`<div class="msg err">${esc(c.error||'Ошибка')}</div>`;
+  let h=`<div class="card"><h2>${esc(c.name||'Эмитент')}<span class="sp">ИНН ${esc(c.inn)}${c.is_fin?' · финансовая компания':''}</span></h2>`;
+  if(!c.years.length)return h+`<div class="mu">${esc(c.note||'Отчётность по РСБУ не найдена.')}</div></div>`+`<div class="card"><h2>Риск размытия</h2>${crpDilution(c)}</div>`;
+  if(c.is_fin)h+=`<div class="msg">Банкротные модели Савицкой и Сайфуллина–Кадыкова не применяются к банкам, лизингу, МФО и прочим финансовым компаниям — вместо чисел показано «неприменимо».</div>`;
+  h+=`<h3 style="margin:10px 0 6px">Модели вероятности банкротства по РСБУ</h3>${crpModelTable(c)}
+    <p class="note">Модели разработаны для нефинансовых компаний на данных отчётности и дают лишь ориентир. Для расчёта оборотов используется средняя величина активов за год и предыдущий (если отчётность за предыдущий год найдена, иначе — активы на конец года).</p></div>`;
+  h+=`<div class="card"><h2>Расширенная долговая нагрузка<span class="sp">приближение по балансу</span></h2>${crpDebtTable(c)}`;
+  const l=c.years[c.years.length-1];
+  if(l&&l.debt&&l.debt.flag)h+=`<div class="msg err">За ${l.y} г. расширенный долг больше отражённого на ${l.debt.uplift==null?'(отражённого долга нет)':crpN(l.debt.uplift*100,0)+' %'} (порог — 25 %): значительная часть обязательств не названа заимствованиями.</div>`;
+  h+=`<p class="note">В расширенный долг входят заимствования (стр. 1410, 1510), прочие долгосрочные и краткосрочные обязательства (1450, 1550) и оценочные обязательства (1540). Выданные гарантии (забалансовый счёт 008) и цифровые финансовые активы (ЦФА) в публичных формах РСБУ не раскрываются и в расчёт НЕ включены; EBIT — прибыль от продаж (стр. 2200) без добавления амортизации, так как её нет в публичных формах 1 и 2. Это оценка по балансу, а не данные эмитента о долге.</p></div>`;
+  h+=`<div class="card"><h2>Риск размытия<span class="sp">ключевые слова в раскрытиях</span></h2>${crpDilution(c)}</div>`;
+  return h;
+}
+function crpBatch(){
+  const b=S.crp.batch;
+  if(S.crp.bLoading)return`<div class="card">${waitBox('Считаю эмитентов портфеля (может занять несколько минут)… <span id="crp-prog">'+(S.crp.prog&&S.crp.prog.total?`${S.crp.prog.done} из ${S.crp.prog.total}`:'')+'</span>')}</div>`;
+  if(!b)return'';
+  if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
+  if(!b.rows.length)return'<div class="card empty">В портфеле нет эмитентов, для которых можно получить отчётность</div>';
+  const zt=(v,k)=>v==null?'<span class="mu">—</span>':`<span class="${k==='high'?'neg':'pos'}">${crpN(v)}</span>`;
+  return`<div class="card"><h2>Эмитенты портфеля<span class="sp">нажмите на строку — подробности</span></h2><div class="tbl"><table><thead><tr><th class="l">Эмитент</th><th>Год</th><th>Z Савицкой</th><th>R Сайфуллина–Кадыкова</th><th>Расш. долг / EBIT</th><th>Превышение долга</th><th>Размытие</th></tr></thead><tbody>${b.rows.map(r=>`<tr class="crp-r" data-crp="${esc(r.q||r.inn||'')}"><td class="l"><b>${esc(r.name||'')}</b>${r.note&&!r.year?`<br><small class="mu">${esc(r.note)}</small>`:''}</td><td class="num">${r.year||'—'}</td>
+    <td class="num">${r.is_fin?'<span class="mu">неприменимо</span>':zt(r.sav,r.sav_key)}</td><td class="num">${r.is_fin?'<span class="mu">неприменимо</span>':zt(r.sk,r.sk_key)}</td><td class="num">${crpX(r.ext_ebit)}</td>
+    <td class="num">${r.uplift==null?'—':`<span class="${r.flag?'neg':''}">+${crpN(r.uplift*100,0)} %</span>`}</td><td class="num">${r.n_dil?`<span class="tag">${r.n_dil}</span>`:'—'}</td></tr>`).join('')}</tbody></table></div>
+    <p class="note">Обновлено ${esc(b.updated||'')}. Z &lt; 8 по Савицкой и R &lt; 1 по Сайфуллину–Кадыкову — зоны повышенного риска по этим моделям.</p></div>`;
+}
+function pCrp(){
+  const C=S.crp;
+  let h=`<div class="card"><h2>Устойчивость эмитентов<span class="sp">РСБУ из ГИР БО ФНС · модели банкротства, долг, размытие</span></h2>
+    <div class="flt"><label class="field"><span>ISIN, тикер или ИНН</span><input class="in" id="crp-q" value="${esc(C.q)}" placeholder="например, RU000A0JX0J2, SBER или 7707083893" autocomplete="off"></label>
+    <button class="btn" id="crp-go">Рассчитать</button><button class="btn ghost" id="crp-my">Мои эмитенты</button></div>
+    <p class="note">Все модели — приближение по публичной бухгалтерской отчётности отдельной компании (не группы). Результаты зависят от допущений и качества отчётности и не являются прогнозом. Покрытие раскрытий для оценки размытия ограничено.</p></div>`;
+  if(C.loading)h+=`<div class="card">${waitBox('Загружаю отчётность…')}</div>`;
+  else if(C.err)h+=`<div class="msg err">${esc(C.err)}</div>`;
+  else if(C.card)h+=crpCard(C.card);
+  h+=crpBatch();
+  return h+NIR_NOTE;
+}
+function bindCrp(){
+  const go=()=>{const v=(document.getElementById('crp-q')||{}).value||'';if(v.trim())loadCrp(v.trim(),false);renderSoon()};
+  const b=document.getElementById('crp-go');if(b)b.onclick=go;
+  const i=document.getElementById('crp-q');if(i){i.onkeydown=e=>{if(e.key==='Enter')go()};i.oninput=()=>{S.crp.q=i.value}}
+  const m=document.getElementById('crp-my');if(m)m.onclick=()=>{loadCrpBatch(!!S.crp.batch);renderSoon()};
+  document.querySelectorAll('tr[data-crp]').forEach(tr=>{tr.style.cursor='pointer';tr.onclick=()=>{const q=tr.dataset.crp;if(q){loadCrp(q,false);renderSoon();window.scrollTo(0,0)}}});
+}
+regPage('crp',{title:'Устойчивость эмитентов',group:'Риски и контроль',icon:'<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/>',render:pCrp,bind:bindCrp,pro:true});
+/* ── Налоговая оптимизация: сбор убытков по лотам FIFO и планировщик ИИС-3 ── */
+S.txo={h:null,hAcc:null,hBusy:0,hErr:null,fee:'',p:null,pBusy:0,pErr:null,F:null};
+try{S.txo.F=JSON.parse(localStorage.getItem('txo_iis3')||'null')}catch(e){}
+const txoR=n=>bad(n)?'—':M(n,'rub',0),txoS=n=>bad(n)?'—':(n>0?'+':'')+M(n,'rub',0);
+const TXO_NOTE='<p class="note">Расчёт по модели и справочный: проверьте его с брокерским отчётом; налог удерживает брокер, итог за год определяется декларацией. Допущения указаны в блоках.</p>';
+function txoF(){
+  return Object.assign({open_year:new Date().getFullYear(),contribution:400000,yield:12,years:10,bracket:'13',income:'',coupon_share:50,reinvest:'1',ldv:'1'},S.txo.F||{});
+}
+function txoLoadH(force){
+  if(S.txo.hBusy)return;S.txo.hBusy=1;const acc=S.account;
+  const p=Object.assign({account:acc},S.txo.fee!==''?{fee:S.txo.fee}:{},force?{force:'1'}:{});
+  api('/api/txo/harvest?'+new URLSearchParams(p)).then(j=>{S.txo.hBusy=0;S.txo.hAcc=acc;S.txo.hErr=null;S.txo.h=j;if(S.page==='txo'&&S.account===acc)renderSoon()})
+   .catch(e=>{S.txo.hBusy=0;S.txo.hAcc=acc;S.txo.h=null;S.txo.hErr=e.message;if(S.page==='txo')renderSoon()});
+}
+function txoLoadP(){
+  if(S.txo.pBusy)return;S.txo.pBusy=1;
+  api('/api/txo/iis3?'+new URLSearchParams(Object.fromEntries(Object.entries(txoF()).filter(([k,v])=>v!==''&&v!=null)))).then(j=>{S.txo.pBusy=0;S.txo.pErr=null;S.txo.p=j;if(S.page==='txo')renderSoon()})
+   .catch(e=>{S.txo.pBusy=0;S.txo.pErr=e.message;if(S.page==='txo')renderSoon()});
+}
+function txoHarvest(){
+  const h=S.txo.h;
+  if(S.txo.hErr&&S.txo.hAcc===S.account)return`<div class="msg err">${esc(S.txo.hErr)} <button class="btn ghost" onclick="S.txo.hErr=null;S.txo.hAcc=null;render()">Повторить</button></div>`;
+  if(!h||S.txo.hAcc!==S.account){txoLoadH();return waitBox('Считаю лоты и налог текущего года…')}
+  const ex=(h.iis_excluded||[]).map(x=>`<p class="note"><b>${esc(x.name)}</b>: ${esc(x.reason)}</p>`).join('');
+  if(!h.available)return`<div class="empty">${esc(h.reason||'Нет данных для расчёта')}</div>${ex}`;
+  const d=h.deadline,t=h.totals;
+  let out=`<div class="g g4">${kpi('Экономия налога',txoR(t.saving),`налог ${h.year}: ${txoR(h.tax_before)} → ${txoR(t.tax_after)}`,t.saving>0?'pos':'',S3)}
+    ${kpi('Комиссии туда-обратно',txoR(t.fees),'продажа и обратная покупка',null,S4)}
+    ${kpi('Чистая выгода модели',txoR(t.net),`позиций в наборе: ${t.n}`,t.net>0?'pos':'',S1)}
+    ${kpi('Последний день сделки',ddm(d.sale_day),d.passed?'срок для этого года прошёл':`осталось ${d.days} дн. (T+1, торги до ${ddm(d.last_trading_day)})`,d.passed?'neg':'',S2)}</div>
+    <div class="row noprint" style="margin:10px 0"><label class="field"><span>Комиссия, % (пусто — по истории)</span><input class="in" id="txo-fee" type="number" step="0.01" min="0" value="${esc(S.txo.fee)}" style="width:140px"></label>
+      <button class="btn" id="txo-fee-go">Пересчитать</button></div>`;
+  if(!h.candidates.length)out+='<div class="empty">Бумаг с нереализованным убытком, продажа которых снизила бы налог, модель не нашла (или налога за год пока нет).</div>';
+  else out+=`<div class="tbl"><table><thead><tr><th>Бумага</th><th>Продать (старые лоты)</th><th>Убыток</th><th>Прибыль в префиксе</th><th>Ставка</th><th>Экономия</th><th>Комиссии</th><th>Чистая выгода</th><th>Примечания</th></tr></thead><tbody>${h.candidates.map(c=>{
+      const nt=[];
+      if(c.selected)nt.push('<span class="tag">в наборе</span>');
+      if(c.carry_forward>1)nt.push(`<small class="mu">убыток сверх базы ${txoR(c.carry_forward)} перенесётся</small>`);
+      if(c.blind)nt.push('<small class="txo-warn">лоты из перевода: стоимость могла быть неизвестна</small>');
+      c.ldv.forEach(l=>nt.push(`<span class="tag txo-ldv">ЛДВ ${l.status==='reached'?'наступила':`через ${l.days} дн.`}</span> <small class="mu">${ddm(l.bdate)}: прибыль ${txoR(l.gain)}${l.tax_at_stake?`, налог без ЛДВ ≈ ${txoR(l.tax_at_stake)}`:''}; после обратной покупки срок начнётся заново</small>`));
+      return`<tr><td class="l"><b>${esc(c.name)}</b><br><small class="mu">${esc(c.ticker)}</small></td><td class="num">${f2(c.qty)}${c.partial?` из ${f2(c.qty_total)}`:''}<br><small class="mu">${txoR(c.value)}</small></td>
+        <td class="num neg">${txoR(-c.loss)}</td><td class="num">${txoR(c.gain_in_prefix)}</td><td class="num">${c.marginal_rate==null?'—':pctp(c.marginal_rate*100,0)}</td>
+        <td class="num pos">${txoR(c.saving)}</td><td class="num">${txoR(c.fees)}</td><td class="num ${c.net>0?'pos':'neg'}"><b>${txoS(c.net)}</b></td><td class="l">${nt.join('<br>')}</td></tr>`}).join('')}</tbody></table></div>`;
+  out+=`<ul class="txo-ul"><li>${(h.assumptions||[]).map(esc).join('</li><li>')}</li></ul>${ex}`;
+  if((h.warnings||[]).length)out+=`<p class="note">${h.warnings.map(esc).join('<br>')}</p>`;
+  out+=`<p class="note noprint">Общая картина по налогам и простые подсказки — на странице <a href="#" onclick="go('tax');return false">«Налоги»</a>.</p>`;
+  return out;
+}
+function txoPlanner(){
+  const F=txoF(),p=S.txo.p;
+  const num=(id,l,v,o)=>`<label class="field"><span>${l}</span><input class="in txo-in" id="txo-${id}" type="number" inputmode="decimal" value="${esc(v)}" ${o||''}></label>`;
+  const sel=(id,l,opts,v)=>`<label class="field"><span>${l}</span><select class="in txo-in" id="txo-${id}">${opts.map(o=>`<option value="${o[0]}" ${String(o[0])===String(v)?'selected':''}>${o[1]}</option>`).join('')}</select></label>`;
+  const pre=S.txo.h&&S.txo.h.iis_prefill;
+  let out=`<div class="txo-form">${num('open_year','Год открытия ИИС-3',F.open_year,'step="1" min="2024"')}${num('contribution','Взнос в год, ₽',F.contribution,'step="10000" min="0"')}
+    ${num('yield','Доходность, % годовых',F.yield,'step="0.5"')}${num('years','Горизонт, лет',F.years,'step="1" min="1" max="40"')}
+    ${sel('bracket','Ставка плательщика',[['13','13 % (доход до 2,4 млн ₽)'],['15','15 % (доход выше 2,4 млн ₽)']],F.bracket)}
+    ${num('income','Доход за год, ₽ (необязательно)',F.income,'step="100000" min="0"')}
+    ${num('coupon_share','Доля купонов в доходности, %',F.coupon_share,'step="5" min="0" max="100"')}
+    ${sel('reinvest','Вычет',[['1','реинвестировать'],['0','оставить наличными']],F.reinvest)}
+    ${sel('ldv','ЛДВ на обычном счёте',[['1','учитывать'],['0','не учитывать']],F.ldv)}</div>
+    <p class="note">Если указан доход за год, ставка (15 % выше 2,4 млн ₽) и предел вычета (не больше уплаченного НДФЛ) определяются по нему.</p>
+    ${pre?`<p class="note noprint">У вас есть ИИС «${esc(pre.name)}» (открыт ${ddm(pre.opened)}, тип ${esc(pre.type)}). <a href="#" onclick="txoPrefill(${pre.open_year});return false">Подставить год открытия</a>.</p>`:''}`;
+  if(S.txo.pErr)return out+`<div class="msg err">${esc(S.txo.pErr)}</div>`;
+  if(!p){txoLoadP();return out+waitBox('Считаю…')}
+  const r=p.rules,i=p.iis,b=p.broker;
+  out+=`<div class="g g4">${kpi('Минимальный срок',`${r.term} лет`,`до конца ${r.term_end_year} г.; горизонт ${p.inputs.years} лет`,r.term_ok?'pos':'neg',S1)}
+    ${kpi('Вычет в год (максимум)',txoR(r.max_refund),`${pctp(r.rate*100,0)} от ${txoR(r.limit)}`,null,S2)}
+    ${kpi('ИИС-3: итог после налогов',txoR(i.net),`на ${txoR(p.own)} своих взносов`,i.net>=b.net?'pos':'',S3)}
+    ${kpi('Обычный счёт: итог',txoR(b.net),`разница ИИС-3 ${txoS(p.advantage)}`,p.advantage>=0?'pos':'neg',S4)}</div>
+    <div class="tbl" style="margin-top:12px"><table><thead><tr><th>Год</th><th>Взнос</th><th>Вычет за год</th><th>ИИС-3, капитал на конец года</th><th>Обычный счёт, капитал</th><th>Налог с купонов (обычный)</th></tr></thead><tbody>${
+      p.rows.map(x=>`<tr><td><b>${x.year}</b></td><td class="num">${txoR(x.contribution)}</td><td class="num pos">${txoR(x.refund)}</td><td class="num">${txoR(x.iis_capital)}</td><td class="num">${txoR(x.broker_capital)}</td><td class="num">${txoR(x.broker_coupon_tax)}</td></tr>`).join('')}</tbody></table></div>
+    <div id="txo-ch" class="chart txo-chart"></div>
+    <h3 class="txo-sub">Итог на конец горизонта</h3>
+    <div class="tbl"><table><thead><tr><th></th><th>ИИС-3</th><th>Обычный счёт</th></tr></thead><tbody>
+      <tr><td class="l">Капитал до налога при закрытии</td><td class="num">${txoR(i.capital)}</td><td class="num">${txoR(b.capital)}</td></tr>
+      <tr><td class="l">Налог при закрытии / продаже</td><td class="num">${txoR(i.tax)}</td><td class="num">${txoR(b.exit_tax)}${b.ldv_exempt>0?`<br><small class="mu">освобождено ЛДВ: ${txoR(b.ldv_exempt)}</small>`:''}</td></tr>
+      <tr><td class="l">Налог с купонов за время владения</td><td class="num">${r.term_ok?'0 ₽ (срок соблюдён)':'входит в налог при закрытии'}</td><td class="num">${txoR(b.coupon_tax)}</td></tr>
+      <tr><td class="l">Вычеты получено / возвращено</td><td class="num">${txoR(i.refunds_total)} / ${txoR(i.refunds_returned)}</td><td class="num">—</td></tr>
+      <tr><td class="l"><b>Итог после налогов</b></td><td class="num"><b>${txoR(i.net)}</b></td><td class="num"><b>${txoR(b.net)}</b></td></tr>
+      <tr><td class="l">Результат к своим взносам (${txoR(p.own)})</td><td class="num ${i.result_over_own>=0?'pos':'neg'}">${txoS(i.result_over_own)}</td><td class="num ${b.result_over_own>=0?'pos':'neg'}">${txoS(b.result_over_own)}</td></tr></tbody></table></div>`;
+  if(p.early.length)out+=`<h3 class="txo-sub">Досрочное закрытие до истечения срока</h3>
+    <div class="tbl"><table><thead><tr><th>Закрытие в году</th><th>Капитал</th><th>Вычеты вернуть</th><th>Налог с дохода</th><th>Итого после возврата и налога</th><th>Потеряно относительно срока</th></tr></thead><tbody>${p.early.map(e=>`<tr><td><b>${e.year}</b> <small class="mu">(${e.n}-й год)</small></td><td class="num">${txoR(e.capital)}</td><td class="num neg">${txoR(e.refunds_returned)}</td><td class="num neg">${txoR(e.tax)}</td><td class="num">${txoR(e.net)}</td><td class="num neg">${txoR(e.extra_cost)}</td></tr>`).join('')}</tbody></table></div>`;
+  if((p.warnings||[]).length)out+=`<p class="note txo-warn">${p.warnings.map(esc).join('<br>')}</p>`;
+  out+=`<ul class="txo-ul"><li>Правила (НК РФ ст. 219.1, 219.2): вычет 13 % (15 % при доходе выше 2,4 млн ₽) с взносов до 400 000 ₽ в год — не больше 52 000 / 60 000 ₽ в год и не больше уплаченного НДФЛ; при соблюдении минимального срока освобождается положительный финансовый результат до 30 млн ₽ за всё время. Минимальный срок по году открытия: 2024–2026 — 5 лет, 2027 — 6, 2028 — 7, 2029 — 8, 2030 — 9, с 2031 — 10.</li>
+    <li>Допущения модели: взнос в начале года, доходность в конце года, вычет за год поступает в начале следующего (последний — после горизонта); на обычном счёте купоны облагаются налогом ежегодно, прирост цены — при продаже в конце горизонта, ЛДВ — по лотам, купленным более трёх лет назад, в пределах 3 млн ₽ × лет владения.</li>
+    <li>Отличие от <a href="#" onclick="go('calc');return false">калькулятора</a>: там ИИС-3 — один из сценариев сравнения стратегий вложений; здесь отдельно учтены срок по году открытия, ставка 13/15 %, предел вычета по НДФЛ, годовая таблица и досрочное закрытие.</li></ul>`;
+  return out;
+}
+function txoPrefill(y){S.txo.F=Object.assign(txoF(),{open_year:y});S.txo.p=null;txoSave();render()}
+function txoSave(){try{localStorage.setItem('txo_iis3',JSON.stringify(S.txo.F))}catch(e){}}
+function pTxo(){
+  const p=S.txo.p;
+  if(p&&p.rows.length)chart('txo-ch',line,{labels:p.rows.map(r=>String(r.year)),h:220,series:[{n:'ИИС-3',c:S1,v:p.rows.map(r=>r.iis_capital)},{n:'Обычный счёт',c:S2,v:p.rows.map(r=>r.broker_capital)},{n:'Свои взносы',c:S4,v:p.rows.map(r=>r.own)}]});
+  return`<div class="txo"><div class="card"><h2>Сбор налоговых убытков (${new Date().getFullYear()} год)</h2>
+    <p class="note">Модель показывает, при каком наборе продаж налог текущего года снизился бы сильнее всего и сколько останется после комиссий. Это не рекомендация что-либо продавать.</p>${txoHarvest()}</div>
+    <div class="card"><h2>Планировщик ИИС-3 <span class="sp">сравнение с обычным счётом</span></h2>${txoPlanner()}</div>${TXO_NOTE}${NIR_NOTE}</div>`;
+}
+function bindTxo(){
+  const g=document.getElementById('txo-fee-go');
+  if(g)g.onclick=()=>{S.txo.fee=(document.getElementById('txo-fee').value||'').trim();S.txo.h=null;S.txo.hAcc=null;render()};
+  document.querySelectorAll('.txo-in').forEach(el=>{el.addEventListener('change',()=>{
+    const F=txoF();document.querySelectorAll('.txo-in').forEach(e=>{F[e.id.slice(4)]=e.value});
+    S.txo.F=F;txoSave();S.txo.p=null;render()})});
+}
+regPage('txo',{title:'Налоговая оптимизация',group:'Учёт и планы',icon:'<path d="M4 20h16M6 16l4-5 3 3 5-7"/><circle cx="7" cy="7" r="2"/>',render:pTxo,bind:bindTxo,pro:true});
+/* ── «Стакан: ликвидность»: проскальзывание крупной заявки и эвристика скрытой ликвидности (/api/mic/*) ── */
+S.mic=S.mic||{secid:'SBER',side:'buy',rub:5e6,custom:'',inst:null,imp:null,ice:null,err:'',iceErr:'',busyI:false,busyC:false};
+let _micTimer=null;
+const MIC_SIZES=[[1e6,'1 млн ₽'],[5e6,'5 млн ₽'],[10e6,'10 млн ₽']];
+const micRub=n=>bad(n)?'—':Math.round(n).toLocaleString('ru-RU')+' ₽';
+const micBp=n=>bad(n)?'—':(n>=0?'':'−')+Math.abs(n).toFixed(1).replace('.',',')+' б.п.';
+const micPx=p=>bad(p)?'—':(+p).toLocaleString('ru-RU',{maximumFractionDigits:4});
+const micT=ts=>{try{return new Date(ts*1000).toLocaleTimeString('ru-RU',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit',second:'2-digit'})}catch(e){return''}};
+function micImpactHtml(){
+  const D=S.mic,d=D.imp;
+  if(!d)return D.err?`<div class="msg err">${esc(D.err)}</div>`:waitBox('Считаю по стакану…');
+  if(!d.ok)return`<div class="empty" style="padding:24px 12px">${esc(d.error||'Стакан недоступен')}</div>`;
+  const side=d.side==='buy'?'покупка':'продажа',bandRow=(k,t)=>{const b=(d.depth_band||{})[k]||{};return`<tr><td class="l">${t}</td><td class="num">${micRub(b.bid_rub)}</td><td class="num">${micRub(b.ask_rub)}</td></tr>`};
+  return`${d.warning?`<div class="msg err mic-warn">${esc(d.warning)}</div>`:''}
+  <div class="mic-grid">
+    <div class="card mic-c"><h2>Заявка: ${side} на ${micRub(d.target_rub)}</h2>
+      <div class="mic-big">${micBp(d.slip_mid_bp)}<small class="mu"> к середине</small></div>
+      <div class="mic-kv"><span>Средневзвешенная цена</span><b>${micPx(d.vwap)}${d.is_bond?' %':''}</b></div>
+      <div class="mic-kv"><span>Потери относительно середины</span><b>${micRub(d.slip_mid_rub)}</b></div>
+      <div class="mic-kv"><span>К лучшей цене стакана</span><b>${micBp(d.slip_best_bp)}</b></div>
+      <div class="mic-kv"><span>Исполнится</span><b>${micRub(d.filled_rub)} (${(d.filled_lots||0).toLocaleString('ru-RU')} лот.)</b></div>
+      <div class="mic-kv"><span>Затронуто уровней</span><b>${d.levels_used} из ${d.visible_levels}</b></div>
+      <div class="mic-kv"><span>Доля видимой глубины</span><b>${bad(d.depth_share)?'—':pctp(d.depth_share*100,0)}</b></div>
+      ${d.is_bond?`<div class="mic-kv"><span>Влияние на доходность (приближённо)</span><b>${bad(d.yield_bp)?'нет дюрации':micBp(d.yield_bp)}</b></div>`:''}</div>
+    <div class="card mic-c"><h2>Спред и глубина</h2>
+      <div class="mic-kv"><span>Лучшая покупка / продажа</span><b>${micPx(d.best_bid)} / ${micPx(d.best_ask)}</b></div>
+      <div class="mic-kv"><span>Спред</span><b>${micPx(d.spread)} (${micBp(d.spread_bp)})</b></div>
+      <div class="tbl" style="margin-top:8px"><table><thead><tr><th class="l">Глубина от середины</th><th>Покупка</th><th>Продажа</th></tr></thead><tbody>${bandRow('0.005','±0,5 %')}${bandRow('0.01','±1 %')}</tbody></table></div></div></div>
+  <div class="card" style="margin-top:12px"><h2>Типовые размеры<span class="sp">${side}</span></h2><div class="tbl"><table><thead><tr><th class="l">Размер</th><th>Цена исполнения</th><th>Проскальзывание</th><th>Потери</th>${d.is_bond?'<th>Доходность</th>':''}<th>Статус</th></tr></thead><tbody>${(d.presets||[]).map(p=>`<tr><td class="l">${micRub(p.rub)}</td><td class="num">${micPx(p.vwap)}</td><td class="num">${micBp(p.slip_mid_bp)}</td><td class="num">${micRub(p.slip_mid_rub)}</td>${d.is_bond?`<td class="num">${bad(p.yield_bp)?'—':micBp(p.yield_bp)}</td>`:''}<td>${p.complete?'<span class="pos">хватает</span>':'<span class="neg">не хватает</span>'}</td></tr>`).join('')}</tbody></table></div></div>
+  <p class="note" style="margin-top:8px">${(d.notes||[]).map(esc).join(' ')}</p>
+  <div class="mic-meta"><span class="flw-src live">${esc(d.source_label||'')}</span><span class="mu">обновлено ${micT(d.ts)} МСК</span></div>`;
+}
+function micIceHtml(){
+  const d=S.mic.ice;
+  if(!d)return S.mic.iceErr?`<div class="msg err">${esc(S.mic.iceErr)}</div>`:waitBox('Наблюдаю за стаканом…');
+  if(!d.ok)return`<div class="empty" style="padding:18px 12px">${esc(d.error||'Недоступно')}</div>`;
+  let h='';
+  if(d.status==='unavailable')h=`<div class="empty" style="padding:18px 12px">${esc(d.message)}</div>`;
+  else if(d.status==='collecting')h=`<div class="empty" style="padding:18px 12px">${esc(d.message||'Накапливаю наблюдения…')} Снимков: ${d.snapshots}, наблюдаю ${d.observed_sec} с.</div>`;
+  else if(!d.candidates.length)h=`<div class="empty" style="padding:18px 12px">Признаков скрытой ликвидности на лучших уровнях не найдено (проверено уровней: ${d.levels_checked}, наблюдение ${d.observed_sec} с).</div>`;
+  else h=`<div class="tbl"><table><thead><tr><th class="l">Сторона</th><th>Цена</th><th>Исполнено, лот.</th><th>Макс. видимо, лот.</th><th>Видимо сейчас</th><th>Скрыто (оценка), лот.</th><th class="l">Подтверждение</th></tr></thead><tbody>${d.candidates.map(c=>`<tr><td class="l">${c.side==='ask'?'заявки на продажу':'заявки на покупку'}</td><td class="num">${micPx(c.price)}</td><td class="num">${c.executed_lots}</td><td class="num">${c.visible_max_lots}</td><td class="num">${c.visible_now_lots}</td><td class="num"><b>${c.hidden_est_lots}</b> <small class="mu">×${String(c.factor).replace('.',',')}</small></td><td class="l mic-ev"><div>стакан: ${c.evidence.book.map(b=>`${micT(b[0])}→${b[1]}`).join(', ')}</div><div>сделки: ${c.evidence.trades.map(t=>`${micT(t[0])}→${t[1]}`).join(', ')}</div><div>уровень держался в ${Math.round(c.persist*100)} % снимков</div></td></tr>`).join('')}</tbody></table></div>`;
+  return h+`<p class="note" style="margin-top:8px">${esc(d.note||'')}</p><div class="mic-meta"><span class="mu">${esc(d.source_label||'')}; снимков ${d.snapshots}, окно до ${Math.round((d.window_sec||600)/60)} мин</span></div>`;
+}
+function micPaint(){
+  if(S.page!=='mic')return;
+  const a=$('#mic-imp'),b=$('#mic-ice');
+  if(a)a.innerHTML=micImpactHtml();
+  if(b)b.innerHTML=micIceHtml();
+}
+function micLoadImpact(){
+  const D=S.mic;if(D.busyI)return;D.busyI=true;const secid=D.secid;
+  api('/api/mic/impact?'+new URLSearchParams({secid,side:D.side,rub:D.rub})).then(j=>{if(secid===D.secid){D.imp=j;D.err=''}}).catch(e=>{D.err=e.message||String(e)})
+    .then(()=>{D.busyI=false;micPaint()});
+}
+function micLoadIce(){
+  const D=S.mic;if(D.busyC)return;D.busyC=true;const secid=D.secid;
+  api('/api/mic/iceberg?'+new URLSearchParams({secid})).then(j=>{if(secid===D.secid){D.ice=j;D.iceErr=''}}).catch(e=>{D.iceErr=e.message||String(e)})
+    .then(()=>{D.busyC=false;micPaint()});
+}
+function micStop(){if(_micTimer){clearInterval(_micTimer);_micTimer=null}}
+function micStart(){
+  micStop();micLoadImpact();micLoadIce();
+  /* опрос раз в 7 с только пока открыт этот экран и вкладка видима */
+  _micTimer=setInterval(()=>{if(S.page!=='mic'){micStop();return}if(document.hidden)return;micLoadImpact();micLoadIce()},7000);
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&S.page==='mic'&&!_micTimer)micStart()});
+function micOpts(){
+  const D=S.mic,opts=(D.inst||[]).slice();if(!opts.some(r=>r.secid===D.secid))opts.unshift({secid:D.secid,name:''});
+  return opts.map(r=>`<option value="${esc(r.secid)}"${r.secid===D.secid?' selected':''}>${esc(r.secid)} ${esc(r.name||'')}</option>`).join('');
+}
+function pMic(){
+  const D=S.mic;
+  if(!D.inst){D.inst=[];api('/api/flows_instruments').then(j=>{D.inst=j.rows||[];const s=$('#mic-sec');if(S.page==='mic'&&s)s.innerHTML=micOpts()}).catch(()=>{})}
+  return`<div class="card"><h2>Стакан: ликвидность<span class="sp">проскальзывание крупной заявки и скрытый объём</span></h2>
+    <div class="flw-bar2"><label class="flw-min">Бумага <select id="mic-sec">${micOpts()}</select></label>
+      <input id="mic-q" class="in" placeholder="Тикер, например SU26238RMFS4" style="width:220px;max-width:100%" value="">
+      <div class="seg" id="mic-side">${[['buy','Покупка'],['sell','Продажа']].map(([k,t])=>`<button data-s="${k}" class="${D.side===k?'on':''}">${t}</button>`).join('')}</div></div>
+    <div class="flw-bar2"><div class="seg" id="mic-size">${MIC_SIZES.map(([v,t])=>`<button data-v="${v}" class="${D.rub===v&&!D.custom?'on':''}">${t}</button>`).join('')}</div>
+      <label class="flw-min">своя сумма, ₽ <input id="mic-cus" class="in" inputmode="numeric" placeholder="например 2500000" style="width:150px" value="${esc(D.custom)}"></label></div>
+    <div id="mic-imp">${micImpactHtml()}</div></div>
+  <div class="card" style="margin-top:14px"><h2>Скрытая ликвидность (айсберг)<span class="sp">эвристика по стакану и ленте сделок</span></h2><div id="mic-ice">${micIceHtml()}</div></div>
+  <p class="note" style="margin-top:10px">Стакан берётся из T-Invest: через сервер данных либо по вашему токену (текущие заявки; фактическая задержка зависит от тарифа биржевых данных). Без токена стакан недоступен: бесплатные данные Мосбиржи (ISS) стакана не содержат. Расчёт аналитический и не прогнозирует исполнение реальной заявки.</p>${NIR_NOTE}`;
+}
+function bindMic(){
+  const D=S.mic,on=(id,f)=>{const e=$(id);if(e)e.onclick=f};
+  on('#mic-side',e=>{const b=e.target.closest('[data-s]');if(!b)return;D.side=b.dataset.s;D.imp=null;render()});
+  on('#mic-size',e=>{const b=e.target.closest('[data-v]');if(!b)return;D.rub=+b.dataset.v;D.custom='';D.imp=null;render()});
+  const sec=$('#mic-sec');if(sec)sec.onchange=e=>{D.secid=e.target.value;D.imp=null;D.ice=null;render()};
+  const q=$('#mic-q');if(q)q.onkeydown=e=>{if(e.key!=='Enter')return;const v=q.value.trim().toUpperCase();if(/^[A-Z0-9_.\-]{1,24}$/.test(v)){D.secid=v;D.imp=null;D.ice=null;render()}};
+  const c=$('#mic-cus');if(c)c.onkeydown=e=>{if(e.key!=='Enter')return;const v=parseFloat(c.value.replace(/\s/g,'').replace(',','.'));if(v>=1000){D.rub=v;D.custom=c.value;D.imp=null;render()}};
+  micStart();
+}
+regPage('mic',{title:'Стакан: ликвидность',group:'Рынок',icon:'<path d="M4 5h16M4 9h12M4 15h12M4 19h16"/><path d="M12 11h8"/>',render:pMic,bind:bindMic,pro:true});
 </script></body></html>
 '''
 
