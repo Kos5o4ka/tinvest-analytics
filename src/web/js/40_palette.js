@@ -79,7 +79,9 @@ function kpOpen(){
   const q=$('#kp-q');
   q.oninput=()=>{KP.items=kpBuild(q.value);KP.sel=0;kpDraw()};
   KP.items=kpBuild('');KP.sel=0;kpDraw();q.focus();
-  if(typeof stkEnsureList==='function')stkEnsureList(()=>{if(KP.open&&q.value.trim()){KP.items=kpBuild(q.value);KP.sel=0;kpDraw()}});
+  const refresh=()=>{if(KP.open&&q.value.trim()){KP.items=kpBuild(q.value);KP.sel=0;kpDraw()}};
+  if(typeof stkEnsureList==='function')stkEnsureList(refresh);
+  if(!S.scr&&typeof loadScr==='function')loadScr(refresh);
 }
 function kpClose(){KP.open=false;const o=$('#kp-ov');if(o)o.remove()}
 function kpRun(i){const it=KP.items[i];if(!it)return;kpClose();it.run()}

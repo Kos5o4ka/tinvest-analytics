@@ -28,6 +28,7 @@ function obRender(){
       <div class="ob-row"><input class="in" type="password" id="ob-tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false" aria-label="API-токен Т-Инвестиций">
         <button class="btn" id="ob-save">Сохранить и проверить</button>
         <button class="btn ghost" id="ob-demo" title="Модельный портфель — без токена и без ваших данных">Посмотреть демо-портфель</button></div>
+      <label class="sw" style="margin:6px 0 4px"><input type="checkbox" id="ob-sb" ${ob.sb?'checked':''}><i></i><div><b>Токен песочницы</b><small>включите, если используете тестовый токен Sandbox</small></div></label>
       <div id="ob-msg" role="status">${ob.err?`<div class="msg err">${esc(ob.err)}</div>`:''}</div>
       <details class="ob-how" ${ob.help?'open':''}><summary>Где взять токен</summary><ol>
         <li>Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении: Профиль → Настройки → Токены T-Invest API).</li>
@@ -39,21 +40,23 @@ function obRender(){
       <span class="mu"> · </span><button class="lnk" id="ob-all">Все настройки</button></div>
   </div></div>`;
   const b=$('#ob-save');if(!b)return;
-  const input=$('#ob-tok');
+  const input=$('#ob-tok'),sb=$('#ob-sb');
+  if(sb)sb.onchange=()=>{ob.sb=sb.checked};
   const save=async()=>{
-    const tok=input.value.trim();
+    const tok=input.value.trim(),sandbox=!!(sb&&sb.checked);
+    ob.sb=sandbox;
     if(!tok){ob.err='Вставьте токен в поле.';$('#ob-msg').innerHTML=`<div class="msg err">${esc(ob.err)}</div>`;input.focus();return}
     ob.busy=true;ob.err='';b.disabled=true;b.textContent='Проверяю…';
     try{
-      await post('/api/config',{token:tok,sandbox:false});
-      const r=await post('/api/test');
+      await post('/api/test',{token:tok,sandbox});
+      await post('/api/config',{token:tok,sandbox});
       ob.done=true;ob.help=false;
       try{S.cfg=await api('/api/config')}catch(e){}
       const c=S.cfg||{};$('#mode').className='badge'+(c.sandbox?' sb':'');$('#mode').innerHTML=c.token_set?'<b></b>'+(c.sandbox?'Песочница':'Боевой режим'):'';
       obRender();
       S.data=S.bonds=S.hist=S.today=null;S.account='all';S.page='dash';persist();renderNav();load(true);
     }catch(e){
-      {const m=e&&e.message?e.message:'Не удалось подключиться';ob.err=/^Программа не отвечает/.test(m)?m:m+'. Проверьте, что токен скопирован целиком и имеет доступ «только чтение».'}
+      {const m=e&&e.message?e.message:'Не удалось подключиться';ob.err=/^Программа не отвечает/.test(m)?m:m+'. Проверьте, что токен скопирован целиком и выбран верный режим (боевой / песочница).'}
       ob.help=true;ob.busy=false;obRender();
     }
   };
@@ -108,8 +111,7 @@ function todayCard(){
       lines.push(tdLine('mon','<path d="M18 16v-5a6 6 0 0 0-12 0v5l-2 3h16z"/><path d="M10 21h4"/>',
         `Тревоги мониторинга: <b>${x.count}</b>${x.high?` <span class="neg">· ${x.high} ${obPl(x.high,'высокая','высокие','высоких')}</span>`:''}`,tdTag()));}
     if(d.movers&&d.movers.items&&d.movers.items.length){const x=d.movers;
-      lines.push(`<div class="td-grp"><div class="mu td-more" style="margin:2px 0 0">Лидеры падения облигаций · оборот от ${M(x.min_turn,'rub',0)}</div>${x.items.map(o=>tdLine('scr','<path d="M3 7l6 6 4-4 8 8"/><path d="M15 17h6v-6"/>',
-        `<b>${esc(o.name||'')}</b> <small class="mu num">${esc(o.isin||'')}</small> · <b class="num neg">${f2(o.chg)} %</b>`,'','td-mv')).join('')}<div class="mu td-more">Полный список — в «Скринере», вкладка «Лидеры»</div></div>`);}
+      lines.push(`<div class="td-grp"><div class="mu td-more" style="margin:2px 0 0">Лидеры падения облигаций · оборот от ${M(x.min_turn,'rub',0)}</div>${x.items.map(o=>o.isin?`<div class="td-it td-mv" data-isin="${esc(o.isin)}" role="button" tabindex="0"><i>${svgI('<path d="M3 7l6 6 4-4 8 8"/><path d="M15 17h6v-6"/>',1.9)}</i><span><b>${esc(o.name||'')}</b> <small class="mu num">${esc(o.isin||'')}</small> · <b class="num neg">${f2(o.chg)} %</b></span><em aria-hidden="true">›</em></div>`:tdLine('scr','<path d="M3 7l6 6 4-4 8 8"/><path d="M15 17h6v-6"/>',`<b>${esc(o.name||'')}</b> · <b class="num neg">${f2(o.chg)} %</b>`,'','td-mv')).join('')}<div class="mu td-more">Полный список — в «Скринере», вкладка «Лидеры»</div></div>`);}
   }else if(t&&t.loading&&!lines.length)return`<div class="card td-card noprint"><h2>Сегодня</h2><div class="sk" style="height:46px;border-radius:10px"></div></div>`;
   if(!lines.length)return'';
   return`<div class="card td-card noprint"><h2>Сегодня<span class="sp">${new Date().toLocaleDateString('ru-RU',{day:'numeric',month:'long'})}</span>${t&&t.loading?'<span class="td-ld">обновляю…</span>':''}</h2>${lines.join('')}</div>`;

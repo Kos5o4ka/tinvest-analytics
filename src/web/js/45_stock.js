@@ -5,6 +5,10 @@ IC.sst='<path d="M3 5h18l-7 8v6l-4-2v-4z"/>';
 PAGES.push(['stk','Акция'],['sst','Скринер акций']);
 NAV_GROUPS.splice(Math.max(0,NAV_GROUPS.findIndex(g=>g[0]==='Рынок')+1),0,['Акции',['stk','sst']]);
 PRO_PAGES.push('sst');
+document.addEventListener('click',e=>{
+  const t=e.target.closest&&e.target.closest('[data-stk]');
+  if(t&&t.dataset.stk&&!e.target.closest('a,input,select'))openStock(t.dataset.stk);
+});
 PRO_FEATURES.sst={t:'Скринер акций',ic:'sst',b:['Акции Мосбиржи с P/E, P/B, EV/EBITDA, дивидендной доходностью и ростом','Готовые подборки: дешёвые по P/E, высокие дивиденды, быстрый рост','Фильтры по сектору, капитализации и показателям','Переход в карточку акции в один клик'],pv:'table'};
 
 S.stk={secid:null,tf:'D',card:null,cardTf:null,err:null,loading:false,ind:{s50:true,s200:true,bb:false,lv:true}};

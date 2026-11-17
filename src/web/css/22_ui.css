@@ -4,7 +4,7 @@
 .nav .ngh:hover{color:var(--tx2);background:none}
 .nav .ngh i{font-style:normal;display:inline-block;transition:transform .15s;font-size:10px}
 .ng.shut .ngh i{transform:rotate(-90deg)}
-#eye.on{color:var(--ac);border-color:var(--ac)}
+#eye.on{color:var(--ac-tx);border-color:var(--ac)}
 #eye .slash{display:none}#eye.on .slash{display:block}
 .top #srch,.top #eye{padding:8px 11px}
 #restore-bar{margin:12px 28px 0}

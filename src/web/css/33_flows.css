@@ -24,7 +24,7 @@
 .flw-l i{position:absolute;top:0;bottom:0;right:0;opacity:.22;z-index:0}
 .flw-l.ask i{background:var(--neg)}.flw-l.bid i{background:var(--pos)}
 .flw-l span,.flw-l em{position:relative;z-index:1}.flw-l.ask .p{color:var(--neg)}.flw-l.bid .p{color:var(--pos)}
-.flw-l em{font-style:normal;font-size:11px;color:var(--ac)}.flw-l.wall{outline:1px solid var(--ac);outline-offset:-1px;font-weight:600}
+.flw-l em{font-style:normal;font-size:11px;color:var(--ac-tx)}.flw-l.wall{outline:1px solid var(--ac);outline-offset:-1px;font-weight:600}
 .flw-mid{text-align:center;padding:6px;background:var(--card);border-block:1px solid var(--line);font-weight:600}
 .flw-gauge{position:relative;height:10px;border-radius:6px;background:linear-gradient(90deg,var(--neg),var(--line) 50%,var(--pos));margin:12px 0 4px}
 .flw-gk{position:absolute;top:-4px;width:4px;height:18px;margin-left:-2px;background:var(--tx);border-radius:2px}
