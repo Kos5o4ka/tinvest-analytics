@@ -114,4 +114,4 @@ function bindRot(){
   const g=$$('rot-gap-go');if(g)g.onclick=()=>{read();R.gap=null;rotGapLoad();renderSoon()};
   const gi=$$('rot-goal');if(gi)gi.onkeydown=ev=>{if(ev.key==='Enter'){read();R.gap=null;rotGapLoad();renderSoon()}};
 }
-if(typeof regPage==='function')regPage('rot',{title:'Флоатеры или фиксы',group:'Рынок',icon:'<path d="M3 17c4 0 4-10 9-10s5 10 9 10"/><path d="M3 12h18"/>',render:pRot,bind:bindRot,pro:true});
+regPage('rot',{title:'Флоатеры или фиксы',group:'Рынок',icon:'<path d="M3 17c4 0 4-10 9-10s5 10 9 10"/><path d="M3 12h18"/>',render:pRot,bind:bindRot,pro:true});
