@@ -1,4 +1,4 @@
-"""Ссылки на документы выпуска: ИНН -> e-disclosure, код -> Мосбиржа (без сети)."""
+"""Ссылки на документы выпуска: ИНН -> СКРИН и e-disclosure, код -> Мосбиржа (без сети)."""
 import unittest
 
 from tests._load import load
@@ -12,10 +12,12 @@ class BondDocLinks(unittest.TestCase):
         self.assertEqual(d["inn"], "7714964716")
         self.assertEqual(d["edisclosure"], "https://www.e-disclosure.ru/poisk-po-kompaniyam?query=7714964716")
         self.assertEqual(d["moex"], "https://www.moex.com/ru/issue.aspx?code=RU000A104JQ3")
+        self.assertEqual(d["skrin"], "https://disclosure.skrin.ru/disclosure/7714964716")
 
     def test_bad_inn_falls_back_to_isin(self):
         d = T.bond_doc_links("SU26238RMFS4", "SU26238RMFS4", "12 3")
         self.assertIsNone(d["inn"])
+        self.assertIsNone(d["skrin"])
         self.assertTrue(d["edisclosure"].endswith("query=SU26238RMFS4"))
 
     def test_inn_with_spaces_and_secid_default(self):

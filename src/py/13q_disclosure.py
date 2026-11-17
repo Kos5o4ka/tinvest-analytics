@@ -383,9 +383,61 @@ def _dfl_executed(isin, f):
     return None
 
 
-def defaults_feed(since=None, isins=None):
+def _dfl_ok_date(d):
+    return bool(d) and isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) is not None and not d.startswith("0000")
+
+
+def dfl_last_due(bz, qty, today):
+    """Последнее обязательство по графику Мосбиржи с датой строго раньше today (выплата в сам день ещё не просрочена): {date, obligation, amount, parts}.
+    bz — moex_bondization (coupons/amort/offers), qty — число бумаг в обращении (None -> суммы не считаем).
+    Несколько выплат в один день склеиваются («Купон №5 + амортизация»); последняя амортизация (или последний купон, если
+    амортизаций нет) = «Погашение». None, если ни одной даты в прошлом нет."""
+    bz = bz or {}
+    cps = sorted((c["coupondate"], c.get("value")) for c in bz.get("coupons") or [] if _dfl_ok_date(c.get("coupondate")))
+    ams = sorted((a["amortdate"], a.get("value")) for a in bz.get("amort") or [] if _dfl_ok_date(a.get("amortdate")))
+    ofs = sorted({o["offerdate"] for o in bz.get("offers") or [] if _dfl_ok_date(o.get("offerdate"))})
+    mat = ams[-1][0] if ams else (cps[-1][0] if cps else None)
+    days = [d for d, _ in cps if d < today] + [d for d, _ in ams if d < today] + [d for d in ofs if d < today]
+    if not days:
+        return None
+    d = max(days)
+    parts, amt, known = [], 0.0, False
+    for i, (cd, v) in enumerate(cps):
+        if cd == d:
+            parts.append("Купон №%d" % (i + 1))
+            if v and qty:
+                amt += float(v) * qty
+                known = True
+    for ad, v in ams:
+        if ad == d:
+            parts.append("Погашение" if ad == mat else "Амортизация")
+            if v and qty:
+                amt += float(v) * qty
+                known = True
+    if d in ofs:
+        parts.append("Оферта")
+    txt = parts[0]
+    for x in parts[1:]:
+        txt += " + " + (x[0].lower() + x[1:] if x != "Оферта" else "оферта")
+    return {"date": d, "obligation": txt, "amount": round(amt, 2) if known else None, "parts": parts}
+
+
+def _dfl_schedule_row(isin, today=None):
+    """Просроченное обязательство по графику Мосбиржи для бумаги с флагом: dfl_last_due с числом бумаг из описания выпуска."""
+    today = today or date.today().isoformat()
+    bz = moex_bondization(isin)
+    if not bz:
+        return None
+    desc = _disc_issue_desc(isin) or {}
+    qty = desc.get("placed") or desc.get("issue_size")
+    return dfl_last_due(bz, qty, today)
+
+
+def defaults_feed(since=None, isins=None, schedule=False):
     """Лента неисполненных обязательств: сообщения эмитентов (сервер данных) + флаги Мосбиржи по бумагам из isins.
-    [{date, status, issuer, inn, isin, obligation, amount, executed, basis, url}], новые сверху."""
+    [{date, status, issuer, inn, isin, obligation, amount, executed, basis, url, date_est}], новые сверху.
+    schedule=True: строки по флагу Мосбиржи получают дату/обязательство/сумму из графика выплат (date_est=True); без него даты нет
+    (так ленту берут тревоги — их ключи дедупликации не должны меняться с датой)."""
     since = since or (date.today() - timedelta(days=30)).isoformat()
     try:
         raw = ds_parsed("disclosure/defaults", {"since": since})
@@ -414,7 +466,7 @@ def defaults_feed(since=None, isins=None):
             out.append({"date": (f.get("published") or "")[:10] or None, "due_date": d.get("due_date") or f.get("due_date"),
                         "status": "default" if d.get("status") == "default" else "technical", "issuer": name or f.get("title") or "",
                         "inn": f.get("inn"), "isin": isin, "obligation": ob + num,
-                        "amount": o.get("amount"), "executed": ex, "basis": "Сообщение эмитента", "url": f.get("url")})
+                        "amount": o.get("amount"), "executed": ex, "basis": "Сообщение эмитента", "url": f.get("url"), "date_est": False})
         return out
     rows = [r for part in (pool_map(one, raw[:300], workers=6) if raw else []) for r in part]
     have = {r["isin"] for r in rows if r.get("isin")}
@@ -426,14 +478,85 @@ def defaults_feed(since=None, isins=None):
             if not (fl.get("tech") or fl.get("default")):
                 return None
             em = issuer_of(isin) or {}
-            return {"date": None, "due_date": None, "status": "default" if fl.get("default") else "technical",
-                    "issuer": em.get("short") or em.get("title") or isin, "inn": em.get("inn"), "isin": isin, "obligation": "",
-                    "amount": None, "executed": None, "basis": "Флаг Мосбиржи", "url": None}
+            row = {"date": None, "due_date": None, "status": "default" if fl.get("default") else "technical",
+                   "issuer": em.get("short") or em.get("title") or isin, "inn": em.get("inn"), "isin": isin, "obligation": "",
+                   "amount": None, "executed": None, "basis": "Флаг Мосбиржи", "url": None, "date_est": False}
+            if schedule:
+                try:
+                    due = _dfl_schedule_row(isin)
+                except Exception:  # noqa: BLE001
+                    due = None
+                if due:
+                    row.update(date=due["date"], due_date=due["date"], obligation=due["obligation"], amount=due["amount"], date_est=True)
+            return row
         except Exception:  # noqa: BLE001
             return None
     rows += [r for r in (pool_map(flag, extra, workers=6) if extra else []) if r]
     rows.sort(key=lambda r: r["date"] or "", reverse=True)
     return rows
+
+
+# ── фоновый обход всего рынка: у Мосбиржи нет списка бумаг с флагом дефолта, поэтому проверяем описание каждого выпуска ──
+
+DFL_MKT_KEY, DFL_MKT_TTL, DFL_UNI_KEY = "dfl_market_v1", 12 * 3600, "dfl_universe_v1"
+_DFL_SCAN = {"running": False, "done": 0, "total": 0, "err": None}
+_DFL_LOCK = threading.Lock()
+
+
+def _dfl_universe():
+    """ISIN всех рублёвых/валютных облигаций с RU-ISIN, торгуемых на bonds (без ОФЗ SU...). Кэш сутки."""
+    hit = store().get(DFL_UNI_KEY, ttl=DAY)
+    if hit:
+        return hit
+    j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/markets/bonds/securities.json?iss.meta=off"
+                             "&iss.only=securities&securities.columns=SECID,ISIN", timeout=90))
+    out = []
+    for r in j["securities"]["data"]:
+        sec, isin = str(r[0] or ""), str(r[1] or "")
+        if isin.startswith("RU") and not sec.startswith("SU") and isin not in out:
+            out.append(isin)
+    if out:
+        store().put(DFL_UNI_KEY, out)
+    return out
+
+
+def _dfl_scan_run(isins):
+    found = []
+    try:
+        for i in range(0, len(isins), 60):
+            part = isins[i:i + 60]
+            for isin, fl in zip(part, pool_map(lambda x: _mon_flags(x), part, workers=6)):
+                if fl.get("tech") or fl.get("default"):
+                    found.append(isin)
+            with _DFL_LOCK:
+                _DFL_SCAN["done"] = min(len(isins), i + len(part))
+            time.sleep(0.15)
+        store().put(DFL_MKT_KEY, {"ts": time.time(), "isins": found, "total": len(isins)})
+    except Exception as e:  # noqa: BLE001
+        with _DFL_LOCK:
+            _DFL_SCAN["err"] = str(e)
+    finally:
+        with _DFL_LOCK:
+            _DFL_SCAN["running"] = False
+
+
+def dfl_market(force=False):
+    """Список ISIN с флагом (тех)дефолта по всему рынку + состояние обхода {running, done, total}. Запускает фоновый обход,
+    если сохранённый результат старше 12 ч (или force). Пока идёт обход, isins — пусто/прошлый результат."""
+    saved = store().get(DFL_MKT_KEY)
+    fresh = bool(saved) and time.time() - saved.get("ts", 0) < DFL_MKT_TTL
+    with _DFL_LOCK:
+        if (force or not fresh) and not _DFL_SCAN["running"]:
+            try:
+                uni = _dfl_universe()
+            except Exception as e:  # noqa: BLE001
+                _DFL_SCAN["err"] = str(e)
+                uni = []
+            if uni:
+                _DFL_SCAN.update(running=True, done=0, total=len(uni), err=None)
+                threading.Thread(target=_dfl_scan_run, args=(uni,), daemon=True).start()
+        scan = {"running": _DFL_SCAN["running"], "done": _DFL_SCAN["done"], "total": _DFL_SCAN["total"], "error": _DFL_SCAN["err"]}
+    return {"isins": list((saved or {}).get("isins") or []), "scan": scan, "ts": (saved or {}).get("ts")}
 
 
 def _disc_own_isins(cfg, acc):
@@ -486,13 +609,34 @@ def defaults_get(cfg, acc, q, force):
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
         since = (date.today() - timedelta(days=days)).isoformat()
     own = str(q.get("own", "1")) != "0"
-    key = ("defaults", since, own, bool(cfg.get("sandbox")), hash(cfg.get("token") or ""), acc)
-    if not force:
-        hit = mem_get(key, 900)
-        if hit:
-            return hit
-    rows = defaults_feed(since, _disc_own_isins(cfg, acc) if own else None)
-    return mem_put(key, {"since": since, "rows": rows, "configured": bool(ds_conf()[0])})
+    scope = "market" if str(q.get("scope") or "my").strip().lower() == "market" else "my"
+    key = ("defaults", since, own, scope, bool(cfg.get("sandbox")), hash(cfg.get("token") or ""), acc)
+    scan = None
+    mine = _disc_own_isins(cfg, acc) if own else []
+    if scope == "market":
+        mk = dfl_market(bool(force))
+        scan = mk["scan"]
+        isins = list(dict.fromkeys(mine + mk["isins"]))
+        if not scan["running"] and not force:
+            hit = mem_get(key, 900)
+            if hit:
+                return dict(hit, scan=scan)
+    else:
+        isins = mine
+        if not force:
+            hit = mem_get(key, 900)
+            if hit:
+                return hit
+    rows = defaults_feed(since, isins if (own or scope == "market") else None, schedule=True)
+    mineset = set(mine)
+    for r in rows:
+        r["mine"] = r.get("isin") in mineset
+    out = {"since": since, "scope": scope, "rows": rows, "configured": bool(ds_conf()[0])}
+    if scan is not None:
+        out["scan"] = scan
+        if scan["running"]:           # промежуточный результат не кэшируем: он меняется по мере обхода
+            return out
+    return mem_put(key, out)
 
 
 API_GET["/api/disclosure"] = disclosure_get

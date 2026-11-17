@@ -1,3 +1,7 @@
 .crp-h td{background:var(--card2,var(--card));font-weight:600;font-size:12.5px;color:var(--tx2)}
 .crp-s td{font-size:12px;color:var(--tx2)}
 .crp-r:hover{background:var(--card2,var(--card))}
+/* таблица «Эмитенты портфеля»: длинные названия и пояснения переносятся, а не растягивают закреплённую первую колонку на пол-экрана */
+.crp-tbl td.crp-nm{white-space:normal;min-width:180px;max-width:300px;line-height:1.3}
+.crp-tbl td.crp-nm small{display:block;margin-top:2px}
+@media(max-width:700px){.crp-tbl td.crp-nm{min-width:130px;max-width:190px}}

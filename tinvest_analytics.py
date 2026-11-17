@@ -6271,7 +6271,7 @@ def primary_payload():
 # v2: на каждую дату вся сетка {срок: доходность}; v1 хранил только 2 года (используем как запас, пока v2 докачивается)
 KBD_KEY, KBD_OLD_KEY, KEY_KEY = "kbd_grid_v2", "kbd2y_v1", "keyrate_v1"
 RATE_TERM_MIN, RATE_TERM_MAX, RATE_TERMS_MAX = 0.25, 30.0, 6
-_rates_state = {"running": False}
+_rates_state = {"running": False, "ended": 0.0}
 
 
 def kbd_interp(grid, term):
@@ -6345,6 +6345,7 @@ def _rates_run(days):
                     cache[d] = v
             st.put(KBD_KEY, cache)
     finally:
+        _rates_state["ended"] = time.time()
         _rates_state["running"] = False
 
 
@@ -6357,7 +6358,8 @@ def _safe(fn, x):
 
 def rates_start(days):
     with _rt_lock:
-        if _rates_state["running"]:
+        # недокачанные дни (сбой ISS, праздники) повторяем не чаще раза в 10 минут — иначе экран вечно «загружается»
+        if _rates_state["running"] or time.time() - _rates_state["ended"] < 600:
             return
         _rates_state["running"] = True
     threading.Thread(target=_rates_run, args=(days,), daemon=True).start()
@@ -6371,8 +6373,11 @@ def rates_payload(days, terms=None):
     old = st.get(KBD_OLD_KEY) or {}
     today = date.today()
     first = (today - timedelta(days=days)).isoformat()
-    miss = sum(1 for i in range(days + 1) if (today - timedelta(days=i)).weekday() < 5
+    # сегодняшняя КБД появляется только после расчёта биржей — её отсутствие не считаем недокачкой
+    miss = sum(1 for i in range(1, days + 1) if (today - timedelta(days=i)).weekday() < 5
                and (today - timedelta(days=i)).isoformat() not in cache)
+    if today.weekday() < 5 and today.isoformat() not in cache:
+        rates_start(days)
     if miss > 0:
         rates_start(days)
     try:
@@ -6400,7 +6405,7 @@ def rates_payload(days, terms=None):
             kbd["%g" % t].append(round(v, 2) if v is not None else None)
         key.append(last)
     return {"iso": iso, "labels": [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y") for d in iso],
-            "kbd": kbd, "terms": tl, "key": key, "loading": _rates_state["running"] or miss > 0,
+            "kbd": kbd, "terms": tl, "key": key, "loading": _rates_state["running"] or (miss > 0 and not _rates_state["ended"]),
             "keys": [k for k in keys if k[0] >= first]}
 
 
@@ -7495,6 +7500,8 @@ def bond_doc_links(isin, secid=None, inn=None):
     inn = inn if len(inn) in (10, 12) else ""
     q = inn or isin
     return {"inn": inn or None,
+            # СКРИН открывает страницу раскрытия эмитента прямо по ИНН; поиск e-disclosure по ссылке не заполняется (страница на JS)
+            "skrin": "https://disclosure.skrin.ru/disclosure/" + inn if inn else None,
             "edisclosure": "https://www.e-disclosure.ru/poisk-po-kompaniyam?query=" + urllib.parse.quote(q) if q else None,
             "moex": "https://www.moex.com/ru/issue.aspx?code=" + urllib.parse.quote(secid) if secid else None}
 # ═══════════════════ карточка облигации: описание, история, денежный поток, аналоги ═══════════════════
@@ -15419,9 +15426,61 @@ def _dfl_executed(isin, f):
     return None
 
 
-def defaults_feed(since=None, isins=None):
+def _dfl_ok_date(d):
+    return bool(d) and isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) is not None and not d.startswith("0000")
+
+
+def dfl_last_due(bz, qty, today):
+    """Последнее обязательство по графику Мосбиржи с датой строго раньше today (выплата в сам день ещё не просрочена): {date, obligation, amount, parts}.
+    bz — moex_bondization (coupons/amort/offers), qty — число бумаг в обращении (None -> суммы не считаем).
+    Несколько выплат в один день склеиваются («Купон №5 + амортизация»); последняя амортизация (или последний купон, если
+    амортизаций нет) = «Погашение». None, если ни одной даты в прошлом нет."""
+    bz = bz or {}
+    cps = sorted((c["coupondate"], c.get("value")) for c in bz.get("coupons") or [] if _dfl_ok_date(c.get("coupondate")))
+    ams = sorted((a["amortdate"], a.get("value")) for a in bz.get("amort") or [] if _dfl_ok_date(a.get("amortdate")))
+    ofs = sorted({o["offerdate"] for o in bz.get("offers") or [] if _dfl_ok_date(o.get("offerdate"))})
+    mat = ams[-1][0] if ams else (cps[-1][0] if cps else None)
+    days = [d for d, _ in cps if d < today] + [d for d, _ in ams if d < today] + [d for d in ofs if d < today]
+    if not days:
+        return None
+    d = max(days)
+    parts, amt, known = [], 0.0, False
+    for i, (cd, v) in enumerate(cps):
+        if cd == d:
+            parts.append("Купон №%d" % (i + 1))
+            if v and qty:
+                amt += float(v) * qty
+                known = True
+    for ad, v in ams:
+        if ad == d:
+            parts.append("Погашение" if ad == mat else "Амортизация")
+            if v and qty:
+                amt += float(v) * qty
+                known = True
+    if d in ofs:
+        parts.append("Оферта")
+    txt = parts[0]
+    for x in parts[1:]:
+        txt += " + " + (x[0].lower() + x[1:] if x != "Оферта" else "оферта")
+    return {"date": d, "obligation": txt, "amount": round(amt, 2) if known else None, "parts": parts}
+
+
+def _dfl_schedule_row(isin, today=None):
+    """Просроченное обязательство по графику Мосбиржи для бумаги с флагом: dfl_last_due с числом бумаг из описания выпуска."""
+    today = today or date.today().isoformat()
+    bz = moex_bondization(isin)
+    if not bz:
+        return None
+    desc = _disc_issue_desc(isin) or {}
+    qty = desc.get("placed") or desc.get("issue_size")
+    return dfl_last_due(bz, qty, today)
+
+
+def defaults_feed(since=None, isins=None, schedule=False):
     """Лента неисполненных обязательств: сообщения эмитентов (сервер данных) + флаги Мосбиржи по бумагам из isins.
-    [{date, status, issuer, inn, isin, obligation, amount, executed, basis, url}], новые сверху."""
+    [{date, status, issuer, inn, isin, obligation, amount, executed, basis, url, date_est}], новые сверху.
+    schedule=True: строки по флагу Мосбиржи получают дату/обязательство/сумму из графика выплат (date_est=True); без него даты нет
+    (так ленту берут тревоги — их ключи дедупликации не должны меняться с датой)."""
     since = since or (date.today() - timedelta(days=30)).isoformat()
     try:
         raw = ds_parsed("disclosure/defaults", {"since": since})
@@ -15450,7 +15509,7 @@ def defaults_feed(since=None, isins=None):
             out.append({"date": (f.get("published") or "")[:10] or None, "due_date": d.get("due_date") or f.get("due_date"),
                         "status": "default" if d.get("status") == "default" else "technical", "issuer": name or f.get("title") or "",
                         "inn": f.get("inn"), "isin": isin, "obligation": ob + num,
-                        "amount": o.get("amount"), "executed": ex, "basis": "Сообщение эмитента", "url": f.get("url")})
+                        "amount": o.get("amount"), "executed": ex, "basis": "Сообщение эмитента", "url": f.get("url"), "date_est": False})
         return out
     rows = [r for part in (pool_map(one, raw[:300], workers=6) if raw else []) for r in part]
     have = {r["isin"] for r in rows if r.get("isin")}
@@ -15462,14 +15521,85 @@ def defaults_feed(since=None, isins=None):
             if not (fl.get("tech") or fl.get("default")):
                 return None
             em = issuer_of(isin) or {}
-            return {"date": None, "due_date": None, "status": "default" if fl.get("default") else "technical",
-                    "issuer": em.get("short") or em.get("title") or isin, "inn": em.get("inn"), "isin": isin, "obligation": "",
-                    "amount": None, "executed": None, "basis": "Флаг Мосбиржи", "url": None}
+            row = {"date": None, "due_date": None, "status": "default" if fl.get("default") else "technical",
+                   "issuer": em.get("short") or em.get("title") or isin, "inn": em.get("inn"), "isin": isin, "obligation": "",
+                   "amount": None, "executed": None, "basis": "Флаг Мосбиржи", "url": None, "date_est": False}
+            if schedule:
+                try:
+                    due = _dfl_schedule_row(isin)
+                except Exception:  # noqa: BLE001
+                    due = None
+                if due:
+                    row.update(date=due["date"], due_date=due["date"], obligation=due["obligation"], amount=due["amount"], date_est=True)
+            return row
         except Exception:  # noqa: BLE001
             return None
     rows += [r for r in (pool_map(flag, extra, workers=6) if extra else []) if r]
     rows.sort(key=lambda r: r["date"] or "", reverse=True)
     return rows
+
+
+# ── фоновый обход всего рынка: у Мосбиржи нет списка бумаг с флагом дефолта, поэтому проверяем описание каждого выпуска ──
+
+DFL_MKT_KEY, DFL_MKT_TTL, DFL_UNI_KEY = "dfl_market_v1", 12 * 3600, "dfl_universe_v1"
+_DFL_SCAN = {"running": False, "done": 0, "total": 0, "err": None}
+_DFL_LOCK = threading.Lock()
+
+
+def _dfl_universe():
+    """ISIN всех рублёвых/валютных облигаций с RU-ISIN, торгуемых на bonds (без ОФЗ SU...). Кэш сутки."""
+    hit = store().get(DFL_UNI_KEY, ttl=DAY)
+    if hit:
+        return hit
+    j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/markets/bonds/securities.json?iss.meta=off"
+                             "&iss.only=securities&securities.columns=SECID,ISIN", timeout=90))
+    out = []
+    for r in j["securities"]["data"]:
+        sec, isin = str(r[0] or ""), str(r[1] or "")
+        if isin.startswith("RU") and not sec.startswith("SU") and isin not in out:
+            out.append(isin)
+    if out:
+        store().put(DFL_UNI_KEY, out)
+    return out
+
+
+def _dfl_scan_run(isins):
+    found = []
+    try:
+        for i in range(0, len(isins), 60):
+            part = isins[i:i + 60]
+            for isin, fl in zip(part, pool_map(lambda x: _mon_flags(x), part, workers=6)):
+                if fl.get("tech") or fl.get("default"):
+                    found.append(isin)
+            with _DFL_LOCK:
+                _DFL_SCAN["done"] = min(len(isins), i + len(part))
+            time.sleep(0.15)
+        store().put(DFL_MKT_KEY, {"ts": time.time(), "isins": found, "total": len(isins)})
+    except Exception as e:  # noqa: BLE001
+        with _DFL_LOCK:
+            _DFL_SCAN["err"] = str(e)
+    finally:
+        with _DFL_LOCK:
+            _DFL_SCAN["running"] = False
+
+
+def dfl_market(force=False):
+    """Список ISIN с флагом (тех)дефолта по всему рынку + состояние обхода {running, done, total}. Запускает фоновый обход,
+    если сохранённый результат старше 12 ч (или force). Пока идёт обход, isins — пусто/прошлый результат."""
+    saved = store().get(DFL_MKT_KEY)
+    fresh = bool(saved) and time.time() - saved.get("ts", 0) < DFL_MKT_TTL
+    with _DFL_LOCK:
+        if (force or not fresh) and not _DFL_SCAN["running"]:
+            try:
+                uni = _dfl_universe()
+            except Exception as e:  # noqa: BLE001
+                _DFL_SCAN["err"] = str(e)
+                uni = []
+            if uni:
+                _DFL_SCAN.update(running=True, done=0, total=len(uni), err=None)
+                threading.Thread(target=_dfl_scan_run, args=(uni,), daemon=True).start()
+        scan = {"running": _DFL_SCAN["running"], "done": _DFL_SCAN["done"], "total": _DFL_SCAN["total"], "error": _DFL_SCAN["err"]}
+    return {"isins": list((saved or {}).get("isins") or []), "scan": scan, "ts": (saved or {}).get("ts")}
 
 
 def _disc_own_isins(cfg, acc):
@@ -15522,13 +15652,34 @@ def defaults_get(cfg, acc, q, force):
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
         since = (date.today() - timedelta(days=days)).isoformat()
     own = str(q.get("own", "1")) != "0"
-    key = ("defaults", since, own, bool(cfg.get("sandbox")), hash(cfg.get("token") or ""), acc)
-    if not force:
-        hit = mem_get(key, 900)
-        if hit:
-            return hit
-    rows = defaults_feed(since, _disc_own_isins(cfg, acc) if own else None)
-    return mem_put(key, {"since": since, "rows": rows, "configured": bool(ds_conf()[0])})
+    scope = "market" if str(q.get("scope") or "my").strip().lower() == "market" else "my"
+    key = ("defaults", since, own, scope, bool(cfg.get("sandbox")), hash(cfg.get("token") or ""), acc)
+    scan = None
+    mine = _disc_own_isins(cfg, acc) if own else []
+    if scope == "market":
+        mk = dfl_market(bool(force))
+        scan = mk["scan"]
+        isins = list(dict.fromkeys(mine + mk["isins"]))
+        if not scan["running"] and not force:
+            hit = mem_get(key, 900)
+            if hit:
+                return dict(hit, scan=scan)
+    else:
+        isins = mine
+        if not force:
+            hit = mem_get(key, 900)
+            if hit:
+                return hit
+    rows = defaults_feed(since, isins if (own or scope == "market") else None, schedule=True)
+    mineset = set(mine)
+    for r in rows:
+        r["mine"] = r.get("isin") in mineset
+    out = {"since": since, "scope": scope, "rows": rows, "configured": bool(ds_conf()[0])}
+    if scan is not None:
+        out["scan"] = scan
+        if scan["running"]:           # промежуточный результат не кэшируем: он меняется по мере обхода
+            return out
+    return mem_put(key, out)
 
 
 API_GET["/api/disclosure"] = disclosure_get
@@ -15877,8 +16028,36 @@ def stk_rows_from_iss(j, sector_of=None, default_sector=STK_DEFAULT_SECTOR):
                     "sector": (sector_of or {}).get(sid) or default_sector, "price": price, "prev": prev,
                     "chg_d": None if chg is None else round(chg, 2),
                     "value_today": _stk_f(m.get("VALTODAY_RUR")) or _stk_f(m.get("VALTODAY")) or 0.0,
-                    "cap": cap or None, "lot": int(r.get("LOTSIZE") or 1), "chg_w": None, "chg_m": None})
+                    "cap": cap or None, "lot": int(r.get("LOTSIZE") or 1), "chg_w": None, "chg_m": None,
+                    "instrid": r.get("INSTRID") or "", "sectype": str(r.get("SECTYPE") or ""),
+                    "is_fund": str(r.get("INSTRID") or "").startswith("IF")})
     return out
+
+
+STK_FUND_CATS = {
+    "Денежный рынок": "LQDT AKMM SBMM TMON AMNR CASH MONY OLIQ PSMM FMMM TSAV",
+    "Золото и металлы": "GOLD TGLD AKGD SBGD BCSG PSGM",
+    "Облигации": "SBGB OBLG AKMB TBRU SBRB TOFZ INFL OFZS WOFZ SUGB SBCB CORP BOND ROBL BNDA BNDB BNDC AMGB PSRB MKBD TLCB SBLB SBHI SBFR AKFB TPAY",
+    "Акции": "TMOS SBMX EQMX AKME TDIV DIVD AKIE AKAI AIIQ",
+    "Валюта": "TUSD TEUR TCNY YUAN CNYM WUSD AMNY BCSD",
+}
+STK_FUND_CAT_OF = {t: c for c, ts in STK_FUND_CATS.items() for t in ts.split()}
+STK_FUND_OTHER = "Прочие фонды"
+_STK_FUND_WORDS = (("Золото и металлы", ("золот", "драгмет", "металл")), ("Денежный рынок", ("денеж", "ликвид", "казна", "казнач")),
+                   ("Облигации", ("облиг", "офз", "бонд")), ("Акции", ("акци", "акц ", "акцрост", "див")),
+                   ("Валюта", ("валют", "юан", "доллар")))
+
+
+def stk_fund_category(secid, name=""):
+    """Категория фонда для тепловой карты: сначала таблица тикеров, затем эвристика по названию, иначе «Прочие фонды»."""
+    c = STK_FUND_CAT_OF.get((secid or "").upper())
+    if c:
+        return c
+    n = (name or "").lower() + " "
+    for cat, words in _STK_FUND_WORDS:
+        if any(w in n for w in words):
+            return cat
+    return STK_FUND_OTHER
 
 
 def stock_history_closes(date_s):
@@ -15947,10 +16126,8 @@ def stk_api_map(cfg):
         return {}
 
 
-def stocks_universe(force=False, cfg=None):
-    """Акции TQBR: [{secid, isin, name, shortname, sector, price, prev, chg_d, value_today, cap, lot, chg_w, chg_m}].
-    Сектор: встроенный справочник, для остальных — сектор T-Invest (если передан cfg с токеном), иначе «Прочее».
-    Кэш 2 минуты в торговые часы, иначе час. Кэш общий, возвращается копия строк."""
+def _stk_tqbr_rows(force=False):
+    """Все бумаги TQBR (акции и фонды) с chg_w/chg_m; общий кэш. Фонды помечены is_fund (INSTRID «IF…»)."""
     key = ("stk_universe",)
     rows = None if force else mem_get(key, _stk_ttl())
     if rows is None:
@@ -15960,7 +16137,14 @@ def stocks_universe(force=False, cfg=None):
                 rows = stk_rows_from_iss(_stk_iss(STK_SH % "TQBR", 40), STK_SECTORS)
                 _stk_changes(rows)
                 mem_put(key, rows)
-    out = [dict(r) for r in rows]
+    return rows
+
+
+def stocks_universe(force=False, cfg=None):
+    """Акции TQBR (без фондов): [{secid, isin, name, shortname, sector, price, prev, chg_d, value_today, cap, lot, chg_w, chg_m}].
+    Сектор: встроенный справочник, для остальных — сектор T-Invest (если передан cfg с токеном), иначе «Прочее».
+    Кэш 2 минуты в торговые часы, иначе час. Кэш общий, возвращается копия строк."""
+    out = [dict(r) for r in _stk_tqbr_rows(force) if not r.get("is_fund")]
     tm = stk_api_map(cfg) if cfg else {}
     for r in out:
         a = tm.get(r["secid"])
@@ -15972,13 +16156,20 @@ def stocks_universe(force=False, cfg=None):
 
 
 def funds_universe():
-    """Фонды (доска TQTF) в том же формате, что stocks_universe; сектор — «Фонды»."""
-    key = ("stk_funds",)
-    rows = mem_get(key, _stk_ttl())
-    if rows is None:
-        rows = stk_rows_from_iss(_stk_iss(STK_SH % "TQTF", 40), None, "Фонды")
-        mem_put(key, rows)
-    return [dict(r) for r in rows]
+    """Фонды (с 2025 торгуются на TQBR, INSTRID «IF…») в формате stocks_universe; sector — категория фонда (stk_fund_category).
+    Если на TQBR фондов нет — запасной вариант: доска TQTF."""
+    rows = [dict(r) for r in _stk_tqbr_rows() if r.get("is_fund")]
+    if not rows:
+        key = ("stk_funds",)
+        cached = mem_get(key, _stk_ttl())
+        if cached is None:
+            cached = stk_rows_from_iss(_stk_iss(STK_SH % "TQTF", 40), None, STK_FUND_OTHER)
+            _stk_changes(cached)
+            mem_put(key, cached)
+        rows = [dict(r, is_fund=True) for r in cached]
+    for r in rows:
+        r["sector"] = stk_fund_category(r["secid"], r.get("name") or r.get("shortname"))
+    return rows
 
 
 STK_IV = {"H": 60, "D": 24, "W": 7, "M": 31}
@@ -19833,6 +20024,212 @@ def mic_iceberg_get(cfg, acc, q, force):
 
 API_GET["/api/mic/impact"] = mic_impact_get
 API_GET["/api/mic/iceberg"] = mic_iceberg_get
+# ═══════════════════════════════ бегущая строка котировок ═══════════════════════════════
+# /api/ticker -> {"items":[{id,label,price,chg,unit,kind}], "updated": ts}. Проценты — в процентных пунктах.
+# Каждый источник тянется независимо: сбой одного не убирает остальные.
+
+TK_ISS = "https://iss.moex.com/iss/"
+TK_BLUE = ("SBER", "GAZP", "LKOH", "ROSN", "NVTK", "GMKN", "YDEX", "T", "PLZL", "VTBR", "MGNT", "TATN", "CHMF", "MTSS")
+TK_UA = "Mozilla/5.0 (compatible; tanalytic)"
+
+
+def tk_f(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v else None
+
+
+def tk_table(j, name):
+    t = (j or {}).get(name) or {}
+    cols = t.get("columns") or []
+    return [dict(zip(cols, r)) for r in (t.get("data") or [])]
+
+
+def tk_item(id_, label, price, chg, unit, kind):
+    price = tk_f(price)
+    if not price:
+        return None
+    chg = tk_f(chg)
+    return {"id": id_, "label": label, "price": price, "chg": None if chg is None else round(chg, 2), "unit": unit, "kind": kind}
+
+
+def tk_parse_index(j):
+    for r in tk_table(j, "marketdata"):
+        it = tk_item("IMOEX", "IMOEX", r.get("CURRENTVALUE"), r.get("LASTCHANGEPRC"), "", "index")
+        if it:
+            return it
+    return None
+
+
+def tk_parse_stocks(rows):
+    by = {r.get("secid"): r for r in rows or []}
+    out = []
+    for s in TK_BLUE:
+        r = by.get(s)
+        it = r and tk_item(s, s, r.get("price"), r.get("chg_d"), "₽", "stock")
+        if it:
+            out.append(it)
+    return out
+
+
+TK_CETS = (("USD000UTSTOM", "USD/RUB", "USD", "fx"), ("CNYRUB_TOM", "CNY/RUB", "CNY", "fx"),
+           ("EUR_RUB__TOM", "EUR/RUB", "EUR", "fx"), ("GLDRUB_TOM", "Золото, ₽/г", "GOLD", "metal"))
+
+
+def tk_parse_cets(j):
+    """{id: item}; бумаги без сделок за сессию (USD после санкций) пропускаем — для них есть запасной ЦБ."""
+    out = {}
+    names = {c[0]: c for c in TK_CETS}
+    prev = {r.get("SECID"): tk_f(r.get("PREVPRICE")) for r in tk_table(j, "securities")}
+    for r in tk_table(j, "marketdata"):
+        c = names.get(r.get("SECID"))
+        if not c:
+            continue
+        nt = tk_f(r.get("NUMTRADES"))
+        last = tk_f(r.get("LAST"))
+        if not last or (nt is not None and nt <= 0):
+            continue
+        chg = tk_f(r.get("LASTCHANGEPRC"))
+        if chg is None and prev.get(r.get("SECID")):
+            chg = (last / prev[r["SECID"]] - 1) * 100
+        it = tk_item(c[2], c[1], last, chg, "₽", c[3])
+        if it:
+            out[c[2]] = it
+    return out
+
+
+def tk_parse_cbr(xml):
+    """XML_daily ЦБ -> {'USD': 90.5, ...} (курс за единицу)."""
+    out = {}
+    for m in re.finditer(r"<Valute[^>]*>(.*?)</Valute>", xml or "", re.S):
+        b = m.group(1)
+        code = re.search(r"<CharCode>(\w+)</CharCode>", b)
+        nom = re.search(r"<Nominal>(\d+)</Nominal>", b)
+        val = re.search(r"<Value>([\d.,]+)</Value>", b)
+        if code and nom and val:
+            out[code.group(1)] = float(val.group(1).replace(",", ".")) / float(nom.group(1))
+    return out
+
+
+def tk_cbr_items(cur, prev, want):
+    out = {}
+    labels = {"USD": "USD/RUB", "CNY": "CNY/RUB", "EUR": "EUR/RUB"}
+    for code in want:
+        v = cur.get(code)
+        if not v:
+            continue
+        p = prev.get(code)
+        out[code] = tk_item(code, labels[code] + " (ЦБ)", v, (v / p - 1) * 100 if p else None, "₽", "fx")
+    return {k: v for k, v in out.items() if v}
+
+
+def tk_parse_btc(j, src):
+    """coingecko: {'bitcoin':{'usd':..,'usd_24h_change':..}}; binance: {'lastPrice','priceChangePercent'}."""
+    if src == "coingecko":
+        b = (j or {}).get("bitcoin") or {}
+        return tk_item("BTC", "Bitcoin", b.get("usd"), b.get("usd_24h_change"), "$", "crypto")
+    return tk_item("BTC", "Bitcoin", (j or {}).get("lastPrice"), (j or {}).get("priceChangePercent"), "$", "crypto")
+
+
+def _tk_get(url, timeout=12):
+    return ext_open(url, headers={"User-Agent": TK_UA, "Accept": "application/json"}, timeout=timeout)[1].decode("utf-8", "replace")
+
+
+def tk_fetch_index():
+    return tk_parse_index(json.loads(http_text(TK_ISS + "engines/stock/markets/index/securities/IMOEX.json?iss.meta=off&iss.only=marketdata"
+                                               "&marketdata.columns=SECID,CURRENTVALUE,LASTCHANGEPRC", timeout=15)))
+
+
+def tk_fetch_cets():
+    return tk_parse_cets(json.loads(http_text(TK_ISS + "engines/currency/markets/selt/boards/CETS/securities.json?iss.meta=off&iss.only=marketdata,securities"
+                                              "&marketdata.columns=SECID,LAST,LASTCHANGEPRC,NUMTRADES&securities.columns=SECID,PREVPRICE", timeout=15)))
+
+
+def tk_fetch_cbr(want):
+    def get(d):
+        url = "https://www.cbr.ru/scripts/XML_daily.asp" + ("?date_req=" + d.strftime("%d/%m/%Y") if d else "")
+        return tk_parse_cbr(http_bytes(url, 15).decode("windows-1251", "replace"))
+    cur = get(None)
+    try:
+        prev = get(date.today() - timedelta(days=1))
+    except Exception:  # noqa: BLE001
+        prev = {}
+    return tk_cbr_items(cur, prev, want)
+
+
+def tk_fetch_btc():
+    mem = mem_get(("tk_btc",), 60)
+    if mem is not None:
+        return mem or None
+    it = None
+    try:
+        it = tk_parse_btc(json.loads(_tk_get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd,rub&include_24hr_change=true")), "coingecko")
+    except Exception:  # noqa: BLE001
+        pass
+    if not it:
+        try:
+            it = tk_parse_btc(json.loads(_tk_get("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT")), "binance")
+        except Exception:  # noqa: BLE001
+            pass
+    mem_put(("tk_btc",), it or {})
+    return it
+
+
+def ticker_payload(force=False):
+    ttl = 60 if _stk_trading() else 600
+    key = ("tk_payload",)
+    hit = None if force else mem_get(key, ttl)
+    if hit is not None:
+        res = dict(hit)
+        btc = tk_fetch_btc()      # BTC торгуется круглосуточно: свой кэш 60 с
+        res["items"] = [btc if i["id"] == "BTC" and btc else i for i in hit["items"]]
+        if btc and not any(i["id"] == "BTC" for i in res["items"]):
+            res["items"].append(btc)
+        return res
+    items = []
+    try:
+        it = tk_fetch_index()
+        if it:
+            items.append(it)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        items += tk_parse_stocks(stocks_universe(force))
+    except Exception:  # noqa: BLE001
+        pass
+    cets = {}
+    try:
+        cets = tk_fetch_cets()
+    except Exception:  # noqa: BLE001
+        pass
+    miss = [c for c in ("USD", "CNY", "EUR") if c not in cets]
+    if miss:
+        try:
+            cets.update(tk_fetch_cbr(miss))
+        except Exception:  # noqa: BLE001
+            pass
+    for c in ("USD", "CNY", "EUR", "GOLD"):
+        if c in cets:
+            items.append(cets[c])
+    try:
+        btc = tk_fetch_btc()
+        if btc:
+            items.append(btc)
+    except Exception:  # noqa: BLE001
+        pass
+    res = {"items": items, "updated": time.time()}
+    if items:
+        mem_put(key, res)
+    return res
+
+
+def _api_ticker(cfg, acc, q, force):
+    return ticker_payload(bool(force))
+
+
+API_GET["/api/ticker"] = _api_ticker
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -21042,15 +21439,18 @@ tr.scr-low td{opacity:.5}
 .dfl-b{display:inline-block;padding:2px 9px;border-radius:7px;font-size:12px;white-space:nowrap}
 .dfl-t{background:#c985001f;color:#c98500}
 .dfl-d{background:#e5484d1f;color:var(--neg)}
-#dfl-tab td{vertical-align:top}
+.dfl-tab td{vertical-align:top}
 .dfl-wrap{overflow-x:auto;max-width:100%}
-#dfl-tab{table-layout:auto;min-width:760px}
-#dfl-tab th,#dfl-tab td{padding:8px 8px}
-#dfl-tab td{white-space:normal;line-height:1.35}
-#dfl-tab td:nth-child(1),#dfl-tab td:nth-child(2),#dfl-tab td:nth-child(5){white-space:nowrap}
-#dfl-tab .dfl-is{min-width:170px;max-width:300px;overflow-wrap:anywhere}
-#dfl-tab .dfl-bs{min-width:120px}
+.dfl-tab{table-layout:auto;min-width:760px}
+.dfl-tab th,.dfl-tab td{padding:8px 8px}
+.dfl-tab td{white-space:normal;line-height:1.35}
+.dfl-tab td:nth-child(1),.dfl-tab td:nth-child(2),.dfl-tab td:nth-child(5){white-space:nowrap}
+.dfl-tab .dfl-is{min-width:170px;max-width:300px;overflow-wrap:anywhere}
+.dfl-tab .dfl-bs{min-width:120px}
 @media(max-width:700px){.dfl-b{white-space:normal}}
+.dfl-spin{display:inline-block;width:10px;height:10px;border:2px solid var(--line2);border-top-color:var(--tx);border-radius:50%;animation:dflsp 1s linear infinite;vertical-align:-1px}
+@keyframes dflsp{to{transform:rotate(360deg)}}
+.dfl-est{cursor:help;white-space:nowrap}
 /* ── Акции: карточка и скринер ── */
 .stk-top{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;margin-bottom:16px;overflow:visible}
 .stk-sw{position:relative;flex:1 1 320px;max-width:520px}
@@ -21083,6 +21483,10 @@ tr.scr-low td{opacity:.5}
 .hm-l,.hm-p{fill:#fff;pointer-events:none;font-weight:600}.hm-p{font-weight:500;opacity:.92}
 [data-theme=light] .hm-l,[data-theme=light] .hm-p{fill:#1b1f27}
 .hm-leg{margin-top:12px}
+.hm-sec{margin:2px 0 10px;flex-wrap:wrap}
+.hm-sec button .pos{color:var(--pos)}.hm-sec button .neg{color:var(--neg)}
+.hm-back{display:flex;align-items:center;gap:12px;margin:0 0 10px}
+.hm-gs{cursor:pointer}.hm-gs:hover{stroke:var(--tx2);stroke-width:1.5}
 .flw-bar2{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:6px 0 12px}
 .flw-meta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:4px 0 12px;font-size:12px}
 .flw-meta .btn{margin-left:auto}
@@ -21156,6 +21560,10 @@ tr.scr-low td{opacity:.5}
 .crp-h td{background:var(--card2,var(--card));font-weight:600;font-size:12.5px;color:var(--tx2)}
 .crp-s td{font-size:12px;color:var(--tx2)}
 .crp-r:hover{background:var(--card2,var(--card))}
+/* таблица «Эмитенты портфеля»: длинные названия и пояснения переносятся, а не растягивают закреплённую первую колонку на пол-экрана */
+.crp-tbl td.crp-nm{white-space:normal;min-width:180px;max-width:300px;line-height:1.3}
+.crp-tbl td.crp-nm small{display:block;margin-top:2px}
+@media(max-width:700px){.crp-tbl td.crp-nm{min-width:130px;max-width:190px}}
 /* ── Налоговая оптимизация ── */
 .txo .txo-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin:10px 0}
 .txo .txo-form .field .in{width:100%}
@@ -21173,6 +21581,30 @@ tr.scr-low td{opacity:.5}
 .mic-warn{margin-bottom:12px}
 .mic-meta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:12px}
 .mic-ev{font-size:12px;color:var(--tx2);white-space:normal;min-width:240px}
+/* ── бегущая строка котировок ── */
+.tkr{position:relative;display:flex;align-items:center;height:30px;flex:none;overflow:hidden;background:var(--card2);border-bottom:1px solid var(--line);font-size:12px;line-height:1;font-variant-numeric:tabular-nums}
+.tkr[hidden]{display:none}
+.tkr.off{height:16px;justify-content:flex-end;background:transparent;border-bottom:0}
+.tkr .tk-vp{flex:1;min-width:0;overflow:hidden;white-space:nowrap;mask-image:linear-gradient(90deg,transparent,#000 18px,#000 calc(100% - 18px),transparent);-webkit-mask-image:linear-gradient(90deg,transparent,#000 18px,#000 calc(100% - 18px),transparent)}
+.tkr .tk-track{display:inline-flex;width:max-content;animation:tk-run var(--tk-dur,90s) linear infinite;will-change:transform}
+.tkr .tk-vp:hover .tk-track{animation-play-state:paused}
+.tkr .tk-grp{display:inline-flex;flex:none}
+@keyframes tk-run{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.tkr .tk-it{display:inline-flex;align-items:baseline;gap:6px;padding:0 14px;border-right:1px solid var(--line);color:var(--tx2);white-space:nowrap}
+.tkr .tk-it b{color:var(--tx);font-weight:600}
+.tkr .tk-it[data-stk]{cursor:pointer}
+.tkr .tk-it[data-stk]:hover b{color:var(--ac-tx)}
+.tkr .tk-ch.pos{color:var(--pos)}.tkr .tk-ch.neg{color:var(--neg)}.tkr .tk-ch.z{color:var(--mu)}
+.tkr .tk-x{flex:none;border:0;background:transparent;color:var(--mu);cursor:pointer;font-size:15px;padding:0 10px;height:100%;line-height:1}
+.tkr .tk-x:hover{color:var(--tx)}
+.tkr.off .tk-x{font-size:11px;padding:0 12px}
+@media(prefers-reduced-motion:reduce){
+  .tkr .tk-vp{overflow-x:auto;mask-image:none;-webkit-mask-image:none;scrollbar-width:none}
+  .tkr .tk-track{animation:none}
+  .tkr .tk-grp[aria-hidden]{display:none}
+}
+@media(max-width:760px){.tkr{height:28px;font-size:11px}.tkr .tk-it{padding:0 10px;gap:5px}}
+@media print{.tkr{display:none}}
 </style></head>
 <body>
 <aside>
@@ -21186,6 +21618,7 @@ tr.scr-low td{opacity:.5}
   <div class="side-foot"><span class="badge" id="mode"></span><button class="ver" id="ver" title="Что нового"></button></div>
 </aside>
 <main>
+  <div class="tkr" id="tkr" hidden></div>
   <div class="top">
     <h1 id="title">Обзор</h1>
     <div class="seg" id="period"></div>
@@ -22996,10 +23429,12 @@ const RT_PRE=[1,2,3,5,10],RT_COL=['#2f6df6','#f59e0b','#8b5cf6','#e5484d','#0ea5
 const rtSave=()=>lsSet('ta_rates_terms',JSON.stringify({sel:S.rTerms,custom:S.rCustom}));
 const rtLab=t=>t<1?Math.round(t*12)+' мес':String(t).replace('.',',')+' г.';
 const rtColor=t=>RT_COL[S.rTerms.indexOf(t)%RT_COL.length];
+/* перерисовывать экран только если данные изменились: фоновые опросы «ещё грузится» не должны дёргать страницу */
+function rtChanged(a,b){if(!a||!b)return true;const k=o=>{const c=Object.assign({},o);delete c.loading;delete c.updated;return JSON.stringify(c)};return k(a)!==k(b)}
 function rtReload(){S.rates=null;rtSave();render()}
 function loadRates(){
   const d=S.ratesDays,tm=S.rTerms.join(',');
-  api('/api/rates?days='+d+'&terms='+tm).then(j=>{if(d!==S.ratesDays||tm!==S.rTerms.join(','))return;S.rates=j;if(S.page==='mkt')renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays&&tm===S.rTerms.join(','))loadRates()},3000)})
+  api('/api/rates?days='+d+'&terms='+tm).then(j=>{if(d!==S.ratesDays||tm!==S.rTerms.join(','))return;const ch=rtChanged(S.rates,j);S.rates=j;if(S.page==='mkt'&&ch)renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays&&tm===S.rTerms.join(','))loadRates()},3000)})
    .catch(e=>{S.rates={error:e.message,labels:[]};if(S.page==='mkt')renderSoon()});
 }
 document.addEventListener('click',e=>{
@@ -23060,7 +23495,7 @@ function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КС: <b>${pc1(r.key[i
 S.ratesX=null;
 function loadRatesX(force){
   if(S._rxL&&!force)return;S._rxL=1;
-  api('/api/rates/extra').then(j=>{S._rxL=0;S.ratesX=j;if(S.page==='mkt'){renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
+  api('/api/rates/extra').then(j=>{S._rxL=0;const ch=rtChanged(S.ratesX,j);S.ratesX=j;if(S.page==='mkt'){if(ch)renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
    .catch(e=>{S._rxL=0;S.ratesX={error:e.message}})
 }
 const RX_COL=['#ffdd2d','#3987e5','#19a070','#d95926','#9085e9'];
@@ -23134,7 +23569,7 @@ function curveCard(cv,its){
 
 /* ── Недельная инфляция (Росстат): текущий и прошлый год против средней 2017–2021 ── */
 S.infl=null;
-function loadInfl(){if(S._inflL)return;S._inflL=1;api('/api/inflation_weekly').then(j=>{S._inflL=0;S.infl=j;if(S.page==='mkt'){renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadInfl()},6000)}}).catch(e=>{S._inflL=0;S.infl={error:e.message,empty:true,years:{},avg:[]}})}
+function loadInfl(){if(S._inflL)return;S._inflL=1;api('/api/inflation_weekly').then(j=>{S._inflL=0;const ch=rtChanged(S.infl,j);S.infl=j;if(S.page==='mkt'){if(ch)renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadInfl()},6000)}}).catch(e=>{S._inflL=0;S.infl={error:e.message,empty:true,years:{},avg:[]}})}
 function inflWeekHtml(){
   if(!S.infl){loadInfl();return`<div class="card rates">${waitBox('Загружаю недельную инфляцию Росстата…')}</div>`}
   const x=S.infl,ys=Object.keys(x.years||{}).sort();
@@ -23399,12 +23834,12 @@ async function openBond(isin){
   const mr=dr.querySelector('#bc-more');
   if(mr)mr.onclick=()=>{BC.all=true;dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);BC.all=false};
 }
-/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, поэтому ведём на поиск по ИНН (или ISIN). */
+/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, а его поиск по ссылке не заполняется, поэтому основная ссылка — страница раскрытия на СКРИН по ИНН; e-disclosure — запасной поиск. */
 function bcDocLinks(isin,inn,secid){
   isin=String(isin||'').trim().toUpperCase();inn=String(inn||'').replace(/\D/g,'');if(inn.length!==10&&inn.length!==12)inn='';
   const q=inn||isin,code=String(secid||isin||'').trim();
   const a=(u,t)=>`<a class="btn ghost" href="${esc(u)}" target="_blank" rel="noopener">${t} ↗</a>`;
-  return`<div class="bc-docs">${q?a('https://www.e-disclosure.ru/poisk-po-kompaniyam?query='+encodeURIComponent(q),'Раскрытие информации эмитента (e-disclosure)'):''}${code?a('https://www.moex.com/ru/issue.aspx?code='+encodeURIComponent(code),'Страница выпуска на Мосбирже'):''}</div>`
+  return`<div class="bc-docs">${inn?a('https://disclosure.skrin.ru/disclosure/'+inn,'Раскрытие информации эмитента (СКРИН)'):''}${q?a('https://www.e-disclosure.ru/poisk-po-kompaniyam?query='+encodeURIComponent(q),inn?'Поиск на e-disclosure':'Раскрытие информации эмитента (e-disclosure)'):''}${code?a('https://www.moex.com/ru/issue.aspx?code='+encodeURIComponent(code),'Страница выпуска на Мосбирже'):''}</div>`
     +`<p class="note" style="margin-top:8px">Условия оферт (put/call), купонов и досрочного погашения — в решении о выпуске и проспекте.${inn?'':' ИНН эмитента не определён — поиск по ISIN может ничего не найти, тогда введите название эмитента на сайте.'}</p>`;
 }
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
@@ -25152,7 +25587,7 @@ function bindIss(){
     const fin=useI?c.ifrs.fin:c&&c.fin;
     if(fin&&fin.years&&fin.years.length&&ch)try{issChart(ch,fin,useI)}catch(e){ch.innerHTML='<div class="empty">Не удалось построить график</div>'}
     const tb=document.getElementById('iss-tabs');if(tb)tb.onclick=e=>{const b=e.target.closest('[data-tab]');if(!b)return;I.tab[I.sel]=b.dataset.tab;render()};
-    if(I.scroll&&c){I.scroll=0;det.scrollIntoView({behavior:'smooth',block:'start'})}
+    if(I.scroll){det.scrollIntoView({behavior:I.scroll===1?'smooth':'auto',block:'start'});I.scroll=c?0:2}  /* листаем к карточке сразу, пока идёт загрузка, и ещё раз — когда она готова */
   }
 }
 /* ── Календарь событий ── */
@@ -26450,7 +26885,7 @@ function bindSst(){
 /* ── Тепловая карта рынка: squarified treemap (акции / облигации / фонды) ── */
 const HM_KINDS=[['stocks','Акции'],['bonds','Облигации'],['funds','Фонды']],HM_PER=[['d','День'],['w','Неделя'],['m','Месяц']],HM_SZ=[['cap','Капитализация'],['value','Оборот']];
 const HM_LIM={d:3,w:7,m:15};
-S.hm={kind:'stocks',period:'d',size:'cap',d:null,loading:'',err:null};
+S.hm={kind:'stocks',period:'d',size:'cap',sel:'',d:null,loading:'',err:null};
 /* Раскладка squarified — зеркало Python treemap_layout (13u_heatmap.py); менять обе реализации синхронно. */
 function hmSquarify(vals,x,y,w,h){
   const n=vals.length,out=vals.map(()=>[x,y,0,0]);
@@ -26482,17 +26917,23 @@ function hmColor(chg,lim){
   const n=lt?[226,229,236]:[52,58,71],g=lt?[46,170,112]:[31,160,104],r=lt?[222,84,84]:[214,68,68],e=t>=0?g:r,a=Math.abs(t);
   return`rgb(${n.map((c,i)=>Math.round(c+(e[i]-c)*a)).join(',')})`;
 }
+/* Выбранный сектор: группа из данных или null (если выбранной группы больше нет — выбор сбрасывается). */
+function hmSel(d){const f=S.hm;if(!f.sel)return null;const g=d&&d.groups&&d.groups.find(x=>x.name===f.sel);if(!g)f.sel='';return g||null}
+function hmStatsOf(d,g){
+  if(!g)return d.stats;const it=g.items,up=it.filter(i=>i.chg>.005).length,dn=it.filter(i=>i.chg<-.005).length;
+  return{up,down:dn,flat:it.length-up-dn,n:it.length,turnover:it.reduce((a,i)=>a+(i.value||0),0),wchg:g.chg};
+}
 function hmFmt(c){return c==null?'—':(c>0?'+':c<0?'−':'')+Math.abs(c).toFixed(2).replace('.',',')+' %'}
 function drawHm(el){
   const f=S.hm,d=f.d;if(!d||d._k!==hmKey())return;
   const W=Math.floor(el.clientWidth);if(W<50)return;
   if(d.error||!d.groups||!d.groups.length){el.innerHTML=`<div class="empty" style="padding:40px">${esc(d.error||'Нет данных для карты')}</div>`;return}
   const H=W<560?Math.round(W*1.35):Math.max(460,Math.min(720,Math.round(W*.52))),lim=HM_LIM[d.period]||3,tiles=[];
-  const gr=hmSquarify(d.groups.map(g=>g.size),0,0,W,H);let s='';
-  d.groups.forEach((g,gi)=>{
+  const sg=hmSel(d),gl=sg?[sg]:d.groups,gr=sg?[[0,0,W,H]]:hmSquarify(gl.map(g=>g.size),0,0,W,H);let s='';
+  gl.forEach((g,gi)=>{
     const [gx,gy,gw,gh]=gr[gi];if(gw<1||gh<1)return;
     const hd=gw>=56&&gh>=44?16:0,ix=gx+1,iy=gy+1+hd,iw=gw-2,ih=gh-2-hd;
-    s+=`<rect class="hm-g" x="${gx.toFixed(1)}" y="${gy.toFixed(1)}" width="${gw.toFixed(1)}" height="${gh.toFixed(1)}"/>`;
+    s+=`<rect class="hm-g${sg?'':' hm-gs'}" data-g="${esc(g.name)}" x="${gx.toFixed(1)}" y="${gy.toFixed(1)}" width="${gw.toFixed(1)}" height="${gh.toFixed(1)}"/>`;
     if(hd){const mc=Math.max(3,Math.floor((gw-8)/6.4));s+=`<text class="hm-gl" x="${(gx+5).toFixed(1)}" y="${(gy+12).toFixed(1)}">${esc(g.name.length>mc?g.name.slice(0,mc-1)+'…':g.name)}</text>`}
     if(iw<2||ih<2)return;
     const ir=hmSquarify(g.items.map(i=>i.size),ix,iy,iw,ih);
@@ -26517,7 +26958,8 @@ function drawHm(el){
       (bd&&it.yield!=null?tipRow(c,'Доходность',pctp(it.yield,2)):'')+tipRow(c,'Оборот за день',it.value?short(it.value)+' ₽':'—')+(it.cap?tipRow(c,'Капитализация',short(it.cap)+' ₽'):'')+
       '<div style="color:var(--mu);margin-top:5px">нажмите — карточка</div>',e)};
   el.onmouseleave=hideTip;
-  el.onclick=e=>{const t=e.target.closest('[data-i]');if(!t)return;const it=tiles[+t.dataset.i];if(!it)return;
+  el.onclick=e=>{const t=e.target.closest('[data-i]');
+    if(!t){const gg=e.target.closest('[data-g]');if(gg&&!sg){hideTip();f.sel=gg.dataset.g;render()}return}const it=tiles[+t.dataset.i];if(!it)return;
     if(d.kind==='bonds'){if(typeof openBond==='function')openBond(it.id)}else if(typeof openStock==='function')openStock(it.id)};
 }
 function pHeatmap(){
@@ -26525,55 +26967,81 @@ function pHeatmap(){
   if(!ok)hmLoad();
   chart('hm-map',drawHm);chart('hm-root',bindHm);
   const seg=(arr,cur,attr)=>arr.map(([k,t])=>`<button type="button" data-${attr}="${k}" class="${k===cur?'on':''}">${t}</button>`).join('');
-  const st=ok&&d.stats,leg=[-lim,-lim/2,0,lim/2,lim];
+  const sg=ok?hmSel(d):null,st=ok&&hmStatsOf(d,sg),leg=[-lim,-lim/2,0,lim/2,lim];
   return`<div id="hm-root"><div class="card"><h2>Тепловая карта рынка<span class="sp">${bd?'размер — оборот за день, цвет — изменение цены за день':'размер и цвет плиток — по выбранным параметрам'}</span></h2>
     <div class="hm-bar"><div class="mp-chips" id="hm-kind">${seg(HM_KINDS,f.kind,'k')}</div>
     ${bd?'':`<div class="mp-chips" id="hm-per">${seg(HM_PER,f.period,'p')}</div><div class="mp-chips" id="hm-sz">${seg(HM_SZ,f.size,'s')}</div>`}</div>
+    ${ok&&d.groups&&d.groups.length>1?`<div class="mp-chips hm-sec" id="hm-sec"><button type="button" data-g="" class="${sg?'':'on'}">Все</button>${d.groups.map(g=>`<button type="button" data-g="${esc(g.name)}" class="${sg&&sg.name===g.name?'on':''}">${esc(g.name)} <span class="${g.chg>0?'pos':g.chg<0?'neg':''}">${hmFmt(g.chg).replace(' %','%')}</span></button>`).join('')}</div>`:''}
+    ${sg?`<div class="hm-back"><button type="button" class="btn ghost" id="hm-all">← Все секторы</button><b>${esc(sg.name)}</b></div>`:''}
     ${st?`<div class="hm-st"><span>Растут: <b class="pos">${st.up}</b></span><span>Падают: <b class="neg">${st.down}</b></span><span>Без изм.: <b>${st.flat}</b></span><span>Оборот: <b>${short(st.turnover)} ₽</b></span><span>Взвешенное изменение: <b class="${st.wchg>0?'pos':st.wchg<0?'neg':''}">${hmFmt(st.wchg)}</b></span></div>`:''}
     ${f.err&&!ok?`<div class="msg err">${esc(f.err)} <button class="btn ghost" id="hm-r">Повторить</button></div>`:ok?'<div class="hm-wrap" id="hm-map"></div>':waitBox('Загружаю данные Мосбиржи…')}
     <div class="legend hm-leg">${leg.map(v=>`<span><i style="background:${hmColor(v,lim)}"></i>${v>0?'+':v<0?'−':''}${(+Math.abs(v).toFixed(1))}%</span>`).join('')}<span class="mu">цвет ограничен значением ±${lim}%${ok&&d.updated?' · обновлено '+new Date(d.updated*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}):''}</span></div></div></div>`;
 }
 function bindHm(){
-  const f=S.hm,pick=(id,attr,key)=>{const e=$(id);if(e)e.onclick=ev=>{const b=ev.target.closest('[data-'+attr+']');if(!b||b.dataset[attr]===f[key])return;f[key]=b.dataset[attr];f.d=null;f.err=null;render()}};
-  pick('#hm-kind','k','kind');pick('#hm-per','p','period');pick('#hm-sz','s','size');
+  const f=S.hm,pick=(id,attr,key)=>{const e=$(id);if(e)e.onclick=ev=>{const b=ev.target.closest('[data-'+attr+']');if(!b||b.dataset[attr]===f[key])return;f[key]=b.dataset[attr];if(key==='kind')f.sel='';f.d=null;f.err=null;render()}};
+  pick('#hm-kind','k','kind');
+  const sc=$('#hm-sec');if(sc)sc.onclick=ev=>{const b=ev.target.closest('[data-g]');if(!b||b.dataset.g===f.sel)return;f.sel=b.dataset.g;render()};
+  const ba=$('#hm-all');if(ba)ba.onclick=()=>{f.sel='';render()};pick('#hm-per','p','period');pick('#hm-sz','s','size');
   const r=$('#hm-r');if(r)r.onclick=()=>{f.err=null;render()};
   if(!window._hmTm){window._hmTm=setInterval(()=>{if(S.page==='hm'&&!document.hidden&&hmTrading())hmLoad()},60000)}
 }
-/* ── Техдефолты: лента неисполненных обязательств эмитентов (сообщения раскрытия, сервер данных) + флаги Мосбиржи по бумагам портфеля ── */
-S.dfl={days:30,status:'all',data:null,loading:false,key:null};
+/* ── Техдефолты: лента неисполненных обязательств эмитентов (сообщения раскрытия, сервер данных) + флаги Мосбиржи (портфель или весь рынок) ── */
+S.dfl={days:30,status:'all',scope:(lsGet('dfl_scope')==='market'?'market':'my'),data:null,loading:false,key:null,tm:null};
 const DFL_ST={technical:['Технический дефолт','dfl-t'],default:['Дефолт','dfl-d']};
-function loadDfl(force){
-  const D=S.dfl,key=D.days+'|'+S.account;if(D.loading)return;D.loading=true;
-  const p=new URLSearchParams({days:D.days,account:S.account});if(force)p.set('force','1');
-  api('/api/defaults?'+p).then(j=>{D.data=j;D.key=key}).catch(e=>{D.data={error:e.message||String(e),rows:[]};D.key=key})
-   .then(()=>{D.loading=false;if(S.page==='dfl')render()});
+function dflKey(){const D=S.dfl;return D.days+'|'+D.scope+'|'+S.account}
+function loadDfl(force,quiet){
+  const D=S.dfl,key=dflKey();if(D.loading)return;D.loading=true;clearTimeout(D.tm);
+  const p=new URLSearchParams({days:D.days,account:S.account,scope:D.scope});if(force)p.set('force','1');
+  api('/api/defaults?'+p).then(j=>{const prev=D.data&&D.data.rows?D.data.rows.length:-1;D.data=j;D.key=key;D.chg=prev!==(j.rows||[]).length||!quiet}).catch(e=>{D.data={error:e.message||String(e),rows:[]};D.key=key;D.chg=true})
+   .then(()=>{D.loading=false;if(S.page!=='dfl')return;
+     const sc=D.data&&D.data.scan;
+     if(sc&&sc.running){
+       if(D.chg||!$('#dfl-prog'))render();else dflProg();
+       D.tm=setTimeout(()=>{if(S.page==='dfl'&&D.key===dflKey())loadDfl(false,true)},3000);
+     }else render()});
+}
+const dflPl=(n,f)=>{const a=n%10,b=n%100;return a===1&&b!==11?f[0]:a>=2&&a<=4&&(b<10||b>=20)?f[1]:f[2]};
+function dflProg(){const e=$('#dfl-prog'),sc=S.dfl.data&&S.dfl.data.scan;if(e&&sc)e.textContent='Проверяю выпуски Мосбиржи: '+sc.done+' из '+sc.total}
+function dflRows(rows,since){
+  return`<div class="tbl dfl-wrap"><table class="dfl-tab"><thead><tr><th class="l">Дата</th><th class="l">Статус</th><th class="l">Эмитент · бумага</th><th class="l">Обязательство</th><th>Сумма</th><th class="l">Исполнение</th><th class="l">Основание</th></tr></thead><tbody>`
+  +rows.map(r=>{const st=DFL_ST[r.status]||DFL_ST.technical;
+    const dt=r.date?ddm(r.date)+(r.date_est?` <small class="mu dfl-est" title="Дата оценена по графику выплат Мосбиржи: последняя плановая выплата до сегодняшнего дня. Фактическую дату неисполнения эмитент мог раскрыть иначе.">по графику</small>`:''):'—';
+    return`<tr${r.isin?` data-isin="${esc(r.isin)}" title="Открыть карточку выпуска"`:''}><td class="l">${dt}</td><td class="l"><span class="dfl-b ${st[1]}">${st[0]}</span></td>
+      <td class="l dfl-is"><b>${esc(r.issuer||'—')}</b>${r.mine?' <span class="tag">мой</span>':''}<br><small class="mu num">${r.isin?esc(r.isin):''}${r.isin&&r.inn?' · ':''}${r.inn?'ИНН '+esc(r.inn):''}</small></td>
+      <td class="l">${esc(r.obligation||'—')}${r.due_date&&!r.date_est?`<br><small class="mu">срок ${ddm(r.due_date)}</small>`:''}</td><td class="num">${r.amount==null?'—':short(r.amount)+' ₽'}</td>
+      <td class="l">${r.executed?`<span class="pos">исполнено ${ddm(r.executed)}</span>`:'<span class="mu">нет данных</span>'}</td>
+      <td class="l dfl-bs">${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
 }
 function pDfl(){
-  const D=S.dfl,key=D.days+'|'+S.account;
+  const D=S.dfl,key=dflKey();
   let h=`<div class="card"><h2>Техдефолты<span class="sp">неисполненные в срок обязательства по облигациям</span></h2>
-    <div class="dfl-bar"><div class="seg" id="dfl-days">${[[7,'7 дней'],[30,'30 дней'],[90,'90 дней']].map(([n,t])=>`<button data-d="${n}" class="${D.days===n?'on':''}">${t}</button>`).join('')}</div>
+    <div class="dfl-bar"><div class="seg" id="dfl-scope">${[['my','Мой портфель'],['market','Весь рынок']].map(([k,t])=>`<button data-sc="${k}" class="${D.scope===k?'on':''}">${t}</button>`).join('')}</div>
+    <div class="seg" id="dfl-days">${[[7,'7 дней'],[30,'30 дней'],[90,'90 дней']].map(([n,t])=>`<button data-d="${n}" class="${D.days===n?'on':''}">${t}</button>`).join('')}</div>
     <div class="seg" id="dfl-st">${[['all','Все'],['technical','Технический дефолт'],['default','Дефолт']].map(([k,t])=>`<button data-st="${k}" class="${D.status===k?'on':''}">${t}</button>`).join('')}</div></div>`;
   if(D.key!==key&&!D.loading){D.data=null;loadDfl()}
   if(!D.data||D.key!==key)return h+waitBox('Загружаю ленту…')+`</div>`;
   const d=D.data;
   if(d.error)return h+`<div class="msg err">${esc(d.error)}</div></div>`;
-  const rows=(d.rows||[]).filter(r=>D.status==='all'||r.status===D.status);
-  if(!d.configured)h+=`<div class="msg" style="margin:10px 0">Сервер данных не подключён: сообщения эмитентов недоступны. Ниже только флаги Мосбиржи по бумагам портфеля и списка наблюдения. Подключить сервер можно в настройках.</div>`;
-  if(!rows.length)return h+`<div class="empty" style="padding:28px 12px">${d.configured?'За выбранный период неисполненных обязательств не найдено.':'Нет данных для показа.'}</div></div>`;
-  h+=`<div class="tbl dfl-wrap"><table id="dfl-tab"><thead><tr><th class="l">Дата</th><th class="l">Статус</th><th class="l">Эмитент · бумага</th><th class="l">Обязательство</th><th>Сумма</th><th class="l">Исполнение</th><th class="l">Основание</th></tr></thead><tbody>`
-    +rows.map(r=>{const st=DFL_ST[r.status]||DFL_ST.technical;
-      return`<tr${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l">${r.date?ddm(r.date):'—'}</td><td class="l"><span class="dfl-b ${st[1]}">${st[0]}</span></td>
-        <td class="l dfl-is"><b>${esc(r.issuer||'—')}</b><br><small class="mu num">${r.isin?esc(r.isin):''}${r.isin&&r.inn?' · ':''}${r.inn?'ИНН '+esc(r.inn):''}</small></td>
-        <td class="l">${esc(r.obligation||'—')}${r.due_date?`<br><small class="mu">срок ${ddm(r.due_date)}</small>`:''}</td><td class="num">${r.amount==null?'—':short(r.amount)+' ₽'}</td>
-        <td class="l">${r.executed?`<span class="pos">исполнено ${ddm(r.executed)}</span>`:'<span class="mu">нет данных</span>'}</td>
-        <td class="l dfl-bs">${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
-  return h+`<p class="note" style="margin-top:10px">Технический дефолт — просрочка платежа до 10 рабочих дней, затем дефолт. «Исполнение» подбирается по раскрытию о выплате: для купона — с тем же номером, для амортизации и погашения — по выплате того же вида после срока. Справочная информация, не инвестиционная рекомендация. <button class="btn ghost" id="dfl-ref" style="padding:3px 10px;font-size:12px;margin-left:6px">Обновить</button></p></div>`;
+  const all=(d.rows||[]).filter(r=>D.status==='all'||r.status===D.status);
+  const since=d.since||'';
+  const inP=r=>r.date&&r.date>=since,main=all.filter(inP),old=all.filter(r=>!inP(r));
+  const sc=d.scan;
+  if(!d.configured)h+=`<div class="msg" style="margin:10px 0">Сервер данных не подключён: сообщения эмитентов недоступны. Ниже только флаги Мосбиржи.</div>`;
+  if(sc&&sc.running)h+=`<div class="msg" style="margin:10px 0"><span class="dfl-spin"></span> <span id="dfl-prog">Проверяю выпуски Мосбиржи: ${sc.done} из ${sc.total}</span> — список дополняется по ходу проверки.</div>`;
+  else if(sc&&sc.error)h+=`<div class="msg err" style="margin:10px 0">Обход рынка не завершён: ${esc(sc.error)}</div>`;
+  const isn=new Set(all.map(r=>r.isin||r.issuer)),iss=new Set(all.map(r=>r.inn||r.issuer));
+  h+=`<p class="mu" style="margin:0 0 8px" id="dfl-cnt">Найдено: ${isn.size} ${dflPl(isn.size,['выпуск','выпуска','выпусков'])}, эмитентов: ${iss.size}</p>`;
+  if(!all.length)return h+`<div class="empty" style="padding:28px 12px">${d.configured?'Неисполненных обязательств не найдено.':'Нет данных для показа.'}</div></div>`;
+  h+=main.length?dflRows(main,since):`<div class="empty" style="padding:18px 12px">За выбранный период новых случаев нет.</div>`;
+  if(old.length)h+=`<h3 style="margin:16px 0 6px">Отмечены на Мосбирже, срок вне периода (${old.length})</h3><p class="mu" style="margin:0 0 6px">Выпуски, у которых флаг дефолта на Мосбирже действует сейчас, но последняя плановая выплата раньше выбранного периода или не определена. Они не скрываются фильтром.</p>`+dflRows(old,since);
+  return h+`<p class="note" style="margin-top:10px">Технический дефолт — просрочка платежа до 10 рабочих дней, затем дефолт. Для строк «Флаг Мосбиржи» дата, обязательство и сумма оцениваются по графику выплат Мосбиржи (последняя плановая выплата) и могут не совпадать с фактической просрочкой; если по бумаге есть сообщение эмитента, показывается оно. «Исполнение» подбирается по раскрытию о выплате. Справочная информация, не инвестиционная рекомендация. <button class="btn ghost" id="dfl-ref" style="padding:3px 10px;font-size:12px;margin-left:6px">Обновить</button></p></div>`;
 }
 function bindDfl(){
-  const D=S.dfl,d=$('#dfl-days'),s=$('#dfl-st'),r=$('#dfl-ref');
-  if(d)d.onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;D.days=+b.dataset.d;D.data=null;render()};
+  const D=S.dfl,d=$('#dfl-days'),s=$('#dfl-st'),r=$('#dfl-ref'),c=$('#dfl-scope');
+  if(c)c.onclick=e=>{const b=e.target.closest('[data-sc]');if(!b||b.dataset.sc===D.scope)return;D.scope=b.dataset.sc;lsSet('dfl_scope',D.scope);clearTimeout(D.tm);D.data=null;render()};
+  if(d)d.onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;D.days=+b.dataset.d;clearTimeout(D.tm);D.data=null;render()};
   if(s)s.onclick=e=>{const b=e.target.closest('[data-st]');if(!b)return;D.status=b.dataset.st;render()};
-  if(r)r.onclick=()=>{D.data=null;D.key=null;loadDfl(true);render()};
+  if(r)r.onclick=()=>{clearTimeout(D.tm);D.data=null;D.key=null;loadDfl(true);render()};
 }
 /* ── «Кто покупает»: потоки денег по классам и секторам, крупные сделки, всплески объёма, стакан (сервер данных, /api/flows*) ── */
 S.flw={period:'1h',tab:'flow',data:null,key:null,loading:false,large:{cls:'',min:0,data:null,key:null,loading:false},
@@ -27172,7 +27640,7 @@ function crpDilution(c){
   if(!d.n_scanned)h+=`<div class="mu">Данных для проверки нет: в приложении нет потока раскрытий по акциям этого эмитента (покрытие — только выпуски облигаций, и то не для всех).</div>`;
   else if(!m.length)h+=`<div class="mu">Проверено заголовков раскрытий: ${d.n_scanned}. Упоминаний допэмиссии, конвертируемых облигаций, опционных программ, выкупа акций и lock-up не найдено.</div>`;
   else h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Признак</th><th class="l">Раскрытие</th></tr></thead><tbody>${m.map(x=>`<tr><td class="l">${crpFmtDate(x.date)}</td><td class="l"><span class="tag">${esc(x.label)}</span></td><td class="l">${x.url?`<a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.title)}</a>`:esc(x.title)}</td></tr>`).join('')}</tbody></table></div>`;
-  h+=`<p class="note">Поиск по ключевым словам в заголовках — это грубый признак, а не оценка вероятности размытия. `+(lk.edisclosure?`Первоисточник: <a href="${esc(lk.edisclosure)}" target="_blank" rel="noopener">раскрытие информации эмитента</a>.`:'')+`</p>`;
+  h+=`<p class="note">Поиск по ключевым словам в заголовках — это грубый признак, а не оценка вероятности размытия. `+((lk.skrin||lk.edisclosure)?`Первоисточник: <a href="${esc(lk.skrin||lk.edisclosure)}" target="_blank" rel="noopener">раскрытие информации эмитента</a>.`:'')+`</p>`;
   return h;
 }
 function crpCard(c){
@@ -27196,7 +27664,7 @@ function crpBatch(){
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   if(!b.rows.length)return'<div class="card empty">В портфеле нет эмитентов, для которых можно получить отчётность</div>';
   const zt=(v,k)=>v==null?'<span class="mu">—</span>':`<span class="${k==='high'?'neg':'pos'}">${crpN(v)}</span>`;
-  return`<div class="card"><h2>Эмитенты портфеля<span class="sp">нажмите на строку — подробности</span></h2><div class="tbl"><table><thead><tr><th class="l">Эмитент</th><th>Год</th><th>Z Савицкой</th><th>R Сайфуллина–Кадыкова</th><th>Расш. долг / EBIT</th><th>Превышение долга</th><th>Размытие</th></tr></thead><tbody>${b.rows.map(r=>`<tr class="crp-r" data-crp="${esc(r.q||r.inn||'')}"><td class="l"><b>${esc(r.name||'')}</b>${r.note&&!r.year?`<br><small class="mu">${esc(r.note)}</small>`:''}</td><td class="num">${r.year||'—'}</td>
+  return`<div class="card"><h2>Эмитенты портфеля<span class="sp">нажмите на строку — подробности</span></h2><div class="tbl crp-tbl"><table><thead><tr><th class="l">Эмитент</th><th>Год</th><th>Z Савицкой</th><th>R Сайфуллина–Кадыкова</th><th>Расш. долг / EBIT</th><th>Превышение долга</th><th>Размытие</th></tr></thead><tbody>${b.rows.map(r=>`<tr class="crp-r" data-crp="${esc(r.q||r.inn||'')}"><td class="l crp-nm"><b>${esc(r.name||'')}</b>${r.note&&!r.year?`<br><small class="mu">${esc(r.note)}</small>`:''}</td><td class="num">${r.year||'—'}</td>
     <td class="num">${r.is_fin?'<span class="mu">неприменимо</span>':zt(r.sav,r.sav_key)}</td><td class="num">${r.is_fin?'<span class="mu">неприменимо</span>':zt(r.sk,r.sk_key)}</td><td class="num">${crpX(r.ext_ebit)}</td>
     <td class="num">${r.uplift==null?'—':`<span class="${r.flag?'neg':''}">+${crpN(r.uplift*100,0)} %</span>`}</td><td class="num">${r.n_dil?`<span class="tag">${r.n_dil}</span>`:'—'}</td></tr>`).join('')}</tbody></table></div>
     <p class="note">Обновлено ${esc(b.updated||'')}. Z &lt; 8 по Савицкой и R &lt; 1 по Сайфуллину–Кадыкову — зоны повышенного риска по этим моделям.</p></div>`;
@@ -27418,6 +27886,65 @@ function bindMic(){
   micStart();
 }
 regPage('mic',{title:'Стакан: ликвидность',group:'Рынок',icon:'<path d="M4 5h16M4 9h12M4 15h12M4 19h16"/><path d="M12 11h8"/>',render:pMic,bind:bindMic,pro:true});
+/* ── бегущая строка котировок: сверху приложения, обновляется только своя разметка (render() не трогаем) ── */
+const TKR={items:[],sig:'',timer:null,busy:false};
+function tkrFmt(it){
+  const p=it.price,d=it.kind==='fx'||it.kind==='stock'?(p<100?(p<10?4:3):2):2;
+  const s=p.toLocaleString('ru-RU',{minimumFractionDigits:it.kind==='index'||p>=1000?2:Math.min(d,2),maximumFractionDigits:d});
+  return it.unit==='$'?'$'+s:s+(it.unit?' '+it.unit:'');
+}
+function tkrChg(c){
+  if(c==null||isNaN(c))return['z','—'];
+  const k=c>0.004?'pos':c<-0.004?'neg':'z';
+  return[k,(c>0?'+':c<0?'−':'')+Math.abs(c).toFixed(2).replace('.',',')+' %'];
+}
+function tkrItemHtml(it){
+  const [k,t]=tkrChg(it.chg),st=it.kind==='stock'?` data-stk="${esc(it.id)}" title="Открыть карточку ${esc(it.id)}"`:'';
+  return`<span class="tk-it" data-id="${esc(it.id)}"${st}><b>${esc(it.label)}</b><span class="tk-p">${esc(tkrFmt(it))}</span><span class="tk-ch ${k}">${t}</span></span>`;
+}
+function tkrOff(){return lsGet('ta_ticker_off')==='1'}
+function tkrBuild(){
+  const el=document.getElementById('tkr');if(!el)return;
+  if(tkrOff()){
+    el.hidden=false;el.className='tkr off';el.innerHTML='<button class="tk-x" id="tkrx" title="Показать бегущую строку котировок">Котировки ▾</button>';
+    el.querySelector('#tkrx').onclick=()=>{lsSet('ta_ticker_off','0');TKR.sig='';tkrBuild();tkrLoad()};
+    TKR.sig='';return;
+  }
+  if(!TKR.items.length){el.hidden=true;return}
+  el.hidden=false;el.className='tkr';
+  const g=TKR.items.map(tkrItemHtml).join('');
+  el.innerHTML=`<div class="tk-vp"><div class="tk-track"><div class="tk-grp">${g}</div><div class="tk-grp" aria-hidden="true">${g}</div></div></div><button class="tk-x" id="tkrx" title="Скрыть строку котировок" aria-label="Скрыть">×</button>`;
+  el.querySelector('#tkrx').onclick=()=>{lsSet('ta_ticker_off','1');tkrBuild()};
+  el.querySelector('.tk-vp').onclick=e=>{const b=e.target.closest('[data-stk]');if(b&&typeof openStock==='function')openStock(b.dataset.stk)};
+  const w=el.querySelector('.tk-grp').scrollWidth||1000;
+  el.querySelector('.tk-track').style.setProperty('--tk-dur',Math.max(40,Math.round(w/45))+'s'); /* ~45 px/с */
+}
+function tkrApply(items){
+  const sig=items.map(i=>i.id).join(',');
+  TKR.items=items;
+  const el=document.getElementById('tkr');if(!el||tkrOff()){tkrBuild();return}
+  if(sig===TKR.sig&&el.querySelector('.tk-track')){
+    for(const it of items){ /* набор тот же — меняем только текст, анимация не сбрасывается */
+      const [k,t]=tkrChg(it.chg);
+      el.querySelectorAll('.tk-it[data-id="'+(window.CSS&&CSS.escape?CSS.escape(it.id):it.id)+'"]').forEach(n=>{
+        n.querySelector('.tk-p').textContent=tkrFmt(it);
+        const c=n.querySelector('.tk-ch');c.textContent=t;c.className='tk-ch '+k;
+      });
+    }
+    return;
+  }
+  TKR.sig=sig;tkrBuild();
+}
+function tkrLoad(){
+  if(TKR.busy||tkrOff())return;TKR.busy=true;
+  api('/api/ticker').then(j=>{TKR.busy=false;if(j&&j.items&&j.items.length)tkrApply(j.items)}).catch(()=>{TKR.busy=false});
+}
+(function(){
+  if(tkrOff()){tkrBuild();return}
+  setTimeout(tkrLoad,600);
+  setInterval(()=>{if(!document.hidden)tkrLoad()},60000);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)tkrLoad()});
+})();
 </script></body></html>
 '''
 

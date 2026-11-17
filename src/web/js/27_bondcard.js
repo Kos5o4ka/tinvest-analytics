@@ -56,12 +56,12 @@ async function openBond(isin){
   const mr=dr.querySelector('#bc-more');
   if(mr)mr.onclick=()=>{BC.all=true;dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);BC.all=false};
 }
-/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, поэтому ведём на поиск по ИНН (или ISIN). */
+/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, а его поиск по ссылке не заполняется, поэтому основная ссылка — страница раскрытия на СКРИН по ИНН; e-disclosure — запасной поиск. */
 function bcDocLinks(isin,inn,secid){
   isin=String(isin||'').trim().toUpperCase();inn=String(inn||'').replace(/\D/g,'');if(inn.length!==10&&inn.length!==12)inn='';
   const q=inn||isin,code=String(secid||isin||'').trim();
   const a=(u,t)=>`<a class="btn ghost" href="${esc(u)}" target="_blank" rel="noopener">${t} ↗</a>`;
-  return`<div class="bc-docs">${q?a('https://www.e-disclosure.ru/poisk-po-kompaniyam?query='+encodeURIComponent(q),'Раскрытие информации эмитента (e-disclosure)'):''}${code?a('https://www.moex.com/ru/issue.aspx?code='+encodeURIComponent(code),'Страница выпуска на Мосбирже'):''}</div>`
+  return`<div class="bc-docs">${inn?a('https://disclosure.skrin.ru/disclosure/'+inn,'Раскрытие информации эмитента (СКРИН)'):''}${q?a('https://www.e-disclosure.ru/poisk-po-kompaniyam?query='+encodeURIComponent(q),inn?'Поиск на e-disclosure':'Раскрытие информации эмитента (e-disclosure)'):''}${code?a('https://www.moex.com/ru/issue.aspx?code='+encodeURIComponent(code),'Страница выпуска на Мосбирже'):''}</div>`
     +`<p class="note" style="margin-top:8px">Условия оферт (put/call), купонов и досрочного погашения — в решении о выпуске и проспекте.${inn?'':' ИНН эмитента не определён — поиск по ISIN может ничего не найти, тогда введите название эмитента на сайте.'}</p>`;
 }
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');

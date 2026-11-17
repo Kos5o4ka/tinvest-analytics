@@ -60,7 +60,7 @@ function crpDilution(c){
   if(!d.n_scanned)h+=`<div class="mu">Данных для проверки нет: в приложении нет потока раскрытий по акциям этого эмитента (покрытие — только выпуски облигаций, и то не для всех).</div>`;
   else if(!m.length)h+=`<div class="mu">Проверено заголовков раскрытий: ${d.n_scanned}. Упоминаний допэмиссии, конвертируемых облигаций, опционных программ, выкупа акций и lock-up не найдено.</div>`;
   else h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Признак</th><th class="l">Раскрытие</th></tr></thead><tbody>${m.map(x=>`<tr><td class="l">${crpFmtDate(x.date)}</td><td class="l"><span class="tag">${esc(x.label)}</span></td><td class="l">${x.url?`<a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.title)}</a>`:esc(x.title)}</td></tr>`).join('')}</tbody></table></div>`;
-  h+=`<p class="note">Поиск по ключевым словам в заголовках — это грубый признак, а не оценка вероятности размытия. `+(lk.edisclosure?`Первоисточник: <a href="${esc(lk.edisclosure)}" target="_blank" rel="noopener">раскрытие информации эмитента</a>.`:'')+`</p>`;
+  h+=`<p class="note">Поиск по ключевым словам в заголовках — это грубый признак, а не оценка вероятности размытия. `+((lk.skrin||lk.edisclosure)?`Первоисточник: <a href="${esc(lk.skrin||lk.edisclosure)}" target="_blank" rel="noopener">раскрытие информации эмитента</a>.`:'')+`</p>`;
   return h;
 }
 function crpCard(c){
@@ -84,7 +84,7 @@ function crpBatch(){
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   if(!b.rows.length)return'<div class="card empty">В портфеле нет эмитентов, для которых можно получить отчётность</div>';
   const zt=(v,k)=>v==null?'<span class="mu">—</span>':`<span class="${k==='high'?'neg':'pos'}">${crpN(v)}</span>`;
-  return`<div class="card"><h2>Эмитенты портфеля<span class="sp">нажмите на строку — подробности</span></h2><div class="tbl"><table><thead><tr><th class="l">Эмитент</th><th>Год</th><th>Z Савицкой</th><th>R Сайфуллина–Кадыкова</th><th>Расш. долг / EBIT</th><th>Превышение долга</th><th>Размытие</th></tr></thead><tbody>${b.rows.map(r=>`<tr class="crp-r" data-crp="${esc(r.q||r.inn||'')}"><td class="l"><b>${esc(r.name||'')}</b>${r.note&&!r.year?`<br><small class="mu">${esc(r.note)}</small>`:''}</td><td class="num">${r.year||'—'}</td>
+  return`<div class="card"><h2>Эмитенты портфеля<span class="sp">нажмите на строку — подробности</span></h2><div class="tbl crp-tbl"><table><thead><tr><th class="l">Эмитент</th><th>Год</th><th>Z Савицкой</th><th>R Сайфуллина–Кадыкова</th><th>Расш. долг / EBIT</th><th>Превышение долга</th><th>Размытие</th></tr></thead><tbody>${b.rows.map(r=>`<tr class="crp-r" data-crp="${esc(r.q||r.inn||'')}"><td class="l crp-nm"><b>${esc(r.name||'')}</b>${r.note&&!r.year?`<br><small class="mu">${esc(r.note)}</small>`:''}</td><td class="num">${r.year||'—'}</td>
     <td class="num">${r.is_fin?'<span class="mu">неприменимо</span>':zt(r.sav,r.sav_key)}</td><td class="num">${r.is_fin?'<span class="mu">неприменимо</span>':zt(r.sk,r.sk_key)}</td><td class="num">${crpX(r.ext_ebit)}</td>
     <td class="num">${r.uplift==null?'—':`<span class="${r.flag?'neg':''}">+${crpN(r.uplift*100,0)} %</span>`}</td><td class="num">${r.n_dil?`<span class="tag">${r.n_dil}</span>`:'—'}</td></tr>`).join('')}</tbody></table></div>
     <p class="note">Обновлено ${esc(b.updated||'')}. Z &lt; 8 по Савицкой и R &lt; 1 по Сайфуллину–Кадыкову — зоны повышенного риска по этим моделям.</p></div>`;

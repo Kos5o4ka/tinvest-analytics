@@ -366,7 +366,7 @@ def primary_payload():
 # v2: на каждую дату вся сетка {срок: доходность}; v1 хранил только 2 года (используем как запас, пока v2 докачивается)
 KBD_KEY, KBD_OLD_KEY, KEY_KEY = "kbd_grid_v2", "kbd2y_v1", "keyrate_v1"
 RATE_TERM_MIN, RATE_TERM_MAX, RATE_TERMS_MAX = 0.25, 30.0, 6
-_rates_state = {"running": False}
+_rates_state = {"running": False, "ended": 0.0}
 
 
 def kbd_interp(grid, term):
@@ -440,6 +440,7 @@ def _rates_run(days):
                     cache[d] = v
             st.put(KBD_KEY, cache)
     finally:
+        _rates_state["ended"] = time.time()
         _rates_state["running"] = False
 
 
@@ -452,7 +453,8 @@ def _safe(fn, x):
 
 def rates_start(days):
     with _rt_lock:
-        if _rates_state["running"]:
+        # недокачанные дни (сбой ISS, праздники) повторяем не чаще раза в 10 минут — иначе экран вечно «загружается»
+        if _rates_state["running"] or time.time() - _rates_state["ended"] < 600:
             return
         _rates_state["running"] = True
     threading.Thread(target=_rates_run, args=(days,), daemon=True).start()
@@ -466,8 +468,11 @@ def rates_payload(days, terms=None):
     old = st.get(KBD_OLD_KEY) or {}
     today = date.today()
     first = (today - timedelta(days=days)).isoformat()
-    miss = sum(1 for i in range(days + 1) if (today - timedelta(days=i)).weekday() < 5
+    # сегодняшняя КБД появляется только после расчёта биржей — её отсутствие не считаем недокачкой
+    miss = sum(1 for i in range(1, days + 1) if (today - timedelta(days=i)).weekday() < 5
                and (today - timedelta(days=i)).isoformat() not in cache)
+    if today.weekday() < 5 and today.isoformat() not in cache:
+        rates_start(days)
     if miss > 0:
         rates_start(days)
     try:
@@ -495,7 +500,7 @@ def rates_payload(days, terms=None):
             kbd["%g" % t].append(round(v, 2) if v is not None else None)
         key.append(last)
     return {"iso": iso, "labels": [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y") for d in iso],
-            "kbd": kbd, "terms": tl, "key": key, "loading": _rates_state["running"] or miss > 0,
+            "kbd": kbd, "terms": tl, "key": key, "loading": _rates_state["running"] or (miss > 0 and not _rates_state["ended"]),
             "keys": [k for k in keys if k[0] >= first]}
 
 

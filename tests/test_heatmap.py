@@ -73,6 +73,15 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(sum(len(g["items"]) for g in w["groups"]), 4)
         self.assertEqual(w["groups"][0]["items"][0]["chg"], 2)
 
+    def test_funds_grouped_by_category(self):
+        T.funds_universe = lambda: [
+            {"secid": "LQDT", "shortname": "LQDT", "sector": "Денежный рынок", "chg_d": 0.1, "value_today": 10, "cap": 500},
+            {"secid": "TMOS", "shortname": "TMOS", "sector": "Акции", "chg_d": -1, "value_today": 5, "cap": 300},
+            {"secid": "SBMM", "shortname": "SBMM", "sector": "Денежный рынок", "chg_d": 0.2, "value_today": 5, "cap": 100}]
+        p = T.heatmap_payload("funds", "d", "cap")
+        self.assertEqual([g["name"] for g in p["groups"]], ["Денежный рынок", "Акции"])
+        self.assertEqual(p["stats"]["n"], 3)
+
     def test_missing_universe(self):
         T.__dict__.pop("funds_universe", None)
         self.assertIn("error", T.heatmap_payload("funds"))
