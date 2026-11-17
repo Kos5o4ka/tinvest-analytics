@@ -4,8 +4,10 @@
   body{display:block;overflow:auto}
   aside{width:100%;border-right:0;border-bottom:1px solid var(--line);padding:10px 10px 8px;overflow:visible}
   .logo{padding:0 6px 8px}
-  .nav{flex-direction:row;overflow-x:auto;gap:4px;padding-bottom:4px}
-  .nav button{white-space:nowrap;padding:7px 10px}.nav .sep{display:none}
+  .nav{flex-direction:row;overflow-x:auto;gap:4px;padding-bottom:4px;align-items:center}
+  .nav .ng{display:contents}
+  .nav .ngh{display:none}
+  .nav button{white-space:nowrap;padding:7px 10px;flex:none}.nav .sep{display:none}
   .accs{margin-top:8px;padding-top:8px}
   .acl{flex-direction:row;overflow-x:auto;gap:6px;padding-bottom:4px}
   .acl button{min-width:150px;border:1px solid var(--line)}

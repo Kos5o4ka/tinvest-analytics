@@ -1,0 +1,9 @@
+.rot-hm td.rot-c{white-space:nowrap}
+.rot-hm td.rot-fx,.rot-key.rot-fx{background:color-mix(in srgb,var(--ac-tx) var(--k,30%),transparent)}
+.rot-hm td.rot-fl,.rot-key.rot-fl{background:color-mix(in srgb,var(--pos) var(--k,30%),transparent)}
+.rot-key{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;--k:35%}
+.rot-ind{display:flex;align-items:center;gap:18px;margin:6px 0 10px}
+.rot-gauge{position:relative;flex:1;max-width:420px;height:10px;border-radius:6px;background:linear-gradient(90deg,var(--pos),var(--mu),var(--ac-tx))}
+.rot-gauge i{position:absolute;top:-4px;width:4px;height:18px;margin-left:-2px;border-radius:2px;background:var(--tx)}
+.rot-sc b{font-size:28px}
+.rot-sc small{color:var(--mu)}

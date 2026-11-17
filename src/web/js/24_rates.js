@@ -62,6 +62,7 @@ function pMkt(){
     ${termChips()}
     <div class="axt">Ставка, % годовых</div><div id="c-rates" class="chart"></div><div class="axt" style="text-align:center">Дата</div>
     <div class="strip" id="rstrip">${stripHtml(r,i0)}</div>${r.loading?'<p class="note">Догружаю историю…</p>':''}</div>
+  ${inflWeekHtml()}
   ${ratesXHtml()}
   <p class="note">КБД — кривая бескупонной доходности ОФЗ Московской биржи (выбранные сроки), ключевая ставка — Банка России. Данные берутся с сайтов Мосбиржи и ЦБ при открытой программе и сохраняются локально. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
@@ -143,3 +144,25 @@ function curveCard(cv,its){
 .rt-chip .rt-x{padding:5px 9px 5px 0;color:var(--mu)}.rt-chip .rt-x:hover{color:var(--neg)}
 .rt-add{display:inline-flex;gap:6px;margin-left:auto}.rt-add input{width:150px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--tx);padding:5px 8px;font-size:13px}
 `;document.head.appendChild(st)})();
+
+/* ── Недельная инфляция (Росстат): текущий и прошлый год против средней 2017–2021 ── */
+S.infl=null;
+function loadInfl(){if(S._inflL)return;S._inflL=1;api('/api/inflation_weekly').then(j=>{S._inflL=0;S.infl=j;if(S.page==='mkt'){renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadInfl()},6000)}}).catch(e=>{S._inflL=0;S.infl={error:e.message,empty:true,years:{},avg:[]}})}
+function inflWeekHtml(){
+  if(!S.infl){loadInfl();return`<div class="card rates">${waitBox('Загружаю недельную инфляцию Росстата…')}</div>`}
+  const x=S.infl,ys=Object.keys(x.years||{}).sort();
+  if((x.empty||!ys.length)&&x.loading)return`<div class="card rates"><h2>Недельная инфляция</h2>${waitBox('Собираю недельные оценки Росстата — в первый раз это занимает пару минут…')}</div>`;
+  if(x.empty||!ys.length)return`<div class="card rates"><h2>Недельная инфляция</h2><div class="empty">нет данных Росстата</div></div>`;
+  const cy=ys[ys.length-1],py=String(+cy-1),W=Array.from({length:52},(_,i)=>i+1);
+  const byW=y=>{const a=Array(52).fill(null);(x.years[y]||[]).forEach(r=>{if(r.week>=1&&r.week<=52)a[r.week-1]=r.pct});return a};
+  const av=Array(52).fill(null);(x.avg||[]).forEach(([w,v])=>{if(w>=1&&w<=52)av[w-1]=v});
+  const A='#ffdd2d',series=[{n:cy,c:A,hex:A,v:byW(cy),w:3}];
+  if(x.years[py])series.push({n:py,c:'#3987e5',hex:'#3987e5',v:byW(py),w:2});
+  if(av.some(v=>v!=null))series.push({n:'Среднее '+(x.avg_label||'2017–2021'),c:'#8d95a6',hex:'#8d95a6',v:av,w:2,dash:true});
+  const last=(x.years[cy]||[]).slice(-1)[0],f=v=>(+v).toFixed(2).replace('.',',')+'%';
+  chart('c-infl-w',line,{h:300,zero:true,labels:W.map(String),fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:f,series});
+  return`<div class="card rates"><h2>Недельная инфляция<span class="sp">${last?'последняя ('+ddm(last.date)+'): <b>'+f(last.pct)+'</b>':''}</span></h2>
+    <div class="legend rx-lg">${series.map(s=>`<span><i style="background:${s.hex}"></i>${esc(s.n)}</span>`).join('')}</div>
+    <div class="axt">Прирост цен за неделю, %</div><div id="c-infl-w" class="chart"></div><div class="axt" style="text-align:center">Номер недели года</div>
+    <p class="note">Росстат, оценка индекса потребительских цен за неделю (к предыдущей дате регистрации). Данные с ${x.history_from?esc(ddm(x.history_from)+' '+x.history_from.slice(0,4)):'—'}${(x.avg||[]).length?'; пунктир — среднее за '+esc(x.avg_label)+' по номеру недели':'; для среднего за 2017–2021 в архиве Росстата нет доступных заметок'}.${x.loading?' Историю ещё докачиваю…':''}</p></div>`;
+}

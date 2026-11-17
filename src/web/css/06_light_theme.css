@@ -1,6 +1,7 @@
 /* ── светлая тема ── */
 :root[data-theme=light]{--bg:#f3f4f7;--side:#fff;--card:#fff;--card2:#f0f2f6;--line:#e4e7ed;--line2:#d2d7e0;
-  --tx:#15171c;--tx2:#4a515f;--mu:#7a8292;--pos:#0f8f5c;--neg:#d23b3b;color-scheme:light}
+  --tx:#15171c;--tx2:#4a515f;--mu:#7a8292;--ac-tx:#8a6d00;--pos:#0f8f5c;--neg:#d23b3b;
+  --sk-1:#e9ecf2;--sk-2:#f5f7fa;--zero-line:#00000033;--err-tx:#b82828;--info-tx:#1d5cb8;color-scheme:light}
 [data-theme=light] ::-webkit-scrollbar-thumb{background:#cdd2dc}
 [data-theme=light] .nav button:hover,[data-theme=light] .acl button:hover{background:#eff1f5}
 [data-theme=light] .nav button.on,[data-theme=light] .acl button.on,[data-theme=light] .seg button.on{background:#eceff4}

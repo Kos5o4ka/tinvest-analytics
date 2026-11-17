@@ -7,7 +7,12 @@ Wants=network-online.target
 User=tinvest
 Group=tinvest
 EnvironmentFile=-/etc/tinvest-server.env
-ExecStart=/usr/bin/python3 /opt/tinvest-analytics/server/tinvest_server.py --host 127.0.0.1 --port 8780 --data /var/lib/tinvest-server --keys-db /var/lib/tinvest-bot/keys.sqlite --bot tanalyticbot
+# Токен владельца (только чтение) лежит в /etc/tanalytic/tinvest_token (root:root 600). «+» — команда выполняется от root вне песочницы:
+# копия кладётся в /run/tinvest-server (только для пользователя сервиса). Нет файла — сервер работает без функций T-Invest.
+RuntimeDirectory=tinvest-server
+RuntimeDirectoryMode=0700
+ExecStartPre=+/bin/sh -c 'if [ -r /etc/tanalytic/tinvest_token ]; then install -m 600 -o tinvest -g tinvest /etc/tanalytic/tinvest_token /run/tinvest-server/tinvest_token; fi'
+ExecStart=/usr/bin/python3 /opt/tinvest-analytics/server/tinvest_server.py --host 127.0.0.1 --port 8780 --data /var/lib/tinvest-server --keys-db /var/lib/tinvest-bot/keys.sqlite --bot tanalyticbot --token-file /run/tinvest-server/tinvest_token
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

@@ -2,8 +2,11 @@
 const RSC=['AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-','BB+','BB','BB-','B+','B','B-','CCC','CC','C','D'];
 const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
 function ratingTag(r,short){
-  const t=r.all.map(x=>`${x.agency}: ${x.rating}${x.outlook?' · '+x.outlook:''} · от ${x.date} · ${x.issuer}${x.approx?' (приблизительное совпадение названия)':''}`).join('\n');
-  const n=r.all.length-1,ag=short||!r.agency?'':` <small class="rt-ag">· ${esc(r.agency)}${n>0?' +'+n:''}</small>`;
+  if(!r)return'';
+  if(typeof r==='string')r={v:r,all:[]};
+  const all=Array.isArray(r.all)?r.all:[];
+  const t=all.map(x=>`${x.agency}: ${x.rating}${x.outlook?' · '+x.outlook:''} · от ${x.date} · ${x.issuer}${x.approx?' (приблизительное совпадение названия)':''}`).join('\n');
+  const n=Math.max(0,all.length-1),ag=short||!r.agency?'':` <small class="rt-ag">· ${esc(r.agency)}${n>0?' +'+n:''}</small>`;
   return`<span class="tag rt rt-${rBucket(r.v).split(' ')[0]}" style="white-space:nowrap" title="${esc(t)}">${r.approx?'≈ ':''}${esc(r.v)}${ag}</span>`;
 }
 function ratingsCard(b){

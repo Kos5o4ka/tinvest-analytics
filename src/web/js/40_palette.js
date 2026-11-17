@@ -46,6 +46,8 @@ function kpSecurities(q){
     let n=0;for(const r of S.scr.rows){if(n>=8)break;const i=r.isin||r.id;if(seen.has(i))continue;
       const before=out.length;add(r.name,r.id,i,'каталог',openB(i));if(out.length>before)n++}
   }
+  if(typeof stkSearch==='function'&&q.length>=1)stkSearch(q,6).forEach(r=>{const k='stk:'+r.secid;if(seen.has(k))return;seen.add(k);
+    out.push({g:'Бумаги',t:r.shortname||r.secid,s:[r.secid,'акция · '+r.sector].join(' · '),sc:Math.max(kpScore(r.secid,q),kpScore(r.shortname,q),kpScore(r.name,q))-0.01,run:()=>openStock(r.secid)})});
   return out.sort((a,b)=>b.sc-a.sc).slice(0,12);
 }
 function kpBuild(raw){
@@ -77,6 +79,9 @@ function kpOpen(){
   const q=$('#kp-q');
   q.oninput=()=>{KP.items=kpBuild(q.value);KP.sel=0;kpDraw()};
   KP.items=kpBuild('');KP.sel=0;kpDraw();q.focus();
+  const refresh=()=>{if(KP.open&&q.value.trim()){KP.items=kpBuild(q.value);KP.sel=0;kpDraw()}};
+  if(typeof stkEnsureList==='function')stkEnsureList(refresh);
+  if(!S.scr&&typeof loadScr==='function')loadScr(refresh);
 }
 function kpClose(){KP.open=false;const o=$('#kp-ov');if(o)o.remove()}
 function kpRun(i){const it=KP.items[i];if(!it)return;kpClose();it.run()}

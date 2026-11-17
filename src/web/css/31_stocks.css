@@ -1,0 +1,21 @@
+/* ── Акции: карточка и скринер ── */
+.stk-top{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;margin-bottom:16px;overflow:visible}
+.stk-sw{position:relative;flex:1 1 320px;max-width:520px}
+.stk-res{position:absolute;left:0;right:0;top:100%;z-index:20;margin-top:4px;background:var(--card);border-radius:10px;box-shadow:0 12px 32px #0006;overflow:hidden}
+.stk-res:empty{display:none}
+.stk-res button{all:unset;box-sizing:border-box;width:100%;display:flex;gap:10px;align-items:center;padding:9px 14px;cursor:pointer;font-size:13px}
+.stk-res button:hover{background:#ffffff0c}.stk-res button span{color:var(--mu);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stk-chips{display:flex;flex-wrap:wrap;gap:8px}
+.stk-chips .btn{font-size:12.5px}
+.stk-hd{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;flex-wrap:wrap;margin-bottom:16px}
+.stk-nm{font-size:22px;font-weight:700;margin-bottom:4px}.stk-nm .mu{font-size:15px;font-weight:500}
+.stk-px{font-size:26px;font-weight:700;display:flex;align-items:baseline;gap:12px}.stk-px .num:last-child{font-size:16px;font-weight:600}
+.stk-verdict{display:flex;align-items:center;gap:14px;margin-bottom:14px}
+.stk-sig{font-size:20px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:6px 16px;border-radius:10px;background:#ffffff0c}
+.stk-sig.pos{background:#3ecf8e1c}.stk-sig.neg{background:#ff6b6b1c}
+.stk-votes{display:grid;gap:7px;font-size:13px;margin-bottom:14px}
+.stk-votes div{display:flex;gap:8px;align-items:baseline}.stk-votes b{font-weight:550;min-width:150px}
+.stk-lv{display:grid;gap:8px;font-size:13px;margin-bottom:10px}.stk-lv .tag{margin-left:2px}
+.stk-lv .tag.neg{background:#ff6b6b17;color:var(--neg)}.stk-lv .tag.pos{background:#3ecf8e17;color:var(--pos)}
+@media(max-width:860px){.stk-votes b{min-width:0}.stk-px{font-size:22px}}
+[data-theme=light] .stk-res{box-shadow:0 12px 32px #0002}[data-theme=light] .stk-res button:hover{background:#0000000a}[data-theme=light] .stk-sig{background:#0000000a}

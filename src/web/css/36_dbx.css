@@ -1,0 +1,6 @@
+.dbx-trap td{background:color-mix(in srgb,var(--neg) 9%,transparent)}
+#dbx-tabs{width:fit-content;max-width:100%}
+.tag.pos{color:var(--pos)}
+.tag.neg{color:var(--neg)}
+.tag.mu{color:var(--mu)}
+.tbl-w{overflow-x:auto}

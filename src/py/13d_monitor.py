@@ -163,6 +163,11 @@ def _mon_match(a, b):
     return lo <= hi and sum(len(x) for x in lo) >= 5 and all(len(x) <= 2 for x in hi - lo)
 
 
+def _mon_ev_tokens(e):
+    """Ключи эмитента события: пересчитываются из названия (в старых журналах сохранены ключи прежнего формата)."""
+    return set(name_tokens(e.get("issuer") or "")) or set(e.get("tokens") or ())
+
+
 def _mon_issuer_keys(row):
     keys = [name_tokens(_bond_query(row.get("name") or ""))]
     b = _tcat_get(row.get("isin") or row.get("ticker"))
@@ -186,7 +191,7 @@ def _mon_rating_state(row, keys, events):
                 last[ag] = (dt, fc)
     ws = {}
     for e in events:
-        if any(_mon_match(set(e["tokens"]), k) for k in keys):
+        if any(_mon_match(_mon_ev_tokens(e), k) for k in keys):
             if e.get("watch") in ("set", "removed"):
                 ws[e["agency"]] = e["watch"] == "set"
             if e.get("outlook") and e["agency"] not in last:
@@ -215,7 +220,7 @@ def _mon_rating_alerts(rows_keys, events, cutoff, today=None):
     for e in events:
         if e["date"] < cutoff:
             continue
-        et = set(e["tokens"])
+        et = _mon_ev_tokens(e)
         hit = [r for r, keys in rows_keys if any(_mon_match(et, k) for k in keys)]
         if not hit:
             continue

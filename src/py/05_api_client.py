@@ -174,6 +174,30 @@ class TInvest:
                     out[k] = qf(p["price"])
         return out
 
+    # — отчётность, фундаментальные показатели, стакан и обезличенные сделки (акции) —
+    def asset_reports(self, asset_uid, frm, to):
+        """Даты отчётности эмитента: [{reportDate, periodYear, periodNum, periodType, createdAt}]. frm/to — RFC 3339."""
+        return self.call("InstrumentsService", "GetAssetReports",
+                         {"instrumentId": asset_uid, "from": frm, "to": to}, timeout=30).get("reports") or []
+
+    def asset_fundamentals(self, asset_uids):
+        """Фундаментальные показатели активов (до 100 за вызов): [{assetUid, peRatioTtm, priceToBookTtm, evToEbitdaMrq, ...}]."""
+        out = []
+        uids = [u for u in asset_uids if u]
+        for i in range(0, len(uids), 100):
+            out.extend(self.call("InstrumentsService", "GetAssetFundamentals", {"assets": uids[i:i + 100]},
+                                 timeout=60).get("fundamentals") or [])
+        return out
+
+    def order_book(self, instrument_id, depth=20):
+        """Стакан: {bids: [{price, quantity}], asks: [...], lastPrice, limitUp, limitDown, ...}; depth — 1, 10, 20, 30, 40 или 50."""
+        return self.call("MarketDataService", "GetOrderBook", {"instrumentId": instrument_id, "depth": int(depth)}, timeout=20)
+
+    def last_trades(self, instrument_id, frm, to):
+        """Обезличенные сделки за интервал (до часа): [{price, quantity, direction, time, ...}]. frm/to — RFC 3339."""
+        return self.call("MarketDataService", "GetLastTrades",
+                         {"instrumentId": instrument_id, "from": frm, "to": to}, timeout=30).get("trades") or []
+
 
 def pool_map(fn, items, workers=8):
     items = list(items)

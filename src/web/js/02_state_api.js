@@ -11,7 +11,10 @@ const IC={
  cmp:'<path d="M8 4v16M16 4v16M4 8h8M12 16h8"/>',
  scr:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/>',
  risk:'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
+ hm:'<rect x="3" y="3" width="10" height="11"/><rect x="13" y="3" width="8" height="6"/><rect x="13" y="9" width="8" height="5"/><rect x="3" y="14" width="18" height="7"/>',
  sig:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+ flw:'<path d="M3 20V10M9 20V4M15 20v-7M21 20V8"/>',
+ dfl:'<path d="M12 3l9 16H3z"/><path d="M9 15l6-5M9 10l6 5"/>',
  mon:'<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/>',
  map:'<circle cx="7" cy="16" r="2"/><circle cx="12" cy="9" r="2.5"/><circle cx="18" cy="13" r="1.6"/><path d="M3 3v18h18"/>',
  pri:'<path d="M12 2l2.6 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.4 6.1 20.1l1.6-6.7L2.5 8.9l6.9-.6z"/>',
@@ -25,12 +28,21 @@ const IC={
  cal:'<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M12 14l1.2 2.4 2.6.4-1.9 1.8.5 2.6-2.4-1.3-2.4 1.3.5-2.6-1.9-1.8 2.6-.4z"/>',
  watch:'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
  kb:'<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5M9 8h6M9 12h4"/>',
+ fng:'<path d="M4 17a8 8 0 0 1 16 0"/><path d="M12 17l4-5"/><circle cx="12" cy="17" r="1.2"/>',
  set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
 const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['cmp','Сравнение облигаций'],['map','Карта рынка'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['pri','Первичка'],['cal','Календарь событий'],null,['kb','База знаний'],['imp','Импорт отчётов'],['set','Настройки']];
+const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['cmp','Сравнение облигаций'],['map','Карта рынка'],['hm','Тепловая карта'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['dfl','Техдефолты'],['flw','Кто покупает'],['pri','Первичка'],['fng','Страх и жадность'],['cal','Календарь событий'],null,['kb','База знаний'],['imp','Импорт отчётов'],['set','Настройки']];
 /* группы меню: ключи страниц остаются прежними, PAGES — плоский список для поиска названий */
 const NAV_GROUPS=[['Портфель',['dash','ret','bench','pos','bonds','pay','off','ops','fees']],['Учёт и планы',['tax','reb','calc','lad']],
-  ['Рынок',['mkt','scr','cmp','map','sig','pri','cal']],['Риски и контроль',['risk','mon','watch','iss']]];
+  ['Рынок',['mkt','fng','scr','cmp','map','hm','sig','pri','cal','dfl','flw']],['Риски и контроль',['risk','mon','watch','iss']]];
+/* Регистрация экрана из отдельного файла (не трогая общие списки): меню, иконка, Pro, отрисовка и привязка событий.
+   regPage('rot',{title:'…',group:'Рынок',icon:'<path …/>',render:pRot,bind:bindRot,pro:true}) */
+const PAGE_EXT={};
+function regPage(id,o){
+  PAGE_EXT[id]=o;PAGES.push([id,o.title]);if(o.icon)IC[id]=o.icon;
+  if(o.group){let g=NAV_GROUPS.find(x=>x[0]===o.group);if(!g){g=[o.group,[]];NAV_GROUPS.push(g)}g[1].push(id)}
+  if(o.pro&&typeof PRO_PAGES!=='undefined'&&!PRO_PAGES.includes(id))PRO_PAGES.push(id);
+}
 const NAV_FIXED=['imp','kb','set'],NAV_PINNED=['dash','set'];
 function lsJson(k,d){try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}}
 function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}

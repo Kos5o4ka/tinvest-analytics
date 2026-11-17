@@ -1,0 +1,6 @@
+/* ── Деньги и базис ── */
+.mm-ref{display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-bottom:12px;font-size:13.5px;color:var(--tx2)}
+.mm-ref b{color:var(--tx)}
+.tbl tr.mm-sel td{background:var(--card2)}
+.tbl tr.mm-sel td:first-child{box-shadow:inset 3px 0 0 var(--ac-tx)}
+#mm-tabs button{white-space:normal}

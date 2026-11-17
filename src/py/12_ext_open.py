@@ -53,6 +53,12 @@ def _auth_reset():
         _auth["res"] = None
 
 
+def _ds_is_timeout(e):
+    """Тайм-аут чтения (сервер жив, но этот ответ долгий), а не отказ соединения."""
+    r = getattr(e, "reason", None)
+    return isinstance(e, (TimeoutError, socket.timeout)) or isinstance(r, (TimeoutError, socket.timeout)) or "timed out" in str(e)
+
+
 def _ds_down(msg):
     with _ds_lock:
         _ds_state["down_until"] = time.time() + DS_DOWN_SECS
@@ -112,6 +118,8 @@ def _ds_request(srv, key, url, data, headers, timeout):
         _ds_down("сервер ответил %d%s" % (e.code, " (неверный ключ)" if e.code in (401, 403) else ""))
         return None
     except Exception as e:  # noqa: BLE001
+        if _ds_is_timeout(e):                          # медленный ответ одного запроса — не повод отключать сервер для всех
+            return None
         _ds_down("нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
         return None
 
@@ -141,6 +149,8 @@ def ds_parsed(name, params=None, timeout=20):
             _ds_down("сервер ответил %d" % e.code)
         return None                                    # 404 (старый сервер), 5xx источника и т.п. — не «роняем» сервер
     except Exception as e:  # noqa: BLE001
+        if _ds_is_timeout(e):                          # медленный ответ одного запроса — не повод отключать сервер для всех
+            return None
         _ds_down("нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
         return None
     if not isinstance(j, dict) or j.get("ok") is not True or j.get("v") != DS_PARSED_V:

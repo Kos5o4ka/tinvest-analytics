@@ -380,6 +380,45 @@ def _tg_dispatch(cfg, title, alerts, sent, now):
     return sent_n
 
 
+_TG_KIND["default_ok"] = "✅"
+TG_DFL_DAYS = 30
+
+
+def defaults_alerts(cfg, sent=None, rows=None, isins=None):
+    """Тревоги о техдефолте/дефолте по бумагам портфеля и списка наблюдения (лента defaults_feed) и «исполнено» после него.
+    Неисполненное -> kind default, severity high, id dfl|isin|дата|обязательство (один раз). Исполненное -> kind default_ok,
+    id dflx|... — только если о дефолте по этой записи мы уже сообщали (ключ dfl|... есть в sent). Бумаги вне портфеля/наблюдения
+    не трогаем. rows/isins передаются в тестах, иначе берутся из defaults_feed и _disc_own_isins."""
+    sent = sent or {}
+    own = list(isins) if isins is not None else _disc_own_isins(cfg, "all")
+    if not own:
+        return []
+    if rows is None:
+        rows = defaults_feed((date.today() - timedelta(days=TG_DFL_DAYS)).isoformat(), own)
+    mine = set(own)
+    out = []
+    for r in rows:
+        isin = r.get("isin")
+        if isin not in mine:
+            continue
+        tail = "%s|%s" % (r.get("date") or r.get("basis") or "", r.get("obligation") or r.get("status"))
+        base = {"isin": isin, "isins": [isin], "name": r.get("issuer") or isin, "bonds": [r.get("issuer") or isin],
+                "date": r.get("date") or date.today().isoformat(), "url": r.get("url") or ""}
+        what = "дефолт" if r.get("status") == "default" else "технический дефолт"
+        ob = (r.get("obligation") or "обязательство").lower()
+        amt = (", %s ₽" % "{:,.0f}".format(r["amount"]).replace(",", " ")) if r.get("amount") else ""
+        due = (", срок %s" % _tg_dmy(r["due_date"])) if r.get("due_date") else ""
+        kd, kx = "dfl|%s|%s" % (isin, tail), "dflx|%s|%s" % (isin, tail)
+        if r.get("executed"):
+            if kd in sent:
+                out.append(dict(base, id=kx, kind="default_ok", severity="medium",
+                                message="%s по бумаге исполнен(о): %s%s, раскрытие о выплате от %s" % (what, ob, amt, _tg_dmy(r["executed"]))))
+        else:
+            out.append(dict(base, id=kd, kind="default", severity="high",
+                            message="%s по бумаге: %s%s%s (%s)" % (what, ob, amt, due, r.get("basis") or "")))
+    return out
+
+
 TG_OFR_CALL_DAYS, TG_OFR_CLOSE_DAYS, TG_OFR_PUT_HORIZON = 14, 2, 120
 
 
@@ -531,6 +570,16 @@ def tg_tick(force_digest=False, manual=False):
             if cfg.get("tg_on_watch", True) and (watch_isins() or notes_all()):
                 al = [a for a in watch_payload(cfg)["alerts"] if a["severity"] != "info"]
                 n += _tg_dispatch(cfg, "Наблюдение и цели", al, sent, now)
+        except Exception:  # noqa: BLE001
+            pass
+        try:        # крупные сделки и всплески объёма по бумагам списка (13v_flows.py; ключ дедупликации — id тревоги)
+            if cfg.get("tg_on_watch", True) and watch_isins() and "flows_watch_alerts" in globals():
+                n += _tg_dispatch(cfg, "Потоки по списку наблюдения", flows_watch_alerts(cfg), sent, now)
+        except Exception:  # noqa: BLE001
+            pass
+        try:        # техдефолты/дефолты по бумагам портфеля и списка наблюдения + «исполнено» (13q_disclosure.py)
+            if cfg.get("tg_on_mon", True) or cfg.get("tg_on_watch", True):
+                n += _tg_dispatch(cfg, "Дефолты по бумагам портфеля и наблюдения", defaults_alerts(cfg, sent), sent, now)
         except Exception:  # noqa: BLE001
             pass
         try:

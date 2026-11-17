@@ -178,6 +178,10 @@ def parse_num(s):
         return None
     if "," in s and "." in s:
         s = s.replace(",", "") if s.rfind(".") > s.rfind(",") else s.replace(".", "").replace(",", ".")
+    elif s.count(",") > 1:
+        s = s.replace(",", "")
+    elif s.count(".") > 1:
+        s = s.replace(".", "")
     else:
         s = s.replace(",", ".")
     try:

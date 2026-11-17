@@ -1,0 +1,8 @@
+.mic-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.mic-c{margin:0}
+.mic-big{font-size:24px;font-weight:600;margin:4px 0 10px}
+.mic-kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid var(--line);font-size:13px}
+.mic-kv:last-child{border-bottom:0}.mic-kv span{color:var(--tx2)}
+.mic-warn{margin-bottom:12px}
+.mic-meta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:12px}
+.mic-ev{font-size:12px;color:var(--tx2);white-space:normal;min-width:240px}

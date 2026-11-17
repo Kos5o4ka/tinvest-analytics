@@ -34,13 +34,47 @@ def kbd_at(years):
 
 _scr = {"t": 0, "rows": []}
 SCR_COLS_S = ("SECID,SHORTNAME,SECNAME,ISIN,FACEVALUE,FACEUNIT,COUPONPERCENT,NEXTCOUPON,MATDATE,OFFERDATE,"
-              "LISTLEVEL,PREVLEGALCLOSEPRICE,YIELDATPREVWAPRICE,COUPONPERIOD,BONDSUBTYPE,ISSUESIZE,ACCRUEDINT")
-SCR_COLS_M = "SECID,LAST,YIELD,WAPRICE,DURATION,VALTODAY,NUMTRADES,ZSPREAD,YIELDATWAPRICE"
+              "LISTLEVEL,PREVLEGALCLOSEPRICE,YIELDATPREVWAPRICE,COUPONPERIOD,BONDSUBTYPE,ISSUESIZE,ACCRUEDINT,COUPONVALUE,PREVPRICE,BONDTYPE,COUPON_DETAILS")
+SCR_COLS_M = "SECID,LAST,YIELD,WAPRICE,DURATION,VALTODAY,NUMTRADES,ZSPREAD,YIELDATWAPRICE,LASTCHANGEPRCNT"
 
 
 def _iss_table(j, name):
     t = j[name]
     return [dict(zip(t["columns"], r)) for r in t["data"]]
+
+
+def bond_cy(coupon_value, period, face, price):
+    """Текущая доходность, %: годовой купон / чистая цена. Цена — в % номинала."""
+    try:
+        if not (coupon_value and period and face and price):
+            return None
+        return round(float(coupon_value) * (365.0 / float(period)) / float(face) * 100.0 / float(price) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def bond_chg(m, s, price):
+    """Изменение цены за день, %: LASTCHANGEPRCNT, иначе LAST к предыдущей цене."""
+    v = m.get("LASTCHANGEPRCNT")
+    if v:
+        return round(float(v), 2)
+    prev = s.get("PREVPRICE") or s.get("PREVLEGALCLOSEPRICE")
+    last = m.get("LAST")
+    if prev and last:
+        return round((float(last) / float(prev) - 1) * 100, 2)
+    return 0.0
+
+
+def liq_tiers(rows):
+    """L1 — верхние 20% по обороту среди торгуемых, L2 — следующие 40%, L3 — остальные и без оборота."""
+    traded = sorted((r["turn"] for r in rows if (r.get("turn") or 0) > 0), reverse=True)
+    n = len(traded)
+    c1 = traded[max(0, int(n * 0.2 + 0.999999) - 1)] if n else None
+    c2 = traded[max(0, int(n * 0.6 + 0.999999) - 1)] if n else None
+    for r in rows:
+        t = r.get("turn") or 0
+        r["liq"] = "L1" if t > 0 and t >= c1 else "L2" if t > 0 and t >= c2 else "L3"
+    return rows
 
 
 def screener_rows():
@@ -69,12 +103,15 @@ def screener_rows():
                 "price": round(price, 3), "yield": round(float(yld), 2), "dur": round(dur, 2) if dur else None,
                 "coupon": s.get("COUPONPERCENT"), "next": s.get("NEXTCOUPON"), "mat": end, "offer": of,
                 "level": s.get("LISTLEVEL"), "turn": round(m.get("VALTODAY") or 0), "trades": m.get("NUMTRADES") or 0,
-                "zs": m.get("ZSPREAD"), "sub": s.get("BONDSUBTYPE"), "size": s.get("ISSUESIZE"), "nkd": s.get("ACCRUEDINT")}
+                "zs": m.get("ZSPREAD"), "cy": bond_cy(s.get("COUPONVALUE"), s.get("COUPONPERIOD"), s.get("FACEVALUE"), m.get("LAST") or price),
+                "macdur": round(dur, 2) if dur else None, "chg": bond_chg(m, s, price), "sub": s.get("BONDSUBTYPE"), "size": s.get("ISSUESIZE"), "nkd": s.get("ACCRUEDINT"),
+                "btype": s.get("BONDTYPE"), "cpn_det": s.get("COUPON_DETAILS")}
     rows = list(out.values())
     for r in rows:
         k = kbd_at(r["dur"]) if r["dur"] else None
         r["spread"] = round(r["yield"] - k, 2) if k is not None and r["cur"] == "RUB" else None
         r["rating"] = None
+    liq_tiers(rows)
     _scr.update(t=time.time(), rows=rows)
     return rows
 
@@ -156,6 +193,37 @@ def _stats_history(stats):
     return hist
 
 
+_fl_job = {"running": False}
+
+
+def fl_spread_job(todo):
+    """Фон: для флоатеров скринера без свежего кэша тянет график выплат (moex_bondization, кэш 24 ч) не чаще FL_SPREAD_RPS в секунду
+    и кладёт спред в kv fl_spread1:<isin> (30 сут). Скринер читает кэш синхронно и ничего не ждёт."""
+    try:
+        for r in todo:
+            isin = r["isin"]
+            fresh = store().get("bondiz2:" + isin, ttl=BC_TTL) is not None
+            try:
+                bz = moex_bondization(isin)
+                fl_spread_put(isin, r.get("full") or r.get("name"), bz, float(r.get("nominal") or 0) or None, r.get("kind"), r.get("cpn_det"))
+            except Exception:  # noqa: BLE001
+                pass
+            if not fresh:
+                time.sleep(1.0 / FL_SPREAD_RPS)
+    finally:
+        _fl_job["running"] = False
+
+
+def fl_spread_kick(rows, cached):
+    """Запускает фоновый расчёт спредов для флоатеров без кэша; одновременно не больше одного задания."""
+    todo = [r for r in rows if r.get("floating") and r.get("isin") and r["isin"] not in cached and r.get("cur") == "RUB"]
+    if not todo or _fl_job["running"]:
+        return False
+    _fl_job["running"] = True
+    threading.Thread(target=fl_spread_job, args=(todo,), daemon=True, name="fl-spread").start()
+    return True
+
+
 def screener_payload():
     rows = screener_rows()
     br, ti = globals().get("best_rating"), globals().get("tcat_info")
@@ -180,7 +248,17 @@ def screener_payload():
                 info = None
         r["sector"] = info.get("sector") if info else None
         r["floating"] = info.get("floating") if info else None
+        if r["floating"] is None and r.get("btype"):      # без справочника T-Invest — по типу облигации из ISS
+            r["floating"] = "плава" in r["btype"].lower()
         r["amort"] = info.get("amort") if info else None
+    try:        # спред флоатера к КС из кэша (без ожидания); недостающее считает фоновое задание
+        fsp = fl_spread_cached()
+        for r in rows:
+            r["fl_label"] = fl_label(fsp.get(r.get("isin")), True) if r.get("floating") else None
+            r["fl_base"] = (fsp.get(r.get("isin")) or {}).get("base") if r.get("floating") else None
+        fl_spread_kick(rows, fsp)
+    except Exception:  # noqa: BLE001
+        pass
     stats = market_stats(rows)
     try:
         hist = _stats_history(stats)
@@ -192,6 +270,38 @@ def screener_payload():
         lq = None
     return {"rows": rows, "kbd": kbd_curve(), "updated": _scr["t"], "ratings": ratings_status(), "stats": stats, "stats_hist": hist,
             "floor": {"lqdt": lq}}
+
+
+def bond_movers(n=50):
+    """Лидеры падения/роста цены за день по облигациям (из тех же данных, что и скринер)."""
+    rows = screener_rows()
+    mv = [r for r in rows if r.get("chg")]
+    br = globals().get("best_rating")
+
+    def item(r):
+        rt = r.get("rating")
+        if rt is None and br:
+            try:
+                x = br(r.get("isin"), r["name"])
+                rt = x["v"] if x else None
+            except Exception:  # noqa: BLE001
+                rt = None
+        return {"name": r["name"], "isin": r.get("isin") or r["id"], "chg": r["chg"], "price": r["price"],
+                "turnover": r["turn"], "trades": r["trades"], "rating": rt}
+    down = [item(r) for r in sorted(mv, key=lambda r: r["chg"])[:n]]
+    up = [item(r) for r in sorted(mv, key=lambda r: -r["chg"])[:n]]
+    return {"down": down, "up": up, "total": len(mv), "n": n, "updated": _scr["t"]}
+
+
+def _api_movers(cfg, acc, q, force):
+    try:
+        n = max(5, min(200, int(q.get("n", 50))))
+    except (TypeError, ValueError):
+        n = 50
+    return bond_movers(n)
+
+
+API_GET["/api/movers"] = _api_movers
 
 
 # ── первичные размещения (по объявлениям Мосбиржи; сводка investmint.ru) ──

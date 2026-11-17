@@ -4,7 +4,7 @@
 
 Клиент -> этот сервер -> MOEX ISS, ФНС ГИР БО, ЦБ, smart-lab, рейтинговые агентства.
 Сервер ходит к источникам один раз, кэширует ответ в SQLite и отдаёт всем клиентам, соблюдая лимиты запросов.
-Токены Т-Инвестиций и портфели сюда не попадают. Только стандартная библиотека, Python 3.8+.
+Токены и портфели пользователей сюда не попадают; исключение — личный токен ВЛАДЕЛЬЦА сервера (только чтение рыночных данных, tinvest_md.py). Только стандартная библиотека, Python 3.8+.
 
     python3 tinvest_server.py [--host 127.0.0.1] [--port 8780] [--data DIR] [--key KEY] [--keys-db PATH --bot NAME] [--verbose]
 """
@@ -25,6 +25,9 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tinvest_md  # noqa: E402  (токен владельца сервера, только чтение; см. tinvest_md.py)
+
 VERSION = "1.0.0"
 MIN, HOUR, DAY = 60, 3600, 86400
 
@@ -34,6 +37,7 @@ MIN, HOUR, DAY = 60, 3600, 86400
 ALLOWED_HOSTS = {
     "iss.moex.com": None, "www.moex.com": None,
     "bo.nalog.gov.ru": None,
+    "rosstat.gov.ru": None, "www.rosstat.gov.ru": None,
     "www.cbr.ru": None, "cbr.ru": None,
     "smart-lab.ru": None,
     "raexpert.ru": None, "ratings.ru": None, "investmint.ru": None,
@@ -150,6 +154,267 @@ def _p_ifrs(params):
     return "https://smart-lab.ru/q/%s/f/y/MSFO/" % t, ifrs_parse
 
 
+# ───────────────────────── сообщения о раскрытии (база disclosure.sqlite от disclosure_worker.py) ─────────────────────────
+# Только чтение (mode=ro), без кэша: ответ всегда свежий. Нет файла/таблиц — пустой результат, а не ошибка.
+def _dp_arg(params, k, rx, err):
+    v = (params.get(k) or [""])[0].strip()
+    if v and not re.fullmatch(rx, v):
+        raise ValueError(err)
+    return v
+
+
+def disclosure_query(data_dir, name, params):
+    """/v1/parsed/disclosure/{facts,defaults,status} -> (http-код, json)."""
+    try:
+        if name == "disclosure/facts":
+            isin = _dp_arg(params, "isin", r"[A-Za-z0-9]{12}", "bad isin").upper()
+            inn = _dp_arg(params, "inn", r"\d{10,12}", "bad inn")
+            kind = _dp_arg(params, "kind", r"[a-z_]{1,32}", "bad kind")
+            lim = int(_dp_arg(params, "limit", r"\d{1,4}", "bad limit") or 200)
+            if not isin and not inn:
+                raise ValueError("isin or inn required")
+            where, args = ["f.isin=?" if isin else "f.inn=?"], [isin or inn]
+            if kind:
+                where.append("f.kind=?")
+                args.append(kind)
+        elif name == "disclosure/defaults":
+            since = _dp_arg(params, "since", r"\d{4}-\d{2}-\d{2}", "bad since") or \
+                (datetime.now(MSK) - timedelta(days=30)).strftime("%Y-%m-%d")
+            lim, where, args = 500, ["f.kind='default'", "d.published>=?"], [since]
+        elif name == "disclosure/status":
+            lim = 0
+        else:
+            return 404, {"ok": False, "error": "unknown parser"}
+    except ValueError as e:
+        return 400, {"ok": False, "error": str(e)}
+    path = os.path.join(data_dir, "disclosure.sqlite")
+    status = name == "disclosure/status"
+    empty = {} if status else []
+    if not os.path.exists(path):
+        return 200, {"ok": True, "v": PARSED_V, "data": empty}
+    db = None
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % quote(path), uri=True, timeout=5)
+        if status:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import disclosure_worker
+            return 200, {"ok": True, "v": PARSED_V, "data": disclosure_worker.stats(db)}
+        rows = db.execute("SELECT f.doc_id, d.title, d.published, f.isin, f.inn, f.kind, f.event_date, f.due_date, f.conf, f.data "
+                          "FROM facts f JOIN docs d ON d.id=f.doc_id WHERE " + " AND ".join(where) +
+                          " ORDER BY d.published DESC, f.doc_id DESC, f.n LIMIT ?", args + [max(1, min(lim, 1000))]).fetchall()
+    except sqlite3.Error:
+        return 200, {"ok": True, "v": PARSED_V, "data": empty}      # файл ещё не создан воркером / таблиц нет
+    finally:
+        if db:
+            db.close()
+    out = []
+    for did, title, pub, isin_, inn_, kind_, ev, due, conf, data in rows:
+        try:
+            data = json.loads(data or "null")
+        except ValueError:
+            data = None
+        out.append({"doc_id": did, "title": title, "published": pub, "url": "https://e-disclosure.azipi.ru/messages/%d/" % did,
+                    "isin": isin_, "inn": inn_, "kind": kind_, "event_date": ev, "due_date": due, "conf": conf, "data": data})
+    return 200, {"ok": True, "v": PARSED_V, "data": out}
+
+
+# ───────────────────────── потоки денег (база flows.sqlite от flows_worker.py) и живой стакан ─────────────────────────
+def flows_query(data_dir, name, params):
+    """/v1/parsed/flows/{summary,instrument,large,spikes,instruments,status} -> (http-код, json). Только чтение, без кэша."""
+    try:
+        period = _dp_arg(params, "period", r"5m|1h|day", "bad period") or "1h"
+        secid = _dp_arg(params, "secid", r"[A-Za-z0-9_.\-]{1,24}", "bad secid")
+        cls = _dp_arg(params, "class", r"share|bond|fund", "bad class")
+        since = _dp_arg(params, "since", r"\d{4}-\d{2}-\d{2}|\d{9,11}(\.\d+)?", "bad since")
+        lim = int(_dp_arg(params, "limit", r"\d{1,3}", "bad limit") or 200)
+        minv = float(_dp_arg(params, "min", r"\d{1,12}(\.\d+)?", "bad min") or 0)
+        secids = [x for x in _dp_arg(params, "secids", r"[A-Za-z0-9_.\-]{1,24}(,[A-Za-z0-9_.\-]{1,24}){0,49}", "bad secids").split(",") if x]
+        isins = [x.upper() for x in _dp_arg(params, "isins", r"[A-Za-z0-9]{12}(,[A-Za-z0-9]{12}){0,49}", "bad isins").split(",") if x]
+        if secid and not secids:
+            secids = [secid]
+        if name not in ("flows/summary", "flows/instrument", "flows/large", "flows/spikes", "flows/instruments", "flows/status"):
+            return 404, {"ok": False, "error": "unknown parser"}
+        if name == "flows/instrument" and not secid:
+            raise ValueError("secid required")
+    except ValueError as e:
+        return 400, {"ok": False, "error": str(e)}
+    import flows_worker
+    path = os.path.join(data_dir, "flows.sqlite")
+    empty = {"flows/summary": {"empty": True, "period": period, "by_class": [], "by_sector": [], "top_buy": [], "top_sell": []},
+             "flows/instrument": {"secid": secid, "series": []}, "flows/status": {}}.get(name, [])
+    if not os.path.exists(path):
+        return 200, {"ok": True, "v": PARSED_V, "data": empty}
+    db = None
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % quote(path), uri=True, timeout=5)
+        if name == "flows/summary":
+            data = flows_worker.q_summary(db, period)
+        elif name == "flows/instrument":
+            data = flows_worker.q_instrument(db, secid, period)
+        elif name == "flows/large":
+            data = flows_worker.q_large(db, since, cls, minv, secids, isins, lim)
+        elif name == "flows/spikes":
+            data = flows_worker.q_spikes(db, since, secids, isins, lim)
+        elif name == "flows/instruments":
+            data = flows_worker.q_instruments(db)
+        else:
+            data = flows_worker.stats(db)
+    except sqlite3.Error:
+        return 200, {"ok": True, "v": PARSED_V, "data": empty}
+    finally:
+        if db:
+            db.close()
+    return 200, {"ok": True, "v": PARSED_V, "data": data}
+
+
+class _TtlFlight:
+    """Короткий кэш с single-flight: пока один поток ходит к источнику, остальные ждут его результат."""
+
+    def __init__(self, clock=time.time):
+        self.clock, self.lock, self.items, self.flights = clock, threading.Lock(), {}, {}
+
+    def get(self, key, ttl, fn):
+        with self.lock:
+            it = self.items.get(key)
+            if it and it[0] > self.clock():
+                return it[1]
+            fl = self.flights.get(key)
+            leader = fl is None
+            if leader:
+                fl = self.flights[key] = {"ev": threading.Event(), "res": None, "err": None}
+        if not leader:
+            fl["ev"].wait(60)
+            if fl["err"]:
+                raise fl["err"]
+            return fl["res"]
+        try:
+            fl["res"] = fn()
+            with self.lock:
+                if len(self.items) > 2000:
+                    self.items.clear()
+                self.items[key] = (self.clock() + ttl, fl["res"])
+            return fl["res"]
+        except Exception as e:  # noqa: BLE001
+            fl["err"] = e
+            raise
+        finally:
+            with self.lock:
+                self.flights.pop(key, None)
+            fl["ev"].set()
+
+
+MD_BOOK_DEPTHS = (1, 10, 20, 30, 40, 50)
+MD_CLASS_CODES = ("TQBR", "TQTF", "TQCB", "TQOB", "TQIR")
+MD_TTL = 1.5
+
+
+def md_query(app, name, params):
+    """/v1/parsed/md/{orderbook,trades}: живые данные T-Invest токеном владельца сервера. Нет токена -> 404 (клиент берёт свой токен)."""
+    try:
+        secid = _dp_arg(params, "secid", r"[A-Za-z0-9_.\-]{1,24}", "bad secid")
+        depth = int(_dp_arg(params, "depth", r"\d{1,3}", "bad depth") or 20)
+        minutes = int(_dp_arg(params, "minutes", r"\d{1,4}", "bad minutes") or 60)
+        if not secid and name != "md/fundamentals":
+            raise ValueError("secid required")
+        if name in MD_EXTRA:
+            return _md_extra(app, name, secid)
+        if name not in ("md/orderbook", "md/trades"):
+            return 404, {"ok": False, "error": "unknown parser"}
+    except ValueError as e:
+        return 400, {"ok": False, "error": str(e)}
+    md = app.md
+    if not md or not md.enabled:
+        return 404, {"ok": False, "error": "no_token"}
+    try:
+        meta = app.md_meta(secid)
+        if not meta or not meta.get("uid"):
+            return 404, {"ok": False, "error": "unknown instrument"}
+        if name == "md/orderbook":
+            d = next((x for x in MD_BOOK_DEPTHS if x >= depth), MD_BOOK_DEPTHS[-1])
+            data = app.ttl.get(("ob", secid, d), MD_TTL, lambda: md.order_book(meta["uid"], d))
+            data = dict(data, source="T-Invest", delay_min=0, secid=secid)
+        else:
+            minutes = max(1, min(minutes, 60))
+            tr = app.ttl.get(("tr", secid, minutes), MD_TTL, lambda: _md_trades(md, meta, minutes))
+            data = {"trades": tr[-300:][::-1], "secid": secid, "ts": time.time(), "source": "T-Invest", "delay_min": 0}
+    except tinvest_md.RateLimited:
+        return 429, {"ok": False, "error": "rate_limited"}
+    except tinvest_md.MDError:
+        return 502, {"ok": False, "error": "upstream failed"}       # подробности (уже без токена) в ответ не отдаём
+    return 200, {"ok": True, "v": PARSED_V, "data": data}
+
+
+MD_EXTRA = ("md/dividends", "md/fundamentals", "md/reports")
+MD_DIV_TTL, MD_FUND_TTL, MD_REPORT_TTL, MD_SHARES_TTL = 12 * HOUR, 6 * HOUR, DAY, DAY
+
+
+def _md_shares(app):
+    """{тикер: {uid, asset_uid}} по акциям TQBR; кэш сутки, single-flight."""
+    def load():
+        out = {}
+        for i in app.md.instruments("share"):
+            t = i.get("ticker")
+            if t and i.get("classCode") == "TQBR" and i.get("uid") and t not in out:
+                out[t] = {"uid": i["uid"], "asset_uid": i.get("assetUid") or ""}
+        if not out:
+            raise tinvest_md.MDError("пустой список акций")
+        return out
+    return app.ttl.get(("md_shares",), MD_SHARES_TTL, load)
+
+
+def _md_extra(app, name, secid):
+    md = app.md
+    if not md or not md.enabled:
+        return 404, {"ok": False, "error": "no_token"}
+    try:
+        shares = _md_shares(app)
+        if name == "md/fundamentals":
+            def load():
+                by = {v["asset_uid"]: t for t, v in shares.items() if v["asset_uid"]}
+                ids, out = list(by), {}
+                for i in range(0, len(ids), 100):
+                    for au, f in md.fundamentals(ids[i:i + 100], priority=tinvest_md.BACKGROUND).items():
+                        if au in by:
+                            out[by[au]] = f
+                return out
+            data = app.ttl.get(("md_fund",), MD_FUND_TTL, load)
+            return 200, {"ok": True, "v": PARSED_V, "data": data}
+        sh = shares.get(secid)
+        if not sh:
+            return 404, {"ok": False, "error": "unknown instrument"}
+        now = datetime.now(timezone.utc)
+        f = lambda t: t.strftime("%Y-%m-%dT00:00:00Z")  # noqa: E731
+        if name == "md/dividends":
+            items = app.ttl.get(("md_div", secid), MD_DIV_TTL,
+                                lambda: md.dividends(sh["uid"], f(now - timedelta(days=6 * 365)), f(now + timedelta(days=400))))
+            data = {"items": items, "secid": secid, "source": "T-Invest"}
+        else:
+            rs = app.ttl.get(("md_rep", secid), MD_REPORT_TTL,
+                             lambda: md.reports(sh["uid"], f(now), f(now + timedelta(days=400))))
+            today = now.strftime("%Y-%m-%d")
+            fut = sorted((tinvest_md._d(r.get("reportDate")), r) for r in rs if (tinvest_md._d(r.get("reportDate")) or "") >= today)
+            r = fut[0][1] if fut else {}
+            data = {"secid": secid, "date": fut[0][0] if fut else None, "year": r.get("periodYear"), "num": r.get("periodNum"),
+                    "type": r.get("periodType"), "source": "T-Invest"}
+    except tinvest_md.RateLimited:
+        return 429, {"ok": False, "error": "rate_limited"}
+    except tinvest_md.MDError:
+        return 502, {"ok": False, "error": "upstream failed"}
+    return 200, {"ok": True, "v": PARSED_V, "data": data}
+
+
+def _md_trades(md, meta, minutes):
+    now = time.time()
+    f = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"  # noqa: E731
+    lot = meta.get("lot") or 1
+    k = (meta.get("face") or 1000.0) / 100.0 if meta.get("cls") == "bond" else 1.0
+    out = []
+    for t in md.last_trades(meta["uid"], f(now - minutes * 60), f(now), priority=tinvest_md.INTERACTIVE):
+        pieces = t["qty"] * lot
+        out.append({"ts": t["ts"], "side": t["side"], "price": t["price"], "qty": pieces, "value": round(t["price"] * pieces * k, 2)})
+    return out
+
+
 # имя -> функция(params) -> (url источника, парсер html -> данные | None/пусто = неудача)
 PARSERS = {"investmint/placements": _p_placements, "smartlab/ifrs": _p_ifrs}
 
@@ -167,6 +432,8 @@ RULES = [
     ("iss.moex.com",       r"/iss/emitters",                          7 * DAY,            None),    # эмитенты
     ("www.moex.com",       r".*",                                     DAY,                None),
     ("bo.nalog.gov.ru",    r".*",                                     7 * DAY,            None),    # ФНС: отчётность годовая
+    ("rosstat.gov.ru",     r".*",                                     12 * HOUR,          None),    # недельный ИПЦ
+    ("www.rosstat.gov.ru", r".*",                                     12 * HOUR,          None),
     ("smart-lab.ru",       r".*",                                     5 * DAY,            None),    # МСФО: страницы обновляются редко
     ("www.cbr.ru",         r"/dkp/|/statistics/|\.pdf",               12 * HOUR,          None),    # прогнозы, календарь, опросы
     ("www.cbr.ru",         r".*",                                     6 * HOUR,           None),    # курсы, ключевая ставка
@@ -465,8 +732,9 @@ class _NoRedirectCheck(urllib.request.HTTPRedirectHandler):
 
 class DataServer:
     def __init__(self, data_dir, key="", max_mb=1024, clock=time.time, extra_allow=(), rates=None, verbose=False,
-                 upstream=None, rules=None, keys_db="", bot="tanalyticbot"):
+                 upstream=None, rules=None, keys_db="", bot="tanalyticbot", md=None, token_file=""):
         os.makedirs(data_dir, exist_ok=True)
+        self.data_dir = data_dir
         self.key, self.clock, self.verbose = key or "", clock, verbose
         self.bot = (bot or "tanalyticbot").strip().lstrip("@")
         self.keystore = KeyStore(keys_db, clock) if keys_db else None
@@ -484,6 +752,49 @@ class DataServer:
         self._rate_lock, self._next_slot = threading.Lock(), {}
         self._stats_lock, self._stats = threading.Lock(), {}
         self._plock, self._pcache = threading.Lock(), {}
+        # Токен владельца (только чтение, только рыночные данные): credentials -> env -> файл. Нет токена — функции T-Invest выключены.
+        if md is None:
+            tok, _how = tinvest_md.load_token(token_file)
+            md = tinvest_md.MDClient(tok, limits={"MarketDataService": 100, "InstrumentsService": 30}) if tok else None
+        self.md = md
+        self.ttl = _TtlFlight(clock)
+        self._meta = {}
+
+    def md_meta(self, secid):
+        """secid -> {uid, lot, face, cls}: из базы сборщика потоков, иначе GetInstrumentBy по тикеру (запоминается)."""
+        if secid in self._meta:
+            return self._meta[secid]
+        meta = None
+        path = os.path.join(self.data_dir, "flows.sqlite")
+        if os.path.exists(path):
+            db = None
+            try:
+                import flows_worker
+                db = sqlite3.connect("file:%s?mode=ro" % quote(path), uri=True, timeout=5)
+                meta = flows_worker.q_instrument_meta(db, secid)
+            except sqlite3.Error:
+                meta = None
+            finally:
+                if db:
+                    db.close()
+        if not (meta and meta.get("uid")):
+            for cc in MD_CLASS_CODES:
+                try:
+                    i = self.md.find_by_ticker(secid, cc)
+                except tinvest_md.RateLimited:
+                    raise
+                except tinvest_md.MDError:
+                    continue
+                if i.get("uid"):
+                    nom = i.get("nominal") or {}
+                    meta = {"uid": i["uid"], "lot": int(i.get("lot") or 1), "cls": "bond" if cc in ("TQCB", "TQOB") else "share",
+                            "face": tinvest_md.quotation(nom) if nom else 0}
+                    break
+        if meta and meta.get("uid"):
+            if len(self._meta) > 3000:
+                self._meta.clear()
+            self._meta[secid] = meta
+        return meta
 
     # --- разрешённость URL ---
     def url_allowed(self, url):
@@ -588,6 +899,12 @@ class DataServer:
     def parsed(self, name, params):
         """Разбор страницы источника -> (http-код, json). Страница берётся через fetch() (кэш, TTL, лимиты); результат разбора
         запоминается по хэшу тела страницы, так что повторный запрос при неизменной странице не парсит заново."""
+        if name.startswith("disclosure/"):
+            return disclosure_query(self.data_dir, name, params)
+        if name.startswith("flows/"):
+            return flows_query(self.data_dir, name, params)
+        if name.startswith("md/"):
+            return md_query(self, name, params)
         mk = PARSERS.get(name)
         if not mk:
             return 404, {"ok": False, "error": "unknown parser"}
@@ -775,12 +1092,13 @@ def main(argv=None):
     ap.add_argument("--max-mb", type=int, default=1024, help="лимит размера кэша, МБ")
     ap.add_argument("--allow", action="append", default=[], help="дополнительный разрешённый host[:port] (для тестов)")
     ap.add_argument("--verbose", action="store_true", help="писать в журнал строки запросов (по умолчанию не пишется)")
+    ap.add_argument("--token-file", default="", help="файл с токеном T-Invest владельца (только чтение); нет файла — функции T-Invest выключены")
     ap.add_argument("--version", action="store_true")
     a = ap.parse_args(argv)
     if a.version:
         print(VERSION)
         return 0
-    app = DataServer(a.data, a.key, a.max_mb, extra_allow=a.allow, verbose=a.verbose, keys_db=a.keys_db, bot=a.bot)
+    app = DataServer(a.data, a.key, a.max_mb, extra_allow=a.allow, verbose=a.verbose, keys_db=a.keys_db, bot=a.bot, token_file=a.token_file)
     srv = make_http_server(app, a.host, a.port)
     print("tinvest-data %s: http://%s:%d, кэш %s%s" % (VERSION, a.host, a.port, a.data, (", ключ включён" if a.key else "") + (", вход по ключам бота @%s" % app.bot if app.keystore else "")), flush=True)
     try:

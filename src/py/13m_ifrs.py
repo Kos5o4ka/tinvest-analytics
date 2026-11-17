@@ -396,3 +396,39 @@ def ifrs_bundle(isin, em=None):
     nm = (em or {}).get("title") or mp.get("group") or ""
     sc = iss_score_ifrs(fin, bool(IFRS_FIN_RE.search(nm)))
     return {"ticker": mp["ticker"], "how": mp["how"], "group": mp["group"], "kind": mp["kind"], "fin": fin, "score": sc, "url": fin.get("url") or IFRS_BASE % mp["ticker"]}
+
+
+# ── мультипликаторы по МСФО (для карточки акции и скринера без токена T-Invest) ──
+
+def ifrs_multiples(fin, cap):
+    """ifrs_fin + рыночная капитализация (₽) -> {pe, pb, ev_ebitda, roe, nd_ebitda, rev_growth, ni_growth, period, source}; доли роста — в процентах.
+    Берётся LTM, если он есть (иначе последний год). Что посчитать нельзя (убыток, нет данных, банк без EBITDA) — None."""
+    out = {"pe": None, "pb": None, "ev_ebitda": None, "roe": None, "nd_ebitda": None, "rev_growth": None, "ni_growth": None,
+           "period": None, "source": "ifrs"}
+    if not fin or fin.get("status") != "ok" or not fin.get("years"):
+        return out
+    yrs = fin["years"]
+    c = fin.get("ltm") or yrs[-1]
+    last = yrs[-1]
+    prev = yrs[-2] if len(yrs) > 1 and yrs[-2]["y"] == last["y"] - 1 else None
+    out["period"] = c.get("y") if c.get("y") == "LTM" else str(c.get("y"))
+    mcap = (cap or 0) / 1e6                       # суммы МСФО — в млн ₽
+    net, eq, ebitda, nd = c.get("net"), c.get("equity"), c.get("ebitda"), c.get("net_debt")
+    if mcap > 0:
+        if net is not None and net > 0:
+            out["pe"] = mcap / net
+        if eq is not None and eq > 0:
+            out["pb"] = mcap / eq
+        if not fin.get("bank") and ebitda is not None and ebitda > 0 and nd is not None:
+            out["ev_ebitda"] = (mcap + nd) / ebitda
+    roe = c.get("roe")
+    if roe is None and net is not None and eq and eq > 0:
+        roe = net / eq
+    out["roe"] = None if roe is None else roe * 100
+    if c.get("nd_ebitda") is not None:
+        out["nd_ebitda"] = c["nd_ebitda"]
+    if last.get("growth") is not None:
+        out["rev_growth"] = last["growth"] * 100
+    if prev and prev.get("net") and prev["net"] > 0 and last.get("net") is not None:
+        out["ni_growth"] = (last["net"] / prev["net"] - 1) * 100
+    return out
