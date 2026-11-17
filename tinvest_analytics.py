@@ -320,23 +320,9 @@ class Store:
             c.execute("DELETE FROM candles")
             c.commit()
 
-    def purge_expired(self, prefixes=(("bondiz2:", 7 * 86400), ("bopt1:", 7 * 86400), ("disc1:", 7 * 86400),
-                                      ("disc_desc1:", 7 * 86400), ("fl_spread1:", 45 * 86400))):
-        """Удаляет просроченные записи временного кэша в kv; пользовательские и исторические ключи не затрагивает."""
-        now, removed = time.time(), 0
-        with self.wlock:
-            c = self.conn()
-            for pref, ttl in prefixes:
-                cur = c.execute("DELETE FROM kv WHERE k LIKE ? AND t < ?", (pref + "%", now - ttl))
-                removed += max(cur.rowcount, 0)
-            if removed:
-                c.commit()
-        return removed
-
 
 STORE = None
 _klocks, _klocks_lock = {}, threading.Lock()
-_KLOCKS_MAX = 512
 
 
 def key_lock(key):
@@ -344,10 +330,6 @@ def key_lock(key):
     with _klocks_lock:
         lk = _klocks.get(key)
         if lk is None:
-            if len(_klocks) >= _KLOCKS_MAX:
-                stale = [k for k, v in list(_klocks.items()) if not v.locked()]
-                for k in stale[:max(1, len(stale) // 2)]:
-                    _klocks.pop(k, None)
             lk = _klocks[key] = threading.Lock()
         return lk
 
@@ -560,29 +542,14 @@ class TInvest:
                          {"instrumentId": instrument_id, "from": frm, "to": to}, timeout=30).get("trades") or []
 
 
-_POOL_LOCK = threading.Lock()
-_SHARED_POOL = None
-
-
-def _get_pool():
-    global _SHARED_POOL
-    with _POOL_LOCK:
-        if _SHARED_POOL is None:
-            _SHARED_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="_pm_")
-        return _SHARED_POOL
-
-
 def pool_map(fn, items, workers=8):
     items = list(items)
     if not items:
         return []
     if len(items) == 1:
         return [fn(items[0])]
-    # Вложенный вызов внутри рабочего потока пула использует локальный пул во избежание взаимоблокировки.
-    if threading.current_thread().name.startswith("_pm_") or workers > 12:
-        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
-            return list(ex.map(fn, items))
-    return list(_get_pool().map(fn, items))
+    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
+        return list(ex.map(fn, items))
 
 
 # ═══════════════════════════════ справочник инструментов ═══════════════════════════════
@@ -2293,8 +2260,6 @@ def yields_by_kind(bz, today, face, dirty, offers, floating=False, est_out=None,
                    flows=call_fl[res["ytw_date"]] if k == "call" else full, end=res["ytw_date"], end_kind="offer" if k == "call" else "maturity")
     elif res["yto"] is not None:
         res.update(basis="unknown", flows=uf, end=res["yto_date"], end_kind="offer", to_kind="unknown", y=res["yto"])
-    basis_price = price if price is not None else dirty
-    res["y_tax"] = cf_ytm(dirty, res["flows"], today, tax=True, basis=basis_price)
     return res
 # ═══════════════════ риски и сценарии: рыночная вероятность дефолта, ожидаемая доходность, сценарии ключевой ставки ═══════════════════
 # Упрощённая модель, справочная информация. Все допущения перечислены в RISK_NOTES и отдаются в UI.
@@ -4391,13 +4356,29 @@ def _rating_issuer(t):
     return " ".join(words) or None
 
 
+# Окончания для грубого стемминга: «Ульяновской»/«Ульяновская» и «Томска»/«Томск» дают одну основу,
+# а разные компании с общим началом («Интерлизинг» и «ИнтерФудГрупп») — разные ключи.
+_NAME_ENDINGS = ("иями", "ями", "ами", "ого", "его", "ому", "ему", "ыми", "ими", "ой", "ей", "ий", "ый", "ая", "яя",
+                 "ое", "ее", "ые", "ие", "ых", "их", "ом", "ем", "ам", "ям", "ах", "ях", "ою", "ую", "юю",
+                 "а", "я", "у", "ю", "е", "ы", "и", "о", "ь", "й")
+
+
+def _name_stem(t):
+    if not re.match(r"[а-я]", t):
+        return t
+    for e in _NAME_ENDINGS:
+        if t.endswith(e) and len(t) - len(e) >= 4:
+            return t[:-len(e)]
+    return t
+
+
 def name_tokens(s):
-    """Нормализованные полные слова названия: ключи эмитента для группировки и журнала (без 5-буквенных коллизий)."""
+    """Основы слов названия (без правовых форм, номеров и падежных окончаний): ключи эмитента для группировки и журнала."""
     out = set()
     for i, t in enumerate(re.findall(r"[a-zа-я0-9]+", (s or "").lower().replace("ё", "е"))):
         if t in _LEGAL or (i == 0 and t == "банк") or len(t) < 2 or any(ch.isdigit() for ch in t):
             continue
-        out.add(t)
+        out.add(_name_stem(t))
     return frozenset(out)
 
 
@@ -8825,6 +8806,11 @@ def _mon_match(a, b):
     return lo <= hi and sum(len(x) for x in lo) >= 5 and all(len(x) <= 2 for x in hi - lo)
 
 
+def _mon_ev_tokens(e):
+    """Ключи эмитента события: пересчитываются из названия (в старых журналах сохранены ключи прежнего формата)."""
+    return set(name_tokens(e.get("issuer") or "")) or set(e.get("tokens") or ())
+
+
 def _mon_issuer_keys(row):
     keys = [name_tokens(_bond_query(row.get("name") or ""))]
     b = _tcat_get(row.get("isin") or row.get("ticker"))
@@ -8848,7 +8834,7 @@ def _mon_rating_state(row, keys, events):
                 last[ag] = (dt, fc)
     ws = {}
     for e in events:
-        if any(_mon_match(set(e["tokens"]), k) for k in keys):
+        if any(_mon_match(_mon_ev_tokens(e), k) for k in keys):
             if e.get("watch") in ("set", "removed"):
                 ws[e["agency"]] = e["watch"] == "set"
             if e.get("outlook") and e["agency"] not in last:
@@ -8877,7 +8863,7 @@ def _mon_rating_alerts(rows_keys, events, cutoff, today=None):
     for e in events:
         if e["date"] < cutoff:
             continue
-        et = set(e["tokens"])
+        et = _mon_ev_tokens(e)
         hit = [r for r, keys in rows_keys if any(_mon_match(et, k) for k in keys)]
         if not hit:
             continue
@@ -19187,9 +19173,7 @@ function renderNav(){
   $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
   $('#period').style.visibility=PERIOD_PAGES.includes(S.page)?'visible':'hidden';
   const a=S.accounts.find(x=>x.id===S.account);
-  const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
-  if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}
-  $('#title').innerHTML=esc(pgCur[1])+(['imp','set','kb'].includes(S.page)?'':` <small>${esc(S.account==='all'?'все счета':a?a.name:'')}</small>`);
+  $('#title').innerHTML=esc(PAGES.find(p=>p&&p[0]===S.page)[1])+(['imp','set','kb'].includes(S.page)?'':` <small>${esc(S.account==='all'?'все счета':a?a.name:'')}</small>`);
 }
 function renderAccounts(){
   const accs=S.accounts||[];
@@ -19244,7 +19228,7 @@ function typingInView(){
   const t=a.tagName;
   return t==='TEXTAREA'||t==='SELECT'||(t==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|file|color|image)$/.test(a.type));
 }
-function render(){renderNow()}
+function render(){if(!window.event&&typingInView()){_rPend=true;return}renderNow()}
 function renderSoon(){if(typingInView()){_rPend=true;return}renderNow()}
 document.addEventListener('focusout',()=>{if(_rPend)setTimeout(()=>{if(_rPend&&!typingInView())renderNow()},400)});
 function renderNow(){
@@ -19261,9 +19245,7 @@ function renderNow(){
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(!S.data){if(S.loading)skeleton();return}
   const sc=v.scrollTop;
-  const views={dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,cmp:pCmp,map:pMap,hm:pHeatmap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,fng:pFng,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,dfl:pDfl,flw:pFlw,cal:pCal,watch:pWatch,stk:pStk,sst:pSst};
-  const fn=views[S.page]||(()=>{S.page='dash';persist();renderNav();return pDash()});
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${S.page==='dash'?proBanner():''}${fn()}</div>`;
+  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${S.page==='dash'?proBanner():''}${({dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,cmp:pCmp,map:pMap,hm:pHeatmap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,fng:pFng,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,dfl:pDfl,flw:pFlw,cal:pCal,watch:pWatch,stk:pStk,sst:pSst})[S.page]()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -19765,7 +19747,7 @@ document.addEventListener('click',e=>{
 const SCR_DEF={q:'',cur:'RUB',kind:'all',sector:'',rmin:'',rated:false,ymin:'',ymax:'60',tmax:'',turn:'',spmin:'',noOffer:false,toOffer:false,fl:'all',liq:''};
 const SCR_PRESETS=[
   ['ofz3','ОФЗ ≤ 3 лет',{kind:'ofz',cur:'RUB',tmax:'3',fl:'fix',noOffer:false}],
-  ['fl_aa','Флоатеры AA+',{cur:'RUB',fl:'float',rmin:'AA-',turn:'1'}],
+  ['fl_aa','Флоатеры от AA-',{cur:'RUB',fl:'float',rmin:'AA-',turn:'1'}],
   ['hy20','ВДО от 20%',{cur:'RUB',kind:'corp',ymin:'20',ymax:'60',turn:'1'}],
   ['fx','Валютные',{cur:'all',kind:'corp',fl:'all',q:''}]
 ];
@@ -23826,7 +23808,7 @@ PAGES.push(['stk','Акция'],['sst','Скринер акций']);
 NAV_GROUPS.splice(Math.max(0,NAV_GROUPS.findIndex(g=>g[0]==='Рынок')+1),0,['Акции',['stk','sst']]);
 PRO_PAGES.push('sst');
 document.addEventListener('click',e=>{
-  const t=e.target.closest&&e.target.closest('[data-stk]');
+  const t=e.target.closest&&e.target.closest('.it[data-stk]');   /* строки дашборда; кнопки и таблицы акций вешают свои обработчики */
   if(t&&t.dataset.stk&&!e.target.closest('a,input,select'))openStock(t.dataset.stk);
 });
 PRO_FEATURES.sst={t:'Скринер акций',ic:'sst',b:['Акции Мосбиржи с P/E, P/B, EV/EBITDA, дивидендной доходностью и ростом','Готовые подборки: дешёвые по P/E, высокие дивиденды, быстрый рост','Фильтры по сектору, капитализации и показателям','Переход в карточку акции в один клик'],pv:'table'};

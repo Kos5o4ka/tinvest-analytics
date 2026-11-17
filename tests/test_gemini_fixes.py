@@ -37,36 +37,14 @@ class GeminiFixesTests(unittest.TestCase):
         self.assertNotEqual(M.name_tokens("Транснефть"), M.name_tokens("ТрансКонтейнер"))
         self.assertNotEqual(M.issuer_group_key("Интерлизинг 001Р-01"), M.issuer_group_key("ИнтерФудГрупп БО-01"))
         self.assertEqual(M.name_tokens("Селигдар"), frozenset({"селигдар"}))
+        # падежи из журнала рейтинговых действий сводятся к той же основе
+        self.assertEqual(M.name_tokens("Ульяновской области"), M.name_tokens("Ульяновская область"))
+        self.assertEqual(M.name_tokens("ТОМСКА"), M.name_tokens("Томск"))
+        self.assertFalse(M._mon_match(set(M.name_tokens("Золото Селигдара")), set(M.name_tokens("Селигдар"))))
 
-    def test_bug05_key_lock_bounded(self):
-        for i in range(600):
-            M.key_lock(f"test_bound_lock_{i}")
-        self.assertLessEqual(len(M._klocks), M._KLOCKS_MAX)
-
-    def test_bug07_store_purge_expired(self):
-        st = M.store()
-        old_ts = time.time() - 10 * 86400
-        st.write("INSERT OR REPLACE INTO kv(k, v, t) VALUES(?,?,?)", ("bondiz2:TEST_OLD", "{}", old_ts))
-        st.write("INSERT OR REPLACE INTO kv(k, v, t) VALUES(?,?,?)", ("watch_v1_keep", "[]", old_ts))
-        removed = st.purge_expired()
-        self.assertGreaterEqual(removed, 1)
-        self.assertIsNone(st.get("bondiz2:TEST_OLD"))
-        self.assertEqual(st.get("watch_v1_keep"), [])
-
-    def test_bug08_yields_by_kind_after_tax(self):
-        bz = {
-            "coupons": [
-                {"coupondate": "2026-06-01", "value": 80.0},
-                {"coupondate": "2026-12-01", "value": 80.0},
-            ],
-            "amort": [],
-            "offers": [],
-        }
-        res = M.yields_by_kind(bz, "2026-01-01", 1000.0, 950.0, [], price=940.0)
-        self.assertIsNotNone(res)
-        self.assertIn("y_tax", res)
-        self.assertIsNotNone(res["y_tax"])
-        self.assertLess(res["y_tax"], res["ytm"])
+    def test_bug04_monitor_uses_issuer_not_stored_tokens(self):
+        e = {"issuer": "Интерлизинг", "tokens": ["интер"]}
+        self.assertEqual(M._mon_ev_tokens(e), {"интерлизинг"})
 
     def test_bug09_pool_map_nested_no_deadlock(self):
         res = M.pool_map(lambda x: M.pool_map(lambda y: x * 10 + y, [1, 2, 3], workers=4), [1, 2, 3], workers=4)

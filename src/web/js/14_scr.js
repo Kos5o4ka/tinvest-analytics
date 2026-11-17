@@ -2,7 +2,7 @@
 const SCR_DEF={q:'',cur:'RUB',kind:'all',sector:'',rmin:'',rated:false,ymin:'',ymax:'60',tmax:'',turn:'',spmin:'',noOffer:false,toOffer:false,fl:'all',liq:''};
 const SCR_PRESETS=[
   ['ofz3','ОФЗ ≤ 3 лет',{kind:'ofz',cur:'RUB',tmax:'3',fl:'fix',noOffer:false}],
-  ['fl_aa','Флоатеры AA+',{cur:'RUB',fl:'float',rmin:'AA-',turn:'1'}],
+  ['fl_aa','Флоатеры от AA-',{cur:'RUB',fl:'float',rmin:'AA-',turn:'1'}],
   ['hy20','ВДО от 20%',{cur:'RUB',kind:'corp',ymin:'20',ymax:'60',turn:'1'}],
   ['fx','Валютные',{cur:'all',kind:'corp',fl:'all',q:''}]
 ];

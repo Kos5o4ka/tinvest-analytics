@@ -109,23 +109,9 @@ class Store:
             c.execute("DELETE FROM candles")
             c.commit()
 
-    def purge_expired(self, prefixes=(("bondiz2:", 7 * 86400), ("bopt1:", 7 * 86400), ("disc1:", 7 * 86400),
-                                      ("disc_desc1:", 7 * 86400), ("fl_spread1:", 45 * 86400))):
-        """Удаляет просроченные записи временного кэша в kv; пользовательские и исторические ключи не затрагивает."""
-        now, removed = time.time(), 0
-        with self.wlock:
-            c = self.conn()
-            for pref, ttl in prefixes:
-                cur = c.execute("DELETE FROM kv WHERE k LIKE ? AND t < ?", (pref + "%", now - ttl))
-                removed += max(cur.rowcount, 0)
-            if removed:
-                c.commit()
-        return removed
-
 
 STORE = None
 _klocks, _klocks_lock = {}, threading.Lock()
-_KLOCKS_MAX = 512
 
 
 def key_lock(key):
@@ -133,10 +119,6 @@ def key_lock(key):
     with _klocks_lock:
         lk = _klocks.get(key)
         if lk is None:
-            if len(_klocks) >= _KLOCKS_MAX:
-                stale = [k for k, v in list(_klocks.items()) if not v.locked()]
-                for k in stale[:max(1, len(stale) // 2)]:
-                    _klocks.pop(k, None)
             lk = _klocks[key] = threading.Lock()
         return lk
 

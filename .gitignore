@@ -27,3 +27,8 @@ build/
 dist/
 packaging/icon.*
 packaging/hidden_imports.txt
+
+# Локальные инструменты разработчика
+graphify-out/
+.agents/
+.claude/
