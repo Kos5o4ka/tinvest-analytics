@@ -14,6 +14,11 @@ from gen_hidden_imports import hidden_imports
 APP_SRC = os.environ.get("TINVEST_APP_SRC") or os.path.join(ROOT, "tinvest_analytics.py")
 ICON_DIR = os.path.abspath(os.environ.get("TINVEST_ICON_DIR") or HERE)   # PyInstaller ищет относительные пути от папки spec
 
+import re
+_m = re.search(r'^APP_VERSION = "(\d+)\.(\d+)', open(APP_SRC, encoding="utf8").read(), re.M)
+VER = (int(_m.group(1)), int(_m.group(2)), 0, 0) if _m else (0, 0, 0, 0)
+VER_STR = "%d.%d" % VER[:2]                    # «0.21» — как в программе и в теге релиза
+
 hidden = hidden_imports(APP_SRC) + ["certifi"] + collect_submodules("encodings")
 datas = collect_data_files("certifi")           # корневые сертификаты: у Python с python.org их нет
 
@@ -47,15 +52,13 @@ if sys.platform == "darwin":
     app = BUNDLE(coll, name="TAnalytic.app", icon=icon("icns"), bundle_identifier="io.github.kos5o4ka.tinvest",
                  info_plist={"CFBundleName": "TAnalytic", "CFBundleDisplayName": "TAnalytic",
                              "NSHighResolutionCapable": True, "LSMinimumSystemVersion": "11.0",
-                             "LSApplicationCategoryType": "public.app-category.finance"})
+                             "LSApplicationCategoryType": "public.app-category.finance",
+                             "CFBundleShortVersionString": VER_STR, "CFBundleVersion": VER_STR})
 else:
     # Сведения о файле (Свойства → Подробно): exe без них эвристики антивирусов оценивают хуже.
     from PyInstaller.utils.win32.versioninfo import (VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
                                                      StringStruct, VarFileInfo, VarStruct)
-    import re
-    m = re.search(r'^APP_VERSION = "(\d+)\.(\d+)', open(APP_SRC, encoding="utf8").read(), re.M)
-    ver = (int(m.group(1)), int(m.group(2)), 0, 0) if m else (0, 0, 0, 0)
-    vs = ".".join(map(str, ver))
+    ver, vs = VER, VER_STR
     version = VSVersionInfo(
         ffi=FixedFileInfo(filevers=ver, prodvers=ver, mask=0x3F, flags=0x0, OS=0x40004, fileType=0x1,
                           subtype=0x0, date=(0, 0)),
