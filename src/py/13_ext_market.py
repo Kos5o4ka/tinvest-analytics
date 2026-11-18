@@ -348,16 +348,122 @@ def primary_rows():
     return rows
 
 
+def primary_parse_guide(desc, book=""):
+    """Извлекает ориентир купона/доходности (%), срок (лет) и признак флоатера из текста объявления размещения."""
+    s = ((desc or "") + " " + (book or "")).replace("\u00a0", " ")
+    low = s.lower()
+    floater = any(w in low for w in ("флоатер", "кс +", "кс+", "ключев", "ruonia", "плавающ", "переменн"))
+    # Ставка купона / ориентир доходности: ищем число перед % (кроме «КС + 2%»)
+    guide_y = None
+    if not floater:
+        for m in re.finditer(r"(?:до|ориентир|купон|ставк\w*|доходност\w*)?[^\d%]{0,20}(\d{1,2}(?:[.,]\d{1,2})?)\s*%", low):
+            v = float(m.group(1).replace(",", "."))
+            if 4.0 <= v <= 45.0:
+                guide_y = v
+                break
+    # Срок обращения: «3 года», «2,5 лет», «18 мес»
+    term = None
+    m_yr = re.search(r"(\d{1,2}(?:[.,]\d{1,2})?)\s*(?:год[а]?|лет|г\.)", low)
+    if m_yr:
+        v = float(m_yr.group(1).replace(",", "."))
+        if 0.25 <= v <= 30.0:
+            term = v
+    else:
+        m_mo = re.search(r"(\d{1,3})\s*мес", low)
+        if m_mo:
+            v = int(m_mo.group(1)) / 12.0
+            if 0.2 <= v <= 30.0:
+                term = round(v, 2)
+    return {"guide_y": guide_y, "term": term, "floater": floater}
+
+
+def primary_nip_for(row, screener=None, rusfar=None, freeze_days=4):
+    """Расчёт премии первички (NIP) к кривой того же эмитента и медиане аналогов по рейтингу/дюрации,
+    плюс стоимость заморозки кэша на время сбора заявок (по RUSFAR / КС)."""
+    scr = screener or []
+    info = primary_parse_guide(row.get("desc"), row.get("book"))
+    guide_y = row.get("guide_y") if row.get("guide_y") is not None else info["guide_y"]
+    term = row.get("term") if row.get("term") is not None else info["term"]
+    floater = bool(row.get("floater") or info["floater"])
+    rt = row.get("rating")
+    rt_v = rt.get("v") if isinstance(rt, dict) else (rt if isinstance(rt, str) else None)
+    bucket = rating_bucket(rt_v) if rt_v else None
+    toks = set(name_tokens(row.get("short") or row.get("issuer") or ""))
+    # 1. Кривая того же эмитента (торгуемые рублёвые фиксы)
+    iss_ys = []
+    if toks and scr:
+        for b in scr:
+            if b.get("cur") not in (None, "RUB") or not (b.get("yield") and 0 < b["yield"] < 60):
+                continue
+            bt = set(name_tokens(b.get("name") or ""))
+            if bt and (toks <= bt or bt <= toks or len(toks & bt) >= max(1, min(len(toks), len(bt)))):
+                d_b = b.get("dur")
+                if term is None or d_b is None or abs(d_b - term) <= 1.8:
+                    iss_ys.append(b["yield"])
+    # 2. Медиана аналогов по рейтингу и сроку
+    peer_ys = []
+    if bucket and bucket != "нет рейтинга" and scr:
+        for b in scr:
+            if b.get("kind") != "corp" or b.get("cur") not in (None, "RUB") or not (b.get("yield") and 0 < b["yield"] < 60):
+                continue
+            br = b.get("rating")
+            br_v = br.get("v") if isinstance(br, dict) else (br if isinstance(br, str) else None)
+            if rating_bucket(br_v) != bucket:
+                continue
+            d_b = b.get("dur")
+            if term is not None and d_b is not None and abs(d_b - term) > 1.2:
+                continue
+            peer_ys.append(b["yield"])
+    iss_y = round(_med(iss_ys), 2) if iss_ys else None
+    peer_y = round(_med(peer_ys), 2) if peer_ys else None
+    nip_iss = round((guide_y - iss_y) * 100) if (guide_y is not None and iss_y is not None) else None
+    nip_peer = round((guide_y - peer_y) * 100) if (guide_y is not None and peer_y is not None) else None
+    nip_bp = nip_iss if nip_iss is not None else nip_peer
+    ref_src = "issuer" if nip_iss is not None else ("peer" if nip_peer is not None else None)
+    rate_ref = rusfar if rusfar is not None else 16.0
+    freeze_pct = round((rate_ref / 100.0) * (max(0, freeze_days) / 365.0) * 100.0, 3)
+    freeze_drag_bp = round(freeze_pct / max(0.5, term or 2.0) * 100.0)
+    net_nip_bp = (nip_bp - freeze_drag_bp) if nip_bp is not None else None
+    return {"guide_y": guide_y, "term": term, "floater": floater, "bucket": bucket,
+            "issuer_y": iss_y, "issuer_n": len(iss_ys), "peer_y": peer_y, "peer_n": len(peer_ys),
+            "nip_issuer_bp": nip_iss, "nip_peer_bp": nip_peer, "nip_bp": nip_bp, "ref_src": ref_src,
+            "freeze_days": freeze_days, "freeze_rate": round(rate_ref, 2),
+            "freeze_cost_pct": freeze_pct, "freeze_drag_bp": freeze_drag_bp, "net_nip_bp": net_nip_bp}
+
+
 def primary_payload():
     rows = primary_rows()
-    for r in rows:
-        rt = rating_for(r["short"])
-        r["rating"] = rt
+    scr = _scr.get("rows") or []
+    rusfar = None
     try:
-        primary_snapshot(rows)
+        kr = key_rate_series()
+        if kr:
+            rusfar = kr[-1][1]
     except Exception:  # noqa: BLE001
         pass
-    return {"rows": rows, "updated": _pri["t"]}
+    out_rows = []
+    for r in rows:
+        item = dict(r)
+        rt = rating_for(item["short"])
+        item["rating"] = rt
+        item["nip"] = primary_nip_for(item, scr, rusfar)
+        out_rows.append(item)
+    # Справочные медианы доходности по рейтинговым группам (для интерактивного калькулятора NIP)
+    peer_med = {}
+    if scr:
+        by_b = {}
+        for b in scr:
+            if b.get("kind") == "corp" and b.get("cur") in (None, "RUB") and b.get("yield") and 0 < b["yield"] < 60:
+                br = b.get("rating")
+                bv = rating_bucket(br.get("v") if isinstance(br, dict) else br)
+                if bv != "нет рейтинга":
+                    by_b.setdefault(bv, []).append(b["yield"])
+        peer_med = {k: round(_med(v), 2) for k, v in by_b.items() if v}
+    try:
+        primary_snapshot(out_rows)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"rows": out_rows, "updated": _pri["t"], "rusfar": rusfar, "peer_medians": peer_med}
 
 
 
@@ -671,7 +777,9 @@ def _grp_stats(items):
     p7 = [x["p7"] for x in items if x["p7"] is not None]
     p30 = [x["p30"] for x in items if x["p30"] is not None]
     dn = [x["now"] - x["p0"] for x in items if x["now"] is not None and x["p0"] is not None]
+    abv = lambda arr: round(100.0 * sum(1 for v in arr if v > 100.0) / len(arr), 1) if arr else None  # noqa: E731
     return {"n": len(items), "p0": _med(p0), "p7": _med(p7), "p30": _med(p30), "n30": len(p30),
+            "above0": abv(p0), "above7": abv(p7), "above30": abv(p30),
             "below30": round(100.0 * sum(1 for v in p30 if v < 100) / len(p30), 1) if p30 else None,
             "d_now": _med(dn)}
 
@@ -723,7 +831,11 @@ def primary_stats_payload():
         by_m.setdefault(x["d0"][:7], []).append(x)
     months = [dict(_grp_stats(v), m=k) for k, v in sorted(by_m.items())]
     snaps = (st.get(PRI_SNAP_KEY) or {}).get("days") or {}
-    res = {"all": _grp_stats(items), "buckets": buckets, "sectors": sectors, "months": months,
+    d30 = _day_add(date.today().isoformat(), -30)
+    d90 = _day_add(date.today().isoformat(), -90)
+    win30 = _grp_stats([x for x in items if (x.get("d0") or "") >= d30])
+    win90 = _grp_stats([x for x in items if (x.get("d0") or "") >= d90])
+    res = {"all": _grp_stats(items), "win30": win30, "win90": win90, "buckets": buckets, "sectors": sectors, "months": months,
            "worst": [trim(x) for x in aged[:8]], "best": [trim(x) for x in aged[::-1][:8]],
            "universe": len(cand), "ready": len(items), "snap_days": len(snaps), "updated": _pri_h["fin"], "err": _pri_h["err"]}
     if not _pri_h["running"]:

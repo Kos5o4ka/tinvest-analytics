@@ -177,6 +177,34 @@ class GeminiFixesTests(unittest.TestCase):
             M.key_lock(f"test_klock_prune_{i}")
         self.assertLessEqual(len(M._klocks), 520)
 
+    def test_feat11_primary_nip_and_freeze_cost(self):
+        g = M.primary_parse_guide("Биржевые облигации, ориентир купона до 22,5% годовых, срок 3 года", "")
+        self.assertEqual(g["guide_y"], 22.5)
+        self.assertEqual(g["term"], 3.0)
+        self.assertFalse(g["floater"])
+
+        gf = M.primary_parse_guide("Флоатер КС + 2,5%, срок 24 мес", "")
+        self.assertTrue(gf["floater"])
+        self.assertEqual(gf["term"], 2.0)
+
+        scr = [
+            {"id": "B1", "name": "Ромашка 001P-01", "kind": "corp", "cur": "RUB", "yield": 21.0, "dur": 2.5, "rating": {"v": "AA"}},
+            {"id": "B2", "name": "Другой 001P-01", "kind": "corp", "cur": "RUB", "yield": 20.5, "dur": 2.8, "rating": {"v": "AA"}},
+        ]
+        row = {"short": "Ромашка", "desc": "до 22,5%, срок 3 года", "book": "", "rating": {"v": "AA"}}
+        nip = M.primary_nip_for(row, scr, rusfar=16.0, freeze_days=4)
+        self.assertEqual(nip["issuer_y"], 21.0)
+        self.assertEqual(nip["nip_issuer_bp"], 150)
+        self.assertEqual(nip["ref_src"], "issuer")
+        self.assertGreater(nip["freeze_cost_pct"], 0)
+        self.assertLess(nip["net_nip_bp"], nip["nip_bp"])
+
+        st = M._grp_stats([
+            {"p0": 100.5, "p7": 101.0, "p30": 102.0, "now": 102.0},
+            {"p0": 99.5, "p7": 99.8, "p30": 99.0, "now": 99.0},
+        ])
+        self.assertEqual((st["above0"], st["above7"], st["above30"]), (50.0, 50.0, 50.0))
+
 
 if __name__ == "__main__":
     unittest.main()
