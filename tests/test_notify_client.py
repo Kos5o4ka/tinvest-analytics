@@ -127,3 +127,17 @@ class T(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DigestEventLabels(unittest.TestCase):
+    """Строки «Ближайшие 7 дней» в сводке Telegram: типы выплат по-русски, без внутренних имён вроде amortization."""
+
+    def test_kinds_are_russian(self):
+        for kind, label in (("coupon", "купон"), ("amortization", "амортизация"), ("redemption", "погашение"),
+                            ("dividend", "дивиденд"), ("offer", "оферта")):
+            line = M._tg_ev_line(("2026-11-20", kind, "Выпуск", 5000))
+            self.assertEqual(line, "20.11 · %s · Выпуск · 5 000 ₽" % label)
+
+    def test_unknown_kind_has_no_english(self):
+        for kind in ("something_new", None):
+            self.assertIn(" · выплата · ", M._tg_ev_line(("2026-11-20", kind, "Выпуск", None)))

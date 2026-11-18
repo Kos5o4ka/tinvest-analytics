@@ -490,12 +490,13 @@ def _tg_payments(cfg, days):
     return sorted(ev, key=lambda x: (x[0], str(x[2])))
 
 
-_TG_EV = {"coupon": "купон", "dividend": "дивиденд", "redemption": "погашение", "offer": "оферта"}
+_TG_EV = {"coupon": "купон", "dividend": "дивиденд", "amortization": "амортизация", "redemption": "погашение",
+          "maturity": "погашение", "offer": "оферта", "call": "оферта CALL", "put": "оферта PUT", "buyback": "выкуп"}
 
 
 def _tg_ev_line(e):
     amt = " · %s ₽" % ("{:,.0f}".format(e[3]).replace(",", " ")) if e[3] else ""
-    return "%s · %s · %s%s" % (e[0][8:] + "." + e[0][5:7], _TG_EV.get(e[1], e[1] or ""), _tg_esc(e[2]), amt)
+    return "%s · %s · %s%s" % (e[0][8:] + "." + e[0][5:7], _TG_EV.get(e[1], "выплата"), _tg_esc(e[2]), amt)
 
 
 def tg_digest_text(cfg):
