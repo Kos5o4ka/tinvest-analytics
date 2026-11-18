@@ -205,6 +205,53 @@ class GeminiFixesTests(unittest.TestCase):
         ])
         self.assertEqual((st["above0"], st["above7"], st["above30"]), (50.0, 50.0, 50.0))
 
+    def test_feat_arb_inversion_and_fx_vs_rub(self):
+        rows = [
+            # Один эмитент, близкая дюрация -> арбитраж +200 б.п.
+            {"id": "A1", "isin": "RU000A0AAA01", "name": "Ромашка 001P-01", "kind": "corp", "cur": "RUB", "yield": 23.0, "dur": 2.0, "turn": 5e6, "rating": "AA"},
+            {"id": "A2", "isin": "RU000A0AAA02", "name": "Ромашка 001P-02", "kind": "corp", "cur": "RUB", "yield": 21.0, "dur": 2.1, "turn": 5e6, "rating": "AA"},
+            # Валютный выпуск того же эмитента -> безубыточная девальвация
+            {"id": "A3", "isin": "RU000A0AAA03", "name": "Ромашка 001P-USD", "kind": "corp", "cur": "USD", "yield": 8.0, "dur": 2.0, "turn": 2e6, "rating": "AA"},
+            # Эмитент с инверсией кривой (короткий 34%, длинный 26%) -> высокий стресс
+            {"id": "B1", "isin": "RU000A0BBB01", "name": "Стресс 001P-01", "kind": "corp", "cur": "RUB", "yield": 34.0, "dur": 0.6, "turn": 1e6, "rating": "BB"},
+            {"id": "B2", "isin": "RU000A0BBB02", "name": "Стресс 001P-02", "kind": "corp", "cur": "RUB", "yield": 26.0, "dur": 2.5, "turn": 1e6, "rating": "BB"},
+        ]
+        res = M.arb_compute(rows, fx_rates={"USD": 95.0}, fee_pct=0.05)
+        self.assertEqual(len(res["pairs"]), 1)
+        self.assertEqual(res["pairs"][0]["spread_bp"], 200)
+        self.assertGreater(res["pairs"][0]["payback_mo"], 0)
+        self.assertEqual(len(res["inversions"]), 1)
+        self.assertEqual(res["inversions"][0]["inv_bp"], 800)
+        self.assertEqual(res["inversions"][0]["severity"], "high")
+        self.assertEqual(len(res["fx_vs_rub"]), 1)
+        self.assertLess(res["fx_vs_rub"][0]["be_ldv_pct"], res["fx_vs_rub"][0]["be_pre_pct"])
+        self.assertGreater(res["fx_vs_rub"][0]["fx_breakeven_1y"], 95.0)
+
+    def test_feat_postmortem_and_ghost_portfolio(self):
+        from datetime import date
+        sales = [
+            {"bucket": "sec", "uid": "u1", "name": "Сбер", "ticker": "SBER", "type": "share", "qty": 10, "cost": 2000, "proceeds": 2500, "result": 500, "bdate": date(2026, 1, 1), "sdate": date(2026, 1, 11)},
+            {"bucket": "sec", "uid": "u2", "name": "Газпром", "ticker": "GAZP", "type": "share", "qty": 10, "cost": 2000, "proceeds": 1800, "result": -200, "bdate": date(2026, 1, 1), "sdate": date(2026, 3, 2)},
+            {"bucket": "sec", "uid": "u3", "name": "ВТБ", "ticker": "VTBR", "type": "share", "qty": 10, "cost": 2000, "proceeds": 1900, "result": -100, "bdate": date(2026, 1, 1), "sdate": date(2026, 3, 2)},
+            {"bucket": "sec", "uid": "u4", "name": "Лукойл", "ticker": "LKOH", "type": "share", "qty": 10, "cost": 2000, "proceeds": 1950, "result": -50, "bdate": date(2026, 1, 1), "sdate": date(2026, 3, 2)},
+        ]
+        st = M.pm_trades_stats(sales)
+        self.assertEqual((st["n"], st["wins"], st["losses"]), (4, 1, 3))
+        self.assertAlmostEqual(st["profit_factor"], 500 / 350, places=2)
+        self.assertTrue(st["disposition_flag"])
+        self.assertAlmostEqual(st["disposition_ratio"], 6.0, places=1)
+
+        hist = {"days": ["2026-01-01", "2026-01-02", "2026-01-03"],
+                "value": [100000.0, 105000.0, 220000.0],
+                "invested": [100000.0, 100000.0, 200000.0],
+                "bench": {"LQDT": [1.0, 1.01, 1.02], "TMOS": [10.0, 11.0, 11.0]}}
+        gh = M.pm_ghost_portfolio(hist)
+        self.assertTrue(gh["ok"])
+        by_c = {x["code"]: x for x in gh["items"]}
+        # LQDT: 100k по 1.0 -> 100k ед; +100k по 1.02 -> +98039.22 ед -> итого 198039.22 * 1.02 = 202000 ₽
+        self.assertAlmostEqual(by_c["LQDT"]["ghost_val"], 202000.0, places=1)
+        self.assertAlmostEqual(by_c["LQDT"]["diff_rub"], 18000.0, places=1)
+
 
 if __name__ == "__main__":
     unittest.main()

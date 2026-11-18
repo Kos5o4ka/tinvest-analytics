@@ -1,9 +1,9 @@
 /* ── UX-реворкинг: 9 разделов + вкладки .seg, Базовый/Профи, счёт в шапке, сворачиваемый сайдбар, подсказки, чек-лист, мини-тур ── */
 const UX_SECTIONS=[
   {id:'home',title:'Главная',icon:'dash',basic:true,tabs:['dash']},
-  {id:'pf',title:'Портфель',icon:'pos',basic:true,tabs:['pos','bonds','ret','bench','ops','fees','reb'],basicTabs:['pos','bonds','ret','ops','reb']},
+  {id:'pf',title:'Портфель',icon:'pos',basic:true,tabs:['pos','bonds','ret','bench','pm','ops','fees','reb'],basicTabs:['pos','bonds','ret','pm','ops','fees','reb']},
   {id:'pay_ev',title:'Выплаты и события',icon:'pay',basic:true,tabs:['pay','off','cal']},
-  {id:'bonds_mkt',title:'Облигации (рынок)',icon:'scr',basic:true,tabs:['scr','cmp','rot','dbx','lad','pri','map'],basicTabs:['scr','cmp','rot','lad','pri']},
+  {id:'bonds_mkt',title:'Облигации (рынок)',icon:'scr',basic:true,tabs:['scr','cmp','arb','rot','dbx','lad','pri','map'],basicTabs:['scr','cmp','arb','rot','lad','pri']},
   {id:'stocks_mkt',title:'Акции и фонды',icon:'hm',basic:false,tabs:['sst','hm','stk','mm']},
   {id:'pulse',title:'Пульс рынка',icon:'mkt',basic:false,tabs:['mkt','fng','flw','mic','sig']},
   {id:'risk_ctrl',title:'Надёжность и риски',icon:'risk',basic:false,tabs:['risk','mon','iss','crp','dfl','watch']},
@@ -11,9 +11,9 @@ const UX_SECTIONS=[
   {id:'calc_sec',title:'Калькулятор',icon:'calc',basic:true,tabs:['calc']}
 ];
 const UX_TAB_SHORT={
-  dash:'Главная',pos:'Позиции',bonds:'Облигации',ret:'Доходность',bench:'Бенчмарки',ops:'Операции',fees:'Комиссии',reb:'Ребалансировка',
+  dash:'Главная',pos:'Позиции',bonds:'Облигации',ret:'Доходность',bench:'Бенчмарки',pm:'Разбор сделок',ops:'Операции',fees:'Комиссии',reb:'Ребалансировка',
   pay:'Выплаты',off:'Оферты',cal:'Календарь',
-  scr:'Скринер',cmp:'Сравнение',rot:'Флоатеры или фиксы',dbx:'Линкеры и валютные',lad:'Лесенка',pri:'Первичка',map:'Карта рынка',
+  scr:'Скринер',cmp:'Сравнение',arb:'Кривые и арбитраж',rot:'Флоатеры или фиксы',dbx:'Линкеры и валютные',lad:'Лесенка',pri:'Первичка',map:'Карта рынка',
   sst:'Скринер акций',hm:'Тепловая карта',stk:'Карточка акции',mm:'Деньги и базис',
   mkt:'Ставки и КБД',fng:'Страх и жадность',flw:'Кто покупает',mic:'Стакан и ликвидность',sig:'Сигналы',
   risk:'Риски портфеля',mon:'Мониторинг',iss:'Эмитенты',crp:'Устойчивость',dfl:'Техдефолты',watch:'Наблюдение',
@@ -36,6 +36,8 @@ const UX_WHY={
   flw:'Агрессия покупателей и продавцов в ленте сделок и дисбаланс стакана в реальном времени.',
   fng:'Сводный индекс настроений российского рынка на основе волатильности, ширины рынка и потоков.',
   dfl:'Лента технических и фактических дефолтов по облигациям с e-disclosure и флагами Мосбиржи.',
+  arb:'Поиск перекосов доходности внутри одного эмитента, инверсий кривой (ранний сигнал риска) и безубыточной девальвации для валютных облигаций.',
+  pm:'Честное сравнение ваших вложений с LQDT/TMOS в те же даты (призрачный портфель) и разбор закрытых сделок по FIFO (Win Rate, эффект диспозиции).',
   bench:'Честное сравнение доходности вашего портфеля с индексами акций, облигаций и денежного рынка.'
 };
 
