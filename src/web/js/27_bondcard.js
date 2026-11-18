@@ -67,17 +67,34 @@ function bcDocLinks(isin,inn,secid){
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
 function bcKpi(k,v,s,cls){return`<div class="card"><div class="k">${k}</div><div class="v num ${cls||''}">${v}</div>${s?`<div class="s">${s}</div>`:''}</div>`}
 /* Раскрытие информации: сколько бумаг в рынке (по последнему купону, иначе по объёму выпуска) и последние факты с сервера данных */
-const BC_DISC_KIND={coupon_paid:'Купон выплачен',coupon_declared:'Ставка купона',default:'Неисполнение',buyback_result:'Итоги выкупа'};
+const BC_DISC_KIND={coupon_paid:'Купон выплачен',coupon_declared:'Ставка купона',default:'Неисполнение',buyback_result:'Итоги выкупа',placement_result:'Размещение / доразмещение'};
 function bcOutLine(o){
   if(!o||o.qty==null)return'';
+  const fmt=n=>Number(n).toLocaleString('ru-RU');
   const sh=o.share!=null?` (${Math.round(o.share*100)} % выпуска)`:'';
   const src=o.doc_url?`<a href="${esc(o.doc_url)}" target="_blank" rel="noopener">источник ↗</a>`:'';
-  const M={coupon_explicit:'купону',coupon_derived:'купону (число бумаг выведено из суммы)',declared_derived:'объявлению о купоне (число бумаг выведено из суммы)'};
+  const M={coupon_explicit:'купону',coupon_derived:'купону (выведено из суммы выплаты)',declared_derived:'объявлению о купоне (выведено из суммы)'};
   let how;
   if(M[o.method])how=`по ${M[o.method]}${o.coupon_no?' №'+esc(String(o.coupon_no)):''}${o.as_of?' от '+ddm(o.as_of):''}`;
   else how=o.method==='issue_placed'?'по размещённому объёму выпуска (Мосбиржа)':'по объёму выпуска (Мосбиржа)';
-  const bb=o.buybacks_after?` · с учётом выкупов после этой даты: ${o.buybacks_after}`:'';
-  return`<div class="bc-out"><b>В рынке:</b> <span class="num">${o.qty.toLocaleString('ru-RU')} шт.</span>${sh} · <span class="mu">${how}${bb}</span>${src?' · '+src:''}</div>`;
+  const bb=o.buybacks_after?` · выкупов после купона: ${o.buybacks_after}`:'';
+  const over=o.over_issue_size?' <span class="tag">выше ISSUESIZE (допвыпуск)</span>':'';
+  const chips=[];
+  if(o.issue_size!=null)chips.push(`<span>Выпущено: <b class="num">${fmt(o.issue_size)} шт.</b>${o.issue_date?' от '+ddm(o.issue_date):''}</span>`);
+  if(o.placed!=null&&o.placed!==o.issue_size)chips.push(`<span>Размещено первично: <b class="num">${fmt(o.placed)} шт.</b></span>`);
+  if(o.added_total>0)chips.push(`<span class="pos">Допвыпуск / доразмещение: <b class="num">+${fmt(o.added_total)} шт.</b></span>`);
+  if(o.buybacks_total>0)chips.push(`<span class="neg">Выкуплено (оферты/выкупы): <b class="num">−${fmt(o.buybacks_total)} шт.</b></span>`);
+  const evs=o.events||[];
+  let tl='';
+  if(evs.length>1||(evs.length===1&&evs[0].kind!=='issue')){
+    const rows=evs.map(e=>{
+      const dlt=e.delta==null?'—':(e.kind==='issue'?fmt(e.delta)+' шт.':(e.delta>0?`<span class="pos">+${fmt(e.delta)} шт.</span>`:`<span class="neg">−${fmt(Math.abs(e.delta))} шт.</span>`));
+      return`<tr><td class="l">${e.date?ddm(e.date):'—'}</td><td class="l">${esc(e.label||e.kind)}</td><td class="num">${dlt}</td><td>${e.url?`<a href="${esc(e.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`;
+    }).join('');
+    tl=`<details class="bc-out-det"><summary>История изменения объёма (${evs.length})</summary><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Событие</th><th>Объём / изменение</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  }
+  return`<div class="bc-out"><div><b>В рынке сейчас:</b> <span class="num">${fmt(o.qty)} шт.</span>${sh}${over} · <span class="mu">${how}${bb}</span>${src?' · '+src:''}</div>`
+    +(chips.length?`<div class="bc-out-meta">${chips.join('')}</div>`:'')+tl+`</div>`;
 }
 function bcDisclosure(dc){
   if(!dc)return'';

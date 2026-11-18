@@ -74,7 +74,7 @@ function typingInView(){
   const t=a.tagName;
   return t==='TEXTAREA'||t==='SELECT'||(t==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|file|color|image)$/.test(a.type));
 }
-function render(){if(!window.event&&typingInView()){_rPend=true;return}renderNow()}
+function render(){renderNow()}
 function renderSoon(){if(typingInView()){_rPend=true;return}renderNow()}
 document.addEventListener('focusout',()=>{if(_rPend)setTimeout(()=>{if(_rPend&&!typingInView())renderNow()},400)});
 function renderNow(){

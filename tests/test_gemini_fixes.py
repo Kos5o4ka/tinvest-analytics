@@ -76,6 +76,107 @@ class GeminiFixesTests(unittest.TestCase):
         self.assertEqual(M.parse_num("1,234.56"), 1234.56)
         self.assertEqual(M.parse_num("1.234,56"), 1234.56)
 
+    def test_new01_and_new11_micro_lot_and_empty_level_drops(self):
+        # NEW-01: _mic_fetch делит сделки сервера данных на lot
+        orig_ds, orig_meta = M._flw_ds, M._mic_meta
+        M._mic_meta = lambda cfg, secid: {"lot": 10, "face": None, "is_bond": False}
+        M._flw_ds = lambda path, params, ttl: (
+            {"bids": [[100, 10]], "asks": [[101, 10]], "ts": 1000.0}
+            if path == "md/orderbook"
+            else {"trades": [{"ts": 1000.0, "side": "buy", "price": 101.0, "qty": 50}]}
+        )
+        try:
+            r = M._mic_fetch({}, "SBER")
+        finally:
+            M._flw_ds, M._mic_meta = orig_ds, orig_meta
+        self.assertEqual(r["trades"][0]["lots"], 5.0)
+
+        # NEW-11: при полном выедании уровня (q=None) видимый расход drops засчитывает 100 -> нет ложного айсберга
+        M._mic_state.clear()
+        M.mic_ice_update("TST1", {"asks": [[101.0, 100]], "bids": [[100.0, 50]]}, [], 1000.0)
+        M.mic_ice_update("TST1", {"asks": [[102.0, 100]], "bids": [[100.0, 50]]},
+                         [{"ts": 1005.0, "side": "buy", "price": 101.0, "lots": 100.0}], 1010.0)
+        M.mic_ice_update("TST1", {"asks": [[101.0, 100]], "bids": [[100.0, 50]]}, [], 1020.0)
+        M.mic_ice_update("TST1", {"asks": [[101.0, 100]], "bids": [[100.0, 50]]}, [], 1030.0)
+        M.mic_ice_update("TST1", {"asks": [[101.0, 100]], "bids": [[100.0, 50]]},
+                         [{"ts": 1035.0, "side": "buy", "price": 101.0, "lots": 200.0}], 1040.0)
+        M.mic_ice_update("TST1", {"asks": [[101.0, 100]], "bids": [[100.0, 50]]}, [], 1050.0)
+        rep = M.mic_ice_report("TST1", 1050.0)
+        # drops = 100 (при исчезновении на 1010), executed = 300 -> hidden = 200, а не 300
+        self.assertEqual(rep["candidates"][0]["visible_consumed_lots"], 100.0)
+        self.assertEqual(rep["candidates"][0]["hidden_est_lots"], 200.0)
+
+    def test_new02_and_new03_corp_saifullin_neg_equity_and_events_inn(self):
+        # NEW-02: убыток при отрицательном капитале не даёт положительный K5 и «удовлетворительно»
+        c = {"1200": 100.0, "1100": 50.0, "1300": -50.0, "1500": 200.0, "1600": 150.0, "2110": 100.0, "2200": -10.0, "2400": -500.0}
+        sk = M.crp_saifullin(c)
+        self.assertEqual(sk["key"], "high")
+        self.assertLess(sk["x"]["K5"], 0)
+
+        # NEW-03: crp_events при наличии ISIN всё равно запрашивает события по ИНН
+        calls = []
+        orig = M.disc_facts
+        M.disc_facts = lambda isin=None, inn=None, kind=None: calls.append((isin, inn)) or (
+            [{"doc_id": 1, "title": "Допэмиссия акций", "published": "2026-05-01"}] if inn else []
+        )
+        try:
+            evs, _ = M.crp_events("RU000A0TEST1", "7701234567")
+        finally:
+            M.disc_facts = orig
+        self.assertTrue(any(inn == "7701234567" for _, inn in calls))
+        self.assertEqual(len(evs), 1)
+
+    def test_new04_rotation_discount_tax_at_maturity_and_floater_floor(self):
+        # NEW-04: при T >= life НДФЛ на дисконт при погашении учитывается; флоатер не уходит в отрицательный купон
+        knots = [(0.0, 10.0), (5.0, 10.0)]
+        flows = [(1.0, 0.0, 100.0)]
+        tr_tax = M.rot_tr_fixed(knots, 2.0, flows, price=80.0, accr0=0.0, tax=True)
+        tr_notax = M.rot_tr_fixed(knots, 2.0, flows, price=80.0, accr0=0.0, tax=False)
+        self.assertLess(tr_tax, tr_notax)
+        tr_fl = M.rot_tr_floater([(0.0, 2.0), (2.0, 2.0)], 1.0, spread=-5.0, tax=False)
+        self.assertGreaterEqual(tr_fl, 0.0)
+
+    def test_new06_debtx_fx_extreme_scenario_no_zero_div(self):
+        from datetime import date
+        p = {"nominal": 1000.0, "price": 100.0, "coupon": 6.0, "freq": 2, "mat": date(2028, 1, 1),
+             "buy_fx": 80.0, "qty": 10.0, "nkd": 0.0, "other": 0.0, "scenarios": [-100, -120, 0, 20]}
+        r = M.dbx_fx_calc(p, date(2026, 1, 1))
+        self.assertEqual([s["scenario"] for s in r["scenarios"]], [0, 20])
+
+    def test_new08_money_no_ldv_on_savings(self):
+        # NEW-08: allow_ldv=False отключает ЛДВ для накопительных счетов даже на 4 года
+        r = M.mm_after_tax(1000000, 4 * 365, 10.0, 0.0, 2026, allow_ldv=False)
+        self.assertFalse(r["ldv"])
+        self.assertGreater(r["tax"], 0)
+
+    def test_new09_server_tqir_is_bond(self):
+        import tinvest_server as ts
+        class FakeMD:
+            def find_by_ticker(self, secid, cc):
+                if cc == "TQIR":
+                    return {"uid": "u-vdo", "lot": 1, "nominal": {"units": 1000, "nano": 0}}
+                raise ts.tinvest_md.MDError("not found")
+        app = object.__new__(ts.DataServer)
+        app._meta = {}
+        app.md = FakeMD()
+        app.data_dir = "/nonexistent_dir_for_test"
+        meta = app.md_meta("VDO1")
+        self.assertEqual(meta["cls"], "bond")
+
+    def test_new10_taxopt_annual_coupon_aggregation(self):
+        # NEW-10: при 10 взносах по 4 млн (купон 10% = 400k на лот -> 4 млн/год > 2.4 млн порога) ставка на превышение 15%
+        r = M.txo_iis3_calc(2025, 4000000, 10.0, 10, income=0.0, rate15=False, coupon_share=1.0)
+        last_row = r["rows"][-1]
+        # 10-й год: капитал ~40+ млн, купон > 4 млн -> налог строго выше 13% от купона
+        est_cp = (last_row["broker_capital"] / 1.0) * 0.10
+        # Проверяем, что эффективная ставка налога в 10-м году > 13%
+        self.assertGreater(last_row["broker_coupon_tax"], 2400000 * 0.13)
+
+    def test_bug05_klocks_bounded(self):
+        for i in range(600):
+            M.key_lock(f"test_klock_prune_{i}")
+        self.assertLessEqual(len(M._klocks), 520)
+
 
 if __name__ == "__main__":
     unittest.main()

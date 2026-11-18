@@ -787,7 +787,7 @@ class DataServer:
                     continue
                 if i.get("uid"):
                     nom = i.get("nominal") or {}
-                    meta = {"uid": i["uid"], "lot": int(i.get("lot") or 1), "cls": "bond" if cc in ("TQCB", "TQOB") else "share",
+                    meta = {"uid": i["uid"], "lot": int(i.get("lot") or 1), "cls": "bond" if cc in ("TQCB", "TQOB", "TQIR") else "share",
                             "face": tinvest_md.quotation(nom) if nom else 0}
                     break
         if meta and meta.get("uid"):

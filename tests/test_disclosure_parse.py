@@ -238,3 +238,43 @@ class DefaultSeveralObligations(unittest.TestCase):
         f = T.dc_extract(txt, "Неисполнение обязательств эмитента перед владельцами его эмиссионных ценных бумаг")["facts"][0]
         self.assertEqual(f["obligation"], "amortization")
         self.assertAlmostEqual(f["amount"], 50000000.0, places=2)
+
+
+class OutstandingFixes(unittest.TestCase):
+    def test_qty_integer_kopeck_tolerance(self):
+        # OUT-02: расхождение 20 коп. при купоне 15 ₽ (ratio = 100000.0133) должно проходить qty_integer
+        r = T._dc_qty(1500000.20, 15.0, None)
+        self.assertEqual(r["qty_derived"], 100000)
+        self.assertTrue(r["checks"]["qty_integer"])
+        # Явно нецелое число (1234.56) по-прежнему False
+        bad = T._dc_qty(123456.0, 100.0, None)
+        self.assertFalse(bad["checks"]["qty_integer"])
+
+    def test_buyback_in_later_section(self):
+        # OUT-05: количество выкупа в п. 2.4 и заголовок «Об исполнении обязательств по приобретению»
+        txt = ("1.4. ИНН: 7701234567\n1.7. Дата: 15.10.2026\n"
+               "2.1. Идентификационные признаки ценных бумаг: облигации ISIN RU000A0TEST1\n"
+               "2.2. Основание приобретения: по требованию владельцев облигаций (оферта)\n"
+               "2.4. Количество приобретенных облигаций: 150 000 штук\n")
+        r = T.dc_extract(txt, "Об исполнении обязательств по приобретению облигаций")
+        self.assertEqual(r["kind"], "buyback_result")
+        self.assertEqual(r["facts"][0]["qty_bought"], 150000)
+        self.assertEqual(r["facts"][0]["basis"], "put")
+
+    def test_placement_additional_and_secondary(self):
+        # OUT-05: дополнительный выпуск и реализация выкупленных облигаций
+        txt1 = ("1.4. ИНН: 7701234567\n1.7. Дата: 10.06.2026\n"
+                "2.1. Облигации ISIN RU000A0TEST2\n"
+                "2.4. Количество фактически размещенных ценных бумаг: 500 000 штук\n")
+        r1 = T.dc_extract(txt1, "Сведения о завершении размещения дополнительного выпуска облигаций")
+        self.assertEqual(r1["kind"], "placement_result")
+        self.assertEqual(r1["facts"][0]["subkind"], "additional")
+        self.assertEqual(r1["facts"][0]["qty_placed"], 500000)
+
+        txt2 = ("1.4. ИНН: 7701234567\n1.7. Дата: 20.08.2026\n"
+                "2.1. Облигации ISIN RU000A0TEST2\n"
+                "2.3. Количество реализованных облигаций: 120 000 штук\n")
+        r2 = T.dc_extract(txt2, "Сообщение о реализации приобретенных эмитентом облигаций")
+        self.assertEqual(r2["kind"], "placement_result")
+        self.assertEqual(r2["facts"][0]["subkind"], "secondary")
+        self.assertEqual(r2["facts"][0]["qty_placed"], 120000)

@@ -4,7 +4,7 @@
 
 DISC_TTL, DISC_ERR_TTL = 6 * 3600, 15 * 60
 DISC_KIND_RU = {"coupon_paid": "Выплата купона", "coupon_declared": "Ставка купона", "default": "Неисполнение обязательства",
-                "buyback_result": "Итоги выкупа"}
+                "buyback_result": "Итоги выкупа", "placement_result": "Размещение / доразмещение"}
 DISC_OBL_RU = {"coupon": "Купон", "amortization": "Амортизация", "redemption": "Погашение", "offer": "Выкуп по оферте", "other": "Обязательство"}
 DISC_FX_RUB = ("", "RUB", "RUR", "SUR")
 
@@ -46,11 +46,11 @@ def disc_facts(isin=None, inn=None, kind=None):
 
 
 def _disc_issue_desc(isin):
-    """Объём выпуска из описания Мосбиржи: {issue_size, placed, face, cur, name}; кэш сутки. {} при ошибке."""
+    """Объём выпуска из описания Мосбиржи: {issue_size, placed, issue_date, face, cur, name}; кэш сутки. {} при ошибке."""
     isin = (isin or "").strip().upper()
     if not isin:
         return {}
-    key = "disc_desc1:" + isin
+    key = "disc_desc2:" + isin
     hit = store().get(key, ttl=DAY)
     if hit is not None:
         return hit
@@ -60,8 +60,9 @@ def _disc_issue_desc(isin):
     except Exception:  # noqa: BLE001
         return {}
     n = lambda k: (int(_disc_num(d.get(k))) if _disc_num(d.get(k)) else None)      # noqa: E731
-    out = {"issue_size": n("ISSUESIZE"), "placed": n("ISSUESIZEPLACED"), "face": _disc_num(d.get("FACEVALUE")),
-           "cur": d.get("FACEUNIT") or "SUR", "name": d.get("SHORTNAME") or d.get("NAME") or isin}
+    out = {"issue_size": n("ISSUESIZE"), "placed": n("ISSUESIZEPLACED"), "issue_date": d.get("ISSUEDATE") or None,
+           "face": _disc_num(d.get("FACEVALUE")), "cur": d.get("FACEUNIT") or "SUR",
+           "name": d.get("SHORTNAME") or d.get("NAME") or isin}
     if d:
         store().put(key, out)
     return out
@@ -78,9 +79,33 @@ def _disc_conf(f):
     return _disc_num(c) or 0.0
 
 
+def _disc_paid_qty(f):
+    """Извлекает (qty, method) из факта coupon_paid. При несовпадении п. 2.6 с суммой выплаты (total_matches=False)
+    приоритет отдаётся qty_derived = total / per_bond (реальный объём в рынке без казначейских бумаг).
+    Частичные выплаты (paid_pct < 99.5) пропускаются."""
+    if _disc_conf(f) < 0.5:
+        return None
+    d = f["data"]
+    pp = _disc_num(d.get("paid_pct"))
+    if pp is not None and pp < 99.5:
+        return None
+    ck = d.get("checks") or {}
+    q_exp = int(_disc_num(d["qty"])) if d.get("qty") is not None and _disc_num(d["qty"]) is not None else None
+    q_der = (int(_disc_num(d["qty_derived"]))
+             if d.get("qty_derived") is not None and _disc_num(d["qty_derived"]) is not None and ck.get("qty_integer")
+             else None)
+    if q_der is not None and q_der > 0 and ck.get("total_matches") is False and not ck.get("split_currency"):
+        return q_der, "coupon_derived"
+    if q_exp is not None:
+        return q_exp, "coupon_explicit"
+    if q_der is not None and q_der > 0:
+        return q_der, "coupon_derived"
+    return None
+
+
 def bond_outstanding(isin, today=None, desc=None):
     """Сколько бумаг выпуска в обращении: по последнему раскрытию (купон -> число бумаг), иначе по объёму выпуска Мосбиржи.
-    -> {qty, issue_size, placed, share, method, as_of, coupon_no, doc_url, buybacks_after, conf}."""
+    Возвращает также историю выпуска, доразмещений, выкупов на офертах и расчётных дельт между купонами."""
     isin = (isin or "").strip().upper()
     today = today or date.today().isoformat()
     try:
@@ -92,52 +117,146 @@ def bond_outstanding(isin, today=None, desc=None):
     except Exception:  # noqa: BLE001
         desc = {}
     size, placed = desc.get("issue_size"), desc.get("placed")
+    issue_date = desc.get("issue_date") or desc.get("ISSUEDATE") or None
     if desc.get("ISSUESIZE") is not None or desc.get("ISSUESIZEPLACED") is not None:       # передан сырой словарь ISS (_bc_desc)
         size = int(_disc_num(desc.get("ISSUESIZE")) or 0) or None
         placed = int(_disc_num(desc.get("ISSUESIZEPLACED")) or 0) or None
-    out = {"qty": None, "issue_size": size, "placed": placed, "share": None, "method": None, "as_of": None, "coupon_no": None,
-           "doc_url": None, "buybacks_after": 0, "conf": None}
+    out = {"qty": None, "issue_size": size, "placed": placed, "issue_date": issue_date, "share": None,
+           "method": None, "as_of": None, "coupon_no": None, "doc_url": None, "buybacks_after": 0, "conf": None,
+           "over_issue_size": False, "buybacks": [], "buybacks_total": 0, "placements": [], "added_total": 0,
+           "coupon_history": [], "events": []}
 
     def dated(kind):
         rows = [f for f in facts if f.get("kind") == kind and isinstance(f.get("data"), dict)]
         rows = [f for f in rows if (_disc_fdate(f) or "") <= today]
         return sorted(rows, key=lambda f: _disc_fdate(f) or "", reverse=True)
-    pick = None
+
+    # Все валидные купонные точки для хронологии и дельт
+    paid_valid = []
     for f in dated("coupon_paid"):
-        d = f["data"]
-        if _disc_conf(f) < 0.5:
-            continue
-        if d.get("qty") is not None and _disc_num(d["qty"]) is not None:
-            pick = (f, int(d["qty"]), "coupon_explicit")
-        elif d.get("qty_derived") is not None and (d.get("checks") or {}).get("qty_integer"):
-            pick = (f, int(d["qty_derived"]), "coupon_derived")
-        if pick:
-            break
+        res = _disc_paid_qty(f)
+        if res:
+            paid_valid.append((f, res[0], res[1]))
+    pick = paid_valid[0] if paid_valid else None
     if not pick:
         for f in dated("coupon_declared"):
             d = f["data"]
             if d.get("qty_derived") is not None and (d.get("checks") or {}).get("qty_integer"):
                 pick = (f, int(d["qty_derived"]), "declared_derived")
                 break
+
+    as_of = _disc_fdate(pick[0]) if pick else None
+
+    # Все выкупы (buyback_result) и размещения/допвыпуски (placement_result) в хронологическом порядке
+    bb_list = []
+    for b in reversed(dated("buyback_result")):
+        bd = b["data"].get("date") or b.get("event_date") or (b.get("published") or "")[:10]
+        qb = _disc_num(b["data"].get("qty_bought"))
+        bb_list.append({"date": bd, "qty": int(qb) if qb else None, "basis": b["data"].get("basis"),
+                        "url": b.get("url"), "after_coupon": bool(as_of and bd and bd > as_of)})
+    pl_list = []
+    for p in reversed(dated("placement_result")):
+        pd = p["data"].get("date") or p.get("event_date") or (p.get("published") or "")[:10]
+        qp = _disc_num(p["data"].get("qty_placed"))
+        sk = p["data"].get("subkind") or "primary"
+        pl_list.append({"date": pd, "qty": int(qp) if qp else None, "subkind": sk,
+                        "url": p.get("url"), "after_coupon": bool(as_of and pd and pd > as_of)})
+
+    bb_total = sum(x["qty"] for x in bb_list if x["qty"])
+    added_total = sum(x["qty"] for x in pl_list if x["qty"] and x["subkind"] in ("additional", "secondary"))
+
     if pick:
         f, qty, method = pick
-        as_of = _disc_fdate(f)
         n_bb = 0
-        for b in dated("buyback_result"):
-            bd = b["data"].get("date") or b.get("event_date") or (b.get("published") or "")[:10]
-            if as_of and bd and bd > as_of:
+        for b in bb_list:
+            if b["after_coupon"]:
                 n_bb += 1
-                qb = _disc_num(b["data"].get("qty_bought"))
-                if qb:
-                    qty = max(0, qty - int(qb))
+                if b["qty"]:
+                    qty = max(0, qty - b["qty"])
+        for p in pl_list:
+            if p["after_coupon"] and p["subkind"] in ("additional", "secondary") and p["qty"]:
+                qty += p["qty"]
+        confirmed_over = bool((f["data"].get("checks") or {}).get("total_matches") or added_total > 0)
         if size and qty > size:
-            qty = size
+            if confirmed_over and qty <= size * 5:
+                out["over_issue_size"] = True
+            else:
+                qty = size
         out.update(qty=qty, method=method, as_of=as_of, coupon_no=f["data"].get("coupon_no"), doc_url=f.get("url"),
                    buybacks_after=n_bb, conf=_disc_conf(f))
     elif placed:
         out.update(qty=placed, method="issue_placed", conf=0.3)
     elif size:
         out.update(qty=size, method="issue_size", conf=0.2)
+
+    # Хронология купонов (от старых к новым) и события изменения объёма
+    chist = [{"date": _disc_fdate(f), "coupon_no": f["data"].get("coupon_no"), "qty": q, "method": m, "doc_url": f.get("url")}
+             for f, q, m in reversed(paid_valid)]
+    events = []
+    if size or placed or issue_date:
+        events.append({"date": issue_date, "kind": "issue", "qty": placed or size, "issue_size": size, "placed": placed,
+                       "delta": placed or size, "label": "Выпуск / первичное размещение", "url": None})
+    for p in pl_list:
+        lbl = {"additional": "Дополнительный выпуск / доразмещение",
+               "secondary": "Реализация ранее выкупленных бумаг"}.get(p["subkind"], "Первичное размещение")
+        events.append({"date": p["date"], "kind": p["subkind"], "qty": p["qty"], "delta": p["qty"], "label": lbl, "url": p["url"]})
+    for b in bb_list:
+        blbl = {"put": "Выкуп по оферте (PUT)", "issuer": "Выкуп по соглашению эмитента"}.get(b["basis"], "Выкуп облигаций")
+        events.append({"date": b["date"], "kind": "buyback", "basis": b["basis"], "qty": b["qty"],
+                       "delta": (-b["qty"] if b["qty"] else None), "label": blbl, "url": b["url"]})
+
+    # Расчётные дельты между соседними купонами, не покрытые явными сообщениями о выкупе/размещении
+    inferred_bb, inferred_add = 0, 0
+    for idx in range(1, len(chist)):
+        prev_c, cur_c = chist[idx - 1], chist[idx]
+        delta = cur_c["qty"] - prev_c["qty"]
+        if not delta:
+            continue
+        d0, d1 = prev_c["date"] or "", cur_c["date"] or ""
+        if delta < 0:
+            covered = sum(x["qty"] for x in bb_list if x["qty"] and d0 < (x["date"] or "") <= d1)
+            if covered < abs(delta) * 0.5:
+                inferred_bb += abs(delta)
+                events.append({"date": cur_c["date"], "kind": "inferred_buyback", "qty": abs(delta), "delta": delta,
+                               "from_qty": prev_c["qty"], "to_qty": cur_c["qty"], "coupon_no": cur_c["coupon_no"],
+                               "label": "Сокращение объёма к купону №%s (вероятно выкуп/оферта)" % (cur_c["coupon_no"] or "?"),
+                               "url": cur_c["doc_url"]})
+        else:
+            covered = sum(x["qty"] for x in pl_list if x["qty"] and d0 < (x["date"] or "") <= d1)
+            if covered < delta * 0.5:
+                inferred_add += delta
+                events.append({"date": cur_c["date"], "kind": "inferred_placement", "qty": delta, "delta": delta,
+                               "from_qty": prev_c["qty"], "to_qty": cur_c["qty"], "coupon_no": cur_c["coupon_no"],
+                               "label": "Рост объёма к купону №%s (доразмещение / реализация)" % (cur_c["coupon_no"] or "?"),
+                               "url": cur_c["doc_url"]})
+
+    # Сравниваем первый купон с первичным объёмом (если до первого купона уже был выкуп или доразмещение)
+    base_init = placed or size
+    if chist and base_init:
+        first_c = chist[0]
+        d_first = first_c["date"] or ""
+        init_delta = first_c["qty"] - base_init
+        if init_delta < 0:
+            covered = sum(x["qty"] for x in bb_list if x["qty"] and (x["date"] or "") <= d_first)
+            if covered < abs(init_delta) * 0.5:
+                inferred_bb += abs(init_delta)
+                events.append({"date": first_c["date"], "kind": "inferred_buyback", "qty": abs(init_delta), "delta": init_delta,
+                               "from_qty": base_init, "to_qty": first_c["qty"], "coupon_no": first_c["coupon_no"],
+                               "label": "Выбытие до купона №%s (выкуп/неполное размещение)" % (first_c["coupon_no"] or "?"),
+                               "url": first_c["doc_url"]})
+        elif init_delta > 0 and placed and size and first_c["qty"] <= size:
+            covered = sum(x["qty"] for x in pl_list if x["qty"] and (x["date"] or "") <= d_first)
+            if covered < init_delta * 0.5:
+                inferred_add += init_delta
+                events.append({"date": first_c["date"], "kind": "inferred_placement", "qty": init_delta, "delta": init_delta,
+                               "from_qty": base_init, "to_qty": first_c["qty"], "coupon_no": first_c["coupon_no"],
+                               "label": "Доразмещение до купона №%s" % (first_c["coupon_no"] or "?"),
+                               "url": first_c["doc_url"]})
+
+    events.sort(key=lambda e: (e.get("date") or "0000-00-00", 0 if e["kind"] == "issue" else 1))
+    out.update(buybacks=bb_list, buybacks_total=bb_total + inferred_bb,
+               placements=pl_list, added_total=added_total + inferred_add,
+               coupon_history=chist, events=events)
     if out["qty"] is not None and size:
         out["share"] = round(out["qty"] / float(size), 4)
     return out
@@ -174,6 +293,12 @@ def disc_brief(f):
         if d.get("qty_bought") is not None:
             bits.append("выкуплено %s шт." % _disc_ru(d["qty_bought"]))
         bits.append({"put": "по требованию владельцев", "issuer": "по соглашению"}.get(d.get("basis"), ""))
+    elif k == "placement_result":
+        verb = {"additional": "доразмещено", "secondary": "реализовано"}.get(d.get("subkind"), "размещено")
+        if d.get("qty_placed") is not None:
+            bits.append("%s %s шт." % (verb, _disc_ru(d["qty_placed"])))
+        else:
+            bits.append(verb)
     return {"date": (f.get("published") or "")[:10] or _disc_fdate(f), "kind": k, "label": DISC_KIND_RU.get(k, k),
             "text": ", ".join(b for b in bits if b), "url": f.get("url"), "title": f.get("title")}
 

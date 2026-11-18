@@ -198,15 +198,17 @@ def txo_iis3_calc(open_year, contrib, yield_pct, years, income=0.0, rate15=None,
             ref = min(ref, tx_ndfl(income, yr)[0])
         refunds.append(ref)
         ref_prev = ref
-        # обычный счёт
+        # обычный счёт: налог с купонов считается на суммарный годовой доход по всем лотам (а не по каждому лоту отдельно),
+        # реинвестированные купоны образуют новый лот текущего года i (не наследуя старый срок владения для ЛДВ)
         lots.append([contrib, contrib, i])
-        cp_tax = 0.0
+        coupons = [l[1] * y * coupon_share for l in lots]
+        total_cp = sum(coupons)
+        cp_tax = txo_tax(total_cp, yr, rate15)
         for l in lots:
-            coupon = l[1] * y * coupon_share
-            t = txo_tax(coupon, yr, rate15)
-            cp_tax += t
-            l[1] += l[1] * y * (1.0 - coupon_share) + coupon - t
-            l[0] += coupon - t       # реинвестированный купон после налога — новая стоимость покупки
+            l[1] += l[1] * y * (1.0 - coupon_share)
+        net_cp = total_cp - cp_tax
+        if net_cp > 0:
+            lots.append([net_cp, net_cp, i])
         paid_tax += cp_tax
         rows.append({"year": yr, "n": i, "contribution": contrib, "deduct_base": ded_base, "refund": ref, "iis_capital": cap, "iis_deposits": dep,
                      "broker_capital": sum(l[1] for l in lots), "broker_coupon_tax": cp_tax, "own": contrib * i})

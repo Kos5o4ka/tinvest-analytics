@@ -328,6 +328,9 @@ _klocks, _klocks_lock = {}, threading.Lock()
 def key_lock(key):
     """Блокировка на ключ: одинаковую тяжёлую работу (запросы к API) параллельные потоки выполняют по одному разу."""
     with _klocks_lock:
+        if len(_klocks) > 512:
+            for k in [k for k, v in _klocks.items() if k != key and not v.locked()]:
+                _klocks.pop(k, None)
         lk = _klocks.get(key)
         if lk is None:
             lk = _klocks[key] = threading.Lock()
@@ -542,14 +545,38 @@ class TInvest:
                          {"instrumentId": instrument_id, "from": frm, "to": to}, timeout=30).get("trades") or []
 
 
+_POOL_LOCK = threading.Lock()
+_POOL = None
+_POOL_TL = threading.local()
+
+
+def _shared_pool():
+    global _POOL
+    if _POOL is None:
+        with _POOL_LOCK:
+            if _POOL is None:
+                _POOL = ThreadPoolExecutor(max_workers=16)
+    return _POOL
+
+
 def pool_map(fn, items, workers=8):
     items = list(items)
     if not items:
         return []
     if len(items) == 1:
         return [fn(items[0])]
-    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
-        return list(ex.map(fn, items))
+    # При вложенном вызове из рабочего потока пула используем локальный пул, чтобы исключить deadlock
+    if getattr(_POOL_TL, "in_pool", False):
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
+            return list(ex.map(fn, items))
+    def _wrap(x):
+        _POOL_TL.in_pool = True
+        try:
+            return fn(x)
+        finally:
+            _POOL_TL.in_pool = False
+    futs = [_shared_pool().submit(_wrap, x) for x in items]
+    return [f.result() for f in futs]
 
 
 # ═══════════════════════════════ справочник инструментов ═══════════════════════════════
@@ -5279,7 +5306,7 @@ def doc_text(data, ctype="", name=""):
 # ищется по тексту его заголовка (до двоеточия), а номер — запасной вариант.
 # TODO: при нескольких ISIN в одном сообщении числа не делятся по блокам — каждому ISIN достаются общие значения (+ warning).
 
-DC_PARSER_VERSION = "2"   # повышать при изменении логики разбора: сборщик (--reparse) перечитывает старые записи
+DC_PARSER_VERSION = "3"   # повышать при изменении логики разбора: сборщик (--reparse) перечитывает старые записи
 
 _DC_MONTHS = {"янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5, "июн": 6, "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12}
 _DC_DATE_TXT = re.compile(r"(?<!\d)(\d{1,2})\s*[»\"”’']?\s*(январ[яь]|феврал[яь]|марта?|апрел[яь]|ма[йя]|июн[яь]|июл[яь]|август[а]?|сентябр[яь]|октябр[яь]|ноябр[яь]|декабр[яь])\s*(\d{4})", re.I)
@@ -5365,7 +5392,11 @@ def dc_sections(text):
 def dc_classify(title, text):
     s = ((title or "") + " " + (text or "")[:600]).lower()
     s = re.sub(r"\s+", " ", s)
-    if "итогах приобретения" in s:
+    if ("реализации приобретенных" in s or "реализации приобретённых" in s
+            or "продаже ранее приобретенных" in s or "вторичной продаже" in s):
+        return "placement_result"
+    if ("итогах приобретения" in s or "результатах приобретения" in s
+            or "исполнении обязательств по приобретению" in s):
         return "buyback_result"
     if "неисполнение обязательств" in s:
         return "default"
@@ -5373,6 +5404,9 @@ def dc_classify(title, text):
         return "coupon_paid"
     if "начисленные доходы" in s or "начисленных (объявленных) доходах" in s:
         return "coupon_declared"
+    if ("завершении размещения" in s or "итогах размещения" in s or "результатах размещения" in s
+            or ("дополнительн" in s and "размещ" in s and "облигац" in s)):
+        return "placement_result"
     return "other"
 
 
@@ -5574,8 +5608,12 @@ def _dc_qty(total, per_bond, qty, qty_tol=0.0051):
     r = {"qty_derived": None, "qty_out": qty, "checks": {}}
     if total and per_bond:
         ratio = total / per_bond
-        r["qty_derived"] = int(round(ratio))
-        r["checks"]["qty_integer"] = abs(ratio - round(ratio)) < 0.01
+        q_est = int(round(ratio))
+        r["qty_derived"] = q_est
+        r["checks"]["qty_integer"] = q_est > 0 and (
+            abs(ratio - q_est) < 0.01
+            or (abs(per_bond * q_est - total) <= max(1.0, qty_tol * q_est) and abs(ratio - q_est) < 0.25)
+        )
     if qty is not None and total is not None and per_bond is not None:
         r["checks"]["total_matches"] = abs(per_bond * qty - total) <= max(1.0, 0.5 * per_bond, qty_tol * qty)
     if qty is None:
@@ -5835,13 +5873,44 @@ def _dc_default_age(f, ref_date):
 
 
 def _dc_buyback(secs, text, event_date):
-    body = (secs.get("2.1") or "") + " " + (secs.get("2.2") or "")
-    m = re.search(r"в количестве\s+(\d[\d  ]*)", body, re.I)
-    qty = _dc_int(dc_parse_number(m.group(1))) if m else None
+    sec2 = " ".join(v for k, v in secs.items() if k.startswith("2."))
+    body = sec2 or ((secs.get("2.1") or "") + " " + (secs.get("2.2") or ""))
+    qty_v = _dc_pick(secs, r"количество\s+(?:фактически\s+)?(?:приобрет|выкуп)|фактически\s+(?:приобрет|выкуп)", None)
+    qty = dc_parse_qty(qty_v) if qty_v else None
+    if qty is None:
+        m = re.search(r"(?:в\s+количестве|приобретено|выкуплено)\s*[:\-–]?\s*(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)", body, re.I)
+        qty = _dc_int(dc_parse_number(m.group(1))) if m else None
+    if qty is None:
+        for k, v in secs.items():
+            if k.startswith("2.") and re.search(r"приобрет|выкуп", v, re.I):
+                cand = dc_parse_qty(v)
+                if cand:
+                    qty = cand
+                    break
     lb = body.lower()
-    basis = "put" if "по требованию владельцев" in lb else "issuer" if ("по соглашению с владельцами" in lb or "по усмотрению" in lb) else None
-    d3 = dc_parse_date(_dc_pick(secs, r"дата наступления события", "2.3") or "")
+    basis = ("put" if ("по требованию владельцев" in lb or "требованию их владельцев" in lb or "оферт" in lb)
+             else "issuer" if ("по соглашению с владельцами" in lb or "по усмотрению" in lb) else None)
+    d3 = dc_parse_date(_dc_pick(secs, r"дата\s+(?:приобретения|выкупа|наступления\s+события|исполнения)", "2.3") or "")
     return {"qty_bought": qty, "basis": basis, "date": event_date or d3, "conf": 1.0 if qty else 0.5, "checks": {}}
+
+
+def _dc_placement(secs, text, title, event_date):
+    sec2 = " ".join(v for k, v in secs.items() if k.startswith("2."))
+    body = sec2 or text or ""
+    low = ((title or "") + " " + body[:1200]).lower()
+    if "реализации приобрет" in low or "продаже ранее приобрет" in low or "вторичной продаже" in low:
+        subkind = "secondary"
+    elif "дополнительн" in low or "доразмещ" in low:
+        subkind = "additional"
+    else:
+        subkind = "primary"
+    qty_v = _dc_pick(secs, r"количество\s+(?:фактически\s+)?(?:размещ|реализован|продан)|фактически\s+(?:размещ|реализован)", None)
+    qty = dc_parse_qty(qty_v) if qty_v else None
+    if qty is None:
+        m = re.search(r"(?:размещено|реализовано|продано|в\s+количестве)\s*[:\-–]?\s*(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)", body, re.I)
+        qty = _dc_int(dc_parse_number(m.group(1))) if m else None
+    d3 = dc_parse_date(_dc_pick(secs, r"дата\s+(?:фактического\s+)?(?:окончания|завершения|реализации|размещения|наступления)", "2.3") or "")
+    return {"qty_placed": qty, "subkind": subkind, "date": d3 or event_date, "conf": 1.0 if qty else 0.5, "checks": {}}
 
 
 def dc_extract(text, title="", meta=None):
@@ -5865,8 +5934,8 @@ def dc_extract(text, title="", meta=None):
     event_date = dc_parse_date(secs.get("1.7", ""))
     res = {"kind": kind, "inn": inn, "ogrn": ogrn, "event_date": event_date, "published": meta.get("published"),
            "code": meta.get("code"), "company": meta.get("company"), "facts": [], "warnings": warnings}
-    if kind == "buyback_result":
-        isins = _dc_isins(secs.get("2.1"), secs.get("2.2"))
+    if kind in ("buyback_result", "placement_result"):
+        isins = _dc_isins(secs.get("2.1"), secs.get("2.2"), secs.get("2.3"))
     elif kind == "other":
         isins = _dc_isins(secs.get("2.4"), secs.get("2.1"))
     else:
@@ -5890,6 +5959,8 @@ def dc_extract(text, title="", meta=None):
     elif kind == "default":
         f = _dc_default(secs, text)
         _dc_default_age(f, event_date or dc_parse_date(meta.get("published") or ""))
+    elif kind == "placement_result":
+        f = _dc_placement(secs, text, title, event_date)
     else:
         f = _dc_buyback(secs, text, event_date)
     for w in f.get("warn") or []:
@@ -8791,17 +8862,6 @@ def _mon_curves(days):
         cache = {k: v for k, v in cache.items() if k >= keep}
         st.put(MON_CURVE_KEY, cache)
     return cache
-
-
-def _interp(pts, t):
-    if not pts or t is None:
-        return None
-    if t <= pts[0][0]:
-        return pts[0][1]
-    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
-        if t <= x1:
-            return y0 + (y1 - y0) * (t - x0) / (x1 - x0)
-    return pts[-1][1]
 
 
 def _curve_on(curves, sorted_dates, d):
@@ -15047,7 +15107,7 @@ API_GET["/api/today"] = today_get
 
 DISC_TTL, DISC_ERR_TTL = 6 * 3600, 15 * 60
 DISC_KIND_RU = {"coupon_paid": "Выплата купона", "coupon_declared": "Ставка купона", "default": "Неисполнение обязательства",
-                "buyback_result": "Итоги выкупа"}
+                "buyback_result": "Итоги выкупа", "placement_result": "Размещение / доразмещение"}
 DISC_OBL_RU = {"coupon": "Купон", "amortization": "Амортизация", "redemption": "Погашение", "offer": "Выкуп по оферте", "other": "Обязательство"}
 DISC_FX_RUB = ("", "RUB", "RUR", "SUR")
 
@@ -15089,11 +15149,11 @@ def disc_facts(isin=None, inn=None, kind=None):
 
 
 def _disc_issue_desc(isin):
-    """Объём выпуска из описания Мосбиржи: {issue_size, placed, face, cur, name}; кэш сутки. {} при ошибке."""
+    """Объём выпуска из описания Мосбиржи: {issue_size, placed, issue_date, face, cur, name}; кэш сутки. {} при ошибке."""
     isin = (isin or "").strip().upper()
     if not isin:
         return {}
-    key = "disc_desc1:" + isin
+    key = "disc_desc2:" + isin
     hit = store().get(key, ttl=DAY)
     if hit is not None:
         return hit
@@ -15103,8 +15163,9 @@ def _disc_issue_desc(isin):
     except Exception:  # noqa: BLE001
         return {}
     n = lambda k: (int(_disc_num(d.get(k))) if _disc_num(d.get(k)) else None)      # noqa: E731
-    out = {"issue_size": n("ISSUESIZE"), "placed": n("ISSUESIZEPLACED"), "face": _disc_num(d.get("FACEVALUE")),
-           "cur": d.get("FACEUNIT") or "SUR", "name": d.get("SHORTNAME") or d.get("NAME") or isin}
+    out = {"issue_size": n("ISSUESIZE"), "placed": n("ISSUESIZEPLACED"), "issue_date": d.get("ISSUEDATE") or None,
+           "face": _disc_num(d.get("FACEVALUE")), "cur": d.get("FACEUNIT") or "SUR",
+           "name": d.get("SHORTNAME") or d.get("NAME") or isin}
     if d:
         store().put(key, out)
     return out
@@ -15121,9 +15182,33 @@ def _disc_conf(f):
     return _disc_num(c) or 0.0
 
 
+def _disc_paid_qty(f):
+    """Извлекает (qty, method) из факта coupon_paid. При несовпадении п. 2.6 с суммой выплаты (total_matches=False)
+    приоритет отдаётся qty_derived = total / per_bond (реальный объём в рынке без казначейских бумаг).
+    Частичные выплаты (paid_pct < 99.5) пропускаются."""
+    if _disc_conf(f) < 0.5:
+        return None
+    d = f["data"]
+    pp = _disc_num(d.get("paid_pct"))
+    if pp is not None and pp < 99.5:
+        return None
+    ck = d.get("checks") or {}
+    q_exp = int(_disc_num(d["qty"])) if d.get("qty") is not None and _disc_num(d["qty"]) is not None else None
+    q_der = (int(_disc_num(d["qty_derived"]))
+             if d.get("qty_derived") is not None and _disc_num(d["qty_derived"]) is not None and ck.get("qty_integer")
+             else None)
+    if q_der is not None and q_der > 0 and ck.get("total_matches") is False and not ck.get("split_currency"):
+        return q_der, "coupon_derived"
+    if q_exp is not None:
+        return q_exp, "coupon_explicit"
+    if q_der is not None and q_der > 0:
+        return q_der, "coupon_derived"
+    return None
+
+
 def bond_outstanding(isin, today=None, desc=None):
     """Сколько бумаг выпуска в обращении: по последнему раскрытию (купон -> число бумаг), иначе по объёму выпуска Мосбиржи.
-    -> {qty, issue_size, placed, share, method, as_of, coupon_no, doc_url, buybacks_after, conf}."""
+    Возвращает также историю выпуска, доразмещений, выкупов на офертах и расчётных дельт между купонами."""
     isin = (isin or "").strip().upper()
     today = today or date.today().isoformat()
     try:
@@ -15135,52 +15220,146 @@ def bond_outstanding(isin, today=None, desc=None):
     except Exception:  # noqa: BLE001
         desc = {}
     size, placed = desc.get("issue_size"), desc.get("placed")
+    issue_date = desc.get("issue_date") or desc.get("ISSUEDATE") or None
     if desc.get("ISSUESIZE") is not None or desc.get("ISSUESIZEPLACED") is not None:       # передан сырой словарь ISS (_bc_desc)
         size = int(_disc_num(desc.get("ISSUESIZE")) or 0) or None
         placed = int(_disc_num(desc.get("ISSUESIZEPLACED")) or 0) or None
-    out = {"qty": None, "issue_size": size, "placed": placed, "share": None, "method": None, "as_of": None, "coupon_no": None,
-           "doc_url": None, "buybacks_after": 0, "conf": None}
+    out = {"qty": None, "issue_size": size, "placed": placed, "issue_date": issue_date, "share": None,
+           "method": None, "as_of": None, "coupon_no": None, "doc_url": None, "buybacks_after": 0, "conf": None,
+           "over_issue_size": False, "buybacks": [], "buybacks_total": 0, "placements": [], "added_total": 0,
+           "coupon_history": [], "events": []}
 
     def dated(kind):
         rows = [f for f in facts if f.get("kind") == kind and isinstance(f.get("data"), dict)]
         rows = [f for f in rows if (_disc_fdate(f) or "") <= today]
         return sorted(rows, key=lambda f: _disc_fdate(f) or "", reverse=True)
-    pick = None
+
+    # Все валидные купонные точки для хронологии и дельт
+    paid_valid = []
     for f in dated("coupon_paid"):
-        d = f["data"]
-        if _disc_conf(f) < 0.5:
-            continue
-        if d.get("qty") is not None and _disc_num(d["qty"]) is not None:
-            pick = (f, int(d["qty"]), "coupon_explicit")
-        elif d.get("qty_derived") is not None and (d.get("checks") or {}).get("qty_integer"):
-            pick = (f, int(d["qty_derived"]), "coupon_derived")
-        if pick:
-            break
+        res = _disc_paid_qty(f)
+        if res:
+            paid_valid.append((f, res[0], res[1]))
+    pick = paid_valid[0] if paid_valid else None
     if not pick:
         for f in dated("coupon_declared"):
             d = f["data"]
             if d.get("qty_derived") is not None and (d.get("checks") or {}).get("qty_integer"):
                 pick = (f, int(d["qty_derived"]), "declared_derived")
                 break
+
+    as_of = _disc_fdate(pick[0]) if pick else None
+
+    # Все выкупы (buyback_result) и размещения/допвыпуски (placement_result) в хронологическом порядке
+    bb_list = []
+    for b in reversed(dated("buyback_result")):
+        bd = b["data"].get("date") or b.get("event_date") or (b.get("published") or "")[:10]
+        qb = _disc_num(b["data"].get("qty_bought"))
+        bb_list.append({"date": bd, "qty": int(qb) if qb else None, "basis": b["data"].get("basis"),
+                        "url": b.get("url"), "after_coupon": bool(as_of and bd and bd > as_of)})
+    pl_list = []
+    for p in reversed(dated("placement_result")):
+        pd = p["data"].get("date") or p.get("event_date") or (p.get("published") or "")[:10]
+        qp = _disc_num(p["data"].get("qty_placed"))
+        sk = p["data"].get("subkind") or "primary"
+        pl_list.append({"date": pd, "qty": int(qp) if qp else None, "subkind": sk,
+                        "url": p.get("url"), "after_coupon": bool(as_of and pd and pd > as_of)})
+
+    bb_total = sum(x["qty"] for x in bb_list if x["qty"])
+    added_total = sum(x["qty"] for x in pl_list if x["qty"] and x["subkind"] in ("additional", "secondary"))
+
     if pick:
         f, qty, method = pick
-        as_of = _disc_fdate(f)
         n_bb = 0
-        for b in dated("buyback_result"):
-            bd = b["data"].get("date") or b.get("event_date") or (b.get("published") or "")[:10]
-            if as_of and bd and bd > as_of:
+        for b in bb_list:
+            if b["after_coupon"]:
                 n_bb += 1
-                qb = _disc_num(b["data"].get("qty_bought"))
-                if qb:
-                    qty = max(0, qty - int(qb))
+                if b["qty"]:
+                    qty = max(0, qty - b["qty"])
+        for p in pl_list:
+            if p["after_coupon"] and p["subkind"] in ("additional", "secondary") and p["qty"]:
+                qty += p["qty"]
+        confirmed_over = bool((f["data"].get("checks") or {}).get("total_matches") or added_total > 0)
         if size and qty > size:
-            qty = size
+            if confirmed_over and qty <= size * 5:
+                out["over_issue_size"] = True
+            else:
+                qty = size
         out.update(qty=qty, method=method, as_of=as_of, coupon_no=f["data"].get("coupon_no"), doc_url=f.get("url"),
                    buybacks_after=n_bb, conf=_disc_conf(f))
     elif placed:
         out.update(qty=placed, method="issue_placed", conf=0.3)
     elif size:
         out.update(qty=size, method="issue_size", conf=0.2)
+
+    # Хронология купонов (от старых к новым) и события изменения объёма
+    chist = [{"date": _disc_fdate(f), "coupon_no": f["data"].get("coupon_no"), "qty": q, "method": m, "doc_url": f.get("url")}
+             for f, q, m in reversed(paid_valid)]
+    events = []
+    if size or placed or issue_date:
+        events.append({"date": issue_date, "kind": "issue", "qty": placed or size, "issue_size": size, "placed": placed,
+                       "delta": placed or size, "label": "Выпуск / первичное размещение", "url": None})
+    for p in pl_list:
+        lbl = {"additional": "Дополнительный выпуск / доразмещение",
+               "secondary": "Реализация ранее выкупленных бумаг"}.get(p["subkind"], "Первичное размещение")
+        events.append({"date": p["date"], "kind": p["subkind"], "qty": p["qty"], "delta": p["qty"], "label": lbl, "url": p["url"]})
+    for b in bb_list:
+        blbl = {"put": "Выкуп по оферте (PUT)", "issuer": "Выкуп по соглашению эмитента"}.get(b["basis"], "Выкуп облигаций")
+        events.append({"date": b["date"], "kind": "buyback", "basis": b["basis"], "qty": b["qty"],
+                       "delta": (-b["qty"] if b["qty"] else None), "label": blbl, "url": b["url"]})
+
+    # Расчётные дельты между соседними купонами, не покрытые явными сообщениями о выкупе/размещении
+    inferred_bb, inferred_add = 0, 0
+    for idx in range(1, len(chist)):
+        prev_c, cur_c = chist[idx - 1], chist[idx]
+        delta = cur_c["qty"] - prev_c["qty"]
+        if not delta:
+            continue
+        d0, d1 = prev_c["date"] or "", cur_c["date"] or ""
+        if delta < 0:
+            covered = sum(x["qty"] for x in bb_list if x["qty"] and d0 < (x["date"] or "") <= d1)
+            if covered < abs(delta) * 0.5:
+                inferred_bb += abs(delta)
+                events.append({"date": cur_c["date"], "kind": "inferred_buyback", "qty": abs(delta), "delta": delta,
+                               "from_qty": prev_c["qty"], "to_qty": cur_c["qty"], "coupon_no": cur_c["coupon_no"],
+                               "label": "Сокращение объёма к купону №%s (вероятно выкуп/оферта)" % (cur_c["coupon_no"] or "?"),
+                               "url": cur_c["doc_url"]})
+        else:
+            covered = sum(x["qty"] for x in pl_list if x["qty"] and d0 < (x["date"] or "") <= d1)
+            if covered < delta * 0.5:
+                inferred_add += delta
+                events.append({"date": cur_c["date"], "kind": "inferred_placement", "qty": delta, "delta": delta,
+                               "from_qty": prev_c["qty"], "to_qty": cur_c["qty"], "coupon_no": cur_c["coupon_no"],
+                               "label": "Рост объёма к купону №%s (доразмещение / реализация)" % (cur_c["coupon_no"] or "?"),
+                               "url": cur_c["doc_url"]})
+
+    # Сравниваем первый купон с первичным объёмом (если до первого купона уже был выкуп или доразмещение)
+    base_init = placed or size
+    if chist and base_init:
+        first_c = chist[0]
+        d_first = first_c["date"] or ""
+        init_delta = first_c["qty"] - base_init
+        if init_delta < 0:
+            covered = sum(x["qty"] for x in bb_list if x["qty"] and (x["date"] or "") <= d_first)
+            if covered < abs(init_delta) * 0.5:
+                inferred_bb += abs(init_delta)
+                events.append({"date": first_c["date"], "kind": "inferred_buyback", "qty": abs(init_delta), "delta": init_delta,
+                               "from_qty": base_init, "to_qty": first_c["qty"], "coupon_no": first_c["coupon_no"],
+                               "label": "Выбытие до купона №%s (выкуп/неполное размещение)" % (first_c["coupon_no"] or "?"),
+                               "url": first_c["doc_url"]})
+        elif init_delta > 0 and placed and size and first_c["qty"] <= size:
+            covered = sum(x["qty"] for x in pl_list if x["qty"] and (x["date"] or "") <= d_first)
+            if covered < init_delta * 0.5:
+                inferred_add += init_delta
+                events.append({"date": first_c["date"], "kind": "inferred_placement", "qty": init_delta, "delta": init_delta,
+                               "from_qty": base_init, "to_qty": first_c["qty"], "coupon_no": first_c["coupon_no"],
+                               "label": "Доразмещение до купона №%s" % (first_c["coupon_no"] or "?"),
+                               "url": first_c["doc_url"]})
+
+    events.sort(key=lambda e: (e.get("date") or "0000-00-00", 0 if e["kind"] == "issue" else 1))
+    out.update(buybacks=bb_list, buybacks_total=bb_total + inferred_bb,
+               placements=pl_list, added_total=added_total + inferred_add,
+               coupon_history=chist, events=events)
     if out["qty"] is not None and size:
         out["share"] = round(out["qty"] / float(size), 4)
     return out
@@ -15217,6 +15396,12 @@ def disc_brief(f):
         if d.get("qty_bought") is not None:
             bits.append("выкуплено %s шт." % _disc_ru(d["qty_bought"]))
         bits.append({"put": "по требованию владельцев", "issuer": "по соглашению"}.get(d.get("basis"), ""))
+    elif k == "placement_result":
+        verb = {"additional": "доразмещено", "secondary": "реализовано"}.get(d.get("subkind"), "размещено")
+        if d.get("qty_placed") is not None:
+            bits.append("%s %s шт." % (verb, _disc_ru(d["qty_placed"])))
+        else:
+            bits.append(verb)
     return {"date": (f.get("published") or "")[:10] or _disc_fdate(f), "kind": k, "label": DISC_KIND_RU.get(k, k),
             "text": ", ".join(b for b in bits if b), "url": f.get("url"), "title": f.get("title")}
 
@@ -17772,7 +17957,7 @@ def rot_tr_floater(knots, T, spread, tax=True, period=0.25):
     v, t = 0.0, 0.0
     while t < T - 1e-9:
         e = min(t + period, T)
-        c = (rot_rate(knots, t) + spread) / 100.0 * (e - t)
+        c = max(0.0, rot_rate(knots, t) + spread) / 100.0 * (e - t)
         v += c * k * rot_growth(knots, e, T)
         t = e
     return ((1.0 + v) ** (1.0 / T) - 1.0) * 100.0
@@ -17849,15 +18034,16 @@ def rot_tr_fixed(knots, T, flows, price, accr0=0.0, betas=None, tax=True, y0=Non
     accT = rot_accr(flows, T)
     cleanT = max(0.0, dirtyT - accT)
     # НКД, уплаченный при покупке, уменьшает налоговую базу первого купона (НДФЛ — только с разницы)
-    cash, ded = 0.0, accr0
+    cash, ded, repaid = 0.0, accr0, 0.0
     for t, c, p in flows:
         if t > T + 1e-9:
             break
         base_c = max(0.0, c - ded)
         ded = max(0.0, ded - c)
         net_c = (c - ROT_TAX * base_c) if tax else c
+        repaid += p
         cash += (net_c + p) * rot_growth(knots, t, T)
-    gain_tax = ROT_TAX * max(0.0, cleanT - price) if tax else 0.0
+    gain_tax = ROT_TAX * max(0.0, cleanT + repaid - price) if tax else 0.0
     acc_net = (accT - ROT_TAX * max(0.0, accT - ded)) if tax else accT     # если купона до горизонта не было
     val = cleanT + acc_net + cash - gain_tax
     if val <= 0:
@@ -18579,26 +18765,51 @@ def dbx_fx_calc(p, today=None):
         raise ValueError("Дата погашения должна быть в будущем")
     q, nom, fx0 = p["qty"], p["nominal"], p["buy_fx"]
     cost_cur = (nom * p["price"] / 100.0 + p.get("nkd", 0.0)) * q
+    cost_rub = cost_cur * fx0
     cpn_cur = nom * p["coupon"] / 100.0 / p["freq"] * q
     dates = dbx_coupon_dates(today, mat, p["freq"])
     span = float((mat - today).days)
     res = []
     for s in p["scenarios"]:
+        if s <= -99.0:
+            continue
         fxm = fx0 * (1 + s / 100.0)
+        if fxm <= 0:
+            continue
 
         def fx_at(d, fxm=fxm):
             return fx0 + (fxm - fx0) * ((d - today).days / span)
-        cpn_rub = sum(cpn_cur * fx_at(d) for d in dates)
+        other = p.get("other", 0.0)
+        # НДФЛ с купонов удерживается в даты их выплат (с учётом прогрессии по году), налог с тела — при погашении
+        yr_acc = {}
+        cpn_rub, cpn_tax_total = 0.0, 0.0
+        flows_c, flows_r = [(today, -cost_cur)], [(today, -cost_rub)]
+        post_flows_c, post_flows_r = [(today, -cost_cur)], [(today, -cost_rub)]
+        for d in dates:
+            fxd = fx_at(d)
+            cr = cpn_cur * fxd
+            cpn_rub += cr
+            prev_y = yr_acc.get(d.year, other)
+            t_d = max(0.0, tx_ndfl(prev_y + cr, d.year)[0] - tx_ndfl(prev_y, d.year)[0]) if cr > 0 else 0.0
+            yr_acc[d.year] = prev_y + cr
+            cpn_tax_total += t_d
+            flows_c.append((d, cpn_cur))
+            flows_r.append((d, cr))
+            post_flows_c.append((d, cpn_cur - t_d / fxd))
+            post_flows_r.append((d, cr - t_d))
         red_cur = nom * q
         red_rub = red_cur * fxm
-        cost_rub = cost_cur * fx0
-        base = cpn_rub + red_rub - cost_rub
-        other = p.get("other", 0.0)
-        tax = max(0.0, tx_ndfl(other + max(0.0, base), mat.year)[0] - tx_ndfl(other, mat.year)[0])
-        flows_c = [(today, -cost_cur)] + [(d, cpn_cur) for d in dates] + [(mat, red_cur)]
-        flows_r = [(today, -cost_rub)] + [(d, cpn_cur * fx_at(d)) for d in dates] + [(mat, red_rub)]
-        post_c = dbx_xirr(flows_c[:-1] + [(mat, red_cur - tax / fxm)])
-        post_r = dbx_xirr(flows_r[:-1] + [(mat, red_rub - tax)])
+        cap_gain_rub = red_rub - cost_rub
+        prev_mat = yr_acc.get(mat.year, other)
+        cap_tax = max(0.0, tx_ndfl(prev_mat + max(0.0, cap_gain_rub), mat.year)[0] - tx_ndfl(prev_mat, mat.year)[0])
+        base = cpn_rub + cap_gain_rub
+        tax = cpn_tax_total + cap_tax
+        flows_c.append((mat, red_cur))
+        flows_r.append((mat, red_rub))
+        post_flows_c.append((mat, red_cur - cap_tax / fxm))
+        post_flows_r.append((mat, red_rub - cap_tax))
+        post_c = dbx_xirr(post_flows_c)
+        post_r = dbx_xirr(post_flows_r)
         pre_c, pre_r = dbx_xirr(flows_c), dbx_xirr(flows_r)
         profit_c = cpn_cur * len(dates) + red_cur - cost_cur
         rd = lambda x: None if x is None else round(x * 100, 2)      # noqa: E731
@@ -18637,7 +18848,9 @@ def dbx_api_fx(cfg, acc, q, force):
         buy = _dbx_f(q, "buy_fx", None) or fx_now
         if not buy:
             return {"error": "Курс ЦБ недоступен — введите курс покупки вручную.", "fx_now": None}
-        sc = [float(x.replace(",", ".")) for x in (q.get("scenarios") or "-20,-10,0,10,20,40").split(",") if x.strip()][:12]
+        sc = [v for v in (float(x.replace(",", ".")) for x in (q.get("scenarios") or "-20,-10,0,10,20,40").split(",") if x.strip()) if v > -99.0][:12]
+        if not sc:
+            return {"error": "Укажите хотя бы один сценарий изменения курса > −99 %."}
         p = {"nominal": _dbx_f(q, "nominal", 1000.0), "price": _dbx_f(q, "price", 100.0), "coupon": _dbx_f(q, "coupon", 0.0),
              "freq": max(1, min(12, int(_dbx_f(q, "freq", 2)))), "mat": mat, "buy_fx": buy, "qty": max(1.0, _dbx_f(q, "qty", 1.0)),
              "nkd": _dbx_f(q, "nkd", 0.0), "other": _dbx_f(q, "other", 0.0), "scenarios": sc}
@@ -18771,10 +18984,11 @@ def mm_gap(fund_ann, bench_ann):
     return fund_ann - bench_ann
 
 
-def mm_after_tax(amount, days, gross_ann, fee_pct=0.0, year=None):
+def mm_after_tax(amount, days, gross_ann, fee_pct=0.0, year=None, allow_ldv=True):
     """Результат вложения amount ₽ на days календарных дней при годовой доходности gross_ann (эффективная, %).
     Комиссия брокера fee_pct % берётся с оборота покупки и продажи; налог по tx_ndfl (13 %, 15 % с превышения порога) с дохода
-    после вычета комиссий; ЛДВ — если срок больше трёх лет: освобождается доход до 3 млн ₽ за каждый полный год владения (приближённо)."""
+    после вычета комиссий; ЛДВ (только при allow_ldv=True — для паёв/ценных бумаг) — если срок больше трёх лет:
+    освобождается доход до 3 млн ₽ за каждый полный год владения (приближённо)."""
     if not amount or amount <= 0 or not days or days <= 0 or gross_ann is None or gross_ann <= -100:
         return None
     year = year or date.today().year
@@ -18784,7 +18998,7 @@ def mm_after_tax(amount, days, gross_ann, fee_pct=0.0, year=None):
     sell_fee = proceeds * f
     base = proceeds - sell_fee - amount
     full_years = days // 365
-    ldv = days > 3 * 365
+    ldv = bool(allow_ldv and days > 3 * 365)
     exempt = 3e6 * full_years if ldv else 0.0
     taxable = max(0.0, base - exempt)
     tax = tx_ndfl(taxable, year)[0]
@@ -18933,7 +19147,8 @@ def mm_funds_payload(q):
     cmp_rows = []
 
     def add(kind, title, gross, note=""):
-        at = mm_after_tax(amount, days, gross, fee if kind in ("fund", "ofz") else 0.0, year) if gross is not None else None
+        at = (mm_after_tax(amount, days, gross, fee if kind in ("fund", "ofz") else 0.0, year, allow_ldv=(kind == "fund"))
+              if gross is not None else None)
         cmp_rows.append({"kind": kind, "title": title, "gross": gross, "after": at, "note": note})
 
     if fw:
@@ -18996,7 +19211,7 @@ def mm_nearest(secs, md, assets, today):
 
 
 def mm_spots():
-    """Спот: {тикер: цена ₽} — акции TQBR и валютная секция (CETS: USD000UTSTOM, CNYRUB_TOM, GLDRUB_TOM за грамм)."""
+    """Спот: {тикер: цена ₽} — акции TQBR, валютная секция (CETS: USD000UTSTOM, CNYRUB_TOM, GLDRUB_TOM) + фолбэк USD на курс ЦБ."""
     out = {}
     try:
         for r in stocks_universe():
@@ -19006,14 +19221,25 @@ def mm_spots():
         pass
     try:
         j = json.loads(http_text(MM_ISS + "engines/currency/markets/selt/boards/CETS/securities.json?iss.meta=off&iss.only=marketdata"
-                                 "&marketdata.columns=SECID,LAST,WAPRICE,MARKETPRICE", timeout=30))
+                                 "&marketdata.columns=SECID,LAST,WAPRICE,MARKETPRICE,NUMTRADES", timeout=30))
         for r in _iss_table(j, "marketdata"):
-            if r["SECID"] in ("USD000UTSTOM", "CNYRUB_TOM", "GLDRUB_TOM"):
+            sid = r.get("SECID")
+            if sid in ("USD000UTSTOM", "CNYRUB_TOM", "GLDRUB_TOM"):
+                nt = mm_f(r.get("NUMTRADES")) or 0
+                if sid == "USD000UTSTOM" and nt <= 0:
+                    continue
                 v = mm_f(r.get("LAST")) or mm_f(r.get("MARKETPRICE")) or mm_f(r.get("WAPRICE"))
                 if v:
-                    out[r["SECID"]] = v
+                    out[sid] = v
     except Exception:  # noqa: BLE001
         pass
+    if "USD000UTSTOM" not in out:
+        try:
+            cbr_usd = tax_cbr_rate("USD", date.today().isoformat())
+            if cbr_usd:
+                out["USD000UTSTOM"] = cbr_usd
+        except Exception:  # noqa: BLE001
+            pass
     return out
 
 
@@ -19175,14 +19401,20 @@ def crp_saifullin(c, prev=None):
     pa = (prev or {}).get("1600")
     avg = (assets + pa) / 2.0 if assets is not None and pa is not None else assets
     rev = c.get("2110")
+    np_val = c.get("2400")
+    k5 = _crp_div(np_val, eq)
+    if eq is not None and eq < 0 and k5 is not None and k5 > 0:
+        k5 = -k5                       # убыток при отрицательном капитале не может давать положительную рентабельность
     k = {"K1": _crp_div(_crp_sub(eq, nca), ca), "K2": _crp_div(ca, c.get("1500")), "K3": _crp_div(rev, avg),
-         "K4": _crp_div(c.get("2200"), rev), "K5": _crp_div(c.get("2400"), eq)}
+         "K4": _crp_div(c.get("2200"), rev), "K5": k5}
     if any(v is None for v in k.values()):
         return {"ok": False, "x": k, "reason": "не хватает строк отчётности"}
     r = 2 * k["K1"] + 0.1 * k["K2"] + 0.08 * k["K3"] + 0.45 * k["K4"] + k["K5"]
-    bad = r < 1
-    return {"ok": True, "r": r, "x": k, "key": "high" if bad else "ok",
-            "zone": "неудовлетворительное состояние (R < 1)" if bad else "удовлетворительное состояние (R ≥ 1)", "avg_prev": pa is not None}
+    neg_eq = eq is not None and eq <= 0
+    bad = neg_eq or r < 1
+    zone = ("неудовлетворительное состояние (отрицательный капитал)" if neg_eq
+            else "неудовлетворительное состояние (R < 1)" if bad else "удовлетворительное состояние (R ≥ 1)")
+    return {"ok": True, "r": r, "x": k, "key": "high" if bad else "ok", "zone": zone, "avg_prev": pa is not None}
 
 
 CRP_EXT_FLAG = 0.25
@@ -19276,11 +19508,16 @@ def crp_raw(inn, name=""):
 
 
 def crp_events(isin, inn):
-    """Факты раскрытия эмитента (disc_facts: по ISIN, иначе по ИНН) -> ([{title, date, url}], источники). Без дублей по документу."""
+    """Факты раскрытия эмитента (при наличии ИНН — по ИНН, плюс по ISIN для полноты) -> ([{title, date, url}], источники). Без дублей."""
+    lst = []
     try:
-        lst = disc_facts(isin, None if isin else inn) or []
+        if inn:
+            lst.extend(disc_facts(None, inn) or [])
+        if isin:
+            lst.extend(disc_facts(isin, None) or [])
     except Exception:  # noqa: BLE001
-        return [], []
+        if not lst:
+            return [], []
     out, seen = [], set()
     for it in lst:
         if not isinstance(it, dict):
@@ -19627,15 +19864,17 @@ def txo_iis3_calc(open_year, contrib, yield_pct, years, income=0.0, rate15=None,
             ref = min(ref, tx_ndfl(income, yr)[0])
         refunds.append(ref)
         ref_prev = ref
-        # обычный счёт
+        # обычный счёт: налог с купонов считается на суммарный годовой доход по всем лотам (а не по каждому лоту отдельно),
+        # реинвестированные купоны образуют новый лот текущего года i (не наследуя старый срок владения для ЛДВ)
         lots.append([contrib, contrib, i])
-        cp_tax = 0.0
+        coupons = [l[1] * y * coupon_share for l in lots]
+        total_cp = sum(coupons)
+        cp_tax = txo_tax(total_cp, yr, rate15)
         for l in lots:
-            coupon = l[1] * y * coupon_share
-            t = txo_tax(coupon, yr, rate15)
-            cp_tax += t
-            l[1] += l[1] * y * (1.0 - coupon_share) + coupon - t
-            l[0] += coupon - t       # реинвестированный купон после налога — новая стоимость покупки
+            l[1] += l[1] * y * (1.0 - coupon_share)
+        net_cp = total_cp - cp_tax
+        if net_cp > 0:
+            lots.append([net_cp, net_cp, i])
         paid_tax += cp_tax
         rows.append({"year": yr, "n": i, "contribution": contrib, "deduct_base": ded_base, "refund": ref, "iis_capital": cap, "iis_deposits": dep,
                      "broker_capital": sum(l[1] for l in lots), "broker_coupon_tax": cp_tax, "own": contrib * i})
@@ -19806,7 +20045,7 @@ def _mic_fetch(cfg, secid, depth=MIC_DEPTH):
     if book:
         tr = _flw_ds("md/trades", {"secid": secid, "minutes": 60}, FLW_BOOK_TTL)
         if tr is not None:
-            trades = _mic_norm_trades(tr.get("trades"), 1)              # сделки сервера данных — в лотах
+            trades = _mic_norm_trades(tr.get("trades"), (meta or {}).get("lot") or 1)   # _md_trades отдаёт штуки (pieces = qty * lot)
         src = "server"
     else:
         try:
@@ -19991,9 +20230,10 @@ def mic_ice_report(secid, now=None):
             vmax = max(q for _, q in tail if q)
             drops, prev = 0, None
             for _, q in tail:
-                if prev and q is not None and q < prev:
-                    drops += prev - q
-                prev = q or prev
+                qv = q or 0
+                if prev is not None and qv < prev:
+                    drops += prev - qv
+                prev = qv
             ex = sorted((k[0], k[3]) for k, n in trades.items() if k[1] == aggr and k[2] == p and k[0] >= series[i0][0] - 1 for _ in range(n))
             executed = sum(l for _, l in ex)
             hidden = max(0.0, executed - drops)
@@ -20188,37 +20428,33 @@ def ticker_payload(force=False):
         if btc and not any(i["id"] == "BTC" for i in res["items"]):
             res["items"].append(btc)
         return res
+    def _run(fn):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            return None
+
+    idx_it, stk_rows, cets_raw, btc_it = pool_map(
+        _run,
+        [tk_fetch_index, lambda: tk_parse_stocks(stocks_universe(force)), tk_fetch_cets, tk_fetch_btc],
+        workers=4,
+    )
     items = []
-    try:
-        it = tk_fetch_index()
-        if it:
-            items.append(it)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        items += tk_parse_stocks(stocks_universe(force))
-    except Exception:  # noqa: BLE001
-        pass
-    cets = {}
-    try:
-        cets = tk_fetch_cets()
-    except Exception:  # noqa: BLE001
-        pass
+    if idx_it:
+        items.append(idx_it)
+    if stk_rows:
+        items += stk_rows
+    cets = dict(cets_raw or {})
     miss = [c for c in ("USD", "CNY", "EUR") if c not in cets]
     if miss:
-        try:
-            cets.update(tk_fetch_cbr(miss))
-        except Exception:  # noqa: BLE001
-            pass
+        cbr = _run(lambda: tk_fetch_cbr(miss))
+        if cbr:
+            cets.update(cbr)
     for c in ("USD", "CNY", "EUR", "GOLD"):
         if c in cets:
             items.append(cets[c])
-    try:
-        btc = tk_fetch_btc()
-        if btc:
-            items.append(btc)
-    except Exception:  # noqa: BLE001
-        pass
+    if btc_it:
+        items.append(btc_it)
     res = {"items": items, "updated": time.time()}
     if items:
         mem_put(key, res)
@@ -21427,6 +21663,10 @@ tr.scr-low td{opacity:.5}
 @media print{#demo-bar{display:none}}
 /* раскрытие информации: карточка облигации, выплаты эмитента, техдефолты */
 .bc-out{padding:10px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;margin-bottom:12px;line-height:1.5}
+.bc-out-meta{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:6px;padding-top:6px;border-top:1px dashed var(--line);font-size:12.5px;color:var(--tx2)}
+.bc-out-det{margin-top:8px}
+.bc-out-det summary{cursor:pointer;font-size:12.5px;color:var(--ac);user-select:none}
+.bc-out-det .tbl{margin-top:6px}
 .iss-fl-h{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin:4px 0 8px}
 .iss-fl-h b{font-size:15px}
 .iss-fl-chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
@@ -22083,7 +22323,7 @@ function typingInView(){
   const t=a.tagName;
   return t==='TEXTAREA'||t==='SELECT'||(t==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|file|color|image)$/.test(a.type));
 }
-function render(){if(!window.event&&typingInView()){_rPend=true;return}renderNow()}
+function render(){renderNow()}
 function renderSoon(){if(typingInView()){_rPend=true;return}renderNow()}
 document.addEventListener('focusout',()=>{if(_rPend)setTimeout(()=>{if(_rPend&&!typingInView())renderNow()},400)});
 function renderNow(){
@@ -23845,17 +24085,34 @@ function bcDocLinks(isin,inn,secid){
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
 function bcKpi(k,v,s,cls){return`<div class="card"><div class="k">${k}</div><div class="v num ${cls||''}">${v}</div>${s?`<div class="s">${s}</div>`:''}</div>`}
 /* Раскрытие информации: сколько бумаг в рынке (по последнему купону, иначе по объёму выпуска) и последние факты с сервера данных */
-const BC_DISC_KIND={coupon_paid:'Купон выплачен',coupon_declared:'Ставка купона',default:'Неисполнение',buyback_result:'Итоги выкупа'};
+const BC_DISC_KIND={coupon_paid:'Купон выплачен',coupon_declared:'Ставка купона',default:'Неисполнение',buyback_result:'Итоги выкупа',placement_result:'Размещение / доразмещение'};
 function bcOutLine(o){
   if(!o||o.qty==null)return'';
+  const fmt=n=>Number(n).toLocaleString('ru-RU');
   const sh=o.share!=null?` (${Math.round(o.share*100)} % выпуска)`:'';
   const src=o.doc_url?`<a href="${esc(o.doc_url)}" target="_blank" rel="noopener">источник ↗</a>`:'';
-  const M={coupon_explicit:'купону',coupon_derived:'купону (число бумаг выведено из суммы)',declared_derived:'объявлению о купоне (число бумаг выведено из суммы)'};
+  const M={coupon_explicit:'купону',coupon_derived:'купону (выведено из суммы выплаты)',declared_derived:'объявлению о купоне (выведено из суммы)'};
   let how;
   if(M[o.method])how=`по ${M[o.method]}${o.coupon_no?' №'+esc(String(o.coupon_no)):''}${o.as_of?' от '+ddm(o.as_of):''}`;
   else how=o.method==='issue_placed'?'по размещённому объёму выпуска (Мосбиржа)':'по объёму выпуска (Мосбиржа)';
-  const bb=o.buybacks_after?` · с учётом выкупов после этой даты: ${o.buybacks_after}`:'';
-  return`<div class="bc-out"><b>В рынке:</b> <span class="num">${o.qty.toLocaleString('ru-RU')} шт.</span>${sh} · <span class="mu">${how}${bb}</span>${src?' · '+src:''}</div>`;
+  const bb=o.buybacks_after?` · выкупов после купона: ${o.buybacks_after}`:'';
+  const over=o.over_issue_size?' <span class="tag">выше ISSUESIZE (допвыпуск)</span>':'';
+  const chips=[];
+  if(o.issue_size!=null)chips.push(`<span>Выпущено: <b class="num">${fmt(o.issue_size)} шт.</b>${o.issue_date?' от '+ddm(o.issue_date):''}</span>`);
+  if(o.placed!=null&&o.placed!==o.issue_size)chips.push(`<span>Размещено первично: <b class="num">${fmt(o.placed)} шт.</b></span>`);
+  if(o.added_total>0)chips.push(`<span class="pos">Допвыпуск / доразмещение: <b class="num">+${fmt(o.added_total)} шт.</b></span>`);
+  if(o.buybacks_total>0)chips.push(`<span class="neg">Выкуплено (оферты/выкупы): <b class="num">−${fmt(o.buybacks_total)} шт.</b></span>`);
+  const evs=o.events||[];
+  let tl='';
+  if(evs.length>1||(evs.length===1&&evs[0].kind!=='issue')){
+    const rows=evs.map(e=>{
+      const dlt=e.delta==null?'—':(e.kind==='issue'?fmt(e.delta)+' шт.':(e.delta>0?`<span class="pos">+${fmt(e.delta)} шт.</span>`:`<span class="neg">−${fmt(Math.abs(e.delta))} шт.</span>`));
+      return`<tr><td class="l">${e.date?ddm(e.date):'—'}</td><td class="l">${esc(e.label||e.kind)}</td><td class="num">${dlt}</td><td>${e.url?`<a href="${esc(e.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`;
+    }).join('');
+    tl=`<details class="bc-out-det"><summary>История изменения объёма (${evs.length})</summary><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Событие</th><th>Объём / изменение</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  }
+  return`<div class="bc-out"><div><b>В рынке сейчас:</b> <span class="num">${fmt(o.qty)} шт.</span>${sh}${over} · <span class="mu">${how}${bb}</span>${src?' · '+src:''}</div>`
+    +(chips.length?`<div class="bc-out-meta">${chips.join('')}</div>`:'')+tl+`</div>`;
 }
 function bcDisclosure(dc){
   if(!dc)return'';
@@ -27843,14 +28100,16 @@ function micPaint(){
   if(b)b.innerHTML=micIceHtml();
 }
 function micLoadImpact(){
-  const D=S.mic;if(D.busyI)return;D.busyI=true;const secid=D.secid;
-  api('/api/mic/impact?'+new URLSearchParams({secid,side:D.side,rub:D.rub})).then(j=>{if(secid===D.secid){D.imp=j;D.err=''}}).catch(e=>{D.err=e.message||String(e)})
-    .then(()=>{D.busyI=false;micPaint()});
+  const D=S.mic;const req=(D.reqI=(D.reqI||0)+1),secid=D.secid;
+  D.busyI=true;
+  api('/api/mic/impact?'+new URLSearchParams({secid,side:D.side,rub:D.rub})).then(j=>{if(req===D.reqI&&secid===D.secid){D.imp=j;D.err=''}}).catch(e=>{if(req===D.reqI)D.err=e.message||String(e)})
+    .then(()=>{if(req===D.reqI){D.busyI=false;micPaint()}});
 }
 function micLoadIce(){
-  const D=S.mic;if(D.busyC)return;D.busyC=true;const secid=D.secid;
-  api('/api/mic/iceberg?'+new URLSearchParams({secid})).then(j=>{if(secid===D.secid){D.ice=j;D.iceErr=''}}).catch(e=>{D.iceErr=e.message||String(e)})
-    .then(()=>{D.busyC=false;micPaint()});
+  const D=S.mic;const req=(D.reqC=(D.reqC||0)+1),secid=D.secid;
+  D.busyC=true;
+  api('/api/mic/iceberg?'+new URLSearchParams({secid})).then(j=>{if(req===D.reqC&&secid===D.secid){D.ice=j;D.iceErr=''}}).catch(e=>{if(req===D.reqC)D.iceErr=e.message||String(e)})
+    .then(()=>{if(req===D.reqC){D.busyC=false;micPaint()}});
 }
 function micStop(){if(_micTimer){clearInterval(_micTimer);_micTimer=null}}
 function micStart(){
@@ -27940,8 +28199,8 @@ function tkrLoad(){
   api('/api/ticker').then(j=>{TKR.busy=false;if(j&&j.items&&j.items.length)tkrApply(j.items)}).catch(()=>{TKR.busy=false});
 }
 (function(){
-  if(tkrOff()){tkrBuild();return}
-  setTimeout(tkrLoad,600);
+  if(tkrOff())tkrBuild();
+  else setTimeout(tkrLoad,600);
   setInterval(()=>{if(!document.hidden)tkrLoad()},60000);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden)tkrLoad()});
 })();

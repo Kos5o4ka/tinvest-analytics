@@ -265,26 +265,51 @@ def dbx_fx_calc(p, today=None):
         raise ValueError("Дата погашения должна быть в будущем")
     q, nom, fx0 = p["qty"], p["nominal"], p["buy_fx"]
     cost_cur = (nom * p["price"] / 100.0 + p.get("nkd", 0.0)) * q
+    cost_rub = cost_cur * fx0
     cpn_cur = nom * p["coupon"] / 100.0 / p["freq"] * q
     dates = dbx_coupon_dates(today, mat, p["freq"])
     span = float((mat - today).days)
     res = []
     for s in p["scenarios"]:
+        if s <= -99.0:
+            continue
         fxm = fx0 * (1 + s / 100.0)
+        if fxm <= 0:
+            continue
 
         def fx_at(d, fxm=fxm):
             return fx0 + (fxm - fx0) * ((d - today).days / span)
-        cpn_rub = sum(cpn_cur * fx_at(d) for d in dates)
+        other = p.get("other", 0.0)
+        # НДФЛ с купонов удерживается в даты их выплат (с учётом прогрессии по году), налог с тела — при погашении
+        yr_acc = {}
+        cpn_rub, cpn_tax_total = 0.0, 0.0
+        flows_c, flows_r = [(today, -cost_cur)], [(today, -cost_rub)]
+        post_flows_c, post_flows_r = [(today, -cost_cur)], [(today, -cost_rub)]
+        for d in dates:
+            fxd = fx_at(d)
+            cr = cpn_cur * fxd
+            cpn_rub += cr
+            prev_y = yr_acc.get(d.year, other)
+            t_d = max(0.0, tx_ndfl(prev_y + cr, d.year)[0] - tx_ndfl(prev_y, d.year)[0]) if cr > 0 else 0.0
+            yr_acc[d.year] = prev_y + cr
+            cpn_tax_total += t_d
+            flows_c.append((d, cpn_cur))
+            flows_r.append((d, cr))
+            post_flows_c.append((d, cpn_cur - t_d / fxd))
+            post_flows_r.append((d, cr - t_d))
         red_cur = nom * q
         red_rub = red_cur * fxm
-        cost_rub = cost_cur * fx0
-        base = cpn_rub + red_rub - cost_rub
-        other = p.get("other", 0.0)
-        tax = max(0.0, tx_ndfl(other + max(0.0, base), mat.year)[0] - tx_ndfl(other, mat.year)[0])
-        flows_c = [(today, -cost_cur)] + [(d, cpn_cur) for d in dates] + [(mat, red_cur)]
-        flows_r = [(today, -cost_rub)] + [(d, cpn_cur * fx_at(d)) for d in dates] + [(mat, red_rub)]
-        post_c = dbx_xirr(flows_c[:-1] + [(mat, red_cur - tax / fxm)])
-        post_r = dbx_xirr(flows_r[:-1] + [(mat, red_rub - tax)])
+        cap_gain_rub = red_rub - cost_rub
+        prev_mat = yr_acc.get(mat.year, other)
+        cap_tax = max(0.0, tx_ndfl(prev_mat + max(0.0, cap_gain_rub), mat.year)[0] - tx_ndfl(prev_mat, mat.year)[0])
+        base = cpn_rub + cap_gain_rub
+        tax = cpn_tax_total + cap_tax
+        flows_c.append((mat, red_cur))
+        flows_r.append((mat, red_rub))
+        post_flows_c.append((mat, red_cur - cap_tax / fxm))
+        post_flows_r.append((mat, red_rub - cap_tax))
+        post_c = dbx_xirr(post_flows_c)
+        post_r = dbx_xirr(post_flows_r)
         pre_c, pre_r = dbx_xirr(flows_c), dbx_xirr(flows_r)
         profit_c = cpn_cur * len(dates) + red_cur - cost_cur
         rd = lambda x: None if x is None else round(x * 100, 2)      # noqa: E731
@@ -323,7 +348,9 @@ def dbx_api_fx(cfg, acc, q, force):
         buy = _dbx_f(q, "buy_fx", None) or fx_now
         if not buy:
             return {"error": "Курс ЦБ недоступен — введите курс покупки вручную.", "fx_now": None}
-        sc = [float(x.replace(",", ".")) for x in (q.get("scenarios") or "-20,-10,0,10,20,40").split(",") if x.strip()][:12]
+        sc = [v for v in (float(x.replace(",", ".")) for x in (q.get("scenarios") or "-20,-10,0,10,20,40").split(",") if x.strip()) if v > -99.0][:12]
+        if not sc:
+            return {"error": "Укажите хотя бы один сценарий изменения курса > −99 %."}
         p = {"nominal": _dbx_f(q, "nominal", 1000.0), "price": _dbx_f(q, "price", 100.0), "coupon": _dbx_f(q, "coupon", 0.0),
              "freq": max(1, min(12, int(_dbx_f(q, "freq", 2)))), "mat": mat, "buy_fx": buy, "qty": max(1.0, _dbx_f(q, "qty", 1.0)),
              "nkd": _dbx_f(q, "nkd", 0.0), "other": _dbx_f(q, "other", 0.0), "scenarios": sc}

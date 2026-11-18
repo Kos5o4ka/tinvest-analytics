@@ -162,37 +162,33 @@ def ticker_payload(force=False):
         if btc and not any(i["id"] == "BTC" for i in res["items"]):
             res["items"].append(btc)
         return res
+    def _run(fn):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            return None
+
+    idx_it, stk_rows, cets_raw, btc_it = pool_map(
+        _run,
+        [tk_fetch_index, lambda: tk_parse_stocks(stocks_universe(force)), tk_fetch_cets, tk_fetch_btc],
+        workers=4,
+    )
     items = []
-    try:
-        it = tk_fetch_index()
-        if it:
-            items.append(it)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        items += tk_parse_stocks(stocks_universe(force))
-    except Exception:  # noqa: BLE001
-        pass
-    cets = {}
-    try:
-        cets = tk_fetch_cets()
-    except Exception:  # noqa: BLE001
-        pass
+    if idx_it:
+        items.append(idx_it)
+    if stk_rows:
+        items += stk_rows
+    cets = dict(cets_raw or {})
     miss = [c for c in ("USD", "CNY", "EUR") if c not in cets]
     if miss:
-        try:
-            cets.update(tk_fetch_cbr(miss))
-        except Exception:  # noqa: BLE001
-            pass
+        cbr = _run(lambda: tk_fetch_cbr(miss))
+        if cbr:
+            cets.update(cbr)
     for c in ("USD", "CNY", "EUR", "GOLD"):
         if c in cets:
             items.append(cets[c])
-    try:
-        btc = tk_fetch_btc()
-        if btc:
-            items.append(btc)
-    except Exception:  # noqa: BLE001
-        pass
+    if btc_it:
+        items.append(btc_it)
     res = {"items": items, "updated": time.time()}
     if items:
         mem_put(key, res)

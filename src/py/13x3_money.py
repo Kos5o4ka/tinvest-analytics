@@ -115,10 +115,11 @@ def mm_gap(fund_ann, bench_ann):
     return fund_ann - bench_ann
 
 
-def mm_after_tax(amount, days, gross_ann, fee_pct=0.0, year=None):
+def mm_after_tax(amount, days, gross_ann, fee_pct=0.0, year=None, allow_ldv=True):
     """Результат вложения amount ₽ на days календарных дней при годовой доходности gross_ann (эффективная, %).
     Комиссия брокера fee_pct % берётся с оборота покупки и продажи; налог по tx_ndfl (13 %, 15 % с превышения порога) с дохода
-    после вычета комиссий; ЛДВ — если срок больше трёх лет: освобождается доход до 3 млн ₽ за каждый полный год владения (приближённо)."""
+    после вычета комиссий; ЛДВ (только при allow_ldv=True — для паёв/ценных бумаг) — если срок больше трёх лет:
+    освобождается доход до 3 млн ₽ за каждый полный год владения (приближённо)."""
     if not amount or amount <= 0 or not days or days <= 0 or gross_ann is None or gross_ann <= -100:
         return None
     year = year or date.today().year
@@ -128,7 +129,7 @@ def mm_after_tax(amount, days, gross_ann, fee_pct=0.0, year=None):
     sell_fee = proceeds * f
     base = proceeds - sell_fee - amount
     full_years = days // 365
-    ldv = days > 3 * 365
+    ldv = bool(allow_ldv and days > 3 * 365)
     exempt = 3e6 * full_years if ldv else 0.0
     taxable = max(0.0, base - exempt)
     tax = tx_ndfl(taxable, year)[0]
@@ -277,7 +278,8 @@ def mm_funds_payload(q):
     cmp_rows = []
 
     def add(kind, title, gross, note=""):
-        at = mm_after_tax(amount, days, gross, fee if kind in ("fund", "ofz") else 0.0, year) if gross is not None else None
+        at = (mm_after_tax(amount, days, gross, fee if kind in ("fund", "ofz") else 0.0, year, allow_ldv=(kind == "fund"))
+              if gross is not None else None)
         cmp_rows.append({"kind": kind, "title": title, "gross": gross, "after": at, "note": note})
 
     if fw:
@@ -340,7 +342,7 @@ def mm_nearest(secs, md, assets, today):
 
 
 def mm_spots():
-    """Спот: {тикер: цена ₽} — акции TQBR и валютная секция (CETS: USD000UTSTOM, CNYRUB_TOM, GLDRUB_TOM за грамм)."""
+    """Спот: {тикер: цена ₽} — акции TQBR, валютная секция (CETS: USD000UTSTOM, CNYRUB_TOM, GLDRUB_TOM) + фолбэк USD на курс ЦБ."""
     out = {}
     try:
         for r in stocks_universe():
@@ -350,14 +352,25 @@ def mm_spots():
         pass
     try:
         j = json.loads(http_text(MM_ISS + "engines/currency/markets/selt/boards/CETS/securities.json?iss.meta=off&iss.only=marketdata"
-                                 "&marketdata.columns=SECID,LAST,WAPRICE,MARKETPRICE", timeout=30))
+                                 "&marketdata.columns=SECID,LAST,WAPRICE,MARKETPRICE,NUMTRADES", timeout=30))
         for r in _iss_table(j, "marketdata"):
-            if r["SECID"] in ("USD000UTSTOM", "CNYRUB_TOM", "GLDRUB_TOM"):
+            sid = r.get("SECID")
+            if sid in ("USD000UTSTOM", "CNYRUB_TOM", "GLDRUB_TOM"):
+                nt = mm_f(r.get("NUMTRADES")) or 0
+                if sid == "USD000UTSTOM" and nt <= 0:
+                    continue
                 v = mm_f(r.get("LAST")) or mm_f(r.get("MARKETPRICE")) or mm_f(r.get("WAPRICE"))
                 if v:
-                    out[r["SECID"]] = v
+                    out[sid] = v
     except Exception:  # noqa: BLE001
         pass
+    if "USD000UTSTOM" not in out:
+        try:
+            cbr_usd = tax_cbr_rate("USD", date.today().isoformat())
+            if cbr_usd:
+                out["USD000UTSTOM"] = cbr_usd
+        except Exception:  # noqa: BLE001
+            pass
     return out
 
 

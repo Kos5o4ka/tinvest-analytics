@@ -62,14 +62,20 @@ def crp_saifullin(c, prev=None):
     pa = (prev or {}).get("1600")
     avg = (assets + pa) / 2.0 if assets is not None and pa is not None else assets
     rev = c.get("2110")
+    np_val = c.get("2400")
+    k5 = _crp_div(np_val, eq)
+    if eq is not None and eq < 0 and k5 is not None and k5 > 0:
+        k5 = -k5                       # убыток при отрицательном капитале не может давать положительную рентабельность
     k = {"K1": _crp_div(_crp_sub(eq, nca), ca), "K2": _crp_div(ca, c.get("1500")), "K3": _crp_div(rev, avg),
-         "K4": _crp_div(c.get("2200"), rev), "K5": _crp_div(c.get("2400"), eq)}
+         "K4": _crp_div(c.get("2200"), rev), "K5": k5}
     if any(v is None for v in k.values()):
         return {"ok": False, "x": k, "reason": "не хватает строк отчётности"}
     r = 2 * k["K1"] + 0.1 * k["K2"] + 0.08 * k["K3"] + 0.45 * k["K4"] + k["K5"]
-    bad = r < 1
-    return {"ok": True, "r": r, "x": k, "key": "high" if bad else "ok",
-            "zone": "неудовлетворительное состояние (R < 1)" if bad else "удовлетворительное состояние (R ≥ 1)", "avg_prev": pa is not None}
+    neg_eq = eq is not None and eq <= 0
+    bad = neg_eq or r < 1
+    zone = ("неудовлетворительное состояние (отрицательный капитал)" if neg_eq
+            else "неудовлетворительное состояние (R < 1)" if bad else "удовлетворительное состояние (R ≥ 1)")
+    return {"ok": True, "r": r, "x": k, "key": "high" if bad else "ok", "zone": zone, "avg_prev": pa is not None}
 
 
 CRP_EXT_FLAG = 0.25
@@ -163,11 +169,16 @@ def crp_raw(inn, name=""):
 
 
 def crp_events(isin, inn):
-    """Факты раскрытия эмитента (disc_facts: по ISIN, иначе по ИНН) -> ([{title, date, url}], источники). Без дублей по документу."""
+    """Факты раскрытия эмитента (при наличии ИНН — по ИНН, плюс по ISIN для полноты) -> ([{title, date, url}], источники). Без дублей."""
+    lst = []
     try:
-        lst = disc_facts(isin, None if isin else inn) or []
+        if inn:
+            lst.extend(disc_facts(None, inn) or [])
+        if isin:
+            lst.extend(disc_facts(isin, None) or [])
     except Exception:  # noqa: BLE001
-        return [], []
+        if not lst:
+            return [], []
     out, seen = [], set()
     for it in lst:
         if not isinstance(it, dict):

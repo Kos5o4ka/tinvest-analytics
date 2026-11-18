@@ -1,5 +1,9 @@
 /* раскрытие информации: карточка облигации, выплаты эмитента, техдефолты */
 .bc-out{padding:10px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;margin-bottom:12px;line-height:1.5}
+.bc-out-meta{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:6px;padding-top:6px;border-top:1px dashed var(--line);font-size:12.5px;color:var(--tx2)}
+.bc-out-det{margin-top:8px}
+.bc-out-det summary{cursor:pointer;font-size:12.5px;color:var(--ac);user-select:none}
+.bc-out-det .tbl{margin-top:6px}
 .iss-fl-h{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin:4px 0 8px}
 .iss-fl-h b{font-size:15px}
 .iss-fl-chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}

@@ -76,6 +76,36 @@ class Outstanding(Patch):
         self.patch(_disc_issue_desc=lambda isin: {})
         self.assertIsNone(T.bond_outstanding("RU000A0AAAA1", TODAY)["qty"])
 
+    def test_derived_wins_over_treasury_explicit_and_skips_partial(self):
+        # OUT-01: в п. 2.6 указан весь выпуск (1M), а по выплате купона в рынке 400k (total_matches=False)
+        f_mismatch = {"kind": "coupon_paid", "published": "2026-10-12T10:00:00", "url": URL, "due_date": "2026-10-12", "conf": 0.8,
+                      "data": {"qty": 1000000, "qty_derived": 400000, "coupon_no": 8, "due_date": "2026-10-12", "paid_pct": 100,
+                               "conf": 0.8, "checks": {"qty_integer": True, "total_matches": False}}}
+        # Частичная выплата (техдефолт 50%) должна игнорироваться
+        f_partial = {"kind": "coupon_paid", "published": "2026-11-12T10:00:00", "url": URL, "due_date": "2026-11-12", "conf": 0.8,
+                     "data": {"qty": 1000000, "qty_derived": 200000, "coupon_no": 9, "due_date": "2026-11-12", "paid_pct": 50,
+                              "conf": 0.8, "checks": {"qty_integer": True, "total_matches": False}}}
+        self.facts = [f_partial, f_mismatch]
+        o = T.bond_outstanding("RU000A0AAAA1", TODAY)
+        self.assertEqual((o["qty"], o["method"], o["coupon_no"]), (400000, "coupon_derived", 8))
+
+    def test_additional_issue_over_size_and_timeline(self):
+        # OUT-03 & OUT-04: допвыпуск + выкуп на оферте + хронология событий
+        pl = {"kind": "placement_result", "published": "2026-06-01T10:00:00", "url": URL, "event_date": "2026-06-01", "conf": 1.0,
+              "data": {"qty_placed": 500000, "subkind": "additional", "date": "2026-06-01", "conf": 1.0}}
+        c_big = {"kind": "coupon_paid", "published": "2026-10-12T10:00:00", "url": URL, "due_date": "2026-10-12", "conf": 1.0,
+                 "data": {"qty": 2400000, "qty_derived": 2400000, "coupon_no": 5, "due_date": "2026-10-12", "conf": 1.0,
+                          "checks": {"qty_integer": True, "total_matches": True}}}
+        self.facts = [c_big, pl, buyback("2026-08-01", 100000)]
+        o = T.bond_outstanding("RU000A0AAAA1", TODAY)
+        self.assertEqual(o["qty"], 2400000)
+        self.assertTrue(o["over_issue_size"])
+        self.assertEqual(o["added_total"], 500000)
+        self.assertEqual(o["buybacks_total"], 100000)
+        kinds = [e["kind"] for e in o["events"]]
+        self.assertIn("additional", kinds)
+        self.assertIn("buyback", kinds)
+
 
 class FactsCache(Patch):
     def test_cache_and_off(self):

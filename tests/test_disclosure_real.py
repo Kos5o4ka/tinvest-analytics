@@ -9,7 +9,7 @@ from tests._load import load
 T = load()
 REAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "disclosure", "real")
 FILES = sorted(glob.glob(os.path.join(REAL, "azipi_*.txt")))
-KINDS = {"coupon_paid", "coupon_declared", "default", "buyback_result", "other"}
+KINDS = {"coupon_paid", "coupon_declared", "default", "buyback_result", "placement_result", "other"}
 ISIN = re.compile(r"^(?:RU|SU)[0-9A-Z]{9}[0-9]$")
 
 
@@ -29,7 +29,7 @@ class Invariants(unittest.TestCase):
         self.assertGreaterEqual(len(FILES), 40)
 
     def test_version(self):
-        self.assertEqual(T.DC_PARSER_VERSION, "2")
+        self.assertEqual(T.DC_PARSER_VERSION, "3")
 
     def test_all(self):
         paid = good = 0

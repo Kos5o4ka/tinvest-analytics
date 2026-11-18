@@ -52,8 +52,8 @@ function tkrLoad(){
   api('/api/ticker').then(j=>{TKR.busy=false;if(j&&j.items&&j.items.length)tkrApply(j.items)}).catch(()=>{TKR.busy=false});
 }
 (function(){
-  if(tkrOff()){tkrBuild();return}
-  setTimeout(tkrLoad,600);
+  if(tkrOff())tkrBuild();
+  else setTimeout(tkrLoad,600);
   setInterval(()=>{if(!document.hidden)tkrLoad()},60000);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden)tkrLoad()});
 })();

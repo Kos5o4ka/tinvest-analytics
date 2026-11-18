@@ -48,14 +48,16 @@ function micPaint(){
   if(b)b.innerHTML=micIceHtml();
 }
 function micLoadImpact(){
-  const D=S.mic;if(D.busyI)return;D.busyI=true;const secid=D.secid;
-  api('/api/mic/impact?'+new URLSearchParams({secid,side:D.side,rub:D.rub})).then(j=>{if(secid===D.secid){D.imp=j;D.err=''}}).catch(e=>{D.err=e.message||String(e)})
-    .then(()=>{D.busyI=false;micPaint()});
+  const D=S.mic;const req=(D.reqI=(D.reqI||0)+1),secid=D.secid;
+  D.busyI=true;
+  api('/api/mic/impact?'+new URLSearchParams({secid,side:D.side,rub:D.rub})).then(j=>{if(req===D.reqI&&secid===D.secid){D.imp=j;D.err=''}}).catch(e=>{if(req===D.reqI)D.err=e.message||String(e)})
+    .then(()=>{if(req===D.reqI){D.busyI=false;micPaint()}});
 }
 function micLoadIce(){
-  const D=S.mic;if(D.busyC)return;D.busyC=true;const secid=D.secid;
-  api('/api/mic/iceberg?'+new URLSearchParams({secid})).then(j=>{if(secid===D.secid){D.ice=j;D.iceErr=''}}).catch(e=>{D.iceErr=e.message||String(e)})
-    .then(()=>{D.busyC=false;micPaint()});
+  const D=S.mic;const req=(D.reqC=(D.reqC||0)+1),secid=D.secid;
+  D.busyC=true;
+  api('/api/mic/iceberg?'+new URLSearchParams({secid})).then(j=>{if(req===D.reqC&&secid===D.secid){D.ice=j;D.iceErr=''}}).catch(e=>{if(req===D.reqC)D.iceErr=e.message||String(e)})
+    .then(()=>{if(req===D.reqC){D.busyC=false;micPaint()}});
 }
 function micStop(){if(_micTimer){clearInterval(_micTimer);_micTimer=null}}
 function micStart(){
