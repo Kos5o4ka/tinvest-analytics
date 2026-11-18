@@ -42,7 +42,14 @@ jobs:
           python-version: "3.12"
       - name: Зависимости сборки (только для сборки, в программе их нет)
         run: |
-          pip install pyinstaller==6.22.3 certifi pillow pywebview==6.2.1
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Загрузчик PyInstaller собираем из исходников (MSVC на раннере): готовый загрузчик из колеса одинаков
+            # у тысяч программ, и эвристики антивирусов помечают любой exe с ним как подозрительный.
+            PYINSTALLER_COMPILE_BOOTLOADER=1 pip install --no-binary pyinstaller pyinstaller==6.22.3
+          else
+            pip install pyinstaller==6.22.3
+          fi
+          pip install certifi pillow pywebview==6.2.1
           # Windows: pywebview берёт Edge WebView2 через pythonnet (ставится как зависимость; явно — на случай смены метаданных)
           if [ "$RUNNER_OS" = "Windows" ]; then pip install pythonnet clr_loader; fi
       - name: Программа из релиза (чтобы собрать список её импортов)

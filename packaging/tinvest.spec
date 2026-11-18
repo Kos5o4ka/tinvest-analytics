@@ -49,5 +49,25 @@ if sys.platform == "darwin":
                              "NSHighResolutionCapable": True, "LSMinimumSystemVersion": "11.0",
                              "LSApplicationCategoryType": "public.app-category.finance"})
 else:
+    # Сведения о файле (Свойства → Подробно): exe без них эвристики антивирусов оценивают хуже.
+    from PyInstaller.utils.win32.versioninfo import (VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
+                                                     StringStruct, VarFileInfo, VarStruct)
+    import re
+    m = re.search(r'^APP_VERSION = "(\d+)\.(\d+)', open(APP_SRC, encoding="utf8").read(), re.M)
+    ver = (int(m.group(1)), int(m.group(2)), 0, 0) if m else (0, 0, 0, 0)
+    vs = ".".join(map(str, ver))
+    version = VSVersionInfo(
+        ffi=FixedFileInfo(filevers=ver, prodvers=ver, mask=0x3F, flags=0x0, OS=0x40004, fileType=0x1,
+                          subtype=0x0, date=(0, 0)),
+        kids=[StringFileInfo([StringTable("041904B0", [
+                  StringStruct("CompanyName", "TAnalytic"),
+                  StringStruct("FileDescription", "TAnalytic — аналитика инвестиционного портфеля"),
+                  StringStruct("FileVersion", vs),
+                  StringStruct("InternalName", "TAnalytic"),
+                  StringStruct("LegalCopyright", "© Kos5o4ka, github.com/Kos5o4ka/tinvest-analytics"),
+                  StringStruct("OriginalFilename", "TAnalytic.exe"),
+                  StringStruct("ProductName", "TAnalytic"),
+                  StringStruct("ProductVersion", vs)])]),
+              VarFileInfo([VarStruct("Translation", [0x0419, 1200])])])
     exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="TAnalytic", console=False, icon=icon("ico"),
-              upx=False)
+              upx=False, version=version)
