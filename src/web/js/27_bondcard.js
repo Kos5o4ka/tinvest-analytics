@@ -118,13 +118,28 @@ function bcBody(c){
   if(c.errors&&c.errors.length)h+=`<div class="bc-warn">${c.errors.map(esc).join('<br>')}</div>`;
   if(m){
     const sp=m.spread;
+    const _q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
     h+=`<div class="bc-kpis">`
       +bcKpi('Цена',bcN(m.price,2)+' %',m.nominal?`номинал ${bcN(m.nominal,0)}`:'')
-      +bcKpi('Доходность',bcN(m.yield,2)+' %','к погашению/оферте')
-      +bcKpi('Спред к КБД',sp==null?'—':(sp>0?'+':'')+bcN(sp,2)+' п.п.',c.kbd!=null?`КБД ${bcN(c.kbd,2)} % на ${bcN(m.dur,2)} г.`:'',sp==null?'':sp>0?'pos':'neg')
-      +bcKpi('Дюрация',m.dur==null?'—':bcN(m.dur,2)+' г.',`оборот ${short(m.turn||0)}`)
+      +bcKpi('Доходность '+_q('yield','Доходность к погашению или ближайшей оферте (YTM)'),bcN(m.yield,2)+' %','к погашению/оферте')
+      +bcKpi('Спред к КБД '+_q('spread','Премия доходности выпуска над безрисковой кривой ОФЗ (КБД)'),sp==null?'—':(sp>0?'+':'')+bcN(sp,2)+' п.п.',c.kbd!=null?`КБД ${bcN(c.kbd,2)} % на ${bcN(m.dur,2)} г.`:'',sp==null?'':sp>0?'pos':'neg')
+      +bcKpi('Дюрация '+_q('duration','Чувствительность цены облигации к изменению ставок'),m.dur==null?'—':bcN(m.dur,2)+' г.',`оборот ${short(m.turn||0)}`)
       +`</div>`;
   }
+  const vBits=[];
+  if(d.HASDEFAULT==='1')vBits.push('<b class="neg">Допущен дефолт</b>');
+  else if(d.HASTECHNICALDEFAULT==='1')vBits.push('<b class="neg">Технический дефолт</b>');
+  else if(c.rating&&c.rating.v){
+    const bk=rBucket(c.rating.v).split(' ')[0];
+    const lvl={AAA:'Надёжность максимальная',AA:'Надёжность высокая',A:'Надёжность выше средней',BBB:'Надёжность умеренная',BB:'Повышенный риск (ВДО)',B:'Высокий риск (ВДО)'}[bk]||'Спекулятивный риск';
+    vBits.push(`${lvl} (<b>${esc(c.rating.v)}</b>)`);
+  }else if(ci.ofz||String(c.isin||'').startsWith('SU'))vBits.push('Государственный выпуск (<b>ОФЗ</b>)');
+  if(m&&m.spread!=null)vBits.push(`спред к КБД <b class="${m.spread>=0?'pos':'neg'}">${m.spread>0?'+':''}${bcN(m.spread,2)} п.п.</b>`);
+  if(c.offers&&c.offers.length){
+    const o0=c.offers[0];
+    vBits.push(`ближайшая оферта <b>${ddm(o0.date)}</b> (${o0.kind==='put'?'PUT — право продать':o0.kind==='call'?'CALL — право эмитента погасить':'оферта'})`);
+  }else if(m&&m.mat)vBits.push(`без оферт до погашения ${ddm(m.mat)}`);
+  if(vBits.length)h+=`<div class="bc-verdict">${vBits.join(' · ')}</div>`;
   const rows=[];const add=(k,v)=>{if(v!=null&&v!=='')rows.push(`<div><span>${k}</span><span>${v}</span></div>`)};
   add('Эмитент',esc(d.EMITTER||''));
   add('Вид',esc(d.BOND_TYPE||d.TYPENAME||''));

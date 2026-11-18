@@ -6,14 +6,16 @@ function pDash(){
     <div class="row" style="justify-content:center"><button class="btn" data-go="imp">Импорт отчёта</button>${d.sandbox?'<button class="btn ghost" data-go="set">Настройки</button>':''}</div></div>`;
   const income=sumK(t,['dividends','coupons','overnight']),taxes=sumK(t,TAXK);
   const profit=d.profit,ppct=d.invested>0&&profit!=null?profit/d.invested*100:null,hs=histSlice();
+  const _q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
   const hero=`<div class="card hero"><div style="position:relative;z-index:1"><div class="lbl">Стоимость портфеля</div>
     <div class="val num">${f2m(p.total)} <small>₽</small></div>
-    <div class="row" style="margin-top:10px">${p.daily!=null?`<span class="pill ${cls(p.daily)}">${SM(p.daily)} · ${pct(p.daily_pct)} за день</span>`:''}
-    <span class="pill ${cls(p.upnl)}">${SM(p.upnl)} · ${pct(p.yield_pct)} по открытым позициям</span></div></div>
+    <div class="row" style="margin-top:10px;flex-wrap:wrap">${p.daily!=null?`<span class="pill ${cls(p.daily)}">${SM(p.daily)} · ${pct(p.daily_pct)} за день</span>`:''}
+    <span class="pill ${cls(p.upnl)}">${SM(p.upnl)} · ${pct(p.yield_pct)} по открытым позициям</span>
+    <span class="hero-acts"><button class="btn" data-go="scr">+ Подобрать бумагу</button><button class="btn ghost" data-share-card="1" title="Сделать PNG-карточку без сумм">Поделиться PNG</button></span></div></div>
     <div class="meta"><div><span>Вложено (пополнения − выводы)</span><b class="num">${M(d.invested,'rub',0)}</b></div>
     <div><span>Прибыль за всё время</span><b class="num ${cls(profit)}">${profit==null?'—':SM(profit)}</b>${ppct!=null?` <span class="mu num" style="display:inline">${pct(ppct,1)}</span>`:''}</div>
-    <div><span>Доходность за период (TWR)</span><b class="num ${hs?cls(hs.total):''}">${hs?pct(hs.total*100,2):S.hist&&!S.hist.error?'—':'…'}</b></div>
-    <div><span>XIRR, % годовых</span><b class="num ${cls(d.xirr)}">${d.xirr==null?'—':pct(d.xirr*100,1)}</b></div></div></div>`;
+    <div><span>Доходность за период (TWR) ${_q('xirr','Доходность без влияния пополнений и выводов — подробнее в Базе знаний')}</span><b class="num ${hs?cls(hs.total):''}">${hs?pct(hs.total*100,2):S.hist&&!S.hist.error?'—':'…'}</b></div>
+    <div><span>XIRR, % годовых ${_q('xirr','Годовая доходность с учётом сумм и дат пополнений')}</span><b class="num ${cls(d.xirr)}">${d.xirr==null?'—':pct(d.xirr*100,1)}</b></div></div></div>`;
   const turn=(t.buy_turnover||0)+(t.sell_turnover||0);
   const kpis=`<div class="g g6">
     ${kpi('Реализовано по сделкам',SM(t.realized||0),'фиксированный результат продаж',cls(t.realized),S1)}
@@ -51,7 +53,8 @@ function pDash(){
     ${[['Ликвидный портфель','liquidPortfolio'],['Начальная маржа','startingMargin'],['Минимальная маржа','minimalMargin'],['Скорр. маржа','correctedMargin'],['Не хватает средств','amountOfMissingFunds']]
       .map(([n,k])=>`<div><div class="mu" style="font-size:12px">${n}</div><div class="num" style="font-weight:650;font-size:16px;margin-top:4px">${M(d.margin[k])}</div></div>`).join('')}
     <div><div class="mu" style="font-size:12px">Уровень достаточности</div><div class="num ${d.margin.fundsSufficiencyLevel<1.1&&d.margin.fundsSufficiencyLevel>0?'neg':''}" style="font-weight:650;font-size:16px;margin-top:4px">${f2(d.margin.fundsSufficiencyLevel)}</div></div></div></div>`:'';
-  return hero+todayCard()+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
+  const uxBlocks=typeof uxDashBlocks==='function'?uxDashBlocks():'';
+  return hero+todayCard()+uxBlocks+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
     <div class="card"><h2>Структура портфеля</h2><div id="c-alloc" class="chart"></div></div></div>
     <div class="g g2"><div class="card"><h2>Доходность по месяцам<span class="sp">последние 12 мес</span></h2>${mret}</div>
     <div class="card"><h2>Ближайшие выплаты<span class="sp">купоны · дивиденды · погашения</span></h2>${pays}</div></div>

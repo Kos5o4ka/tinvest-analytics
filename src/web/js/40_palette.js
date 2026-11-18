@@ -27,6 +27,7 @@ function kpScore(text,q){
 function kpCommands(){
   return[
     {g:'Команды',t:'Обновить данные',k:'обновить данные перезагрузить refresh',run:()=>load(true)},
+    {g:'Команды',t:'Поделиться портфелем (PNG без сумм)',k:'поделиться png карточка картинка share telegram',run:()=>{if(typeof shareOpen==='function')shareOpen()}},
     {g:'Команды',t:'Экспорт PDF (печать)',k:'экспорт pdf печать',run:()=>window.print()},
     {g:'Команды',t:INCOG.on?'Показать суммы':'Скрыть суммы (инкогнито)',k:'инкогнито скрыть суммы показать',run:()=>setIncog(!INCOG.on)},
     {g:'Команды',t:'Сменить тему',k:'тема оформление светлая тёмная',run:()=>$('#thm').click()}];

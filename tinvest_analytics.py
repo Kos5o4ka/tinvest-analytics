@@ -21971,11 +21971,109 @@ tr.scr-low td{opacity:.5}
 .shr-cvw{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:8px;display:flex;justify-content:center}
 .shr-cvw canvas{width:100%;height:auto;border-radius:8px;display:block}
 .shr-ft{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:12.5px}
+/* ── UX-реворкинг: режимы, вкладки, дропдаун счёта, сворачиваемый сайдбар, 3 карточки онбординга, подсказки, мини-тур ── */
+.logo{position:relative}
+.side-tog{all:unset;cursor:pointer;margin-left:auto;width:24px;height:24px;border-radius:7px;display:grid;place-items:center;color:var(--mu);font-size:15px;border:1px solid transparent;transition:.15s}
+.side-tog:hover{color:var(--tx);border-color:var(--line2);background:var(--card2)}
+.ux-mode{padding:0 4px 10px}
+.ux-mseg{width:100%;display:grid;grid-template-columns:1fr 1fr}
+.ux-mseg button{text-align:center;padding:5px 8px;font-size:12px}
+.nav .ux-cnt{margin-left:auto;font-size:11px;color:var(--mu);background:var(--card2);padding:1px 6px;border-radius:99px;line-height:1.4}
+.nav .nav-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Свёрнутый сайдбар (icon rail 62px) */
+body.side-mini aside{width:64px;padding:14px 8px 12px;overflow:visible}
+body.side-mini .logo{justify-content:center;padding:2px 0 12px;flex-direction:column;gap:6px}
+body.side-mini .logo-tx,body.side-mini .ux-mode,body.side-mini .nav-t,body.side-mini .ux-cnt,body.side-mini .accs,body.side-mini .badge{display:none}
+body.side-mini .side-tog{margin-left:0}
+body.side-mini .nav button{justify-content:center;padding:9px 0}
+body.side-mini .side-foot{justify-content:center;padding:8px 0 0}
+
+/* Выбор счёта в шапке .top (на десктопе скрываем дублирующий список в сайдбаре) */
+@media(min-width:901px){aside .accs{display:none}}
+.acc-dd{position:relative}
+.acc-dd-btn{padding:7px 11px;gap:8px;max-width:260px}
+.acc-dd-nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px}
+.acc-dd-ch{font-size:11px;color:var(--mu)}
+.acc-dd-menu{position:absolute;top:calc(100% + 6px);left:0;min-width:260px;max-width:340px;background:var(--card);border:1px solid var(--line2);border-radius:12px;box-shadow:0 14px 36px #00000055;padding:8px;z-index:900}
+.acc-dd-h{display:flex;align-items:center;justify-content:space-between;padding:4px 6px 8px;border-bottom:1px solid var(--line);font-size:11.5px;color:var(--mu);font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+.acc-dd-list{display:flex;flex-direction:column;gap:2px;margin-top:6px;max-height:300px;overflow:auto}
+.acc-dd-list button{all:unset;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 9px;border-radius:8px;font-size:13px;color:var(--tx)}
+.acc-dd-list button:hover{background:var(--card2)}
+.acc-dd-list button.on{background:var(--card2);box-shadow:inset 3px 0 0 var(--ac)}
+.acc-dd-list b{font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Заметное поле поиска в шапке */
+.srch-pill{padding:7px 11px;gap:7px}
+.srch-tx{color:var(--tx2);font-weight:500;font-size:12.5px}
+.srch-k{font:600 11px/1 system-ui,sans-serif;padding:2px 5px;border-radius:5px;border:1px solid var(--line2);color:var(--mu);background:var(--bg)}
+@media(max-width:820px){.srch-tx,.srch-k{display:none}}
+
+/* Внутренние вкладки раздела + строка «Зачем этот экран» + гостевая плашка */
+.ux-subwrap{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:-4px}
+.ux-sub{max-width:100%;overflow-x:auto}
+.ux-why{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 14px;border-radius:11px;background:var(--card);border:1px solid var(--line);font-size:13px;color:var(--tx2)}
+.ux-why-x{all:unset;cursor:pointer;font-size:12px;color:var(--mu);white-space:nowrap;padding:3px 8px;border-radius:7px;border:1px solid var(--line)}
+.ux-why-x:hover{color:var(--tx);border-color:var(--line2)}
+.ux-guest{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 14px;border-radius:12px;background:linear-gradient(90deg,#ffdd2d14,var(--card));border:1px solid #ffdd2d44;font-size:13px}
+.ux-guest-b{display:flex;gap:8px;flex-wrap:wrap}
+
+/* Инлайн ?-подсказка в Базу знаний */
+.ux-q{all:unset;cursor:pointer;display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;border:1px solid var(--line2);color:var(--mu);font-size:11px;font-weight:700;vertical-align:1px;margin-left:3px;transition:.15s}
+.ux-q:hover{color:var(--tx);border-color:var(--ac);background:#ffdd2d22}
+
+/* Главная: кнопки в Hero, «Быстрые задачи», чек-лист «С чего начать» */
+.hero-acts{margin-left:auto;display:inline-flex;gap:8px;flex-wrap:wrap}
+.ux-tasks{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+@media(max-width:1050px){.ux-tasks{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.ux-tasks{grid-template-columns:1fr}}
+.ux-tcard{all:unset;cursor:pointer;background:var(--card);border:1px solid var(--line);border-radius:13px;padding:13px 15px;display:flex;flex-direction:column;gap:4px;transition:.15s}
+.ux-tcard:hover{border-color:var(--ac);transform:translateY(-1px);background:var(--card2)}
+.ux-tcard b{font-size:13.5px;color:var(--tx)}
+.ux-tcard small{font-size:12px;color:var(--mu);line-height:1.35}
+.ux-chk{padding:14px 16px}
+.ux-chk-h{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px;font-size:14px}
+.ux-chk-l{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+@media(max-width:760px){.ux-chk-l{grid-template-columns:1fr}}
+.ux-chk-i{all:unset;cursor:pointer;display:flex;align-items:center;gap:9px;padding:8px 11px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;color:var(--tx);transition:.15s}
+.ux-chk-i:hover{border-color:var(--line2)}
+.ux-chk-i i{font-style:normal;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font-size:12px;border:1px solid var(--line2);color:var(--mu);flex:none}
+.ux-chk-i.done{opacity:.72}.ux-chk-i.done i{background:#3ecf8e22;border-color:var(--pos);color:var(--pos)}.ux-chk-i.done span{text-decoration:line-through;color:var(--mu)}
+
+/* Карточка облигации: строка-вывод и пресеты калькулятора */
+.bc-verdict{padding:10px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);border-left:3px solid var(--ac);font-size:13px;margin:10px 0 12px;line-height:1.45}
+.cl-pre{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0 14px;font-size:12.5px}
+.cl-pre .btn{padding:6px 11px;font-size:12.5px}
+
+/* 3 карточки онбординга */
+.ob-cards{display:grid;grid-template-columns:1.35fr 1fr;gap:14px;margin:14px 0}
+@media(max-width:760px){.ob-cards{grid-template-columns:1fr}}
+.ob-opt-col{display:flex;flex-direction:column;gap:14px}
+.ob-opt{background:var(--card2);border:1px solid var(--line);border-radius:13px;padding:15px 16px}
+.ob-opt-main{border-color:#ffdd2d55}
+.ob-opt-h{display:flex;align-items:flex-start;gap:10px;margin-bottom:8px}
+.ob-opt-h h3{margin:0;font-size:15px}
+.ob-badge{width:24px;height:24px;border-radius:50%;background:var(--ac);color:#111;font-weight:700;font-size:13px;display:grid;place-items:center;flex:none;margin-top:1px}
+
+/* Базовый режим: скрываем сложные колонки CY (7) и MacDur (12) в скринере облигаций */
+[data-ux-mode="basic"] #scr-head th:nth-child(7),
+[data-ux-mode="basic"] #scr-body td:nth-child(7),
+[data-ux-mode="basic"] #scr-head th:nth-child(12),
+[data-ux-mode="basic"] #scr-body td:nth-child(12){display:none}
+
+/* Мини-тур (4 шага) */
+.ux-hl{outline:2px solid var(--ac)!important;outline-offset:3px;border-radius:10px;position:relative;z-index:950}
+.ux-tour{position:fixed;right:24px;bottom:24px;z-index:1300;width:min(360px,calc(100vw - 32px));background:var(--card);border:1px solid var(--ac);border-radius:14px;padding:15px 17px;box-shadow:0 18px 48px #00000077}
+.ux-tour-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;font-size:14px}
+.ux-tour p{margin:0 0 12px;font-size:13px;color:var(--tx2);line-height:1.45}
+.ux-tour-ft{display:flex;align-items:center;justify-content:space-between}
 </style></head>
 <body>
 <aside>
   <div class="logo"><i><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#111" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16l5-6 4 3 7-8"/></svg></i>
-    <div>TAnalytic<small>аналитика портфеля</small></div></div>
+    <div class="logo-tx">TAnalytic<small>аналитика портфеля</small></div>
+    <button class="side-tog" id="side-tog" title="Свернуть / развернуть меню" aria-label="Свернуть меню">«</button></div>
+  <div class="ux-mode" id="ux-mode"></div>
   <nav class="nav" id="nav"></nav>
   <div class="accs">
     <div class="acc-h">Счета <label class="msw" title="Скрыть счета без активов"><input type="checkbox" id="hideEmpty"><i></i>скрыть пустые</label></div>
@@ -21987,11 +22085,12 @@ tr.scr-low td{opacity:.5}
   <div class="tkr" id="tkr" hidden></div>
   <div class="top">
     <h1 id="title">Обзор</h1>
+    <div class="acc-dd" id="acc-dd"></div>
     <div class="seg" id="period"></div>
     <span class="upd" id="upd"></span>
     <span class="pronly" id="prinfo"></span>
     <span class="who" id="who" style="display:none"></span>
-    <button class="btn ghost" id="srch" title="Поиск и команды (Ctrl+K / Cmd+K)" aria-label="Поиск"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button>
+    <button class="btn ghost srch-pill" id="srch" title="Поиск и команды (Ctrl+K / Cmd+K)" aria-label="Поиск"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><span class="srch-tx">Поиск…</span><kbd class="srch-k">⌘K</kbd></button>
     <button class="btn ghost" id="eye" title="Скрыть суммы в деньгах" aria-label="Режим инкогнито"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path class="slash" d="M3 3l18 18"/></svg></button>
     <button class="btn ghost" id="thm" title="Сменить тему">◐</button>
     <button class="btn ghost" id="share" title="Поделиться портфелем (PNG без сумм)">PNG</button>
@@ -22453,6 +22552,7 @@ function typingInView(){
 function render(){renderNow()}
 function renderSoon(){if(typingInView()){_rPend=true;return}renderNow()}
 document.addEventListener('focusout',()=>{if(_rPend)setTimeout(()=>{if(_rPend&&!typingInView())renderNow()},400)});
+const NO_PORTFOLIO_PAGES=new Set(['scr','cmp','map','hm','mkt','fng','pri','cal','dfl','flw','iss','watch','stk','sst','calc','lad','rot','dbx','mm','crp','mic','sig','mon']);
 function renderNow(){
   _rPend=false;
   S.charts=[];hideTip();prInfo();
@@ -22460,16 +22560,31 @@ function renderNow(){
   if(S.page==='set')return renderSettings();
   if(S.page==='imp')return renderImport();
   if(S.page==='kb')return renderKb();
-  if(PRO_PAGES.includes(S.page)&&!isPro()){v.innerHTML=`<div class="wrap">${proLock(S.page)}</div>`;return}
-  if(S.err&&!S.data){v.innerHTML=`<div class="wrap"><div class="card empty fade">${svgI('<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>')}
+  if(PRO_PAGES.includes(S.page)&&!isPro()){v.innerHTML=`<div class="wrap">${typeof uxSubTabs==='function'?uxSubTabs():''}${proLock(S.page)}</div>`;return}
+  const guestOk=NO_PORTFOLIO_PAGES.has(S.page);
+  if(S.err&&!S.data&&!guestOk){v.innerHTML=`<div class="wrap"><div class="card empty fade">${svgI('<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>')}
     <div style="max-width:640px">${esc(S.err)}</div><div class="row" style="justify-content:center"><button class="btn" id="retry">Повторить</button>
-    <button class="btn ghost" data-go="set">Настройки</button><button class="btn ghost" data-go="imp">Импорт отчёта</button></div></div></div>`;
+    <button class="btn ghost" data-go="set">Подключить счёт</button><button class="btn ghost" data-go="scr">Открыть рынок без токена</button></div></div></div>`;
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
-  if(!S.data){if(S.loading)skeleton();return}
+  if(!S.data&&!guestOk){
+    if(S.loading){skeleton();return}
+    v.innerHTML=`<div class="wrap fade">${typeof uxSubTabs==='function'?uxSubTabs():''}<div class="card empty">
+      <div style="font-size:16px;font-weight:600;color:var(--tx)">Этот раздел показывает данные вашего портфеля</div>
+      <div style="max-width:480px">Подключите Т-Инвестиции, загрузите отчёт брокера или откройте демо-портфель — это займёт меньше минуты. Рыночные разделы и калькулятор уже доступны без токена.</div>
+      <div class="row" style="justify-content:center"><button class="btn" data-go="set">Подключить счёт</button>
+      <button class="btn ghost" id="ux-go-demo">Посмотреть демо</button>
+      <button class="btn ghost" data-go="scr">Скринер облигаций</button></div></div></div>`;
+    v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));
+    const dm=$('#ux-go-demo');if(dm&&typeof demoEnter==='function')dm.onclick=()=>demoEnter(dm);
+    return;
+  }
   const sc=v.scrollTop;
   const views={dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,cmp:pCmp,map:pMap,hm:pHeatmap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,fng:pFng,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,dfl:pDfl,flw:pFlw,cal:pCal,watch:pWatch,stk:pStk,sst:pSst};
   const fn=views[S.page]||(PAGE_EXT[S.page]&&PAGE_EXT[S.page].render)||(()=>{S.page='dash';persist();renderNav();return pDash()});
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${S.page==='dash'?proBanner():''}${fn()}</div>`;
+  const topUx=(typeof uxGuestBar==='function'&&!S.data?uxGuestBar():'')
+    +(typeof uxSubTabs==='function'?uxSubTabs():'')
+    +(typeof uxWhyBanner==='function'?uxWhyBanner(S.page):'');
+  v.innerHTML=`<div class="wrap fade">${topUx}${S.err&&S.data?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)&&S.data?remindHtml():''}${S.page==='dash'&&S.data?proBanner():''}${fn()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
@@ -22522,14 +22637,16 @@ function pDash(){
     <div class="row" style="justify-content:center"><button class="btn" data-go="imp">Импорт отчёта</button>${d.sandbox?'<button class="btn ghost" data-go="set">Настройки</button>':''}</div></div>`;
   const income=sumK(t,['dividends','coupons','overnight']),taxes=sumK(t,TAXK);
   const profit=d.profit,ppct=d.invested>0&&profit!=null?profit/d.invested*100:null,hs=histSlice();
+  const _q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
   const hero=`<div class="card hero"><div style="position:relative;z-index:1"><div class="lbl">Стоимость портфеля</div>
     <div class="val num">${f2m(p.total)} <small>₽</small></div>
-    <div class="row" style="margin-top:10px">${p.daily!=null?`<span class="pill ${cls(p.daily)}">${SM(p.daily)} · ${pct(p.daily_pct)} за день</span>`:''}
-    <span class="pill ${cls(p.upnl)}">${SM(p.upnl)} · ${pct(p.yield_pct)} по открытым позициям</span></div></div>
+    <div class="row" style="margin-top:10px;flex-wrap:wrap">${p.daily!=null?`<span class="pill ${cls(p.daily)}">${SM(p.daily)} · ${pct(p.daily_pct)} за день</span>`:''}
+    <span class="pill ${cls(p.upnl)}">${SM(p.upnl)} · ${pct(p.yield_pct)} по открытым позициям</span>
+    <span class="hero-acts"><button class="btn" data-go="scr">+ Подобрать бумагу</button><button class="btn ghost" data-share-card="1" title="Сделать PNG-карточку без сумм">Поделиться PNG</button></span></div></div>
     <div class="meta"><div><span>Вложено (пополнения − выводы)</span><b class="num">${M(d.invested,'rub',0)}</b></div>
     <div><span>Прибыль за всё время</span><b class="num ${cls(profit)}">${profit==null?'—':SM(profit)}</b>${ppct!=null?` <span class="mu num" style="display:inline">${pct(ppct,1)}</span>`:''}</div>
-    <div><span>Доходность за период (TWR)</span><b class="num ${hs?cls(hs.total):''}">${hs?pct(hs.total*100,2):S.hist&&!S.hist.error?'—':'…'}</b></div>
-    <div><span>XIRR, % годовых</span><b class="num ${cls(d.xirr)}">${d.xirr==null?'—':pct(d.xirr*100,1)}</b></div></div></div>`;
+    <div><span>Доходность за период (TWR) ${_q('xirr','Доходность без влияния пополнений и выводов — подробнее в Базе знаний')}</span><b class="num ${hs?cls(hs.total):''}">${hs?pct(hs.total*100,2):S.hist&&!S.hist.error?'—':'…'}</b></div>
+    <div><span>XIRR, % годовых ${_q('xirr','Годовая доходность с учётом сумм и дат пополнений')}</span><b class="num ${cls(d.xirr)}">${d.xirr==null?'—':pct(d.xirr*100,1)}</b></div></div></div>`;
   const turn=(t.buy_turnover||0)+(t.sell_turnover||0);
   const kpis=`<div class="g g6">
     ${kpi('Реализовано по сделкам',SM(t.realized||0),'фиксированный результат продаж',cls(t.realized),S1)}
@@ -22567,7 +22684,8 @@ function pDash(){
     ${[['Ликвидный портфель','liquidPortfolio'],['Начальная маржа','startingMargin'],['Минимальная маржа','minimalMargin'],['Скорр. маржа','correctedMargin'],['Не хватает средств','amountOfMissingFunds']]
       .map(([n,k])=>`<div><div class="mu" style="font-size:12px">${n}</div><div class="num" style="font-weight:650;font-size:16px;margin-top:4px">${M(d.margin[k])}</div></div>`).join('')}
     <div><div class="mu" style="font-size:12px">Уровень достаточности</div><div class="num ${d.margin.fundsSufficiencyLevel<1.1&&d.margin.fundsSufficiencyLevel>0?'neg':''}" style="font-weight:650;font-size:16px;margin-top:4px">${f2(d.margin.fundsSufficiencyLevel)}</div></div></div></div>`:'';
-  return hero+todayCard()+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
+  const uxBlocks=typeof uxDashBlocks==='function'?uxDashBlocks():'';
+  return hero+todayCard()+uxBlocks+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
     <div class="card"><h2>Структура портфеля</h2><div id="c-alloc" class="chart"></div></div></div>
     <div class="g g2"><div class="card"><h2>Доходность по месяцам<span class="sp">последние 12 мес</span></h2>${mret}</div>
     <div class="card"><h2>Ближайшие выплаты<span class="sp">купоны · дивиденды · погашения</span></h2>${pays}</div></div>
@@ -24199,7 +24317,10 @@ setInterval(()=>{fetch('/api/ping').catch(()=>{})},20000);fetch('/api/ping').cat
   const c=S.cfg||{};
   $('#ver').textContent='v'+(c.version||'');$('#ver').onclick=()=>{go('set');setTimeout(()=>{const w=$('#whatsnew');if(w)w.scrollIntoView({behavior:'smooth'})},400)};
   $('#mode').className='badge'+(c.sandbox?' sb':'');$('#mode').innerHTML=c.token_set?'<b></b>'+(c.sandbox?'Песочница':'Боевой режим'):'';
-  if(!c.token_set&&!(c.imports||[]).length){S.page='set';renderNav();renderSettings();return}
+  if(!c.token_set&&!(c.imports||[]).length){
+    if(typeof NO_PORTFOLIO_PAGES!=='undefined'&&NO_PORTFOLIO_PAGES.has(S.page)){renderNav();render();return}
+    S.page='set';renderNav();renderSettings();return;
+  }
   if(['set','imp','kb'].includes(S.page)){render();load(false)}else load(false);
 })();
 // ── карточка облигации (боковая панель): клик по любому элементу с data-isin ──
@@ -24322,13 +24443,28 @@ function bcBody(c){
   if(c.errors&&c.errors.length)h+=`<div class="bc-warn">${c.errors.map(esc).join('<br>')}</div>`;
   if(m){
     const sp=m.spread;
+    const _q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
     h+=`<div class="bc-kpis">`
       +bcKpi('Цена',bcN(m.price,2)+' %',m.nominal?`номинал ${bcN(m.nominal,0)}`:'')
-      +bcKpi('Доходность',bcN(m.yield,2)+' %','к погашению/оферте')
-      +bcKpi('Спред к КБД',sp==null?'—':(sp>0?'+':'')+bcN(sp,2)+' п.п.',c.kbd!=null?`КБД ${bcN(c.kbd,2)} % на ${bcN(m.dur,2)} г.`:'',sp==null?'':sp>0?'pos':'neg')
-      +bcKpi('Дюрация',m.dur==null?'—':bcN(m.dur,2)+' г.',`оборот ${short(m.turn||0)}`)
+      +bcKpi('Доходность '+_q('yield','Доходность к погашению или ближайшей оферте (YTM)'),bcN(m.yield,2)+' %','к погашению/оферте')
+      +bcKpi('Спред к КБД '+_q('spread','Премия доходности выпуска над безрисковой кривой ОФЗ (КБД)'),sp==null?'—':(sp>0?'+':'')+bcN(sp,2)+' п.п.',c.kbd!=null?`КБД ${bcN(c.kbd,2)} % на ${bcN(m.dur,2)} г.`:'',sp==null?'':sp>0?'pos':'neg')
+      +bcKpi('Дюрация '+_q('duration','Чувствительность цены облигации к изменению ставок'),m.dur==null?'—':bcN(m.dur,2)+' г.',`оборот ${short(m.turn||0)}`)
       +`</div>`;
   }
+  const vBits=[];
+  if(d.HASDEFAULT==='1')vBits.push('<b class="neg">Допущен дефолт</b>');
+  else if(d.HASTECHNICALDEFAULT==='1')vBits.push('<b class="neg">Технический дефолт</b>');
+  else if(c.rating&&c.rating.v){
+    const bk=rBucket(c.rating.v).split(' ')[0];
+    const lvl={AAA:'Надёжность максимальная',AA:'Надёжность высокая',A:'Надёжность выше средней',BBB:'Надёжность умеренная',BB:'Повышенный риск (ВДО)',B:'Высокий риск (ВДО)'}[bk]||'Спекулятивный риск';
+    vBits.push(`${lvl} (<b>${esc(c.rating.v)}</b>)`);
+  }else if(ci.ofz||String(c.isin||'').startsWith('SU'))vBits.push('Государственный выпуск (<b>ОФЗ</b>)');
+  if(m&&m.spread!=null)vBits.push(`спред к КБД <b class="${m.spread>=0?'pos':'neg'}">${m.spread>0?'+':''}${bcN(m.spread,2)} п.п.</b>`);
+  if(c.offers&&c.offers.length){
+    const o0=c.offers[0];
+    vBits.push(`ближайшая оферта <b>${ddm(o0.date)}</b> (${o0.kind==='put'?'PUT — право продать':o0.kind==='call'?'CALL — право эмитента погасить':'оферта'})`);
+  }else if(m&&m.mat)vBits.push(`без оферт до погашения ${ddm(m.mat)}`);
+  if(vBits.length)h+=`<div class="bc-verdict">${vBits.join(' · ')}</div>`;
   const rows=[];const add=(k,v)=>{if(v!=null&&v!=='')rows.push(`<div><span>${k}</span><span>${v}</span></div>`)};
   add('Эмитент',esc(d.EMITTER||''));
   add('Вид',esc(d.BOND_TYPE||d.TYPENAME||''));
@@ -25379,7 +25515,12 @@ function pCalcInv(){
   const seg=(id,opts,v)=>`<div class="seg" id="cl-${id}">${opts.map(o=>`<button data-v="${o[0]}" class="${String(o[0])===String(v)?'on':''}">${o[1]}</button>`).join('')}</div>`;
   const chips=clAvail(P).map(s=>`<label class="cl-chip"><input type="checkbox" data-s="${s[0]}" ${F.strat[s[0]]?'checked':''}><span><i style="background:${s[2]}"></i>${s[1]}</span></label>`).join('');
   return`${ld?`<div class="card">${waitBox('Загружаю параметры рынка (ставки, доходности, ваш портфель)… пока расчёт идёт на значениях по умолчанию')}</div>`:''}${fb?`<div class="msg err">Не удалось загрузить рыночные данные (${esc(S.calcErr||'нет ответа')}). Использованы значения по умолчанию, расчёт приблизителен.</div>`:''}
-  <div class="card"><h2>Параметры<span class="sp">пересчёт мгновенный</span></h2><div id="cl-form">
+  <div class="card"><h2>Параметры<span class="sp">пересчёт мгновенный</span></h2>
+   <div class="cl-pre" id="cl-pre"><span class="mu">Быстрые сценарии:</span>
+    <button class="btn ghost" data-clp="cushion">Подушка 1 год</button>
+    <button class="btn ghost" data-clp="passive50">Пассивный доход 50 тыс/мес</button>
+    <button class="btn ghost" data-clp="goal5">Цель через 5 лет (ИИС-3)</button></div>
+   <div id="cl-form">
    <div class="cl-grid cl-base">${num('start','Стартовый капитал, ₽',F.start,'min="0" step="10000"')}${num('monthly','Пополнение в месяц, ₽',F.monthly,'min="0" step="1000"')}
     <label class="field"><span>Срок: <b id="cl-yv">${F.years}</b> лет</span><input id="cl-years" type="range" min="1" max="30" step="1" value="${F.years}"></label></div>
    ${pf&&pf.value!=null?`<div class="cl-row"><button class="btn ghost" id="cl-pf">Подставить мой портфель</button><span class="note">старт ${clRub(pf.value)}${pf.monthly!=null?`, пополнение ${clRub(pf.monthly)} в месяц (среднее за 12 мес.)`:''}</span></div>`:''}
@@ -25431,6 +25572,13 @@ function bindCalcInv(){
     o.onchange=e=>{if(e.target.id==='cl-view')pick(e.target.value)};
     o.onclick=e=>{const t=e.target.closest('tr[data-s]');if(t&&o.querySelectorAll('tr[data-s]').length>1)pick(t.dataset.s)}}
   const b=$('#cl-pf');if(b)b.onclick=()=>{const pf=P.portfolio;if(!pf)return;if(pf.value!=null)F.start=Math.round(pf.value);if(pf.monthly!=null)F.monthly=Math.round(pf.monthly);F.strat.pf=1;clSave();render()};
+  const pr=$('#cl-pre');if(pr)pr.onclick=e=>{
+    const x=e.target.closest('[data-clp]');if(!x)return;
+    const k=x.dataset.clp;
+    if(k==='cushion'){F.start=300000;F.monthly=25000;F.years=1;F.acct='plain';F.strat={dep:1,fund:1,ofz:1,aa:0,a:0};clSave();render();return}
+    if(k==='goal5'){F.start=500000;F.monthly=35000;F.years=5;F.acct='iis3';F.strat={dep:1,fund:1,ofz:1,aa:1,a:0};clSave();render();return}
+    if(k==='passive50'){const G=cgLoad();G.monthly=50000;G.years=10;G.hz='years';try{localStorage.setItem('ta_calc_goal',JSON.stringify(G))}catch(err){}cgSetMode('goal');return}
+  };
 }
 
 /* ── Вкладка «Пассивный доход»: математика на сервере (/api/calc/goal), здесь только ввод и вывод ── */
@@ -26440,6 +26588,7 @@ function kpScore(text,q){
 function kpCommands(){
   return[
     {g:'Команды',t:'Обновить данные',k:'обновить данные перезагрузить refresh',run:()=>load(true)},
+    {g:'Команды',t:'Поделиться портфелем (PNG без сумм)',k:'поделиться png карточка картинка share telegram',run:()=>{if(typeof shareOpen==='function')shareOpen()}},
     {g:'Команды',t:'Экспорт PDF (печать)',k:'экспорт pdf печать',run:()=>window.print()},
     {g:'Команды',t:INCOG.on?'Показать суммы':'Скрыть суммы (инкогнито)',k:'инкогнито скрыть суммы показать',run:()=>setIncog(!INCOG.on)},
     {g:'Команды',t:'Сменить тему',k:'тема оформление светлая тёмная',run:()=>$('#thm').click()}];
@@ -26931,27 +27080,48 @@ function obStep(n,state,title,body){
 function obRender(){
   const v=$('#view');if(!v)return;
   const tokDone=ob.done;
-  const authOk=typeof AUTH!=='undefined'&&AUTH.st&&AUTH.st.state==='ok';
-  v.innerHTML=`<div class="wrap fade" style="max-width:760px"><div class="card ob-card">
-    <div class="ob-hd"><div class="ob-t">Добро пожаловать 👋</div><p class="t2">Три шага, и вы увидите свой портфель: доходность, выплаты, оферты и риски по облигациям.</p></div>
-    ${obStep(1,'done','Ключ из бота',`<p class="mu">${authOk?'Вход выполнен.':'Готово — можно переходить к следующему шагу.'}</p>`)}
-    ${obStep(2,tokDone?'done':'now','Токен Т-Инвестиций «только чтение»',tokDone?'<p class="mu">Токен сохранён и проверен.</p>':`
-      ${`<div class="ro-note">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}<div><b>Нужен токен только для чтения.</b> С ним нельзя торговать, выводить деньги или менять настройки счёта — это ограничение на стороне Т-Банка. Токен хранится только на этом компьютере.</div></div>`}
-      <p class="mu">Он нужен, чтобы программа могла прочитать ваши счета.</p>
-      <div class="ob-row"><input class="in" type="password" id="ob-tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false" aria-label="API-токен Т-Инвестиций">
-        <button class="btn" id="ob-save">Сохранить и проверить</button>
-        <button class="btn ghost" id="ob-demo" title="Модельный портфель — без токена и без ваших данных">Посмотреть демо-портфель</button></div>
-      <label class="sw" style="margin:6px 0 4px"><input type="checkbox" id="ob-sb" ${ob.sb?'checked':''}><i></i><div><b>Токен песочницы</b><small>включите, если используете тестовый токен Sandbox</small></div></label>
-      <div id="ob-msg" role="status">${ob.err?`<div class="msg err">${esc(ob.err)}</div>`:''}</div>
-      <details class="ob-how" ${ob.help?'open':''}><summary>Где взять токен</summary><ol>
-        <li>Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении: Профиль → Настройки → Токены T-Invest API).</li>
-        <li>Нажмите «Создать токен», выберите доступ <b>«Только для чтения»</b> и нужные счета.</li>
-        <li>Скопируйте токен сразу (второй раз его не покажут) и вставьте в поле выше.</li></ol></details>
-      <p class="ob-priv">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}Токен хранится только на этом компьютере и никуда не отправляется, кроме Т-Инвестиций.</p>`)}
-    ${obStep(3,tokDone?'now':'soon','Первый взгляд на портфель',tokDone?'<div class="wait">Загружаю портфель…</div>':'<p class="mu">Откроется сам, как только токен будет сохранён.</p>')}
-    <div class="ob-alt">Нет Т-Инвестиций? <button class="lnk" id="ob-imp">Импортируйте отчёт другого брокера</button>
-      <span class="mu"> · </span><button class="lnk" id="ob-all">Все настройки</button></div>
+  v.innerHTML=`<div class="wrap fade" style="max-width:960px"><div class="card ob-card">
+    <div class="ob-hd"><div class="ob-t">Добро пожаловать в TAnalytic 👋</div>
+      <p class="t2">Выберите удобный способ начать — это займёт меньше минуты. Все данные хранятся только на вашем компьютере.</p></div>
+    <div class="ob-cards">
+      <div class="ob-opt ob-opt-main">
+        <div class="ob-opt-h"><span class="ob-badge">1</span><div><h3>Подключить Т-Инвестиции</h3><small class="mu">Автозагрузка сделок, портфеля и истории по токену «только чтение»</small></div></div>
+        ${tokDone?'<div class="msg ok">Токен сохранён и проверен — загружаю портфель…</div>':`
+        <div class="ro-note">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}<div><b>Токен только для чтения.</b> С ним нельзя торговать или выводить деньги.</div></div>
+        <div class="ob-row"><input class="in" type="password" id="ob-tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false" aria-label="API-токен Т-Инвестиций">
+          <button class="btn" id="ob-save">Проверить и подключить</button></div>
+        <label class="sw" style="margin:6px 0 4px"><input type="checkbox" id="ob-sb" ${ob.sb?'checked':''}><i></i><div><b>Токен песочницы (Sandbox)</b><small>включите для тестового токена</small></div></label>
+        <div id="ob-msg" role="status">${ob.err?`<div class="msg err">${esc(ob.err)}</div>`:''}</div>
+        <details class="ob-how" ${ob.help?'open':''}><summary>Где взять токен за 30 секунд</summary><ol>
+          <li>Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> (или в приложении: Профиль → Настройки → Токены T-Invest API).</li>
+          <li>Нажмите «Создать токен», выберите доступ <b>«Только для чтения»</b> и нужные счета.</li>
+          <li>Скопируйте токен и вставьте в поле выше — сначала проверим, потом сохраним.</li></ol></details>`}
+      </div>
+      <div class="ob-opt-col">
+        <div class="ob-opt">
+          <div class="ob-opt-h"><span class="ob-badge">2</span><div><h3>Другой брокер</h3><small class="mu">ВТБ · Сбер · Альфа · БКС · Финам</small></div></div>
+          <p class="mu" style="margin:6px 0 12px;font-size:13px">Загрузите брокерский отчёт (XLSX / XML / HTML) — программа построит доходность, выплаты и налоги без токена.</p>
+          <button class="btn ghost" id="ob-imp">Загрузить отчёт брокера</button>
+        </div>
+        <div class="ob-opt">
+          <div class="ob-opt-h"><span class="ob-badge">3</span><div><h3>Посмотреть демо-портфель</h3><small class="mu">Без токена и ваших данных</small></div></div>
+          <p class="mu" style="margin:6px 0 12px;font-size:13px">Готовый живой портфель с облигациями, акциями, офертами и графиками — посмотрите, как всё работает.</p>
+          <button class="btn" id="ob-demo">Открыть демо в 1 клик</button>
+        </div>
+      </div>
+    </div>
+    <div class="ob-alt">
+      <span>Хотите просто изучить рынок без портфеля?</span>
+      <button class="lnk" id="ob-mkt">Скринер облигаций →</button>
+      <span class="mu"> · </span><button class="lnk" id="ob-calc">Калькулятор →</button>
+      <span class="mu"> · </span><button class="lnk" id="ob-all">Все настройки</button>
+    </div>
   </div></div>`;
+  const dm=$('#ob-demo');if(dm)dm.onclick=()=>demoEnter(dm);
+  const imp=$('#ob-imp');if(imp)imp.onclick=()=>go('imp');
+  const mkt=$('#ob-mkt');if(mkt)mkt.onclick=()=>go('scr');
+  const clc=$('#ob-calc');if(clc)clc.onclick=()=>go('calc');
+  const all=$('#ob-all');if(all)all.onclick=()=>{ob.skip=true;renderSettings()};
   const b=$('#ob-save');if(!b)return;
   const input=$('#ob-tok'),sb=$('#ob-sb');
   if(sb)sb.onchange=()=>{ob.sb=sb.checked};
@@ -26974,10 +27144,7 @@ function obRender(){
     }
   };
   b.onclick=save;
-  const dm=$('#ob-demo');if(dm)dm.onclick=()=>demoEnter(dm);
   input.onkeydown=e=>{if(e.key==='Enter')save()};
-  $('#ob-imp').onclick=()=>go('imp');
-  $('#ob-all').onclick=()=>{ob.skip=true;renderSettings()};
   if(!tokDone&&!ob.err)input.focus();
 }
 /* пока токена нет, а страница «Настройки» открыта при старте: бутстрап вызывает renderSettings() по имени — перехват выше сработает */
@@ -28628,6 +28795,272 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&SHR.open)shareClose
 document.addEventListener('click',e=>{
   if(e.target.closest('#share')||e.target.closest('[data-share-card]'))shareOpen();
 });
+/* ── UX-реворкинг: 9 разделов + вкладки .seg, Базовый/Профи, счёт в шапке, сворачиваемый сайдбар, подсказки, чек-лист, мини-тур ── */
+const UX_SECTIONS=[
+  {id:'home',title:'Главная',icon:'dash',basic:true,tabs:['dash']},
+  {id:'pf',title:'Портфель',icon:'pos',basic:true,tabs:['pos','bonds','ret','bench','ops','fees','reb'],basicTabs:['pos','bonds','ret','ops','reb']},
+  {id:'pay_ev',title:'Выплаты и события',icon:'pay',basic:true,tabs:['pay','off','cal']},
+  {id:'bonds_mkt',title:'Облигации (рынок)',icon:'scr',basic:true,tabs:['scr','cmp','rot','dbx','lad','pri','map'],basicTabs:['scr','cmp','rot','lad','pri']},
+  {id:'stocks_mkt',title:'Акции и фонды',icon:'hm',basic:false,tabs:['sst','hm','stk','mm']},
+  {id:'pulse',title:'Пульс рынка',icon:'mkt',basic:false,tabs:['mkt','fng','flw','mic','sig']},
+  {id:'risk_ctrl',title:'Надёжность и риски',icon:'risk',basic:false,tabs:['risk','mon','iss','crp','dfl','watch']},
+  {id:'taxes',title:'Налоги',icon:'tax',basic:true,tabs:['tax','txo']},
+  {id:'calc_sec',title:'Калькулятор',icon:'calc',basic:true,tabs:['calc']}
+];
+const UX_TAB_SHORT={
+  dash:'Главная',pos:'Позиции',bonds:'Облигации',ret:'Доходность',bench:'Бенчмарки',ops:'Операции',fees:'Комиссии',reb:'Ребалансировка',
+  pay:'Выплаты',off:'Оферты',cal:'Календарь',
+  scr:'Скринер',cmp:'Сравнение',rot:'Флоатеры или фиксы',dbx:'Линкеры и валютные',lad:'Лесенка',pri:'Первичка',map:'Карта рынка',
+  sst:'Скринер акций',hm:'Тепловая карта',stk:'Карточка акции',mm:'Деньги и базис',
+  mkt:'Ставки и КБД',fng:'Страх и жадность',flw:'Кто покупает',mic:'Стакан и ликвидность',sig:'Сигналы',
+  risk:'Риски портфеля',mon:'Мониторинг',iss:'Эмитенты',crp:'Устойчивость',dfl:'Техдефолты',watch:'Наблюдение',
+  tax:'Итоги года и ЛДВ',txo:'Оптимизация и ИИС-3',calc:'Калькулятор'
+};
+const UX_WHY={
+  scr:'Подберите облигации по надёжности, доходности, сроку и купону. Нажмите на любую строку — откроется карточка бумаги.',
+  cmp:'Сравните 2–5 облигаций лицом к лицу: доходность, спред к КБД, дюрацию, оферты и денежный поток.',
+  rot:'Помогает выбрать между флоатерами и фиксами при разных сценариях ключевой ставки ЦБ.',
+  dbx:'Оценка инфляционных ОФЗ-ИН (линкеров), радар покрытия ближайших оферт и налог на валютные облигации.',
+  lad:'Соберите «лесенку» облигаций с равномерными выплатами и погашениями без риска реинвестирования.',
+  pri:'Новые размещения облигаций: премия первички (NIP) к рынку, стоимость заморозки кэша и статистика первых 30 дней.',
+  map:'Карта всех корпоративных облигаций «доходность vs дюрация» относительно кривой ОФЗ (КБД).',
+  mm:'Сравнение фондов ликвидности (LQDT и др.) с накопительным счётом после налогов и базис фьючерсов.',
+  crp:'Финансовая устойчивость эмитента по РСБУ: модели банкротства, скрытый долг и риск размытия акций.',
+  txo:'Сбор убытков по FIFO для снижения НДФЛ и сравнение ИИС-3 с обычным брокерским счётом.',
+  mic:'Оценка проскальзывания крупной заявки в стакане и поиск скрытых («айсберг») заявок.',
+  risk:'Стресс-тест портфеля на изменение ставок, концентрацию по эмитентам и валютный риск.',
+  reb:'Расчёт покупок и продаж для приведения долей портфеля к вашей целевой структуре.',
+  flw:'Агрессия покупателей и продавцов в ленте сделок и дисбаланс стакана в реальном времени.',
+  fng:'Сводный индекс настроений российского рынка на основе волатильности, ширины рынка и потоков.',
+  dfl:'Лента технических и фактических дефолтов по облигациям с e-disclosure и флагами Мосбиржи.',
+  bench:'Честное сравнение доходности вашего портфеля с индексами акций, облигаций и денежного рынка.'
+};
+
+const UX={
+  mode:lsGet('ta_ux_mode')==='pro'?'pro':'basic',
+  mini:lsGet('ta_side_mini')==='1',
+  lastTab:lsJson('ta_ux_last',{}),
+  whyOff:lsJson('ta_ux_why_off',{}),
+  checks:lsJson('ta_ux_checks',{}),
+  checkOff:lsGet('ta_ux_chk_off')==='1',
+  ddOpen:false
+};
+function uxSyncMode(){
+  document.documentElement.dataset.uxMode=UX.mode;
+  document.body.classList.toggle('side-mini',UX.mini);
+  const tg=$('#side-tog');if(tg)tg.textContent=UX.mini?'»':'«';
+}
+uxSyncMode();
+
+function uxSetMode(m){
+  UX.mode=m==='pro'?'pro':'basic';
+  lsSet('ta_ux_mode',UX.mode);
+  uxSyncMode();renderNav();render();
+}
+function uxMarkCheck(k){
+  if(UX.checks[k])return;
+  UX.checks[k]=1;lsSet('ta_ux_checks',JSON.stringify(UX.checks));
+}
+function uxSectionOf(page){
+  return UX_SECTIONS.find(s=>s.tabs.includes(page))||null;
+}
+function uxVisTabs(sec){
+  if(!sec)return[];
+  const raw=(UX.mode==='basic'&&sec.basicTabs&&!sec.tabs.filter(t=>!sec.basicTabs.includes(t)).includes(S.page))?sec.basicTabs:sec.tabs;
+  return raw.filter(k=>PAGES.some(p=>p&&p[0]===k)&&!navHid(k));
+}
+
+/* ── Инлайн ?-подсказки, ведущие в Базу знаний (42_kb.js) ── */
+function uxTip(kbId,shortTxt){
+  return`<button type="button" class="ux-q" data-kb-jump="${esc(kbId)}" title="${esc(shortTxt||'Открыть справку в Базе знаний')}" aria-label="${esc(shortTxt||'Справка')}">?</button>`;
+}
+
+/* ── Плашка гостевого режима ── */
+function uxGuestBar(){
+  return`<div class="ux-guest"><span><b>Гостевой режим</b> — рыночные разделы и калькулятор открыты без токена.</span>
+    <span class="ux-guest-b"><button class="btn" data-go="set">Подключить счёт</button><button class="btn ghost" id="ux-g-demo">Демо-портфель</button></span></div>`;
+}
+
+/* ── Верхние вкладки внутри раздела (.seg) ── */
+function uxSubTabs(){
+  const sec=uxSectionOf(S.page);
+  if(!sec)return'';
+  const tabs=uxVisTabs(sec);
+  if(tabs.length<=1)return'';
+  const pgName=k=>UX_TAB_SHORT[k]||(PAGES.find(p=>p&&p[0]===k)||[k,k])[1];
+  return`<div class="ux-subwrap"><div class="seg ux-sub" id="ux-sub">${tabs.map(k=>`<button class="${k===S.page?'on':''}" data-p="${esc(k)}">${esc(pgName(k))}${typeof proNavBadge==='function'?proNavBadge(k):''}</button>`).join('')}</div></div>`;
+}
+
+/* ── 1-строчная подсказка «Зачем этот экран» ── */
+function uxWhyBanner(page){
+  const t=UX_WHY[page];
+  if(!t||UX.whyOff[page])return'';
+  return`<div class="ux-why"><span>${esc(t)}</span><button type="button" class="ux-why-x" data-why-off="${esc(page)}" title="Скрыть подсказку">Понятно ×</button></div>`;
+}
+
+/* ── Блоки Главной: «Быстрые задачи» и Чек-лист «С чего начать» ── */
+function uxDashBlocks(){
+  if(S.data)uxMarkCheck('acc');
+  const tasks=`<div class="ux-tasks">
+    <button class="ux-tcard" data-ux-task="ofz"><b>Подобрать надёжные облигации</b><small>ОФЗ и корпоративные с высоким рейтингом</small></button>
+    <button class="ux-tcard" data-ux-task="rot"><b>Флоатеры или фиксы?</b><small>Сравнить доходность при изменении ставки ЦБ</small></button>
+    <button class="ux-tcard" data-ux-task="calc"><b>Посчитать, сколько накоплю</b><small>Капитал и пассивный доход с учётом инфляции</small></button>
+    <button class="ux-tcard" data-ux-task="tax"><b>Проверить налоги за год</b><small>НДФЛ, льгота ЛДВ и вычет по ИИС-3</small></button>
+  </div>`;
+  const steps=[
+    ['acc','Подключите счёт или откройте демо-портфель','set'],
+    ['pay','Проверьте ближайшие выплаты и оферты','pay'],
+    ['bond','Откройте карточку любой облигации в портфеле или скринере','scr'],
+    ['srch','Попробуйте быстрый поиск по тикерам и экранам (⌘K / Ctrl+K)','__srch']
+  ];
+  const doneCnt=steps.filter(([k])=>UX.checks[k]).length;
+  let chk='';
+  if(!UX.checkOff&&doneCnt<steps.length){
+    chk=`<div class="card ux-chk"><div class="ux-chk-h"><div><b>С чего начать</b> <span class="mu">· выполнено ${doneCnt} из ${steps.length}</span></div>
+      <div class="row" style="gap:8px"><button class="btn ghost" id="ux-tour-go" style="padding:5px 10px;font-size:12px">Мини-тур (4 шага)</button>
+      <button class="lnk" id="ux-chk-hide" style="font-size:12px">Скрыть</button></div></div>
+      <div class="ux-chk-l">${steps.map(([k,t,act])=>`<button class="ux-chk-i${UX.checks[k]?' done':''}" data-ux-step="${esc(act)}"><i>${UX.checks[k]?'✓':'○'}</i><span>${esc(t)}</span></button>`).join('')}</div></div>`;
+  }
+  return chk+tasks;
+}
+
+/* ── Переопределяем renderNav: 9 сжатых разделов + переключатель «Базовый / Профи» ── */
+const _renderNavPrev=renderNav;
+renderNav=function(){
+  const modeEl=$('#ux-mode');
+  if(modeEl){
+    modeEl.innerHTML=`<div class="seg ux-mseg"><button class="${UX.mode==='basic'?'on':''}" data-um="basic" title="6 основных разделов без перегруза">Базовый</button><button class="${UX.mode==='pro'?'on':''}" data-um="pro" title="Все 9 разделов и продвинутая аналитика">Профи</button></div>`;
+  }
+  const curSec=uxSectionOf(S.page);
+  if(curSec){UX.lastTab[curSec.id]=S.page;lsSet('ta_ux_last',JSON.stringify(UX.lastTab))}
+  const secs=UX_SECTIONS.filter(s=>UX.mode==='pro'||s.basic||(curSec&&curSec.id===s.id));
+  const used=new Set(NAV_FIXED.concat(...UX_SECTIONS.flatMap(s=>s.tabs)));
+  const extra=PAGES.filter(p=>p&&!used.has(p[0])&&!navHid(p[0]));
+  let h=secs.map(s=>{
+    const tabs=uxVisTabs(s);if(!tabs.length)return'';
+    const act=curSec&&curSec.id===s.id;
+    const target=(UX.lastTab[s.id]&&tabs.includes(UX.lastTab[s.id]))?UX.lastTab[s.id]:tabs[0];
+    const cnt=tabs.length>1?`<span class="ux-cnt">${tabs.length}</span>`:'';
+    return`<button class="${act?'on':''}" data-p="${esc(target)}" title="${esc(s.title)}">${svgI(IC[s.icon]||IC.dash)}<span class="nav-t">${esc(s.title)}</span>${cnt}</button>`;
+  }).join('');
+  if(extra.length){
+    h+='<div class="sep"></div>'+extra.map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}">${svgI(IC[p[0]]||IC.dash)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
+  }
+  h+='<div class="sep"></div>'+NAV_FIXED.map(k=>PAGES.find(p=>p&&p[0]===k)).filter(Boolean).map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}">${svgI(IC[p[0]]||IC.set)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
+  $('#nav').innerHTML=h;
+  $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
+  $('#period').style.visibility=PERIOD_PAGES.includes(S.page)&&S.data?'visible':'hidden';
+  const a=S.accounts.find(x=>x.id===S.account);
+  const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
+  if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}
+  $('#title').innerHTML=esc(pgCur[1])+(['imp','set','kb'].includes(S.page)||!S.data?'':` <small>${esc(S.account==='all'?'все счета':a?a.name:'')}</small>`);
+  if(typeof demoBar==='function')try{demoBar();if(typeof demoSync==='function')demoSync()}catch(e){}
+  uxRenderAccDropdown();
+};
+
+/* ── Дропдаун выбора счёта в шапке .top (синхронизирован с renderAccounts) ── */
+function uxRenderAccDropdown(){
+  const wrap=$('#acc-dd');if(!wrap)return;
+  const accs=S.accounts||[];
+  if(!accs.length||!S.data){wrap.innerHTML='';wrap.style.display='none';return}
+  wrap.style.display='';
+  const cur=accs.find(a=>a.id===S.account);
+  const allTot=accs.filter(a=>!a.empty).reduce((s,a)=>s+(a.total||0),0);
+  const label=S.account==='all'?'Все счета':(cur?cur.name:'Счёт');
+  const sumTxt=S.account==='all'?short(allTot):(cur&&!cur.empty?short(cur.total):'пусто');
+  const vis=accs.filter(a=>!S.hideEmpty||!a.empty||a.id===S.account);
+  wrap.innerHTML=`<button type="button" class="btn ghost acc-dd-btn" id="acc-dd-btn" aria-expanded="${UX.ddOpen}">
+    <span class="acc-dd-nm">${esc(label)}</span><span class="mu num">${esc(sumTxt)}</span><span class="acc-dd-ch">▾</span></button>
+    ${UX.ddOpen?`<div class="acc-dd-menu" id="acc-dd-menu">
+      <div class="acc-dd-h"><span>Выбор счёта</span><label class="msw"><input type="checkbox" id="acc-dd-he" ${S.hideEmpty?'checked':''}><i></i>скрыть пустые</label></div>
+      <div class="acc-dd-list">
+        ${accs.length>1?`<button class="${S.account==='all'?'on':''}" data-a="all"><b>Все счета</b><span class="num">${short(allTot)}</span></button>`:''}
+        ${vis.map(a=>`<button class="${a.id===S.account?'on':''}" data-a="${esc(a.id)}"><b>${esc(a.name)}</b><span class="num">${a.empty?'пусто':short(a.total)}</span></button>`).join('')}
+      </div></div>`:''}`;
+}
+const _renderAccPrev=renderAccounts;
+renderAccounts=function(){_renderAccPrev.apply(this,arguments);uxRenderAccDropdown()};
+
+/* ── Трекинг шагов чек-листа и 4-шаговый мини-тур ── */
+const _goPrev=go;
+go=function(p){
+  if(p==='pay'||p==='off')uxMarkCheck('pay');
+  _goPrev(p);
+};
+if(typeof openBond==='function'){
+  const _obPrev=openBond;
+  openBond=function(){uxMarkCheck('bond');return _obPrev.apply(this,arguments)};
+}
+if(typeof kpOpen==='function'){
+  const _kpPrev=kpOpen;
+  kpOpen=function(){uxMarkCheck('srch');return _kpPrev.apply(this,arguments)};
+}
+
+const UX_TOUR_STEPS=[
+  {sel:'aside',title:'Умное меню и режим «Базовый / Профи»',text:'В «Базовом» режиме показаны 6 главных разделов без лишнего шума. Переключатель «Профи» вверху меню открывает все квантовые инструменты.'},
+  {sel:'#acc-dd,#period',title:'Счёт и период всегда под рукой',text:'Переключайте брокерские счета и период доходности прямо в верхней панели — не нужно прокручивать боковое меню.'},
+  {sel:'#srch',title:'Быстрый поиск ⌘K / Ctrl+K',text:'Мгновенно находите любую облигацию, акцию, эмитента или экран программы с клавиатуры.'},
+  {sel:'#eye',title:'Режим инкогнито и PNG-карточка',text:'Глаз скрывает все суммы в рублях на экране, а кнопка PNG делает красивую карточку доходности для Telegram без абсолютных сумм.'}
+];
+let _uxTourI=-1;
+function uxTourStop(){
+  _uxTourI=-1;lsSet('ta_ux_tour_done','1');
+  const el=$('#ux-tour');if(el)el.remove();
+  document.querySelectorAll('.ux-hl').forEach(x=>x.classList.remove('ux-hl'));
+}
+function uxTourShow(i){
+  document.querySelectorAll('.ux-hl').forEach(x=>x.classList.remove('ux-hl'));
+  if(i>=UX_TOUR_STEPS.length){uxTourStop();return}
+  _uxTourI=i;
+  const st=UX_TOUR_STEPS[i];
+  const tgt=document.querySelector(st.sel);
+  if(tgt)tgt.classList.add('ux-hl');
+  let box=$('#ux-tour');
+  if(!box){box=document.createElement('div');box.id='ux-tour';box.className='ux-tour';document.body.appendChild(box)}
+  box.innerHTML=`<div class="ux-tour-hd"><b>${esc(st.title)}</b><span class="mu">${i+1} / ${UX_TOUR_STEPS.length}</span></div>
+    <p>${esc(st.text)}</p>
+    <div class="ux-tour-ft"><button class="lnk" id="uxt-skip">Пропустить</button>
+    <button class="btn" id="uxt-next">${i+1===UX_TOUR_STEPS.length?'Готово':'Далее →'}</button></div>`;
+  $('#uxt-skip').onclick=uxTourStop;
+  $('#uxt-next').onclick=()=>uxTourShow(i+1);
+}
+function uxTourStart(){uxTourShow(0)}
+
+/* ── Единые делегированные обработчики UX ── */
+document.addEventListener('click',e=>{
+  const t=e.target;
+  const um=t.closest('[data-um]');if(um){uxSetMode(um.dataset.um);return}
+  if(t.closest('#side-tog')){UX.mini=!UX.mini;lsSet('ta_side_mini',UX.mini?'1':'0');uxSyncMode();return}
+  const sub=t.closest('#ux-sub [data-p]');if(sub){go(sub.dataset.p);return}
+  const wh=t.closest('[data-why-off]');if(wh){UX.whyOff[wh.dataset.whyOff]=1;lsSet('ta_ux_why_off',JSON.stringify(UX.whyOff));const el=wh.closest('.ux-why');if(el)el.remove();return}
+  const kb=t.closest('[data-kb-jump]');if(kb){e.stopPropagation();S.kbArticle=kb.dataset.kbJump;go('kb');return}
+  if(t.closest('#ux-g-demo')&&typeof demoEnter==='function'){demoEnter(t.closest('#ux-g-demo'));return}
+  if(t.closest('#ux-tour-go')){uxTourStart();return}
+  if(t.closest('#ux-chk-hide')){UX.checkOff=true;lsSet('ta_ux_chk_off','1');const c=t.closest('.ux-chk');if(c)c.remove();return}
+  const step=t.closest('[data-ux-step]');
+  if(step){const a=step.dataset.uxStep;if(a==='__srch'){if(typeof kpOpen==='function')kpOpen();else $('#srch').click()}else go(a);return}
+  const task=t.closest('[data-ux-task]');
+  if(task){
+    const k=task.dataset.uxTask;
+    if(k==='ofz'){S.scrPreset='ofz3';S.sf=Object.assign({},SCR_DEF,{kind:'ofz',cur:'RUB',tmax:'3',fl:'fix'});go('scr');return}
+    go(k);return;
+  }
+  if(t.closest('#acc-dd-btn')){UX.ddOpen=!UX.ddOpen;uxRenderAccDropdown();return}
+  const accBtn=t.closest('#acc-dd-menu [data-a]');
+  if(accBtn){
+    UX.ddOpen=false;
+    if(accBtn.dataset.a!==S.account){S.account=accBtn.dataset.a;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)}
+    else uxRenderAccDropdown();
+    return;
+  }
+  if(UX.ddOpen&&!t.closest('#acc-dd')){UX.ddOpen=false;uxRenderAccDropdown()}
+});
+document.addEventListener('change',e=>{
+  if(e.target&&e.target.id==='acc-dd-he'){S.hideEmpty=e.target.checked;persist();renderAccounts();return}
+});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&_uxTourI>=0)uxTourStop()});
+/* Обновляем уже отрисованную навигацию после загрузки этого файла */
+if(typeof renderNav==='function')try{renderNav()}catch(e){}
 </script></body></html>
 '''
 

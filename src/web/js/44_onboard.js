@@ -18,27 +18,48 @@ function obStep(n,state,title,body){
 function obRender(){
   const v=$('#view');if(!v)return;
   const tokDone=ob.done;
-  const authOk=typeof AUTH!=='undefined'&&AUTH.st&&AUTH.st.state==='ok';
-  v.innerHTML=`<div class="wrap fade" style="max-width:760px"><div class="card ob-card">
-    <div class="ob-hd"><div class="ob-t">Добро пожаловать 👋</div><p class="t2">Три шага, и вы увидите свой портфель: доходность, выплаты, оферты и риски по облигациям.</p></div>
-    ${obStep(1,'done','Ключ из бота',`<p class="mu">${authOk?'Вход выполнен.':'Готово — можно переходить к следующему шагу.'}</p>`)}
-    ${obStep(2,tokDone?'done':'now','Токен Т-Инвестиций «только чтение»',tokDone?'<p class="mu">Токен сохранён и проверен.</p>':`
-      ${`<div class="ro-note">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}<div><b>Нужен токен только для чтения.</b> С ним нельзя торговать, выводить деньги или менять настройки счёта — это ограничение на стороне Т-Банка. Токен хранится только на этом компьютере.</div></div>`}
-      <p class="mu">Он нужен, чтобы программа могла прочитать ваши счета.</p>
-      <div class="ob-row"><input class="in" type="password" id="ob-tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false" aria-label="API-токен Т-Инвестиций">
-        <button class="btn" id="ob-save">Сохранить и проверить</button>
-        <button class="btn ghost" id="ob-demo" title="Модельный портфель — без токена и без ваших данных">Посмотреть демо-портфель</button></div>
-      <label class="sw" style="margin:6px 0 4px"><input type="checkbox" id="ob-sb" ${ob.sb?'checked':''}><i></i><div><b>Токен песочницы</b><small>включите, если используете тестовый токен Sandbox</small></div></label>
-      <div id="ob-msg" role="status">${ob.err?`<div class="msg err">${esc(ob.err)}</div>`:''}</div>
-      <details class="ob-how" ${ob.help?'open':''}><summary>Где взять токен</summary><ol>
-        <li>Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении: Профиль → Настройки → Токены T-Invest API).</li>
-        <li>Нажмите «Создать токен», выберите доступ <b>«Только для чтения»</b> и нужные счета.</li>
-        <li>Скопируйте токен сразу (второй раз его не покажут) и вставьте в поле выше.</li></ol></details>
-      <p class="ob-priv">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}Токен хранится только на этом компьютере и никуда не отправляется, кроме Т-Инвестиций.</p>`)}
-    ${obStep(3,tokDone?'now':'soon','Первый взгляд на портфель',tokDone?'<div class="wait">Загружаю портфель…</div>':'<p class="mu">Откроется сам, как только токен будет сохранён.</p>')}
-    <div class="ob-alt">Нет Т-Инвестиций? <button class="lnk" id="ob-imp">Импортируйте отчёт другого брокера</button>
-      <span class="mu"> · </span><button class="lnk" id="ob-all">Все настройки</button></div>
+  v.innerHTML=`<div class="wrap fade" style="max-width:960px"><div class="card ob-card">
+    <div class="ob-hd"><div class="ob-t">Добро пожаловать в TAnalytic 👋</div>
+      <p class="t2">Выберите удобный способ начать — это займёт меньше минуты. Все данные хранятся только на вашем компьютере.</p></div>
+    <div class="ob-cards">
+      <div class="ob-opt ob-opt-main">
+        <div class="ob-opt-h"><span class="ob-badge">1</span><div><h3>Подключить Т-Инвестиции</h3><small class="mu">Автозагрузка сделок, портфеля и истории по токену «только чтение»</small></div></div>
+        ${tokDone?'<div class="msg ok">Токен сохранён и проверен — загружаю портфель…</div>':`
+        <div class="ro-note">${svgI('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}<div><b>Токен только для чтения.</b> С ним нельзя торговать или выводить деньги.</div></div>
+        <div class="ob-row"><input class="in" type="password" id="ob-tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false" aria-label="API-токен Т-Инвестиций">
+          <button class="btn" id="ob-save">Проверить и подключить</button></div>
+        <label class="sw" style="margin:6px 0 4px"><input type="checkbox" id="ob-sb" ${ob.sb?'checked':''}><i></i><div><b>Токен песочницы (Sandbox)</b><small>включите для тестового токена</small></div></label>
+        <div id="ob-msg" role="status">${ob.err?`<div class="msg err">${esc(ob.err)}</div>`:''}</div>
+        <details class="ob-how" ${ob.help?'open':''}><summary>Где взять токен за 30 секунд</summary><ol>
+          <li>Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> (или в приложении: Профиль → Настройки → Токены T-Invest API).</li>
+          <li>Нажмите «Создать токен», выберите доступ <b>«Только для чтения»</b> и нужные счета.</li>
+          <li>Скопируйте токен и вставьте в поле выше — сначала проверим, потом сохраним.</li></ol></details>`}
+      </div>
+      <div class="ob-opt-col">
+        <div class="ob-opt">
+          <div class="ob-opt-h"><span class="ob-badge">2</span><div><h3>Другой брокер</h3><small class="mu">ВТБ · Сбер · Альфа · БКС · Финам</small></div></div>
+          <p class="mu" style="margin:6px 0 12px;font-size:13px">Загрузите брокерский отчёт (XLSX / XML / HTML) — программа построит доходность, выплаты и налоги без токена.</p>
+          <button class="btn ghost" id="ob-imp">Загрузить отчёт брокера</button>
+        </div>
+        <div class="ob-opt">
+          <div class="ob-opt-h"><span class="ob-badge">3</span><div><h3>Посмотреть демо-портфель</h3><small class="mu">Без токена и ваших данных</small></div></div>
+          <p class="mu" style="margin:6px 0 12px;font-size:13px">Готовый живой портфель с облигациями, акциями, офертами и графиками — посмотрите, как всё работает.</p>
+          <button class="btn" id="ob-demo">Открыть демо в 1 клик</button>
+        </div>
+      </div>
+    </div>
+    <div class="ob-alt">
+      <span>Хотите просто изучить рынок без портфеля?</span>
+      <button class="lnk" id="ob-mkt">Скринер облигаций →</button>
+      <span class="mu"> · </span><button class="lnk" id="ob-calc">Калькулятор →</button>
+      <span class="mu"> · </span><button class="lnk" id="ob-all">Все настройки</button>
+    </div>
   </div></div>`;
+  const dm=$('#ob-demo');if(dm)dm.onclick=()=>demoEnter(dm);
+  const imp=$('#ob-imp');if(imp)imp.onclick=()=>go('imp');
+  const mkt=$('#ob-mkt');if(mkt)mkt.onclick=()=>go('scr');
+  const clc=$('#ob-calc');if(clc)clc.onclick=()=>go('calc');
+  const all=$('#ob-all');if(all)all.onclick=()=>{ob.skip=true;renderSettings()};
   const b=$('#ob-save');if(!b)return;
   const input=$('#ob-tok'),sb=$('#ob-sb');
   if(sb)sb.onchange=()=>{ob.sb=sb.checked};
@@ -61,10 +82,7 @@ function obRender(){
     }
   };
   b.onclick=save;
-  const dm=$('#ob-demo');if(dm)dm.onclick=()=>demoEnter(dm);
   input.onkeydown=e=>{if(e.key==='Enter')save()};
-  $('#ob-imp').onclick=()=>go('imp');
-  $('#ob-all').onclick=()=>{ob.skip=true;renderSettings()};
   if(!tokDone&&!ob.err)input.focus();
 }
 /* пока токена нет, а страница «Настройки» открыта при старте: бутстрап вызывает renderSettings() по имени — перехват выше сработает */

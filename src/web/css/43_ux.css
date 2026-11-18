@@ -1,0 +1,96 @@
+/* ── UX-реворкинг: режимы, вкладки, дропдаун счёта, сворачиваемый сайдбар, 3 карточки онбординга, подсказки, мини-тур ── */
+.logo{position:relative}
+.side-tog{all:unset;cursor:pointer;margin-left:auto;width:24px;height:24px;border-radius:7px;display:grid;place-items:center;color:var(--mu);font-size:15px;border:1px solid transparent;transition:.15s}
+.side-tog:hover{color:var(--tx);border-color:var(--line2);background:var(--card2)}
+.ux-mode{padding:0 4px 10px}
+.ux-mseg{width:100%;display:grid;grid-template-columns:1fr 1fr}
+.ux-mseg button{text-align:center;padding:5px 8px;font-size:12px}
+.nav .ux-cnt{margin-left:auto;font-size:11px;color:var(--mu);background:var(--card2);padding:1px 6px;border-radius:99px;line-height:1.4}
+.nav .nav-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Свёрнутый сайдбар (icon rail 62px) */
+body.side-mini aside{width:64px;padding:14px 8px 12px;overflow:visible}
+body.side-mini .logo{justify-content:center;padding:2px 0 12px;flex-direction:column;gap:6px}
+body.side-mini .logo-tx,body.side-mini .ux-mode,body.side-mini .nav-t,body.side-mini .ux-cnt,body.side-mini .accs,body.side-mini .badge{display:none}
+body.side-mini .side-tog{margin-left:0}
+body.side-mini .nav button{justify-content:center;padding:9px 0}
+body.side-mini .side-foot{justify-content:center;padding:8px 0 0}
+
+/* Выбор счёта в шапке .top (на десктопе скрываем дублирующий список в сайдбаре) */
+@media(min-width:901px){aside .accs{display:none}}
+.acc-dd{position:relative}
+.acc-dd-btn{padding:7px 11px;gap:8px;max-width:260px}
+.acc-dd-nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px}
+.acc-dd-ch{font-size:11px;color:var(--mu)}
+.acc-dd-menu{position:absolute;top:calc(100% + 6px);left:0;min-width:260px;max-width:340px;background:var(--card);border:1px solid var(--line2);border-radius:12px;box-shadow:0 14px 36px #00000055;padding:8px;z-index:900}
+.acc-dd-h{display:flex;align-items:center;justify-content:space-between;padding:4px 6px 8px;border-bottom:1px solid var(--line);font-size:11.5px;color:var(--mu);font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+.acc-dd-list{display:flex;flex-direction:column;gap:2px;margin-top:6px;max-height:300px;overflow:auto}
+.acc-dd-list button{all:unset;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 9px;border-radius:8px;font-size:13px;color:var(--tx)}
+.acc-dd-list button:hover{background:var(--card2)}
+.acc-dd-list button.on{background:var(--card2);box-shadow:inset 3px 0 0 var(--ac)}
+.acc-dd-list b{font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Заметное поле поиска в шапке */
+.srch-pill{padding:7px 11px;gap:7px}
+.srch-tx{color:var(--tx2);font-weight:500;font-size:12.5px}
+.srch-k{font:600 11px/1 system-ui,sans-serif;padding:2px 5px;border-radius:5px;border:1px solid var(--line2);color:var(--mu);background:var(--bg)}
+@media(max-width:820px){.srch-tx,.srch-k{display:none}}
+
+/* Внутренние вкладки раздела + строка «Зачем этот экран» + гостевая плашка */
+.ux-subwrap{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:-4px}
+.ux-sub{max-width:100%;overflow-x:auto}
+.ux-why{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 14px;border-radius:11px;background:var(--card);border:1px solid var(--line);font-size:13px;color:var(--tx2)}
+.ux-why-x{all:unset;cursor:pointer;font-size:12px;color:var(--mu);white-space:nowrap;padding:3px 8px;border-radius:7px;border:1px solid var(--line)}
+.ux-why-x:hover{color:var(--tx);border-color:var(--line2)}
+.ux-guest{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 14px;border-radius:12px;background:linear-gradient(90deg,#ffdd2d14,var(--card));border:1px solid #ffdd2d44;font-size:13px}
+.ux-guest-b{display:flex;gap:8px;flex-wrap:wrap}
+
+/* Инлайн ?-подсказка в Базу знаний */
+.ux-q{all:unset;cursor:pointer;display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;border:1px solid var(--line2);color:var(--mu);font-size:11px;font-weight:700;vertical-align:1px;margin-left:3px;transition:.15s}
+.ux-q:hover{color:var(--tx);border-color:var(--ac);background:#ffdd2d22}
+
+/* Главная: кнопки в Hero, «Быстрые задачи», чек-лист «С чего начать» */
+.hero-acts{margin-left:auto;display:inline-flex;gap:8px;flex-wrap:wrap}
+.ux-tasks{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+@media(max-width:1050px){.ux-tasks{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.ux-tasks{grid-template-columns:1fr}}
+.ux-tcard{all:unset;cursor:pointer;background:var(--card);border:1px solid var(--line);border-radius:13px;padding:13px 15px;display:flex;flex-direction:column;gap:4px;transition:.15s}
+.ux-tcard:hover{border-color:var(--ac);transform:translateY(-1px);background:var(--card2)}
+.ux-tcard b{font-size:13.5px;color:var(--tx)}
+.ux-tcard small{font-size:12px;color:var(--mu);line-height:1.35}
+.ux-chk{padding:14px 16px}
+.ux-chk-h{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px;font-size:14px}
+.ux-chk-l{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+@media(max-width:760px){.ux-chk-l{grid-template-columns:1fr}}
+.ux-chk-i{all:unset;cursor:pointer;display:flex;align-items:center;gap:9px;padding:8px 11px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;color:var(--tx);transition:.15s}
+.ux-chk-i:hover{border-color:var(--line2)}
+.ux-chk-i i{font-style:normal;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font-size:12px;border:1px solid var(--line2);color:var(--mu);flex:none}
+.ux-chk-i.done{opacity:.72}.ux-chk-i.done i{background:#3ecf8e22;border-color:var(--pos);color:var(--pos)}.ux-chk-i.done span{text-decoration:line-through;color:var(--mu)}
+
+/* Карточка облигации: строка-вывод и пресеты калькулятора */
+.bc-verdict{padding:10px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);border-left:3px solid var(--ac);font-size:13px;margin:10px 0 12px;line-height:1.45}
+.cl-pre{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0 14px;font-size:12.5px}
+.cl-pre .btn{padding:6px 11px;font-size:12.5px}
+
+/* 3 карточки онбординга */
+.ob-cards{display:grid;grid-template-columns:1.35fr 1fr;gap:14px;margin:14px 0}
+@media(max-width:760px){.ob-cards{grid-template-columns:1fr}}
+.ob-opt-col{display:flex;flex-direction:column;gap:14px}
+.ob-opt{background:var(--card2);border:1px solid var(--line);border-radius:13px;padding:15px 16px}
+.ob-opt-main{border-color:#ffdd2d55}
+.ob-opt-h{display:flex;align-items:flex-start;gap:10px;margin-bottom:8px}
+.ob-opt-h h3{margin:0;font-size:15px}
+.ob-badge{width:24px;height:24px;border-radius:50%;background:var(--ac);color:#111;font-weight:700;font-size:13px;display:grid;place-items:center;flex:none;margin-top:1px}
+
+/* Базовый режим: скрываем сложные колонки CY (7) и MacDur (12) в скринере облигаций */
+[data-ux-mode="basic"] #scr-head th:nth-child(7),
+[data-ux-mode="basic"] #scr-body td:nth-child(7),
+[data-ux-mode="basic"] #scr-head th:nth-child(12),
+[data-ux-mode="basic"] #scr-body td:nth-child(12){display:none}
+
+/* Мини-тур (4 шага) */
+.ux-hl{outline:2px solid var(--ac)!important;outline-offset:3px;border-radius:10px;position:relative;z-index:950}
+.ux-tour{position:fixed;right:24px;bottom:24px;z-index:1300;width:min(360px,calc(100vw - 32px));background:var(--card);border:1px solid var(--ac);border-radius:14px;padding:15px 17px;box-shadow:0 18px 48px #00000077}
+.ux-tour-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;font-size:14px}
+.ux-tour p{margin:0 0 12px;font-size:13px;color:var(--tx2);line-height:1.45}
+.ux-tour-ft{display:flex;align-items:center;justify-content:space-between}

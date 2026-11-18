@@ -77,6 +77,7 @@ function typingInView(){
 function render(){renderNow()}
 function renderSoon(){if(typingInView()){_rPend=true;return}renderNow()}
 document.addEventListener('focusout',()=>{if(_rPend)setTimeout(()=>{if(_rPend&&!typingInView())renderNow()},400)});
+const NO_PORTFOLIO_PAGES=new Set(['scr','cmp','map','hm','mkt','fng','pri','cal','dfl','flw','iss','watch','stk','sst','calc','lad','rot','dbx','mm','crp','mic','sig','mon']);
 function renderNow(){
   _rPend=false;
   S.charts=[];hideTip();prInfo();
@@ -84,16 +85,31 @@ function renderNow(){
   if(S.page==='set')return renderSettings();
   if(S.page==='imp')return renderImport();
   if(S.page==='kb')return renderKb();
-  if(PRO_PAGES.includes(S.page)&&!isPro()){v.innerHTML=`<div class="wrap">${proLock(S.page)}</div>`;return}
-  if(S.err&&!S.data){v.innerHTML=`<div class="wrap"><div class="card empty fade">${svgI('<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>')}
+  if(PRO_PAGES.includes(S.page)&&!isPro()){v.innerHTML=`<div class="wrap">${typeof uxSubTabs==='function'?uxSubTabs():''}${proLock(S.page)}</div>`;return}
+  const guestOk=NO_PORTFOLIO_PAGES.has(S.page);
+  if(S.err&&!S.data&&!guestOk){v.innerHTML=`<div class="wrap"><div class="card empty fade">${svgI('<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>')}
     <div style="max-width:640px">${esc(S.err)}</div><div class="row" style="justify-content:center"><button class="btn" id="retry">Повторить</button>
-    <button class="btn ghost" data-go="set">Настройки</button><button class="btn ghost" data-go="imp">Импорт отчёта</button></div></div></div>`;
+    <button class="btn ghost" data-go="set">Подключить счёт</button><button class="btn ghost" data-go="scr">Открыть рынок без токена</button></div></div></div>`;
     $('#retry').onclick=()=>load(true);v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
-  if(!S.data){if(S.loading)skeleton();return}
+  if(!S.data&&!guestOk){
+    if(S.loading){skeleton();return}
+    v.innerHTML=`<div class="wrap fade">${typeof uxSubTabs==='function'?uxSubTabs():''}<div class="card empty">
+      <div style="font-size:16px;font-weight:600;color:var(--tx)">Этот раздел показывает данные вашего портфеля</div>
+      <div style="max-width:480px">Подключите Т-Инвестиции, загрузите отчёт брокера или откройте демо-портфель — это займёт меньше минуты. Рыночные разделы и калькулятор уже доступны без токена.</div>
+      <div class="row" style="justify-content:center"><button class="btn" data-go="set">Подключить счёт</button>
+      <button class="btn ghost" id="ux-go-demo">Посмотреть демо</button>
+      <button class="btn ghost" data-go="scr">Скринер облигаций</button></div></div></div>`;
+    v.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));
+    const dm=$('#ux-go-demo');if(dm&&typeof demoEnter==='function')dm.onclick=()=>demoEnter(dm);
+    return;
+  }
   const sc=v.scrollTop;
   const views={dash:pDash,ret:pRet,pos:pPos,bonds:pBonds,pay:pPay,ops:pOps,fees:pFees,tax:pTax,reb:pReb,mkt:pMkt,scr:pScr,cmp:pCmp,map:pMap,hm:pHeatmap,risk:pRisk,sig:pSig,mon:pMon,pri:pPri,fng:pFng,bench:pBench,calc:pCalc,off:pOff,lad:pLad,iss:pIss,dfl:pDfl,flw:pFlw,cal:pCal,watch:pWatch,stk:pStk,sst:pSst};
   const fn=views[S.page]||(PAGE_EXT[S.page]&&PAGE_EXT[S.page].render)||(()=>{S.page='dash';persist();renderNav();return pDash()});
-  v.innerHTML=`<div class="wrap fade">${S.err?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)?remindHtml():''}${S.page==='dash'?proBanner():''}${fn()}</div>`;
+  const topUx=(typeof uxGuestBar==='function'&&!S.data?uxGuestBar():'')
+    +(typeof uxSubTabs==='function'?uxSubTabs():'')
+    +(typeof uxWhyBanner==='function'?uxWhyBanner(S.page):'');
+  v.innerHTML=`<div class="wrap fade">${topUx}${S.err&&S.data?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)&&S.data?remindHtml():''}${S.page==='dash'&&S.data?proBanner():''}${fn()}</div>`;
   v.scrollTop=sc;
   mountCharts();bindPage();
 }
