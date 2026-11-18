@@ -41,19 +41,25 @@ EYVMxjh8zNbFuoc7fzvvrFILLe7ifvEIUqSVIC/AzplM/Jxw7buXFeGP1qVCBEHq
 
 def make_ssl_context(ca_file="", verify=True):
     ctx = ssl.create_default_context(cafile=ca_file or None)
-    if not ctx.cert_store_stats().get("x509_ca"):
-        # Python с python.org на macOS часто идёт без списка корневых сертификатов
+    # certifi добавляем к системному хранилищу всегда: на свежей Windows оно не пустое, но неполное
+    # (корневые сертификаты докачиваются по требованию, а OpenSSL этого не умеет); на python.org-Python
+    # для macOS системного списка нет вовсе.
+    has_certifi = False
+    if not ca_file:
         try:
             import certifi  # noqa
             ctx.load_verify_locations(cafile=certifi.where())
+            has_certifi = True
         except Exception:  # noqa: BLE001
-            for path in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"):
-                if os.path.isfile(path):
-                    try:
-                        ctx.load_verify_locations(cafile=path)
-                        break
-                    except ssl.SSLError:
-                        pass
+            pass
+    if not has_certifi and not ctx.cert_store_stats().get("x509_ca"):
+        for path in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"):
+            if os.path.isfile(path):
+                try:
+                    ctx.load_verify_locations(cafile=path)
+                    break
+                except ssl.SSLError:
+                    pass
     ctx.load_verify_locations(cadata=RUSSIAN_TRUSTED_ROOT_CA)
     if not verify:
         ctx.check_hostname = False

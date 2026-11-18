@@ -42,18 +42,23 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 def ssl_context():
     ctx = ssl.create_default_context()
-    if not ctx.cert_store_stats().get("x509_ca"):      # Python с python.org на macOS бывает без корневых сертификатов
-        try:
-            import certifi
-            ctx.load_verify_locations(cafile=certifi.where())
-        except Exception:
-            for p in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"):
-                if os.path.isfile(p):
-                    try:
-                        ctx.load_verify_locations(cafile=p)
-                        break
-                    except ssl.SSLError:
-                        pass
+    # certifi добавляем к системному хранилищу всегда: на свежей Windows оно не пустое, но неполное
+    # (корневые сертификаты докачиваются по требованию, а OpenSSL этого не умеет) — отсюда
+    # CERTIFICATE_VERIFY_FAILED при обращении к GitHub; на python.org-Python для macOS списка нет вовсе.
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+        return ctx
+    except Exception:
+        pass
+    if not ctx.cert_store_stats().get("x509_ca"):
+        for p in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"):
+            if os.path.isfile(p):
+                try:
+                    ctx.load_verify_locations(cafile=p)
+                    break
+                except ssl.SSLError:
+                    pass
     return ctx
 
 
