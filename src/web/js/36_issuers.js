@@ -253,6 +253,6 @@ function bindIss(){
     const fin=useI?c.ifrs.fin:c&&c.fin;
     if(fin&&fin.years&&fin.years.length&&ch)try{issChart(ch,fin,useI)}catch(e){ch.innerHTML='<div class="empty">Не удалось построить график</div>'}
     const tb=document.getElementById('iss-tabs');if(tb)tb.onclick=e=>{const b=e.target.closest('[data-tab]');if(!b)return;I.tab[I.sel]=b.dataset.tab;render()};
-    if(I.scroll&&c){I.scroll=0;det.scrollIntoView({behavior:'smooth',block:'start'})}
+    if(I.scroll){det.scrollIntoView({behavior:I.scroll===1?'smooth':'auto',block:'start'});I.scroll=c?0:2}  /* листаем к карточке сразу, пока идёт загрузка, и ещё раз — когда она готова */
   }
 }

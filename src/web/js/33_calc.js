@@ -287,7 +287,12 @@ function pCalcInv(){
   const seg=(id,opts,v)=>`<div class="seg" id="cl-${id}">${opts.map(o=>`<button data-v="${o[0]}" class="${String(o[0])===String(v)?'on':''}">${o[1]}</button>`).join('')}</div>`;
   const chips=clAvail(P).map(s=>`<label class="cl-chip"><input type="checkbox" data-s="${s[0]}" ${F.strat[s[0]]?'checked':''}><span><i style="background:${s[2]}"></i>${s[1]}</span></label>`).join('');
   return`${ld?`<div class="card">${waitBox('Загружаю параметры рынка (ставки, доходности, ваш портфель)… пока расчёт идёт на значениях по умолчанию')}</div>`:''}${fb?`<div class="msg err">Не удалось загрузить рыночные данные (${esc(S.calcErr||'нет ответа')}). Использованы значения по умолчанию, расчёт приблизителен.</div>`:''}
-  <div class="card"><h2>Параметры<span class="sp">пересчёт мгновенный</span></h2><div id="cl-form">
+  <div class="card"><h2>Параметры<span class="sp">пересчёт мгновенный</span></h2>
+   <div class="cl-pre" id="cl-pre"><span class="mu">Быстрые сценарии:</span>
+    <button class="btn ghost" data-clp="cushion">Подушка 1 год</button>
+    <button class="btn ghost" data-clp="passive50">Пассивный доход 50 тыс/мес</button>
+    <button class="btn ghost" data-clp="goal5">Цель через 5 лет (ИИС-3)</button></div>
+   <div id="cl-form">
    <div class="cl-grid cl-base">${num('start','Стартовый капитал, ₽',F.start,'min="0" step="10000"')}${num('monthly','Пополнение в месяц, ₽',F.monthly,'min="0" step="1000"')}
     <label class="field"><span>Срок: <b id="cl-yv">${F.years}</b> лет</span><input id="cl-years" type="range" min="1" max="30" step="1" value="${F.years}"></label></div>
    ${pf&&pf.value!=null?`<div class="cl-row"><button class="btn ghost" id="cl-pf">Подставить мой портфель</button><span class="note">старт ${clRub(pf.value)}${pf.monthly!=null?`, пополнение ${clRub(pf.monthly)} в месяц (среднее за 12 мес.)`:''}</span></div>`:''}
@@ -339,6 +344,13 @@ function bindCalcInv(){
     o.onchange=e=>{if(e.target.id==='cl-view')pick(e.target.value)};
     o.onclick=e=>{const t=e.target.closest('tr[data-s]');if(t&&o.querySelectorAll('tr[data-s]').length>1)pick(t.dataset.s)}}
   const b=$('#cl-pf');if(b)b.onclick=()=>{const pf=P.portfolio;if(!pf)return;if(pf.value!=null)F.start=Math.round(pf.value);if(pf.monthly!=null)F.monthly=Math.round(pf.monthly);F.strat.pf=1;clSave();render()};
+  const pr=$('#cl-pre');if(pr)pr.onclick=e=>{
+    const x=e.target.closest('[data-clp]');if(!x)return;
+    const k=x.dataset.clp;
+    if(k==='cushion'){F.start=300000;F.monthly=25000;F.years=1;F.acct='plain';F.strat={dep:1,fund:1,ofz:1,aa:0,a:0};clSave();render();return}
+    if(k==='goal5'){F.start=500000;F.monthly=35000;F.years=5;F.acct='iis3';F.strat={dep:1,fund:1,ofz:1,aa:1,a:0};clSave();render();return}
+    if(k==='passive50'){const G=cgLoad();G.monthly=50000;G.years=10;G.hz='years';try{localStorage.setItem('ta_calc_goal',JSON.stringify(G))}catch(err){}cgSetMode('goal');return}
+  };
 }
 
 /* ── Вкладка «Пассивный доход»: математика на сервере (/api/calc/goal), здесь только ввод и вывод ── */

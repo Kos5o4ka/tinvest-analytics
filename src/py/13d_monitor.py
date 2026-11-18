@@ -124,17 +124,6 @@ def _mon_curves(days):
     return cache
 
 
-def _interp(pts, t):
-    if not pts or t is None:
-        return None
-    if t <= pts[0][0]:
-        return pts[0][1]
-    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
-        if t <= x1:
-            return y0 + (y1 - y0) * (t - x0) / (x1 - x0)
-    return pts[-1][1]
-
-
 def _curve_on(curves, sorted_dates, d):
     """Кривая на дату d: последняя непустая на эту дату или раньше."""
     import bisect

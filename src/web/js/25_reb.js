@@ -1,5 +1,43 @@
-/* ── Ребалансировка ── */
-S.reb={contrib:'',buyOnly:true,draft:null,tax:null};S.payDays=90;
+/* ── Ребалансировка + Снежный ком купонов (безналоговая ребалансировка, #9) ── */
+S.reb={contrib:'',monthly:'',buyOnly:true,draft:null,tax:null};S.payDays=90;
+function rebSnowballHtml(cur,keys,w,tot,dev0){
+  const pays=(S.bonds&&S.bonds.payments)||[];
+  const now=new Date(),mKeys=[],byM={};
+  for(let i=0;i<12;i++){const d=new Date(now.getFullYear(),now.getMonth()+i,1);const k=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');mKeys.push(k);byM[k]=0}
+  pays.forEach(p=>{const m=(p.date||'').slice(0,7);if(byM[m]!=null&&(p.kind==='coupon'||p.kind==='dividend'||p.kind==='amortization'||p.kind==='redemption'))byM[m]+=p.amount||0});
+  const mExtra=Math.max(0,+S.reb.monthly||0);
+  const totPay12=mKeys.reduce((a,k)=>a+byM[k],0);
+  const sim=Object.assign({},cur);let sTot=tot;
+  const plan=mKeys.map(mk=>{
+    const inflow=byM[mk]+mExtra;
+    const buys=[];
+    if(inflow>1){
+      sTot+=inflow;
+      const need={};let sn=0;
+      keys.forEach(k=>{const v=Math.max(0,sTot*w(k)-(sim[k]||0));need[k]=v;sn+=v});
+      keys.forEach(k=>{
+        const add=sn>0?inflow*need[k]/sn:inflow*w(k);
+        if(add>=10){sim[k]=(sim[k]||0)+add;buys.push([k,add])}
+      });
+    }
+    const dev=keys.reduce((a,k)=>a+Math.abs((sim[k]||0)/Math.max(1,sTot)-w(k)),0)/2*100;
+    return{mk,pay:byM[mk],extra:mExtra,inflow,buys,dev};
+  });
+  const dev12=plan.length?plan[plan.length-1].dev:dev0;
+  return`<div class="card"><h2>Снежный ком купонов: безналоговая ребалансировка на 12 мес.<span class="sp">0 ₽ продаж · 0 ₽ НДФЛ</span></h2>
+    <div class="row" style="margin-bottom:12px;gap:16px;flex-wrap:wrap;align-items:flex-end">
+      <label class="field" style="max-width:250px"><span>Ежемесячное пополнение, ₽</span><input class="in num" id="rb-m" type="number" min="0" step="5000" value="${S.reb.monthly}" placeholder="0"></label>
+      <span class="mu" style="font-size:12.5px">Все купоны, дивиденды и пополнения направляются только в отстающие от целевых долей классы активов.</span></div>
+    <div class="g g3" style="margin-bottom:12px">
+      ${kpi('Поступления по бумагам (12 мес.)',M(totPay12,'rub',0),'купоны, дивиденды, погашения',totPay12>0?'pos':'')}
+      ${kpi('Всего на докупки за 12 мес.',M(totPay12+mExtra*12,'rub',0),mExtra>0?'выплаты + по '+M(mExtra,'rub',0)+'/мес':'только из выплат портфеля')}
+      ${kpi('Отклонение от целей',pctp(dev0,1)+' → '+pctp(dev12,1),'снижение перекоса без единой продажи',dev12<dev0?'pos':'')}</div>
+    <div class="tbl"><table><thead><tr><th class="l">Месяц</th><th>Выплаты портфеля</th><th>Пополнение</th><th class="l">Что докупить (без продаж)</th><th>Отклонение после</th></tr></thead><tbody>`+
+    plan.map(r=>`<tr><td class="l"><b>${esc(mlabel(r.mk))} ${r.mk.slice(0,4)}</b></td><td class="num">${r.pay>0?M(r.pay,'rub',0):'<span class="mu">—</span>'}</td>
+      <td class="num">${r.extra>0?M(r.extra,'rub',0):'<span class="mu">—</span>'}</td>
+      <td class="l">${r.buys.length?r.buys.sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<span class="tag">${esc(TYPES[k]||k)}: ${M(v,'rub',0)}</span>`).join(' '):'<span class="mu">нет поступлений</span>'}</td>
+      <td class="num">${pctp(r.dev,1)}</td></tr>`).join('')+`</tbody></table></div></div>`;
+}
 /* налог при продаже (маршрут /api/tax/reb): сначала продаём бумаги с убытком и с наступившей ЛДВ */
 function rebTaxHtml(act,keys){
   if(S.reb.buyOnly)return'';
@@ -59,14 +97,16 @@ function pReb(){
     <div class="tbl"><table><thead><tr><th class="l">Класс</th><th>Сейчас, ₽</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>Действие</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="row" style="margin-top:14px"><button class="btn" id="rb-s">Сохранить цели</button><button class="btn ghost" id="rb-r">Сбросить</button><span class="reb-sum" id="rb-sum"></span></div></div>
   ${rebTaxHtml(act,keys)}
+  ${has?rebSnowballHtml(cur,keys,w,tot,dev):''}
   <p class="note">Расчёт по классам активов (акции, облигации, фонды, валюта…) на уровне портфеля, без учёта комиссий и лотности; налог при продаже оценивается отдельно (в режиме с продажами). Это справочный расчёт, а не инвестиционная рекомендация. Цели сохраняются локально.</p>`;
 }
 function bindReb(){
   const d=S.reb.draft;
   $('#view').querySelectorAll('.reb-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)d[i.dataset.k]=Math.min(100,v);else delete d[i.dataset.k];render()});
   $('#rb-c').onchange=e=>{S.reb.contrib=e.target.value;render()};
+  const rm=$('#rb-m');if(rm)rm.onchange=e=>{S.reb.monthly=e.target.value;render()};
   $('#rb-b').onchange=e=>{S.reb.buyOnly=e.target.checked;render()};
-  $('#rb-r').onclick=()=>{S.reb.draft=null;S.reb.contrib='';render()};
+  $('#rb-r').onclick=()=>{S.reb.draft=null;S.reb.contrib='';S.reb.monthly='';render()};
   $('#rb-s').onclick=async e=>{e.currentTarget.disabled=true;try{await post('/api/config',{targets:d});S.cfg.targets=Object.assign({},d);$('#rb-sum').textContent='Сохранено'}catch(x){$('#rb-sum').textContent=x.message}finally{e.currentTarget.disabled=false}};
 }
 

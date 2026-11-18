@@ -88,8 +88,36 @@ def stk_rows_from_iss(j, sector_of=None, default_sector=STK_DEFAULT_SECTOR):
                     "sector": (sector_of or {}).get(sid) or default_sector, "price": price, "prev": prev,
                     "chg_d": None if chg is None else round(chg, 2),
                     "value_today": _stk_f(m.get("VALTODAY_RUR")) or _stk_f(m.get("VALTODAY")) or 0.0,
-                    "cap": cap or None, "lot": int(r.get("LOTSIZE") or 1), "chg_w": None, "chg_m": None})
+                    "cap": cap or None, "lot": int(r.get("LOTSIZE") or 1), "chg_w": None, "chg_m": None,
+                    "instrid": r.get("INSTRID") or "", "sectype": str(r.get("SECTYPE") or ""),
+                    "is_fund": str(r.get("INSTRID") or "").startswith("IF")})
     return out
+
+
+STK_FUND_CATS = {
+    "Денежный рынок": "LQDT AKMM SBMM TMON AMNR CASH MONY OLIQ PSMM FMMM TSAV",
+    "Золото и металлы": "GOLD TGLD AKGD SBGD BCSG PSGM",
+    "Облигации": "SBGB OBLG AKMB TBRU SBRB TOFZ INFL OFZS WOFZ SUGB SBCB CORP BOND ROBL BNDA BNDB BNDC AMGB PSRB MKBD TLCB SBLB SBHI SBFR AKFB TPAY",
+    "Акции": "TMOS SBMX EQMX AKME TDIV DIVD AKIE AKAI AIIQ",
+    "Валюта": "TUSD TEUR TCNY YUAN CNYM WUSD AMNY BCSD",
+}
+STK_FUND_CAT_OF = {t: c for c, ts in STK_FUND_CATS.items() for t in ts.split()}
+STK_FUND_OTHER = "Прочие фонды"
+_STK_FUND_WORDS = (("Золото и металлы", ("золот", "драгмет", "металл")), ("Денежный рынок", ("денеж", "ликвид", "казна", "казнач")),
+                   ("Облигации", ("облиг", "офз", "бонд")), ("Акции", ("акци", "акц ", "акцрост", "див")),
+                   ("Валюта", ("валют", "юан", "доллар")))
+
+
+def stk_fund_category(secid, name=""):
+    """Категория фонда для тепловой карты: сначала таблица тикеров, затем эвристика по названию, иначе «Прочие фонды»."""
+    c = STK_FUND_CAT_OF.get((secid or "").upper())
+    if c:
+        return c
+    n = (name or "").lower() + " "
+    for cat, words in _STK_FUND_WORDS:
+        if any(w in n for w in words):
+            return cat
+    return STK_FUND_OTHER
 
 
 def stock_history_closes(date_s):
@@ -158,10 +186,8 @@ def stk_api_map(cfg):
         return {}
 
 
-def stocks_universe(force=False, cfg=None):
-    """Акции TQBR: [{secid, isin, name, shortname, sector, price, prev, chg_d, value_today, cap, lot, chg_w, chg_m}].
-    Сектор: встроенный справочник, для остальных — сектор T-Invest (если передан cfg с токеном), иначе «Прочее».
-    Кэш 2 минуты в торговые часы, иначе час. Кэш общий, возвращается копия строк."""
+def _stk_tqbr_rows(force=False):
+    """Все бумаги TQBR (акции и фонды) с chg_w/chg_m; общий кэш. Фонды помечены is_fund (INSTRID «IF…»)."""
     key = ("stk_universe",)
     rows = None if force else mem_get(key, _stk_ttl())
     if rows is None:
@@ -171,7 +197,14 @@ def stocks_universe(force=False, cfg=None):
                 rows = stk_rows_from_iss(_stk_iss(STK_SH % "TQBR", 40), STK_SECTORS)
                 _stk_changes(rows)
                 mem_put(key, rows)
-    out = [dict(r) for r in rows]
+    return rows
+
+
+def stocks_universe(force=False, cfg=None):
+    """Акции TQBR (без фондов): [{secid, isin, name, shortname, sector, price, prev, chg_d, value_today, cap, lot, chg_w, chg_m}].
+    Сектор: встроенный справочник, для остальных — сектор T-Invest (если передан cfg с токеном), иначе «Прочее».
+    Кэш 2 минуты в торговые часы, иначе час. Кэш общий, возвращается копия строк."""
+    out = [dict(r) for r in _stk_tqbr_rows(force) if not r.get("is_fund")]
     tm = stk_api_map(cfg) if cfg else {}
     for r in out:
         a = tm.get(r["secid"])
@@ -183,13 +216,20 @@ def stocks_universe(force=False, cfg=None):
 
 
 def funds_universe():
-    """Фонды (доска TQTF) в том же формате, что stocks_universe; сектор — «Фонды»."""
-    key = ("stk_funds",)
-    rows = mem_get(key, _stk_ttl())
-    if rows is None:
-        rows = stk_rows_from_iss(_stk_iss(STK_SH % "TQTF", 40), None, "Фонды")
-        mem_put(key, rows)
-    return [dict(r) for r in rows]
+    """Фонды (с 2025 торгуются на TQBR, INSTRID «IF…») в формате stocks_universe; sector — категория фонда (stk_fund_category).
+    Если на TQBR фондов нет — запасной вариант: доска TQTF."""
+    rows = [dict(r) for r in _stk_tqbr_rows() if r.get("is_fund")]
+    if not rows:
+        key = ("stk_funds",)
+        cached = mem_get(key, _stk_ttl())
+        if cached is None:
+            cached = stk_rows_from_iss(_stk_iss(STK_SH % "TQTF", 40), None, STK_FUND_OTHER)
+            _stk_changes(cached)
+            mem_put(key, cached)
+        rows = [dict(r, is_fund=True) for r in cached]
+    for r in rows:
+        r["sector"] = stk_fund_category(r["secid"], r.get("name") or r.get("shortname"))
+    return rows
 
 
 STK_IV = {"H": 60, "D": 24, "W": 7, "M": 31}

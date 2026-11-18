@@ -92,7 +92,7 @@ def _mic_fetch(cfg, secid, depth=MIC_DEPTH):
     if book:
         tr = _flw_ds("md/trades", {"secid": secid, "minutes": 60}, FLW_BOOK_TTL)
         if tr is not None:
-            trades = _mic_norm_trades(tr.get("trades"), 1)              # сделки сервера данных — в лотах
+            trades = _mic_norm_trades(tr.get("trades"), (meta or {}).get("lot") or 1)   # _md_trades отдаёт штуки (pieces = qty * lot)
         src = "server"
     else:
         try:
@@ -277,9 +277,10 @@ def mic_ice_report(secid, now=None):
             vmax = max(q for _, q in tail if q)
             drops, prev = 0, None
             for _, q in tail:
-                if prev and q is not None and q < prev:
-                    drops += prev - q
-                prev = q or prev
+                qv = q or 0
+                if prev is not None and qv < prev:
+                    drops += prev - qv
+                prev = qv
             ex = sorted((k[0], k[3]) for k, n in trades.items() if k[1] == aggr and k[2] == p and k[0] >= series[i0][0] - 1 for _ in range(n))
             executed = sum(l for _, l in ex)
             hidden = max(0.0, executed - drops)

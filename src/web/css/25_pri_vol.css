@@ -7,3 +7,9 @@
 .pv-dd>td{background:#ffffff06;padding:10px 14px!important;white-space:normal}.pv-dc{max-width:100%}
 .pv-pt{background:#3987e522;color:var(--tx)}
 [data-theme=light] .pv-x:hover{background:#0000000f}[data-theme=light] .pv-bar{background:#00000012}[data-theme=light] .pv-dd>td{background:#00000006}
+.pri-nip{font-weight:600;margin-top:3px;display:inline-block}
+.pri-nip-f{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:6px}
+.pri-nip-f label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--tx2)}
+.pri-nip-f .in{width:130px;padding:6px 9px}
+.pri-nip-f select.in{width:190px}
+.pri-nip-out{display:flex;gap:10px 18px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--line);font-size:13px;color:var(--tx2)}

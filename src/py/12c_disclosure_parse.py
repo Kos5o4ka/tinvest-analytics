@@ -5,7 +5,7 @@
 # ищется по тексту его заголовка (до двоеточия), а номер — запасной вариант.
 # TODO: при нескольких ISIN в одном сообщении числа не делятся по блокам — каждому ISIN достаются общие значения (+ warning).
 
-DC_PARSER_VERSION = "2"   # повышать при изменении логики разбора: сборщик (--reparse) перечитывает старые записи
+DC_PARSER_VERSION = "3"   # повышать при изменении логики разбора: сборщик (--reparse) перечитывает старые записи
 
 _DC_MONTHS = {"янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5, "июн": 6, "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12}
 _DC_DATE_TXT = re.compile(r"(?<!\d)(\d{1,2})\s*[»\"”’']?\s*(январ[яь]|феврал[яь]|марта?|апрел[яь]|ма[йя]|июн[яь]|июл[яь]|август[а]?|сентябр[яь]|октябр[яь]|ноябр[яь]|декабр[яь])\s*(\d{4})", re.I)
@@ -91,7 +91,11 @@ def dc_sections(text):
 def dc_classify(title, text):
     s = ((title or "") + " " + (text or "")[:600]).lower()
     s = re.sub(r"\s+", " ", s)
-    if "итогах приобретения" in s:
+    if ("реализации приобретенных" in s or "реализации приобретённых" in s
+            or "продаже ранее приобретенных" in s or "вторичной продаже" in s):
+        return "placement_result"
+    if ("итогах приобретения" in s or "результатах приобретения" in s
+            or "исполнении обязательств по приобретению" in s):
         return "buyback_result"
     if "неисполнение обязательств" in s:
         return "default"
@@ -99,6 +103,9 @@ def dc_classify(title, text):
         return "coupon_paid"
     if "начисленные доходы" in s or "начисленных (объявленных) доходах" in s:
         return "coupon_declared"
+    if ("завершении размещения" in s or "итогах размещения" in s or "результатах размещения" in s
+            or ("дополнительн" in s and "размещ" in s and "облигац" in s)):
+        return "placement_result"
     return "other"
 
 
@@ -300,8 +307,12 @@ def _dc_qty(total, per_bond, qty, qty_tol=0.0051):
     r = {"qty_derived": None, "qty_out": qty, "checks": {}}
     if total and per_bond:
         ratio = total / per_bond
-        r["qty_derived"] = int(round(ratio))
-        r["checks"]["qty_integer"] = abs(ratio - round(ratio)) < 0.01
+        q_est = int(round(ratio))
+        r["qty_derived"] = q_est
+        r["checks"]["qty_integer"] = q_est > 0 and (
+            abs(ratio - q_est) < 0.01
+            or (abs(per_bond * q_est - total) <= max(1.0, qty_tol * q_est) and abs(ratio - q_est) < 0.25)
+        )
     if qty is not None and total is not None and per_bond is not None:
         r["checks"]["total_matches"] = abs(per_bond * qty - total) <= max(1.0, 0.5 * per_bond, qty_tol * qty)
     if qty is None:
@@ -561,13 +572,44 @@ def _dc_default_age(f, ref_date):
 
 
 def _dc_buyback(secs, text, event_date):
-    body = (secs.get("2.1") or "") + " " + (secs.get("2.2") or "")
-    m = re.search(r"в количестве\s+(\d[\d  ]*)", body, re.I)
-    qty = _dc_int(dc_parse_number(m.group(1))) if m else None
+    sec2 = " ".join(v for k, v in secs.items() if k.startswith("2."))
+    body = sec2 or ((secs.get("2.1") or "") + " " + (secs.get("2.2") or ""))
+    qty_v = _dc_pick(secs, r"количество\s+(?:фактически\s+)?(?:приобрет|выкуп)|фактически\s+(?:приобрет|выкуп)", None)
+    qty = dc_parse_qty(qty_v) if qty_v else None
+    if qty is None:
+        m = re.search(r"(?:в\s+количестве|приобретено|выкуплено)\s*[:\-–]?\s*(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)", body, re.I)
+        qty = _dc_int(dc_parse_number(m.group(1))) if m else None
+    if qty is None:
+        for k, v in secs.items():
+            if k.startswith("2.") and re.search(r"приобрет|выкуп", v, re.I):
+                cand = dc_parse_qty(v)
+                if cand:
+                    qty = cand
+                    break
     lb = body.lower()
-    basis = "put" if "по требованию владельцев" in lb else "issuer" if ("по соглашению с владельцами" in lb or "по усмотрению" in lb) else None
-    d3 = dc_parse_date(_dc_pick(secs, r"дата наступления события", "2.3") or "")
+    basis = ("put" if ("по требованию владельцев" in lb or "требованию их владельцев" in lb or "оферт" in lb)
+             else "issuer" if ("по соглашению с владельцами" in lb or "по усмотрению" in lb) else None)
+    d3 = dc_parse_date(_dc_pick(secs, r"дата\s+(?:приобретения|выкупа|наступления\s+события|исполнения)", "2.3") or "")
     return {"qty_bought": qty, "basis": basis, "date": event_date or d3, "conf": 1.0 if qty else 0.5, "checks": {}}
+
+
+def _dc_placement(secs, text, title, event_date):
+    sec2 = " ".join(v for k, v in secs.items() if k.startswith("2."))
+    body = sec2 or text or ""
+    low = ((title or "") + " " + body[:1200]).lower()
+    if "реализации приобрет" in low or "продаже ранее приобрет" in low or "вторичной продаже" in low:
+        subkind = "secondary"
+    elif "дополнительн" in low or "доразмещ" in low:
+        subkind = "additional"
+    else:
+        subkind = "primary"
+    qty_v = _dc_pick(secs, r"количество\s+(?:фактически\s+)?(?:размещ|реализован|продан)|фактически\s+(?:размещ|реализован)", None)
+    qty = dc_parse_qty(qty_v) if qty_v else None
+    if qty is None:
+        m = re.search(r"(?:размещено|реализовано|продано|в\s+количестве)\s*[:\-–]?\s*(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)", body, re.I)
+        qty = _dc_int(dc_parse_number(m.group(1))) if m else None
+    d3 = dc_parse_date(_dc_pick(secs, r"дата\s+(?:фактического\s+)?(?:окончания|завершения|реализации|размещения|наступления)", "2.3") or "")
+    return {"qty_placed": qty, "subkind": subkind, "date": d3 or event_date, "conf": 1.0 if qty else 0.5, "checks": {}}
 
 
 def dc_extract(text, title="", meta=None):
@@ -591,8 +633,8 @@ def dc_extract(text, title="", meta=None):
     event_date = dc_parse_date(secs.get("1.7", ""))
     res = {"kind": kind, "inn": inn, "ogrn": ogrn, "event_date": event_date, "published": meta.get("published"),
            "code": meta.get("code"), "company": meta.get("company"), "facts": [], "warnings": warnings}
-    if kind == "buyback_result":
-        isins = _dc_isins(secs.get("2.1"), secs.get("2.2"))
+    if kind in ("buyback_result", "placement_result"):
+        isins = _dc_isins(secs.get("2.1"), secs.get("2.2"), secs.get("2.3"))
     elif kind == "other":
         isins = _dc_isins(secs.get("2.4"), secs.get("2.1"))
     else:
@@ -616,6 +658,8 @@ def dc_extract(text, title="", meta=None):
     elif kind == "default":
         f = _dc_default(secs, text)
         _dc_default_age(f, event_date or dc_parse_date(meta.get("published") or ""))
+    elif kind == "placement_result":
+        f = _dc_placement(secs, text, title, event_date)
     else:
         f = _dc_buyback(secs, text, event_date)
     for w in f.get("warn") or []:

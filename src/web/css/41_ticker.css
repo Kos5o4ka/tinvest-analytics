@@ -1,0 +1,24 @@
+/* ── бегущая строка котировок ── */
+.tkr{position:relative;display:flex;align-items:center;height:30px;flex:none;overflow:hidden;background:var(--card2);border-bottom:1px solid var(--line);font-size:12px;line-height:1;font-variant-numeric:tabular-nums}
+.tkr[hidden]{display:none}
+.tkr.off{height:16px;justify-content:flex-end;background:transparent;border-bottom:0}
+.tkr .tk-vp{flex:1;min-width:0;overflow:hidden;white-space:nowrap;mask-image:linear-gradient(90deg,transparent,#000 18px,#000 calc(100% - 18px),transparent);-webkit-mask-image:linear-gradient(90deg,transparent,#000 18px,#000 calc(100% - 18px),transparent)}
+.tkr .tk-track{display:inline-flex;width:max-content;animation:tk-run var(--tk-dur,90s) linear infinite;will-change:transform}
+.tkr .tk-vp:hover .tk-track{animation-play-state:paused}
+.tkr .tk-grp{display:inline-flex;flex:none}
+@keyframes tk-run{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.tkr .tk-it{display:inline-flex;align-items:baseline;gap:6px;padding:0 14px;border-right:1px solid var(--line);color:var(--tx2);white-space:nowrap}
+.tkr .tk-it b{color:var(--tx);font-weight:600}
+.tkr .tk-it[data-stk]{cursor:pointer}
+.tkr .tk-it[data-stk]:hover b{color:var(--ac-tx)}
+.tkr .tk-ch.pos{color:var(--pos)}.tkr .tk-ch.neg{color:var(--neg)}.tkr .tk-ch.z{color:var(--mu)}
+.tkr .tk-x{flex:none;border:0;background:transparent;color:var(--mu);cursor:pointer;font-size:15px;padding:0 10px;height:100%;line-height:1}
+.tkr .tk-x:hover{color:var(--tx)}
+.tkr.off .tk-x{font-size:11px;padding:0 12px}
+@media(prefers-reduced-motion:reduce){
+  .tkr .tk-vp{overflow-x:auto;mask-image:none;-webkit-mask-image:none;scrollbar-width:none}
+  .tkr .tk-track{animation:none}
+  .tkr .tk-grp[aria-hidden]{display:none}
+}
+@media(max-width:760px){.tkr{height:28px;font-size:11px}.tkr .tk-it{padding:0 10px;gap:5px}}
+@media print{.tkr{display:none}}

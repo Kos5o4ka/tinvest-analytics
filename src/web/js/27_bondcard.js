@@ -56,28 +56,45 @@ async function openBond(isin){
   const mr=dr.querySelector('#bc-more');
   if(mr)mr.onclick=()=>{BC.all=true;dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);BC.all=false};
 }
-/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, поэтому ведём на поиск по ИНН (или ISIN). */
+/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, а его поиск по ссылке не заполняется, поэтому основная ссылка — страница раскрытия на СКРИН по ИНН; e-disclosure — запасной поиск. */
 function bcDocLinks(isin,inn,secid){
   isin=String(isin||'').trim().toUpperCase();inn=String(inn||'').replace(/\D/g,'');if(inn.length!==10&&inn.length!==12)inn='';
   const q=inn||isin,code=String(secid||isin||'').trim();
   const a=(u,t)=>`<a class="btn ghost" href="${esc(u)}" target="_blank" rel="noopener">${t} ↗</a>`;
-  return`<div class="bc-docs">${q?a('https://www.e-disclosure.ru/poisk-po-kompaniyam?query='+encodeURIComponent(q),'Раскрытие информации эмитента (e-disclosure)'):''}${code?a('https://www.moex.com/ru/issue.aspx?code='+encodeURIComponent(code),'Страница выпуска на Мосбирже'):''}</div>`
+  return`<div class="bc-docs">${inn?a('https://disclosure.skrin.ru/disclosure/'+inn,'Раскрытие информации эмитента (СКРИН)'):''}${q?a('https://www.e-disclosure.ru/poisk-po-kompaniyam?query='+encodeURIComponent(q),inn?'Поиск на e-disclosure':'Раскрытие информации эмитента (e-disclosure)'):''}${code?a('https://www.moex.com/ru/issue.aspx?code='+encodeURIComponent(code),'Страница выпуска на Мосбирже'):''}</div>`
     +`<p class="note" style="margin-top:8px">Условия оферт (put/call), купонов и досрочного погашения — в решении о выпуске и проспекте.${inn?'':' ИНН эмитента не определён — поиск по ISIN может ничего не найти, тогда введите название эмитента на сайте.'}</p>`;
 }
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
 function bcKpi(k,v,s,cls){return`<div class="card"><div class="k">${k}</div><div class="v num ${cls||''}">${v}</div>${s?`<div class="s">${s}</div>`:''}</div>`}
 /* Раскрытие информации: сколько бумаг в рынке (по последнему купону, иначе по объёму выпуска) и последние факты с сервера данных */
-const BC_DISC_KIND={coupon_paid:'Купон выплачен',coupon_declared:'Ставка купона',default:'Неисполнение',buyback_result:'Итоги выкупа'};
+const BC_DISC_KIND={coupon_paid:'Купон выплачен',coupon_declared:'Ставка купона',default:'Неисполнение',buyback_result:'Итоги выкупа',placement_result:'Размещение / доразмещение'};
 function bcOutLine(o){
   if(!o||o.qty==null)return'';
+  const fmt=n=>Number(n).toLocaleString('ru-RU');
   const sh=o.share!=null?` (${Math.round(o.share*100)} % выпуска)`:'';
   const src=o.doc_url?`<a href="${esc(o.doc_url)}" target="_blank" rel="noopener">источник ↗</a>`:'';
-  const M={coupon_explicit:'купону',coupon_derived:'купону (число бумаг выведено из суммы)',declared_derived:'объявлению о купоне (число бумаг выведено из суммы)'};
+  const M={coupon_explicit:'купону',coupon_derived:'купону (выведено из суммы выплаты)',declared_derived:'объявлению о купоне (выведено из суммы)'};
   let how;
   if(M[o.method])how=`по ${M[o.method]}${o.coupon_no?' №'+esc(String(o.coupon_no)):''}${o.as_of?' от '+ddm(o.as_of):''}`;
   else how=o.method==='issue_placed'?'по размещённому объёму выпуска (Мосбиржа)':'по объёму выпуска (Мосбиржа)';
-  const bb=o.buybacks_after?` · с учётом выкупов после этой даты: ${o.buybacks_after}`:'';
-  return`<div class="bc-out"><b>В рынке:</b> <span class="num">${o.qty.toLocaleString('ru-RU')} шт.</span>${sh} · <span class="mu">${how}${bb}</span>${src?' · '+src:''}</div>`;
+  const bb=o.buybacks_after?` · выкупов после купона: ${o.buybacks_after}`:'';
+  const over=o.over_issue_size?' <span class="tag">выше ISSUESIZE (допвыпуск)</span>':'';
+  const chips=[];
+  if(o.issue_size!=null)chips.push(`<span>Выпущено: <b class="num">${fmt(o.issue_size)} шт.</b>${o.issue_date?' от '+ddm(o.issue_date):''}</span>`);
+  if(o.placed!=null&&o.placed!==o.issue_size)chips.push(`<span>Размещено первично: <b class="num">${fmt(o.placed)} шт.</b></span>`);
+  if(o.added_total>0)chips.push(`<span class="pos">Допвыпуск / доразмещение: <b class="num">+${fmt(o.added_total)} шт.</b></span>`);
+  if(o.buybacks_total>0)chips.push(`<span class="neg">Выкуплено (оферты/выкупы): <b class="num">−${fmt(o.buybacks_total)} шт.</b></span>`);
+  const evs=o.events||[];
+  let tl='';
+  if(evs.length>1||(evs.length===1&&evs[0].kind!=='issue')){
+    const rows=evs.map(e=>{
+      const dlt=e.delta==null?'—':(e.kind==='issue'?fmt(e.delta)+' шт.':(e.delta>0?`<span class="pos">+${fmt(e.delta)} шт.</span>`:`<span class="neg">−${fmt(Math.abs(e.delta))} шт.</span>`));
+      return`<tr><td class="l">${e.date?ddm(e.date):'—'}</td><td class="l">${esc(e.label||e.kind)}</td><td class="num">${dlt}</td><td>${e.url?`<a href="${esc(e.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`;
+    }).join('');
+    tl=`<details class="bc-out-det"><summary>История изменения объёма (${evs.length})</summary><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Событие</th><th>Объём / изменение</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  }
+  return`<div class="bc-out"><div><b>В рынке сейчас:</b> <span class="num">${fmt(o.qty)} шт.</span>${sh}${over} · <span class="mu">${how}${bb}</span>${src?' · '+src:''}</div>`
+    +(chips.length?`<div class="bc-out-meta">${chips.join('')}</div>`:'')+tl+`</div>`;
 }
 function bcDisclosure(dc){
   if(!dc)return'';
@@ -101,13 +118,28 @@ function bcBody(c){
   if(c.errors&&c.errors.length)h+=`<div class="bc-warn">${c.errors.map(esc).join('<br>')}</div>`;
   if(m){
     const sp=m.spread;
+    const _q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
     h+=`<div class="bc-kpis">`
       +bcKpi('Цена',bcN(m.price,2)+' %',m.nominal?`номинал ${bcN(m.nominal,0)}`:'')
-      +bcKpi('Доходность',bcN(m.yield,2)+' %','к погашению/оферте')
-      +bcKpi('Спред к КБД',sp==null?'—':(sp>0?'+':'')+bcN(sp,2)+' п.п.',c.kbd!=null?`КБД ${bcN(c.kbd,2)} % на ${bcN(m.dur,2)} г.`:'',sp==null?'':sp>0?'pos':'neg')
-      +bcKpi('Дюрация',m.dur==null?'—':bcN(m.dur,2)+' г.',`оборот ${short(m.turn||0)}`)
+      +bcKpi('Доходность '+_q('yield','Доходность к погашению или ближайшей оферте (YTM)'),bcN(m.yield,2)+' %','к погашению/оферте')
+      +bcKpi('Спред к КБД '+_q('spread','Премия доходности выпуска над безрисковой кривой ОФЗ (КБД)'),sp==null?'—':(sp>0?'+':'')+bcN(sp,2)+' п.п.',c.kbd!=null?`КБД ${bcN(c.kbd,2)} % на ${bcN(m.dur,2)} г.`:'',sp==null?'':sp>0?'pos':'neg')
+      +bcKpi('Дюрация '+_q('duration','Чувствительность цены облигации к изменению ставок'),m.dur==null?'—':bcN(m.dur,2)+' г.',`оборот ${short(m.turn||0)}`)
       +`</div>`;
   }
+  const vBits=[];
+  if(d.HASDEFAULT==='1')vBits.push('<b class="neg">Допущен дефолт</b>');
+  else if(d.HASTECHNICALDEFAULT==='1')vBits.push('<b class="neg">Технический дефолт</b>');
+  else if(c.rating&&c.rating.v){
+    const bk=rBucket(c.rating.v).split(' ')[0];
+    const lvl={AAA:'Надёжность максимальная',AA:'Надёжность высокая',A:'Надёжность выше средней',BBB:'Надёжность умеренная',BB:'Повышенный риск (ВДО)',B:'Высокий риск (ВДО)'}[bk]||'Спекулятивный риск';
+    vBits.push(`${lvl} (<b>${esc(c.rating.v)}</b>)`);
+  }else if(ci.ofz||String(c.isin||'').startsWith('SU'))vBits.push('Государственный выпуск (<b>ОФЗ</b>)');
+  if(m&&m.spread!=null)vBits.push(`спред к КБД <b class="${m.spread>=0?'pos':'neg'}">${m.spread>0?'+':''}${bcN(m.spread,2)} п.п.</b>`);
+  if(c.offers&&c.offers.length){
+    const o0=c.offers[0];
+    vBits.push(`ближайшая оферта <b>${ddm(o0.date)}</b> (${o0.kind==='put'?'PUT — право продать':o0.kind==='call'?'CALL — право эмитента погасить':'оферта'})`);
+  }else if(m&&m.mat)vBits.push(`без оферт до погашения ${ddm(m.mat)}`);
+  if(vBits.length)h+=`<div class="bc-verdict">${vBits.join(' · ')}</div>`;
   const rows=[];const add=(k,v)=>{if(v!=null&&v!=='')rows.push(`<div><span>${k}</span><span>${v}</span></div>`)};
   add('Эмитент',esc(d.EMITTER||''));
   add('Вид',esc(d.BOND_TYPE||d.TYPENAME||''));

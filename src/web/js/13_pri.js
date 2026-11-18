@@ -1,6 +1,47 @@
 /* ── Первичные размещения ── */
-S.pri=null;
+S.pri=null;S.priNip={y:21,bucket:'AA',term:3,days:4};
 function loadPri(){api('/api/primary').then(j=>{S.pri=j;if(S.page==='pri')renderSoon()}).catch(e=>{S.pri={error:e.message,rows:[]};if(S.page==='pri')renderSoon()})}
+function priNipCell(n){
+  if(!n)return'<span class="mu">—</span>';
+  const bits=[];
+  if(n.floater)bits.push('<span class="tag">флоатер</span>');
+  else if(n.guide_y!=null)bits.push(`<b>${pp1(n.guide_y)}</b>`);
+  if(n.issuer_y!=null)bits.push(`<small class="mu">эмитент ${pp1(n.issuer_y)} (${n.issuer_n})</small>`);
+  else if(n.peer_y!=null)bits.push(`<small class="mu">аналоги ${pp1(n.peer_y)}</small>`);
+  if(n.nip_bp!=null){
+    const cls=n.net_nip_bp>15?'pos':n.net_nip_bp<-15?'neg':'';
+    const sg=n.nip_bp>0?'+':'';
+    const nsg=n.net_nip_bp>0?'+':'';
+    const tip=`NIP к ${n.ref_src==='issuer'?'кривой эмитента':'медиане аналогов'}: ${sg}${n.nip_bp} б.п.; заморозка кэша (${n.freeze_days} дн. под ${pp1(n.freeze_rate)}): −${String(n.freeze_cost_pct).replace('.',',')} % номинала (≈ −${n.freeze_drag_bp} б.п. годовых); чистая премия: ${nsg}${n.net_nip_bp} б.п.`;
+    bits.push(`<span class="tag pri-nip ${cls}" title="${esc(tip)}">NIP ${sg}${n.nip_bp} б.п. · нетто ${nsg}${n.net_nip_bp}</span>`);
+  }
+  return bits.length?bits.join('<br>'):'<span class="mu">—</span>';
+}
+function priNipCalcHtml(d){
+  const pm=(d&&d.peer_medians)||{},rate=(d&&d.rusfar)!=null?d.rusfar:16.0;
+  const st=S.priNip,bks=Object.keys(pm).length?Object.keys(pm):['AAA','AA','A','BBB','BB'];
+  if(!bks.includes(st.bucket))st.bucket=bks[0];
+  const peer=pm[st.bucket];
+  const freezePct=(rate/100)*(Math.max(0,st.days)/365)*100;
+  const dragBp=Math.round(freezePct/Math.max(0.5,st.term||2)*100);
+  const rawBp=peer!=null?Math.round((st.y-peer)*100):null;
+  const netBp=rawBp!=null?rawBp-dragBp:null;
+  const verd=netBp==null?'Откройте «Скринер облигаций» хотя бы раз, чтобы загрузить медианы аналогов.':
+    netBp>=30?`<b class="pos">Чистая премия +${netBp} б.п.</b> — первичка выглядит интереснее вторички даже с учётом заморозки денег.`:
+    netBp>=0?`<b>Чистая премия +${netBp} б.п.</b> — около нуля после стоимости заморозки кэша (${freezePct.toFixed(2).replace('.',',')} %).`:
+    `<b class="neg">Премия отрицательная (${netBp} б.п.)</b> — на вторичном рынке аналоги того же рейтинга дают больше.`;
+  return`<div class="card pri-nip-box" style="margin-top:16px"><h2>Калькулятор премии первички (NIP) и заморозки кэша<span class="sp">ставка заморозки ≈ ${pp1(rate)} (КС/RUSFAR)</span></h2>
+    <div class="pri-nip-f">
+      <label>Ориентир купона/YTM, % <input class="in" type="number" step="0.1" id="pn-y" value="${st.y}"></label>
+      <label>Рейтинг <select class="in" id="pn-b">${bks.map(b=>`<option value="${esc(b)}"${b===st.bucket?' selected':''}>${esc(b)}${pm[b]!=null?' (мед. '+pp1(pm[b])+')':''}</option>`).join('')}</select></label>
+      <label>Срок, лет <input class="in" type="number" step="0.5" min="0.5" max="30" id="pn-t" value="${st.term}"></label>
+      <label>Заморозка, дн. <input class="in" type="number" step="1" min="0" max="30" id="pn-d" value="${st.days}"></label>
+    </div>
+    <div class="pri-nip-out"><span>Медиана аналогов (${esc(st.bucket)}): <b>${peer!=null?pp1(peer):'—'}</b></span>
+      <span>Стоимость заморозки (${st.days} дн.): <b class="neg">−${freezePct.toFixed(2).replace('.',',')} %</b> (−${dragBp} б.п./год)</span>
+      <span>NIP брутто: <b>${rawBp!=null?(rawBp>0?'+':'')+rawBp+' б.п.':'—'}</b></span>
+      <span>${verd}</span></div></div>`;
+}
 function pPri(){
   const d=S.pri;
   if(!d){loadPri();return`<div class="card">${waitBox('Загружаю календарь первичных размещений…')}</div>`}
@@ -9,12 +50,14 @@ function pPri(){
   const wk=new Date(Date.now()+7*864e5).toISOString().slice(0,10);
   const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${isinTxt(r.isin)}</small>`:''}</td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
+    <td class="l">${priNipCell(r.nip)}</td>
     <td class="num">${ddm(r.start)}${r.start===today?'<br><small class="pos">сегодня</small>':''}</td><td class="num">${esc(r.end.replace(' г.',''))}</td>
     <td class="l">${esc(r.book)}</td><td class="l">${r.link?`<a class="blue-link" href="${esc(r.link)}" target="_blank" rel="noopener">объявление Мосбиржи ↗</a>`:''}</td></tr>`).join('');
   return priVolHtml()+`<div class="g g4" style="margin-top:16px">${kpi('Размещений в списке',rows.length,'объявлено Мосбиржей')}${kpi('Сегодня',rows.filter(r=>r.start===today).length,'плановое начало размещения')}
     ${kpi('На этой неделе',rows.filter(r=>r.start>=today&&r.start<=wk).length,'начало в ближайшие 7 дней')}${kpi('С рейтингом',rows.filter(r=>r.rating).length,'эмитент найден в базе рейтингов')}</div>
-  <div class="card" style="padding:12px 10px 6px"><div class="row" style="padding:0 6px 10px"><b>Календарь первичных размещений</b><button class="btn ghost" id="pri-r" style="margin-left:auto">Обновить</button></div>
-    ${rows.length?`<div class="tbl"><table><thead><tr><th class="l">Эмитент и выпуск</th><th class="l">Рейтинг</th><th>Начало размещения</th><th>Окончание</th><th class="l">Книга заявок</th><th class="l">Источник</th></tr></thead><tbody>${body}</tbody></table></div>`:'<div class="empty">Объявленных размещений нет</div>'}</div>
+  ${priNipCalcHtml(d)}
+  <div class="card" style="padding:12px 10px 6px;margin-top:16px"><div class="row" style="padding:0 6px 10px"><b>Календарь первичных размещений</b><button class="btn ghost" id="pri-r" style="margin-left:auto">Обновить</button></div>
+    ${rows.length?`<div class="tbl"><table><thead><tr><th class="l">Эмитент и выпуск</th><th class="l">Рейтинг</th><th class="l">Ориентир и премия (NIP)</th><th>Начало размещения</th><th>Окончание</th><th class="l">Книга заявок</th><th class="l">Источник</th></tr></thead><tbody>${body}</tbody></table></div>`:'<div class="empty">Объявленных размещений нет</div>'}</div>
   ${priStatsHtml()}
   <p class="note">Даты начала размещения — по объявлениям Московской биржи (сводка investmint.ru). Ставку купона эмитент обычно объявляет в день сбора заявок: уточняйте её у брокера. Рейтинг сопоставлен с эмитентом по названию. </p>${NIR_NOTE}`;
 }
@@ -53,8 +96,12 @@ function priStatsHtml(){
   const dv=a.p30==null?null:a.p30-100;
   const verdict=a.p30==null?'Через 30 дней данных пока мало.':
     `В первый день новые выпуски торгуются в среднем около ${pp1(a.p0)} от номинала, через 30 дней — около ${pp1(a.p30)}. ${a.below30>50?'Больше половины выпусков через месяц стоят ниже номинала: покупка на размещении чаще оказывалась невыгодной, чем покупка позже.':a.below30<30?'Большинство выпусков через месяц стоят не ниже номинала: покупка на размещении обычно не проигрывала.':'Примерно половина выпусков через месяц стоит ниже номинала, половина — выше: явного преимущества у размещения или вторички нет.'}`;
+  const wRows=[['Последние 30 дней',d.win30],['Последние 90 дней',d.win90],['За 12 месяцев',a]].filter(([,w])=>w&&w.n);
+  const abvTbl=wRows.length?`<div class="tbl" style="margin:10px 0"><table><thead><tr><th class="l">Окно размещений</th><th>Выпусков</th><th>Выше 100 % в T+1</th><th>Выше 100 % в T+7</th><th>Выше 100 % в T+30</th><th>Медиана T+30</th></tr></thead><tbody>`
+    +wRows.map(([lbl,w])=>`<tr><td class="l"><b>${lbl}</b></td><td class="num">${w.n}</td><td class="num">${w.above0==null?'—':pctp(w.above0,0)}</td><td class="num">${w.above7==null?'—':pctp(w.above7,0)}</td><td class="num">${w.above30==null?'—':pctp(w.above30,0)}</td><td class="num">${pp1(w.p30)}</td></tr>`).join('')+`</tbody></table></div>`:'';
   return head+`<div class="g g4">${kpi('Выпусков в расчёте',a.n,'размещены за 12 месяцев')}${kpi('Медиана через 7 дней',pp1(a.p7),'от номинала')}
     ${kpi('Медиана через 30 дней',pp1(a.p30),dv==null?'':ppd(dv)+' к номиналу',dv==null?'':dv<0?'neg':'pos')}${kpi('Ниже номинала через 30 дней',a.below30==null?'—':pctp(a.below30,0),'доля выпусков')}</div>
+  ${abvTbl}
   <p style="margin:12px 6px;color:var(--tx2)">${esc(verdict)}</p>
   <div class="g g2" style="margin-top:6px"><div><div class="axt">Отклонение цены от номинала по рейтингам, п.п.</div><div id="c-pri-b" class="chart"></div></div>
   <div><div class="tbl"><table><thead><tr><th class="l">Группа</th><th>Выпусков</th><th>Цена 1-й день</th><th>Через 30 дн.</th><th>Ниже номинала</th><th>Сейчас к 1-му дню</th></tr></thead><tbody>
@@ -157,4 +204,16 @@ document.addEventListener('click',e=>{
   const f=t.closest('[data-pvf]');if(f){S.priVF=f.dataset.pvf;render();return}
   const h=t.closest('#pv-tab thead [data-pvs]');
   if(h){const kk=h.dataset.pvs;S.priVSort={k:kk,d:S.priVSort.k===kk?-S.priVSort.d:(['name','coupon','rating'].includes(kk)?1:-1)};render()}
+});
+document.addEventListener('change',e=>{
+  if(S.page!=='pri')return;
+  const id=e.target&&e.target.id;
+  if(!['pn-y','pn-b','pn-t','pn-d'].includes(id))return;
+  const st=S.priNip;
+  if(id==='pn-y')st.y=+e.target.value||0;
+  if(id==='pn-b')st.bucket=e.target.value;
+  if(id==='pn-t')st.term=Math.max(0.5,+e.target.value||2);
+  if(id==='pn-d')st.days=Math.max(0,+e.target.value||0);
+  const box=document.querySelector('.pri-nip-box');
+  if(box&&S.pri)box.outerHTML=priNipCalcHtml(S.pri);
 });

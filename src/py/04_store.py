@@ -117,6 +117,9 @@ _klocks, _klocks_lock = {}, threading.Lock()
 def key_lock(key):
     """Блокировка на ключ: одинаковую тяжёлую работу (запросы к API) параллельные потоки выполняют по одному разу."""
     with _klocks_lock:
+        if len(_klocks) > 512:
+            for k in [k for k, v in _klocks.items() if k != key and not v.locked()]:
+                _klocks.pop(k, None)
         lk = _klocks.get(key)
         if lk is None:
             lk = _klocks[key] = threading.Lock()

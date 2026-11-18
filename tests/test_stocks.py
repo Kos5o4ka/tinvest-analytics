@@ -36,6 +36,57 @@ class Universe(unittest.TestCase):
         self.assertEqual(rows["ZZZZ"]["chg_d"], 0.0)
         self.assertEqual(rows["ZZZZ"]["sector"], "Прочее")
 
+    def test_fund_split(self):
+        cols = SEC_COLS + ["SECTYPE", "INSTRID"]
+        sec = {"columns": cols, "data": [
+            ["SBER", "TQBR", "Сбербанк", 300.0, 1, "Сбербанк", 1000, "RU1", "1", "EQIN"],
+            ["LQDT", "TQBR", "LQDT", 2.0, 1, "ВИМ ликвидность", 1000, "RU2", "J", "IFTF"],
+            ["TMOS", "TQBR", "TMOS", 7.0, 1, "Тинькофф iMOEX", 1000, "RU3", "J", "IFTF"],
+            ["RU000A109QR5", "TQBR", "ААА Золото", 5.0, 1, "ААА Золото", 1000, "RU4", "9", "IFA1"],
+            ["XXXXXX", "TQBR", "Рентал ПРО", 5.0, 1, "Рентал ПРО", 1000, "RU5", "B", "IFA1"]]}
+        md = {"columns": MD_COLS, "data": [["LQDT", 2.1, 1e9, None, None]]}
+        rows = {r["secid"]: r for r in m.stk_rows_from_iss({"securities": sec, "marketdata": md}, m.STK_SECTORS)}
+        self.assertFalse(rows["SBER"]["is_fund"])
+        self.assertTrue(rows["LQDT"]["is_fund"] and rows["LQDT"]["instrid"] == "IFTF")
+        orig = (m._stk_iss, m.stock_candles, m.stock_history_closes)
+        try:
+            m._stk_iss = lambda path, timeout=25: {"securities": sec, "marketdata": md}
+            m.stock_candles = lambda s, i=24, d=400: []
+            m.mem_clear()
+            st = {r["secid"] for r in m.stocks_universe(force=True)}
+            fu = {r["secid"]: r for r in m.funds_universe()}
+        finally:
+            m._stk_iss, m.stock_candles, m.stock_history_closes = orig
+            m.mem_clear()
+        self.assertEqual(st, {"SBER"})
+        self.assertEqual(set(fu), {"LQDT", "TMOS", "RU000A109QR5", "XXXXXX"})
+        self.assertEqual((fu["LQDT"]["sector"], fu["TMOS"]["sector"]), ("Денежный рынок", "Акции"))
+        self.assertEqual((fu["RU000A109QR5"]["sector"], fu["XXXXXX"]["sector"]), ("Золото и металлы", "Прочие фонды"))
+
+    def test_fund_fallback_tqtf(self):
+        paths = []
+        orig = (m._stk_iss, m.stock_candles)
+        try:
+            def fake(path, timeout=25):
+                paths.append(path)
+                return ISS
+            m._stk_iss = fake
+            m.stock_candles = lambda s, i=24, d=400: []
+            m.mem_clear()
+            fu = m.funds_universe()
+        finally:
+            m._stk_iss, m.stock_candles = orig
+            m.mem_clear()
+        self.assertTrue(any("TQTF" in p for p in paths))
+        self.assertTrue(fu and all(r["is_fund"] for r in fu))
+
+    def test_fund_category(self):
+        c = m.stk_fund_category
+        self.assertEqual(c("SBGB", ""), "Облигации")
+        self.assertEqual(c("ZZZ", "ПИФ Облигации"), "Облигации")
+        self.assertEqual(c("ZZZ", "РСХБ Акции"), "Акции")
+        self.assertEqual(c("ZZZ", "Какой-то ЗПИФ"), "Прочие фонды")
+
     def test_sector_table(self):
         self.assertEqual(m.STK_SECTORS["LKOH"], "Нефть и газ")
         self.assertGreater(len(m.STK_SECTORS), 120)

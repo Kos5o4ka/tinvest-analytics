@@ -1,7 +1,7 @@
 /* ── Тепловая карта рынка: squarified treemap (акции / облигации / фонды) ── */
 const HM_KINDS=[['stocks','Акции'],['bonds','Облигации'],['funds','Фонды']],HM_PER=[['d','День'],['w','Неделя'],['m','Месяц']],HM_SZ=[['cap','Капитализация'],['value','Оборот']];
 const HM_LIM={d:3,w:7,m:15};
-S.hm={kind:'stocks',period:'d',size:'cap',d:null,loading:'',err:null};
+S.hm={kind:'stocks',period:'d',size:'cap',sel:'',d:null,loading:'',err:null};
 /* Раскладка squarified — зеркало Python treemap_layout (13u_heatmap.py); менять обе реализации синхронно. */
 function hmSquarify(vals,x,y,w,h){
   const n=vals.length,out=vals.map(()=>[x,y,0,0]);
@@ -33,17 +33,23 @@ function hmColor(chg,lim){
   const n=lt?[226,229,236]:[52,58,71],g=lt?[46,170,112]:[31,160,104],r=lt?[222,84,84]:[214,68,68],e=t>=0?g:r,a=Math.abs(t);
   return`rgb(${n.map((c,i)=>Math.round(c+(e[i]-c)*a)).join(',')})`;
 }
+/* Выбранный сектор: группа из данных или null (если выбранной группы больше нет — выбор сбрасывается). */
+function hmSel(d){const f=S.hm;if(!f.sel)return null;const g=d&&d.groups&&d.groups.find(x=>x.name===f.sel);if(!g)f.sel='';return g||null}
+function hmStatsOf(d,g){
+  if(!g)return d.stats;const it=g.items,up=it.filter(i=>i.chg>.005).length,dn=it.filter(i=>i.chg<-.005).length;
+  return{up,down:dn,flat:it.length-up-dn,n:it.length,turnover:it.reduce((a,i)=>a+(i.value||0),0),wchg:g.chg};
+}
 function hmFmt(c){return c==null?'—':(c>0?'+':c<0?'−':'')+Math.abs(c).toFixed(2).replace('.',',')+' %'}
 function drawHm(el){
   const f=S.hm,d=f.d;if(!d||d._k!==hmKey())return;
   const W=Math.floor(el.clientWidth);if(W<50)return;
   if(d.error||!d.groups||!d.groups.length){el.innerHTML=`<div class="empty" style="padding:40px">${esc(d.error||'Нет данных для карты')}</div>`;return}
   const H=W<560?Math.round(W*1.35):Math.max(460,Math.min(720,Math.round(W*.52))),lim=HM_LIM[d.period]||3,tiles=[];
-  const gr=hmSquarify(d.groups.map(g=>g.size),0,0,W,H);let s='';
-  d.groups.forEach((g,gi)=>{
+  const sg=hmSel(d),gl=sg?[sg]:d.groups,gr=sg?[[0,0,W,H]]:hmSquarify(gl.map(g=>g.size),0,0,W,H);let s='';
+  gl.forEach((g,gi)=>{
     const [gx,gy,gw,gh]=gr[gi];if(gw<1||gh<1)return;
     const hd=gw>=56&&gh>=44?16:0,ix=gx+1,iy=gy+1+hd,iw=gw-2,ih=gh-2-hd;
-    s+=`<rect class="hm-g" x="${gx.toFixed(1)}" y="${gy.toFixed(1)}" width="${gw.toFixed(1)}" height="${gh.toFixed(1)}"/>`;
+    s+=`<rect class="hm-g${sg?'':' hm-gs'}" data-g="${esc(g.name)}" x="${gx.toFixed(1)}" y="${gy.toFixed(1)}" width="${gw.toFixed(1)}" height="${gh.toFixed(1)}"/>`;
     if(hd){const mc=Math.max(3,Math.floor((gw-8)/6.4));s+=`<text class="hm-gl" x="${(gx+5).toFixed(1)}" y="${(gy+12).toFixed(1)}">${esc(g.name.length>mc?g.name.slice(0,mc-1)+'…':g.name)}</text>`}
     if(iw<2||ih<2)return;
     const ir=hmSquarify(g.items.map(i=>i.size),ix,iy,iw,ih);
@@ -68,7 +74,8 @@ function drawHm(el){
       (bd&&it.yield!=null?tipRow(c,'Доходность',pctp(it.yield,2)):'')+tipRow(c,'Оборот за день',it.value?short(it.value)+' ₽':'—')+(it.cap?tipRow(c,'Капитализация',short(it.cap)+' ₽'):'')+
       '<div style="color:var(--mu);margin-top:5px">нажмите — карточка</div>',e)};
   el.onmouseleave=hideTip;
-  el.onclick=e=>{const t=e.target.closest('[data-i]');if(!t)return;const it=tiles[+t.dataset.i];if(!it)return;
+  el.onclick=e=>{const t=e.target.closest('[data-i]');
+    if(!t){const gg=e.target.closest('[data-g]');if(gg&&!sg){hideTip();f.sel=gg.dataset.g;render()}return}const it=tiles[+t.dataset.i];if(!it)return;
     if(d.kind==='bonds'){if(typeof openBond==='function')openBond(it.id)}else if(typeof openStock==='function')openStock(it.id)};
 }
 function pHeatmap(){
@@ -76,17 +83,21 @@ function pHeatmap(){
   if(!ok)hmLoad();
   chart('hm-map',drawHm);chart('hm-root',bindHm);
   const seg=(arr,cur,attr)=>arr.map(([k,t])=>`<button type="button" data-${attr}="${k}" class="${k===cur?'on':''}">${t}</button>`).join('');
-  const st=ok&&d.stats,leg=[-lim,-lim/2,0,lim/2,lim];
+  const sg=ok?hmSel(d):null,st=ok&&hmStatsOf(d,sg),leg=[-lim,-lim/2,0,lim/2,lim];
   return`<div id="hm-root"><div class="card"><h2>Тепловая карта рынка<span class="sp">${bd?'размер — оборот за день, цвет — изменение цены за день':'размер и цвет плиток — по выбранным параметрам'}</span></h2>
     <div class="hm-bar"><div class="mp-chips" id="hm-kind">${seg(HM_KINDS,f.kind,'k')}</div>
     ${bd?'':`<div class="mp-chips" id="hm-per">${seg(HM_PER,f.period,'p')}</div><div class="mp-chips" id="hm-sz">${seg(HM_SZ,f.size,'s')}</div>`}</div>
+    ${ok&&d.groups&&d.groups.length>1?`<div class="mp-chips hm-sec" id="hm-sec"><button type="button" data-g="" class="${sg?'':'on'}">Все</button>${d.groups.map(g=>`<button type="button" data-g="${esc(g.name)}" class="${sg&&sg.name===g.name?'on':''}">${esc(g.name)} <span class="${g.chg>0?'pos':g.chg<0?'neg':''}">${hmFmt(g.chg).replace(' %','%')}</span></button>`).join('')}</div>`:''}
+    ${sg?`<div class="hm-back"><button type="button" class="btn ghost" id="hm-all">← Все секторы</button><b>${esc(sg.name)}</b></div>`:''}
     ${st?`<div class="hm-st"><span>Растут: <b class="pos">${st.up}</b></span><span>Падают: <b class="neg">${st.down}</b></span><span>Без изм.: <b>${st.flat}</b></span><span>Оборот: <b>${short(st.turnover)} ₽</b></span><span>Взвешенное изменение: <b class="${st.wchg>0?'pos':st.wchg<0?'neg':''}">${hmFmt(st.wchg)}</b></span></div>`:''}
     ${f.err&&!ok?`<div class="msg err">${esc(f.err)} <button class="btn ghost" id="hm-r">Повторить</button></div>`:ok?'<div class="hm-wrap" id="hm-map"></div>':waitBox('Загружаю данные Мосбиржи…')}
     <div class="legend hm-leg">${leg.map(v=>`<span><i style="background:${hmColor(v,lim)}"></i>${v>0?'+':v<0?'−':''}${(+Math.abs(v).toFixed(1))}%</span>`).join('')}<span class="mu">цвет ограничен значением ±${lim}%${ok&&d.updated?' · обновлено '+new Date(d.updated*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}):''}</span></div></div></div>`;
 }
 function bindHm(){
-  const f=S.hm,pick=(id,attr,key)=>{const e=$(id);if(e)e.onclick=ev=>{const b=ev.target.closest('[data-'+attr+']');if(!b||b.dataset[attr]===f[key])return;f[key]=b.dataset[attr];f.d=null;f.err=null;render()}};
-  pick('#hm-kind','k','kind');pick('#hm-per','p','period');pick('#hm-sz','s','size');
+  const f=S.hm,pick=(id,attr,key)=>{const e=$(id);if(e)e.onclick=ev=>{const b=ev.target.closest('[data-'+attr+']');if(!b||b.dataset[attr]===f[key])return;f[key]=b.dataset[attr];if(key==='kind')f.sel='';f.d=null;f.err=null;render()}};
+  pick('#hm-kind','k','kind');
+  const sc=$('#hm-sec');if(sc)sc.onclick=ev=>{const b=ev.target.closest('[data-g]');if(!b||b.dataset.g===f.sel)return;f.sel=b.dataset.g;render()};
+  const ba=$('#hm-all');if(ba)ba.onclick=()=>{f.sel='';render()};pick('#hm-per','p','period');pick('#hm-sz','s','size');
   const r=$('#hm-r');if(r)r.onclick=()=>{f.err=null;render()};
   if(!window._hmTm){window._hmTm=setInterval(()=>{if(S.page==='hm'&&!document.hidden&&hmTrading())hmLoad()},60000)}
 }

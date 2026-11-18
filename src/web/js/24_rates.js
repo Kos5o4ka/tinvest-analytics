@@ -9,10 +9,12 @@ const RT_PRE=[1,2,3,5,10],RT_COL=['#2f6df6','#f59e0b','#8b5cf6','#e5484d','#0ea5
 const rtSave=()=>lsSet('ta_rates_terms',JSON.stringify({sel:S.rTerms,custom:S.rCustom}));
 const rtLab=t=>t<1?Math.round(t*12)+' мес':String(t).replace('.',',')+' г.';
 const rtColor=t=>RT_COL[S.rTerms.indexOf(t)%RT_COL.length];
+/* перерисовывать экран только если данные изменились: фоновые опросы «ещё грузится» не должны дёргать страницу */
+function rtChanged(a,b){if(!a||!b)return true;const k=o=>{const c=Object.assign({},o);delete c.loading;delete c.updated;return JSON.stringify(c)};return k(a)!==k(b)}
 function rtReload(){S.rates=null;rtSave();render()}
 function loadRates(){
   const d=S.ratesDays,tm=S.rTerms.join(',');
-  api('/api/rates?days='+d+'&terms='+tm).then(j=>{if(d!==S.ratesDays||tm!==S.rTerms.join(','))return;S.rates=j;if(S.page==='mkt')renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays&&tm===S.rTerms.join(','))loadRates()},3000)})
+  api('/api/rates?days='+d+'&terms='+tm).then(j=>{if(d!==S.ratesDays||tm!==S.rTerms.join(','))return;const ch=rtChanged(S.rates,j);S.rates=j;if(S.page==='mkt'&&ch)renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt'&&d===S.ratesDays&&tm===S.rTerms.join(','))loadRates()},3000)})
    .catch(e=>{S.rates={error:e.message,labels:[]};if(S.page==='mkt')renderSoon()});
 }
 document.addEventListener('click',e=>{
@@ -73,7 +75,7 @@ function stripHtml(r,i){return`<b>${r.labels[i]}</b><span>КС: <b>${pc1(r.key[i
 S.ratesX=null;
 function loadRatesX(force){
   if(S._rxL&&!force)return;S._rxL=1;
-  api('/api/rates/extra').then(j=>{S._rxL=0;S.ratesX=j;if(S.page==='mkt'){renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
+  api('/api/rates/extra').then(j=>{S._rxL=0;const ch=rtChanged(S.ratesX,j);S.ratesX=j;if(S.page==='mkt'){if(ch)renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
    .catch(e=>{S._rxL=0;S.ratesX={error:e.message}})
 }
 const RX_COL=['#ffdd2d','#3987e5','#19a070','#d95926','#9085e9'];
@@ -147,7 +149,7 @@ function curveCard(cv,its){
 
 /* ── Недельная инфляция (Росстат): текущий и прошлый год против средней 2017–2021 ── */
 S.infl=null;
-function loadInfl(){if(S._inflL)return;S._inflL=1;api('/api/inflation_weekly').then(j=>{S._inflL=0;S.infl=j;if(S.page==='mkt'){renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadInfl()},6000)}}).catch(e=>{S._inflL=0;S.infl={error:e.message,empty:true,years:{},avg:[]}})}
+function loadInfl(){if(S._inflL)return;S._inflL=1;api('/api/inflation_weekly').then(j=>{S._inflL=0;const ch=rtChanged(S.infl,j);S.infl=j;if(S.page==='mkt'){if(ch)renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadInfl()},6000)}}).catch(e=>{S._inflL=0;S.infl={error:e.message,empty:true,years:{},avg:[]}})}
 function inflWeekHtml(){
   if(!S.infl){loadInfl();return`<div class="card rates">${waitBox('Загружаю недельную инфляцию Росстата…')}</div>`}
   const x=S.infl,ys=Object.keys(x.years||{}).sort();

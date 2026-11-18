@@ -10,5 +10,7 @@ def bond_doc_links(isin, secid=None, inn=None):
     inn = inn if len(inn) in (10, 12) else ""
     q = inn or isin
     return {"inn": inn or None,
+            # СКРИН открывает страницу раскрытия эмитента прямо по ИНН; поиск e-disclosure по ссылке не заполняется (страница на JS)
+            "skrin": "https://disclosure.skrin.ru/disclosure/" + inn if inn else None,
             "edisclosure": "https://www.e-disclosure.ru/poisk-po-kompaniyam?query=" + urllib.parse.quote(q) if q else None,
             "moex": "https://www.moex.com/ru/issue.aspx?code=" + urllib.parse.quote(secid) if secid else None}

@@ -98,7 +98,7 @@ def rot_tr_floater(knots, T, spread, tax=True, period=0.25):
     v, t = 0.0, 0.0
     while t < T - 1e-9:
         e = min(t + period, T)
-        c = (rot_rate(knots, t) + spread) / 100.0 * (e - t)
+        c = max(0.0, rot_rate(knots, t) + spread) / 100.0 * (e - t)
         v += c * k * rot_growth(knots, e, T)
         t = e
     return ((1.0 + v) ** (1.0 / T) - 1.0) * 100.0
@@ -175,15 +175,16 @@ def rot_tr_fixed(knots, T, flows, price, accr0=0.0, betas=None, tax=True, y0=Non
     accT = rot_accr(flows, T)
     cleanT = max(0.0, dirtyT - accT)
     # НКД, уплаченный при покупке, уменьшает налоговую базу первого купона (НДФЛ — только с разницы)
-    cash, ded = 0.0, accr0
+    cash, ded, repaid = 0.0, accr0, 0.0
     for t, c, p in flows:
         if t > T + 1e-9:
             break
         base_c = max(0.0, c - ded)
         ded = max(0.0, ded - c)
         net_c = (c - ROT_TAX * base_c) if tax else c
+        repaid += p
         cash += (net_c + p) * rot_growth(knots, t, T)
-    gain_tax = ROT_TAX * max(0.0, cleanT - price) if tax else 0.0
+    gain_tax = ROT_TAX * max(0.0, cleanT + repaid - price) if tax else 0.0
     acc_net = (accT - ROT_TAX * max(0.0, accT - ded)) if tax else accT     # если купона до горизонта не было
     val = cleanT + acc_net + cash - gain_tax
     if val <= 0:
