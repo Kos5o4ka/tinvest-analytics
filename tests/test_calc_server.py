@@ -119,6 +119,24 @@ class Worker(unittest.TestCase):
         cw.CALCS.clear()
 
 
+class WorkerLocalFlows(unittest.TestCase):
+    """В воркере сервер данных выключен, но потоки денег берутся прямо из flows.sqlite той же функцией, что и сервер."""
+
+    def test_flows_from_local_db(self):
+        tmp = tempfile.mkdtemp(prefix="tcalc_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+
+        class Lib:
+            ds_parsed = staticmethod(lambda *a, **k: "orig")
+        cw._local_parsed(Lib, tmp)
+        got = Lib.ds_parsed("flows/summary", {"period": "day"})
+        self.assertEqual(got["period"], "day")                 # базы ещё нет -> пустая сводка, но не None
+        self.assertTrue(got.get("empty"))
+        self.assertIsNone(Lib.ds_parsed("flows/summary", {"period": "bad"}))   # неверный параметр -> None, без исключения
+        self.assertIsNone(Lib.ds_parsed("calc/fng"))           # остальное — как при выключенном сервере
+        self.assertIsNone(Lib.ds_parsed("disclosure/facts", {"isin": "RU000A104JQ3"}))
+
+
 class ClientFng(unittest.TestCase):
     def setUp(self):
         self.ds, self.kick = M.ds_parsed, M._fng_kick

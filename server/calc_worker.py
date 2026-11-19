@@ -35,7 +35,22 @@ def load_lib(path, data_dir):
     m = importlib.util.module_from_spec(spec)
     sys.modules["tinvest_analytics_lib"] = m
     spec.loader.exec_module(m)
+    _local_parsed(m, data_dir)
     return m
+
+
+def _local_parsed(lib, data_dir):
+    """Сервер данных в воркере выключен, но часть готовых данных лежит рядом: потоки денег (flows.sqlite от flows_worker.py)
+    нужны индексу страха и жадности (компонент «поток»). Отдаём их напрямую из базы той же функцией, что и сервер."""
+    sys.path.insert(0, HERE)
+    import tinvest_server
+
+    def ds_parsed(name, params=None, timeout=20):
+        if not name.startswith("flows/"):
+            return None
+        code, obj = tinvest_server.flows_query(data_dir, name, {k: [str(v)] for k, v in (params or {}).items()})
+        return obj.get("data") if code == 200 and obj.get("ok") else None
+    lib.ds_parsed = ds_parsed
 
 
 def register_calcs(lib):
