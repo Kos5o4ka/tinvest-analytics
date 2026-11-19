@@ -24,6 +24,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("calc")
 CALCS = {}                       # имя -> (функция, период пересчёта, с); заполняется в register_calcs()
+PROGRESS = {}                    # имя -> функция без аргументов -> строка о ходе расчёта (для журнала раз в минуту)
+PROGRESS_EVERY = 60
 
 
 def load_lib(path, data_dir):
@@ -54,7 +56,10 @@ def _local_parsed(lib, data_dir):
 
 
 def register_calcs(lib):
-    CALCS["fng"] = (lib.fng_compute, 900)            # индекс страха и жадности, ~4 минуты на холодном кэше
+    CALCS["fng"] = (lib.fng_compute, 900)            # индекс страха и жадности: первый расчёт — ~2 000 запросов к ISS (десятки минут на VPS)
+    st = getattr(lib, "_fng", None)
+    if isinstance(st, dict):
+        PROGRESS["fng"] = lambda: "этап «%s», дней с закрытиями %s из %s" % (st.get("phase") or "—", st.get("have", 0), st.get("need", 0))
     # шаг 2: CALCS["inflation"] = (lib.weekly_inflation, 3600)
 
 
@@ -74,12 +79,39 @@ def write_result(data_dir, name, data, now=None):
     return path
 
 
-def run_calc(data_dir, name, fn):
-    """Один расчёт -> True/False. Ошибка не трогает прежний файл."""
+def run_calc(data_dir, name, fn, stop=None, progress=None):
+    """Один расчёт -> True/False; None — остановлен по сигналу (прогресс расчёта остаётся в кэше calc_home).
+    Ошибка не трогает прежний файл. Со `stop` расчёт идёт в фоновом потоке: процесс сразу реагирует на SIGTERM
+    и раз в PROGRESS_EVERY секунд пишет в журнал, как идёт расчёт (первый расчёт на VPS бывает долгим)."""
     t0 = time.time()
+    box = {}
+
+    def work():
+        try:
+            box["data"] = fn()
+        except Exception as e:  # noqa: BLE001
+            box["err"] = e
+    if stop is None:
+        work()
+    else:
+        th = threading.Thread(target=work, name="calc-" + name, daemon=True)
+        th.start()
+        while th.is_alive():
+            if stop.wait(PROGRESS_EVERY):
+                log.info("%s: остановка во время расчёта (%.0f с); скачанное сохранено в кэше, продолжится после запуска",
+                         name, time.time() - t0)
+                return None
+            if th.is_alive():
+                try:
+                    msg = progress() if progress else ""
+                except Exception:  # noqa: BLE001
+                    msg = ""
+                log.info("%s: считаю %.0f с%s", name, time.time() - t0, (": " + msg) if msg else "")
+    if "err" in box:
+        log.warning("%s: расчёт не удался, прежний результат сохранён: %s", name, box["err"])
+        return False
     try:
-        data = fn()
-        write_result(data_dir, name, data)
+        write_result(data_dir, name, box.get("data"))
     except Exception as e:  # noqa: BLE001
         log.warning("%s: расчёт не удался, прежний результат сохранён: %s", name, e)
         return False
@@ -96,7 +128,8 @@ def loop(data_dir, calcs, stop, once=False):
             if not once and time.time() - last.get(name, 0) < every:
                 continue
             last[name] = time.time()
-            run_calc(data_dir, name, fn)
+            if run_calc(data_dir, name, fn, stop, PROGRESS.get(name)) is None:
+                return
         if once:
             return
         stop.wait(10)

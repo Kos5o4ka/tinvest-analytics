@@ -119,6 +119,55 @@ class Worker(unittest.TestCase):
         cw.CALCS.clear()
 
 
+class WorkerStopAndProgress(unittest.TestCase):
+    """Долгий расчёт: воркер пишет ход расчёта в журнал и сразу останавливается по сигналу (systemd не ждёт 90 с)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tcalc_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.old = cw.PROGRESS_EVERY
+        cw.PROGRESS_EVERY = 0.05
+        self.addCleanup(setattr, cw, "PROGRESS_EVERY", self.old)
+
+    def test_stop_during_long_calc(self):
+        import threading
+        import time as _t
+        stop, release = threading.Event(), threading.Event()
+
+        def slow():
+            release.wait(5)
+            return {"a": 1}
+        threading.Timer(0.15, stop.set).start()
+        t0 = _t.time()
+        with self.assertLogs("calc", level="INFO") as lg:
+            res = cw.run_calc(self.tmp, "x", slow, stop, lambda: "дней 3 из 10")
+        release.set()
+        self.assertIsNone(res)
+        self.assertLess(_t.time() - t0, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "calc", "x.json")))
+        self.assertTrue(any("дней 3 из 10" in m for m in lg.output))
+        self.assertTrue(any("остановка" in m for m in lg.output))
+
+    def test_threaded_success_and_error(self):
+        import threading
+        stop = threading.Event()
+        self.assertTrue(cw.run_calc(self.tmp, "x", lambda: {"a": 2}, stop))
+        with open(os.path.join(self.tmp, "calc", "x.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["data"], {"a": 2})
+
+        def boom():
+            raise RuntimeError("нет сети")
+        self.assertFalse(cw.run_calc(self.tmp, "x", boom, stop))
+        with open(os.path.join(self.tmp, "calc", "x.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["data"], {"a": 2})
+
+    def test_loop_returns_on_stop(self):
+        import threading
+        stop = threading.Event()
+        threading.Timer(0.1, stop.set).start()
+        cw.loop(self.tmp, {"x": (lambda: __import__("time").sleep(3) or {}, 900)}, stop)   # не ждёт 3 с
+
+
 class WorkerLocalFlows(unittest.TestCase):
     """В воркере сервер данных выключен, но потоки денег берутся прямо из flows.sqlite той же функцией, что и сервер."""
 
