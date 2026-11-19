@@ -306,7 +306,8 @@ API_GET["/api/movers"] = _api_movers
 
 # ── первичные размещения (по объявлениям Мосбиржи; сводка investmint.ru) ──
 
-_pri = {"t": 0, "rows": []}
+_pri = {"t": 0, "rows": [], "err_t": 0, "err": ""}
+PRI_ERR_TTL = 1800      # после отказа investmint не спрашиваем его снова полчаса (сайт закрыл доступ программам — HTTP 403)
 
 
 # ВАЖНО: placements_parse (и _strip) дублируются в server/tinvest_server.py (эндпоинт /v1/parsed/investmint/placements).
@@ -339,12 +340,23 @@ def placements_parse(s):
 
 
 def primary_rows():
-    if time.time() - _pri["t"] < 1800 and _pri["rows"]:
+    """Календарь будущих размещений (investmint). Ошибка источника -> исключение, но не чаще раза в PRI_ERR_TTL: в промежутке
+    повторно бросаем запомненную ошибку, не обращаясь к сайту (вызывающие показывают её или работают без календаря)."""
+    now = time.time()
+    if now - _pri["t"] < 1800 and _pri["rows"]:
         return _pri["rows"]
-    rows = ds_parsed("investmint/placements", timeout=40)       # разбор на сервере данных; None -> разбираем сами
-    if not (isinstance(rows, list) and rows and all(isinstance(r, dict) and r.get("start") for r in rows)):
-        rows = placements_parse(http_text("https://investmint.ru/bond-placements/", timeout=40))
-    _pri.update(t=time.time(), rows=rows)
+    if now - _pri["err_t"] < PRI_ERR_TTL and _pri["err"]:
+        raise ApiError(_pri["err"], 502)
+    try:
+        rows = ds_parsed("investmint/placements", timeout=40)       # разбор на сервере данных; None -> разбираем сами
+        if not (isinstance(rows, list) and rows and all(isinstance(r, dict) and r.get("start") for r in rows)):
+            rows = placements_parse(http_text("https://investmint.ru/bond-placements/", timeout=40))
+    except Exception as e:  # noqa: BLE001
+        code = getattr(e, "code", None)
+        _pri.update(err_t=now, err=("investmint.ru закрыл доступ для программ (HTTP %d)" % code) if code in (401, 403, 429)
+                    else "investmint.ru не ответил: %s" % (str(e)[:120] or type(e).__name__))
+        raise ApiError(_pri["err"], 502)
+    _pri.update(t=now, rows=rows, err_t=0, err="")
     return rows
 
 
@@ -432,7 +444,11 @@ def primary_nip_for(row, screener=None, rusfar=None, freeze_days=4):
 
 
 def primary_payload():
-    rows = primary_rows()
+    cal_error = None
+    try:
+        rows = primary_rows()
+    except Exception as e:  # noqa: BLE001
+        rows, cal_error = [], str(e)[:200]      # без календаря экран всё равно показывает размещения Мосбиржи и калькулятор
     scr = _scr.get("rows") or []
     rusfar = None
     try:
@@ -463,7 +479,7 @@ def primary_payload():
         primary_snapshot(out_rows)
     except Exception:  # noqa: BLE001
         pass
-    return {"rows": out_rows, "updated": _pri["t"], "rusfar": rusfar, "peer_medians": peer_med}
+    return {"rows": out_rows, "updated": _pri["t"], "rusfar": rusfar, "peer_medians": peer_med, "cal_error": cal_error}
 
 
 

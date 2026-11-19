@@ -47,13 +47,15 @@ function pPri(){
   if(!d){loadPri();return`<div class="card">${waitBox('Загружаю календарь первичных размещений…')}</div>`}
   if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="pri-r">Повторить</button></div>`;
   const today=new Date().toISOString().slice(0,10),rows=d.rows;
+  // календарь будущих размещений недоступен (investmint закрыл доступ программам): остальное на экране работает по данным Мосбиржи
+  const calNote=d.cal_error?`<div class="msg" style="margin-top:16px">Календарь будущих размещений сейчас недоступен: ${esc(d.cal_error)}. Размещения, которые уже идут на Мосбирже, показаны выше; калькулятор премии работает.</div>`:'';
   const wk=new Date(Date.now()+7*864e5).toISOString().slice(0,10);
   const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${isinTxt(r.isin)}</small>`:''}</td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
     <td class="l">${priNipCell(r.nip)}</td>
     <td class="num">${ddm(r.start)}${r.start===today?'<br><small class="pos">сегодня</small>':''}</td><td class="num">${esc(r.end.replace(' г.',''))}</td>
     <td class="l">${esc(r.book)}</td><td class="l">${r.link?`<a class="blue-link" href="${esc(r.link)}" target="_blank" rel="noopener">объявление Мосбиржи ↗</a>`:''}</td></tr>`).join('');
-  return priVolHtml()+`<div class="g g4" style="margin-top:16px">${kpi('Размещений в списке',rows.length,'объявлено Мосбиржей')}${kpi('Сегодня',rows.filter(r=>r.start===today).length,'плановое начало размещения')}
+  return priVolHtml()+calNote+`<div class="g g4" style="margin-top:16px">${kpi('Размещений в списке',rows.length,'объявлено Мосбиржей')}${kpi('Сегодня',rows.filter(r=>r.start===today).length,'плановое начало размещения')}
     ${kpi('На этой неделе',rows.filter(r=>r.start>=today&&r.start<=wk).length,'начало в ближайшие 7 дней')}${kpi('С рейтингом',rows.filter(r=>r.rating).length,'эмитент найден в базе рейтингов')}</div>
   ${priNipCalcHtml(d)}
   <div class="card" style="padding:12px 10px 6px;margin-top:16px"><div class="row" style="padding:0 6px 10px"><b>Календарь первичных размещений</b><button class="btn ghost" id="pri-r" style="margin-left:auto">Обновить</button></div>

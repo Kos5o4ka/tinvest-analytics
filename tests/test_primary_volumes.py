@@ -180,3 +180,29 @@ class LivePrimaryVolumes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrimaryCalendarUnavailable(unittest.TestCase):
+    """investmint закрыл доступ программам (403): экран «Первичка» не падает, календарь пуст с пояснением, сайт не долбим повторно."""
+
+    def test_403_is_soft_and_cached(self):
+        import urllib.error
+        calls = []
+
+        def boom(url, timeout=25):
+            if "investmint" in url:
+                calls.append(url)
+            raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+        saved = (M.http_text, M.ds_parsed, dict(M._pri))
+        try:
+            M.http_text, M.ds_parsed = boom, (lambda *a, **k: None)
+            M._pri.update(t=0, rows=[], err_t=0, err="")
+            p = M.primary_payload()
+            self.assertEqual(p["rows"], [])
+            self.assertIn("403", p["cal_error"])
+            M.primary_payload()                              # второй вызов — из запомненной ошибки, без запроса к сайту
+            self.assertEqual(len(calls), 1)
+        finally:
+            M.http_text, M.ds_parsed = saved[0], saved[1]
+            M._pri.clear()
+            M._pri.update(saved[2])
