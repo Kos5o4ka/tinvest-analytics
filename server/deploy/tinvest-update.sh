@@ -26,6 +26,9 @@ restart() {   # $1 — сервис; вместе с сервером данны
     if [ "$1" = tinvest-server ] && systemctl is-enabled --quiet tinvest-flows 2>/dev/null; then
         systemctl restart tinvest-flows
     fi
+    if [ "$1" = tinvest-server ] && systemctl is-enabled --quiet tinvest-calc 2>/dev/null; then
+        systemctl restart tinvest-calc
+    fi
 }
 
 update() {    # $1 — каталог, $2 — сервис, $3 — файл, который должен компилироваться

@@ -220,6 +220,27 @@ def disclosure_query(data_dir, name, params):
 
 
 # ───────────────────────── потоки денег (база flows.sqlite от flows_worker.py) и живой стакан ─────────────────────────
+CALC_NAME_RX = re.compile(r"^[a-z0-9_]+$")
+CALC_MAX_AGE = 3600          # результат тяжёлого расчёта старше часа клиентам не отдаём: пусть считают у себя
+
+
+def calc_query(data_dir, name, now):
+    """/v1/parsed/calc/<имя>: готовый результат расчёта из calc_worker.py (<data>/calc/<имя>.json = {"t", "data"}).
+    Нет файла, неверное имя или результат старше CALC_MAX_AGE -> 404 (клиент считает сам)."""
+    nm = name[len("calc/"):]
+    if not CALC_NAME_RX.match(nm):
+        return 404, {"ok": False, "error": "unknown calc"}
+    try:
+        with open(os.path.join(data_dir, "calc", nm + ".json"), "r", encoding="utf-8") as f:
+            j = json.load(f)
+        t, data = float(j["t"]), j["data"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return 404, {"ok": False, "error": "no result"}
+    if now - t > CALC_MAX_AGE:
+        return 404, {"ok": False, "error": "stale"}
+    return 200, {"ok": True, "v": PARSED_V, "data": data, "t": t}
+
+
 def flows_query(data_dir, name, params):
     """/v1/parsed/flows/{summary,instrument,large,spikes,instruments,status} -> (http-код, json). Только чтение, без кэша."""
     try:
@@ -906,6 +927,8 @@ class DataServer:
             return disclosure_query(self.data_dir, name, params)
         if name.startswith("flows/"):
             return flows_query(self.data_dir, name, params)
+        if name.startswith("calc/"):
+            return calc_query(self.data_dir, name, self.clock())
         if name.startswith("md/"):
             return md_query(self, name, params)
         mk = PARSERS.get(name)

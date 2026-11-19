@@ -275,6 +275,22 @@ keys(key_hash TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, created REAL NOT NULL, e
 
 Проверка доступа вынесена в функцию `authorize_ex()` / `authorize()` в `tinvest_server.py`.
 
+## Серверные расчёты (индекс страха и жадности): `calc_worker.py`
+
+Тяжёлые расчёты по публичным данным (сейчас — индекс страха и жадности, ~4 минуты на холодном кэше) считаются на сервере один раз, клиенты
+забирают готовый JSON, а при недоступности сервера считают у себя, как раньше. Токен T-Invest не нужен. Установка:
+
+```sh
+sudo cp server/deploy/tinvest-calc.service /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl enable --now tinvest-calc
+```
+
+Воркер (`python3 server/calc_worker.py --data DIR [--only fng] [--once]`) импортирует собранный `tinvest_analytics.py` из клона репозитория
+(сервер данных у него выключен, кэш в `<data>/calc_home`), раз в ~15 минут пересчитывает расчёты из реестра и атомарно пишет
+`<data>/calc/<имя>.json` = `{"t", "data"}`; при ошибке остаётся прежний файл. Чтение: `/v1/parsed/calc/<имя>` (имя `[a-z0-9_]+`); результат
+старше часа и неизвестное имя дают 404 (клиент считает сам). Новый расчёт — одна строка в `register_calcs()`. `tinvest-update.sh`
+перезапускает `tinvest-calc` вместе с сервером, если юнит включён.
+
 ## Потоки денег и стакан («Кто покупает»): `flows_worker.py`, `tinvest_md.py`
 
 Экран «Кто покупает»: куда идут деньги (акции / облигации / фонды / сектора), крупные сделки, всплески объёма и стакан.

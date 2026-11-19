@@ -14,6 +14,7 @@ FNG_CL_KEY = "fng_cl1:"          # закрытия TQBR за день: {secid: 
 FNG_SP_KEY = "fng_sp1"           # спред ВДО к КБД по дням: {дата: п.п.}
 FNG_FL_KEY = "fng_fl1"           # поток «акции минус фонды денежного рынка» по дням
 FNG_TTL = 1800
+FNG_SRV_TTL = 300                # сколько держим в памяти готовый ответ сервера данных
 FNG_COMPS = [
     ("mom", "Моментум", False), ("breadth", "Ширина рынка", False), ("hl", "Новые максимумы и минимумы", False),
     ("vol", "Волатильность", True), ("safe", "Спрос на защитные активы", True), ("spread", "Спрос на риск в долге", True),
@@ -427,7 +428,38 @@ def _fng_kick(force=False):
     threading.Thread(target=_fng_run, daemon=True).start()
 
 
+def fng_compute():
+    """Синхронный расчёт индекса целиком (для серверного воркера calc_worker.py): готовый словарь без флагов загрузки.
+    Бросает исключение, если расчёт не удался. Внутри — тот же _fng_run, что и в фоновом потоке клиента."""
+    with _fng_lock:
+        _fng["running"] = True
+    _fng["err"] = None
+    _fng_run()
+    with _fng_lock:
+        res, err = _fng["res"], _fng["err"]
+    if err or not res:
+        raise RuntimeError(err or "нет результата")
+    return dict(res)
+
+
+def _fng_server(force):
+    """Готовый индекс с сервера данных (calc/fng) либо None. Ответ держим в памяти FNG_SRV_TTL, чтобы опрос интерфейса не нагружал сервер."""
+    if not force:
+        hit = mem_get("fng_srv", FNG_SRV_TTL)
+        if hit is not None:
+            return hit
+    j = ds_parsed("calc/fng")
+    if not isinstance(j, dict) or j.get("value") is None:
+        return None
+    return mem_put("fng_srv", j)
+
+
 def fng_payload(force=False):
+    srv = _fng_server(force)
+    if srv is not None:
+        out = dict(srv)
+        out.update(loading=False, progress={"have": 1, "need": 1, "phase": ""}, error=None, source="server")
+        return out
     _fng_kick(force)
     with _fng_lock:
         res, running, err = _fng["res"], _fng["running"], _fng["err"]
