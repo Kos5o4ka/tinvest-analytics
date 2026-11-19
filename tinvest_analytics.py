@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "TAnalytic"
-APP_VERSION = "0.23"
+APP_VERSION = "0.24"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -16173,6 +16173,239 @@ API_GET["/api/localdata"] = ld_info_get
 API_POST["/api/localdata/open"] = ld_open_post
 API_POST["/api/localdata/clear"] = ld_clear_post
 API_POST["/api/localdata/wipe"] = ld_wipe_post
+# ═══════════════ помощь в сборе раскрытий эмитентов (по желанию пользователя) ═══════════════
+# Сервер данных не может открыть e-disclosure.azipi.ru (сайт блокирует его адрес), а у пользователей в России страницы открываются.
+# Если пользователь включил «Помогать собирать раскрытия» (по умолчанию выключено), то ПОКА ПРОГРАММА ЗАПУЩЕНА фоновый поток
+# берёт у сервера данных задания (адреса страниц azipi), скачивает каждую страницу НАПРЯМУЮ со своего интернет-подключения
+# (не через сервер данных и не через ext_open: сервер до azipi не дотянется) и отправляет серверу. Личных данных в запросах нет.
+# Вежливость: не чаще одного запроса к azipi раз в CROWD_PACE секунд, после любой ошибки azipi пауза CROWD_BACKOFF, нет заданий
+# или сервер недоступен — повторный опрос через несколько минут. Адрес задания проверяется здесь же (только две формы страниц azipi):
+# даже скомпрометированный сервер не сможет заставить приложение ходить на другие сайты.
+
+CROWD_PACE = 15.0
+CROWD_BACKOFF = 1800.0
+CROWD_IDLE = 120.0
+CROWD_MAX_BODY = 2 * 1024 * 1024
+CROWD_AZIPI = "https://e-disclosure.azipi.ru/"
+CROWD_UA = "Mozilla/5.0 (compatible; TAnalytic-crowd/%s; +https://github.com/Kos5o4ka/tinvest-analytics)"
+_CROWD_FEED = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/list/day-(\d{2}\.\d{2}\.\d{4})/\?MESSAGE_BY_DAY=\1&PAGEN_2=\d{1,3}$")
+_CROWD_MSG = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/\d{1,10}/$")
+_CROWD_BAD = ("captcha", "just a moment", "access denied", "attention required", "ddos")
+DEFAULT_CONFIG.setdefault("crowd_enabled", False)
+DEFAULT_CONFIG.setdefault("crowd_dismissed", False)
+
+
+def crowd_url_ok(url):
+    return isinstance(url, str) and len(url) < 200 and bool(_CROWD_FEED.match(url) or _CROWD_MSG.match(url))
+
+
+def crowd_srv_call(method, path, payload=None, timeout=25):
+    """Запрос к серверу данных (только он): -> (код, dict). Исключение при сетевой ошибке. Не использует ext_open."""
+    srv, key = ds_conf()
+    hd = {"User-Agent": EXT_UA["User-Agent"], "X-Client-Key": key}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        hd["Content-Type"] = "application/json"
+    req = urllib.request.Request(srv + path, data=data, headers=hd, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+            code, raw = r.status, r.read(1 << 20)
+    except urllib.error.HTTPError as e:
+        code, raw = e.code, e.read(1 << 20)
+    try:
+        j = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        j = None
+    return code, (j if isinstance(j, dict) else {})
+
+
+def crowd_azipi_get(url, timeout=30):
+    """Страница azipi НАПРЯМУЮ (общий SSL-контекст приложения, без сервера данных) -> (статус, байты, content-type).
+    Статусы 4xx/5xx возвращаются как есть; сетевые ошибки — исключением."""
+    req = urllib.request.Request(url, headers={"User-Agent": CROWD_UA % APP_VERSION, "Accept-Encoding": "identity", "Accept-Language": "ru"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+            if not r.geturl().startswith(CROWD_AZIPI):          # редирект на чужой сайт не принимаем
+                return 0, b"", ""
+            body = r.read(CROWD_MAX_BODY + 1)
+            return r.status, body, r.headers.get("Content-Type") or ""
+    except urllib.error.HTTPError as e:
+        return e.code, b"", ""
+
+
+class CrowdHelper:
+    """Фоновый помощник. step() делает не более одного действия и возвращает, сколько секунд подождать до следующего; все внешние вещи подставляемы (тесты)."""
+
+    def __init__(self, conf=None, srv=None, azipi=None, clock=time.time, stats=None, pace=None):
+        self.conf = conf or (lambda: (bool(load_config().get("crowd_enabled")),) + tuple(ds_conf()))
+        self.srv = srv or crowd_srv_call
+        self.azipi = azipi or crowd_azipi_get
+        self.clock = clock
+        self.pace = CROWD_PACE if pace is None else pace
+        self.stats = stats if stats is not None else _CrowdStats()
+        self.queue, self.last_req, self.idle_until, self.backoff_until = [], 0.0, 0.0, 0.0
+        self.state, self.msg, self.bad = "off", "", 0
+
+    def _idle(self, sec, state, msg=""):
+        self.idle_until = self.clock() + sec
+        self.queue = []
+        self.state, self.msg = state, msg
+        return sec
+
+    def _backoff(self, msg):
+        self.queue = []
+        self.backoff_until = self.clock() + CROWD_BACKOFF
+        self.state, self.msg = "backoff", msg
+        self.stats.add(errors=1)
+        return CROWD_BACKOFF
+
+    def _tasks(self):
+        try:
+            code, j = self.srv("GET", "/v1/crowd/task?n=2")
+        except Exception as e:  # noqa: BLE001
+            return self._idle(600, "no_server", "нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
+        if code in (401, 403):
+            return self._idle(1800, "no_server", "сервер не принял ключ")
+        if code == 404 or code == 405:
+            return self._idle(3600, "no_server", "сервер не поддерживает сбор страниц")
+        if code != 200 or not j.get("ok"):
+            return self._idle(600, "no_server", "сервер ответил %d" % code)
+        self.queue = [t for t in (j.get("tasks") or []) if isinstance(t, dict) and isinstance(t.get("id"), int) and crowd_url_ok(t.get("url"))][:5]
+        self.stats.add(queue=int(j.get("queue") or 0))
+        if not self.queue:
+            return self._idle(CROWD_IDLE, "idle", "заданий пока нет")
+        self.state, self.msg = "working", ""
+        return 0.0
+
+    def step(self):
+        now = self.clock()
+        enabled, srv, key = self.conf()
+        if not enabled:
+            self.queue, self.state, self.msg = [], "off", ""
+            return 30.0
+        if not srv or not key:
+            self.queue, self.state, self.msg = [], "no_server", "сервер данных выключен или нужен вход по ключу"
+            return CROWD_IDLE
+        if now < self.backoff_until:
+            self.state = "backoff"
+            return min(self.backoff_until - now, 60.0)
+        if not self.queue:
+            if now < self.idle_until:
+                return min(self.idle_until - now, 60.0)
+            r = self._tasks()
+            if r:
+                return min(r, 60.0)
+        wait = self.last_req + self.pace - now
+        if wait > 0:
+            return wait
+        task = self.queue.pop(0)
+        url = task["url"]
+        self.last_req = now
+        try:
+            status, body, ctype = self.azipi(url)
+        except Exception as e:  # noqa: BLE001
+            return self._backoff("azipi не отвечает: %s" % (getattr(e, "reason", None) or type(e).__name__))
+        if status in (404, 410):
+            payload = {"id": task["id"], "url": url, "status": status, "body_b64": "", "ctype": ""}
+        elif status == 200 and len(body) <= CROWD_MAX_BODY:
+            low = body[:200000].decode("utf-8", "ignore").lower()
+            if any(b in low for b in _CROWD_BAD):
+                return self._backoff("azipi показал проверку (captcha)")
+            self.stats.add(fetched=1)
+            payload = {"id": task["id"], "url": url, "status": 200, "body_b64": base64.b64encode(gzip.compress(body, 6, mtime=0)).decode("ascii"),
+                       "ctype": ctype[:100]}
+        else:
+            return self._backoff("azipi ответил %s" % (status or "ошибкой"))
+        try:
+            code, j = self.srv("POST", "/v1/crowd/submit", payload)
+        except Exception as e:  # noqa: BLE001
+            return self._idle(600, "no_server", "нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
+        if code == 429:
+            return self._idle(max(5.0, min(float(j.get("retry_after") or 30), 3600.0)), "idle", "сервер просит подождать")
+        if code == 200 and j.get("accepted"):
+            self.bad = 0
+            self.stats.add(accepted=1, last=now)
+        elif code == 422:                                   # сервер не принял страницу (чужая/ошибочная): не долбим azipi вхолостую
+            self.bad += 1
+            if self.bad >= 3:
+                self.bad = 0
+                return self._backoff("сервер трижды не принял страницу")
+        self.state = "working" if self.queue else "idle"
+        return self.pace
+
+
+class _CrowdStats:
+    """Счётчики в базе приложения (kv 'crowd_stats'): accepted — сколько страниц принято сервером за всё время."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def get(self):
+        try:
+            return dict(store().get("crowd_stats") or {})
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def add(self, **kw):
+        with self.lock:
+            s = self.get()
+            for k, v in kw.items():
+                s[k] = v if k in ("last", "queue") else s.get(k, 0) + v
+            try:
+                store().put("crowd_stats", s)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+_crowd = [None]
+
+
+def crowd_helper():
+    if _crowd[0] is None:
+        _crowd[0] = CrowdHelper()
+    return _crowd[0]
+
+
+def _crowd_loop():
+    h = crowd_helper()
+    while True:
+        try:
+            d = h.step()
+        except Exception as e:  # noqa: BLE001
+            h.state, h.msg, d = "idle", "ошибка: %s" % type(e).__name__, 120.0
+        time.sleep(max(0.5, min(d, 30.0)))
+
+
+def crowd_start():
+    threading.Thread(target=_crowd_loop, daemon=True, name="crowd").start()
+
+
+def api_crowd_status(cfg, acc, q, force):
+    h, srv_key = crowd_helper(), ds_conf()
+    st = h.stats.get()
+    return {"enabled": bool(cfg.get("crowd_enabled")), "dismissed": bool(cfg.get("crowd_dismissed")), "state": h.state, "message": h.msg,
+            "available": bool(srv_key[0] and srv_key[1]), "accepted": int(st.get("accepted", 0)), "fetched": int(st.get("fetched", 0)),
+            "errors": int(st.get("errors", 0)), "last": st.get("last"), "queue": int(st.get("queue", 0)),
+            "backoff_in": max(0, int(h.backoff_until - time.time())), "pace": h.pace}
+
+
+def api_crowd_settings(cfg, body):
+    if "enabled" in body:
+        cfg["crowd_enabled"] = bool(body["enabled"])
+        if cfg["crowd_enabled"]:
+            cfg["crowd_dismissed"] = True
+    if "dismissed" in body:
+        cfg["crowd_dismissed"] = bool(body["dismissed"])
+    save_config(cfg)
+    h = crowd_helper()
+    h.idle_until = 0.0
+    return {"ok": True}
+
+
+API_GET["/api/crowd/status"] = api_crowd_status
+API_POST["/api/crowd/settings"] = api_crowd_settings
+STARTUP_HOOKS.append(crowd_start)
 # ═══════════════════════════════ «Сегодня»: дневная сводка на «Обзоре» ═══════════════════════════════
 # Выплаты на 7 дней, ближайшие оферты, рейтинговые действия за неделю и число тревог мониторинга.
 # Чистые функции (td_*) не ходят в сеть; сеть и кэши трогает только td_build/today_get. Кэш 10 минут.
@@ -25412,7 +25645,7 @@ async function renderSettings(){
   ${setSec('set-conn','Подключение к Т-Инвестициям','',conn)}
   ${setSec('set-acc','Аккаунт и доступ','вход по ключу и Telegram',setAccHtml()+setTgHtml(c))}
   ${setSec('set-look','Внешний вид и меню','',look)}
-  ${setSec('set-calc','Данные и расчёты','',calc)}
+  ${setSec('set-calc','Данные и расчёты','',calc+setCrowdHtml(c))}
   ${setSec('set-local','Данные на компьютере','хранение, копии, очистка',setLocalHtml(c)+setBackupHtml(c))}
   ${setSec('set-adv','','',adv)}
   ${setSec('set-news','Что нового и планы','',`<div class="card" id="whatsnew"><h2>Что нового<span class="sp">версия ${esc(c.version||'')}</span></h2>${changelogHtml()}</div>
@@ -25431,6 +25664,7 @@ async function renderSettings(){
   try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
+  try{bindSetCrowd(c,msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
   const body=()=>({token:$('#tok').value,sandbox:$('#sb').checked,verify_ssl:$('#vs').checked,ca_file:$('#ca').value,
     hosts_prod:$('#hp').value.split('\n'),hosts_sandbox:$('#hs').value.split('\n')});
@@ -25779,6 +26013,7 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+ ['0.24','19.11.2026',['<b>Помощь в сборе раскрытий эмитентов</b> (по желанию, выключено по умолчанию): пока программа открыта, она раз в 15 секунд скачивает со своего подключения публичные страницы e-disclosure.azipi.ru и отправляет их на сервер данных, который не может открыть этот сайт сам. Так купоны, выкупы и дефолты видны всем пользователям. Личные данные не передаются; включить можно в «Настройках»']],
  ['0.23','19.11.2026',['<b>Импорт отчётов ВТБ</b> теперь загружается из интерфейса: показывается карточка отчёта со сверкой и кнопка «Импортировать» (в 0.22 экран импорта падал на отчёте ВТБ)','Сервер данных: расчёт индекса страха и жадности пишет ход в журнал и корректно останавливается']],
  ['0.22','19.11.2026',['<b>Исправлено отключение сервера данных</b>: бегущая строка (курс BTC) отключала сервер почти постоянно — из-за этого не работали раскрытия эмитентов, «Кто покупает», первичка и мультипликаторы с сервера','<b>Импорт отчётов Т-Инвестиций</b>: сделки РЕПО больше не считаются покупками и продажами, учитываются купоны, погашения, амортизация, дивиденды, пополнения, выводы, налоги; несколько отчётов (например, за 2025 и 2026 год) объединяются в один счёт — кнопка «Добавить к портфелю»','<b>Импорт отчётов ВТБ</b>: сделки, купоны, дивиденды, погашения, пополнения и выводы, объединение нескольких периодов','<b>Сплиты и консолидации</b> по данным Мосбиржи: количество и цена покупки пересчитываются, срок владения сохраняется','Импорт сверяется с остатками денег и бумаг из самого отчёта — результат сверки виден до загрузки','Оптимизатор тарифа: актуальные тарифы Т-Инвестиций («Трейдер» 390 ₽, Premium 2 990 ₽)','Карточка облигации: без сообщений эмитента объём показывается как текущий по Мосбирже (после выкупов на офертах он меньше первоначального); кнопка e-disclosure копирует ИНН для поиска','Индекс страха и жадности может считаться на сервере данных — открывается сразу']],
  ['0.21','19.11.2026',['<b>Windows</b>: исправлена ошибка CERTIFICATE_VERIFY_FAILED при запуске и загрузке данных — на Windows нужно один раз скачать новый TAnalytic-win.exe','Сводка в Telegram: амортизация и другие типы выплат подписаны по-русски']],
@@ -26012,8 +26247,9 @@ function bcOutLine(o){
 function bcDisclosure(dc){
   if(!dc)return'';
   const o=bcOutLine(dc.outstanding),fs=dc.facts||[];
-  if(!o&&!fs.length)return'';
-  let h=`<div class="card bc-sec"><h2>Раскрытие эмитента<span class="sp">сообщения на e-disclosure, разбор сервера данных</span></h2>${o}`;
+  const inv=typeof crowdInviteHtml==='function'?crowdInviteHtml():'';
+  if(!o&&!fs.length&&!inv)return'';
+  let h=`<div class="card bc-sec"><h2>Раскрытие эмитента<span class="sp">сообщения на e-disclosure, разбор сервера данных</span></h2>${inv}${o}`;
   if(fs.length)h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Данные</th><th></th></tr></thead><tbody>`
     +fs.map(f=>`<tr><td class="l">${f.date?ddm(f.date):'—'}</td><td class="l">${esc(BC_DISC_KIND[f.kind]||f.label||f.kind)}</td><td class="l">${esc(f.text||'')}</td><td>${f.url?`<a href="${esc(f.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`).join('')+`</tbody></table></div>`;
   else h+=`<div class="mu" style="font-size:13px">Раскрытий по выпуску пока нет (сервер данных не подключён или сообщений не найдено).</div>`;
@@ -30770,6 +31006,36 @@ function bindPm(){
 }
 regPage('pm',{title:'Разбор сделок',group:'Портфель',icon:'<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',render:pPm,bind:bindPm});
 if(typeof renderNav==='function')try{renderNav()}catch(e){}
+/* ── Помощь в сборе раскрытий эмитентов (по желанию, по умолчанию выключено) ── */
+const CROWD={st:null};
+function crowdLoad(){return api('/api/crowd/status').then(s=>{CROWD.st=s;return s}).catch(()=>null)}
+setTimeout(crowdLoad,3000);
+const CROWD_STATE={off:'выключено',idle:'ждёт заданий',working:'работает',backoff:'пауза после ошибки сайта',no_server:'нет связи с сервером данных'};
+function setCrowdHtml(c){
+  return`<div class="card" id="crowd-card"><h2>Помогать собирать раскрытия эмитентов<span class="sp" id="crowd-sp"></span></h2><div style="display:grid;gap:12px">
+    <p class="note" style="margin:0">Сообщения эмитентов о купонах, выкупах и дефолтах лежат на сайте e-disclosure.azipi.ru, а наш сервер данных его открыть не может. Если вы включите эту настройку, программа, <b>пока она открыта</b>, будет скачивать публичные страницы этого сайта <b>с вашего интернет-подключения — примерно одну страницу раз в 15 секунд</b> — и отправлять их на сервер данных. Так все пользователи видят купоны, выкупы и дефолты по своим облигациям. Токен, портфель и другие ваши данные не отправляются; в страницах только то, что видно любому посетителю сайта. Сайт видит ваш IP-адрес, как при обычном заходе в браузере. При ошибках сайта программа делает паузу на 30 минут. Выключить можно в любой момент.</p>
+    <label class="sw"><input type="checkbox" id="crowd-on"><i></i><div><b>Помогать собирать раскрытия</b><small>Работает только пока программа запущена и подключён сервер данных.</small></div></label>
+    <p class="note" id="crowd-info">Загружаю…</p></div></div>`;
+}
+async function bindSetCrowd(c,msg){
+  const on=document.getElementById('crowd-on');if(!on)return;
+  const show=async()=>{const s=await crowdLoad();if(!s||!document.getElementById('crowd-info'))return;
+    on.checked=!!s.enabled;
+    document.getElementById('crowd-sp').textContent=s.enabled?CROWD_STATE[s.state]||'':'';
+    document.getElementById('crowd-info').innerHTML=`Отправлено страниц, принятых сервером: <b>${s.accepted}</b>${s.fetched?` (скачано ${s.fetched})`:''}.${s.enabled?` Состояние: ${esc(CROWD_STATE[s.state]||s.state)}${s.message?' — '+esc(s.message):''}.`:''}${!s.available?' Подключите сервер данных и войдите по ключу — без этого помощь не работает.':''}`;
+    clearTimeout(CROWD.t);if(s.enabled)CROWD.t=setTimeout(show,5000)};
+  on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
+  show();
+}
+/* одноразовая карточка-приглашение (в разделе «Раскрытие эмитента» карточки облигации) */
+function crowdInviteHtml(){
+  const s=CROWD.st;if(!s||s.enabled||s.dismissed)return'';
+  return`<div class="msg" id="crowd-inv" style="margin:0 0 10px"><b>Помогите собирать раскрытия эмитентов.</b> Сервер данных не может открыть сайт e-disclosure.azipi.ru, поэтому сообщения о купонах, выкупах и дефолтах собираются с компьютеров пользователей: программа, пока она открыта, скачивает публичные страницы сайта примерно раз в 15 секунд и отправляет их на сервер. Ваши данные (токен, портфель) не передаются; сайт видит только ваш IP-адрес, как при обычном заходе. Включить можно и позже в «Настройках».
+    <div class="row" style="margin-top:8px"><button class="btn" onclick="crowdInvite(true)">Включить</button><button class="btn ghost" onclick="crowdInvite(false)">Не сейчас</button></div></div>`;
+}
+async function crowdInvite(on){
+  try{await post('/api/crowd/settings',on?{enabled:true}:{dismissed:true});await crowdLoad();const e=document.getElementById('crowd-inv');if(e)e.remove()}catch(e){}
+}
 </script></body></html>
 '''
 

@@ -153,7 +153,7 @@ async function renderSettings(){
   ${setSec('set-conn','Подключение к Т-Инвестициям','',conn)}
   ${setSec('set-acc','Аккаунт и доступ','вход по ключу и Telegram',setAccHtml()+setTgHtml(c))}
   ${setSec('set-look','Внешний вид и меню','',look)}
-  ${setSec('set-calc','Данные и расчёты','',calc)}
+  ${setSec('set-calc','Данные и расчёты','',calc+setCrowdHtml(c))}
   ${setSec('set-local','Данные на компьютере','хранение, копии, очистка',setLocalHtml(c)+setBackupHtml(c))}
   ${setSec('set-adv','','',adv)}
   ${setSec('set-news','Что нового и планы','',`<div class="card" id="whatsnew"><h2>Что нового<span class="sp">версия ${esc(c.version||'')}</span></h2>${changelogHtml()}</div>
@@ -172,6 +172,7 @@ async function renderSettings(){
   try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
+  try{bindSetCrowd(c,msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
   const body=()=>({token:$('#tok').value,sandbox:$('#sb').checked,verify_ssl:$('#vs').checked,ca_file:$('#ca').value,
     hosts_prod:$('#hp').value.split('\n'),hosts_sandbox:$('#hs').value.split('\n')});

@@ -1,12 +1,12 @@
 [Unit]
-Description=TAnalytic disclosure collector (e-disclosure.azipi.ru -> disclosure.sqlite)
+Description=TAnalytic disclosure collector (crowd mode: pages of e-disclosure.azipi.ru come from users' apps -> disclosure.sqlite)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=tinvest
 Group=tinvest
-ExecStart=/usr/bin/python3 /opt/tinvest-analytics/server/disclosure_worker.py --data /var/lib/tinvest-server
+ExecStart=/usr/bin/python3 /opt/tinvest-analytics/server/disclosure_worker.py --data /var/lib/tinvest-server --crowd
 Restart=always
 RestartSec=10
 NoNewPrivileges=true

@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tinvest_md  # noqa: E402  (токен владельца сервера, только чтение; см. tinvest_md.py)
+import crowd  # noqa: E402  (очередь и приём страниц раскрытия от приложений пользователей, см. crowd.py)
 
 VERSION = "1.0.0"
 MIN, HOUR, DAY = 60, 3600, 86400
@@ -783,6 +784,15 @@ class DataServer:
         self.md = md
         self.ttl = _TtlFlight(clock)
         self._meta = {}
+        self._crowd, self._crowd_lock = None, threading.Lock()
+
+    @property
+    def crowd(self):
+        """Очередь заданий и принятых страниц (crowd.sqlite создаётся при первом обращении)."""
+        with self._crowd_lock:
+            if self._crowd is None:
+                self._crowd = crowd.CrowdStore(os.path.join(self.data_dir, "crowd.sqlite"), self.clock)
+            return self._crowd
 
     def md_meta(self, secid):
         """secid -> {uid, lot, face, cls}: из базы сборщика потоков, иначе GetInstrumentBy по тикеру (запоминается)."""
@@ -1063,12 +1073,46 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, {"error": "upstream failed"}, extra=[("X-Upstream-Error", "1")])
             extra = [("X-Cache", r.xcache), ("X-Age", str(r.age))] + [("X-Set-Cookie", c) for c in r.cookies]
             return self._send(r.status, r.body, r.ctype, extra)
+        if u.path.startswith("/v1/crowd/"):
+            return self._crowd(u, client, body)
         if u.path.startswith("/v1/parsed/"):
             if self.command != "GET":
                 return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", "GET")])
             code, obj = app.parsed(u.path[len("/v1/parsed/"):], parse_qs(u.query))
             return self._send(code, obj)
         self._send(404, {"error": "not found"})
+
+    def _crowd(self, u, client, body):
+        """Сбор страниц раскрытия приложениями: /v1/crowd/task, /submit, /status. Анонимный доступ (сервер без ключей) не допускается."""
+        if client == "anon":
+            return self._send(401, {"ok": False, "error": "key required"})
+        name, st = u.path[len("/v1/crowd/"):], self.app.crowd
+        try:
+            if name == "task" and self.command == "GET":
+                try:
+                    n = int((parse_qs(u.query).get("n") or ["2"])[0])
+                except ValueError:
+                    n = 2
+                tasks = st.lease(client, n)
+                s = st.status()
+                return self._send(200, {"ok": True, "tasks": tasks, "queue": s["queue"], "retry_after": 0 if tasks else 300})
+            if name == "submit" and self.command == "POST":
+                try:
+                    j = json.loads(body.decode("utf-8"))
+                    tid, url, status = j["id"], j["url"], j["status"]
+                except (ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError):
+                    return self._send(400, {"ok": False, "error": "bad request"})
+                if not isinstance(tid, int) or not isinstance(url, str):
+                    return self._send(400, {"ok": False, "error": "bad request"})
+                res = st.submit(client, tid, url, status, j.get("body_b64") or "", str(j.get("ctype") or "")[:100])
+                return self._send(200, dict(res, ok=True))
+            if name == "status" and self.command == "GET":
+                return self._send(200, dict(st.status(), ok=True))
+        except crowd.CrowdError as e:
+            return self._send(e.code, dict(e.extra, ok=False, error=e.error))
+        except sqlite3.Error:
+            return self._send(503, {"ok": False, "error": "crowd db busy"})
+        self._send(404 if name not in ("task", "submit", "status") else 405, {"ok": False, "error": "not found"})
 
     def _notify(self, client, info, body):
         if self.command != "POST":

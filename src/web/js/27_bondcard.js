@@ -110,8 +110,9 @@ function bcOutLine(o){
 function bcDisclosure(dc){
   if(!dc)return'';
   const o=bcOutLine(dc.outstanding),fs=dc.facts||[];
-  if(!o&&!fs.length)return'';
-  let h=`<div class="card bc-sec"><h2>Раскрытие эмитента<span class="sp">сообщения на e-disclosure, разбор сервера данных</span></h2>${o}`;
+  const inv=typeof crowdInviteHtml==='function'?crowdInviteHtml():'';
+  if(!o&&!fs.length&&!inv)return'';
+  let h=`<div class="card bc-sec"><h2>Раскрытие эмитента<span class="sp">сообщения на e-disclosure, разбор сервера данных</span></h2>${inv}${o}`;
   if(fs.length)h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Данные</th><th></th></tr></thead><tbody>`
     +fs.map(f=>`<tr><td class="l">${f.date?ddm(f.date):'—'}</td><td class="l">${esc(BC_DISC_KIND[f.kind]||f.label||f.kind)}</td><td class="l">${esc(f.text||'')}</td><td>${f.url?`<a href="${esc(f.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`).join('')+`</tbody></table></div>`;
   else h+=`<div class="mu" style="font-size:13px">Раскрытий по выпуску пока нет (сервер данных не подключён или сообщений не найдено).</div>`;

@@ -16,7 +16,10 @@ tinvest_analytics.py (--lib), дублирования парсера нет. З
   meta(k PK, v)                                                     — служебное (конец архива, вчера уже дособрано)
 
     python3 disclosure_worker.py --data DIR [--lib PATH] [--pace 1.5] [--interval 60] [--since 2015-01-01]
-                                 [--no-backfill] [--once --days N] [--reparse] [--stats] [--verbose]
+                                 [--no-backfill] [--once --days N] [--reparse] [--stats] [--crowd] [--verbose]
+
+Режим --crowd: страницы azipi не скачиваются самим процессом (с VPS он недоступен), а запрашиваются через очередь заданий crowd.sqlite;
+их скачивают и присылают приложения пользователей через сервер данных (server/crowd.py, /v1/crowd/*). Остальная логика (универсум, лента, тексты, разбор) та же.
 """
 import argparse
 import hashlib
@@ -39,6 +42,8 @@ from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import crowd  # noqa: E402
 UA = "TAnalytic-disclosure/1.0 (+https://github.com/Kos5o4ka/tinvest-analytics)"
 AZIPI = "https://e-disclosure.azipi.ru"
 ISS = "https://iss.moex.com/iss/securities.json?engine=stock&market=bonds&is_trading=1&limit=100&iss.meta=off&start=%d"
@@ -64,6 +69,18 @@ class Gone(FetchError):
 
 class Stopped(Exception):
     pass
+
+
+class Pending(FetchError):
+    """Режим --crowd: страница ещё не прислана пользователями; адрес стоит в очереди, повторить позже."""
+
+
+# Приоритеты заданий в очереди (меньше = раньше): живая лента, тексты нужных сообщений (из них получаются факты), вчерашний день целиком,
+# история, заглядывание вперёд по дням истории
+P_LIVE, P_BODY, P_YDAY, P_HIST, P_AHEAD = 0, 1, 2, 3, 4
+LIVE_AGE = 600           # живая лента сегодняшнего дня считается свежей 10 минут (режим --crowd)
+AHEAD_DAYS = 3           # на сколько дней истории вперёд заранее просить первую страницу ленты
+PURGE_EVERY = 3600
 
 
 def msk_now():
@@ -135,6 +152,33 @@ class Fetcher:
             except (UnicodeDecodeError, LookupError):
                 pass
         return data.decode("cp1251", "replace")
+
+
+class CrowdFetch:
+    """Источник страниц для режима --crowd. Адреса azipi берутся из очереди пользовательских приложений (бросает Pending, пока страницы нет),
+    остальное (ISS Мосбиржи) качается напрямую через `direct`."""
+
+    def __init__(self, store, direct, default_prio=P_HIST):
+        self.store, self.direct, self.default_prio = store, direct, default_prio
+
+    def __call__(self, url, newer_than=None):
+        if not url.startswith(AZIPI + "/"):
+            return self.direct(url)
+        r = self.store.get(url, newer_than)
+        if r is None:
+            self.store.want([url], self.default_prio, newer_than=newer_than)
+            raise Pending("ждём страницу от пользователей: " + url)
+        if r[0] == "failed":
+            raise Gone("страницу не удалось получить: " + url)
+        if r[0] != 200:
+            raise Gone("HTTP %s: %s" % (r[0], url))
+        return Fetcher.decode(r[1], r[2])
+
+    def want(self, urls, prio, newer_than=None):
+        return self.store.want(urls, prio, newer_than=newer_than)
+
+    def have(self, url, newer_than=None):
+        return self.store.has(url, newer_than)
 
 
 # ───────────────────────── разбор страниц azipi ─────────────────────────
@@ -263,12 +307,37 @@ def stats(db, pace=1.5, since="2015-01-01", today=None):
 
 # ───────────────────────── сборщик ─────────────────────────
 class Worker:
-    def __init__(self, db, fetch, lib, pver="", since="2015-01-01", interval=60, body_cap=200, now=msk_now, stop=None, universe_pages=0):
+    def __init__(self, db, fetch, lib, pver="", since="2015-01-01", interval=60, body_cap=200, now=msk_now, stop=None, universe_pages=0, clock=time.time):
         self.db, self.fetch, self.lib, self.pver = db, fetch, lib, pver
         self.since, self.interval, self.body_cap, self.now = since, interval, body_cap, now
         self.stop = stop or threading.Event()
         self.universe_pages = universe_pages     # 0 = без ограничения (для отладки)
         self.universe_cache = None
+        self.clock = clock
+        self.crowd = hasattr(fetch, "want")      # режим --crowd: страницы приходят из очереди, а не из HTTP
+        self.pass_new = {}                       # crowd: id, добавленные в текущем (ещё не завершённом) проходе живой ленты дня
+        self.last_purge = 0.0
+
+    def get(self, url, newer_than=None):
+        return self.fetch(url, newer_than) if self.crowd else self.fetch(url)
+
+    def hint(self, urls, prio, newer_than=None):
+        if self.crowd and urls:
+            self.fetch.want(urls, prio, newer_than)
+
+    @staticmethod
+    def feed_url(day, page=1):
+        d = "%02d.%02d.%04d" % (int(day[8:]), int(day[5:7]), int(day[:4]))
+        return "%s/messages/list/day-%s/?MESSAGE_BY_DAY=%s&PAGEN_2=%d" % (AZIPI, d, d, page)
+
+    def day_rule(self, day, full):
+        """(приоритет, newer_than) для страниц ленты дня в режиме --crowd. Страница ленты дня, принятая до конца этого дня, неполна."""
+        today = self.now().date()
+        d = date.fromisoformat(day)
+        if d >= today and not full:
+            return P_LIVE, self.clock() - LIVE_AGE
+        end = datetime(d.year, d.month, d.day, tzinfo=MSK) + timedelta(days=1)
+        return (P_YDAY if d == today - timedelta(days=1) else P_HIST), end.timestamp()
 
     # --- универсум ---
     def refresh_universe(self, force=False):
@@ -317,18 +386,28 @@ class Worker:
     # --- лента ---
     def ingest_day(self, day, full):
         """Читает страницы ленты дня. full=False (live): остановка на странице, где все id уже известны. -> (страниц, элементов, новых, нужных, полностью?)"""
-        d = "%02d.%02d.%04d" % (int(day[8:]), int(day[5:7]), int(day[:4]))
         uni = self.universe()
         page, last, items_n, new_n, want_n, complete, read = 1, 1, 0, 0, 0, True, 0
+        prio, newer = self.day_rule(day, full) if self.crowd else (0, None)
         while page <= last:
             if self.stop.is_set():
                 complete = False
                 break
-            url = "%s/messages/list/day-%s/?MESSAGE_BY_DAY=%s&PAGEN_2=%d" % (AZIPI, d, d, page)
-            items, last = parse_feed(self.fetch(url))
+            url = self.feed_url(day, page)
+            if self.crowd:
+                self.hint([url], prio, newer)
+            items, last = parse_feed(self.get(url, newer))
+            if self.crowd and full and page == 1 and last > 1:
+                # лента дня целиком: просим все страницы сразу (параллельно разными пользователями) и берёмся за день, когда все пришли
+                rest = [self.feed_url(day, p) for p in range(2, last + 1)]
+                self.hint(rest, prio, newer)
+                if not all(self.fetch.have(u, newer) for u in rest):
+                    raise Pending("лента %s: жду страницы 2..%d" % (day, last))
             if not items:
                 break
             known = {r[0] for r in self.db.execute("SELECT id FROM feed WHERE id IN (%s)" % ",".join("?" * len(items)), [i["id"] for i in items])}
+            if self.crowd and not full:
+                known -= self.pass_new.get(day, set())     # добавленное ранее в этом же проходе (он мог прерваться ожиданием страницы) считаем свежим
             fresh = [i for i in items if i["id"] not in known]
             with self.db:
                 for i in fresh:
@@ -337,26 +416,54 @@ class Worker:
                     self.db.execute("INSERT OR IGNORE INTO feed(id, day, ts, title, org, inn, event_date, wanted) VALUES(?,?,?,?,?,?,?,?)",
                                     (i["id"], day, i["ts"], i["title"], i["org"], i["inn"], i["event_date"], w))
             items_n, new_n, read = items_n + len(items), new_n + len(fresh), read + 1
+            if self.crowd and not full:
+                self.pass_new.setdefault(day, set()).update(i["id"] for i in fresh)
             if not full and not fresh:
                 break
             page += 1
+        self.pass_new.pop(day, None)
         log.info("день %s: страниц %d, элементов %d, новых %d, нужных %d", day, read, items_n, new_n, want_n)
         return read, items_n, new_n, want_n, complete
 
     def live_cycle(self):
         today = self.now().date()
-        try:
-            self.refresh_universe()
-            self.ingest_day(today.isoformat(), False)
-            y = (today - timedelta(days=1)).isoformat()
+        y = (today - timedelta(days=1)).isoformat()
+
+        def yesterday():
             if get_meta(self.db, "live_yday") != y:       # после полуночи по Москве один раз дособрать вчерашний день целиком
                 pages, items, _, _, ok = self.ingest_day(y, True)
                 self.mark_day(y, pages, items, ok)
                 if ok:
                     set_meta(self.db, "live_yday", y)
-            self.fetch_bodies(self.body_cap)
-        except (FetchError, ValueError, KeyError) as e:
-            log.warning("live-цикл прерван: %s", e)
+
+        steps = (self.refresh_universe, lambda: self.ingest_day(today.isoformat(), False), yesterday, lambda: self.fetch_bodies(self.body_cap))
+        for step in steps:
+            try:
+                step()
+            except Pending as e:                           # только --crowd: ждём страницу, остальные шаги цикла выполняем
+                log.debug("%s", e)
+            except (FetchError, ValueError, KeyError) as e:
+                log.warning("live-цикл прерван: %s", e)
+                break
+        self.housekeeping()
+
+    def housekeeping(self):
+        """--crowd: переразбор сообщений, чьи страницы заменены большинством или отозваны (недоверенный ключ); чистка старых страниц очереди."""
+        if not self.crowd:
+            return
+        for url, kind in self.fetch.store.pop_events():
+            c = crowd.classify(url)
+            if not c:
+                continue
+            if c[0] == "msg":
+                self.db.execute("UPDATE feed SET fetched=0, tries=0 WHERE id=?", (c[1],))
+                log.warning("сообщение %d: страница изменилась (%s), загружаю заново", c[1], kind)
+            else:
+                log.warning("лента %s стр. %d: страница изменилась (%s); уже добавленные элементы остаются", c[1], c[2], kind)
+            self.db.commit()
+        if self.clock() - self.last_purge > PURGE_EVERY:
+            self.last_purge = self.clock()
+            self.fetch.store.purge()
 
     def mark_day(self, day, pages, items, ok):
         self.db.execute("INSERT OR REPLACE INTO days VALUES(?,?,?,?,?)", (day, pages, items, "done" if ok else "partial", time.time()))
@@ -367,11 +474,14 @@ class Worker:
         q = "SELECT id, ts, title, org, inn FROM feed WHERE wanted=1 AND fetched=0 AND tries<5" + (" AND day=?" if day else "") + " ORDER BY ts DESC LIMIT ?"
         rows = self.db.execute(q, ((day, cap) if day else (cap,))).fetchall()
         done = 0
+        self.hint(["%s/messages/%d/" % (AZIPI, r[0]) for r in rows], P_BODY)       # --crowd: все нужные тексты сразу
         for mid, ts, title, org, inn in rows:
             if self.stop.is_set():
                 break
             try:
-                html = self.fetch("%s/messages/%d/" % (AZIPI, mid))
+                html = self.get("%s/messages/%d/" % (AZIPI, mid))
+            except Pending:
+                continue
             except Gone as e:
                 self.db.execute("UPDATE feed SET tries=5, err=? WHERE id=?", (str(e)[:200], mid))
                 self.db.commit()
@@ -437,10 +547,15 @@ class Worker:
                 if empty >= EMPTY_STOP:
                     break
                 try:
+                    if self.crowd:                       # заранее просим первые страницы ближайших дней истории
+                        self.hint([self.feed_url((day - timedelta(days=k)).isoformat()) for k in range(1, AHEAD_DAYS + 1)
+                                   if (day - timedelta(days=k)).isoformat() >= self.since], P_AHEAD, self.day_rule(ds, True)[1])
                     pages, items, _, _, ok = self.ingest_day(ds, True)
                     self.mark_day(ds, pages, items, ok)
                     if ok:
                         self.fetch_bodies(1000, ds)
+                except Pending:
+                    return "wait"
                 except FetchError as e:
                     log.warning("день %s не дособран: %s", ds, e)
                     self.db.execute("INSERT OR REPLACE INTO days(day, pages, items, status, done_at) VALUES(?,0,0,'partial',?)", (ds, time.time()))
@@ -464,7 +579,7 @@ class Worker:
             st = self.backfill_step() if backfill else "end"
             if st == "ok":
                 continue
-            self.stop.wait(60 if st == "err" else max(1.0, self.interval - (time.monotonic() - last_live)))
+            self.stop.wait(60 if st == "err" else min(5.0, self.interval) if st == "wait" else max(1.0, self.interval - (time.monotonic() - last_live)))
 
 
 def main(argv=None):
@@ -481,6 +596,7 @@ def main(argv=None):
     ap.add_argument("--stats", action="store_true")
     ap.add_argument("--max-requests", type=int, default=0, help="жёсткий лимит числа запросов за запуск (отладка)")
     ap.add_argument("--universe-pages", type=int, default=0, help="читать не больше N страниц ISS (отладка)")
+    ap.add_argument("--crowd", action="store_true", help="страницы azipi собирают приложения пользователей через очередь crowd.sqlite (с VPS azipi недоступен)")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -491,8 +607,11 @@ def main(argv=None):
     stop = threading.Event()
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: stop.set())
-    w = Worker(db, Fetcher(a.pace, stop, max_requests=a.max_requests).get, load_lib(a.lib), parser_ver(a.lib), a.since, a.interval,
-               stop=stop, universe_pages=a.universe_pages)
+    fetch = Fetcher(a.pace, stop, max_requests=a.max_requests).get
+    if a.crowd:
+        fetch = CrowdFetch(crowd.CrowdStore(os.path.join(a.data, "crowd.sqlite")), fetch)
+    w = Worker(db, fetch, load_lib(a.lib), parser_ver(a.lib), a.since, a.interval,
+               body_cap=400 if a.crowd else 200, stop=stop, universe_pages=a.universe_pages)
     try:
         if a.reparse:
             w.reparse()
@@ -502,7 +621,7 @@ def main(argv=None):
                 if w.backfill_step() != "ok":
                     break
         else:
-            log.info("старт: данные %s, pace %.1f с, interval %.0f с", a.data, a.pace, a.interval)
+            log.info("старт: данные %s, pace %.1f с, interval %.0f с%s", a.data, a.pace, a.interval, ", режим crowd" if a.crowd else "")
             w.run(not a.no_backfill)
     except Stopped:
         pass
