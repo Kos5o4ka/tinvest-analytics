@@ -13,12 +13,12 @@ function feeTariffOptimizer(){
   const nMo=ms.length;
   const tariffs=[
     {name:'Инвестор',rate:0.003,sub:0,cost:turn12*0.003,note:'0,30 % за сделку, без абонплаты'},
-    {name:'Трейдер',rate:0.0005,sub:portVal>=2e6?0:290*activeMo,
-     cost:turn12*0.0005+(portVal>=2e6?0:290*activeMo),
-     note:portVal>=2e6?'0,05 % за сделку, 0 ₽/мес (портфель ≥ 2 млн ₽)':'0,05 % за сделку + 290 ₽ в месяцы со сделками'},
-    {name:'Премиум',rate:0.0004,sub:portVal>=3e6?0:1990*nMo,
-     cost:turn12*0.0004+(portVal>=3e6?0:1990*nMo),
-     note:portVal>=3e6?'0,04 % за сделку, 0 ₽/мес (портфель ≥ 3 млн ₽)':'0,04 % за сделку + 1 990 ₽/мес'}
+    {name:'Трейдер',rate:0.0005,sub:portVal>=2e6?0:390*activeMo,
+     cost:turn12*0.0005+(portVal>=2e6?0:390*activeMo),
+     note:portVal>=2e6?'0,05 % за сделку, 0 ₽/мес (портфель ≥ 2 млн ₽)':'0,05 % за сделку + 390 ₽ в месяцы с операциями'},
+    {name:'Премиум',rate:0.0004,sub:portVal>=3e6?0:2990*nMo,
+     cost:turn12*0.0004+(portVal>=3e6?0:2990*nMo),
+     note:portVal>=3e6?'0,04 % за сделку, 0 ₽/мес (портфель ≥ 3 млн ₽)':'0,04 % за сделку + 2 990 ₽/мес'}
   ];
   const best=tariffs.reduce((a,b)=>b.cost<a.cost?b:a);
   const save=Math.max(0,paid12-best.cost);
@@ -28,12 +28,12 @@ function feeTariffOptimizer(){
       ${kpi('Фактически уплачено',M(paid12,'rub',0),'брокерская + обслуживание за '+nMo+' мес.')}
       ${kpi('Оптимальный тариф',esc(best.name),M(best.cost,'rub',0)+' расчётно за период','pos')}
       ${kpi('Потенциальная экономия',save>100?M(save,'rub',0):'0 ₽',save>100?'можно сэкономить на смене тарифа':'ваш текущий тариф уже близок к оптимуму',save>100?'pos':'')}
-      ${kpi('Порог «Инвестор → Трейдер»','116 тыс ₽/мес','ваш ср. оборот: '+short(avgMoTurn)+' ₽/акт. мес.')}</div>
+      ${kpi('Порог «Инвестор → Трейдер»','156 тыс ₽/мес','ваш ср. оборот: '+short(avgMoTurn)+' ₽/акт. мес.')}</div>
     <div class="tbl"><table><thead><tr><th class="l">Тариф Т-Инвестиций</th><th>Ставка</th><th>Комиссия с оборота</th><th>Абонплата</th><th>Итого за ${nMo} мес.</th><th class="l">Условия</th></tr></thead><tbody>`+
     tariffs.map(x=>`<tr class="${x===best?'pnew':''}"><td class="l"><b>${esc(x.name)}</b>${x===best?' <span class="tag pos">выгоднее</span>':''}</td>
       <td class="num">${(x.rate*100).toFixed(2).replace('.',',')} %</td><td class="num">${M(turn12*x.rate,'rub',0)}</td>
       <td class="num">${M(x.sub,'rub',0)}</td><td class="num"><b>${M(x.cost,'rub',0)}</b></td><td class="l mu">${esc(x.note)}</td></tr>`).join('')+`</tbody></table></div>
-    <p class="note" style="margin-top:8px">Справочная модель для стандартных тарифов Т-Инвестиций без учёта сделок с фондами Т-Капитала (0 %) и фьючерсов. Точка безубыточности «Инвестор → Трейдер»: 290 / (0,30% − 0,05%) = 116 000 ₽ оборота в месяц.</p></div>`;
+    <p class="note" style="margin-top:8px">Справочная модель для стандартных тарифов Т-Инвестиций без учёта сделок с фондами Т-Капитала (0 %) и фьючерсов. Точка безубыточности «Инвестор → Трейдер»: 390 / (0,30% − 0,05%) = 156 000 ₽ оборота в месяц. Тарифы — по справке Т-Инвестиций (ноябрь 2026): «Инвестор» от 0,3 % без абонплаты, «Трейдер» от 0,05 % + 390 ₽ в месяцы с операциями, Premium от 0,04 % + 2 990 ₽/мес.</p></div>`;
 }
 function pFees(){
   const d=S.data;let out='';
