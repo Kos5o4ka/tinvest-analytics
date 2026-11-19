@@ -114,6 +114,10 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.f.up.hits, 0)
         self.assertTrue(self.f.app.url_allowed("https://iss.moex.com/iss/x.json"))
         self.assertTrue(self.f.app.url_allowed("https://t.me/s/issuerRatings"))
+        # курс BTC для бегущей строки клиента: только эти пути
+        self.assertTrue(self.f.app.url_allowed("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"))
+        self.assertTrue(self.f.app.url_allowed("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"))
+        self.assertFalse(self.f.app.url_allowed("https://api.binance.com/api/v3/order"))
 
     def test_hit_and_ttl_expiry(self):
         u = self.f.up.url("/a")

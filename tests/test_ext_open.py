@@ -40,6 +40,10 @@ class Fake:
                     mode = me.mode
                     if mode == "401":
                         return self._r(401, b"{}")
+                    if mode == "403host":
+                        return self._r(403, json.dumps({"error": "host not allowed"}).encode())
+                    if mode == "403":
+                        return self._r(403, b"{}")
                     if mode == "5xx":
                         return self._r(500, b"x")
                     if mode == "404":
@@ -152,6 +156,20 @@ class ExtOpenTests(unittest.TestCase):
             self.m.ext_open(self.fk.base + "/real")
         self.assertEqual(cm.exception.code, 404)
         self.assertEqual(len(self.fk.log), n + 1)       # прямой повтор не делался
+
+    def test_host_not_allowed_keeps_server(self):
+        """403 «host not allowed» (сайта нет в списке сервера): запрос напрямую, но сервер остаётся включённым для остальных."""
+        self.set_cfg(self.fk.base, "k")
+        self.fk.mode = "403host"
+        self.m.ds_reset()
+        self.assertEqual(self.m.ext_open(self.fk.base + "/btc")[1], b"direct")
+        self.assertEqual(self.m.ds_status()["mode"], "server")
+        self.fk.mode = "ok"
+        self.assertEqual(self.m.ext_open(self.fk.base + "/real")[1], b"via-server")
+        self.fk.mode = "403"                             # обычный 403 (ключ не принят) по-прежнему выключает сервер
+        self.m.ds_reset()
+        self.assertEqual(self.m.ext_open(self.fk.base + "/real")[1], b"direct")
+        self.assertEqual(self.m.ds_status()["mode"], "down")
 
     def test_connection_test_endpoint(self):
         r = self.m.ds_test({}, {"url": self.fk.base, "key": "z"})

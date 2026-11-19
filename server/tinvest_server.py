@@ -42,6 +42,7 @@ ALLOWED_HOSTS = {
     "smart-lab.ru": None,
     "raexpert.ru": None, "ratings.ru": None, "investmint.ru": None,
     "invest-brands.cdn-tinkoff.ru": None,
+    "api.coingecko.com": "/api/v3/simple/price", "api.binance.com": "/api/v3/ticker/24hr",   # курс BTC для бегущей строки
     "t.me": "/s/",                      # публичное зеркало канала с рейтингами (только страницы /s/...)
 }
 
@@ -444,6 +445,8 @@ RULES = [
     ("t.me",               r".*",                                     12 * HOUR,          None),    # канал рейтингов
     ("investmint.ru",      r".*",                                     6 * HOUR,           None),
     ("invest-brands.cdn-tinkoff.ru", r".*",                           30 * DAY,           None),    # логотипы
+    ("api.coingecko.com",  r".*",                                     MIN,                None),    # курс BTC (бегущая строка)
+    ("api.binance.com",    r".*",                                     MIN,                None),
 ]
 DEFAULT_TTL = HOUR
 NOT_FOUND_TTL = 10 * MIN

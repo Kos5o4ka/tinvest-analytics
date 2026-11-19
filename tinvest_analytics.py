@@ -4082,6 +4082,15 @@ def _jar_update(jar, set_cookies):
             jar[k.strip()] = v.strip()
 
 
+def _ds_host_refused(err):
+    """403 сервера «host not allowed» (сайта нет в его списке) — это не отказ в ключе: сервер для остальных запросов не отключаем.
+    Иначе один такой запрос раз в минуту (например, курс BTC в бегущей строке) держал бы сервер выключенным постоянно."""
+    try:
+        return (json.loads(err.read().decode("utf-8", "replace")) or {}).get("error") == "host not allowed"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _ds_request(srv, key, url, data, headers, timeout):
     """Запрос через сервер данных. Возвращает (статус, тело, content-type, set-cookie[], X-Cache) либо None (нужен прямой запрос).
     Ответ источника (в т.ч. 404) приходит с заголовком X-Cache; его отсутствие значит, что ответил сам сервер (ошибка)."""
@@ -4104,6 +4113,8 @@ def _ds_request(srv, key, url, data, headers, timeout):
         if e.headers.get("X-Cache"):                   # настоящий ответ источника (404 и т.п.): повторять напрямую не нужно
             return e.code, e.read(), e.headers.get("Content-Type") or "", [], e.headers.get("X-Cache")
         if e.headers.get("X-Upstream-Error"):         # сервер жив, но источник не ответил: пробуем напрямую, сервер не «роняем»
+            return None
+        if e.code == 403 and _ds_host_refused(e):     # сайта нет в списке сервера: этот запрос — напрямую, ключ тут ни при чём
             return None
         if e.code == 401:                              # ключ не принят: UI попросит войти; этот запрос всё же выполняем напрямую
             with _ds_lock:
