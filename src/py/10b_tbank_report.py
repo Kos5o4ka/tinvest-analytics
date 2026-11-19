@@ -447,7 +447,7 @@ def tbank_parse(table):
                              "payment": to_money(round(b_in, 2), cur), "name": "Входящий остаток на начало периода"}, **tag))
             stat["opening_cash"] += 1
     ops.sort(key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
-    meta = {"format": "tbank", "period": period, "cash_open": {c: v[0] for c, v in bal.items()},
+    meta = {"format": "tbank", "title": "Отчёт брокера Т-Инвестиций", "period": period, "cash_open": {c: v[0] for c, v in bal.items()},
             "cash_close": {c: v[1] for c, v in bal.items()}, "pos": meta_pos, "stat": dict(stat)}
     return ops, meta
 
@@ -495,8 +495,8 @@ def tbank_preview(ops, meta):
     bad_cash = {c: [a, b] for c, (a, b) in rec["cash"].items() if abs(a - b) >= 1.0}
     bad_pos = sorted(((abs(a - b), k, a, b) for k, (a, b) in rec["pos"].items() if abs(a - b) >= 0.5), reverse=True)
     st = meta["stat"]
-    mine = [x for x in imports_list() if x.get("format") == "tbank"]
-    return {"format": "tbank", "title": "Отчёт брокера Т-Инвестиций", "period": meta["period"], "count": len(ops),
+    mine = [x for x in imports_list() if x.get("format") == meta["format"]]  # добавлять предлагаем только к счетам того же брокера
+    return {"format": meta["format"], "title": meta["title"], "period": meta["period"], "count": len(ops),
             "kinds": dict(kinds), "kinds_ru": TB_KIND_RU, "repo_skipped": st.get("repo", 0), "mirror_skipped": st.get("mirror", 0),
             "opening_sec": st.get("opening_sec", 0), "xfer": st.get("xfer_in", 0) + st.get("xfer_out", 0),
             "cash_ok": not bad_cash, "cash_bad": bad_cash, "pos_total": len(rec["pos"]), "pos_bad": len(bad_pos),
@@ -507,14 +507,14 @@ def tbank_preview(ops, meta):
 
 
 def import_preview_any(filename, raw):
-    hit = tbank_try(filename, raw)
+    hit = broker_try(filename, raw)
     return tbank_preview(*hit) if hit else import_preview(filename, raw)
 
 
 def import_ops_any(filename, raw, table, header_row, mapping):
     """(ops, пропущено строк, формат, meta): отчёт Т-Инвестиций разбирается своим парсером, остальное — по выбранным колонкам."""
-    hit = tbank_try(filename, raw)
+    hit = broker_try(filename, raw)
     if hit:
-        return hit[0], hit[1]["stat"].get("skipped", 0), "tbank", hit[1]
+        return hit[0], hit[1]["stat"].get("skipped", 0), hit[1]["format"], hit[1]
     ops, skipped = import_ops(filename, raw, table, header_row, mapping)
     return ops, skipped, "", None
