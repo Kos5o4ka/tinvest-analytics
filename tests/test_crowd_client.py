@@ -72,9 +72,8 @@ def tasks(*urls):
 
 
 class CrowdClientTests(unittest.TestCase):
-    def test_disabled_by_default(self):
-        self.assertFalse(T.DEFAULT_CONFIG["crowd_enabled"])
-        self.assertFalse(T.load_config()["crowd_enabled"])
+    def test_enabled_by_default(self):
+        self.assertTrue(T.DEFAULT_CONFIG["crowd_enabled"])
         self.assertFalse(T.DEFAULT_CONFIG["crowd_dismissed"])
         s = Sim(tasks(MSG % 1), enabled=False)
         s.run(120)
@@ -250,6 +249,16 @@ class RoutingTests(unittest.TestCase):
 
 
 class SettingsApiTests(unittest.TestCase):
+    def setUp(self):
+        c = T.load_config()
+        c["crowd_enabled"], c["crowd_dismissed"] = False, False
+        T.save_config(c)
+
+    def test_enable_wakes_helper(self):
+        T._crowd_wake.clear()
+        T.api_crowd_settings(T.load_config(), {"enabled": True})
+        self.assertTrue(T._crowd_wake.is_set())
+
     def tearDown(self):
         c = T.load_config()
         c["crowd_enabled"], c["crowd_dismissed"] = False, False

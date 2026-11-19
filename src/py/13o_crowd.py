@@ -1,6 +1,6 @@
 # ═══════════════ помощь в сборе раскрытий эмитентов (по желанию пользователя) ═══════════════
 # Сервер данных не может открыть e-disclosure.azipi.ru (сайт блокирует его адрес), а у пользователей в России страницы открываются.
-# Если пользователь включил «Помогать собирать раскрытия» (по умолчанию выключено), то ПОКА ПРОГРАММА ЗАПУЩЕНА фоновый поток
+# Если «Помогать собирать раскрытия» включено (по умолчанию включено, выключается в «Настройках»), то ПОКА ПРОГРАММА ЗАПУЩЕНА фоновый поток
 # берёт у сервера данных задания (адреса страниц azipi), скачивает каждую страницу НАПРЯМУЮ со своего интернет-подключения
 # (не через сервер данных и не через ext_open: сервер до azipi не дотянется) и отправляет серверу. Личных данных в запросах нет.
 # Вежливость: не чаще одного запроса к azipi раз в CROWD_PACE секунд, после любой ошибки azipi пауза CROWD_BACKOFF, нет заданий
@@ -16,7 +16,7 @@ CROWD_UA = "Mozilla/5.0 (compatible; TAnalytic-crowd/%s; +https://github.com/Kos
 _CROWD_FEED = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/list/day-(\d{2}\.\d{2}\.\d{4})/\?MESSAGE_BY_DAY=\1&PAGEN_2=\d{1,3}$")
 _CROWD_MSG = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/\d{1,10}/$")
 _CROWD_BAD = ("captcha", "just a moment", "access denied", "attention required", "ddos")
-DEFAULT_CONFIG.setdefault("crowd_enabled", False)
+DEFAULT_CONFIG.setdefault("crowd_enabled", True)     # по умолчанию помогаем; выключается в «Настройках»
 DEFAULT_CONFIG.setdefault("crowd_dismissed", False)
 
 
@@ -184,6 +184,7 @@ class _CrowdStats:
 
 
 _crowd = [None]
+_crowd_wake = threading.Event()        # будит фоновый поток сразу после изменения настройки
 
 
 def crowd_helper():
@@ -199,7 +200,8 @@ def _crowd_loop():
             d = h.step()
         except Exception as e:  # noqa: BLE001
             h.state, h.msg, d = "idle", "ошибка: %s" % type(e).__name__, 120.0
-        time.sleep(max(0.5, min(d, 30.0)))
+        _crowd_wake.wait(max(0.5, min(d, 30.0)))
+        _crowd_wake.clear()
 
 
 def crowd_start():
@@ -225,6 +227,7 @@ def api_crowd_settings(cfg, body):
     save_config(cfg)
     h = crowd_helper()
     h.idle_until = 0.0
+    _crowd_wake.set()                    # включили — начинаем сразу, а не через 30 с
     return {"ok": True}
 
 

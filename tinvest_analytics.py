@@ -16191,7 +16191,7 @@ API_POST["/api/localdata/clear"] = ld_clear_post
 API_POST["/api/localdata/wipe"] = ld_wipe_post
 # ═══════════════ помощь в сборе раскрытий эмитентов (по желанию пользователя) ═══════════════
 # Сервер данных не может открыть e-disclosure.azipi.ru (сайт блокирует его адрес), а у пользователей в России страницы открываются.
-# Если пользователь включил «Помогать собирать раскрытия» (по умолчанию выключено), то ПОКА ПРОГРАММА ЗАПУЩЕНА фоновый поток
+# Если «Помогать собирать раскрытия» включено (по умолчанию включено, выключается в «Настройках»), то ПОКА ПРОГРАММА ЗАПУЩЕНА фоновый поток
 # берёт у сервера данных задания (адреса страниц azipi), скачивает каждую страницу НАПРЯМУЮ со своего интернет-подключения
 # (не через сервер данных и не через ext_open: сервер до azipi не дотянется) и отправляет серверу. Личных данных в запросах нет.
 # Вежливость: не чаще одного запроса к azipi раз в CROWD_PACE секунд, после любой ошибки azipi пауза CROWD_BACKOFF, нет заданий
@@ -16207,7 +16207,7 @@ CROWD_UA = "Mozilla/5.0 (compatible; TAnalytic-crowd/%s; +https://github.com/Kos
 _CROWD_FEED = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/list/day-(\d{2}\.\d{2}\.\d{4})/\?MESSAGE_BY_DAY=\1&PAGEN_2=\d{1,3}$")
 _CROWD_MSG = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/\d{1,10}/$")
 _CROWD_BAD = ("captcha", "just a moment", "access denied", "attention required", "ddos")
-DEFAULT_CONFIG.setdefault("crowd_enabled", False)
+DEFAULT_CONFIG.setdefault("crowd_enabled", True)     # по умолчанию помогаем; выключается в «Настройках»
 DEFAULT_CONFIG.setdefault("crowd_dismissed", False)
 
 
@@ -16375,6 +16375,7 @@ class _CrowdStats:
 
 
 _crowd = [None]
+_crowd_wake = threading.Event()        # будит фоновый поток сразу после изменения настройки
 
 
 def crowd_helper():
@@ -16390,7 +16391,8 @@ def _crowd_loop():
             d = h.step()
         except Exception as e:  # noqa: BLE001
             h.state, h.msg, d = "idle", "ошибка: %s" % type(e).__name__, 120.0
-        time.sleep(max(0.5, min(d, 30.0)))
+        _crowd_wake.wait(max(0.5, min(d, 30.0)))
+        _crowd_wake.clear()
 
 
 def crowd_start():
@@ -16416,6 +16418,7 @@ def api_crowd_settings(cfg, body):
     save_config(cfg)
     h = crowd_helper()
     h.idle_until = 0.0
+    _crowd_wake.set()                    # включили — начинаем сразу, а не через 30 с
     return {"ok": True}
 
 
@@ -31031,7 +31034,7 @@ setTimeout(crowdLoad,3000);
 const CROWD_STATE={off:'выключено',idle:'ждёт заданий',working:'работает',backoff:'пауза после ошибки сайта',no_server:'нет связи с сервером данных'};
 function setCrowdHtml(c){
   return`<div class="card" id="crowd-card"><h2>Помогать собирать раскрытия эмитентов<span class="sp" id="crowd-sp"></span></h2><div style="display:grid;gap:12px">
-    <p class="note" style="margin:0">Сообщения эмитентов о купонах, выкупах и дефолтах лежат на сайте e-disclosure.azipi.ru, а наш сервер данных его открыть не может. Если вы включите эту настройку, программа, <b>пока она открыта</b>, будет скачивать публичные страницы этого сайта <b>с вашего интернет-подключения — примерно одну страницу раз в 15 секунд</b> — и отправлять их на сервер данных. Так все пользователи видят купоны, выкупы и дефолты по своим облигациям. Токен, портфель и другие ваши данные не отправляются; в страницах только то, что видно любому посетителю сайта. Сайт видит ваш IP-адрес, как при обычном заходе в браузере. При ошибках сайта программа делает паузу на 30 минут. Выключить можно в любой момент.</p>
+    <p class="note" style="margin:0">Включено по умолчанию. Сообщения эмитентов о купонах, выкупах и дефолтах лежат на сайте e-disclosure.azipi.ru, а наш сервер данных его открыть не может. <b>Пока программа открыта</b>, она скачивает публичные страницы этого сайта <b>с вашего интернет-подключения — примерно одну страницу раз в 15 секунд</b> — и отправляет их на сервер данных. Так все пользователи видят купоны, выкупы и дефолты по своим облигациям. Токен, портфель и другие ваши данные не отправляются; в страницах только то, что видно любому посетителю сайта. Сайт видит ваш IP-адрес, как при обычном заходе в браузере. При ошибках сайта программа делает паузу на 30 минут. Выключить можно в любой момент.</p>
     <label class="sw"><input type="checkbox" id="crowd-on"><i></i><div><b>Помогать собирать раскрытия</b><small>Работает только пока программа запущена и подключён сервер данных.</small></div></label>
     <p class="note" id="crowd-info">Загружаю…</p></div></div>`;
 }
@@ -31039,8 +31042,9 @@ async function bindSetCrowd(c,msg){
   const on=document.getElementById('crowd-on');if(!on)return;
   const show=async()=>{const s=await crowdLoad();if(!s||!document.getElementById('crowd-info'))return;
     on.checked=!!s.enabled;
-    document.getElementById('crowd-sp').textContent=s.enabled?CROWD_STATE[s.state]||'':'';
-    document.getElementById('crowd-info').innerHTML=`Отправлено страниц, принятых сервером: <b>${s.accepted}</b>${s.fetched?` (скачано ${s.fetched})`:''}.${s.enabled?` Состояние: ${esc(CROWD_STATE[s.state]||s.state)}${s.message?' — '+esc(s.message):''}.`:''}${!s.available?' Подключите сервер данных и войдите по ключу — без этого помощь не работает.':''}`;
+    const stt=s.enabled&&s.state==='off'?'запускается…':(CROWD_STATE[s.state]||s.state);   // включили, а поток ещё не проснулся
+    document.getElementById('crowd-sp').textContent=s.enabled?stt:'выключено';
+    document.getElementById('crowd-info').innerHTML=`Отправлено страниц, принятых сервером: <b>${s.accepted}</b>${s.fetched?` (скачано ${s.fetched})`:''}.${s.enabled?` Состояние: ${esc(stt)}${s.message?' — '+esc(s.message):''}.`:''}${!s.available?' Подключите сервер данных и войдите по ключу — без этого помощь не работает.':''}`;
     clearTimeout(CROWD.t);if(s.enabled)CROWD.t=setTimeout(show,5000)};
   on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
   show();
