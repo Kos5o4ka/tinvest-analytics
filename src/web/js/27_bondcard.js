@@ -56,12 +56,18 @@ async function openBond(isin){
   const mr=dr.querySelector('#bc-more');
   if(mr)mr.onclick=()=>{BC.all=true;dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);BC.all=false};
 }
-/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, а его поиск по ссылке не заполняется, поэтому основная ссылка — страница раскрытия на СКРИН по ИНН; e-disclosure — запасной поиск. */
+/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, а его поиск
+   не берёт запрос из ссылки (ищет отдельным POST), поэтому основная ссылка — страница раскрытия на СКРИН по ИНН; кнопка e-disclosure
+   открывает поиск и копирует ИНН, чтобы его оставалось только вставить. */
+document.addEventListener('click',e=>{
+  const a=e.target.closest&&e.target.closest('a[data-copy-open]');
+  if(a)copyText(a.dataset.copyOpen,'ИНН '+a.dataset.copyOpen+' скопирован — вставьте его в поиск на e-disclosure');
+});
 function bcDocLinks(isin,inn,secid){
   isin=String(isin||'').trim().toUpperCase();inn=String(inn||'').replace(/\D/g,'');if(inn.length!==10&&inn.length!==12)inn='';
   const q=inn||isin,code=String(secid||isin||'').trim();
-  const a=(u,t)=>`<a class="btn ghost" href="${esc(u)}" target="_blank" rel="noopener">${t} ↗</a>`;
-  return`<div class="bc-docs">${inn?a('https://disclosure.skrin.ru/disclosure/'+inn,'Раскрытие информации эмитента (СКРИН)'):''}${q?a('https://www.e-disclosure.ru/poisk-po-kompaniyam?query='+encodeURIComponent(q),inn?'Поиск на e-disclosure':'Раскрытие информации эмитента (e-disclosure)'):''}${code?a('https://www.moex.com/ru/issue.aspx?code='+encodeURIComponent(code),'Страница выпуска на Мосбирже'):''}</div>`
+  const a=(u,t,cp)=>`<a class="btn ghost" href="${esc(u)}" target="_blank" rel="noopener"${cp?` data-copy-open="${esc(cp)}" title="Откроет поиск и скопирует ИНН ${esc(cp)}"`:''}>${t} ↗</a>`;
+  return`<div class="bc-docs">${inn?a('https://disclosure.skrin.ru/disclosure/'+inn,'Раскрытие информации эмитента (СКРИН)'):''}${q?a('https://www.e-disclosure.ru/poisk-po-kompaniyam?query='+encodeURIComponent(q),inn?'Поиск на e-disclosure (ИНН скопируется)':'Раскрытие информации эмитента (e-disclosure)',inn):''}${code?a('https://www.moex.com/ru/issue.aspx?code='+encodeURIComponent(code),'Страница выпуска на Мосбирже'):''}</div>`
     +`<p class="note" style="margin-top:8px">Условия оферт (put/call), купонов и досрочного погашения — в решении о выпуске и проспекте.${inn?'':' ИНН эмитента не определён — поиск по ISIN может ничего не найти, тогда введите название эмитента на сайте.'}</p>`;
 }
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
@@ -80,7 +86,11 @@ function bcOutLine(o){
   const bb=o.buybacks_after?` · выкупов после купона: ${o.buybacks_after}`:'';
   const over=o.over_issue_size?' <span class="tag">выше ISSUESIZE (допвыпуск)</span>':'';
   const chips=[];
-  if(o.issue_size!=null)chips.push(`<span>Выпущено: <b class="num">${fmt(o.issue_size)} шт.</b>${o.issue_date?' от '+ddm(o.issue_date):''}</span>`);
+  // Без сообщений эмитента известен только текущий ISSUESIZE Мосбиржи: после выкупа на оферте биржа его уменьшает,
+  // поэтому называть его «выпущено» нельзя — первоначальный объём виден только по раскрытиям.
+  const msOnly=!M[o.method]&&!(o.buybacks||[]).length&&!(o.placements||[]).length;
+  if(o.issue_size!=null)chips.push(msOnly?`<span>Объём выпуска по Мосбирже сейчас: <b class="num">${fmt(o.issue_size)} шт.</b>${o.issue_date?' · в обращении с '+ddm(o.issue_date):''}</span>`
+    :`<span>Выпущено: <b class="num">${fmt(o.issue_size)} шт.</b>${o.issue_date?' от '+ddm(o.issue_date):''}</span>`);
   if(o.placed!=null&&o.placed!==o.issue_size)chips.push(`<span>Размещено первично: <b class="num">${fmt(o.placed)} шт.</b></span>`);
   if(o.added_total>0)chips.push(`<span class="pos">Допвыпуск / доразмещение: <b class="num">+${fmt(o.added_total)} шт.</b></span>`);
   if(o.buybacks_total>0)chips.push(`<span class="neg">Выкуплено (оферты/выкупы): <b class="num">−${fmt(o.buybacks_total)} шт.</b></span>`);
@@ -93,8 +103,9 @@ function bcOutLine(o){
     }).join('');
     tl=`<details class="bc-out-det"><summary>История изменения объёма (${evs.length})</summary><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Событие</th><th>Объём / изменение</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
   }
-  return`<div class="bc-out"><div><b>В рынке сейчас:</b> <span class="num">${fmt(o.qty)} шт.</span>${sh}${over} · <span class="mu">${how}${bb}</span>${src?' · '+src:''}</div>`
-    +(chips.length?`<div class="bc-out-meta">${chips.join('')}</div>`:'')+tl+`</div>`;
+  const msNote=msOnly?`<div class="note" style="margin-top:6px">Мосбиржа уменьшает объём выпуска после выкупа на оферте, поэтому первоначальный объём и выкупы видны только по сообщениям эмитента — их разбирает сервер данных.</div>`:'';
+  return`<div class="bc-out"><div><b>В рынке сейчас:</b> <span class="num">${fmt(o.qty)} шт.</span>${msOnly?'':sh}${over} · <span class="mu">${how}${bb}</span>${src?' · '+src:''}</div>`
+    +(chips.length?`<div class="bc-out-meta">${chips.join('')}</div>`:'')+tl+msNote+`</div>`;
 }
 function bcDisclosure(dc){
   if(!dc)return'';
