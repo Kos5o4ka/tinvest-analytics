@@ -1,4 +1,5 @@
 /* ── Импорт ── */
+const IMP_BROKER={tbank:'Т-Инвестиции',vtb:'ВТБ'};   // распознанные отчёты брокеров (format из /api/import/preview)
 const ROLE_RU={date:'Дата',type:'Тип операции',isin:'ISIN',ticker:'Тикер',name:'Название / описание',qty:'Количество',price:'Цена',amount:'Сумма',currency:'Валюта',commission:'Комиссия',nkd:'НКД'};
 async function renderImport(){
   S.charts=[];
@@ -6,7 +7,7 @@ async function renderImport(){
   const im=S.imp;
   const imps=cfg.imports||[];
   let step='';
-  const tb=!!(im&&im.preview&&im.preview.format==='tbank');
+  const tb=!!(im&&im.preview&&im.preview.format);   // любой распознанный отчёт брокера: своя карточка со сверкой
   if(tb){
     const pv=im.preview,bd=pv.kinds||{},ru=pv.kinds_ru||{},tg=pv.targets||[];
     const cash=Object.entries(pv.cash_bad||{});
@@ -51,8 +52,8 @@ async function renderImport(){
     msg('Читаю файл…','info');
     const data=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=rej;r.readAsDataURL(f)});
     try{const pv=await post('/api/import/preview',{filename:f.name,data});
-      const t=pv.format==='tbank';
-      S.imp={filename:f.name,data,preview:pv,mapping:pv.mapping,name:$('#iname').value||(t?'Т-Инвестиции':f.name.replace(/\.[^.]+$/,'')),broker:$('#ibroker').value||(t?'Т-Инвестиции':''),
+      const t=!!pv.format,bn=IMP_BROKER[pv.format]||'';
+      S.imp={filename:f.name,data,preview:pv,mapping:pv.mapping,name:$('#iname').value||(t?bn||pv.title:f.name.replace(/\.[^.]+$/,'')),broker:$('#ibroker').value||bn,
         target:t&&pv.targets&&pv.targets.length?pv.targets[0].id:$('#itarget').value};msg('');renderImport()}
     catch(e){msg(esc(e.message))}
   }
