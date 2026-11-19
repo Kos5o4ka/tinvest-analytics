@@ -400,7 +400,7 @@ def tbank_parse(table):
         if p["econ_open"] > 0.5:
             q = p["econ_open"]
             ops.append(dict({"id": "tb-open-sec-%s-%s" % (key, period["from"]), "date": open_iso,
-                             "type": "OPERATION_TYPE_INPUT_SECURITIES", "payment": to_money(round(unit * q, 9), "rub"),
+                             "type": "OPERATION_TYPE_INPUT_SECURITIES", "payment": to_money(0, "rub"),   # деньги не двигаются: оценка — в price
                              "name": nm, "_ident": key, "quantity": tb_qty_str(q), "quantityDone": tb_qty_str(q),
                              "price": to_money(round(unit, 9), "rub"),
                              "description": "Входящий остаток на начало периода (раздел 3.1 отчёта)"}, **tag))
@@ -435,7 +435,7 @@ def tbank_parse(table):
         for sec_in, qty_x, when, u in extra:
             ops.append({"id": "tb-xfer-%s-%s-%s" % ("in" if sec_in else "out", key, tb_iso(when)),
                         "date": tb_iso(when), "type": "OPERATION_TYPE_" + ("INPUT_SECURITIES" if sec_in else "OUTPUT_SECURITIES"),
-                        "payment": to_money(round(u * qty_x, 9), "rub"), "name": nm, "_ident": key,
+                        "payment": to_money(0, "rub"), "name": nm, "_ident": key,   # перевод бумаг не двигает деньги; оценка — в price
                         "quantity": tb_qty_str(qty_x), "quantityDone": tb_qty_str(qty_x), "price": to_money(round(u, 9), "rub"),
                         "description": "Движение бумаг без сделки (раздел 3.1 отчёта): перевод, DFP, корпоративное действие или продажа без покрытия"})
             stat["xfer_in" if sec_in else "xfer_out"] += 1
@@ -456,9 +456,8 @@ def tbank_reconcile(ops, meta):
     """Сверка операций с итогами самого отчёта: деньги по валютам и количество бумаг по ISIN.
     {'cash': {cur: (по отчёту, по операциям)}, 'pos': {isin: (по отчёту, по операциям)}, 'ok': bool}."""
     cash = defaultdict(float)
-    for o in ops:
-        if classify(o["type"]) not in ("sec_in", "sec_out"):
-            cash[cur_of(o["payment"])] += qf(o["payment"])
+    for o in ops:                                   # все операции, как их суммирует портфель (переводы бумаг — с нулевой суммой)
+        cash[cur_of(o["payment"])] += qf(o["payment"])
     work = []
     for o in sorted(ops, key=lambda o: o["date"]):
         w = dict(o)

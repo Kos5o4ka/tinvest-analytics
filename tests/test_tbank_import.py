@@ -197,6 +197,11 @@ class TBankParse(unittest.TestCase):
         # продажа 4 из 10 входящих бумаг получает лоты (стоимость оценена по цене сделки периода)
         out = finalize(ops)
         self.assertEqual(M.fifo(out)["imp:" + ISIN]["qty"], 6)
+        # перевод бумаг не двигает деньги: иначе портфель считает оценку бумаг рублями на счёте
+        for o in ops:
+            if M.classify(o["type"]) in ("sec_in", "sec_out"):
+                self.assertEqual(M.qf(o["payment"]), 0.0)
+                self.assertGreater(M.qf(o["price"]), 0.0)
 
     def test_rows_with_same_content_get_distinct_ids(self):
         two = [cash("01.02.2025", "10:00:00", "02.02.2025", "Пополнение счета", cr=100.0)] * 2
@@ -227,7 +232,7 @@ class TBankMerge(unittest.TestCase):
         self.assertTrue(any(o.get("_opening") for o in o2))
         self.assertEqual([o for o in b if o.get("_opening") and o["date"] >= "2025-07-01"], [])
         self.assertEqual(len([o for o in b if o.get("_opening")]), len([o for o in a if o.get("_opening")]))
-        cash_total = sum(M.qf(o["payment"]) for o in b if M.classify(o["type"]) not in ("sec_in", "sec_out"))
+        cash_total = sum(M.qf(o["payment"]) for o in b)                  # все операции, как считает портфель
         self.assertAlmostEqual(cash_total, 93583.0, 2)                    # исходящий остаток второго отчёта
 
     def test_reversed_order_gives_same_result(self):
