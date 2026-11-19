@@ -1,0 +1,21 @@
+/* ── дивидендные гэпы ── */
+.dl-top{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-bottom:16px;position:relative;z-index:5}
+.dl-top .stk-sw{flex:1 1 300px;max-width:480px}
+.dl-f{width:150px}.dl-f .in{width:100%}
+.dl-warn{color:var(--s4)}
+.dl-sc b{font-size:15px;font-variant-numeric:tabular-nums}.dl-sc small{font-size:11.5px}
+.dl-hd{display:flex;gap:18px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:16px}
+.dl-nx{text-align:right}.dl-nx b{font-size:20px;margin:0 6px;font-variant-numeric:tabular-nums}.dl-nx small{display:block}
+.dl-tiles{margin-bottom:0;grid-template-columns:repeat(3,minmax(0,1fr))}
+.dl-lead{font-size:14px;line-height:1.55;color:var(--tx2)}
+.dl-big{font-size:38px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}.dl-big small{font-size:13px;font-weight:500;margin-left:8px;color:var(--tx2)}
+.dl-bar{position:relative;height:8px;margin:14px 0 6px;border-radius:5px;background:linear-gradient(90deg,var(--neg) 0 50%,var(--s4) 50% 80%,var(--pos) 80%);opacity:.55}
+.dl-bar i{position:absolute;top:-4px;width:4px;height:16px;margin-left:-2px;border-radius:2px;background:var(--tx);box-shadow:0 0 0 2px var(--card)}
+.dl-comps{display:grid;gap:12px;margin-top:12px}
+.dl-ch{display:flex;justify-content:space-between;gap:10px;font-size:13px}
+.dl-cb{height:5px;border-radius:3px;background:var(--line);margin:5px 0 3px;overflow:hidden}.dl-cb i{display:block;height:100%;background:var(--s1);border-radius:3px}
+.dl-comp.off{opacity:.6}
+.dl-mid .chart{min-height:230px}
+[data-theme=light] .dl-bar i{background:#1a1d24}
+@media(max-width:1180px){.dl-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:760px){.dl-f{width:calc(50% - 7px)}.dl-nx{text-align:left}.dl-big{font-size:32px}}

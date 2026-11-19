@@ -274,16 +274,6 @@ def stock_candles(secid, interval=24, days=400):
 
 # ── дивиденды ──
 
-def stk_iss_dividends(j):
-    """Таблица dividends ISS -> [{record, payment, declared, value, cur}] (ISS может не отдавать таблицу — тогда пусто)."""
-    out = []
-    for r in _stk_tab(j, "dividends"):
-        d, v = (r.get("registryclosedate") or "")[:10], _stk_f(r.get("value"))
-        if d and v:
-            out.append({"record": d, "payment": None, "declared": None, "last_buy": None, "value": v, "cur": (r.get("currencyid") or "RUB").upper(), "src": "iss"})
-    return out
-
-
 def stk_api_dividends(items):
     """GetDividends -> тот же формат."""
     out = []
@@ -328,11 +318,7 @@ def stk_dividends_build(items, price, today=None):
 
 def stock_dividends(secid, price, uid=None, cfg=None):
     items = []
-    try:
-        items.extend(stk_iss_dividends(_stk_iss("securities/%s/dividends.json?iss.meta=off&iss.only=dividends" % urllib.parse.quote(secid), 20)))
-    except Exception:  # noqa: BLE001
-        pass
-    source = "iss"
+    source = "none"                                    # ISS dividends.json мёртв — только T-Invest / сервер данных
     if uid and cfg and (cfg.get("token") or "").strip():
         try:
             now = datetime.now(timezone.utc)
@@ -343,7 +329,7 @@ def stock_dividends(secid, price, uid=None, cfg=None):
             pass
     else:
         srv = ds_parsed("md/dividends", {"secid": secid})
-        if srv and srv.get("items") is not None:
+        if isinstance(srv, dict) and srv.get("items") is not None:
             items.extend(stk_srv_dividends(srv["items"]))
             source = "tinvest-server"
     res = stk_dividends_build(items, price)

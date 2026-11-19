@@ -7,6 +7,18 @@ set -u
 DATA_DIR=${DATA_DIR:-/opt/tinvest-analytics}     # клон публичного репозитория tinvest-analytics
 BOT_DIR=${BOT_DIR:-/opt/tinvest-bot}             # клон закрытого репозитория tinvest-bot
 HEALTH=${HEALTH:-http://127.0.0.1:8780/v1/health}
+VENV=${VENV:-/opt/tinvest-venv}                  # окружение для библиотек серверных воркеров (server/requirements.txt)
+
+deps() {      # $1 — каталог, $2 — прежний коммит: доустановить библиотеки, если server/requirements.txt изменился
+    req="$1/server/requirements.txt"
+    [ -f "$req" ] || return 0
+    grep -qv '^[[:space:]]*\(#\|$\)' "$req" || return 0                 # в файле нет ни одного пакета
+    if git -C "$1" diff --quiet "$2" HEAD -- server/requirements.txt 2>/dev/null && [ -x "$VENV/bin/python" ]; then
+        return 0                                                          # не менялся, окружение есть
+    fi
+    [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV" || return 1
+    "$VENV/bin/python" -m pip install -q --require-hashes --only-binary=:all: -r "$req"
+}
 
 healthy() {   # $1 — имя сервиса
     sleep 5
@@ -41,6 +53,9 @@ update() {    # $1 — каталог, $2 — сервис, $3 — файл, к�
     git -C "$dir" reset -q --hard "$new"
     if ! python3 -m py_compile "$dir/$main"; then
         echo "$svc: $main не компилируется, откат"; git -C "$dir" reset -q --hard "$old"; return 1
+    fi
+    if ! deps "$dir" "$old"; then
+        echo "$svc: не удалось установить библиотеки из server/requirements.txt, откат"; git -C "$dir" reset -q --hard "$old"; return 1
     fi
     restart "$svc"
     if healthy "$svc"; then

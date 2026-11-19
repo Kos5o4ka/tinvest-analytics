@@ -316,6 +316,18 @@ keys(key_hash TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, created REAL NOT NULL, e
 
 Проверка доступа вынесена в функцию `authorize_ex()` / `authorize()` в `tinvest_server.py`.
 
+## Библиотеки для серверных воркеров
+
+Сервер данных и воркеры работают на стандартной библиотеке. Когда воркеру понадобится пакет (pandas, разбор PDF и т.п.):
+
+1. Добавьте его в `server/requirements.txt` с точной версией и `--hash=sha256:…` (и все зависимости — тоже с хэшами).
+2. Один раз на VPS: `sudo apt install python3-venv` (если `python3 -m venv` ругается).
+3. В unit-файле этого воркера замените `ExecStart=/usr/bin/python3 …` на `ExecStart=/opt/tinvest-venv/bin/python …`
+   (`sudo systemctl daemon-reload`).
+
+Окружение `/opt/tinvest-venv` создаёт и обновляет `tinvest-update.sh`: при изменении `requirements.txt` он ставит пакеты
+с проверкой хэшей (`pip install --require-hashes --only-binary=:all:`); не получилось — откатывает код на прежний коммит.
+
 ## Серверные расчёты (индекс страха и жадности): `calc_worker.py`
 
 Тяжёлые расчёты по публичным данным (сейчас — индекс страха и жадности: первый расчёт ≈ 2 000 запросов к ISS, на VPS — десятки минут; скачанные дни сохраняются в `calc_home`, после перезапуска расчёт продолжается, а следующие пересчёты занимают секунды; ход расчёта пишется в журнал раз в минуту) считаются на сервере один раз, клиенты

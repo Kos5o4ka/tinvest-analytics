@@ -345,7 +345,9 @@ class CrowdStore:
             same = pg[1] == sha
             c.execute("INSERT OR REPLACE INTO subs(url, key_id, gen, status, sha, body, ts) VALUES(?,?,?,?,?,?,?)",
                       (url, key_id, gen, 200, sha, None if same else gz, now))
-            c.execute("UPDATE tasks SET verified=1, vuntil=0 WHERE id=?", (tid,))
+            c.execute("UPDATE tasks SET vuntil=0 WHERE id=?", (tid,))
+            if same:
+                c.execute("UPDATE tasks SET verified=1 WHERE id=?", (tid,))
             if state == "leased" and lkey == key_id:
                 c.execute("UPDATE tasks SET state='done', lease_key=NULL, lease_until=0 WHERE id=?", (tid,))
             if same:
@@ -383,7 +385,8 @@ class CrowdStore:
         top = max(votes.values())
         winners = [s for s, v in votes.items() if v == top]
         if pg[0] in winners:
-            c.execute("UPDATE tasks SET conflict=?, verified=0 WHERE url=?", (1 if len(votes) > 1 and len(winners) > 1 else 0, url))
+            tie = len(votes) > 1 and len(winners) > 1
+            c.execute("UPDATE tasks SET conflict=?, verified=? WHERE url=?", (1 if tie else 0, 0 if tie else 1, url))   # единственный победитель = принятая версия подтверждена
             return
         win = winners[0]
         body = next((b for s, b, _k in rows if s == win and b), None)
@@ -392,7 +395,7 @@ class CrowdStore:
         c.execute("UPDATE pages SET sha=?, body=?, key_id=?, ver=ver+1, changed=1, accepted_at=? WHERE url=?",
                   (win, body, next(k for s, _b, k in rows if s == win), now, url))
         c.execute("INSERT INTO events(url, kind, ts) VALUES(?,?,?)", (url, "replaced", now))
-        c.execute("UPDATE tasks SET conflict=0 WHERE url=?", (url,))
+        c.execute("UPDATE tasks SET conflict=0, verified=1 WHERE url=?", (url,))
         log.warning("страница %s заменена версией большинства (%d из %d)", url, top, len(rows))
 
     # ───────────── недоверие ─────────────

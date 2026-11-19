@@ -160,8 +160,8 @@ class Candles(unittest.TestCase):
 
 class Dividends(unittest.TestCase):
     def test_build(self):
-        iss = m.stk_iss_dividends({"dividends": {"columns": ["secid", "registryclosedate", "value", "currencyid"],
-                                                 "data": [["SBER", "2025-07-18", 34.84, "RUB"], ["SBER", "2024-07-11", 33.3, "RUB"], ["SBER", "2026-07-17", 0, "RUB"]]}})
+        iss = m.stk_srv_dividends([{"record": "2025-07-18", "value": 34.84, "currency": "RUB"}, {"record": "2024-07-11", "value": 33.3, "currency": "RUB"},
+                                   {"record": "2026-07-17", "value": 0, "currency": "RUB"}])
         self.assertEqual(len(iss), 2)
         api = m.stk_api_dividends([{"dividendNet": {"units": "36", "nano": 0, "currency": "rub"}, "recordDate": "2026-07-20T00:00:00Z",
                                     "paymentDate": "2026-07-30T00:00:00Z", "declaredDate": "2026-05-01T00:00:00Z"},

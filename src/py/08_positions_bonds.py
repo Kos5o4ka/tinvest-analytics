@@ -109,6 +109,7 @@ def imported_positions(client, ops, names):
     for o in ops:
         cash[cur_of(o.get("payment"))] += qf(o.get("payment"))
     fx = fx_now(client, curs | set(cash))
+    mq = moex_quotes([u[4:] for u in f if u.startswith("imp:") and u not in lp])      # без токена — котировки Мосбиржи
     out = []
     for uid, p in f.items():
         info = names.get(uid) or {"name": next((o.get("name") for o in ops if (o.get("instrumentUid") or o.get("figi")) == uid), uid),
@@ -125,6 +126,12 @@ def imported_positions(client, ops, names):
                 nominal = (b or {}).get("nominal") or 1000.0
                 unit = unit / 100.0 * nominal
                 nkd = (b or {}).get("aci") or 0.0
+        if unit is None and uid.startswith("imp:") and (cur or "rub") == "rub":
+            q = mq.get(uid[4:].upper())
+            if q and q.get("price"):
+                unit, nkd = q["price"], q.get("nkd") or 0.0
+                if not itype and q.get("type"):
+                    itype = {"etf": "etf"}.get(q["type"], q["type"])
         if unit is None:
             unit = p["last_unit"]
         value = qty * (unit + nkd)
@@ -433,12 +440,30 @@ def bonds_report(client, rows):
             pays.append({"date": b["maturity"], "kind": "redemption", "name": r["name"], "ticker": r["ticker"],
                          "logo": r["logo"], "amount": max(nominal - am_total, 0.0) * r["qty"] * k_, "est": False})
     # дивиденды по акциям (объявленные)
-    shares = [r for r in rows if r["type"] in ("share",) and r["uid"] and r["qty"] > 0 and not r["uid"].startswith("imp:")]
+    shares = [r for r in rows if r["type"] in ("share",) and r["uid"] and r["qty"] > 0]
+
+    def srv_divs(secid):
+        """Дивиденды с сервера данных (md/dividends) -> [[дата, на акцию, валюта]] в окне (today, horizon]."""
+        d = ds_parsed("md/dividends", {"secid": secid}) if secid else None
+        if not isinstance(d, dict) or d.get("items") is None:
+            return None
+        out_ = []
+        for x in d["items"]:
+            dt = iso_date(x.get("payment")) or iso_date(x.get("record"))
+            v_ = qf(x.get("value")) if not isinstance(x.get("value"), (int, float)) else float(x["value"])
+            if dt and v_ and today < dt <= horizon:
+                out_.append([dt, v_, str(x.get("currency") or "rub").lower()])
+        return out_
 
     def divs(r):
         st = store()
         v = st.get("div2:" + r["uid"], ttl=DAY)
-        if v is None and client.ready:
+        if v is None and (r["uid"].startswith("imp:") or not client.ready):
+            sid = (moex_secid(r["uid"][4:]) or r["uid"][4:]) if r["uid"].startswith("imp:") else r.get("ticker")
+            v = srv_divs(sid)
+            if v is not None:
+                st.put("div2:" + r["uid"], v)
+        elif v is None and client.ready:
             try:
                 ds = client.dividends(r["uid"], today + "T00:00:00Z", horizon + "T00:00:00Z")
                 v = [[iso_date(d.get("paymentDate")) or iso_date(d.get("recordDate")), qf(d.get("dividendNet")),

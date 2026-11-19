@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "TAnalytic"
-APP_VERSION = "0.24"
+APP_VERSION = "0.25"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -150,6 +150,176 @@ def make_ssl_context(ca_file="", verify=True):
     return ctx
 
 
+# ═══════════════ дополнительные библиотеки: замок (сгенерировано packaging/vendor_lock.py из packaging/vendor.txt, руками не править) ═══════════════
+# Программа подгрузит колесо, только если его SHA256 совпал с этой таблицей; сама таблица проверяется лаунчером вместе со всем файлом.
+VENDOR_LOCK = [
+    {"name": "pypdf", "version": "6.21.4", "file": "pypdf-6.21.4-py3-none-any.whl", "sha256": "33e4fb41ca352810eb4e9838aa0d82d6888a5f8bf682f43e99cce5faa666255c", "size": 410430, "url": "https://files.pythonhosted.org/packages/3f/4b/77e8ad4ac42c9d93600f40541a50e9feb3a61d2bbee2d76f659346072051/pypdf-6.21.4-py3-none-any.whl", "python": [3, 9], "only_below": None, "requires": ["typing_extensions"]},
+    {"name": "typing_extensions", "version": "4.15.0", "file": "typing_extensions-4.15.0-py3-none-any.whl", "sha256": "f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548", "size": 44614, "url": "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl", "python": [3, 9], "only_below": [3, 11], "requires": []},
+]
+
+# ═══════════════ дополнительные библиотеки: загрузка по требованию ═══════════════
+# Ядро программы работает только на стандартной библиотеке. Тяжёлым функциям (разбор PDF и т.п.) нужны чистые Python-пакеты
+# из VENDOR_LOCK: колесо скачивается при первом обращении в APP_DIR/lib, проверяется по SHA256 из замка и импортируется прямо
+# из .whl (zipimport, без распаковки). Хэш не совпал — файл не используется. Источник: PyPI, запасной — ассет релиза на GitHub.
+#
+#   pypdf = vendor_import("pypdf")      # ApiError с понятным текстом, если библиотека недоступна
+#   vendor_available("pypdf")           # уже скачана и проверена (без сети)
+
+import importlib
+import urllib.parse
+
+VENDOR_DIR = os.path.join(APP_DIR, "lib")
+VENDOR_GH = "https://github.com/Kos5o4ka/tinvest-analytics/releases/download/v%s/%s"
+_vendor_mx = threading.Lock()
+_vendor_ok = {}                     # имя файла -> путь, проверенный в этом процессе
+
+
+def _vendor_entry(name):
+    for e in VENDOR_LOCK:
+        if e["name"] == name:
+            return e
+    raise ApiError("Библиотека %s не входит в состав программы." % name, 500)
+
+
+def _vendor_supported(e, vi=None):
+    return tuple((vi or sys.version_info)[:2]) >= tuple(e["python"])
+
+
+def _vendor_needed(e, vi=None):
+    return not e.get("only_below") or tuple((vi or sys.version_info)[:2]) < tuple(e["only_below"])
+
+
+def _vendor_sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _vendor_urls(e):
+    return [e["url"], VENDOR_GH % (APP_VERSION, e["file"])]
+
+
+def _vendor_get(url, limit, timeout):
+    """Байты по адресу (не больше limit). Отдельная функция — чтобы подменять в тестах."""
+    req = urllib.request.Request(url, headers={"User-Agent": "TAnalytic/%s" % APP_VERSION})
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("файл больше ожидаемого")
+    return data
+
+
+def _vendor_fetch(e, timeout):
+    """Скачать колесо и проверить SHA256. Любой источник годится: подменённый файл не пройдёт проверку."""
+    errs = []
+    for url in _vendor_urls(e):
+        try:
+            data = _vendor_get(url, int(e["size"]) + 1024, timeout)
+        except Exception as x:  # noqa: BLE001
+            errs.append("%s: %s" % (urllib.parse.urlparse(url).netloc, x))
+            continue
+        if hashlib.sha256(data).hexdigest() != e["sha256"]:
+            errs.append("%s: контрольная сумма не совпала" % urllib.parse.urlparse(url).netloc)
+            continue
+        os.makedirs(VENDOR_DIR, exist_ok=True)
+        path = os.path.join(VENDOR_DIR, e["file"])
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        _vendor_cleanup()
+        return path
+    raise ApiError("Не удалось загрузить библиотеку %s %s (%s). Проверьте интернет и попробуйте ещё раз."
+                   % (e["name"], e["version"], "; ".join(errs) or "нет источников"), 503)
+
+
+def _vendor_cleanup():
+    """Удалить из APP_DIR/lib колёса, которых нет в замке (прежние версии)."""
+    keep = {e["file"] for e in VENDOR_LOCK}
+    try:
+        for fn in os.listdir(VENDOR_DIR):
+            if fn.endswith(".whl") and fn not in keep:
+                os.remove(os.path.join(VENDOR_DIR, fn))
+    except OSError:
+        pass
+
+
+def _vendor_file(e, download, timeout):
+    """Путь к проверенному колесу или None (download=False и файла нет)."""
+    if e["file"] in _vendor_ok:
+        return _vendor_ok[e["file"]]
+    path = os.path.join(VENDOR_DIR, e["file"])
+    if os.path.isfile(path):
+        try:
+            if _vendor_sha(path) == e["sha256"]:
+                _vendor_ok[e["file"]] = path
+                return path
+        except OSError:
+            pass
+        try:
+            os.remove(path)               # испорченный или подменённый файл
+        except OSError:
+            pass
+    if not download:
+        return None
+    path = _vendor_fetch(e, timeout)
+    _vendor_ok[e["file"]] = path
+    return path
+
+
+def _vendor_chain(name, seen=None):
+    """Библиотека и её зависимости из замка, которые нужны на этой версии Python (зависимости — первыми)."""
+    seen = seen if seen is not None else []
+    e = _vendor_entry(name)
+    for r in e.get("requires") or []:
+        if _vendor_needed(_vendor_entry(r)) and r not in [x["name"] for x in seen]:
+            _vendor_chain(r, seen)
+    if e not in seen:
+        seen.append(e)
+    return seen
+
+
+def vendor_available(name):
+    """Библиотека уже скачана, проверена и подходит к этой версии Python (сеть не трогается)."""
+    try:
+        chain = _vendor_chain(name)
+        if not all(_vendor_supported(e) for e in chain):
+            return False
+        with _vendor_mx:
+            return all(_vendor_file(e, False, 0) for e in chain)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def vendor_import(name, download=True, timeout=60):
+    """Импорт дополнительной библиотеки: при необходимости скачать, проверить SHA256, подключить .whl. -> модуль."""
+    chain = _vendor_chain(name)
+    for e in chain:
+        if not _vendor_supported(e):
+            raise ApiError("Для этой функции нужен Python %d.%d или новее (сейчас %d.%d). Установите приложение TAnalytic "
+                           "или обновите Python." % (e["python"][0], e["python"][1], sys.version_info[0], sys.version_info[1]), 501)
+    with _vendor_mx:
+        for e in chain:
+            path = _vendor_file(e, download, timeout)
+            if not path:
+                raise ApiError("Библиотека %s ещё не загружена." % e["name"], 503)
+            if path not in sys.path:
+                sys.path.insert(0, path)    # наша проверенная версия важнее установленной в системе
+        importlib.invalidate_caches()
+    return importlib.import_module(name)
+
+
+def vendor_status():
+    out = []
+    for e in VENDOR_LOCK:
+        out.append({"name": e["name"], "version": e["version"], "size": e["size"], "needed": _vendor_needed(e),
+                    "supported": _vendor_supported(e), "installed": vendor_available(e["name"]) if _vendor_needed(e) else None})
+    return out
+
+
+API_GET["/api/vendor"] = lambda cfg, acc, q, force: {"ok": True, "dir": VENDOR_DIR, "items": vendor_status()}
 # ═══════════════════════════════ настройки ═══════════════════════════════
 
 _cfg_lock = threading.Lock()
@@ -1505,6 +1675,7 @@ def imported_positions(client, ops, names):
     for o in ops:
         cash[cur_of(o.get("payment"))] += qf(o.get("payment"))
     fx = fx_now(client, curs | set(cash))
+    mq = moex_quotes([u[4:] for u in f if u.startswith("imp:") and u not in lp])      # без токена — котировки Мосбиржи
     out = []
     for uid, p in f.items():
         info = names.get(uid) or {"name": next((o.get("name") for o in ops if (o.get("instrumentUid") or o.get("figi")) == uid), uid),
@@ -1521,6 +1692,12 @@ def imported_positions(client, ops, names):
                 nominal = (b or {}).get("nominal") or 1000.0
                 unit = unit / 100.0 * nominal
                 nkd = (b or {}).get("aci") or 0.0
+        if unit is None and uid.startswith("imp:") and (cur or "rub") == "rub":
+            q = mq.get(uid[4:].upper())
+            if q and q.get("price"):
+                unit, nkd = q["price"], q.get("nkd") or 0.0
+                if not itype and q.get("type"):
+                    itype = {"etf": "etf"}.get(q["type"], q["type"])
         if unit is None:
             unit = p["last_unit"]
         value = qty * (unit + nkd)
@@ -1829,12 +2006,30 @@ def bonds_report(client, rows):
             pays.append({"date": b["maturity"], "kind": "redemption", "name": r["name"], "ticker": r["ticker"],
                          "logo": r["logo"], "amount": max(nominal - am_total, 0.0) * r["qty"] * k_, "est": False})
     # дивиденды по акциям (объявленные)
-    shares = [r for r in rows if r["type"] in ("share",) and r["uid"] and r["qty"] > 0 and not r["uid"].startswith("imp:")]
+    shares = [r for r in rows if r["type"] in ("share",) and r["uid"] and r["qty"] > 0]
+
+    def srv_divs(secid):
+        """Дивиденды с сервера данных (md/dividends) -> [[дата, на акцию, валюта]] в окне (today, horizon]."""
+        d = ds_parsed("md/dividends", {"secid": secid}) if secid else None
+        if not isinstance(d, dict) or d.get("items") is None:
+            return None
+        out_ = []
+        for x in d["items"]:
+            dt = iso_date(x.get("payment")) or iso_date(x.get("record"))
+            v_ = qf(x.get("value")) if not isinstance(x.get("value"), (int, float)) else float(x["value"])
+            if dt and v_ and today < dt <= horizon:
+                out_.append([dt, v_, str(x.get("currency") or "rub").lower()])
+        return out_
 
     def divs(r):
         st = store()
         v = st.get("div2:" + r["uid"], ttl=DAY)
-        if v is None and client.ready:
+        if v is None and (r["uid"].startswith("imp:") or not client.ready):
+            sid = (moex_secid(r["uid"][4:]) or r["uid"][4:]) if r["uid"].startswith("imp:") else r.get("ticker")
+            v = srv_divs(sid)
+            if v is not None:
+                st.put("div2:" + r["uid"], v)
+        elif v is None and client.ready:
             try:
                 ds = client.dividends(r["uid"], today + "T00:00:00Z", horizon + "T00:00:00Z")
                 v = [[iso_date(d.get("paymentDate")) or iso_date(d.get("recordDate")), qf(d.get("dividendNet")),
@@ -2672,6 +2867,112 @@ def build_risk(cfg, acc, q=None):
                        "real_tax": fish(m["irr_tax"]) if m.get("irr_tax") is not None else None,
                        "irr_count": m.get("irr_count"), "irr_value": m.get("irr_value")}
     return mem_put(key, out)
+# ═══════════════════════════════ котировки MOEX ISS для бумаг из отчётов брокера (без токена T-Invest) ═══════════════════════════════
+
+MQ_FIND = "https://iss.moex.com/iss/securities.json?q=%s&iss.meta=off&securities.columns=secid,isin,primary_boardid,group,is_traded"
+MQ_BOARD = "https://iss.moex.com/iss/engines/stock/markets/%s/boards/%s/securities/%s.json?iss.meta=off&iss.only=securities,marketdata"
+MQ_TTL, MQ_MAP_TTL, MQ_ERR_TTL = 15 * 60, 30 * DAY, 10 * 60
+MQ_GROUPS = {"stock_shares": ("share", "shares"), "stock_bonds": ("bond", "bonds"), "stock_ppif": ("etf", "shares"),
+             "stock_etf": ("etf", "shares"), "stock_dr": ("share", "shares"), "stock_qnv": ("share", "shares")}
+
+
+def _mq_num(x):
+    try:
+        v = float(x)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _mq_find(ident):
+    """ident (ISIN или тикер) -> {secid, isin, board, type, market} либо None. Маппинг кэшируется на 30 дней, неудача — на 10 минут."""
+    st = store()
+    key = "mqmap:" + ident
+    v = st.get(key, ttl=MQ_MAP_TTL)
+    if v is not None:
+        if v.get("ok"):
+            return v
+        if time.time() - v.get("ts", 0) < MQ_ERR_TTL:
+            return None
+    best = None
+    try:
+        rows = _bc_table(json.loads(http_text(MQ_FIND % urllib.parse.quote(ident), 20)), "securities")
+        for r in rows:
+            g = MQ_GROUPS.get(r.get("group") or "")
+            if not g or not r.get("primary_boardid") or not r.get("secid"):
+                continue
+            exact = ident in (str(r.get("isin") or "").upper(), str(r["secid"]).upper())
+            score = (exact, bool(r.get("is_traded")))
+            if exact and (best is None or score > best[0]):
+                best = (score, {"ok": True, "secid": str(r["secid"]).upper(), "isin": str(r.get("isin") or "").upper(),
+                                "board": r["primary_boardid"], "type": g[0], "market": g[1]})
+    except Exception:  # noqa: BLE001
+        best = None
+    out = best[1] if best else {"ok": False, "ts": time.time()}
+    try:
+        st.put(key, out)
+    except Exception:  # noqa: BLE001
+        pass
+    return out if out.get("ok") else None
+
+
+def _mq_one(ident):
+    ident = (ident or "").strip().upper()
+    if not ident:
+        return ident, None
+    try:
+        st = store()
+        key = "mqquote:" + ident
+        v = st.get(key, ttl=MQ_TTL)
+        if v is not None and (v.get("ok") or time.time() - v.get("ts", 0) < MQ_ERR_TTL):
+            return ident, (v if v.get("ok") else None)
+        m = _mq_find(ident)
+        if not m:
+            return ident, None
+        res = None
+        try:
+            j = json.loads(http_text(MQ_BOARD % (m["market"], m["board"], urllib.parse.quote(m["secid"])), 20))
+            sec = (_bc_table(j, "securities") or [{}])[0]
+            md = (_bc_table(j, "marketdata") or [{}])[0]
+            px = (_mq_num(md.get("LAST")) or _mq_num(md.get("LCURRENTPRICE")) or _mq_num(md.get("MARKETPRICE"))
+                  or _mq_num(sec.get("PREVPRICE")) or _mq_num(sec.get("PREVLEGALCLOSEPRICE")))
+            cur = str(sec.get("CURRENCYID") or sec.get("FACEUNIT") or "SUR").upper()
+            if px and cur in ("SUR", "RUB", "RUR"):
+                nkd = 0.0
+                if m["type"] == "bond":
+                    face = _mq_num(sec.get("FACEVALUE")) or 1000.0
+                    px = px / 100.0 * face
+                    nkd = _mq_num(sec.get("ACCRUEDINT")) or 0.0
+                res = {"ok": True, "secid": m["secid"], "type": m["type"], "price": px, "nkd": nkd, "isin": m["isin"]}
+        except Exception:  # noqa: BLE001
+            res = None
+        st.put(key, res or {"ok": False, "ts": time.time()})
+        if not res:                                    # неудачу держим недолго
+            return ident, None
+        return ident, res
+    except Exception:  # noqa: BLE001
+        return ident, None
+
+
+def moex_quotes(idents):
+    """{ident (ISIN/тикер): {secid, type: share|bond|etf, price (₽ за штуку), nkd (₽ на облигацию), isin}}; без сети/данных — пропуск. Не бросает."""
+    ids = sorted({(x or "").strip().upper() for x in idents or [] if x})
+    if not ids:
+        return {}
+    try:
+        return {i: q for i, q in pool_map(_mq_one, ids) if q}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def moex_secid(ident):
+    """ISIN/тикер -> SECID Мосбиржи (или None)."""
+    try:
+        ident = (ident or "").strip().upper()
+        m = _mq_find(ident) if ident else None
+        return m["secid"] if m else None
+    except Exception:  # noqa: BLE001
+        return None
 # ═══════════════════════════════ история стоимости и доходность ═══════════════════════════════
 
 SPLIT_FACTORS = (2, 3, 4, 5, 8, 10, 15, 20, 25, 40, 50, 100, 200, 500, 1000, 5000, 10000)
@@ -3811,6 +4112,16 @@ def tb_hash_id(prefix, parts, seen):
     return "%s-%s%s" % (prefix, h, "" if n == 1 else "-%d" % n)
 
 
+def uniq_op_id(xid, seen):
+    """id перевода бумаг: при совпадении (одна бумага, одна секунда) — суффикс -2, -3...; прежние id не меняются."""
+    base, n = xid, 1
+    while xid in seen:
+        n += 1
+        xid = "%s-%d" % (base, n)
+    seen.add(xid)
+    return xid
+
+
 def tb_deals(rows):
     """Строки раздела 1.1/1.2 -> список сделок (все виды, включая РЕПО; фильтрует вызывающий)."""
     out, cm = [], None
@@ -3998,7 +4309,7 @@ def tbank_parse(table, splits=None):
         d_from, d_to = min(dts), max(dts)
     start = d_from.replace(hour=0, minute=0, second=0)
     period = {"from": start.strftime("%Y-%m-%d"), "to": (d_to or d_from).strftime("%Y-%m-%d")}
-    ops, stat = [], defaultdict(int)
+    ops, stat, xids = [], defaultdict(int), set()
 
     # ── сделки (раздел 1.1) ──
     dq_trade, dq_repo, first_unit, nums = defaultdict(float), defaultdict(float), {}, defaultdict(int)
@@ -4145,7 +4456,9 @@ def tbank_parse(table, splits=None):
         elif r < 0:
             extra.append((False, -r, end_dt, unit))
         for sec_in, qty_x, when, u in extra:
-            ops.append({"id": "tb-xfer-%s-%s-%s" % ("in" if sec_in else "out", key, tb_iso(when)),
+            xid = "tb-xfer-%s-%s-%s" % ("in" if sec_in else "out", key, tb_iso(when))
+            xid = uniq_op_id(xid, xids)
+            ops.append({"id": xid,
                         "date": tb_iso(when), "type": "OPERATION_TYPE_" + ("INPUT_SECURITIES" if sec_in else "OUTPUT_SECURITIES"),
                         "payment": to_money(0, "rub"), "name": nm, "_ident": key,   # перевод бумаг не двигает деньги; оценка — в price
                         "quantity": tb_qty_str(qty_x), "quantityDone": tb_qty_str(qty_x), "price": to_money(round(u, 9), "rub"),
@@ -4459,7 +4772,7 @@ def vtb_parse(table, splits=None):
     pos = vt_secbal(sec.get("secbal") or [])
     mov = vt_secmov(sec.get("secmov") or [])
     stat = defaultdict(int)
-    ops, deal_seen = [], {}
+    ops, deal_seen, xids = [], {}, set()
     for x in vt_deals(sec.get("deals") or []) + vt_deals(sec.get("done") or []):  # «заключённые» + «завершённые», дедуп по номеру
         deal_seen.setdefault(x["num"], x)
     deals = sorted(deal_seen.values(), key=lambda z: z["dt"])
@@ -4576,7 +4889,9 @@ def vtb_parse(table, splits=None):
         elif r < 0:
             extra.append((False, -r, end_dt, unit))
         for sec_in, qty_x, when, u in extra:
-            ops.append({"id": "vtb-xfer-%s-%s-%s" % ("in" if sec_in else "out", isin, tb_iso(when)), "date": tb_iso(when),
+            xid = "vtb-xfer-%s-%s-%s" % ("in" if sec_in else "out", isin, tb_iso(when))
+            xid = uniq_op_id(xid, xids)
+            ops.append({"id": xid, "date": tb_iso(when),
                         "type": "OPERATION_TYPE_" + ("INPUT_SECURITIES" if sec_in else "OUTPUT_SECURITIES"),
                         "payment": to_money(0, "rub"), "name": nm, "_ident": isin,
                         "quantity": tb_qty_str(qty_x), "quantityDone": tb_qty_str(qty_x), "price": to_money(round(u, 9), "rub"),
@@ -16206,7 +16521,8 @@ CROWD_AZIPI = "https://e-disclosure.azipi.ru/"
 CROWD_UA = "Mozilla/5.0 (compatible; TAnalytic-crowd/%s; +https://github.com/Kos5o4ka/tinvest-analytics)"
 _CROWD_FEED = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/list/day-(\d{2}\.\d{2}\.\d{4})/\?MESSAGE_BY_DAY=\1&PAGEN_2=\d{1,3}$")
 _CROWD_MSG = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/\d{1,10}/$")
-_CROWD_BAD = ("captcha", "just a moment", "access denied", "attention required", "ddos")
+_CROWD_BAD = ("captcha", "just a moment", "access denied", "attention required", "ddos",
+              "доступ ограничен", "подтвердите, что вы не робот", "проверка безопасности", "are you a robot", "cf-browser-verification")
 DEFAULT_CONFIG.setdefault("crowd_enabled", True)     # по умолчанию помогаем; выключается в «Настройках»
 DEFAULT_CONFIG.setdefault("crowd_dismissed", False)
 
@@ -17877,16 +18193,6 @@ def stock_candles(secid, interval=24, days=400):
 
 # ── дивиденды ──
 
-def stk_iss_dividends(j):
-    """Таблица dividends ISS -> [{record, payment, declared, value, cur}] (ISS может не отдавать таблицу — тогда пусто)."""
-    out = []
-    for r in _stk_tab(j, "dividends"):
-        d, v = (r.get("registryclosedate") or "")[:10], _stk_f(r.get("value"))
-        if d and v:
-            out.append({"record": d, "payment": None, "declared": None, "last_buy": None, "value": v, "cur": (r.get("currencyid") or "RUB").upper(), "src": "iss"})
-    return out
-
-
 def stk_api_dividends(items):
     """GetDividends -> тот же формат."""
     out = []
@@ -17931,11 +18237,7 @@ def stk_dividends_build(items, price, today=None):
 
 def stock_dividends(secid, price, uid=None, cfg=None):
     items = []
-    try:
-        items.extend(stk_iss_dividends(_stk_iss("securities/%s/dividends.json?iss.meta=off&iss.only=dividends" % urllib.parse.quote(secid), 20)))
-    except Exception:  # noqa: BLE001
-        pass
-    source = "iss"
+    source = "none"                                    # ISS dividends.json мёртв — только T-Invest / сервер данных
     if uid and cfg and (cfg.get("token") or "").strip():
         try:
             now = datetime.now(timezone.utc)
@@ -17946,7 +18248,7 @@ def stock_dividends(secid, price, uid=None, cfg=None):
             pass
     else:
         srv = ds_parsed("md/dividends", {"secid": secid})
-        if srv and srv.get("items") is not None:
+        if isinstance(srv, dict) and srv.get("items") is not None:
             items.extend(stk_srv_dividends(srv["items"]))
             source = "tinvest-server"
     res = stk_dividends_build(items, price)
@@ -22048,10 +22350,10 @@ def pm_ghost_portfolio(hist):
                 if cash_wait:
                     units += cash_wait / p
                     cash_wait = 0.0
-                units += flow / p
+                units = max(0.0, units + flow / p)      # вывод больше стоимости бенчмарка не делает его шортом
                 gv = max(0.0, units * p)
             else:
-                cash_wait += flow
+                cash_wait = max(0.0, cash_wait + flow)
                 gv = max(0.0, cash_wait)
             curve.append(round(gv, 2))
         if not valid:
@@ -22090,6 +22392,375 @@ def _api_postmortem(cfg, acc, q, force):
 
 
 API_GET["/api/postmortem"] = _api_postmortem
+# ═══════════════════ дивидендные гэпы: лаборатория отсечки, радар по портфелю, оценка надёжности дивидендов ═══════════════════
+# Чистая математика (без сети): dl_gaps / dl_stats / dl_payoff / dl_safety. Сеть — только в _dl_analyze (свечи ISS, дивиденды T-Invest/сервер, МСФО).
+# Описательная статистика по прошлым отсечкам, не инвестиционная рекомендация.
+
+DL_HORIZON = 250                      # торговых дней на закрытие гэпа
+DL_WINDOWS = (30, 60, 90)
+DL_T1_FROM = "2023-07-31"            # Мосбиржа перешла с расчётов T+2 на T+1
+DL_TTL = 12 * 3600
+DL_HIST = [("в день отсечки", 0, 0), ("1–5 дн.", 1, 5), ("6–20 дн.", 6, 20), ("21–60 дн.", 21, 60), ("61–120 дн.", 61, 120), ("121–250 дн.", 121, 250)]
+
+
+def _dl_num(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if x == x and x not in (float("inf"), float("-inf")) else None
+
+
+def dl_median(vals):
+    v = sorted(x for x in vals if x is not None)
+    if not v:
+        return None
+    n = len(v)
+    return float(v[n // 2]) if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
+
+def dl_gaps(divs, candles, horizon=DL_HORIZON):
+    """Прошлые рублёвые дивиденды × дневные свечи -> гэпы отсечки.
+    divs: [{record, value, cur?, last_buy?}], candles: [{t, o, h, l, c}] (t — ГГГГ-ММ-ДД). Результат — по возрастанию даты фиксации."""
+    cs = sorted((c for c in candles or [] if c.get("t") and _dl_num(c.get("c")) is not None), key=lambda c: c["t"])
+    if len(cs) < 3:
+        return []
+    ds = [c["t"][:10] for c in cs]
+    out, seen = [], set()
+    for d in sorted(divs or [], key=lambda x: x.get("record") or ""):
+        rec, val = (d.get("record") or "")[:10], _dl_num(d.get("value"))
+        if not rec or not val or val <= 0 or str(d.get("cur") or "RUB").upper() not in ("RUB", "RUR") or rec in seen:
+            continue
+        seen.add(rec)
+        if rec > ds[-1] or rec <= ds[0]:
+            continue
+        lb = (d.get("last_buy") or "")[:10]
+        if lb and ds[0] <= lb < rec and rec >= DL_T1_FROM:   # для отсечек эпохи T+2 T-Invest отдаёт last_buy по правилу T+1 — не верим
+            i_last = bisect.bisect_right(ds, lb) - 1          # последний торговый день не позже last_buy
+        else:
+            # последний день покупки: за 1 торговый день до фиксации (T+1 с 31.07.2023), раньше — за 2 (T+2)
+            i_last = bisect.bisect_left(ds, rec) - (1 if rec >= DL_T1_FROM else 2)
+        if i_last < 0 or i_last + 1 >= len(cs):
+            continue
+        try:
+            if (datetime.strptime(rec, "%Y-%m-%d") - datetime.strptime(ds[i_last], "%Y-%m-%d")).days > 10:
+                continue                                      # дыра в данных: свечи не покрывают отсечку
+        except ValueError:
+            continue
+        pre = _dl_num(cs[i_last]["c"])
+        i_gap = i_last + 1
+        post = _dl_num(cs[i_gap].get("o")) or _dl_num(cs[i_gap]["c"])
+        if not pre or not post:
+            continue
+        gap = pre - post
+        n_after = len(cs) - 1 - i_gap                         # торговых дней после дня гэпа в данных
+        closed, days, mx = False, None, post
+        for k in range(0, min(horizon, n_after) + 1):
+            h = _dl_num(cs[i_gap + k].get("h")) or _dl_num(cs[i_gap + k]["c"])
+            if h is not None and h > mx:
+                mx = h
+            if h is not None and h >= pre:
+                closed, days = True, k
+                break
+        rec_pct = 100.0 if closed else (round((mx - post) / gap * 100.0, 1) if gap > 0 else 0.0)
+        out.append({"record": rec, "last_buy": ds[i_last], "gap_day": ds[i_gap], "div": val, "p_pre": round(pre, 4), "p_post": round(post, 4),
+                    "gap": round(gap, 4), "gap_pct": round(gap / pre * 100.0, 2), "div_pct": round(val / pre * 100.0, 2), "k": round(gap / val, 3),
+                    "closed": closed, "days": days, "recovery_pct": rec_pct, "n_after": n_after})
+    return out
+
+
+def dl_stats(gaps, horizon=DL_HORIZON):
+    """Сводка по гэпам: медиана дней до закрытия (только закрытые), доли закрытых за 30/60/90 дней (среди событий, по которым уже можно судить),
+    число «ещё открытых» (слишком свежих), средняя k = гэп / дивиденд, гистограмма сроков закрытия."""
+    gs = gaps or []
+    closed = [g for g in gs if g["closed"]]
+    win = {}
+    for w in DL_WINDOWS:
+        den = [g for g in gs if g["closed"] or g["n_after"] >= w]
+        num = [g for g in den if g["closed"] and g["days"] <= w]
+        win[str(w)] = {"n": len(num), "of": len(den), "pct": round(len(num) / len(den) * 100.0, 1) if den else None}
+    still_open = [g for g in gs if not g["closed"] and g["n_after"] < DL_WINDOWS[-1]]
+    ks = [g["k"] for g in gs]
+    hist = [{"label": lb, "n": sum(1 for g in closed if lo <= g["days"] <= hi)} for lb, lo, hi in DL_HIST]
+    hist.append({"label": "не закрыт", "n": sum(1 for g in gs if not g["closed"] and g["n_after"] >= DL_WINDOWS[-1])})
+    hist.append({"label": "ещё открыт", "n": len(still_open)})
+    return {"count": len(gs), "closed": len(closed), "median_days": dl_median([g["days"] for g in closed]), "within": win, "still_open": len(still_open),
+            "avg_k": round(sum(ks) / len(ks), 3) if ks else None, "median_k": round(dl_median(ks), 3) if ks else None,
+            "avg_gap_pct": round(sum(g["gap_pct"] for g in gs) / len(gs), 2) if gs else None, "hist": hist}
+
+
+def dl_payoff(div, p_pre, p_post_est, cost, tax_rate, fee_rate):
+    """На одну акцию, изменение стоимости от цены накануне p_pre: удержание = дивиденд после налога − гэп;
+    продажа накануне и обратная покупка по p_buy (на 0,1 гэпа выше открытия) = −(p_buy − p_post) − комиссии − налог с продажи."""
+    div, p_pre, p_post_est = float(div), float(p_pre), float(p_post_est)
+    tax, fee = float(tax_rate or 0.0), float(fee_rate or 0.0)
+    gap = p_pre - p_post_est
+    hold = div * (1.0 - tax) - gap
+    p_buy = p_post_est + 0.1 * gap
+    tax_sale = tax * max(0.0, p_pre - cost) if cost is not None else 0.0
+    sell = (p_post_est - p_buy) - 2.0 * fee * p_pre - tax_sale   # продали по p_pre, откупили по p_buy: в итоге та же акция по p_post_est плюс разница
+    return {"div": round(div, 4), "p_pre": round(p_pre, 4), "p_post_est": round(p_post_est, 4), "gap": round(gap, 4),
+            "gap_pct": round(gap / p_pre * 100.0, 2) if p_pre else None, "p_buy": round(p_buy, 4), "hold": round(hold, 4),
+            "sell_rebuy": round(sell, 4), "diff": round(sell - hold, 4), "tax_sale": round(tax_sale, 4), "fees": round(2.0 * fee * p_pre, 4),
+            "cost_known": cost is not None, "tax_rate": tax, "fee_rate": fee}
+
+
+def dl_streak(years, today_year):
+    """Подряд идущие календарные годы с выплатами, оканчивающиеся текущим или прошлым годом."""
+    ys = set(years)
+    y = today_year if today_year in ys else today_year - 1
+    n = 0
+    while y in ys:
+        n += 1
+        y -= 1
+    return n
+
+
+DL_ZONES = [(80, "надёжно", "pos"), (50, "умеренно", "warn"), (0, "высокий риск", "neg")]
+
+
+def dl_zone(score):
+    if score is None:
+        return None
+    return next(z for z in DL_ZONES if score >= z[0])
+
+
+def dl_safety(fin):
+    """Оценка надёжности дивиденда 0–100. fin: {fcf, div_total (оба млн ₽), nd_ebitda, roe (%), pay_years (подряд), bank}.
+    Компонент без данных исключается, баллы пересчитываются на доступный вес; при доступных <50 % веса оценки нет."""
+    fin = fin or {}
+    comps, flags = [], []
+
+    def add(cid, name, w, pts, val, note):
+        comps.append({"id": cid, "name": name, "weight": w, "points": pts, "value": val, "note": note, "available": pts is not None})
+
+    fcf, dt = _dl_num(fin.get("fcf")), _dl_num(fin.get("div_total"))
+    if fcf is None or dt is None or dt <= 0:
+        add("fcf", "Покрытие дивидендов свободным денежным потоком", 40, None, None, "нет данных" if dt is None or fcf is None else "нет выплат за 12 мес.")
+    else:
+        cov = fcf / dt
+        pts = 40 if cov >= 1.3 else 30 if cov >= 1.0 else 15 if cov >= 0.7 else 0
+        if pts == 0:
+            flags.append("дивиденды больше свободного денежного потока")
+        add("fcf", "Покрытие дивидендов свободным денежным потоком", 40, pts, round(cov, 2), "FCF / дивиденды = ×%.2f" % cov)
+    nd = _dl_num(fin.get("nd_ebitda"))
+    if fin.get("bank"):
+        add("nd", "Чистый долг / EBITDA", 30, None, None, "не применимо к банкам и финансовым компаниям")
+    elif nd is None:
+        add("nd", "Чистый долг / EBITDA", 30, None, None, "нет данных")
+    else:
+        pts = 30 if nd < 1.5 else 20 if nd < 2.5 else 10 if nd < 3.5 else 0
+        add("nd", "Чистый долг / EBITDA", 30, pts, round(nd, 2), "×%.2f" % nd)
+    py = fin.get("pay_years")
+    if py is None:
+        add("track", "Стабильность выплат", 20, None, None, "нет данных")
+    else:
+        pts = 20 if py >= 5 else 15 if py >= 3 else 5
+        add("track", "Стабильность выплат", 20, pts, py, "лет подряд с выплатами: %d" % py)
+    roe = _dl_num(fin.get("roe"))
+    if roe is None:
+        add("roe", "Рентабельность капитала (ROE)", 10, None, None, "нет данных")
+    else:
+        pts = 10 if roe >= 20 else 5 if roe >= 10 else 0
+        add("roe", "Рентабельность капитала (ROE)", 10, pts, round(roe, 1), "%.1f %%" % roe)
+    avail = sum(c["weight"] for c in comps if c["available"])
+    if avail < 50:
+        return {"score": None, "zone": None, "label": None, "available_weight": avail, "components": comps, "flags": flags,
+                "note": "Недостаточно данных для оценки (доступно %d %% веса)." % avail}
+    score = int(round(sum(c["points"] for c in comps if c["available"]) / float(avail) * 100.0))
+    z = dl_zone(score)
+    return {"score": score, "zone": z[2], "label": z[1], "available_weight": avail, "components": comps, "flags": flags, "note": None}
+
+
+# ── сеть: сбор данных по бумаге ──
+
+def _dl_rub_divs(items):
+    return [d for d in items or [] if str(d.get("cur") or "RUB").upper() in ("RUB", "RUR") and _dl_num(d.get("value"))]
+
+
+def _dl_fin_inputs(secid, q, dv, divs, cfg):
+    """Входы dl_safety: МСФО (FCF, долг) + мультипликаторы (ND/EBITDA, ROE) + число лет подряд с выплатами. Любой сбой -> компонент без данных."""
+    today = date.today()
+    out = {"fcf": None, "div_total": None, "nd_ebitda": None, "roe": None, "bank": (q or {}).get("sector") == "Банки и финансы", "pay_years": None}
+    years = {int(d["record"][:4]) for d in divs if d.get("record") and d["record"] <= today.isoformat()}
+    if years:
+        out["pay_years"] = dl_streak(years, today.year)
+    try:
+        fin = ifrs_fin(secid)
+        if fin.get("bank"):
+            out["bank"] = True
+        c = (fin.get("ltm") or (fin.get("years") or [None])[-1]) if fin.get("status") == "ok" else None
+        if c:
+            out["fcf"] = c.get("fcf")
+            out["nd_ebitda"] = c.get("nd_ebitda")
+            if c.get("roe") is not None:
+                out["roe"] = c["roe"] * 100
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        m = stock_multiples(secid, (q or {}).get("cap"), (q or {}).get("asset_uid"), cfg) or {}
+        if m.get("nd_ebitda") is not None:
+            out["nd_ebitda"] = m["nd_ebitda"]
+        if m.get("roe") is not None:
+            out["roe"] = m["roe"]
+    except Exception:  # noqa: BLE001
+        pass
+    price, cap, ttm = (q or {}).get("price"), (q or {}).get("cap"), (dv or {}).get("ttm_value")
+    if price and cap and ttm:
+        out["div_total"] = ttm * (cap / price) / 1e6
+    return out
+
+
+def _dl_analyze(secid, cfg, q=None, force=False):
+    """Тяжёлый расчёт по одной бумаге (кэш 12 ч): дивиденды, гэпы, надёжность. Ошибки сети — в поле error, не исключением."""
+    secid = (secid or "").strip().upper()
+    key = "dl_v2_%s_%d" % (secid, 1 if (cfg or {}).get("token") else 0)
+    if not force:
+        hit = store().get(key, DL_TTL)
+        if hit:
+            return hit
+    err = []
+    if q is None:
+        try:
+            q = next((r for r in stocks_universe(cfg=cfg) if r["secid"] == secid), None)
+        except Exception as e:  # noqa: BLE001
+            q = None
+            err.append("список акций недоступен: %s" % str(e)[:80])
+    q = q or {}
+    candles = []
+    try:
+        candles = stock_candles(secid, 24, days=2400)
+    except Exception as e:  # noqa: BLE001
+        err.append("свечи Мосбиржи недоступны: %s" % str(e)[:80])
+    price = q.get("price") or (candles[-1]["c"] if candles else None)
+    dv = {}
+    try:
+        dv = stock_dividends(secid, price, q.get("uid"), cfg) or {}
+    except Exception as e:  # noqa: BLE001
+        err.append("дивиденды недоступны: %s" % str(e)[:80])
+    divs = sorted(_dl_rub_divs(dv.get("items")), key=lambda d: d["record"])
+    gaps = dl_gaps(divs, candles)
+    safety = dl_safety(_dl_fin_inputs(secid, q, dv, divs, cfg))
+    res = {"secid": secid, "name": q.get("shortname") or q.get("name") or secid, "sector": q.get("sector"), "price": price,
+           "divs": [{k: d.get(k) for k in ("record", "payment", "last_buy", "value")} for d in divs], "gaps": gaps, "safety": safety,
+           "div_source": dv.get("source"), "candles_to": candles[-1]["t"][:10] if candles else None, "candles_n": len(candles), "error": "; ".join(err) or None}
+    if candles and divs and not err:
+        try:
+            store().put(key, res)
+        except Exception:  # noqa: BLE001
+            pass
+    return res
+
+
+def _dl_next(divs, today):
+    """Ближайший будущий дивиденд (по дате фиксации); если нет — последний прошедший."""
+    fut = sorted((d for d in divs if d["record"] >= today), key=lambda d: d["record"])
+    past = sorted((d for d in divs if d["record"] < today), key=lambda d: d["record"])
+    x = dict(fut[0], upcoming=True) if fut else dict(past[-1], upcoming=False) if past else None
+    if x and not x.get("last_buy"):
+        try:                                                  # оценка: предыдущий будний день (праздники не учтены)
+            d = datetime.strptime(x["record"], "%Y-%m-%d") - timedelta(days=1)
+            while d.weekday() > 4:
+                d -= timedelta(days=1)
+            x["last_buy"], x["last_buy_est"] = d.strftime("%Y-%m-%d"), True
+        except ValueError:
+            pass
+    return x
+
+
+def _dl_cost_map(cfg, acc):
+    """Позиции-акции счёта: {тикер: {qty, avg, name}}. Без токена/счёта — пусто."""
+    out = {}
+    try:
+        for r in build_summary(cfg, acc, "all")["portfolio"]["positions"]:
+            if r.get("type") == "share" and (r.get("qty") or 0) > 0 and r.get("ticker"):
+                o = out.setdefault(r["ticker"], {"qty": 0.0, "cost": 0.0, "name": r.get("name") or r["ticker"], "price": r.get("price")})
+                o["qty"] += r["qty"]
+                o["cost"] += (r.get("avg") or 0.0) * r["qty"]
+    except Exception:  # noqa: BLE001
+        return None
+    for o in out.values():
+        o["avg"] = o["cost"] / o["qty"] if o["qty"] else None
+    return out
+
+
+def _dl_stock_view(secid, cfg, acc, tax, fee, force):
+    secid = (secid or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9._-]{1,16}", secid):
+        raise ApiError("Некорректный тикер.", 400)
+    a = _dl_analyze(secid, cfg, force=force)
+    gaps = a["gaps"]
+    st = dl_stats(gaps)
+    today = date.today().isoformat()
+    nx = _dl_next(a["divs"], today)
+    pos = (_dl_cost_map(cfg, acc) or {}).get(secid) if acc else None
+    payoff = None
+    if nx and a.get("price"):
+        k = st["median_k"] if st["median_k"] is not None else 1.0
+        payoff = dl_payoff(nx["value"], a["price"], a["price"] - k * nx["value"], pos["avg"] if pos else None, tax, fee)
+        payoff.update(record=nx["record"], upcoming=nx["upcoming"], k_used=round(k, 3), k_fallback=st["median_k"] is None,
+                      qty=pos["qty"] if pos else None, held=bool(pos))
+    return {"ok": True, "mode": "stock", "secid": secid, "name": a["name"], "sector": a["sector"], "price": a["price"], "gaps": list(reversed(gaps)),
+            "stats": st, "safety": a["safety"], "next": nx, "payoff": payoff, "tax": tax, "fee": fee, "div_source": a["div_source"],
+            "candles_to": a["candles_to"], "error": a["error"]}
+
+
+def _dl_portfolio_view(cfg, acc, tax, force):
+    pos = _dl_cost_map(cfg, acc)
+    if pos is None:
+        return {"ok": True, "mode": "portfolio", "rows": [], "held": 0, "error": "Не удалось получить позиции счёта.", "token": bool(cfg.get("token"))}
+    if not pos:
+        return {"ok": True, "mode": "portfolio", "rows": [], "held": 0, "error": None, "token": bool(cfg.get("token"))}
+    try:
+        uni = {r["secid"]: r for r in stocks_universe(cfg=cfg)}
+    except Exception:  # noqa: BLE001
+        uni = {}
+    tickers = sorted(pos)
+
+    def one(t):
+        try:
+            return _dl_analyze(t, cfg, uni.get(t), force)
+        except Exception as e:  # noqa: BLE001
+            return {"secid": t, "divs": [], "gaps": [], "safety": {"score": None}, "error": str(e)[:100], "name": pos[t]["name"], "price": pos[t].get("price")}
+    res = pool_map(one, tickers, workers=6)
+    today = date.today().isoformat()
+    rows = []
+    for t, a in zip(tickers, res):
+        if not a.get("divs") and not a.get("gaps") and not a.get("price") and uni and t not in uni:
+            continue                                            # не акция TQBR (например, зарубежная) — радар её не видит
+        nx = _dl_next(a.get("divs") or [], today)
+        st = dl_stats(a.get("gaps") or [])
+        p = pos[t]
+        row = {"secid": t, "name": a.get("name") or p["name"], "qty": p["qty"], "avg": p["avg"], "price": a.get("price") or p.get("price"),
+               "next": nx if nx and nx["upcoming"] else None, "last": nx if nx and not nx["upcoming"] else None,
+               "safety": (a.get("safety") or {}).get("score"), "zone": (a.get("safety") or {}).get("zone"), "label": (a.get("safety") or {}).get("label"),
+               "median_days": st["median_days"], "events": st["count"], "median_k": st["median_k"], "within90": st["within"]["90"]["pct"], "error": a.get("error")}
+        if row["next"]:
+            row["net_total"] = round(row["next"]["value"] * p["qty"] * (1.0 - tax), 2)
+            row["gross_total"] = round(row["next"]["value"] * p["qty"], 2)
+        rows.append(row)
+    rows.sort(key=lambda r: (0 if r["next"] else 1, r["next"]["record"] if r["next"] else "", r["secid"]))
+    return {"ok": True, "mode": "portfolio", "rows": rows, "held": len(pos), "tax": tax, "error": None, "token": bool(cfg.get("token"))}
+
+
+def _api_divlab(cfg, acc, q, force):
+    def num(k, d, lo, hi):
+        v = _dl_num(str(q.get(k) or "").replace(",", "."))
+        return d if v is None else min(hi, max(lo, v))
+    tax = num("tax", 13.0, 0.0, 35.0) / 100.0
+    fee = num("fee", 0.05, 0.0, 2.0) / 100.0
+    secid = (q.get("secid") or "").strip()
+    try:
+        if secid:
+            return _dl_stock_view(secid, cfg, acc if q.get("account") else None, tax, fee, bool(force))
+        return _dl_portfolio_view(cfg, acc, tax, bool(force))
+    except ApiError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        return {"ok": True, "mode": "stock" if secid else "portfolio", "rows": [], "gaps": [], "error": "Данные временно недоступны: %s" % str(e)[:120]}
+
+
+API_GET["/api/divlab"] = _api_divlab
 # ═══════════════════════════════ бегущая строка котировок ═══════════════════════════════
 # /api/ticker -> {"items":[{id,label,price,chg,unit,kind}], "updated": ts}. Проценты — в процентных пунктах.
 # Каждый источник тянется независимо: сбой одного не убирает остальные.
@@ -23282,7 +23953,16 @@ tr.scr-low td{opacity:.5}
 .ng.shut .ngh i{transform:rotate(-90deg)}
 #eye.on{color:var(--ac-tx);border-color:var(--ac)}
 #eye .slash{display:none}#eye.on .slash{display:block}
-.top #srch,.top #eye{padding:8px 11px}
+.top #srch,.top #more{padding:8px 11px}
+.top #more svg{width:16px;height:16px}
+.more-wrap{position:relative}
+.more-dd{position:absolute;top:calc(100% + 6px);right:0;min-width:230px;background:var(--card);border:1px solid var(--line2);border-radius:12px;box-shadow:0 14px 36px #00000055;padding:6px;z-index:900;display:flex;flex-direction:column;gap:2px}
+.more-dd[hidden]{display:none}
+.more-dd .mi{display:flex;align-items:center;gap:10px;width:100%;padding:9px 10px;border:0;border-radius:8px;background:none;color:var(--tx);font:inherit;text-align:left;cursor:pointer}
+.more-dd .mi:hover,.more-dd .mi:focus-visible{background:var(--card2)}
+.more-dd .mi svg{width:16px;height:16px;flex:none}
+.more-dd .mi-ic{width:28px;flex:none;font-size:11px;font-weight:650;color:var(--mu);text-align:center}
+.more-dd .mi svg+.mi-t{margin-left:12px}
 #restore-bar{margin:12px 28px 0}
 .disc{flex:none;padding:6px 28px;border-top:1px solid var(--line);color:var(--mu);font-size:11px;text-align:center}
 #toast{position:fixed;left:50%;bottom:44px;transform:translate(-50%,16px);background:var(--card2);color:var(--tx);border:1px solid var(--line2);
@@ -23792,6 +24472,27 @@ body.side-mini .side-foot{justify-content:center;padding:8px 0 0}
 .ux-tour-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;font-size:14px}
 .ux-tour p{margin:0 0 12px;font-size:13px;color:var(--tx2);line-height:1.45}
 .ux-tour-ft{display:flex;align-items:center;justify-content:space-between}
+/* ── дивидендные гэпы ── */
+.dl-top{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-bottom:16px;position:relative;z-index:5}
+.dl-top .stk-sw{flex:1 1 300px;max-width:480px}
+.dl-f{width:150px}.dl-f .in{width:100%}
+.dl-warn{color:var(--s4)}
+.dl-sc b{font-size:15px;font-variant-numeric:tabular-nums}.dl-sc small{font-size:11.5px}
+.dl-hd{display:flex;gap:18px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:16px}
+.dl-nx{text-align:right}.dl-nx b{font-size:20px;margin:0 6px;font-variant-numeric:tabular-nums}.dl-nx small{display:block}
+.dl-tiles{margin-bottom:0;grid-template-columns:repeat(3,minmax(0,1fr))}
+.dl-lead{font-size:14px;line-height:1.55;color:var(--tx2)}
+.dl-big{font-size:38px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}.dl-big small{font-size:13px;font-weight:500;margin-left:8px;color:var(--tx2)}
+.dl-bar{position:relative;height:8px;margin:14px 0 6px;border-radius:5px;background:linear-gradient(90deg,var(--neg) 0 50%,var(--s4) 50% 80%,var(--pos) 80%);opacity:.55}
+.dl-bar i{position:absolute;top:-4px;width:4px;height:16px;margin-left:-2px;border-radius:2px;background:var(--tx);box-shadow:0 0 0 2px var(--card)}
+.dl-comps{display:grid;gap:12px;margin-top:12px}
+.dl-ch{display:flex;justify-content:space-between;gap:10px;font-size:13px}
+.dl-cb{height:5px;border-radius:3px;background:var(--line);margin:5px 0 3px;overflow:hidden}.dl-cb i{display:block;height:100%;background:var(--s1);border-radius:3px}
+.dl-comp.off{opacity:.6}
+.dl-mid .chart{min-height:230px}
+[data-theme=light] .dl-bar i{background:#1a1d24}
+@media(max-width:1180px){.dl-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:760px){.dl-f{width:calc(50% - 7px)}.dl-nx{text-align:left}.dl-big{font-size:32px}}
 </style></head>
 <body>
 <aside>
@@ -23816,11 +24517,16 @@ body.side-mini .side-foot{justify-content:center;padding:8px 0 0}
     <span class="pronly" id="prinfo"></span>
     <span class="who" id="who" style="display:none"></span>
     <button class="btn ghost srch-pill" id="srch" title="Поиск и команды (Ctrl+K / Cmd+K)" aria-label="Поиск"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><span class="srch-tx">Поиск…</span><kbd class="srch-k">⌘K</kbd></button>
-    <button class="btn ghost" id="eye" title="Скрыть суммы в деньгах" aria-label="Режим инкогнито"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path class="slash" d="M3 3l18 18"/></svg></button>
-    <button class="btn ghost" id="thm" title="Сменить тему">◐</button>
-    <button class="btn ghost" id="share" title="Поделиться портфелем (PNG без сумм)">PNG</button>
-    <button class="btn ghost" id="pdf" title="Печать / сохранить как PDF">PDF</button>
     <button class="btn ghost" id="refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></svg>Обновить</button>
+    <div class="more-wrap" id="more-wrap">
+      <button class="btn ghost" id="more" title="Ещё: скрыть суммы, тема, PNG, PDF" aria-label="Ещё" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
+      <div class="more-dd noprint" id="more-dd" role="menu" hidden>
+        <button class="mi" id="eye" role="menuitem" title="Скрыть суммы в деньгах"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path class="slash" d="M3 3l18 18"/></svg><span class="mi-t">Скрыть суммы</span></button>
+        <button class="mi" id="thm" role="menuitem"><span class="mi-ic">◐</span><span class="mi-t" id="thm-t">Светлая тема</span></button>
+        <button class="mi" id="share" role="menuitem" title="Карточка доходности для Telegram без абсолютных сумм"><span class="mi-ic">PNG</span><span class="mi-t">Поделиться картинкой</span></button>
+        <button class="mi" id="pdf" role="menuitem"><span class="mi-ic">PDF</span><span class="mi-t">Печать / сохранить PDF</span></button>
+      </div>
+    </div>
   </div>
   <div id="view"></div>
   <div class="disc">Информация носит аналитический характер и не является индивидуальной инвестиционной рекомендацией</div>
@@ -24277,7 +24983,7 @@ function typingInView(){
 function render(){renderNow()}
 function renderSoon(){if(typingInView()){_rPend=true;return}renderNow()}
 document.addEventListener('focusout',()=>{if(_rPend)setTimeout(()=>{if(_rPend&&!typingInView())renderNow()},400)});
-const NO_PORTFOLIO_PAGES=new Set(['scr','cmp','map','hm','mkt','fng','pri','cal','dfl','flw','iss','watch','stk','sst','calc','lad','rot','dbx','mm','crp','mic','sig','mon','arb']);
+const NO_PORTFOLIO_PAGES=new Set(['scr','cmp','map','hm','mkt','fng','pri','cal','dfl','flw','iss','watch','stk','sst','calc','lad','rot','dbx','mm','crp','mic','sig','mon','arb','dgap']);
 function renderNow(){
   _rPend=false;
   S.charts=[];hideTip();prInfo();
@@ -25703,9 +26409,18 @@ async function renderSettings(){
 }
 /* ── тема, печать ── */
 function themeNow(t){return t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}
-function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}document.documentElement.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t}
+function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}document.documentElement.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t;thmLabel()}
+function thmLabel(){const e=document.getElementById('thm-t');if(e)e.textContent=document.documentElement.dataset.theme==='light'?'Тёмная тема':'Светлая тема'}
 function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
-$('#thm').onclick=()=>{const n={auto:'light',light:'dark',dark:'auto'}[curTheme()]||'auto';applyTheme(n);post('/api/config',{theme:n}).catch(()=>{});if(S.data)render()};
+// один клик = видимая смена: от того, что сейчас на экране (раньше цикл auto→light→dark→auto при тёмной системе давал «пустой» клик dark→auto)
+$('#thm').onclick=()=>{const n=document.documentElement.dataset.theme==='light'?'dark':'light';applyTheme(n);post('/api/config',{theme:n}).catch(()=>{});if(S.data)render()};
+thmLabel();
+// меню «⋯» в шапке
+function moreOpen(on){const d=$('#more-dd');d.hidden=!on;$('#more').setAttribute('aria-expanded',on?'true':'false')}
+$('#more').onclick=e=>{e.stopPropagation();moreOpen($('#more-dd').hidden)};
+$('#more-dd').addEventListener('click',e=>{if(e.target.closest('.mi'))setTimeout(()=>moreOpen(false),0)});
+document.addEventListener('click',e=>{if(!e.target.closest('#more-wrap'))moreOpen(false)});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#more-dd').hidden)moreOpen(false)});
 $('#pdf').onclick=()=>window.print();
 let _prevTheme=null;
 window.addEventListener('beforeprint',()=>{_prevTheme=document.documentElement.dataset.theme;document.documentElement.dataset.theme='light'});
@@ -26034,6 +26749,7 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+ ['0.25','19.11.2026',['<b>Дивидендные гэпы</b> (раздел «Акции и фонды»): насколько акция падает в день отсечки и за сколько торговых дней возвращается, по истории за ~6 лет; оценка надёжности дивиденда по МСФО; расчёт «держать через отсечку или продать накануне» по прошлым данным; ближайшие дивиденды вашего портфеля после налога','<b>Помощь в сборе раскрытий теперь включена по умолчанию</b>: пока программа открыта, она скачивает публичные страницы e-disclosure.azipi.ru со своего подключения и отправляет их на сервер данных. Токен, портфель и другие ваши данные не передаются. Выключить — в «Настройках»','<b>Бумаги из отчётов брокера без токена</b> оцениваются по текущим ценам Мосбиржи (облигации — с НКД), их дивиденды попадают в календарь выплат','<b>Шапка проще</b>: скрыть суммы, тема, PNG и PDF — в меню «⋯»; смена темы срабатывает с первого клика','Исправлено: дивиденды акций без токена (Мосбиржа перестала отдавать их по старому адресу), совпадающие номера переводов бумаг при импорте отчётов, «призрачный» портфель в разборе сделок при крупном выводе денег, распознавание русскоязычной капчи при сборе раскрытий','Для будущих функций (разбор PDF и др.) программа умеет подгружать проверенные библиотеки: файл скачивается, только если его контрольная сумма совпала с записанной в программе']],
  ['0.24','19.11.2026',['<b>Помощь в сборе раскрытий эмитентов</b> (по желанию, выключено по умолчанию): пока программа открыта, она раз в 15 секунд скачивает со своего подключения публичные страницы e-disclosure.azipi.ru и отправляет их на сервер данных, который не может открыть этот сайт сам. Так купоны, выкупы и дефолты видны всем пользователям. Личные данные не передаются; включить можно в «Настройках»','<b>Первичка</b> больше не падает целиком, если календарь размещений investmint недоступен (сайт закрыл доступ программам): показываются размещения Мосбиржи и калькулятор премии']],
  ['0.23','19.11.2026',['<b>Импорт отчётов ВТБ</b> теперь загружается из интерфейса: показывается карточка отчёта со сверкой и кнопка «Импортировать» (в 0.22 экран импорта падал на отчёте ВТБ)','Сервер данных: расчёт индекса страха и жадности пишет ход в журнал и корректно останавливается']],
  ['0.22','19.11.2026',['<b>Исправлено отключение сервера данных</b>: бегущая строка (курс BTC) отключала сервер почти постоянно — из-за этого не работали раскрытия эмитентов, «Кто покупает», первичка и мультипликаторы с сервера','<b>Импорт отчётов Т-Инвестиций</b>: сделки РЕПО больше не считаются покупками и продажами, учитываются купоны, погашения, амортизация, дивиденды, пополнения, выводы, налоги; несколько отчётов (например, за 2025 и 2026 год) объединяются в один счёт — кнопка «Добавить к портфелю»','<b>Импорт отчётов ВТБ</b>: сделки, купоны, дивиденды, погашения, пополнения и выводы, объединение нескольких периодов','<b>Сплиты и консолидации</b> по данным Мосбиржи: количество и цена покупки пересчитываются, срок владения сохраняется','Импорт сверяется с остатками денег и бумаг из самого отчёта — результат сверки виден до загрузки','Оптимизатор тарифа: актуальные тарифы Т-Инвестиций («Трейдер» 390 ₽, Premium 2 990 ₽)','Карточка облигации: без сообщений эмитента объём показывается как текущий по Мосбирже (после выкупов на офертах он меньше первоначального); кнопка e-disclosure копирует ИНН для поиска','Индекс страха и жадности может считаться на сервере данных — открывается сразу']],
@@ -28407,13 +29123,13 @@ function bindSetBackup(c,msg){
 /* ── инкогнито и палитра команд (Ctrl+K / Cmd+K) ── */
 function setIncog(on){
   INCOG.on=!!on;lsSet('ta_incog',on?'1':'0');
-  const e=$('#eye');e.classList.toggle('on',INCOG.on);e.title=INCOG.on?'Показать суммы':'Скрыть суммы в деньгах';
+  const e=$('#eye');e.classList.toggle('on',INCOG.on);e.title=INCOG.on?'Показать суммы':'Скрыть суммы в деньгах';const lt=e.querySelector('.mi-t');if(lt)lt.textContent=INCOG.on?'Показать суммы':'Скрыть суммы';
   renderAccounts();renderNav();
   if(S.data||['set','imp'].includes(S.page))renderNow();
   toast(INCOG.on?'Суммы скрыты':'Суммы показаны');
 }
 $('#eye').onclick=()=>setIncog(!INCOG.on);
-$('#eye').classList.toggle('on',INCOG.on);
+$('#eye').classList.toggle('on',INCOG.on);{const lt=$('#eye .mi-t');if(lt&&INCOG.on)lt.textContent='Показать суммы'}
 $('#srch').onclick=()=>kpOpen();
 
 const KP={open:false,items:[],sel:0};
@@ -30646,7 +31362,7 @@ const UX_SECTIONS=[
   {id:'pf',title:'Портфель',icon:'pos',basic:true,tabs:['pos','bonds','ret','bench','pm','ops','fees','reb'],basicTabs:['pos','bonds','ret','pm','ops','fees','reb']},
   {id:'pay_ev',title:'Выплаты и события',icon:'pay',basic:true,tabs:['pay','off','cal']},
   {id:'bonds_mkt',title:'Облигации (рынок)',icon:'scr',basic:true,tabs:['scr','cmp','arb','rot','dbx','lad','pri','map'],basicTabs:['scr','cmp','arb','rot','lad','pri']},
-  {id:'stocks_mkt',title:'Акции и фонды',icon:'hm',basic:false,tabs:['sst','hm','stk','mm']},
+  {id:'stocks_mkt',title:'Акции и фонды',icon:'hm',basic:false,tabs:['sst','hm','stk','dgap','mm']},
   {id:'pulse',title:'Пульс рынка',icon:'mkt',basic:false,tabs:['mkt','fng','flw','mic','sig']},
   {id:'risk_ctrl',title:'Надёжность и риски',icon:'risk',basic:false,tabs:['risk','mon','iss','crp','dfl','watch']},
   {id:'taxes',title:'Налоги',icon:'tax',basic:true,tabs:['tax','txo']},
@@ -30656,7 +31372,7 @@ const UX_TAB_SHORT={
   dash:'Главная',pos:'Позиции',bonds:'Облигации',ret:'Доходность',bench:'Бенчмарки',pm:'Разбор сделок',ops:'Операции',fees:'Комиссии',reb:'Ребалансировка',
   pay:'Выплаты',off:'Оферты',cal:'Календарь',
   scr:'Скринер',cmp:'Сравнение',arb:'Кривые и арбитраж',rot:'Флоатеры или фиксы',dbx:'Линкеры и валютные',lad:'Лесенка',pri:'Первичка',map:'Карта рынка',
-  sst:'Скринер акций',hm:'Тепловая карта',stk:'Карточка акции',mm:'Деньги и базис',
+  sst:'Скринер акций',hm:'Тепловая карта',stk:'Карточка акции',dgap:'Дивидендные гэпы',mm:'Деньги и базис',
   mkt:'Ставки и КБД',fng:'Страх и жадность',flw:'Кто покупает',mic:'Стакан и ликвидность',sig:'Сигналы',
   risk:'Риски портфеля',mon:'Мониторинг',iss:'Эмитенты',crp:'Устойчивость',dfl:'Техдефолты',watch:'Наблюдение',
   tax:'Итоги года и ЛДВ',txo:'Оптимизация и ИИС-3',calc:'Калькулятор'
@@ -30679,6 +31395,7 @@ const UX_WHY={
   fng:'Сводный индекс настроений российского рынка на основе волатильности, ширины рынка и потоков.',
   dfl:'Лента технических и фактических дефолтов по облигациям с e-disclosure и флагами Мосбиржи.',
   arb:'Поиск перекосов доходности внутри одного эмитента, инверсий кривой (ранний сигнал риска) и безубыточной девальвации для валютных облигаций.',
+  dgap:'Как цена акции ведёт себя в день отсечки: насколько падает и за сколько дней возвращается, плюс оценка надёжности дивиденда.',
   pm:'Честное сравнение ваших вложений с LQDT/TMOS в те же даты (призрачный портфель) и разбор закрытых сделок по FIFO (Win Rate, эффект диспозиции).',
   bench:'Честное сравнение доходности вашего портфеля с индексами акций, облигаций и денежного рынка.'
 };
@@ -30847,7 +31564,7 @@ const UX_TOUR_STEPS=[
   {sel:'aside',title:'Умное меню и режим «Базовый / Профи»',text:'В «Базовом» режиме показаны 6 главных разделов без лишнего шума. Переключатель «Профи» вверху меню открывает все квантовые инструменты.'},
   {sel:'#acc-dd,#period',title:'Счёт и период всегда под рукой',text:'Переключайте брокерские счета и период доходности прямо в верхней панели — не нужно прокручивать боковое меню.'},
   {sel:'#srch',title:'Быстрый поиск ⌘K / Ctrl+K',text:'Мгновенно находите любую облигацию, акцию, эмитента или экран программы с клавиатуры.'},
-  {sel:'#eye',title:'Режим инкогнито и PNG-карточка',text:'Глаз скрывает все суммы в рублях на экране, а кнопка PNG делает красивую карточку доходности для Telegram без абсолютных сумм.'}
+  {sel:'#more',title:'Скрыть суммы, тема, PNG и PDF',text:'В меню «⋯» — скрытие всех сумм в рублях, смена темы, карточка доходности для Telegram без абсолютных сумм и печать в PDF.'}
 ];
 let _uxTourI=-1;
 function uxTourStop(){
@@ -31058,6 +31775,186 @@ function crowdInviteHtml(){
 async function crowdInvite(on){
   try{await post('/api/crowd/settings',on?{enabled:true}:{dismissed:true});await crowdLoad();const e=document.getElementById('crowd-inv');if(e)e.remove()}catch(e){}
 }
+/* ── Дивидендные гэпы: радар по портфелю, статистика закрытия гэпа по истории отсечек, надёжность дивиденда, сравнение «удержать / продать накануне» ── */
+S.dl={tab:'port',secid:'',data:null,loading:false,err:'',port:null,ploading:false,perr:'',pacc:null,tax:'13',fee:'0.05'};
+function dlQs(extra){return new URLSearchParams(Object.assign({account:S.account,tax:S.dl.tax,fee:S.dl.fee},extra||{}))}
+function dlLoadPort(force){
+  const D=S.dl,acc=S.account;
+  if(D.ploading&&!force&&D.pacc===acc)return;
+  D.ploading=true;D.pacc=acc;D.perr='';
+  api('/api/divlab?'+dlQs()+(force?'&force=1':'')).then(j=>{
+    if(D.pacc!==acc)return;D.ploading=false;D.port=j;if(S.page==='dgap')renderSoon();
+  }).catch(e=>{if(D.pacc!==acc)return;D.ploading=false;D.perr=e.message||String(e);if(S.page==='dgap')renderSoon()});
+}
+function dlLoadStock(force){
+  const D=S.dl,sec=D.secid;if(!sec||(D.loading&&!force))return;
+  D.loading=true;D.err='';
+  api('/api/divlab?'+dlQs({secid:sec})+(force?'&force=1':'')).then(j=>{
+    D.loading=false;if(D.secid!==sec){dlLoadStock();return}
+    D.data=j;if(S.page==='dgap')renderSoon();
+  }).catch(e=>{D.loading=false;if(D.secid!==sec)return;D.err=e.message||String(e);if(S.page==='dgap')renderSoon()});
+}
+function dlOpen(secid){
+  secid=String(secid||'').trim().toUpperCase();if(!secid)return;
+  const D=S.dl;D.tab='stock';if(D.secid!==secid){D.secid=secid;D.data=null;D.err=''}
+  if(S.page==='dgap')render();else go('dgap');
+}
+const dlN=(v,d=2)=>stkN(v,d);
+const dlRub=(v,d=2)=>v==null||isNaN(v)?'—':dlN(v,d)+' ₽';
+const dlSg=(v,d=2)=>v==null||isNaN(v)?'—':(v>0?'+':v<0?'−':'')+dlN(Math.abs(v),d)+' ₽';
+const dlPct=v=>v==null?'—':dlN(v,1)+' %';
+const dlEv=(n,one,few,many)=>{const a=Math.abs(n)%100,b=a%10;return a>10&&a<20?many:b===1?one:b>=2&&b<=4?few:many};
+const dlDays=v=>v==null?'—':(Math.round(v*2)/2).toString().replace('.',',')+' дн.';
+function dlZoneCls(z){return z==='pos'?'pos':z==='neg'?'neg':z==='warn'?'dl-warn':'mu'}
+function dlSafetyTag(score,label,zone){
+  if(score==null)return'<span class="mu" title="Недостаточно данных для оценки">нет данных</span>';
+  return`<span class="dl-sc ${dlZoneCls(zone)}" title="Оценка надёжности дивиденда 0–100: ${esc(label)}"><b>${score}</b> <small>${esc(label)}</small></span>`;
+}
+function dlSearchBox(){
+  const D=S.dl;
+  return`<div class="dl-top"><div class="stk-sw"><input class="in" id="dl-q" placeholder="Тикер или название: SBER, LKOH…" autocomplete="off" spellcheck="false" value="${esc(D.secid)}"><div id="dl-res" class="stk-res"></div></div>
+    <label class="field dl-f"><span>Налог на дивиденды, %</span><input class="in num" id="dl-tax" value="${esc(D.tax)}" inputmode="decimal"></label>
+    <label class="field dl-f"><span>Комиссия брокера, %</span><input class="in num" id="dl-fee" value="${esc(D.fee)}" inputmode="decimal"></label>
+    ${D.secid?'<button class="btn ghost" id="dl-r">Обновить</button>':''}</div>`;
+}
+/* ── вкладка «Мой портфель» ── */
+function dlPortTab(){
+  const D=S.dl;
+  if(D.pacc!==S.account&&!D.ploading){D.port=null;dlLoadPort(false)}
+  if(!D.port&&!D.ploading&&!D.perr)dlLoadPort(false);
+  if(D.ploading&&!D.port)return`<div class="card">${waitBox('Смотрю дивиденды по акциям портфеля и историю отсечек. Первый расчёт может занять до минуты…')}</div>`;
+  if(D.perr)return`<div class="msg err">${esc(D.perr)} <button class="btn ghost" id="dl-r">Повторить</button></div>`;
+  const d=D.port||{},rows=d.rows||[];
+  const note=d.error?`<div class="msg info" style="margin-bottom:12px">${esc(d.error)}</div>`:'';
+  if(!rows.length){
+    return`<div class="card"><h2>Радар дивидендов портфеля</h2>${note}<div class="empty" style="padding:30px 20px">${d.token===false&&!d.held?'Акций в портфеле не найдено. Подключите счёт или импортируйте отчёт брокера — либо откройте вкладку «Анализ акции» и посмотрите историю гэпов любой бумаги.':'В выбранном счёте нет российских акций.'}
+      <div class="row" style="justify-content:center"><button class="btn" id="dl-to-stock">Анализ акции</button></div></div></div>`;
+  }
+  const up=rows.filter(r=>r.next),no=rows.filter(r=>!r.next);
+  const th='<th class="l">Бумага</th><th title="Количество акций в портфеле">Шт.</th><th title="Размер дивиденда на одну акцию">Дивиденд</th><th title="Дата закрытия реестра">Фиксация</th><th title="Последний день, когда покупка ещё даёт право на дивиденд (если биржа не указала — оценка по будням, помечена «≈»)">Посл. день покупки</th><th title="Дивиденд × количество акций за вычетом налога">Получите (после налога)</th><th title="Оценка надёжности дивиденда 0–100">Надёжность</th><th title="Медиана числа торговых дней, за которые цена возвращалась к уровню до отсечки">Медиана закрытия гэпа</th>';
+  const tr=(r,x)=>`<tr data-dl="${esc(r.secid)}" style="cursor:pointer" title="Открыть анализ"><td class="l"><b>${esc(r.name||r.secid)}</b><br><small class="mu">${esc(r.secid)}</small></td>
+    <td class="num">${dlN(r.qty,0)}</td><td class="num">${x?dlRub(x.value,2):'—'}${x?`<br><small class="mu">${r.price?dlN(x.value/r.price*100,1)+' % к цене':''}</small>`:''}</td>
+    <td class="num">${x?ddm(x.record):'—'}</td><td class="num">${x&&x.last_buy?(x.last_buy_est?'≈ ':'')+ddm(x.last_buy):'—'}</td>
+    <td class="num">${r.net_total!=null?'<b>'+dlRub(r.net_total,0)+'</b>':'—'}</td>
+    <td>${dlSafetyTag(r.safety,r.label,r.zone)}</td>
+    <td class="num">${r.median_days!=null?dlDays(r.median_days)+`<br><small class="mu">по ${r.events} ${dlEv(r.events,'событию','событиям','событиям')}</small>`:'<span class="mu">нет истории</span>'}</td></tr>`;
+  const tot=up.reduce((a,r)=>a+(r.net_total||0),0);
+  return`<div class="card"><h2>Ближайшие дивиденды портфеля<span class="sp">${up.length?`итого к получению: ${M(tot,'rub',0)} после налога ${esc(D.tax)} %`:'объявленных дивидендов нет'}</span></h2>${note}
+    ${up.length?`<div class="tbl"><table><thead><tr>${th}</tr></thead><tbody>${up.map(r=>tr(r,r.next)).join('')}</tbody></table></div>`:'<div class="empty" style="padding:24px">По акциям портфеля пока нет объявленных будущих дивидендов.</div>'}</div>
+    ${no.length?`<div class="card"><h2>Без объявленного дивиденда<span class="sp">показан последний выплаченный</span></h2><div class="tbl"><table><thead><tr>${th}</tr></thead><tbody>${no.map(r=>tr(r,r.last)).join('')}</tbody></table></div></div>`:''}
+    <p class="note">Дата фиксации и размер дивиденда — по данным T-Invest (ближайшие значения могут измениться после решения собрания акционеров). Нажмите на строку, чтобы увидеть историю гэпов бумаги. ${NIR_NOTE}</p>`;
+}
+/* ── вкладка «Анализ акции» ── */
+function dlStockHome(){
+  const l=(S.stkList||[]).slice(0,16);
+  if(!S.stkList)stkEnsureList(()=>{if(S.page==='dgap'&&S.dl.tab==='stock'&&!S.dl.secid)renderSoon()});
+  return`<div class="card"><h2>Выберите акцию<span class="sp">или введите тикер выше</span></h2>${S.stkList?`<div class="stk-chips">${l.map(r=>`<button class="btn ghost" data-dl="${esc(r.secid)}"><b>${esc(r.secid)}</b> <span class="mu">${esc(r.shortname||'')}</span></button>`).join('')}</div>`:waitBox('Загружаю список акций…')}</div>
+    <p class="note">В день отсечки (на следующий торговый день после последнего дня покупки) цена акции в среднем снижается примерно на размер дивиденда. Здесь по истории видно, как глубоко и как быстро это снижение отыгрывалось. ${NIR_NOTE}</p>`;
+}
+function dlStats(st){
+  const w=st.within||{};
+  const tile=(k,v,s,c)=>kpi(k,v,s,c);
+  const wp=n=>{const x=w[n]||{};return x.pct!=null?pctp(x.pct,0):'—'};
+  const wsub=n=>{const x=w[n]||{};return x.of?`${x.n} из ${x.of} ${dlEv(x.of,'события','событий','событий')}`:'мало данных'};
+  return`<div class="g g4 dl-tiles">${tile('Медиана до закрытия гэпа',st.median_days!=null?dlDays(st.median_days):'—',`торговых дней; закрыто ${st.closed} из ${st.count}`)}
+    ${tile('Закрыто за 30 дн.',wp('30'),wsub('30'))}${tile('Закрыто за 60 дн.',wp('60'),wsub('60'))}${tile('Закрыто за 90 дн.',wp('90'),wsub('90'))}
+    ${tile('Гэп, медиана',st.median_k!=null?pctp(st.median_k*100,0)+' от дивиденда':'—',st.avg_gap_pct!=null?`в среднем ${dlN(st.avg_gap_pct,1)} % от цены`:'')}
+    ${tile('Ещё открыты',String(st.still_open||0),'слишком свежие, чтобы судить')}</div>`;
+}
+function dlHistChart(el,o){
+  const h=o.hist,W=el.clientWidth||600,H=230,pl=30,pr=10,pt=18,pb=52,n=h.length,pw=W-pl-pr,ph=H-pt-pb,bw=pw/n;
+  const mx=Math.max(1,...h.map(x=>x.n));
+  const col=x=>x.label==='не закрыт'?'var(--neg)':x.label==='ещё открыт'?'var(--mu)':'var(--s3)';
+  let s='';
+  (mx<=2?[0,1]:[0,.5,1]).forEach(f=>{const y=pt+ph-f*ph;s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-6}" y="${y+4}" text-anchor="end">${Math.round(mx*f)}</text>`});
+  h.forEach((x,i)=>{
+    const bh=x.n/mx*ph,bx=pl+i*bw+bw*.18,w=bw*.64;
+    s+=`<rect x="${bx}" y="${pt+ph-bh}" width="${w}" height="${Math.max(bh,x.n?1.5:0)}" rx="3" fill="${col(x)}" fill-opacity=".85"/>`;
+    if(x.n)s+=`<text class="ax num" x="${bx+w/2}" y="${pt+ph-bh-5}" text-anchor="middle">${x.n}</text>`;
+    const words=x.label.split(' ');
+    s+=`<text class="ax" x="${bx+w/2}" y="${H-pb+16}" text-anchor="middle">${esc(words.slice(0,Math.ceil(words.length/2)).join(' '))}</text>`;
+    if(words.length>1)s+=`<text class="ax" x="${bx+w/2}" y="${H-pb+30}" text-anchor="middle">${esc(words.slice(Math.ceil(words.length/2)).join(' '))}</text>`;
+  });
+  let hits='';h.forEach((x,i)=>hits+=`<rect data-i="${i}" x="${pl+i*bw}" y="${pt}" width="${bw}" height="${ph+pb-8}" fill="transparent"/>`);
+  el.innerHTML=`<svg width="${W}" height="${H}" role="img" aria-label="Гистограмма сроков закрытия дивидендных гэпов">${s}${hits}</svg>`;
+  bindTip(el,i=>`<b>${esc(h[i].label)}</b>`+tipRow(col(h[i]),'событий',String(h[i].n)));
+}
+function dlGapsTable(gs){
+  if(!gs.length)return'<div class="empty" style="padding:24px">Нет прошлых отсечек, покрытых историей котировок.</div>';
+  const st=g=>g.closed?`<span class="pos">закрыт за ${g.days===0?'тот же день':g.days+' дн.'}</span>`:g.n_after>=90?`<span class="neg" title="Максимальное восстановление цены: ${dlN(g.recovery_pct,0)} % гэпа">не закрыт · вернулось ${dlN(g.recovery_pct,0)} %</span>`:`<span class="mu" title="Прошло ${g.n_after} торговых дней — рано судить">ещё открыт · ${g.n_after} дн.</span>`;
+  return`<div class="tbl"><table><thead><tr><th class="l">Фиксация</th><th>Дивиденд</th><th title="Закрытие последнего дня покупки">Цена до</th><th title="Цена открытия следующего торгового дня">Цена после</th><th>Гэп</th><th>Гэп, %</th><th title="Гэп / дивиденд">Гэп к дивиденду</th><th class="l">Закрытие гэпа</th></tr></thead><tbody>`+
+    gs.map(g=>`<tr><td class="l num">${ddm(g.record)}<br><small class="mu">посл. покупка ${ddm(g.last_buy)}</small></td><td class="num">${dlRub(g.div)}<br><small class="mu">${dlN(g.div_pct,1)} % к цене</small></td>
+      <td class="num">${dlN(g.p_pre)}</td><td class="num">${dlN(g.p_post)}</td><td class="num ${g.gap>0?'neg':'pos'}">${dlSg(-g.gap)}</td><td class="num ${g.gap>0?'neg':'pos'}">${g.gap_pct>0?'−':'+'}${dlN(Math.abs(g.gap_pct),1)} %</td>
+      <td class="num">${dlN(g.k*100,0)} %</td><td class="l">${st(g)}</td></tr>`).join('')+`</tbody></table></div>`;
+}
+function dlSafetyCard(sf){
+  if(!sf)return'';
+  const z=dlZoneCls(sf.zone);
+  const head=sf.score!=null?`<div class="dl-big ${z}">${sf.score}<small>из 100 · ${esc(sf.label)}</small></div><div class="dl-bar"><i style="left:${sf.score}%" class="${z}"></i></div>`
+    :`<div class="empty" style="padding:14px">${esc(sf.note||'Недостаточно данных для оценки')}</div>`;
+  const comps=(sf.components||[]).map(c=>`<div class="dl-comp${c.available?'':' off'}"><div class="dl-ch"><b>${esc(c.name)}</b><span class="num">${c.available?c.points+' / '+c.weight:'нет данных'}</span></div>
+    <div class="dl-cb"><i style="width:${c.available?c.points/c.weight*100:0}%"></i></div><small class="mu">${esc(c.note||'')}</small></div>`).join('');
+  return`<div class="card"><h2>Надёжность дивиденда<span class="sp">оценка 0–100 по доступной отчётности</span></h2>${head}
+    ${(sf.flags||[]).map(f=>`<div class="msg err" style="margin:10px 0">${esc(f.charAt(0).toUpperCase()+f.slice(1))}</div>`).join('')}
+    <div class="dl-comps">${comps}</div>
+    <p class="note" style="margin-top:10px">80 и выше — «надёжно», 50–79 — «умеренно», ниже 50 — «высокий риск». Компоненты без данных не учитываются, баллы пересчитываются на доступный вес. Для банков показатель «чистый долг / EBITDA» не применяется. Оценка — по отчётности МСФО и истории выплат, это не прогноз.</p></div>`;
+}
+function dlPayoffCard(d){
+  const p=d.payoff,st=d.stats;
+  if(!p)return`<div class="card"><h2>Удержание или продажа накануне</h2><div class="empty" style="padding:24px">Нет известного дивиденда или цены для расчёта.</div></div>`;
+  const best=p.diff>0;
+  const kTxt=p.k_fallback?'Истории гэпов нет, принято соотношение гэпа к дивиденду 100 %':`По истории гэп в среднем ${dlN(p.k_used*100,0)} % от дивиденда (медиана)`;
+  const cnt=p.qty?` На вашу позицию (${dlN(p.qty,0)} шт.): удержание ${dlSg(p.hold*p.qty,0)}, продажа и обратная покупка ${dlSg(p.sell_rebuy*p.qty,0)}.`:'';
+  return`<div class="card"><h2>Удержание или продажа накануне<span class="sp">${p.upcoming?'ближайший дивиденд':'последний дивиденд'}: ${dlRub(p.div)}, фиксация ${ddm(p.record)}</span></h2>
+    <p class="dl-lead">${kTxt}, то есть ожидаемый гэп около ${dlRub(p.gap)} (${dlN(p.gap_pct,1)} % от цены ${dlN(p.p_pre)} ₽). При продаже накануне и обратной покупке на открытии результат на акцию был бы ${dlSg(p.sell_rebuy)} против ${dlSg(p.hold)} при удержании${p.held?'':' (себестоимость не известна — налог с продажи не учтён)'}.</p>
+    <div class="g g3" style="margin:12px 0">${kpi('Удержание, на акцию',dlSg(p.hold),`дивиденд после налога ${dlN(p.tax_rate*100,0)} % минус гэп`,cls(p.hold))}
+      ${kpi('Продажа накануне и покупка обратно, на акцию',dlSg(p.sell_rebuy),`комиссии ${dlRub(p.fees)}${p.cost_known?`, налог с продажи ${dlRub(p.tax_sale)}`:''}`,cls(p.sell_rebuy))}
+      ${kpi('Разница',dlSg(p.diff),best?'сценарий продажи выше на эту сумму':'сценарий удержания выше на эту сумму')}</div>
+    <p class="note">${cnt} Допущения: обратная покупка — на 10 % гэпа выше цены открытия после отсечки; комиссия брокера ${dlN(p.fee_rate*100,2)} % с каждой сделки; налог на прибыль от продажи считается от ${p.cost_known?'средней цены покупки по вашим лотам':'неизвестной себестоимости — не учтён'}. Это оценка по прошлым данным, а не инвестиционная рекомендация: цена в день отсечки может вести себя иначе. Продажа сбрасывает срок владения для льготы ЛДВ (3 года), а повторная покупка начинает его заново.</p></div>`;
+}
+function dlStockTab(){
+  const D=S.dl;
+  if(!D.secid)return dlStockHome();
+  if(!D.data&&!D.loading&&!D.err)dlLoadStock(false);
+  if(D.loading&&!D.data)return`<div class="card">${waitBox('Загружаю свечи за 6 лет, дивиденды и отчётность…')}</div>`;
+  if(D.err)return`<div class="msg err">${esc(D.err)} <button class="btn ghost" id="dl-r">Повторить</button></div>`;
+  const d=D.data||{},st=d.stats||{count:0};
+  const err=d.error?`<div class="msg info" style="margin-bottom:12px">${esc(d.error)}</div>`:'';
+  const src=d.div_source==='tinvest'||d.div_source==='tinvest-server'?'T-Invest':'нет источника';
+  const nx=d.next;
+  const hdr=`<div class="card dl-hd"><div><h2 style="margin:0">${esc(d.name||d.secid)} <span class="mu">${esc(d.secid)}</span></h2><small class="mu">${esc(d.sector||'')}${d.price?' · цена '+dlRub(d.price):''}${d.candles_to?' · свечи до '+ddm(d.candles_to):''} · дивиденды: ${esc(src)}</small></div>
+    ${nx?`<div class="dl-nx"><small class="mu">${nx.upcoming?'Ближайший дивиденд':'Последний дивиденд'}</small><b>${dlRub(nx.value)}</b> <small class="mu">фиксация ${ddm(nx.record)}${nx.last_buy?', покупка до '+(nx.last_buy_est?'≈ ':'')+ddm(nx.last_buy):''}</small></div>`:''}</div>`;
+  if(!st.count)return hdr+err+`<div class="card"><div class="empty" style="padding:30px">Не удалось найти прошлые рублёвые дивиденды, покрытые историей котировок. Возможно, бумага не платит дивиденды или данные временно недоступны.</div></div>`+(d.safety?dlSafetyCard(d.safety):'');
+  chart('c-dl-h',dlHistChart,{hist:st.hist});
+  return hdr+err+dlStats(st)+`<div class="g c-2-1 dl-mid" style="margin-top:16px"><div class="card"><h2>За сколько дней закрывался гэп<span class="sp">торговых дней от дня отсечки</span></h2><div id="c-dl-h" class="chart"></div></div>${dlSafetyCard(d.safety)}</div>
+    ${dlPayoffCard(d)}
+    <div class="card" style="margin-top:16px"><h2>История гэпов<span class="sp">${st.count} ${dlEv(st.count,'событие','события','событий')}</span></h2>${dlGapsTable(d.gaps||[])}</div>
+    <p class="note">Гэп — разница между закрытием последнего дня покупки (за один торговый день до даты фиксации) и открытием следующего дня. Гэп считается закрытым, когда максимум дня достигает цены «до». Не закрытые события разделены на «не закрыт» (прошло 90+ торговых дней) и «ещё открыт» (слишком свежие). ${NIR_NOTE}</p>`;
+}
+function pDgap(){
+  const D=S.dl;
+  const tabs=`<div class="row" style="gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:16px"><div class="seg" id="dl-tabs"><button data-t="port" class="${D.tab==='port'?'on':''}">Мой портфель</button><button data-t="stock" class="${D.tab==='stock'?'on':''}">Анализ акции</button></div>${D.tab==='port'?'<button class="btn ghost" id="dl-r" style="margin-left:auto">Обновить</button>':''}</div>`;
+  return tabs+(D.tab==='port'?dlPortTab():dlSearchBox()+dlStockTab());
+}
+function bindDgap(){
+  const D=S.dl;
+  const t=$('#dl-tabs');if(t)t.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===D.tab)return;D.tab=b.dataset.t;render()};
+  const r=$('#dl-r');if(r)r.onclick=()=>{
+    if(D.tab==='port'){D.port=null;D.perr='';dlLoadPort(true)}else{D.data=null;D.err='';D.loading=false;dlLoadStock(true)}render()};
+  const ts=$('#dl-to-stock');if(ts)ts.onclick=()=>{D.tab='stock';render()};
+  document.querySelectorAll('#view [data-dl]').forEach(b=>b.onclick=()=>dlOpen(b.dataset.dl));
+  const q=$('#dl-q'),res=$('#dl-res');
+  if(q){
+    const show=()=>{const l=stkSearch(q.value,8);res.innerHTML=q.value.trim()?l.map(r=>`<button data-dl="${esc(r.secid)}"><b>${esc(r.secid)}</b><span>${esc(r.shortname)}</span></button>`).join('')||'<div class="kp-e">Не найдено</div>':''};
+    q.oninput=()=>stkEnsureList(show);
+    q.onkeydown=e=>{if(e.key==='Enter'){const v=q.value.trim();const l=stkSearch(v,1);dlOpen(l.length?l[0].secid:v)}else if(e.key==='Escape'){q.value='';res.innerHTML=''}};
+    res.onclick=e=>{const b=e.target.closest('[data-dl]');if(b)dlOpen(b.dataset.dl)};
+    stkEnsureList();
+  }
+  [['dl-tax','tax'],['dl-fee','fee']].forEach(([id,k])=>{const e=$('#'+id);if(e)e.onchange=()=>{D[k]=e.value;D.data=null;D.port=null;D.loading=false;if(D.secid)dlLoadStock(true);render()}});
+}
+regPage('dgap',{title:'Дивидендные гэпы',group:'Акции',icon:'<path d="M3 17l5-6 4 3 4-8 5 6"/><path d="M3 21h18"/><path d="M12 14v7" stroke-dasharray="2 2"/>',render:pDgap,bind:bindDgap});
+if(typeof renderNav==='function')try{renderNav()}catch(e){}
 </script></body></html>
 '''
 

@@ -44,9 +44,29 @@ def stdlib_imports(source):
     return found
 
 
-def hidden_imports(app_path):
+def wheel_imports(wheel_dir):
+    """Модули стандартной библиотеки, которые импортируют дополнительные библиотеки (колёса из packaging/vendor.txt).
+    Код колёс не выполняется: только разбор текста .py внутри архива."""
+    import zipfile
+    found = set()
+    for fn in sorted(os.listdir(wheel_dir)):
+        if not fn.endswith(".whl"):
+            continue
+        with zipfile.ZipFile(os.path.join(wheel_dir, fn)) as z:
+            for n in z.namelist():
+                if n.endswith(".py"):
+                    try:
+                        found |= stdlib_imports(z.read(n).decode("utf-8", "replace"))
+                    except SyntaxError:
+                        pass
+    return found
+
+
+def hidden_imports(app_path, wheel_dir=None):
     with open(app_path, encoding="utf-8") as f:
         found = stdlib_imports(f.read())
+    if wheel_dir:
+        found |= wheel_imports(wheel_dir)
     # «from x import y» даёт и x, и x.y; y не всегда модуль — отбрасываем то, чего нет
     import importlib.util
     ok = set()
@@ -63,8 +83,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("app", nargs="?", default=os.path.join(ROOT, "tinvest_analytics.py"))
     ap.add_argument("-o", "--output", help="записать в файл (по умолчанию — в stdout)")
+    ap.add_argument("--wheels", help="папка с колёсами дополнительных библиотек (packaging/vendor_lock.py --download)")
     a = ap.parse_args()
-    text = "\n".join(hidden_imports(a.app)) + "\n"
+    text = "\n".join(hidden_imports(a.app, a.wheels)) + "\n"
     if a.output:
         with open(a.output, "w", encoding="utf-8") as f:
             f.write(text)

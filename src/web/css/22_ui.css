@@ -6,7 +6,16 @@
 .ng.shut .ngh i{transform:rotate(-90deg)}
 #eye.on{color:var(--ac-tx);border-color:var(--ac)}
 #eye .slash{display:none}#eye.on .slash{display:block}
-.top #srch,.top #eye{padding:8px 11px}
+.top #srch,.top #more{padding:8px 11px}
+.top #more svg{width:16px;height:16px}
+.more-wrap{position:relative}
+.more-dd{position:absolute;top:calc(100% + 6px);right:0;min-width:230px;background:var(--card);border:1px solid var(--line2);border-radius:12px;box-shadow:0 14px 36px #00000055;padding:6px;z-index:900;display:flex;flex-direction:column;gap:2px}
+.more-dd[hidden]{display:none}
+.more-dd .mi{display:flex;align-items:center;gap:10px;width:100%;padding:9px 10px;border:0;border-radius:8px;background:none;color:var(--tx);font:inherit;text-align:left;cursor:pointer}
+.more-dd .mi:hover,.more-dd .mi:focus-visible{background:var(--card2)}
+.more-dd .mi svg{width:16px;height:16px;flex:none}
+.more-dd .mi-ic{width:28px;flex:none;font-size:11px;font-weight:650;color:var(--mu);text-align:center}
+.more-dd .mi svg+.mi-t{margin-left:12px}
 #restore-bar{margin:12px 28px 0}
 .disc{flex:none;padding:6px 28px;border-top:1px solid var(--line);color:var(--mu);font-size:11px;text-align:center}
 #toast{position:fixed;left:50%;bottom:44px;transform:translate(-50%,16px);background:var(--card2);color:var(--tx);border:1px solid var(--line2);

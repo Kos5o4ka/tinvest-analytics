@@ -107,6 +107,16 @@ def tb_hash_id(prefix, parts, seen):
     return "%s-%s%s" % (prefix, h, "" if n == 1 else "-%d" % n)
 
 
+def uniq_op_id(xid, seen):
+    """id перевода бумаг: при совпадении (одна бумага, одна секунда) — суффикс -2, -3...; прежние id не меняются."""
+    base, n = xid, 1
+    while xid in seen:
+        n += 1
+        xid = "%s-%d" % (base, n)
+    seen.add(xid)
+    return xid
+
+
 def tb_deals(rows):
     """Строки раздела 1.1/1.2 -> список сделок (все виды, включая РЕПО; фильтрует вызывающий)."""
     out, cm = [], None
@@ -294,7 +304,7 @@ def tbank_parse(table, splits=None):
         d_from, d_to = min(dts), max(dts)
     start = d_from.replace(hour=0, minute=0, second=0)
     period = {"from": start.strftime("%Y-%m-%d"), "to": (d_to or d_from).strftime("%Y-%m-%d")}
-    ops, stat = [], defaultdict(int)
+    ops, stat, xids = [], defaultdict(int), set()
 
     # ── сделки (раздел 1.1) ──
     dq_trade, dq_repo, first_unit, nums = defaultdict(float), defaultdict(float), {}, defaultdict(int)
@@ -441,7 +451,9 @@ def tbank_parse(table, splits=None):
         elif r < 0:
             extra.append((False, -r, end_dt, unit))
         for sec_in, qty_x, when, u in extra:
-            ops.append({"id": "tb-xfer-%s-%s-%s" % ("in" if sec_in else "out", key, tb_iso(when)),
+            xid = "tb-xfer-%s-%s-%s" % ("in" if sec_in else "out", key, tb_iso(when))
+            xid = uniq_op_id(xid, xids)
+            ops.append({"id": xid,
                         "date": tb_iso(when), "type": "OPERATION_TYPE_" + ("INPUT_SECURITIES" if sec_in else "OUTPUT_SECURITIES"),
                         "payment": to_money(0, "rub"), "name": nm, "_ident": key,   # перевод бумаг не двигает деньги; оценка — в price
                         "quantity": tb_qty_str(qty_x), "quantityDone": tb_qty_str(qty_x), "price": to_money(round(u, 9), "rub"),

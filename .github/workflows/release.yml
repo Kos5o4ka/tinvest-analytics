@@ -50,8 +50,10 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then pip install pythonnet clr_loader; fi
       - name: Программа из релиза (чтобы собрать список её импортов)
         run: gh release download "$TAG" -p tinvest_analytics.py -D release_app --clobber
-      - name: Список импортов программы
-        run: python packaging/gen_hidden_imports.py release_app/tinvest_analytics.py -o packaging/hidden_imports.txt
+      - name: Колёса дополнительных библиотек (скачиваются по SHA256 из замка, код не запускается)
+        run: python packaging/vendor_lock.py --download vendor_wheels
+      - name: Список импортов программы и её дополнительных библиотек
+        run: python packaging/gen_hidden_imports.py release_app/tinvest_analytics.py --wheels vendor_wheels -o packaging/hidden_imports.txt
       - name: Иконки
         run: python packaging/make_icon.py build_icons
       - name: Сборка
@@ -92,6 +94,11 @@ jobs:
         with:
           path: bin
           merge-multiple: true
+      - uses: actions/checkout@v4
+        with:
+          path: src_checkout
+      - name: Колёса дополнительных библиотек — запасной источник для программы (основной — PyPI)
+        run: python3 src_checkout/packaging/vendor_lock.py --download bin
       - name: Контрольные суммы и загрузка в релиз
         run: |
           set -euo pipefail

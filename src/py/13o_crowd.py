@@ -15,7 +15,8 @@ CROWD_AZIPI = "https://e-disclosure.azipi.ru/"
 CROWD_UA = "Mozilla/5.0 (compatible; TAnalytic-crowd/%s; +https://github.com/Kos5o4ka/tinvest-analytics)"
 _CROWD_FEED = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/list/day-(\d{2}\.\d{2}\.\d{4})/\?MESSAGE_BY_DAY=\1&PAGEN_2=\d{1,3}$")
 _CROWD_MSG = re.compile(r"^https://e-disclosure\.azipi\.ru/messages/\d{1,10}/$")
-_CROWD_BAD = ("captcha", "just a moment", "access denied", "attention required", "ddos")
+_CROWD_BAD = ("captcha", "just a moment", "access denied", "attention required", "ddos",
+              "доступ ограничен", "подтвердите, что вы не робот", "проверка безопасности", "are you a robot", "cf-browser-verification")
 DEFAULT_CONFIG.setdefault("crowd_enabled", True)     # по умолчанию помогаем; выключается в «Настройках»
 DEFAULT_CONFIG.setdefault("crowd_dismissed", False)
 

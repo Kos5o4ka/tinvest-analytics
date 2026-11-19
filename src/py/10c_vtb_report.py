@@ -225,7 +225,7 @@ def vtb_parse(table, splits=None):
     pos = vt_secbal(sec.get("secbal") or [])
     mov = vt_secmov(sec.get("secmov") or [])
     stat = defaultdict(int)
-    ops, deal_seen = [], {}
+    ops, deal_seen, xids = [], {}, set()
     for x in vt_deals(sec.get("deals") or []) + vt_deals(sec.get("done") or []):  # «заключённые» + «завершённые», дедуп по номеру
         deal_seen.setdefault(x["num"], x)
     deals = sorted(deal_seen.values(), key=lambda z: z["dt"])
@@ -342,7 +342,9 @@ def vtb_parse(table, splits=None):
         elif r < 0:
             extra.append((False, -r, end_dt, unit))
         for sec_in, qty_x, when, u in extra:
-            ops.append({"id": "vtb-xfer-%s-%s-%s" % ("in" if sec_in else "out", isin, tb_iso(when)), "date": tb_iso(when),
+            xid = "vtb-xfer-%s-%s-%s" % ("in" if sec_in else "out", isin, tb_iso(when))
+            xid = uniq_op_id(xid, xids)
+            ops.append({"id": xid, "date": tb_iso(when),
                         "type": "OPERATION_TYPE_" + ("INPUT_SECURITIES" if sec_in else "OUTPUT_SECURITIES"),
                         "payment": to_money(0, "rub"), "name": nm, "_ident": isin,
                         "quantity": tb_qty_str(qty_x), "quantityDone": tb_qty_str(qty_x), "price": to_money(round(u, 9), "rub"),

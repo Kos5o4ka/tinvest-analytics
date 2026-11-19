@@ -1,13 +1,13 @@
 /* ── инкогнито и палитра команд (Ctrl+K / Cmd+K) ── */
 function setIncog(on){
   INCOG.on=!!on;lsSet('ta_incog',on?'1':'0');
-  const e=$('#eye');e.classList.toggle('on',INCOG.on);e.title=INCOG.on?'Показать суммы':'Скрыть суммы в деньгах';
+  const e=$('#eye');e.classList.toggle('on',INCOG.on);e.title=INCOG.on?'Показать суммы':'Скрыть суммы в деньгах';const lt=e.querySelector('.mi-t');if(lt)lt.textContent=INCOG.on?'Показать суммы':'Скрыть суммы';
   renderAccounts();renderNav();
   if(S.data||['set','imp'].includes(S.page))renderNow();
   toast(INCOG.on?'Суммы скрыты':'Суммы показаны');
 }
 $('#eye').onclick=()=>setIncog(!INCOG.on);
-$('#eye').classList.toggle('on',INCOG.on);
+$('#eye').classList.toggle('on',INCOG.on);{const lt=$('#eye .mi-t');if(lt&&INCOG.on)lt.textContent='Показать суммы'}
 $('#srch').onclick=()=>kpOpen();
 
 const KP={open:false,items:[],sel:0};
