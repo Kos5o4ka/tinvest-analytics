@@ -219,11 +219,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"ok": True})
             if path == "/api/import/preview":
                 raw = base64.b64decode(body.get("data") or "")
-                return self.send(200, import_preview(body.get("filename") or "", raw))
+                return self.send(200, import_preview_any(body.get("filename") or "", raw))
             if path == "/api/import/parse":
                 raw = base64.b64decode(body.get("data") or "")
-                ops, skipped = import_ops(body.get("filename") or "", raw, int(body.get("table") or 0),
-                                          int(body.get("header_row") or 0), body.get("mapping") or {})
+                ops, skipped, _fmt, _meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
+                                                           int(body.get("header_row") or 0), body.get("mapping") or {})
                 kinds = defaultdict(int)
                 for o in ops:
                     kinds[classify(o["type"])] += 1
@@ -233,24 +233,35 @@ class Handler(BaseHTTPRequestHandler):
                                        "from": ops[0]["date"][:10] if ops else None, "to": ops[-1]["date"][:10] if ops else None})
             if path == "/api/import/commit":
                 raw = base64.b64decode(body.get("data") or "")
-                ops, skipped = import_ops(body.get("filename") or "", raw, int(body.get("table") or 0),
-                                          int(body.get("header_row") or 0), body.get("mapping") or {})
+                ops, skipped, fmt, meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
+                                                         int(body.get("header_row") or 0), body.get("mapping") or {})
                 if not ops:
                     raise ApiError("В файле не нашлось операций с выбранными колонками.", 400)
-                ops, ids = finalize_import(client, ops)
                 acc_id = body.get("target") if str(body.get("target") or "").startswith("imp-") else "imp-" + uuid.uuid4().hex[:10]
                 lst = imports_list()
                 ex = next((x for x in lst if x["id"] == acc_id), None)
                 if ex is None:
                     ex = {"id": acc_id, "name": (body.get("name") or "").strip() or "Импорт " + date.today().strftime("%d.%m.%Y"),
                           "broker": (body.get("broker") or "").strip(), "created": utc_now_str(), "files": []}
+                    if fmt:
+                        ex["format"] = fmt
                     lst.append(ex)
-                ex["files"].append({"name": body.get("filename") or "", "count": len(ops), "at": utc_now_str()})
+                finfo = {"name": body.get("filename") or "", "count": len(ops), "at": utc_now_str()}
+                if meta:
+                    finfo["from"], finfo["to"] = meta["period"]["from"], meta["period"]["to"]
+                periods = [(f.get("from"), f.get("to")) for f in ex["files"] if f.get("from")] + \
+                          ([(finfo["from"], finfo["to"])] if meta else [])
+                # новый файл склеивается со всеми операциями счёта: FIFO и «досчитанные» пополнения считаются по всей истории
+                ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) if ex["files"] else None,
+                                           periods=periods, synth=not fmt)
+                ex["files"].append(finfo)
+                ex["ops"] = len(ops)
+                store().ops_clear(acc_id)
                 store().ops_put(acc_id, ops)
                 store().put("imports", lst)
                 mem_clear()
                 found = sum(1 for v in ids.values() if v.get("uid"))
-                return self.send(200, {"ok": True, "id": acc_id, "count": len(ops), "skipped": skipped,
+                return self.send(200, {"ok": True, "id": acc_id, "count": finfo["count"], "total": len(ops), "skipped": skipped,
                                        "resolved": found, "idents": len(ids)})
             if path == "/api/import/delete":
                 lst = [x for x in imports_list() if x["id"] != body.get("id")]

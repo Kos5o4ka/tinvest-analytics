@@ -360,11 +360,46 @@ def resolve_idents(client, idents):
     return out
 
 
-def finalize_import(client, ops, keep_demo=False):
+def _period_covered(o, periods):
+    """Синтетическая «входящая» операция отчёта (_opening) не нужна, если другой, более ранний файл счёта
+    покрывает начало её периода: остатки на эту дату там уже получились из самих операций."""
+    per = o.get("_period")
+    if not o.get("_opening") or not per:
+        return False
+    try:
+        start = datetime.strptime(per[0], "%Y-%m-%d").date()
+        for f, t in periods or []:
+            if f and t and datetime.strptime(f, "%Y-%m-%d").date() < start <= datetime.strptime(t, "%Y-%m-%d").date() + timedelta(days=1):
+                return True
+    except (ValueError, TypeError):
+        return False
+    return False
+
+
+def import_merge_ops(old, new, periods=None):
+    """Склейка операций счёта: новые заменяют старые с тем же id, служебные «досчитанные» пополнения и
+    входящие остатки, закрытые более ранним файлом, снимаются. Порядок — по дате."""
+    by_id = {}
+    for o in list(old or []) + list(new or []):
+        by_id[op_key(o)] = o
+    ops = [o for o in by_id.values() if not o.get("_synthetic") and not _period_covered(o, periods)]
+    ops.sort(key=lambda o: (o.get("date") or "", 0 if o.get("_opening") else 1))
+    return ops
+
+
+def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, synth=True):
+    """Находит бумаги, склеивает с уже сохранёнными операциями счёта (existing) и пересчитывает по всему набору:
+    досчитанные пополнения (synth) и FIFO идут по всей истории, а не только по новому файлу."""
     if not keep_demo:
         demo_remove()  # настоящий отчёт заменяет демо-портфель
-    ids = resolve_idents(client, [o.get("_ident") for o in ops])
-    for o in ops:
+    existing = [dict(o) for o in existing or []]
+    for o in existing:
+        o.pop("yield", None)
+        o.pop("_yield", None)
+        if str(o.get("instrumentUid") or "").startswith("imp:"):  # раньше не нашлись на бирже — пробуем ещё раз
+            o["_ident"] = o.pop("instrumentUid")[4:]
+    ids = resolve_idents(client, [o.get("_ident") for o in list(ops) + existing])
+    for o in list(ops) + existing:
         ident = o.pop("_ident", "")
         r = ids.get(ident) or {}
         if r.get("uid"):
@@ -375,10 +410,11 @@ def finalize_import(client, ops, keep_demo=False):
                 o["instrumentKind"] = "INSTRUMENT_TYPE_" + r["type"].upper()
             if classify(o["type"]) in ("buy", "sell", "coupons", "dividends", "repayments") and r.get("name"):
                 o["name"] = r["name"]
-        elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends"):
+        elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out"):
             o["instrumentUid"] = "imp:" + ident
+    ops = import_merge_ops(existing, ops, periods) if existing else sorted(ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
     # если в отчёте нет пополнений — досоздаём их, чтобы деньги на счёте не уходили в минус
-    if not any(classify(o["type"]) == "deposits" for o in ops):
+    if synth and not any(classify(o["type"]) == "deposits" for o in ops):
         cash, extra = defaultdict(float), []
         for o in ops:
             c = cur_of(o["payment"])
