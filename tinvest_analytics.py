@@ -2939,6 +2939,8 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
             pay, c = qf(o.get("payment")), cur_of(o.get("payment"))
             k = classify(o.get("type"))
             uid = pos_key(o)
+            if k in ("conv_in", "conv_out") and (o.get("_conv") or {}).get("source") == "moex_split":
+                continue    # сплит: свечи API уже пересчитаны, а количество сделок масштабируется выше по цене — второй раз не умножаем
             # сделки с фьючерсами/опционами: payment — условная стоимость контракта, деньги движутся через
             # вариационную маржу (отдельные операции); считать payment деньгами — значит выдумать скачки на ±цену контракта
             # дивиденды «на карту» (DIV_EXT) на счёт не поступают: это доход и сразу вывод. Покупка с карты (BUY_CARD)
@@ -3419,6 +3421,8 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
     ids = resolve_idents(client, [o.get("_ident") for o in list(ops) + existing])
     for o in list(ops) + existing:
         ident = o.pop("_ident", "")
+        if ident:
+            o["_sec"] = ident      # код бумаги в отчёте (ISIN или тикер): по нему находятся сплиты при слиянии файлов
         r = ids.get(ident) or {}
         if r.get("uid"):
             o["instrumentUid"], o["figi"] = r["uid"], r.get("figi") or ""
@@ -3431,6 +3435,7 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
         elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out"):
             o["instrumentUid"] = "imp:" + ident
     ops = import_merge_ops(existing, ops, periods) if existing else sorted(ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
+    ops = import_apply_splits(ops)   # пары обмена на дни сплитов по всей истории счёта
     # если в отчёте нет пополнений — досоздаём их, чтобы деньги на счёте не уходили в минус
     if synth and not any(classify(o["type"]) == "deposits" for o in ops):
         cash, extra = defaultdict(float), []
@@ -3973,7 +3978,7 @@ def tb_qty_str(q):
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else ("%.9f" % q).rstrip("0").rstrip(".")
 
 
-def tbank_parse(table):
+def tbank_parse(table, splits=None):
     """Разбор отчёта Т-Инвестиций. Возвращает (ops, meta): ops в том же формате, что и у общего импортёра
     (с полем _ident для поиска бумаги), meta — период, остатки и счётчики для сверки и предпросмотра."""
     d_from, d_to = tb_period(table)
@@ -4076,18 +4081,22 @@ def tbank_parse(table):
     for x in pending:
         if x["repo"] and re.match(r"^\s*репо\s*2", x["kind"], re.I):
             lent_end[ident(x["code"])] += x["qty"] if "покуп" in x["kind"].lower() else -x["qty"]
+    # сплиты Мосбиржи внутри периода: количество на их день умножается, поэтому «лишних» бумаг без сделки не возникает
+    sp = splits if splits is not None else splits_by_isin(period["from"], period["to"], set(pos) | set(dq_trade) | set(lent_end), isin_of)
     meta_pos = {}
     for isin, p in pos.items():
         key = isin if ISIN_RE.match(isin) else ident(p["code"])
         econ_close = p["close"] + lent_end.get(key, 0.0)
         econ_open = p["open"] + lent_end.get(key, 0.0) + dq_repo.get(key, 0.0)
         meta_pos[key] = {"name": p["name"], "open": p["open"], "close": p["close"], "plan": p["plan"], "econ_open": econ_open,
-                         "econ_close": econ_close, "resid": (econ_close - econ_open) - dq_trade.get(key, 0.0)}
+                         "econ_close": econ_close,
+                         "resid": econ_close - split_walk(econ_open, day_deals.get(key, ()), sp.get(key, ()))}
     for key in set(dq_trade) | set(lent_end):
         if key not in meta_pos:  # бумаги нет в 3.1 (нулевые остатки)
             eo = lent_end.get(key, 0.0) + dq_repo.get(key, 0.0)
             meta_pos[key] = {"name": "", "open": 0.0, "close": 0.0, "plan": 0.0, "econ_open": eo,
-                             "econ_close": lent_end.get(key, 0.0), "resid": lent_end.get(key, 0.0) - eo - dq_trade.get(key, 0.0)}
+                             "econ_close": lent_end.get(key, 0.0),
+                             "resid": lent_end.get(key, 0.0) - split_walk(eo, day_deals.get(key, ()), sp.get(key, ()))}
     day_deals = {k: sorted(v, key=lambda z: z[0]) for k, v in day_deals.items()}
     name_of = {ident(x["code"]): x["name"] for x in deals + pending if x["name"]}
     open_iso = tb_iso(start)
@@ -4112,7 +4121,11 @@ def tbank_parse(table):
         # FIFO не знает коротких позиций: если продаж больше, чем бумаг на руках (продажа «с плеча» с покрытием через
         # секунды), недостающее довносим входящей операцией перед продажей и снимаем после покупки-покрытия
         run, short, extra = p["econ_open"] + max(r, 0.0), 0.0, []
-        for t, dq, u in day_deals.get(key, ()):
+        for t, dq, u in split_timeline(day_deals.get(key, ()), sp.get(key, ())):
+            if dq is None:
+                run *= u
+                short *= u
+                continue
             if dq < 0:
                 take = min(run, -dq)
                 run -= take
@@ -4162,7 +4175,9 @@ def tbank_reconcile(ops, meta):
         w = dict(o)
         if w.get("_ident") and classify(w["type"]) in ("buy", "sell", "sec_in", "sec_out", "repayments"):
             w["instrumentUid"] = "imp:" + w["_ident"]
+            w["_sec"] = w["_ident"]
         work.append(w)
+    work = import_apply_splits(work, until=meta["period"]["to"])   # сплиты после конца периода отчёта в его остатках не видны
     held = {u[4:]: v["qty"] for u, v in fifo(work).items()}
     res = {"cash": {c: (meta["cash_close"].get(c, 0.0), cash.get(c, 0.0)) for c in set(meta["cash_close"]) | set(cash)},
            "pos": {k: (p["econ_close"], held.get(k, 0.0)) for k, p in meta["pos"].items()}}
@@ -4430,7 +4445,7 @@ def vt_cash_type(op, note, redeemed_full):
     return "OTHER", op
 
 
-def vtb_parse(table):
+def vtb_parse(table, splits=None):
     """Разбор отчёта ВТБ -> (ops, meta) в том же виде, что tbank_parse (см. tbank_reconcile / tbank_preview)."""
     d_from, d_to = vt_period(table)
     if d_from is None:
@@ -4509,12 +4524,13 @@ def vtb_parse(table):
     # остатки: входящий = операция на начало периода; всё, что не объяснено сделками, — движение без сделки
     open_iso = tb_iso(start)
     tag = {"_opening": True, "_period": [period["from"], period["to"]]}
+    sp = splits if splits is not None else splits_by_isin(period["from"], period["to"], set(pos) | set(dq))
     meta_pos = {}
     for isin in set(pos) | set(dq):
         p = pos.get(isin) or {"name": "", "open": 0.0, "close": 0.0, "plan": 0.0}
         econ_open, econ_close = p["open"], p["plan"] if isin in pos else dq[isin]
         meta_pos[isin] = {"name": p["name"], "open": p["open"], "close": p["close"], "plan": p["plan"], "econ_open": econ_open,
-                          "econ_close": econ_close, "resid": (econ_close - econ_open) - dq.get(isin, 0.0) - dm.get(isin, 0.0)}
+                          "econ_close": econ_close, "resid": econ_close - split_walk(econ_open, day_deals.get(isin, ()), sp.get(isin, ())) - dm.get(isin, 0.0)}
     name_of = {x["isin"]: x["name"] for x in deals}
     for isin, p in sorted(meta_pos.items()):
         nm, unit = p["name"] or name_of.get(isin) or isin, first_unit.get(isin, 0.0)
@@ -4532,7 +4548,11 @@ def vtb_parse(table):
             stat["opening_sec"] += 1
         # продажи без покрытия FIFO не знает: недостающее довносим входящей операцией перед продажей и снимаем после покрытия
         run, short, extra = p["econ_open"] + max(r, 0.0), 0.0, []
-        for t, q, u in sorted(day_deals.get(isin, ()), key=lambda z: z[0]):
+        for t, q, u in split_timeline(day_deals.get(isin, ()), sp.get(isin, ())):
+            if q is None:
+                run *= u
+                short *= u
+                continue
             if q < 0:
                 take = min(run, -q)
                 run -= take
@@ -4588,6 +4608,155 @@ def broker_try(filename, raw):
         return tbank_parse(t)
     t = vt_detect(tables)
     return vtb_parse(t) if t else None
+# ═══════════════════════════════ сплиты в импорте отчётов ═══════════════════════════════
+# В отчётах брокеров количество бумаг после сплита/консолидации «появляется без сделки» (3.1 на начало периода — до сплита,
+# на конец — после). Список сплитов берём у Мосбиржи (ISS statistics/engines/stock/splits), сопоставляем бумагу по ISIN
+# (secid в списке бывает тикером или самим ISIN) и:
+#   1) при разборе отчёта количество на день сплита умножается на after/before, поэтому «движения без сделки» не возникает;
+#   2) при слиянии файлов (finalize_import) в счёт вставляется пара служебных операций X_CONV_OUT / X_CONV_IN (как в 07a_conversions),
+#      которая переносит лоты FIFO в новое количество и сохраняет стоимость и срок владения. Пара идемпотентна по id.
+# Нет сети — работаем как раньше, без сплитов.
+
+SPLITS_URL = "https://iss.moex.com/iss/statistics/engines/stock/splits.json?iss.meta=off"
+SECURITY_URL = "https://iss.moex.com/iss/securities/%s.json?iss.meta=off&iss.only=description"
+
+
+def moex_splits_list():
+    """[{date, secid, before, after}] из ISS (кэш на сутки). При ошибке сети — [] (пустой результат не кэшируется)."""
+    st = store()
+    v = st.get("moex:splits", ttl=DAY)
+    if v is not None:
+        return v
+    try:
+        data = json.loads(http_text(SPLITS_URL))["splits"]
+        cols = data["columns"]
+        rows = []
+        for r in data["data"]:
+            d = dict(zip(cols, r))
+            if d.get("tradedate") and d.get("secid") and d.get("before") and d.get("after"):
+                rows.append({"date": str(d["tradedate"])[:10], "secid": str(d["secid"]), "before": float(d["before"]),
+                             "after": float(d["after"])})
+    except Exception:  # noqa: BLE001 — нет сети/сбой источника: импорт идёт без сплитов
+        return []
+    st.put("moex:splits", rows)
+    return rows
+
+
+def moex_secid_isin(secid):
+    """ISIN по коду бумаги Мосбиржи (кэш на месяц); пустая строка, если узнать не удалось."""
+    st = store()
+    v = st.get("moex:secisin:" + secid, ttl=30 * DAY)
+    if v is not None:
+        return v
+    try:
+        data = json.loads(http_text(SECURITY_URL % urllib.parse.quote(secid)))["description"]
+        cols = data["columns"]
+        isin = ""
+        for r in data["data"]:
+            d = dict(zip(cols, r))
+            if d.get("name") == "ISIN":
+                isin = str(d.get("value") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+    st.put("moex:secisin:" + secid, isin)
+    return isin
+
+
+def splits_by_isin(d_from, d_to, wanted, secid_isin=None):
+    """{ключ бумаги: [(дата 'ГГГГ-ММ-ДД', коэффициент after/before)]} для сплитов в [d_from; d_to] (строки дат) по нужным бумагам
+    wanted (ISIN или тикеры, как они записаны в операциях). secid_isin — известные соответствия «код -> ISIN» из самого отчёта."""
+    wanted = set(w for w in wanted if w)
+    if not wanted:
+        return {}
+    rows = [r for r in moex_splits_list() if d_from <= r["date"] <= d_to and r["before"] and r["before"] != r["after"]]
+    known = dict(secid_isin or {})
+    need = sorted({r["secid"] for r in rows if r["secid"] not in wanted and r["secid"] not in known and not ISIN_RE.match(r["secid"])})
+    for sid, isin in pool_map(lambda x: (x, moex_secid_isin(x)), need, workers=4):
+        known[sid] = isin
+    out = {}
+    for r in rows:
+        sid = r["secid"]
+        key = sid if sid in wanted else known.get(sid)
+        if key in wanted:
+            out.setdefault(key, []).append((r["date"], r["after"] / r["before"]))
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def split_label(before, after):
+    f = lambda x: str(int(x)) if x == int(x) else str(x)
+    return "Сплит %s:%s (Мосбиржа)" % (f(before), f(after)) if after >= before else "Консолидация %s:%s (Мосбиржа)" % (f(before), f(after))
+
+
+def import_apply_splits(ops, until=None):
+    """Вставляет в операции счёта пары X_CONV_OUT / X_CONV_IN на дни сплитов по всей истории (после слияния файлов).
+    Ранее вставленные пары (id split:…) пересчитываются заново; бумаги, которых на день сплита не было, пропускаются."""
+    ops = [o for o in ops if not str(o.get("id") or "").startswith("split:")]
+    dates = sorted(o["date"][:10] for o in ops if o.get("date"))
+    if not dates:
+        return ops
+    by_sec = defaultdict(list)
+    for o in ops:
+        if o.get("_sec") and classify(o["type"]) in ("buy", "sell", "sec_in", "sec_out", "repayments"):
+            by_sec[o["_sec"]].append(o)
+    # конец диапазона — сегодня: бумага могла остаться в портфеле, а сплит случиться уже после последней операции
+    sp = splits_by_isin(dates[0], until or max(dates[-1], datetime.now(timezone.utc).strftime("%Y-%m-%d")), by_sec)
+    zero = to_money(0, "rub")
+    for sec, evs in sp.items():
+        rows = sorted(by_sec[sec], key=lambda o: o["date"])
+        for idx, (day, ratio) in enumerate(evs):
+            qty, ei = 0.0, 0
+            for o in rows:
+                d = o["date"][:10]
+                if d >= day:
+                    break
+                while ei < idx and evs[ei][0] <= d:   # предыдущие сплиты этой бумаги уже сработали
+                    qty *= evs[ei][1]
+                    ei += 1
+                k, q = classify(o["type"]), op_qty(o)
+                if k in ("buy", "sec_in"):
+                    qty += q
+                elif k in ("sell", "sec_out"):
+                    qty -= q
+                elif k == "repayments" and op_type(o) == "BOND_REPAYMENT_FULL":
+                    qty = 0.0
+            while ei < idx:
+                qty *= evs[ei][1]
+                ei += 1
+            if qty <= 0.5:
+                continue
+            new_q = qty * ratio
+            new_q = int(round(new_q)) if abs(new_q - round(new_q)) < 1e-6 else round(new_q, 6)
+            sample = max(rows, key=lambda o: o["date"])
+            uid = sample.get("instrumentUid") or sample.get("figi")
+            before, after = (1, ratio) if ratio >= 1 else (round(1 / ratio), 1)
+            cv = {"from_key": uid, "to_key": uid, "ratio": ratio, "label": split_label(before, after), "source": "moex_split",
+                  "old_uids": [uid], "new_uid": uid, "old_qty": qty, "new_qty": new_q}
+            base = {"date": day + "T00:00:01Z", "state": "OPERATION_STATE_EXECUTED", "payment": dict(zero), "_conv": cv, "_sec": sec,
+                    "name": sample.get("name") or sec, "instrumentUid": sample.get("instrumentUid"), "figi": sample.get("figi"),
+                    "instrumentKind": sample.get("instrumentKind") or "INSTRUMENT_TYPE_SHARE"}
+            cid = "split:%s:%s" % (sec, day)
+            qs = lambda x: str(int(x)) if x == int(x) else repr(x)
+            # «in» на секунду позже «out»: хранилище отдаёт операции по (дата, ключ), а ':in' < ':out' по алфавиту
+            ops.append(dict(base, id=cid + ":out", type="OPERATION_TYPE_X_CONV_OUT", quantity=qs(qty), quantityDone=qs(qty)))
+            ops.append(dict(base, id=cid + ":in", date=day + "T00:00:02Z", type="OPERATION_TYPE_X_CONV_IN",
+                            quantity=qs(new_q), quantityDone=qs(new_q)))
+    ops.sort(key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
+    return ops
+
+
+def split_walk(run, events, splits):
+    """Количество на конец периода: стартовое run, сделки events [(время, ±кол-во, …)], в дни сплитов количество умножается."""
+    items = sorted([(x[0], 1, x[1]) for x in events] + [(datetime.strptime(d, "%Y-%m-%d"), 0, r) for d, r in splits],
+                   key=lambda z: (z[0], z[1]))
+    for _t, kind, v in items:
+        run = run * v if kind == 0 else run + v
+    return run
+
+
+def split_timeline(events, splits):
+    """Сделки (время, ±кол-во, цена) вперемешку с маркерами сплитов (время, None, коэффициент) в хронологическом порядке."""
+    return sorted(list(events) + [(datetime.strptime(d, "%Y-%m-%d"), None, r) for d, r in splits],
+                  key=lambda z: (z[0], 0 if z[1] is None else 1))
 # ═══════════════════════════════ счета и сводка ═══════════════════════════════
 
 _mem, _mem_lock = {}, threading.Lock()

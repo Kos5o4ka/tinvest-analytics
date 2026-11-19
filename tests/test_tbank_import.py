@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _load import load  # noqa: E402
 
 M = load()
+M.moex_splits_list = lambda: []      # тесты без сети: сплитов нет (см. tests/test_splits_import.py)
 
 ISIN = "RU000A0TEST1"
 ISIN2 = "RU000A0TEST2"

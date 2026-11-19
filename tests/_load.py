@@ -18,5 +18,6 @@ def load():
         m = importlib.util.module_from_spec(spec)
         sys.modules["tinvest_analytics_under_test"] = m
         spec.loader.exec_module(m)
+        m._orig_moex_splits_list = m.moex_splits_list   # настоящая функция — для теста разбора ответа ISS; остальные тесты её подменяют
         _mod = m
     return _mod

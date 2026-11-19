@@ -401,6 +401,8 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
     ids = resolve_idents(client, [o.get("_ident") for o in list(ops) + existing])
     for o in list(ops) + existing:
         ident = o.pop("_ident", "")
+        if ident:
+            o["_sec"] = ident      # код бумаги в отчёте (ISIN или тикер): по нему находятся сплиты при слиянии файлов
         r = ids.get(ident) or {}
         if r.get("uid"):
             o["instrumentUid"], o["figi"] = r["uid"], r.get("figi") or ""
@@ -413,6 +415,7 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
         elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out"):
             o["instrumentUid"] = "imp:" + ident
     ops = import_merge_ops(existing, ops, periods) if existing else sorted(ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
+    ops = import_apply_splits(ops)   # пары обмена на дни сплитов по всей истории счёта
     # если в отчёте нет пополнений — досоздаём их, чтобы деньги на счёте не уходили в минус
     if synth and not any(classify(o["type"]) == "deposits" for o in ops):
         cash, extra = defaultdict(float), []

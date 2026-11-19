@@ -274,7 +274,7 @@ def tb_qty_str(q):
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else ("%.9f" % q).rstrip("0").rstrip(".")
 
 
-def tbank_parse(table):
+def tbank_parse(table, splits=None):
     """Разбор отчёта Т-Инвестиций. Возвращает (ops, meta): ops в том же формате, что и у общего импортёра
     (с полем _ident для поиска бумаги), meta — период, остатки и счётчики для сверки и предпросмотра."""
     d_from, d_to = tb_period(table)
@@ -377,18 +377,22 @@ def tbank_parse(table):
     for x in pending:
         if x["repo"] and re.match(r"^\s*репо\s*2", x["kind"], re.I):
             lent_end[ident(x["code"])] += x["qty"] if "покуп" in x["kind"].lower() else -x["qty"]
+    # сплиты Мосбиржи внутри периода: количество на их день умножается, поэтому «лишних» бумаг без сделки не возникает
+    sp = splits if splits is not None else splits_by_isin(period["from"], period["to"], set(pos) | set(dq_trade) | set(lent_end), isin_of)
     meta_pos = {}
     for isin, p in pos.items():
         key = isin if ISIN_RE.match(isin) else ident(p["code"])
         econ_close = p["close"] + lent_end.get(key, 0.0)
         econ_open = p["open"] + lent_end.get(key, 0.0) + dq_repo.get(key, 0.0)
         meta_pos[key] = {"name": p["name"], "open": p["open"], "close": p["close"], "plan": p["plan"], "econ_open": econ_open,
-                         "econ_close": econ_close, "resid": (econ_close - econ_open) - dq_trade.get(key, 0.0)}
+                         "econ_close": econ_close,
+                         "resid": econ_close - split_walk(econ_open, day_deals.get(key, ()), sp.get(key, ()))}
     for key in set(dq_trade) | set(lent_end):
         if key not in meta_pos:  # бумаги нет в 3.1 (нулевые остатки)
             eo = lent_end.get(key, 0.0) + dq_repo.get(key, 0.0)
             meta_pos[key] = {"name": "", "open": 0.0, "close": 0.0, "plan": 0.0, "econ_open": eo,
-                             "econ_close": lent_end.get(key, 0.0), "resid": lent_end.get(key, 0.0) - eo - dq_trade.get(key, 0.0)}
+                             "econ_close": lent_end.get(key, 0.0),
+                             "resid": lent_end.get(key, 0.0) - split_walk(eo, day_deals.get(key, ()), sp.get(key, ()))}
     day_deals = {k: sorted(v, key=lambda z: z[0]) for k, v in day_deals.items()}
     name_of = {ident(x["code"]): x["name"] for x in deals + pending if x["name"]}
     open_iso = tb_iso(start)
@@ -413,7 +417,11 @@ def tbank_parse(table):
         # FIFO не знает коротких позиций: если продаж больше, чем бумаг на руках (продажа «с плеча» с покрытием через
         # секунды), недостающее довносим входящей операцией перед продажей и снимаем после покупки-покрытия
         run, short, extra = p["econ_open"] + max(r, 0.0), 0.0, []
-        for t, dq, u in day_deals.get(key, ()):
+        for t, dq, u in split_timeline(day_deals.get(key, ()), sp.get(key, ())):
+            if dq is None:
+                run *= u
+                short *= u
+                continue
             if dq < 0:
                 take = min(run, -dq)
                 run -= take
@@ -463,7 +471,9 @@ def tbank_reconcile(ops, meta):
         w = dict(o)
         if w.get("_ident") and classify(w["type"]) in ("buy", "sell", "sec_in", "sec_out", "repayments"):
             w["instrumentUid"] = "imp:" + w["_ident"]
+            w["_sec"] = w["_ident"]
         work.append(w)
+    work = import_apply_splits(work, until=meta["period"]["to"])   # сплиты после конца периода отчёта в его остатках не видны
     held = {u[4:]: v["qty"] for u, v in fifo(work).items()}
     res = {"cash": {c: (meta["cash_close"].get(c, 0.0), cash.get(c, 0.0)) for c in set(meta["cash_close"]) | set(cash)},
            "pos": {k: (p["econ_close"], held.get(k, 0.0)) for k, p in meta["pos"].items()}}

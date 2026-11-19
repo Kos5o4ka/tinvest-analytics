@@ -211,7 +211,7 @@ def vt_cash_type(op, note, redeemed_full):
     return "OTHER", op
 
 
-def vtb_parse(table):
+def vtb_parse(table, splits=None):
     """Разбор отчёта ВТБ -> (ops, meta) в том же виде, что tbank_parse (см. tbank_reconcile / tbank_preview)."""
     d_from, d_to = vt_period(table)
     if d_from is None:
@@ -290,12 +290,13 @@ def vtb_parse(table):
     # остатки: входящий = операция на начало периода; всё, что не объяснено сделками, — движение без сделки
     open_iso = tb_iso(start)
     tag = {"_opening": True, "_period": [period["from"], period["to"]]}
+    sp = splits if splits is not None else splits_by_isin(period["from"], period["to"], set(pos) | set(dq))
     meta_pos = {}
     for isin in set(pos) | set(dq):
         p = pos.get(isin) or {"name": "", "open": 0.0, "close": 0.0, "plan": 0.0}
         econ_open, econ_close = p["open"], p["plan"] if isin in pos else dq[isin]
         meta_pos[isin] = {"name": p["name"], "open": p["open"], "close": p["close"], "plan": p["plan"], "econ_open": econ_open,
-                          "econ_close": econ_close, "resid": (econ_close - econ_open) - dq.get(isin, 0.0) - dm.get(isin, 0.0)}
+                          "econ_close": econ_close, "resid": econ_close - split_walk(econ_open, day_deals.get(isin, ()), sp.get(isin, ())) - dm.get(isin, 0.0)}
     name_of = {x["isin"]: x["name"] for x in deals}
     for isin, p in sorted(meta_pos.items()):
         nm, unit = p["name"] or name_of.get(isin) or isin, first_unit.get(isin, 0.0)
@@ -313,7 +314,11 @@ def vtb_parse(table):
             stat["opening_sec"] += 1
         # продажи без покрытия FIFO не знает: недостающее довносим входящей операцией перед продажей и снимаем после покрытия
         run, short, extra = p["econ_open"] + max(r, 0.0), 0.0, []
-        for t, q, u in sorted(day_deals.get(isin, ()), key=lambda z: z[0]):
+        for t, q, u in split_timeline(day_deals.get(isin, ()), sp.get(isin, ())):
+            if q is None:
+                run *= u
+                short *= u
+                continue
             if q < 0:
                 take = min(run, -q)
                 run -= take

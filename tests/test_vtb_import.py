@@ -10,6 +10,7 @@ from _load import load  # noqa: E402
 from test_tbank_import import make_xlsx, row, report1  # noqa: E402
 
 M = load()
+M.moex_splits_list = lambda: []      # тесты без сети: сплитов нет (см. tests/test_splits_import.py)
 ISIN = "RU000A0TEST1"
 NAME = "Тест 1, 4B02-01-00001-A, " + ISIN
 

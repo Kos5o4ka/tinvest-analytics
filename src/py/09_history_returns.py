@@ -265,6 +265,8 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
             pay, c = qf(o.get("payment")), cur_of(o.get("payment"))
             k = classify(o.get("type"))
             uid = pos_key(o)
+            if k in ("conv_in", "conv_out") and (o.get("_conv") or {}).get("source") == "moex_split":
+                continue    # сплит: свечи API уже пересчитаны, а количество сделок масштабируется выше по цене — второй раз не умножаем
             # сделки с фьючерсами/опционами: payment — условная стоимость контракта, деньги движутся через
             # вариационную маржу (отдельные операции); считать payment деньгами — значит выдумать скачки на ±цену контракта
             # дивиденды «на карту» (DIV_EXT) на счёт не поступают: это доход и сразу вывод. Покупка с карты (BUY_CARD)
