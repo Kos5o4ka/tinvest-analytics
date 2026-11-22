@@ -56,7 +56,7 @@ class Up(BaseHTTPRequestHandler):
         elif self.path.startswith("/q/SBER/"):
             b = fx("smartlab_ifrs.html").encode()
         elif self.path.startswith("/q/JUNK/"):
-            b = b"<html>captcha</html>"
+            b = b"<html>junk</html>"   # не «captcha»: такая страница теперь считается блокировкой источника
         else:
             self.send_response(404)
             self.send_header("Content-Length", "0")

@@ -25,14 +25,17 @@ class Upstream:
         self.delay = 0.0
         self.fail = False
         self.posts = []
+        self.override = None            # (код, тело, content-type, {заголовки}) — ответ вместо обычного
         up = self
 
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
 
-            def _reply(self, code, body, ct="text/plain"):
+            def _reply(self, code, body, ct="text/plain", extra=None):
                 self.send_response(code)
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
                 self.send_header("Content-Type", ct)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Set-Cookie", "svc=1; Path=/")
@@ -42,6 +45,8 @@ class Upstream:
             def do_GET(self):
                 up.hits += 1
                 time.sleep(up.delay)
+                if up.override:
+                    return self._reply(*up.override)
                 if up.fail or self.path == "/boom":
                     return self._reply(503, b"down")
                 if self.path == "/nf":
@@ -245,6 +250,156 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(a.ttl_for("bo.nalog.gov.ru", "https://bo.nalog.gov.ru/nbo/x", "GET", mon), 7 * 86400)
         self.assertIsNone(a.ttl_for("iss.moex.com", "https://iss.moex.com/iss/x", "POST", mon))
         self.assertEqual(a.ttl_for("raexpert.ru", "https://raexpert.ru/search/", "POST", mon), 12 * 3600)
+
+
+class BlockTests(unittest.TestCase):
+    """Блокировки источника: 403/429/451 и анти-бот страницы -> пауза хоста, stale, 503 с X-Upstream-Blocked."""
+
+    def setUp(self):
+        self.f = Fx()
+        self.u = self.f.up.url("/p")
+
+    def tearDown(self):
+        self.f.close()
+
+    def block429(self, ra="120"):
+        self.f.up.override = (429, b"slow down", "text/plain", {"Retry-After": ra} if ra else {})
+
+    def test_429_cooldown_no_upstream_and_headers(self):
+        self.block429("120")
+        st, body, h = self.f.call(self.u)
+        self.assertEqual(st, 503)
+        self.assertEqual((h["X-Upstream-Error"], h["X-Upstream-Blocked"], h["Retry-After"]), ("1", "120", "120"))
+        self.assertIsNone(h["X-Cache"])
+        self.assertNotIn(b"slow down", body)
+        n = self.f.up.hits
+        self.f.now[0] += 50
+        st, _, h = self.f.call(self.f.up.url("/other"))       # другой URL того же хоста: к источнику тоже не ходим
+        self.assertEqual(st, 503)
+        self.assertEqual(self.f.up.hits, n)
+        self.assertEqual(int(h["X-Upstream-Blocked"]), 71)
+        self.assertEqual(self.f.app.stats()["cooldowns"][self.f.up.host], 71)
+
+    def test_retry_after_clamped(self):
+        self.block429("5")
+        self.assertEqual(self.f.call(self.u)[2]["X-Upstream-Blocked"], "30")
+        self.f.now[0] += 100
+        self.block429("999999")
+        self.assertEqual(self.f.call(self.u)[2]["X-Upstream-Blocked"], str(6 * 3600))
+
+    def test_retry_after_http_date(self):
+        self.f.now[0] = 1_700_000_000.0
+        when = datetime.fromtimestamp(self.f.now[0] + 300, timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        self.block429(when)
+        self.assertEqual(self.f.call(self.u)[2]["X-Upstream-Blocked"], "300")
+
+    def test_expiry_calls_upstream_and_success_resets_backoff(self):
+        self.block429("")                                       # без Retry-After: 60, 120 …
+        self.assertEqual(self.f.call(self.u)[2]["X-Upstream-Blocked"], "60")
+        self.f.now[0] += 61
+        self.assertEqual(self.f.call(self.u)[2]["X-Upstream-Blocked"], "120")
+        self.f.now[0] += 121
+        n = self.f.up.hits
+        self.f.up.override = None
+        st, body, h = self.f.call(self.u)
+        self.assertEqual((st, h["X-Cache"]), (200, "miss"))
+        self.assertEqual(self.f.up.hits, n + 1)
+        self.f.now[0] += 101                                    # кэш истёк (TTL 100)
+        self.block429("")
+        self.assertEqual(self.f.call(self.f.up.url("/q2"))[2]["X-Upstream-Blocked"], "60")   # backoff сброшен успехом
+
+    def test_backoff_cap(self):
+        self.block429("")
+        vals = []
+        for _ in range(7):
+            vals.append(int(self.f.call(self.u)[2]["X-Upstream-Blocked"]))
+            self.f.now[0] += vals[-1] + 1
+        self.assertEqual(vals, [60, 120, 240, 480, 960, 1800, 1800])
+
+    def test_stale_served_when_blocked_and_in_cooldown(self):
+        self.assertEqual(self.f.call(self.u)[0], 200)
+        self.f.now[0] += 101
+        self.block429("120")
+        st, body, h = self.f.call(self.u)
+        self.assertEqual((st, h["X-Cache"], body), (200, "stale", b"hit1"))
+        n = self.f.up.hits
+        st, body, h = self.f.call(self.u)                       # пауза: источник не трогаем, отдаём stale
+        self.assertEqual((st, h["X-Cache"]), (200, "stale"))
+        self.assertEqual(self.f.up.hits, n)
+        s = self.f.app.stats()
+        self.assertEqual(s["blocked"], 2)
+        self.assertEqual(s["hosts"][self.f.up.host]["blocked"], 2)
+        self.assertEqual(s["hit"], 0)
+
+    def test_blocked_not_cached(self):
+        self.block429("30")
+        self.f.call(self.u)
+        self.f.now[0] += 31
+        self.f.up.override = None
+        st, body, h = self.f.call(self.u)
+        self.assertEqual((st, h["X-Cache"]), (200, "miss"))
+
+    def test_captcha_short_html_blocked(self):
+        self.f.up.override = (200, b"<html><title>Just a moment...</title></html>", "text/html; charset=utf-8", {})
+        st, body, h = self.f.call(self.u)
+        self.assertEqual((st, h["X-Upstream-Blocked"]), (503, "60"))
+
+    def test_captcha_marker_in_json_or_large_html_not_blocked(self):
+        self.f.up.override = (200, b'{"note": "captcha"}', "application/json", {})
+        self.assertEqual(self.f.call(self.f.up.url("/j"))[0], 200)
+        big = b"<html>" + b"x" * 70000 + b" captcha </html>"
+        self.f.up.override = (200, big, "text/html", {})
+        st, body, h = self.f.call(self.f.up.url("/big"))
+        self.assertEqual((st, h["X-Cache"], len(body)), (200, "miss", len(big)))
+        self.assertEqual(self.f.app.stats()["blocked"], 0)
+
+    def test_single_403_no_cooldown_two_403_cooldown(self):
+        self.f.up.override = (403, b"private", "text/plain", {})
+        st, body, h = self.f.call(self.f.up.url("/a"))
+        self.assertEqual((st, h["X-Upstream-Blocked"]), (503, "0"))
+        self.assertNotIn("Retry-After", h)
+        self.assertEqual(self.f.app.stats()["cooldowns"], {})
+        self.f.up.override = None
+        self.assertEqual(self.f.call(self.f.up.url("/ok"))[0], 200)       # хост не заморожен; успех сбрасывает счёт «подряд»
+        self.f.up.override = (403, b"private", "text/plain", {})
+        self.assertEqual(self.f.call(self.f.up.url("/b0"))[2]["X-Upstream-Blocked"], "0")
+        st, _, h = self.f.call(self.f.up.url("/b"))                       # второй 403 подряд — уже пауза
+        self.assertEqual((st, h["X-Upstream-Blocked"]), (503, "60"))
+        n = self.f.up.hits
+        self.f.call(self.f.up.url("/c"))
+        self.assertEqual(self.f.up.hits, n)
+
+    def test_403_strikes_expire(self):
+        self.f.up.override = (403, b"x", "text/plain", {})
+        self.f.call(self.f.up.url("/a"))
+        self.f.now[0] += 601
+        st, _, h = self.f.call(self.f.up.url("/b"))
+        self.assertEqual(h["X-Upstream-Blocked"], "0")
+
+    def test_parsed_blocked_502(self):
+        self.f.app.allowed["iss.moex.com"] = None
+        orig = self.f.app.upstream
+        calls = []
+
+        def up(m, url, b, c, h):
+            calls.append(url)
+            return 429, "text/plain", b"no", [], {"Retry-After": "90"}
+        self.f.app.upstream = up
+        name = next(iter(ts.PARSERS))
+        params = {"secid": ["SBER"], "ticker": ["SBER"]}
+        try:
+            url, _fn = ts.PARSERS[name](params)
+        except Exception:  # noqa: BLE001
+            self.skipTest("parser needs other params")
+        self.f.app.allowed[urllib.parse.urlparse(url).hostname] = None
+        q = "&".join("%s=%s" % (k, v[0]) for k, v in params.items())
+        st, body, h = self.f.call(None, path="/v1/parsed/%s?%s" % (name, q))
+        self.assertEqual(st, 502)
+        j = json.loads(body)
+        self.assertEqual((j["ok"], j["error"], j["retry_in"]), (False, "upstream blocked", 90))
+        self.assertEqual(h["X-Upstream-Blocked"], "90")
+        self.assertEqual(len(calls), 1)
+        self.f.app.upstream = orig
 
 
 class KeyTests(unittest.TestCase):

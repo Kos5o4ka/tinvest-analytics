@@ -17,6 +17,10 @@ DEFAULT_CONFIG.setdefault("data_server", "")
 DEFAULT_CONFIG.setdefault("data_key", "")
 _ds_state = {"down_until": 0.0, "error": "", "hit": 0, "miss": 0, "stale": 0, "direct": 0}
 _ds_lock = threading.Lock()
+_ds_bypass = {}                          # host -> до какого времени не ходить через сервер (источник заблокировал сервер: 429/captcha)
+_direct_block = {}                       # host -> [до какого времени не ходить и напрямую, число подряд отказов]
+DS_BYPASS_DEFAULT, DS_BYPASS_MIN, DS_BYPASS_MAX = 300, 30, 1800
+DIRECT_BLOCK_BASE, DIRECT_BLOCK_MAX = 120, 1800
 _ds_conf_cache = [0.0, ("", "")]
 _auth = {"need_login": False, "at": 0.0, "res": None, "bot": DS_BOT_DEFAULT}
 
@@ -97,6 +101,52 @@ def _ds_host_refused(err):
         return False
 
 
+def _ds_note_bypass(host, hdr):
+    """Сервер сообщил, что источник его заблокировал (X-Upstream-Blocked: секунды; 0 — одиночный отказ, хост не замораживаем)."""
+    try:
+        secs = int(float(hdr)) if hdr is not None else DS_BYPASS_DEFAULT
+    except ValueError:
+        secs = DS_BYPASS_DEFAULT
+    if secs <= 0 and hdr is not None:
+        return
+    with _ds_lock:
+        _ds_bypass[host] = time.time() + min(max(secs, DS_BYPASS_MIN), DS_BYPASS_MAX)
+
+
+def _ds_bypassed(host):
+    with _ds_lock:
+        t = _ds_bypass.get(host, 0.0)
+        if t and t <= time.time():
+            _ds_bypass.pop(host, None)
+            return False
+        return bool(t)
+
+
+def _direct_wait(host):
+    with _ds_lock:
+        b = _direct_block.get(host)
+        return max(0, int(b[0] - time.time()) + 1) if b and b[0] > time.time() else 0
+
+
+def _direct_note_fail(host, err):
+    """Прямой запрос отклонён: 429 всегда, 403/451 — только для хоста, который уже обходит сервер. Пауза: Retry-After или 120 с, 240 … до 1800."""
+    if err.code != 429 and not (err.code in (403, 451) and _ds_bypassed(host)):
+        return
+    try:
+        ra = float(err.headers.get("Retry-After") or "")
+    except (ValueError, AttributeError, TypeError):
+        ra = None
+    with _ds_lock:
+        n = _direct_block.get(host, [0.0, 0])[1]
+        d = min(max(ra, 30), 21600) if ra is not None else min(DIRECT_BLOCK_BASE * (2 ** n), DIRECT_BLOCK_MAX)
+        _direct_block[host] = [time.time() + d, n + 1]
+
+
+def _direct_note_ok(host):
+    with _ds_lock:
+        _direct_block.pop(host, None)
+
+
 def _ds_request(srv, key, url, data, headers, timeout):
     """Запрос через сервер данных. Возвращает (статус, тело, content-type, set-cookie[], X-Cache) либо None (нужен прямой запрос).
     Ответ источника (в т.ч. 404) приходит с заголовком X-Cache; его отсутствие значит, что ответил сам сервер (ошибка)."""
@@ -118,6 +168,9 @@ def _ds_request(srv, key, url, data, headers, timeout):
     except urllib.error.HTTPError as e:
         if e.headers.get("X-Cache"):                   # настоящий ответ источника (404 и т.п.): повторять напрямую не нужно
             return e.code, e.read(), e.headers.get("Content-Type") or "", [], e.headers.get("X-Cache")
+        if e.headers.get("X-Upstream-Blocked") is not None:    # источник заблокировал сервер: этот хост пока ходим напрямую
+            _ds_note_bypass((urllib.parse.urlparse(url).hostname or "").lower(), e.headers.get("X-Upstream-Blocked"))
+            return None
         if e.headers.get("X-Upstream-Error"):         # сервер жив, но источник не ответил: пробуем напрямую, сервер не «роняем»
             return None
         if e.code == 403 and _ds_host_refused(e):     # сайта нет в списке сервера: этот запрос — напрямую, ключ тут ни при чём
@@ -176,7 +229,8 @@ def ext_open(url, data=None, headers=None, timeout=25, jar=None):
     if jar:
         headers["Cookie"] = _cookie_header(jar)
     srv, key = ds_conf()
-    if srv and time.time() >= _ds_state["down_until"]:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if srv and time.time() >= _ds_state["down_until"] and not _ds_bypassed(host):
         res = _ds_request(srv, key, url, data, headers, timeout)
         if res is not None:
             status, body, ct, cookies, xc = res
@@ -187,16 +241,26 @@ def ext_open(url, data=None, headers=None, timeout=25, jar=None):
             if status >= 400:
                 raise urllib.error.HTTPError(url, status, "HTTP %d" % status, {"Content-Type": ct}, io.BytesIO(body))
             return status, body, ct
+    wait = _direct_wait(host)
+    if wait:                                            # источник ограничил и прямые запросы: сети не касаемся
+        raise urllib.error.HTTPError(url, 429, "Источник %s временно ограничил запросы, повтор через %d с" % (host, wait),
+                                     {"Retry-After": str(wait)}, io.BytesIO(b""))
     with _ds_lock:
         _ds_state["direct"] += 1
     hd = dict(EXT_UA)
     hd.update(headers)
     req = urllib.request.Request(url, data=data, headers=hd)
-    with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
-        body = r.read()
-        if jar is not None:
-            _jar_update(jar, r.headers.get_all("Set-Cookie"))
-        return r.status, body, r.headers.get("Content-Type") or ""
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+            body = r.read()
+            if jar is not None:
+                _jar_update(jar, r.headers.get_all("Set-Cookie"))
+            result = r.status, body, r.headers.get("Content-Type") or ""
+    except urllib.error.HTTPError as e:
+        _direct_note_fail(host, e)
+        raise
+    _direct_note_ok(host)
+    return result
 
 
 def ds_status():
@@ -204,7 +268,10 @@ def ds_status():
     with _ds_lock:
         st = dict(_ds_state)
     down = bool(srv) and time.time() < st["down_until"]
-    return {"mode": "direct" if not srv else ("down" if down else "server"), "url": srv, "key_set": bool(key),
+    now = time.time()
+    with _ds_lock:
+        bypass = {h: int(t - now) + 1 for h, t in _ds_bypass.items() if t > now}
+    return {"mode": "direct" if not srv else ("down" if down else "server"), "url": srv, "key_set": bool(key), "bypass": bypass,
             "hit": st["hit"], "miss": st["miss"], "stale": st["stale"], "direct": st["direct"],
             "error": st["error"] if down else "", "retry_in": max(0, int(st["down_until"] - time.time())) if down else 0}
 

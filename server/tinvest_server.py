@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tinvest_md  # noqa: E402  (токен владельца сервера, только чтение; см. tinvest_md.py)
 import crowd  # noqa: E402  (очередь и приём страниц раскрытия от приложений пользователей, см. crowd.py)
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MIN, HOUR, DAY = 60, 3600, 86400
 
 # ───────────────────────── разрешённые источники ─────────────────────────
@@ -737,11 +737,52 @@ class Cache:
 
 # ───────────────────────── ядро ─────────────────────────
 class Result:
-    __slots__ = ("status", "ctype", "body", "xcache", "age", "cookies", "error")
+    __slots__ = ("status", "ctype", "body", "xcache", "age", "cookies", "error", "blocked")
 
-    def __init__(self, status, ctype, body, xcache="miss", age=0, cookies=(), error=None):
+    def __init__(self, status, ctype, body, xcache="miss", age=0, cookies=(), error=None, blocked=None):
         self.status, self.ctype, self.body, self.xcache, self.age = status, ctype, body, xcache, age
         self.cookies, self.error = list(cookies), error
+        self.blocked = blocked          # None — обычный ответ/ошибка; число — источник нас заблокировал, секунд до повтора (0 — одиночный отказ)
+
+
+# ───────────────────────── блокировки источников (403/429/451, captcha) ─────────────────────────
+BLOCK_STATUSES = (403, 429, 451)
+# Признаки анти-бот страницы. Проверяются только в text/html с кодом 200 и только если тело короткое (< BLOCK_HTML_MAX):
+# настоящие страницы, где слово «captcha» встречается в форме входа или скрипте, обычно большие. Смотрим первые BLOCK_SCAN байт.
+BLOCK_MARKERS = ("captcha", "just a moment", "access denied", "attention required", "ddos", "доступ ограничен",
+                 "подтвердите, что вы не робот", "проверка безопасности", "are you a robot", "cf-browser-verification")
+BLOCK_HTML_MAX = 60 * 1024
+BLOCK_SCAN = 20 * 1024
+COOLDOWN_BASE, COOLDOWN_MAX = 60, 1800          # экспоненциально: 60, 120, 240 … 1800 с (если источник не прислал Retry-After)
+RETRY_AFTER_MIN, RETRY_AFTER_MAX = 30, 6 * 3600
+STRIKES_403, STRIKES_403_WINDOW = 2, 600        # 403 морозит хост только со 2-го подряд в течение 10 минут
+
+
+def block_kind(status, ctype, data):
+    """-> "status" | "captcha" | None. Заблокированный ответ нельзя отдавать клиентам как настоящий ответ источника."""
+    if status in BLOCK_STATUSES:
+        return "status"
+    if status == 200 and "text/html" in (ctype or "").lower() and len(data) < BLOCK_HTML_MAX:
+        head = data[:BLOCK_SCAN].decode("utf-8", "ignore").lower()
+        if any(m in head for m in BLOCK_MARKERS):
+            return "captcha"
+    return None
+
+
+def parse_retry_after(v, now):
+    """Retry-After: секунды или HTTP-дата -> секунды (float) либо None."""
+    v = (v or "").strip()
+    if not v:
+        return None
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        return max(0.0, parsedate_to_datetime(v).timestamp() - now)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
 
 
 class _NoRedirectCheck(urllib.request.HTTPRedirectHandler):
@@ -776,6 +817,7 @@ class DataServer:
         self._flights, self._flock = {}, threading.Lock()
         self._rate_lock, self._next_slot = threading.Lock(), {}
         self._stats_lock, self._stats = threading.Lock(), {}
+        self._blk_lock, self._blk = threading.Lock(), {}      # host -> {"until", "n" (подряд блокировок), "s403" (времена 403)}
         self._plock, self._pcache = threading.Lock(), {}
         # Токен владельца (только чтение, только рыночные данные): credentials -> env -> файл. Нет токена — функции T-Invest выключены.
         if md is None:
@@ -850,7 +892,7 @@ class DataServer:
     # --- статистика (без IP клиентов) ---
     def _stat(self, host, field):
         with self._stats_lock:
-            s = self._stats.setdefault(host, {"requests": 0, "hit": 0, "miss": 0, "stale": 0, "upstream_errors": 0})
+            s = self._stats.setdefault(host, {"requests": 0, "hit": 0, "miss": 0, "stale": 0, "upstream_errors": 0, "blocked": 0})
             s[field] += 1
 
     def stats(self):
@@ -860,7 +902,45 @@ class DataServer:
         miss = sum(v["miss"] for v in hosts.values())
         return {"hosts": hosts, "hit": hit, "miss": miss, "stale": sum(v["stale"] for v in hosts.values()),
                 "hit_ratio": round(hit / (hit + miss), 4) if hit + miss else 0.0,
-                "upstream_errors": sum(v["upstream_errors"] for v in hosts.values())}
+                "upstream_errors": sum(v["upstream_errors"] for v in hosts.values()),
+                "blocked": sum(v["blocked"] for v in hosts.values()), "cooldowns": self.cooldowns()}
+
+    # --- блокировки источников ---
+    def cooldown_left(self, host):
+        """Секунд до конца паузы хоста (0 — можно ходить к источнику)."""
+        with self._blk_lock:
+            st = self._blk.get(host)
+            left = st["until"] - self.clock() if st else 0
+        return int(left) + 1 if left > 0 else 0
+
+    def cooldowns(self):
+        now = self.clock()
+        with self._blk_lock:
+            return {h: int(st["until"] - now) + 1 for h, st in self._blk.items() if st["until"] > now}
+
+    def _note_block(self, host, status, retry_after):
+        """Источник заблокировал запрос -> секунд паузы для хоста (0 — паузы нет: одиночный 403)."""
+        now = self.clock()
+        with self._blk_lock:
+            st = self._blk.setdefault(host, {"until": 0.0, "n": 0, "s403": []})
+            if status == 403:
+                st["s403"] = [t for t in st["s403"] if now - t < STRIKES_403_WINDOW] + [now]
+                if len(st["s403"]) < STRIKES_403:
+                    return 0
+                st["s403"] = []
+            if retry_after is not None:
+                d = min(max(retry_after, RETRY_AFTER_MIN), RETRY_AFTER_MAX)
+            else:
+                d = min(COOLDOWN_BASE * (2 ** st["n"]), COOLDOWN_MAX)
+            st["n"] = min(st["n"] + 1, 30)
+            st["until"] = now + d
+            return int(d)
+
+    def _note_ok(self, host):
+        with self._blk_lock:
+            st = self._blk.get(host)
+            if st:
+                st["n"], st["s403"] = 0, []
 
     # --- TTL ---
     def ttl_for(self, host, url, method, now):
@@ -902,7 +982,8 @@ class DataServer:
             if len(data) > MAX_BODY_OUT:
                 raise UpstreamError("response too large")
             cookies = r.headers.get_all("Set-Cookie") or []
-            return r.status if hasattr(r, "status") else r.code, r.headers.get("Content-Type") or "application/octet-stream", data, cookies
+            return (r.status if hasattr(r, "status") else r.code, r.headers.get("Content-Type") or "application/octet-stream", data, cookies,
+                    {"Retry-After": r.headers.get("Retry-After") or ""})
         finally:
             r.close()
 
@@ -922,7 +1003,9 @@ class DataServer:
             self._stat(host, "hit")
             return Result(row[0], row[1], row[2], "hit", int(now - row[3]))
         res = self._single_flight(key, lambda: self._do_upstream(method, url, body, ctype, headers, host, key, ttl, cacheable))
-        if res.error and row:                                   # источник недоступен: отдаём устаревшее
+        if res.blocked is not None:
+            self._stat(host, "blocked")
+        if res.error and row:                                   # источник недоступен или блокирует: отдаём устаревшее
             self._stat(host, "stale")
             return Result(row[0], row[1], row[2], "stale", int(now - row[3]))
         if res.error:
@@ -950,6 +1033,8 @@ class DataServer:
             return 400, {"ok": False, "error": str(e)}
         r = self.fetch("GET", url)
         if r.error:
+            if r.blocked is not None:
+                return 502, {"ok": False, "error": "upstream blocked", "retry_in": r.blocked}
             return 502, {"ok": False, "error": "upstream failed"}
         if r.status != 200:
             return 200, {"ok": False, "error": "upstream status %d" % r.status}
@@ -991,16 +1076,33 @@ class DataServer:
             fl["ev"].set()
         return fl["res"]
 
+    def _blocked_result(self, left):
+        return Result(503, "text/plain", b"upstream blocked", error="blocked", blocked=left)
+
     def _do_upstream(self, method, url, body, ctype, headers, host, key, ttl, cacheable):
+        left = self.cooldown_left(host)
+        if left:                                                # пауза хоста: к источнику не ходим вообще
+            return self._blocked_result(left)
         self._throttle(host)
+        left = self.cooldown_left(host)                         # пока стояли в очереди лимита, хост могли заблокировать
+        if left:
+            return self._blocked_result(left)
         try:
-            status, ct, data, cookies = self.upstream(method, url, body, ctype, headers)
+            up = self.upstream(method, url, body, ctype, headers)
+            status, ct, data, cookies = up[:4]
+            up_headers = up[4] if len(up) > 4 else {}
         except Exception as e:  # noqa: BLE001
             self._stat(host, "upstream_errors")
             return Result(502, "text/plain", ("upstream error: %s" % type(e).__name__).encode(), error=str(e))
         if status >= 500:
             self._stat(host, "upstream_errors")
             return Result(502, "text/plain", b"upstream status %d" % status, error="status %d" % status)
+        if block_kind(status, ct, data):                        # 403/429/451 или анти-бот страница: клиентам как ответ источника не отдаём
+            self._stat(host, "upstream_errors")
+            ra = parse_retry_after((up_headers or {}).get("Retry-After"), self.clock())
+            return self._blocked_result(self._note_block(host, status, ra))
+        if 200 <= status < 300 or status == 404:
+            self._note_ok(host)
         if host not in SESSION_HOSTS:
             cookies = []
         if cacheable and not (cookies and method == "GET"):
@@ -1069,6 +1171,11 @@ class Handler(BaseHTTPRequestHandler):
                 if v:
                     hdrs[name] = v
             r = app.fetch(method, url, body if method == "POST" else None, self.headers.get("Content-Type") or "", hdrs)
+            if r.blocked is not None:
+                extra = [("X-Upstream-Error", "1"), ("X-Upstream-Blocked", str(r.blocked))]
+                if r.blocked:
+                    extra.append(("Retry-After", str(r.blocked)))
+                return self._send(503, {"error": "upstream blocked", "retry_in": r.blocked}, extra=extra)
             if r.error:
                 return self._send(502, {"error": "upstream failed"}, extra=[("X-Upstream-Error", "1")])
             extra = [("X-Cache", r.xcache), ("X-Age", str(r.age))] + [("X-Set-Cookie", c) for c in r.cookies]
@@ -1079,6 +1186,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.command != "GET":
                 return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", "GET")])
             code, obj = app.parsed(u.path[len("/v1/parsed/"):], parse_qs(u.query))
+            if code == 502 and obj.get("error") == "upstream blocked":
+                return self._send(code, obj, extra=[("X-Upstream-Blocked", str(obj.get("retry_in", 0)))])
             return self._send(code, obj)
         self._send(404, {"error": "not found"})
 

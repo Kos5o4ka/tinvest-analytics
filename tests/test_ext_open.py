@@ -48,9 +48,17 @@ class Fake:
                         return self._r(500, b"x")
                     if mode == "404":
                         return self._r(404, b"gone", [("X-Cache", "miss"), ("Content-Type", "text/plain")])
+                    if mode == "blocked":
+                        return self._r(503, b"{}", [("X-Upstream-Error", "1"), ("X-Upstream-Blocked", "90"), ("Retry-After", "90")])
+                    if mode == "blocked0":
+                        return self._r(503, b"{}", [("X-Upstream-Error", "1"), ("X-Upstream-Blocked", "0")])
                     if mode == "upfail":
                         return self._r(502, b"{}", [("X-Upstream-Error", "1")])
                     return self._r(200, b"via-server", [("X-Cache", "hit"), ("Content-Type", "text/plain"), ("X-Set-Cookie", "sid=7; Path=/")])
+                if self.path.startswith("/d429"):
+                    return self._r(429, b"slow", [("Retry-After", "40")] if me.dmode == "ra" else [])
+                if self.path.startswith("/d403"):
+                    return self._r(403, b"nope")
                 self._r(200, b"direct", [("Content-Type", "text/plain")])
 
             def do_POST(self):
@@ -58,6 +66,7 @@ class Fake:
                 self._r(200, b"post:" + self.rfile.read(n))
 
         self.mode = "ok"
+        self.dmode = ""
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.srv.daemon_threads = True
         self.base = "http://127.0.0.1:%d" % self.srv.server_address[1]
@@ -77,6 +86,8 @@ class ExtOpenTests(unittest.TestCase):
         self.fk = Fake()
         self.addCleanup(self.fk.close)
         self.orig = dict(self.m._ds_state)
+        self.m._ds_bypass.clear()
+        self.m._direct_block.clear()
         os.environ["TINVEST_DATA_SERVER"] = "off"
         os.environ.pop("TINVEST_DATA_KEY", None)
         self.set_cfg("", "")
@@ -170,6 +181,85 @@ class ExtOpenTests(unittest.TestCase):
         self.m.ds_reset()
         self.assertEqual(self.m.ext_open(self.fk.base + "/real")[1], b"direct")
         self.assertEqual(self.m.ds_status()["mode"], "down")
+
+    def _fetches(self):
+        return [p for p, _, _ in self.fk.log if p.startswith("/v1/fetch")]
+
+    def test_blocked_header_goes_direct_and_bypasses_host(self):
+        self.set_cfg(self.fk.base, "k")
+        self.fk.mode = "blocked"
+        a = self.fk.base + "/real"                         # 127.0.0.1
+        self.assertEqual(self.m.ext_open(a)[1], b"direct")
+        self.assertEqual(self.m.ds_status()["mode"], "server")        # сервер не «упал»
+        bp = self.m.ds_status()["bypass"]
+        self.assertEqual(list(bp), ["127.0.0.1"])
+        self.assertTrue(80 < bp["127.0.0.1"] <= 91)
+        n = len(self._fetches())
+        self.fk.mode = "ok"
+        self.assertEqual(self.m.ext_open(self.fk.base + "/again")[1], b"direct")   # тот же хост: сервер пропускаем
+        self.assertEqual(len(self._fetches()), n)
+        self.assertEqual(self.m.ds_status()["direct"], 2)
+        other = self.fk.base.replace("127.0.0.1", "localhost") + "/x"
+        self.assertEqual(self.m.ext_open(other)[1], b"via-server")                 # другой хост — через сервер
+        self.assertEqual(len(self._fetches()), n + 1)
+        self.m._ds_bypass["127.0.0.1"] = time.time() - 1                           # срок вышел
+        self.assertEqual(self.m.ext_open(self.fk.base + "/z")[1], b"via-server")
+        self.assertEqual(self.m.ds_status()["bypass"], {})
+
+    def test_bypass_clamp_and_zero(self):
+        self.set_cfg(self.fk.base, "")
+        self.fk.mode = "blocked0"                          # одиночный отказ: хост не обходим
+        self.assertEqual(self.m.ext_open(self.fk.base + "/real")[1], b"direct")
+        self.assertEqual(self.m.ds_status()["bypass"], {})
+        self.m._ds_note_bypass("h", "5")
+        self.m._ds_note_bypass("g", "999999")
+        self.m._ds_note_bypass("d", None)
+        bp = self.m.ds_status()["bypass"]
+        self.assertTrue(30 <= bp["h"] <= 31 and 1799 <= bp["g"] <= 1801 and 299 <= bp["d"] <= 301)
+
+    def test_404_from_source_unchanged(self):
+        self.set_cfg(self.fk.base, "")
+        self.fk.mode = "404"
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.m.ext_open(self.fk.base + "/real")
+        self.assertEqual(cm.exception.code, 404)
+        self.assertEqual(self.m.ds_status()["bypass"], {})
+
+    def test_direct_429_client_cooldown(self):
+        self.fk.dmode = "ra"
+        url = self.fk.base + "/d429"
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.m.ext_open(url)
+        self.assertEqual(cm.exception.code, 429)
+        n = len(self.fk.log)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.m.ext_open(self.fk.base + "/fine")        # пауза держится на хосте, сети не касаемся
+        self.assertEqual(cm.exception.code, 429)
+        self.assertIn("временно ограничил запросы, повтор через", cm.exception.msg)
+        self.assertIn("127.0.0.1", cm.exception.msg)
+        self.assertEqual(len(self.fk.log), n)
+        self.assertEqual(self.m.ext_open(self.fk.base.replace("127.0.0.1", "localhost") + "/fine")[1], b"direct")   # другие хосты не затронуты
+        self.m._direct_block["127.0.0.1"][0] = time.time() - 1       # пауза кончилась -> запрос идёт, успех сбрасывает
+        self.assertEqual(self.m.ext_open(self.fk.base + "/fine")[1], b"direct")
+        self.assertNotIn("127.0.0.1", self.m._direct_block)
+
+    def test_direct_429_exponential_without_retry_after(self):
+        self.fk.dmode = ""
+        for want in (120, 240):
+            with self.assertRaises(urllib.error.HTTPError):
+                self.m.ext_open(self.fk.base + "/d429")
+            left = self.m._direct_block["127.0.0.1"][0] - time.time()
+            self.assertTrue(want - 2 <= left <= want, left)
+            self.m._direct_block["127.0.0.1"][0] = time.time() - 1
+
+    def test_direct_403_only_when_bypassed(self):
+        with self.assertRaises(urllib.error.HTTPError):
+            self.m.ext_open(self.fk.base + "/d403")
+        self.assertEqual(self.m._direct_block, {})
+        self.m._ds_note_bypass("127.0.0.1", "60")
+        with self.assertRaises(urllib.error.HTTPError):
+            self.m.ext_open(self.fk.base + "/d403")
+        self.assertIn("127.0.0.1", self.m._direct_block)
 
     def test_connection_test_endpoint(self):
         r = self.m.ds_test({}, {"url": self.fk.base, "key": "z"})
