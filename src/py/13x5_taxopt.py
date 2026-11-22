@@ -61,13 +61,67 @@ def txo_ldv_flags(rows, lots, today, rate):
     return out
 
 
-def txo_harvest_calc(st, settings, fee_rate=None, min_loss=TXO_MIN_LOSS, holidays=()):
+TXO_LDV_WARN_DAYS = 730      # с этого стажа продажа «сбрасывает» накопленный срок для ЛДВ
+TXO_LDV_CRIT_LEFT = 182      # до ЛДВ осталось не больше стольких дней — предупреждение усиливается
+TXO_FIFO_NOTE = "Продажа идёт по FIFO с самых старых лотов, поэтому продать только «молодые» лоты нельзя."
+
+
+def txo_hold_text(bdate, today):
+    m = (today.year - bdate.year) * 12 + today.month - bdate.month - (1 if today.day < bdate.day else 0)
+    y, m = divmod(max(0, m), 12)
+    return "%d г. %d мес." % (y, m)
+
+
+def txo_ldv_class(rows, lots, today, rate):
+    """Оценка проданных (по FIFO) лотов префикса относительно ЛДВ. Учитываются только ЛДВ-типы и покупки с TAX_LDV_FROM без «слепых» лотов.
+    status: n/a | young | warn | critical | reached; hold_days_max — возраст самого старого проданного лота; ldv_cost — потеря освобождения
+    на прибыльных лотах warn/critical (прибыль × ставка)."""
+    blind = {l["date"] for l in lots if l.get("blind")}
+    res = {"status": "n/a", "hold_days_max": 0, "ldv_days_left": None, "ldv_badge": "", "ldv_cost": 0.0, "ldv_lots": 0}
+    seen, worst, oldest_warn = set(), 0, None
+    for r in rows:
+        bd = r["bdate"]
+        if r["type"] not in TAX_LDV_TYPES or bd is None or bd in blind or bd < TAX_LDV_FROM:
+            continue
+        age = (today - bd).days
+        left = (tx_add_years(bd, 3) - today).days
+        res["hold_days_max"] = max(res["hold_days_max"], age)
+        if left < 0:
+            seen.add("reached")
+            continue
+        if age < TXO_LDV_WARN_DAYS:
+            seen.add("young")
+            continue
+        lvl = 2 if left <= TXO_LDV_CRIT_LEFT else 1
+        res["ldv_lots"] += 1
+        if res["ldv_days_left"] is None or left < res["ldv_days_left"]:
+            res["ldv_days_left"] = left
+        if oldest_warn is None or bd < oldest_warn:
+            oldest_warn = bd
+        worst = max(worst, lvl)
+        if r["result"] > 0:
+            res["ldv_cost"] += r["result"] * rate
+    if worst:
+        res["status"] = "critical" if worst == 2 else "warn"
+        if worst == 2:
+            res["ldv_badge"] = "🛡 до ЛДВ осталось %d дн. — продажа почти наверняка невыгодна" % res["ldv_days_left"]
+        else:
+            res["ldv_badge"] = "🛡 стаж %s: продажа сбросит срок владения для ЛДВ" % txo_hold_text(oldest_warn, today)
+    elif "young" in seen:
+        res["status"] = "young"
+    elif "reached" in seen:
+        res["status"] = "reached"
+    return res
+
+
+def txo_harvest_calc(st, settings, fee_rate=None, min_loss=TXO_MIN_LOSS, holidays=(), skip_ldv2=False):
     today, cy = st["today"], st["today"].year
     fee_src = "заданная" if fee_rate is not None else "по истории сделок"
     if fee_rate is None:
         fee_rate = st["eng"]["fee_rate"]
     sale_day, last_day = tx_last_sale_day(cy, holidays)
-    out = {"available": False, "year": cy, "today": today.isoformat(), "fee_rate": fee_rate, "fee_source": fee_src, "candidates": [], "iis_excluded": [],
+    out = {"available": False, "year": cy, "today": today.isoformat(), "fee_rate": fee_rate, "fee_source": fee_src, "candidates": [], "iis_excluded": [], "ldv_skipped": [], "skip_ldv2": bool(skip_ldv2), "ldv_note": "",
+           "ldv_summary": {"young": 0, "warn": 0, "critical": 0, "reached": 0, "na": 0, "ldv_cost": 0.0, "net_ldv": 0.0},
            "deadline": {"sale_day": sale_day.isoformat(), "last_trading_day": last_day.isoformat(), "days": (sale_day - today).days, "passed": today > sale_day},
            "totals": {"saving": 0.0, "fees": 0.0, "net": 0.0, "n": 0}, "warnings": list(st["eng"].get("warnings") or []), "reason": "",
            "iis_prefill": txo_iis_prefill(st)}
@@ -108,12 +162,19 @@ def txo_harvest_calc(st, settings, fee_rate=None, min_loss=TXO_MIN_LOSS, holiday
         fee_sell = sum(r["fee"] for r in rows)
         fee_buy = value * fee_rate
         saving = t0 - t1
+        lc = txo_ldv_class(rows, lots, today, rate0)
+        if skip_ldv2 and lc["hold_days_max"] >= TXO_LDV_WARN_DAYS:
+            out["ldv_skipped"].append({"uid": uid, "name": base["name"], "ticker": base["ticker"], "loss": -res, "hold_days_max": lc["hold_days_max"],
+                                       "reason": "Самый старый из продаваемых лотов держится %d дн. (≥ %d). %s" % (lc["hold_days_max"], TXO_LDV_WARN_DAYS, TXO_FIFO_NOTE)})
+            continue
         carry = max(0.0, ((row1 or {}).get("loss_new", 0.0)) - ((row0 or {}).get("loss_new", 0.0)))
         cands.append({"uid": uid, "name": base["name"], "ticker": base["ticker"], "type": base["type"], "qty": q, "qty_total": total_q, "partial": q < total_q - 1e-9,
                       "price": pr, "value": value, "loss": -res, "gain_in_prefix": sum(r["result"] for r in rows if r["result"] > 0),
                       "base_before": base0, "base_after": base1, "tax_before": t0, "tax_after": t1, "saving": saving,
                       "marginal_rate": (saving / (base0 - base1)) if base0 - base1 > 1 else None, "carry_forward": carry,
                       "fees": fee_sell + fee_buy, "net": saving - fee_sell - fee_buy, "ldv": txo_ldv_flags(rows, lots, today, rate0),
+                      "ldv_status": lc["status"], "hold_days_max": lc["hold_days_max"], "ldv_days_left": lc["ldv_days_left"], "ldv_badge": lc["ldv_badge"],
+                      "ldv_cost": lc["ldv_cost"], "net_ldv": saving - fee_sell - fee_buy - lc["ldv_cost"],
                       "blind": any(l.get("blind") for l in lots), "rows": rows})
     cands.sort(key=lambda c: -c["net"])
     extra, tot_fee = [], 0.0
@@ -131,8 +192,15 @@ def txo_harvest_calc(st, settings, fee_rate=None, min_loss=TXO_MIN_LOSS, holiday
     t_all, _ = tx_cur_tax(g, extra, cy, settings)
     n_sel = sum(1 for c in cands if c["selected"])
     out["totals"] = {"saving": t0 - t_all, "fees": tot_fee, "net": (t0 - t_all) - tot_fee, "n": n_sel, "tax_after": t_all}
+    sm = out["ldv_summary"]
     for c in cands:
         c.pop("rows", None)
+        if c["selected"]:
+            sm[c["ldv_status"] if c["ldv_status"] in sm else "na"] += 1
+            sm["ldv_cost"] += c["ldv_cost"]
+    sm["net_ldv"] = out["totals"]["net"] - sm["ldv_cost"]
+    if skip_ldv2:
+        out["ldv_note"] = TXO_FIFO_NOTE
     out["candidates"] = cands[:30]
     out["assumptions"] = [
         "Продажа списывает лоты по FIFO (старые первыми), поэтому для каждой бумаги берётся такой префикс лотов, при котором реализованный убыток наибольший; прибыльные лоты внутри префикса уже учтены в расчёте.",
@@ -160,7 +228,8 @@ def txo_iis_prefill(st):
 def txo_harvest_get(cfg, acc, q, force):
     st, settings = tax_state(cfg, acc, force)
     fr = txo_num(q, "fee", -1.0, -1.0, 5.0) if q.get("fee") not in (None, "") else -1.0
-    return txo_harvest_calc(st, settings, fr / 100.0 if fr >= 0 else None, txo_num(q, "min_loss", TXO_MIN_LOSS, 0.0, 1e9))
+    return txo_harvest_calc(st, settings, fr / 100.0 if fr >= 0 else None, txo_num(q, "min_loss", TXO_MIN_LOSS, 0.0, 1e9),
+                            skip_ldv2=str(q.get("skip_ldv2") or "").lower() in ("1", "true", "on", "yes"))
 
 
 # ── планировщик ИИС-3 ──

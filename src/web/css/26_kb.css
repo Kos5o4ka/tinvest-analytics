@@ -19,7 +19,7 @@
 .kb-nav{display:flex;justify-content:space-between;gap:10px;margin-top:20px;padding-top:14px;border-top:1px solid var(--line);flex-wrap:wrap}
 .kb-nav .btn{max-width:100%;text-align:left}
 .kb-disc{margin:14px 4px 0;text-align:center}
-[data-theme=light] .kb-a{color:#8a6d00}
+[data-theme=light] .kb-a{color:#1d4ed8}
 @media(max-width:760px){
   .kb{grid-template-columns:minmax(0,1fr)}
   .kb-side{position:static;max-height:260px}

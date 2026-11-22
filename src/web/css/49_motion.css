@@ -1,0 +1,42 @@
+/* ── Motion engine (FE-14) ── */
+/* числовой тикер */
+.tick{display:inline-block;position:relative}
+.tick-old{position:absolute;left:0;top:0;white-space:nowrap;pointer-events:none;animation:tickOut .28s cubic-bezier(.25,1,.5,1) forwards}
+.tick.tick-in{animation:tickIn .28s cubic-bezier(.25,1,.5,1)}
+.tick.tick-up{color:var(--pos)}.tick.tick-dn{color:var(--neg)}
+.tick.tick-in.tick-up,.tick.tick-in.tick-dn{transition:color .6s ease .15s}
+@keyframes tickIn{from{opacity:0;transform:translateY(60%)}to{opacity:1;transform:none}}
+@keyframes tickOut{to{opacity:0;transform:translateY(-60%)}}
+.tick-dn .tick-old{animation-name:tickOutDn}
+@keyframes tickOutDn{to{opacity:0;transform:translateY(60%)}}
+.tick-dn.tick-in{animation-name:tickInDn}
+@keyframes tickInDn{from{opacity:0;transform:translateY(-60%)}to{opacity:1;transform:none}}
+
+/* скелетон 2.0: движущийся металлический блик (GPU-friendly: сдвиг background-position) */
+.sk{background:linear-gradient(105deg,var(--sk-1) 0%,var(--sk-1) 38%,var(--sk-2) 50%,var(--sk-1) 62%,var(--sk-1) 100%);background-size:250% 100%;background-position:100% 0;animation:skShim 1.4s linear infinite}
+@keyframes skShim{to{background-position:-150% 0}}
+
+/* плавное появление раздела */
+#view.vsw>.wrap{animation:vsw .26s cubic-bezier(.16,1,.3,1)}
+@keyframes vsw{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* hover строк таблиц: только фон (transform ломает sticky-ячейки) */
+.tbl:not(.scr-tbl) table tr:hover td{background:var(--card-hover)}
+
+/* пульс рынка */
+.mkt-pulse{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mu);white-space:nowrap}
+.mp-dot{width:8px;height:8px;border-radius:50%;background:var(--mu);flex:none;position:relative}
+.mkt-pulse.on .mp-dot{background:var(--pos)}.mkt-pulse.on{color:var(--tx2)}
+.mkt-pulse.ses .mp-dot{background:var(--ac)}.mkt-pulse.ses{color:var(--tx2)}
+.mkt-pulse.auc .mp-dot{background:var(--warn)}.mkt-pulse.auc{color:var(--tx2)}
+.mkt-pulse.on .mp-dot::after,.mkt-pulse.ses .mp-dot::after,.mkt-pulse.auc .mp-dot::after{content:"";position:absolute;inset:0;border-radius:50%;background:inherit;animation:mpPulse 2s ease-out infinite}
+@keyframes mpPulse{from{transform:scale(1);opacity:.55}to{transform:scale(2.8);opacity:0}}
+@media(max-width:1100px){.mkt-pulse .mp-tx{display:none}}
+
+@media(prefers-reduced-motion:reduce){
+  .tick-old,.tick.tick-in,.tick-dn.tick-in{animation:none!important}
+  .sk{animation:none!important}
+  #view.vsw>.wrap{animation:none!important}
+  .mkt-pulse .mp-dot::after{animation:none!important;display:none}
+  #bc-ov,#bc-ov .bc-dr{animation:none!important;transition:none!important}
+}

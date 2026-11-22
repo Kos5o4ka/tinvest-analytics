@@ -1,0 +1,23 @@
+/* ── Матрица потоков на 3 года ── */
+.cf36-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:14px 0 8px}
+.cf36-grid{min-width:680px;display:flex;flex-direction:column;gap:10px}
+.cf36-r{display:flex;flex-direction:column;gap:5px}
+.cf36-rh{display:flex;align-items:baseline;gap:10px;font-size:13px}
+.cf36-rh small{color:var(--mu)}.cf36-rh .num{margin-left:auto;font-weight:600;color:var(--pos)}.cf36-rh .cf36-w{color:var(--neg)}
+.cf36-row{display:grid;grid-template-columns:repeat(12,1fr);gap:5px}
+.cf36-c{position:relative;overflow:hidden;min-height:58px;border-radius:9px;padding:6px 7px;display:flex;flex-direction:column;justify-content:space-between;
+  background:color-mix(in srgb,var(--ac) 4%,transparent);border:1px solid var(--line);color:var(--tx);cursor:default}
+.cf36-m{font-size:11px;color:var(--tx2)}.cf36-v{font-size:13px;font-weight:600}
+.cf36-e{border:1px dashed var(--mu);background:transparent}.cf36-e .cf36-v{font-size:11px;font-weight:500;color:var(--mu)}
+.cf36-h,.cf36-hs{background:repeating-linear-gradient(135deg,var(--tx) 0 2px,transparent 2px 5px);opacity:.35}
+.cf36-h{position:absolute;left:0;right:0;bottom:0}
+.cf36-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12px;color:var(--tx2);margin:6px 0 4px}
+.cf36-sw{display:inline-block;width:14px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px;border:1px solid var(--line)}
+.cf36-ee{border:1px dashed var(--mu);background:transparent}
+.cf36-h3{margin:22px 0 10px;font-size:16px;display:flex;align-items:baseline;gap:10px}.cf36-h3 .sp{font-size:12px;color:var(--mu);font-weight:400}
+.cf36-ctl{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin-bottom:6px}
+.cf36-rate button:disabled{opacity:.4;cursor:not-allowed}
+.cf36-own,.cf36-chk{font-size:13px;color:var(--tx2);display:flex;align-items:center;gap:6px}
+.cf36-in{width:70px;background:var(--card);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 8px}
+.cf36-src{font-size:12px;color:var(--mu);margin-bottom:10px}
+@media(max-width:700px){.cf36-grid{min-width:620px}}

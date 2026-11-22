@@ -8,7 +8,7 @@ function pDash(){
   const profit=d.profit,ppct=d.invested>0&&profit!=null?profit/d.invested*100:null,hs=histSlice();
   const _q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
   const hero=`<div class="card hero"><div style="position:relative;z-index:1"><div class="lbl">Стоимость портфеля</div>
-    <div class="val num">${f2m(p.total)} <small>₽</small></div>
+    <div class="val num" data-tick="dash-total">${f2m(p.total)} <small>₽</small></div>
     <div class="row" style="margin-top:10px;flex-wrap:wrap">${p.daily!=null?`<span class="pill ${cls(p.daily)}">${SM(p.daily)} · ${pct(p.daily_pct)} за день</span>`:''}
     <span class="pill ${cls(p.upnl)}">${SM(p.upnl)} · ${pct(p.yield_pct)} по открытым позициям</span>
     <span class="hero-acts"><button class="btn" data-go="scr">+ Подобрать бумагу</button><button class="btn ghost" data-share-card="1" title="Сделать PNG-карточку без сумм">Поделиться PNG</button></span></div></div>

@@ -26,6 +26,7 @@ function kpScore(text,q){
 }
 function kpCommands(){
   return[
+    {g:'Команды',t:'Тур по интерфейсу',k:'тур обучение подсказки подсветка tour onboarding',run:()=>{if(typeof tourStart==='function')setTimeout(tourStart,80)}},
     {g:'Команды',t:'Обновить данные',k:'обновить данные перезагрузить refresh',run:()=>load(true)},
     {g:'Команды',t:'Поделиться портфелем (PNG без сумм)',k:'поделиться png карточка картинка share telegram',run:()=>{if(typeof shareOpen==='function')shareOpen()}},
     {g:'Команды',t:'Экспорт PDF (печать)',k:'экспорт pdf печать',run:()=>window.print()},

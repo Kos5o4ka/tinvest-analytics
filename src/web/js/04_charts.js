@@ -10,6 +10,13 @@ const rbot=(x,y,w,h,r)=>{r=Math.min(r,w/2,h);if(h<=0)return'';return`M${x},${y}H
 const legend=ser=>ser.length>1?`<div class="legend">${ser.map(s=>`<span><i style="background:${s.c}"></i>${esc(s.n)}</span>`).join('')}</div>`:'';
 function emptyChart(el,h,t){el.innerHTML=`<div class="empty" style="min-height:${h}px;padding:20px">${svgI('<path d="M3 3v18h18M7 15l4-4 3 3 5-6"/>')}<div>${t||'Нет данных за период'}</div></div>`}
 
+/* мини-график цены: цвет по знаку изменения (порог 0,15 %) */
+function spark(v,w=64,h=18){
+  if(!v||v.length<2)return'';
+  const a=Math.min(...v),b=Math.max(...v),k=b>a?(h-2)/(b-a):0,n=v.length-1,f=v[0],l=v[n],c=l>f*1.0015?'pos':l<f*.9985?'neg':'mu';
+  return`<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true"><polyline points="${v.map((y,i)=>(1+i*(w-2)/n).toFixed(1)+','+(h-1-(y-a)*k).toFixed(1)).join(' ')}" fill="none" stroke="var(--${c})" stroke-width="1.4"/></svg>`;
+}
+
 let _axc;
 /* подписи оси X: шаг подбирается по ширине текста, пересекающиеся подписи отбрасываются (первую/последнюю принудительно не добавляем) */
 function axisTicks(labels,X,x0,x1,gap=12){

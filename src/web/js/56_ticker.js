@@ -39,7 +39,7 @@ function tkrApply(items){
     for(const it of items){ /* набор тот же — меняем только текст, анимация не сбрасывается */
       const [k,t]=tkrChg(it.chg);
       el.querySelectorAll('.tk-it[data-id="'+(window.CSS&&CSS.escape?CSS.escape(it.id):it.id)+'"]').forEach(n=>{
-        n.querySelector('.tk-p').textContent=tkrFmt(it);
+        {const pe=n.querySelector('.tk-p'),nt=tkrFmt(it);if(pe.textContent!==nt){if(typeof tickNum==='function')tickNum(pe,nt);else pe.textContent=nt}}
         const c=n.querySelector('.tk-ch');c.textContent=t;c.className='tk-ch '+k;
       });
     }

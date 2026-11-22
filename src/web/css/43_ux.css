@@ -42,12 +42,12 @@ body.side-mini .side-foot{justify-content:center;padding:8px 0 0}
 .ux-why{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 14px;border-radius:11px;background:var(--card);border:1px solid var(--line);font-size:13px;color:var(--tx2)}
 .ux-why-x{all:unset;cursor:pointer;font-size:12px;color:var(--mu);white-space:nowrap;padding:3px 8px;border-radius:7px;border:1px solid var(--line)}
 .ux-why-x:hover{color:var(--tx);border-color:var(--line2)}
-.ux-guest{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 14px;border-radius:12px;background:linear-gradient(90deg,#ffdd2d14,var(--card));border:1px solid #ffdd2d44;font-size:13px}
+.ux-guest{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 14px;border-radius:12px;background:linear-gradient(90deg,#3b82f614,var(--card));border:1px solid #3b82f644;font-size:13px}
 .ux-guest-b{display:flex;gap:8px;flex-wrap:wrap}
 
 /* Инлайн ?-подсказка в Базу знаний */
 .ux-q{all:unset;cursor:pointer;display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;border:1px solid var(--line2);color:var(--mu);font-size:11px;font-weight:700;vertical-align:1px;margin-left:3px;transition:.15s}
-.ux-q:hover{color:var(--tx);border-color:var(--ac);background:#ffdd2d22}
+.ux-q:hover{color:var(--tx);border-color:var(--ac);background:#3b82f622}
 
 /* Главная: кнопки в Hero, «Быстрые задачи», чек-лист «С чего начать» */
 .hero-acts{margin-left:auto;display:inline-flex;gap:8px;flex-wrap:wrap}
@@ -77,10 +77,10 @@ body.side-mini .side-foot{justify-content:center;padding:8px 0 0}
 @media(max-width:760px){.ob-cards{grid-template-columns:1fr}}
 .ob-opt-col{display:flex;flex-direction:column;gap:14px}
 .ob-opt{background:var(--card2);border:1px solid var(--line);border-radius:13px;padding:15px 16px}
-.ob-opt-main{border-color:#ffdd2d55}
+.ob-opt-main{border-color:#3b82f655}
 .ob-opt-h{display:flex;align-items:flex-start;gap:10px;margin-bottom:8px}
 .ob-opt-h h3{margin:0;font-size:15px}
-.ob-badge{width:24px;height:24px;border-radius:50%;background:var(--ac);color:#111;font-weight:700;font-size:13px;display:grid;place-items:center;flex:none;margin-top:1px}
+.ob-badge{width:24px;height:24px;border-radius:50%;background:var(--ac);color:#fff;font-weight:700;font-size:13px;display:grid;place-items:center;flex:none;margin-top:1px}
 
 /* Базовый режим: скрываем сложные колонки CY (7) и MacDur (12) в скринере облигаций */
 [data-ux-mode="basic"] #scr-head th:nth-child(7),
@@ -94,3 +94,12 @@ body.side-mini .side-foot{justify-content:center;padding:8px 0 0}
 .ux-tour-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;font-size:14px}
 .ux-tour p{margin:0 0 12px;font-size:13px;color:var(--tx2);line-height:1.45}
 .ux-tour-ft{display:flex;align-items:center;justify-content:space-between}
+
+/* Шапка 761–1100px: кнопки без текста, одна строка */
+@media(min-width:761px) and (max-width:1100px){
+  .top{flex-wrap:nowrap;gap:10px;padding-left:18px;padding-right:18px}
+  .top h1{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .top #srch,.top #refresh{width:36px;height:36px;padding:0;border-radius:50%;justify-content:center;flex:none}
+  .top #srch .srch-tx,.top #srch .srch-k,.top #refresh .btn-tx{display:none}
+  .top .upd,.top .pronly{display:none}
+}

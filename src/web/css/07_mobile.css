@@ -21,3 +21,12 @@
   .tbl{max-height:none!important}
 }
 
+/* мобильные вкладки: одна горизонтальная лента с прокруткой и затуханием по краям */
+@media(max-width:760px){
+  .seg,.ux-sub{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x proximity;scrollbar-width:none;-webkit-overflow-scrolling:touch;
+    -webkit-mask-image:linear-gradient(90deg,transparent 0,#000 14px,#000 calc(100% - 14px),transparent 100%);mask-image:linear-gradient(90deg,transparent 0,#000 14px,#000 calc(100% - 14px),transparent 100%)}
+  .seg::-webkit-scrollbar,.ux-sub::-webkit-scrollbar{display:none}
+  .seg button{flex:none;scroll-snap-align:center}
+  .ux-mseg{-webkit-mask-image:none;mask-image:none}
+  .ux-subwrap{max-width:100%}
+}

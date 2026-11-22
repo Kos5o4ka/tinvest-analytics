@@ -1,10 +1,10 @@
 /* ── Тарифы Free / Pro: заглушка, плашки, бейджи ── */
-.pro-b{font-style:normal;font-size:9px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-left:auto;padding:1px 5px;border-radius:5px;background:#ffdd2d22;color:var(--ac);border:1px solid #ffdd2d44}
+.pro-b{font-style:normal;font-size:9px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-left:auto;padding:1px 5px;border-radius:5px;background:#3b82f622;color:var(--ac);border:1px solid #3b82f644}
 #nav button{position:relative}
 .pro-lock{position:relative;min-height:440px;display:flex;align-items:center;justify-content:center;padding:20px 0;overflow:hidden}
 .pro-prev{position:absolute;inset:0;filter:blur(5px) grayscale(.6);opacity:.45;pointer-events:none;user-select:none;overflow:hidden}
 .pro-card{position:relative;width:min(520px,100%);display:flex;flex-direction:column;gap:12px;box-shadow:0 20px 60px #0007;border-color:var(--line2)}
-.pro-tag{align-self:flex-start;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:2px 8px;border-radius:6px;background:var(--ac);color:#111}
+.pro-tag{align-self:flex-start;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:2px 8px;border-radius:6px;background:var(--ac);color:#fff}
 .pro-card h2{margin:0}
 .pro-ft{display:flex;align-items:center;gap:10px;color:var(--tx2)}
 .pro-ft svg{width:20px;height:20px;flex:none;color:var(--ac-tx)}.pro-ft b{color:var(--tx);font-size:15px}
@@ -23,7 +23,7 @@
 .pro-lk,.pro-try{all:unset;cursor:pointer;color:var(--ac);font-size:12px;text-decoration:underline dotted}
 .pro-lk:hover,.pro-try:hover{color:var(--ac2)}
 .pro-pill{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;border:1px solid var(--line2);color:var(--tx2)}
-.pro-pill.on{background:#ffdd2d1c;border-color:#ffdd2d55;color:var(--ac)}
+.pro-pill.on{background:#3b82f61c;border-color:#3b82f655;color:var(--ac)}
 .pro-ban{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px}
 .pro-ban a{color:inherit;text-decoration:underline}
 .pro-ban button{all:unset;cursor:pointer;font-size:18px;line-height:1;padding:0 4px;opacity:.7}
@@ -36,6 +36,6 @@
 .pro-it svg{width:20px;height:20px;flex:none;color:var(--ac-tx);margin-top:1px}
 .pro-it b{display:block;font-size:13px}.pro-it small{color:var(--mu);font-size:12px}
 @media(max-width:640px){.pro-grid,.pro-sk-g{grid-template-columns:1fr}.pro-lock{min-height:0}}
-[data-theme="light"] .pro-b,[data-theme="light"] .pro-pill.on{color:#8a6d00;background:#ffdd2d33;border-color:#c9a40088}
-[data-theme="light"] .pro-lk,[data-theme="light"] .pro-try{color:#8a6d00}
+[data-theme="light"] .pro-b,[data-theme="light"] .pro-pill.on{color:#1d4ed8;background:#2563eb22;border-color:#2563eb66}
+[data-theme="light"] .pro-lk,[data-theme="light"] .pro-try{color:#1d4ed8}
 [data-theme="light"] #pro-ov{background:#0007}

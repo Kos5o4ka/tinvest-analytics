@@ -1,6 +1,6 @@
 /* ── печать / PDF ── */
 @media print{
-  aside,.top .btn,.top .seg,.upd,#tip,.noprint{display:none!important}
+  aside,.top .btn,.top .seg,.upd,#tip,.noprint,#boot-splash{display:none!important}
   html,body{height:auto;overflow:visible;display:block;background:#fff!important}
   main{display:block}#view{overflow:visible;padding:0}
   .top{padding:0 0 10px;border:0}.pronly{display:block;color:#666;font-size:12px;width:100%}

@@ -94,6 +94,72 @@ class Harvest(unittest.TestCase):
         self.assertEqual(h["deadline"]["sale_day"], M.tx_last_sale_day(2024)[0].isoformat())
 
 
+class LdvShield(unittest.TestCase):
+    G = [buy("2024-01-10", 10, 1000, uid="g"), sell("2024-03-10", 10, 1500, uid="g")]
+
+    def cand(self, bdate, skip=False, extra=None):
+        ops = self.G + [buy(bdate, 10, 300, uid="m")] + (extra or [])
+        st = M.tax_compute(ops, {}, [pos("m", 10 + (10 if extra else 0), 150.0)], SEL, S0, today=TODAY)
+        h = M.txo_harvest_calc(st, S0, 0.0, skip_ldv2=skip)
+        return h, (h["candidates"][0] if h["candidates"] else None)
+
+    def test_young_warn_boundary(self):
+        c = self.cand("2022-11-03")[1]                 # 729 дней
+        self.assertEqual((c["ldv_status"], c["hold_days_max"]), ("young", 729))
+        self.assertEqual(c["ldv_badge"], "")
+        c = self.cand("2022-11-02")[1]                 # 730 дней
+        self.assertEqual((c["ldv_status"], c["hold_days_max"]), ("warn", 730))
+        self.assertIn("стаж 1 г. 11 мес.", c["ldv_badge"])
+        self.assertIn("сбросит срок владения", c["ldv_badge"])
+
+    def test_critical_boundary(self):
+        c = self.cand("2022-05-03")[1]                 # до ЛДВ 183 дня
+        self.assertEqual(c["ldv_status"], "warn")
+        c = self.cand("2022-05-01")[1]                 # 181 день
+        self.assertEqual(c["ldv_status"], "critical")
+        self.assertEqual(c["ldv_days_left"], 181)
+        self.assertIn("до ЛДВ осталось 181 дн.", c["ldv_badge"])
+
+    def test_reached_and_na(self):
+        self.assertEqual(self.cand("2021-01-05")[1]["ldv_status"], "reached")
+        ops = self.G + [buy("2022-11-02", 10, 300, uid="m")]
+        st = M.tax_compute(ops, {}, [dict(pos("m", 10, 150.0), type="currency")], SEL, S0, today=TODAY)
+        h = M.txo_harvest_calc(st, S0, 0.0)
+        for c in h["candidates"]:
+            self.assertIn(c["ldv_status"], ("n/a", "young", "warn"))
+
+    def test_ldv_cost_for_profitable_warn_lot(self):
+        # старый лот @100 (прибыль +500, стаж ≥ 730 дн.) + молодой @300 (убыток); префикс из двух лотов
+        ops = self.G + [buy("2022-06-01", 10, 100, uid="m"), buy("2024-02-05", 10, 300, uid="m")]
+        st = M.tax_compute(ops, {}, [pos("m", 20, 150.0)], SEL, S0, today=TODAY)
+        h = M.txo_harvest_calc(st, S0, 0.0)
+        c = h["candidates"][0]
+        self.assertAlmostEqual(c["gain_in_prefix"], 500)
+        self.assertEqual(c["ldv_status"], "warn")
+        self.assertAlmostEqual(c["ldv_cost"], 500 * h["rate_now"], places=6)
+        self.assertAlmostEqual(c["net_ldv"], c["net"] - c["ldv_cost"], places=6)
+        if c["selected"]:
+            self.assertEqual(h["ldv_summary"]["warn"], 1)
+            self.assertAlmostEqual(h["ldv_summary"]["ldv_cost"], c["ldv_cost"], places=6)
+
+    def test_loss_warn_lot_has_no_cost(self):
+        c = self.cand("2022-11-02")[1]
+        self.assertEqual(c["ldv_cost"], 0.0)
+
+    def test_skip_ldv2_excludes_when_oldest_old(self):
+        h, c = self.cand("2022-11-02", skip=True)
+        self.assertIsNone(c)
+        self.assertEqual(len(h["ldv_skipped"]), 1)
+        self.assertIn("FIFO", h["ldv_skipped"][0]["reason"])
+        self.assertIn("FIFO", h["ldv_note"])
+        h, c = self.cand("2022-11-03", skip=True)
+        self.assertIsNotNone(c)
+        self.assertEqual(h["ldv_skipped"], [])
+
+    def test_endpoint_param(self):
+        self.assertIn("skip_ldv2", M.txo_harvest_get.__code__.co_consts + M.txo_harvest_get.__code__.co_names)
+
+
 class Iis3(unittest.TestCase):
     def test_term_table(self):
         t = M.txo_iis3_term

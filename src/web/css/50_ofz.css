@@ -1,0 +1,15 @@
+/* ОФЗ-Спредер */
+.ofz-b{display:inline-block;font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;background:#ffffff0f;color:var(--tx2)}
+.ofz-b-inv2{color:var(--pos);background:#3ecf8e17}
+.ofz-b-inv{color:var(--pos);background:#3ecf8e12}
+.ofz-b-flat{color:var(--tx2)}
+.ofz-b-steep{color:var(--warn);background:#f5a52418}
+[data-theme=light] .ofz-b{background:#0000000d}
+.ofz-verdict{margin-top:16px}
+.ofz-verdict p{margin:0 0 8px;line-height:1.55;font-size:14px}
+.ofz-verdict p:last-child{margin-bottom:0}
+.ofz-th{cursor:pointer;user-select:none;white-space:nowrap}
+.ofz-d{transition:fill-opacity .12s}
+.ofz-d:hover{fill-opacity:1;stroke-width:2}
+.ofz-mid .chart{min-height:220px}
+@media (max-width:700px){.ofz-verdict p{font-size:13px}}

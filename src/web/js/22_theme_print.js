@@ -1,6 +1,7 @@
 /* ── тема, печать ── */
 function themeNow(t){return t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}
-function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}document.documentElement.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t;thmLabel()}
+let _thmT=0;
+function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}const h=document.documentElement;h.classList.add('thm-anim');clearTimeout(_thmT);_thmT=setTimeout(()=>h.classList.remove('thm-anim'),260);h.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t;thmLabel()}
 function thmLabel(){const e=document.getElementById('thm-t');if(e)e.textContent=document.documentElement.dataset.theme==='light'?'Тёмная тема':'Светлая тема'}
 function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
 // один клик = видимая смена: от того, что сейчас на экране (раньше цикл auto→light→dark→auto при тёмной системе давал «пустой» клик dark→auto)

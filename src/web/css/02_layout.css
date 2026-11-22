@@ -1,10 +1,10 @@
 aside{width:252px;flex:none;background:var(--side);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:16px 10px 12px;overflow:auto}
 .logo{display:flex;gap:10px;align-items:center;padding:2px 8px 16px;font-weight:700;font-size:15px;letter-spacing:-.01em}
-.logo i{width:30px;height:30px;border-radius:9px;background:var(--ac);display:grid;place-items:center;flex:none}
+.logo i{width:28px;height:28px;display:grid;place-items:center;flex:none;line-height:0}.logo i svg{width:28px;height:28px;display:block}
 .logo small{display:block;font-weight:500;color:var(--mu);font-size:11px}
 .nav{display:flex;flex-direction:column;gap:1px}
 .nav button{all:unset;cursor:pointer;display:flex;gap:11px;align-items:center;padding:7px 11px;border-radius:9px;color:var(--tx2);font-weight:500;font-size:13.5px;transition:.15s}
-.nav button:hover{background:#171a20;color:var(--tx)}
+.nav button:hover{background:var(--card2);color:var(--tx)}
 .nav button.on{background:#1d2027;color:var(--tx);box-shadow:inset 3px 0 0 var(--ac)}
 .nav svg{width:17px;height:17px;flex:none;opacity:.85}
 .nav .sep{height:1px;background:var(--line);margin:8px 6px}
@@ -14,10 +14,10 @@ aside{width:252px;flex:none;background:var(--side);border-right:1px solid var(--
 .msw input{position:absolute;opacity:0;width:1px;height:1px;pointer-events:none}.msw i{width:26px;height:15px;border-radius:9px;background:#2a2e38;position:relative;transition:.2s}
 .msw input:focus-visible+i{outline:2px solid var(--ac);outline-offset:2px}
 .msw i:after{content:"";position:absolute;left:2px;top:2px;width:11px;height:11px;border-radius:50%;background:#fff;transition:.2s}
-.msw input:checked+i{background:var(--ac)}.msw input:checked+i:after{left:13px;background:#121212}
+.msw input:checked+i{background:var(--ac)}.msw input:checked+i:after{left:13px;background:#fff}
 .acl{display:flex;flex-direction:column;gap:2px}
 .acl button{all:unset;cursor:pointer;display:grid;grid-template-columns:1fr auto;gap:2px 8px;padding:7px 10px;border-radius:9px;transition:.15s}
-.acl button:hover{background:#171a20}
+.acl button:hover{background:var(--card2)}
 .acl button.on{background:#1d2027;box-shadow:inset 3px 0 0 var(--ac)}
 .acl b{font-weight:550;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .acl span{font-size:12px;color:var(--tx2);text-align:right}
@@ -30,10 +30,10 @@ aside{width:252px;flex:none;background:var(--side);border-right:1px solid var(--
 .cl ul{margin:0;padding-left:18px;color:var(--tx2);font-size:13px;line-height:1.6}.cl li b{color:var(--tx);font-weight:600}
 .rm{display:grid;gap:8px}.rm div{display:grid;grid-template-columns:118px 1fr;gap:12px;align-items:start;font-size:13px;padding:8px 10px;border-radius:10px;background:#ffffff04}
 .rm em{font-style:normal;font-size:11px;font-weight:600;padding:2px 8px;border-radius:6px;text-align:center}
-.rm .s-now{background:#ffdd2d1f;color:var(--ac-tx)}.rm .s-next{background:#3987e51f;color:#9cc3f5}.rm .s-later{background:#ffffff0d;color:var(--tx2)}.rm small{display:block;color:var(--mu);font-size:12px;margin-top:2px}
+.rm .s-now{background:#3b82f61f;color:var(--ac-tx)}.rm .s-next{background:#3987e51f;color:#9cc3f5}.rm .s-later{background:#ffffff0d;color:var(--tx2)}.rm small{display:block;color:var(--mu);font-size:12px;margin-top:2px}
 .badge{display:inline-flex;gap:6px;align-items:center;font-size:12px;color:var(--tx2)}
 .badge b{width:7px;height:7px;border-radius:50%;background:var(--pos);box-shadow:0 0 0 3px #3ecf8e22}
-.badge.sb b{background:var(--ac);box-shadow:0 0 0 3px #ffdd2d22}
+.badge.sb b{background:var(--ac);box-shadow:0 0 0 3px #3b82f622}
 
 main{flex:1;min-width:0;display:flex;flex-direction:column}
 .top{display:flex;align-items:center;gap:14px;padding:14px 28px;border-bottom:1px solid var(--line);flex-wrap:wrap}
@@ -41,10 +41,10 @@ main{flex:1;min-width:0;display:flex;flex-direction:column}
 .top h1 small{font-size:13px;color:var(--mu);font-weight:500}
 .seg{display:flex;background:var(--card);border:1px solid var(--line);border-radius:11px;padding:3px;flex-wrap:wrap}
 .seg button{all:unset;cursor:pointer;padding:6px 12px;border-radius:8px;color:var(--tx2);font-size:13px;font-weight:500;transition:.15s;white-space:nowrap}
-.seg button:hover{color:var(--tx)}.seg button.on{background:#2a2e38;color:var(--tx)}
-.btn{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:8px;background:var(--ac);color:#121212;font-weight:600;
+.seg button:hover{color:var(--tx)}.seg button.on{background:var(--card-hover);color:var(--tx)}
+.btn{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:8px;background:var(--ac);color:#fff;font-weight:600;
   padding:9px 15px;border-radius:10px;font-size:13px;transition:.15s;white-space:nowrap}
-.btn:hover{background:var(--ac2)}
+.btn:hover{background:var(--ac2);box-shadow:0 0 0 3px var(--ac-glow)}
 .btn.ghost{background:var(--card);color:var(--tx);border:1px solid var(--line2)}.btn.ghost:hover{background:var(--card2)}
 .btn.danger{background:transparent;color:var(--neg);border:1px solid #ff6b6b55}
 .btn[disabled]{opacity:.5;pointer-events:none}.btn svg{width:15px;height:15px}

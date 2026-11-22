@@ -251,6 +251,19 @@ def screener_payload():
         if r["floating"] is None and r.get("btype"):      # без справочника T-Invest — по типу облигации из ISS
             r["floating"] = "плава" in r["btype"].lower()
         r["amort"] = info.get("amort") if info else None
+    today_s = date.today().isoformat()
+    for r in rows:      # линкер, к чему считается доходность (оферта/погашение), дней до оферты
+        try:
+            r["linker"] = bool(DBX_LINKER_RE.match(r.get("id") or "")) and r.get("kind") == "ofz"
+        except NameError:
+            r["linker"] = bool(re.match(r"^SU52\d{3}", r.get("id") or "")) and r.get("kind") == "ofz"
+        of = r.get("offer")
+        up = bool(of and of >= today_s and (not r.get("mat") or of < r["mat"]))
+        r["ytm_kind"] = "offer" if up else "mat"
+        try:
+            r["days_to_offer"] = (datetime.strptime(of, "%Y-%m-%d").date() - date.today()).days if up else None
+        except Exception:  # noqa: BLE001
+            r["days_to_offer"] = None
     try:        # спред флоатера к КС из кэша (без ожидания); недостающее считает фоновое задание
         fsp = fl_spread_cached()
         for r in rows:
@@ -268,8 +281,76 @@ def screener_payload():
         lq = bench_lqdt_yield()
     except Exception:  # noqa: BLE001
         lq = None
+    try:        # ожидаемая инфляция (прогноз ЦБ, декабрь к декабрю) для переключателя «реальная доходность»
+        ie, isrc = scr_infl_exp()
+    except Exception:  # noqa: BLE001
+        ie, isrc = None, ""
     return {"rows": rows, "kbd": kbd_curve(), "updated": _scr["t"], "ratings": ratings_status(), "stats": stats, "stats_hist": hist,
-            "floor": {"lqdt": lq}}
+            "floor": {"lqdt": lq}, "infl_exp": ie, "infl_src": isrc}
+
+
+def scr_infl_exp():
+    """(ожидаемая инфляция, %; подпись источника). Прогноз ЦБ на текущий год, иначе на ближайший; нет прогноза — (None, '')."""
+    fc = inflation_forecast()
+    ys = fc.get("yearly") or []
+    if not ys:
+        return None, ""
+    y0 = date.today().year
+    pick = next((y for y in ys if y["year"] == y0), ys[0])
+    return pick["mid"], "прогноз Банка России на %d г. (%s)" % (pick["year"], fc.get("as_of") or "")
+
+
+# ── спарклайны цен: последние ~30 торговых дней, кэш на сутки ──
+SPARK_URL = ("https://iss.moex.com/iss/history/engines/stock/markets/bonds/securities/%s.json?iss.meta=off&iss.only=history"
+             "&marketprice_board=1&history.columns=TRADEDATE,CLOSE,LEGALCLOSEPRICE,BOARDID&from=%s")
+SPARK_MAX_IDS, SPARK_DAYS = 60, 30
+_spark_cache = {}
+_spark_lock = threading.Lock()
+
+
+def spark_parse(j, n=SPARK_DAYS):
+    """Ответ ISS history -> цены закрытия по торговым дням (старые первыми, не больше n). По дню берётся первая площадка с ценой."""
+    t = (j or {}).get("history") or {}
+    cols = t.get("columns") or []
+    by = {}
+    for row in t.get("data") or []:
+        r = dict(zip(cols, row))
+        d = r.get("TRADEDATE")
+        px = r.get("CLOSE") or r.get("LEGALCLOSEPRICE")
+        if not d or not px or d in by:
+            continue
+        by[d] = round(float(px), 3)
+    return [by[d] for d in sorted(by)][-n:]
+
+
+def spark_payload(ids, budget=25.0):
+    """{isin: [цены]} для списка бумаг. Идёт последовательно, при ошибке источника останавливается и отдаёт, что есть."""
+    out, t0 = {}, time.time()
+    frm = (date.today() - timedelta(days=60)).isoformat()
+    seen = []
+    for i in ids:
+        i = (i or "").strip().upper()
+        if re.match(r"^[A-Z0-9]{5,16}$", i) and i not in seen:
+            seen.append(i)
+    for i in seen[:SPARK_MAX_IDS]:
+        key = (i, date.today())
+        with _spark_lock:
+            hit = _spark_cache.get(key)
+        if hit is not None:
+            out[i] = hit
+            continue
+        if time.time() - t0 > budget:
+            break
+        try:
+            vals = spark_parse(json.loads(http_text(SPARK_URL % (i, frm), timeout=15)))
+        except Exception:  # noqa: BLE001
+            break
+        with _spark_lock:
+            for k in [k for k in _spark_cache if k[1] != date.today()]:
+                _spark_cache.pop(k, None)
+            _spark_cache[key] = vals
+        out[i] = vals
+    return out
 
 
 def bond_movers(n=50):

@@ -1,5 +1,5 @@
 /* ── Календарь событий ── */
-const CAL_KINDS=[['cbr','Заседания ЦБ','#ffdd2d',['cbr']],['coupon','Купоны','#19a070',['coupon']],['redemption','Погашения','#d95926',['redemption']],
+const CAL_KINDS=[['cbr','Заседания ЦБ','#3b82f6',['cbr']],['coupon','Купоны','#19a070',['coupon']],['redemption','Погашения','#d95926',['redemption']],
   ['amort','Амортизации','#c98500',['amort']],['dividend','Дивиденды','#9085e9',['dividend']],['offer','Оферты','#e66767',['offer']],
   ['primary','Размещения','#3987e5',['primary']],['watch','Наблюдение','#8d94a3',['w_coupon','w_redemption','w_offer']],['other','Прочее','#8d94a3',[]]];
 const CAL_NAME={cbr:'Заседание ЦБ',coupon:'Купон',redemption:'Погашение',amort:'Амортизация',dividend:'Дивиденд',offer:'Оферта',primary:'Размещение',

@@ -5,5 +5,11 @@
 .txo .txo-warn{color:var(--neg)}
 .txo ul.txo-ul{margin:6px 0 0;padding-left:20px;line-height:1.6}
 .txo .tag.txo-ldv{border:1px solid var(--neg);color:var(--neg)}
+.txo .txo-chk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--mu)}
+.txo .txo-ldvsum{margin:8px 0;padding:8px 12px;background:var(--card2);border:1px solid var(--line);border-radius:8px;font-size:13px}
+.txo .txo-young{color:var(--mu)}
+.txo .txo-lw,.txo .tag.txo-bw{color:var(--warn)}
+.txo .txo-lc,.txo .tag.txo-bc{color:var(--neg)}
+.txo .tag.txo-bdg{white-space:normal;border:1px solid currentColor}
 .txo .txo-chart{min-height:240px}
 @media print{.txo .txo-form{display:none}}

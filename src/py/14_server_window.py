@@ -96,6 +96,11 @@ class Handler(BaseHTTPRequestHandler):
                                  {"Content-Disposition": 'attachment; filename="operations.csv"'})
             if u.path == "/api/screener":
                 return self.send(200, screener_payload())
+            if u.path == "/api/spark":
+                try:
+                    return self.send(200, spark_payload([x for x in (q.get("ids") or "").split(",") if x][:SPARK_MAX_IDS]))
+                except Exception:  # noqa: BLE001
+                    return self.send(200, {})
             if u.path == "/api/bond":
                 return self.send(200, bond_card(q.get("isin", "")))
             if u.path == "/api/primary":

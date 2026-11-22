@@ -5,7 +5,7 @@ const UX_SECTIONS=[
   {id:'pay_ev',title:'Выплаты и события',icon:'pay',basic:true,tabs:['pay','off','cal']},
   {id:'bonds_mkt',title:'Облигации (рынок)',icon:'scr',basic:true,tabs:['scr','cmp','arb','rot','dbx','lad','pri','map'],basicTabs:['scr','cmp','arb','rot','lad','pri']},
   {id:'stocks_mkt',title:'Акции и фонды',icon:'hm',basic:false,tabs:['sst','hm','stk','dgap','mm']},
-  {id:'pulse',title:'Пульс рынка',icon:'mkt',basic:false,tabs:['mkt','fng','flw','mic','sig']},
+  {id:'pulse',title:'Пульс рынка',icon:'mkt',basic:false,tabs:['mkt','ofz','fng','flw','mic','sig']},
   {id:'risk_ctrl',title:'Надёжность и риски',icon:'risk',basic:false,tabs:['risk','mon','iss','crp','dfl','watch']},
   {id:'taxes',title:'Налоги',icon:'tax',basic:true,tabs:['tax','txo']},
   {id:'calc_sec',title:'Калькулятор',icon:'calc',basic:true,tabs:['calc']}
@@ -123,7 +123,7 @@ function uxDashBlocks(){
   let chk='';
   if(!UX.checkOff&&doneCnt<steps.length){
     chk=`<div class="card ux-chk"><div class="ux-chk-h"><div><b>С чего начать</b> <span class="mu">· выполнено ${doneCnt} из ${steps.length}</span></div>
-      <div class="row" style="gap:8px"><button class="btn ghost" id="ux-tour-go" style="padding:5px 10px;font-size:12px">Мини-тур (4 шага)</button>
+      <div class="row" style="gap:8px"><button class="btn ghost" id="ux-tour-go" style="padding:5px 10px;font-size:12px">Тур по интерфейсу</button>
       <button class="lnk" id="ux-chk-hide" style="font-size:12px">Скрыть</button></div></div>
       <div class="ux-chk-l">${steps.map(([k,t,act])=>`<button class="ux-chk-i${UX.checks[k]?' done':''}" data-ux-step="${esc(act)}"><i>${UX.checks[k]?'✓':'○'}</i><span>${esc(t)}</span></button>`).join('')}</div></div>`;
   }
@@ -187,7 +187,7 @@ function uxRenderAccDropdown(){
 const _renderAccPrev=renderAccounts;
 renderAccounts=function(){_renderAccPrev.apply(this,arguments);uxRenderAccDropdown()};
 
-/* ── Трекинг шагов чек-листа и 4-шаговый мини-тур ── */
+/* ── Трекинг шагов чек-листа и тур по интерфейсу ── */
 const _goPrev=go;
 go=function(p){
   if(p==='pay'||p==='off')uxMarkCheck('pay');
@@ -202,36 +202,8 @@ if(typeof kpOpen==='function'){
   kpOpen=function(){uxMarkCheck('srch');return _kpPrev.apply(this,arguments)};
 }
 
-const UX_TOUR_STEPS=[
-  {sel:'aside',title:'Умное меню и режим «Базовый / Профи»',text:'В «Базовом» режиме показаны 6 главных разделов без лишнего шума. Переключатель «Профи» вверху меню открывает все квантовые инструменты.'},
-  {sel:'#acc-dd,#period',title:'Счёт и период всегда под рукой',text:'Переключайте брокерские счета и период доходности прямо в верхней панели — не нужно прокручивать боковое меню.'},
-  {sel:'#srch',title:'Быстрый поиск ⌘K / Ctrl+K',text:'Мгновенно находите любую облигацию, акцию, эмитента или экран программы с клавиатуры.'},
-  {sel:'#more',title:'Скрыть суммы, тема, PNG и PDF',text:'В меню «⋯» — скрытие всех сумм в рублях, смена темы, карточка доходности для Telegram без абсолютных сумм и печать в PDF.'}
-];
-let _uxTourI=-1;
-function uxTourStop(){
-  _uxTourI=-1;lsSet('ta_ux_tour_done','1');
-  const el=$('#ux-tour');if(el)el.remove();
-  document.querySelectorAll('.ux-hl').forEach(x=>x.classList.remove('ux-hl'));
-}
-function uxTourShow(i){
-  document.querySelectorAll('.ux-hl').forEach(x=>x.classList.remove('ux-hl'));
-  if(i>=UX_TOUR_STEPS.length){uxTourStop();return}
-  _uxTourI=i;
-  const st=UX_TOUR_STEPS[i];
-  const tgt=[...document.querySelectorAll(st.sel)].find(e=>e.offsetParent&&getComputedStyle(e).visibility!=='hidden'&&e.getBoundingClientRect().width>0);
-  if(!tgt){uxTourShow(i+1);return}
-  tgt.classList.add('ux-hl');
-  let box=$('#ux-tour');
-  if(!box){box=document.createElement('div');box.id='ux-tour';box.className='ux-tour';document.body.appendChild(box)}
-  box.innerHTML=`<div class="ux-tour-hd"><b>${esc(st.title)}</b><span class="mu">${i+1} / ${UX_TOUR_STEPS.length}</span></div>
-    <p>${esc(st.text)}</p>
-    <div class="ux-tour-ft"><button class="lnk" id="uxt-skip">Пропустить</button>
-    <button class="btn" id="uxt-next">${i+1===UX_TOUR_STEPS.length?'Готово':'Далее →'}</button></div>`;
-  $('#uxt-skip').onclick=uxTourStop;
-  $('#uxt-next').onclick=()=>uxTourShow(i+1);
-}
-function uxTourStart(){uxTourShow(0)}
+/* тур по интерфейсу — js/58a_tour.js (window.tourStart) */
+function uxTourStart(){if(typeof tourStart==='function')tourStart()}
 
 /* ── Единые делегированные обработчики UX ── */
 document.addEventListener('click',e=>{
@@ -265,6 +237,5 @@ document.addEventListener('click',e=>{
 document.addEventListener('change',e=>{
   if(e.target&&e.target.id==='acc-dd-he'){S.hideEmpty=e.target.checked;persist();renderAccounts();return}
 });
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&_uxTourI>=0)uxTourStop()});
 /* Обновляем уже отрисованную навигацию после загрузки этого файла */
 if(typeof renderNav==='function')try{renderNav()}catch(e){}

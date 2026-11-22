@@ -1,5 +1,5 @@
 /* ── Налоговая оптимизация: сбор убытков по лотам FIFO и планировщик ИИС-3 ── */
-S.txo={h:null,hAcc:null,hBusy:0,hErr:null,fee:'',p:null,pBusy:0,pErr:null,F:null};
+S.txo={h:null,hAcc:null,hBusy:0,hErr:null,fee:'',skip:(()=>{try{return localStorage.getItem('txo_skip2')==='1'}catch(e){return false}})(),p:null,pBusy:0,pErr:null,F:null};
 try{S.txo.F=JSON.parse(localStorage.getItem('txo_iis3')||'null')}catch(e){}
 const txoR=n=>bad(n)?'—':M(n,'rub',0),txoS=n=>bad(n)?'—':(n>0?'+':'')+M(n,'rub',0);
 const TXO_NOTE='<p class="note">Расчёт по модели и справочный: проверьте его с брокерским отчётом; налог удерживает брокер, итог за год определяется декларацией. Допущения указаны в блоках.</p>';
@@ -8,7 +8,7 @@ function txoF(){
 }
 function txoLoadH(force){
   if(S.txo.hBusy)return;S.txo.hBusy=1;const acc=S.account;
-  const p=Object.assign({account:acc},S.txo.fee!==''?{fee:S.txo.fee}:{},force?{force:'1'}:{});
+  const p=Object.assign({account:acc},S.txo.fee!==''?{fee:S.txo.fee}:{},S.txo.skip?{skip_ldv2:'1'}:{},force?{force:'1'}:{});
   api('/api/txo/harvest?'+new URLSearchParams(p)).then(j=>{S.txo.hBusy=0;S.txo.hAcc=acc;S.txo.hErr=null;S.txo.h=j;if(S.page==='txo'&&S.account===acc)renderSoon()})
    .catch(e=>{S.txo.hBusy=0;S.txo.hAcc=acc;S.txo.h=null;S.txo.hErr=e.message;if(S.page==='txo')renderSoon()});
 }
@@ -29,13 +29,22 @@ function txoHarvest(){
     ${kpi('Чистая выгода модели',txoR(t.net),`позиций в наборе: ${t.n}`,t.net>0?'pos':'',S1)}
     ${kpi('Последний день сделки',ddm(d.sale_day),d.passed?'срок для этого года прошёл':`осталось ${d.days} дн. (T+1, торги до ${ddm(d.last_trading_day)})`,d.passed?'neg':'',S2)}</div>
     <div class="row noprint" style="margin:10px 0"><label class="field"><span>Комиссия, % (пусто — по истории)</span><input class="in" id="txo-fee" type="number" step="0.01" min="0" value="${esc(S.txo.fee)}" style="width:140px"></label>
+      <label class="txo-chk"><input type="checkbox" id="txo-skip2" ${S.txo.skip?'checked':''}> Не предлагать лоты со стажем ≥ 2 лет</label>
       <button class="btn" id="txo-fee-go">Пересчитать</button></div>`;
+  const sm=h.ldv_summary;
+  if(sm&&(sm.young+sm.warn+sm.critical+sm.reached>0||sm.ldv_cost>0))out+=`<div class="txo-ldvsum"><b>Стаж лотов в наборе:</b> <span class="txo-young">моложе 2 лет: ${sm.young}</span> · <span class="txo-lw">со стажем 2–3 года: ${sm.warn}</span> · <span class="txo-lc">почти ЛДВ: ${sm.critical}</span>${sm.reached?` · ЛДВ уже наступила: ${sm.reached}`:''}${sm.ldv_cost>0?` · потеря ЛДВ ≈ <b>${txoR(sm.ldv_cost)}</b>, выгода с учётом ЛДВ ${txoS(sm.net_ldv)}`:''}</div>`;
+  if(h.ldv_note)out+=`<p class="note">${esc(h.ldv_note)}</p>`;
+  if((h.ldv_skipped||[]).length)out+=`<div class="txo-ldvsum"><b>Исключены из-за стажа ≥ 2 лет:</b><ul class="txo-ul">${h.ldv_skipped.map(x=>`<li>${esc(x.name)} (${esc(x.ticker)}), убыток ${txoR(x.loss)}: ${esc(x.reason)}</li>`).join('')}</ul></div>`;
   if(!h.candidates.length)out+='<div class="empty">Бумаг с нереализованным убытком, продажа которых снизила бы налог, модель не нашла (или налога за год пока нет).</div>';
   else out+=`<div class="tbl"><table><thead><tr><th>Бумага</th><th>Продать (старые лоты)</th><th>Убыток</th><th>Прибыль в префиксе</th><th>Ставка</th><th>Экономия</th><th>Комиссии</th><th>Чистая выгода</th><th>Примечания</th></tr></thead><tbody>${h.candidates.map(c=>{
       const nt=[];
       if(c.selected)nt.push('<span class="tag">в наборе</span>');
       if(c.carry_forward>1)nt.push(`<small class="mu">убыток сверх базы ${txoR(c.carry_forward)} перенесётся</small>`);
       if(c.blind)nt.push('<small class="txo-warn">лоты из перевода: стоимость могла быть неизвестна</small>');
+      if(c.ldv_status==='critical')nt.push(`<span class="tag txo-bdg txo-bc">${esc(c.ldv_badge)}</span>`);
+      else if(c.ldv_status==='warn')nt.push(`<span class="tag txo-bdg txo-bw">${esc(c.ldv_badge)}</span>`);
+      else if(c.ldv_status==='young')nt.push('<small class="mu">стаж &lt; 2 лет ✓</small>');
+      if(c.ldv_cost>0)nt.push(`<small class="mu">потеря ЛДВ ≈ ${txoR(c.ldv_cost)}; выгода с учётом ЛДВ <b>${txoS(c.net_ldv)}</b></small>`);
       c.ldv.forEach(l=>nt.push(`<span class="tag txo-ldv">ЛДВ ${l.status==='reached'?'наступила':`через ${l.days} дн.`}</span> <small class="mu">${ddm(l.bdate)}: прибыль ${txoR(l.gain)}${l.tax_at_stake?`, налог без ЛДВ ≈ ${txoR(l.tax_at_stake)}`:''}; после обратной покупки срок начнётся заново</small>`));
       return`<tr><td class="l"><b>${esc(c.name)}</b><br><small class="mu">${esc(c.ticker)}</small></td><td class="num">${f2(c.qty)}${c.partial?` из ${f2(c.qty_total)}`:''}<br><small class="mu">${txoR(c.value)}</small></td>
         <td class="num neg">${txoR(-c.loss)}</td><td class="num">${txoR(c.gain_in_prefix)}</td><td class="num">${c.marginal_rate==null?'—':pctp(c.marginal_rate*100,0)}</td>
@@ -96,6 +105,8 @@ function pTxo(){
 }
 function bindTxo(){
   const g=document.getElementById('txo-fee-go');
+  const sk=document.getElementById('txo-skip2');
+  if(sk)sk.onchange=()=>{S.txo.skip=sk.checked;try{localStorage.setItem('txo_skip2',sk.checked?'1':'0')}catch(e){}S.txo.h=null;S.txo.hAcc=null;render()};
   if(g)g.onclick=()=>{S.txo.fee=(document.getElementById('txo-fee').value||'').trim();S.txo.h=null;S.txo.hAcc=null;render()};
   document.querySelectorAll('.txo-in').forEach(el=>{el.addEventListener('change',()=>{
     const F=txoF();document.querySelectorAll('.txo-in').forEach(e=>{F[e.id.slice(4)]=e.value});

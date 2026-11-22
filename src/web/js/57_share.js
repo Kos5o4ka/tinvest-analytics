@@ -68,8 +68,8 @@ function shareDraw(cv){
   if(!cv)return;
   const ctx=cv.getContext('2d'),W=1200,H=630,dk=SHR.theme!=='light';
   const C=dk
-    ?{bg:'#0f131a',card:'#171d28',line:'#263042',tx:'#f2f5fa',tx2:'#9aa6bc',ac:'#ffdd2d',pos:'#3ecf8e',neg:'#ff6b6b',s1:'#4da3ff',s2:'#f5a623',s3:'#3ecf8e',grid:'#ffffff10'}
-    :{bg:'#f4f6fa',card:'#ffffff',line:'#dde3ee',tx:'#141923',tx2:'#5c677d',ac:'#ffdd2d',pos:'#128a5a',neg:'#d63c41',s1:'#2474e5',s2:'#d98200',s3:'#128a5a',grid:'#00000010'};
+    ?{bg:'#0f131a',card:'#171d28',line:'#263042',tx:'#f2f5fa',tx2:'#9aa6bc',ac:'#3b82f6',pos:'#10b981',neg:'#ff6b6b',s1:'#4da3ff',s2:'#f5a623',s3:'#3ecf8e',grid:'#ffffff10'}
+    :{bg:'#f4f6fa',card:'#ffffff',line:'#dde3ee',tx:'#141923',tx2:'#5c677d',ac:'#2563eb',pos:'#128a5a',neg:'#d63c41',s1:'#2474e5',s2:'#d98200',s3:'#128a5a',grid:'#00000010'};
   ctx.fillStyle=C.bg;ctx.fillRect(0,0,W,H);
   // Subtle accent glow
   const gr=ctx.createRadialGradient(180,80,10,180,80,460);
@@ -82,7 +82,7 @@ function shareDraw(cv){
 
   // Header brand badge
   ctx.fillStyle=C.ac;_shrRR(ctx,44,36,40,40,10);ctx.fill();
-  ctx.strokeStyle='#111';ctx.lineWidth=3.2;ctx.lineCap='round';ctx.lineJoin='round';
+  ctx.strokeStyle='#fff';ctx.lineWidth=3.2;ctx.lineCap='round';ctx.lineJoin='round';
   ctx.beginPath();ctx.moveTo(52,64);ctx.lineTo(60,54);ctx.lineTo(66,59);ctx.lineTo(76,46);ctx.stroke();
 
   ctx.fillStyle=C.tx;ctx.font='700 24px '+F;ctx.fillText('TAnalytic',96,58);

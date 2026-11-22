@@ -59,6 +59,7 @@ function pMkt(){
     ${kpi('КБД '+rtLab(bt)+' − ключевая',dk!=null?ppf(dk):'—',dk==null?'':'рынок закладывает '+(dk>0?'повышение / удержание':'снижение')+' ставки',dk==null?null:dk>0?'neg':'pos')}
     ${hasSl?kpi('Наклон: 10 лет − 1 год',ppf(sl),sl<0?'кривая инвертирована':'длинные ставки выше коротких',sl<0?'pos':null):
       kpi('КБД '+rtLab(bt)+' за период',lastK!=null&&first!=null?ppf(lastK-first):'—','с '+r.labels[Math.max(0,firstI)],lastK!=null&&first!=null?(lastK-first>0?'neg':'pos'):null)}</div>
+  <div class="mu" style="margin:-4px 2px 12px;font-size:13px">Форма кривой и премия за срок: <button class="btn ghost ofz-go" type="button">Подробнее: ОФЗ-Спредер →</button></div>
   <div class="card rates"><h2>Доходность КБД и ключевая ставка<span class="sp">${seg}</span></h2>
     <p class="note rx-lead">Линии КБД — доходность гособлигаций выбранных сроков, зелёная — ключевая ставка. Если линия КБД выше зелёной — рынок ждёт, что ставка останется высокой; ниже — ждёт её снижения. Сроки между точками кривой считаются линейной интерполяцией.</p>
     ${termChips()}
@@ -78,8 +79,8 @@ function loadRatesX(force){
   api('/api/rates/extra').then(j=>{S._rxL=0;const ch=rtChanged(S.ratesX,j);S.ratesX=j;if(S.page==='mkt'){if(ch)renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
    .catch(e=>{S._rxL=0;S.ratesX={error:e.message}})
 }
-const RX_COL=['#ffdd2d','#3987e5','#19a070','#d95926','#9085e9'];
-const RX_BCOL={'AAA':'#3987e5','AA':'#19a070','A':'#ffdd2d','BBB':'#d95926','BB и ниже':'#e66767'};
+const RX_COL=['#3b82f6','#3987e5','#19a070','#d95926','#9085e9'];
+const RX_BCOL={'AAA':'#3987e5','AA':'#19a070','A':'#d97706','BBB':'#d95926','BB и ниже':'#e66767'};
 function ratesXHtml(){
   if(!S.ratesX)loadRatesX();
   const x=S.ratesX;
@@ -124,7 +125,7 @@ function curveCard(cv,its){
   const sum=`<ul class="rx-sum"><li>${mv(1,'Короткие (1 год)')}</li><li>${mv(10,'Длинные (10 лет)')}</li><li>Кривая ${dyn}, сейчас ${shape}: 10 лет − 2 года = <b class="num">${fmtS(s1)}</b> (было ${fmtS(s0)}).</li></ul>
     <p class="rx-mean"><b>Что это значит:</b> ${mean} ${lvlT}</p>`;
   const rows=RX_TEN.filter(([t])=>ix(t)>=0).map(([t,n])=>{const a=y(cmp,t),b=y(now,t),d=b-a;return`<tr><td>${n}</td><td class="num"><b>${pc2(b)}</b></td><td class="num">${pc2(a)}</td><td class="num ${dcl(d)}">${pp(d,1)}</td></tr>`}).join('');
-  const AC=document.documentElement.dataset.theme==='light'?'#c99700':'#ffdd2d',nm='Сегодня ('+ddm(now.date)+')',cn=lab+' назад ('+ddm(cmp.date)+')';
+  const AC=document.documentElement.dataset.theme==='light'?'#2563eb':'#3b82f6',nm='Сегодня ('+ddm(now.date)+')',cn=lab+' назад ('+ddm(cmp.date)+')';
   chart('c-rx-curve',line,{h:320,zero:false,labels:cv.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc2(v),band:{a:1,b:0},
     series:[{n:cn,c:'#8d95a6',hex:'#8d95a6',v:cmp.y,w:2,dash:true},{n:nm,c:AC,hex:AC,v:now.y,w:3.4}],
     tip:i=>{const a=cmp.y[i],b=now.y[i],d=b-a;return`<b>Срок: ${esc(cv.labels[i])}</b>`+tipRow(AC,nm,pc2(b))+tipRow('#8d95a6',cn,pc2(a))+`<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Изменение<span class="${dcl(d)}">${pp(d,1)}</span></div>`}});
@@ -158,7 +159,7 @@ function inflWeekHtml(){
   const cy=ys[ys.length-1],py=String(+cy-1),W=Array.from({length:52},(_,i)=>i+1);
   const byW=y=>{const a=Array(52).fill(null);(x.years[y]||[]).forEach(r=>{if(r.week>=1&&r.week<=52)a[r.week-1]=r.pct});return a};
   const av=Array(52).fill(null);(x.avg||[]).forEach(([w,v])=>{if(w>=1&&w<=52)av[w-1]=v});
-  const A='#ffdd2d',series=[{n:cy,c:A,hex:A,v:byW(cy),w:3}];
+  const A='#3b82f6',series=[{n:cy,c:A,hex:A,v:byW(cy),w:3}];
   if(x.years[py])series.push({n:py,c:'#3987e5',hex:'#3987e5',v:byW(py),w:2});
   if(av.some(v=>v!=null))series.push({n:'Среднее '+(x.avg_label||'2017–2021'),c:'#8d95a6',hex:'#8d95a6',v:av,w:2,dash:true});
   const last=(x.years[cy]||[]).slice(-1)[0],f=v=>(+v).toFixed(2).replace('.',',')+'%';

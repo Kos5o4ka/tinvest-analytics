@@ -22,7 +22,7 @@ function authOverlay(show,err){
   if(ov){const e=$('#lg-err');if(e&&err!==undefined){e.textContent=err;e.style.display=err?'':'none'}return}
   ov=document.createElement('div');ov.id='login-ov';
   ov.innerHTML=`<div class="lg-box" role="dialog" aria-modal="true" aria-label="Вход">
-    <div class="logo"><i><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#111" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16l5-6 4 3 7-8"/></svg></i>
+    <div class="logo"><i>${typeof LOGO_SVG==='function'?LOGO_SVG(28):''}</i>
       <div>TAnalytic<small>аналитика портфеля</small></div></div>
     <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует 7 дней.</p>
     <a class="btn" id="lg-bot" href="https://t.me/${bot}?start=app" target="_blank" rel="noopener noreferrer">Открыть @${bot}</a>

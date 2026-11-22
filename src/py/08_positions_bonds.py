@@ -326,9 +326,9 @@ def issuer_group_key(name):
     return "".join(sorted(name_tokens(_bond_query(n)))) or low
 
 
-def bonds_report(client, rows):
+def bonds_report(client, rows, horizon_days=365):
     today = date.today().isoformat()
-    horizon = (date.today() + timedelta(days=365)).isoformat()
+    horizon = (date.today() + timedelta(days=horizon_days)).isoformat()   # окно выплат; 365 — «Выплаты», больше — матрица потоков
     bonds = [r for r in rows if r["type"] == "bond" and r["uid"] and r["qty"] > 0]
     infos = dict(zip([r["uid"] for r in bonds], pool_map(lambda r: bond_info(client, r["uid"]), bonds)))
     out, pays = [], []
