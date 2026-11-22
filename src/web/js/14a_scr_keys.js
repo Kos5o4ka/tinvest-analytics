@@ -4,7 +4,7 @@ function kbBlocked(e){
   if(e.ctrlKey||e.metaKey||e.altKey||e.defaultPrevented)return true;
   const a=document.activeElement,t=a&&a.tagName;
   if(t==='TEXTAREA'||t==='SELECT'||(t==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|file|color)$/.test(a.type))||(a&&a.isContentEditable))return true;
-  if(document.querySelector('#bc-ov,#kp-ov,#ks-ov,#login-ov,#pro-ov,[aria-modal="true"]'))return true;
+  if(document.querySelector('#bc-ov,#sk-ov,#kp-ov,#ks-ov,#login-ov,#pro-ov,[aria-modal="true"]'))return true;
   return false;
 }
 const kbRows=()=>[...document.querySelectorAll('#view table tbody tr[data-isin], #view table tbody tr[data-stk]')];

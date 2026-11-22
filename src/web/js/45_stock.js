@@ -31,17 +31,23 @@ function stkSearch(q,n){
   for(const r of l){const sc=Math.max(r.secid.toLowerCase()===q?9:kpScore(r.secid,q),kpScore(r.shortname,q),kpScore(r.name,q)*.8);if(sc)out.push([sc,r])}
   return out.sort((a,b)=>b[0]-a[0]).slice(0,n||8).map(x=>x[1]);
 }
-function openStock(secid){
+function openStock(secid,opts){
   secid=String(secid||'').trim().toUpperCase();if(!secid)return;
+  if(/^[A-Z]{2}[A-Z0-9]{9}\d$/.test(secid)){         /* ISIN (так приходят бумаги из отчётов брокера) -> тикер Мосбиржи по списку акций */
+    if(!S.stkList){stkEnsureList(()=>{const r=(S.stkList||[]).find(x=>x.isin===secid);openStock(r?r.secid:secid+'#',opts)});return}
+    const r=S.stkList.find(x=>x.isin===secid);if(r)secid=r.secid;
+  }
+  secid=secid.replace(/#$/,'');
   const st=S.stk;if(st.secid!==secid){st.secid=secid;st.card=null;st.err=null;st.cardTf=null}
-  go('stk');
+  if(S.page==='stk'||(opts&&opts.page)){skClose();if(S.page==='stk')render();else go('stk');return}
+  skOpen();
 }
 function loadStk(force){
   const st=S.stk,sec=st.secid,tf=st.tf;if(!sec||(st.loading&&!force))return;st.loading=true;st.err=null;
   api('/api/stock?'+new URLSearchParams({secid:sec,tf})+(force?'&force=1':'')).then(j=>{
     st.loading=false;if(st.secid!==sec||st.tf!==tf){loadStk();return}
-    st.card=j;st.cardTf=tf;if(S.page==='stk')renderSoon();
-  }).catch(e=>{st.loading=false;if(st.secid!==sec)return;st.err=e.message;if(S.page==='stk')renderSoon()});
+    st.card=j;st.cardTf=tf;if(S.page==='stk')renderSoon();skRender();
+  }).catch(e=>{st.loading=false;if(st.secid!==sec)return;st.err=e.message;if(S.page==='stk')renderSoon();skRender()});
 }
 function stkSearchBox(){
   const tfs=[['D','День'],['W','Неделя'],['H','Час']];
@@ -112,26 +118,32 @@ function stkRepCard(c){
   return`<div class="card"><h2>Следующая отчётность</h2>${v}</div>`;
 }
 function pStk(){
-  const st=S.stk,head=stkSearchBox();
-  if(!st.secid)return head+stkHome();
-  if(st.err)return head+`<div class="msg err">${esc(st.err)} <button class="btn ghost" id="stk-r">Повторить</button></div>`;
+  const head=stkSearchBox();
+  return S.stk.secid?head+stkCardHtml('stk-'):head+stkHome();
+}
+/* Карточка акции без строки поиска. prefix даёт ids: 'stk-' на странице, 'skd-' в панели — они не пересекаются. */
+function stkCardHtml(p){
+  const st=S.stk,drw=p!=='stk-';
+  if(st.err)return`<div class="msg err">${esc(st.err)} <button class="btn ghost" id="${p}r">Повторить</button></div>`;
   const c=st.card;
-  if(!c||c.secid!==st.secid||st.cardTf!==st.tf){loadStk();return head+`<div class="card">${waitBox('Загружаю '+esc(st.secid)+'…')}</div>`}
+  if(!c||c.secid!==st.secid||st.cardTf!==st.tf){loadStk();return`<div class="card">${waitBox('Загружаю '+esc(st.secid)+'…')}</div>`}
   const q=c.quote,cs=c.candles,sr=c.series||{},ind=st.ind,lab=stkLabel(st.tf);
   const lines=[];
   if(ind.s50)lines.push({v:sr.sma50||[],c:'#f0b429',n:'SMA 50',w:1.5});
   if(ind.s200)lines.push({v:sr.sma200||[],c:'#7a8cff',n:'SMA 200',w:1.5});
   const lv=[];if(ind.lv&&c.levels)c.levels.resistance.forEach(x=>lv.push({p:x.price,kind:'r'})),c.levels.support.forEach(x=>lv.push({p:x.price,kind:'s'}));
-  chart('c-stk',(el,o)=>candles(el,cs,o),{h:380,lines,band:ind.bb?{up:sr.bb_up||[],low:sr.bb_low||[],c:'#7a8cff'}:null,levels:lv,labelOf:lab,fmt:stkPrice});
-  chart('c-stk-rsi',stkSub,{kind:'rsi',h:100,labels:cs.map(x=>lab(x.t)),rsi:sr.rsi||[]});
-  chart('c-stk-macd',stkSub,{kind:'macd',h:120,labels:cs.map(x=>lab(x.t)),macd:sr.macd||[],sig:sr.macd_signal||[],hist:sr.macd_hist||[]});
-  const tg=(id,t,on)=>`<label class="sw"><input type="checkbox" id="${id}" ${on?'checked':''}><i></i><div><b>${t}</b></div></label>`;
-  return head+`<div class="card stk-hd"><div><h1 class="stk-nm">${esc(q.shortname)} <span class="mu">${esc(q.secid)}</span></h1><div class="note">${esc(q.name)} · ${esc(q.sector)} · ${esc(q.isin)}</div></div>
+  chart('c-'+p+'chart',(el,o)=>candles(el,cs,o),{h:380,lines,band:ind.bb?{up:sr.bb_up||[],low:sr.bb_low||[],c:'#7a8cff'}:null,levels:lv,labelOf:lab,fmt:stkPrice});
+  chart('c-'+p+'rsi',stkSub,{kind:'rsi',h:100,labels:cs.map(x=>lab(x.t)),rsi:sr.rsi||[]});
+  chart('c-'+p+'macd',stkSub,{kind:'macd',h:120,labels:cs.map(x=>lab(x.t)),macd:sr.macd||[],sig:sr.macd_signal||[],hist:sr.macd_hist||[]});
+  const tg=(id,t,on)=>`<label class="sw"><input type="checkbox" id="${p}${id}" ${on?'checked':''}><i></i><div><b>${t}</b></div></label>`;
+  const tfs=[['D','День'],['W','Неделя'],['H','Час']];
+  const tfSeg=drw?`<div class="seg" id="${p}tf" title="Таймфрейм свечей">${tfs.map(([k,t])=>`<button data-t="${k}" class="${st.tf===k?'on':''}">${t}</button>`).join('')}</div>`:'';
+  return`<div class="card stk-hd"><div><h1 class="stk-nm">${esc(q.shortname)} <span class="mu">${esc(q.secid)}</span></h1><div class="note">${esc(q.name)} · ${esc(q.sector)} · ${esc(q.isin)}</div></div>
       <div class="stk-px"><span class="num">${stkPrice(q.price)} ₽</span> <span class="num">${stkPc(q.chg_d)}</span></div></div>
     <div class="g g4">${kpi('За неделю',stkPc(q.chg_w,1),'5 торговых дней')}${kpi('За месяц',stkPc(q.chg_m,1),'21 торговый день')}${kpi('Капитализация',stkCap(q.cap),'лот: '+q.lot+' шт.')}${kpi('Оборот за день',stkCap(q.value_today),'Мосбиржа, TQBR')}</div>
-    <div class="card" style="margin-top:16px"><div class="row" style="margin-bottom:8px">${tg('stk-s50','SMA 50',ind.s50)}${tg('stk-s200','SMA 200',ind.s200)}${tg('stk-bb','Боллинджер',ind.bb)}${tg('stk-lv','Уровни',ind.lv)}
-        <button class="btn ghost" id="stk-r" style="margin-left:auto">Обновить</button></div>
-      <div id="c-stk" class="chart"></div><div id="c-stk-rsi" class="chart"></div><div id="c-stk-macd" class="chart"></div></div>
+    <div class="card" style="margin-top:16px"><div class="row" style="margin-bottom:8px">${tfSeg}${tg('s50','SMA 50',ind.s50)}${tg('s200','SMA 200',ind.s200)}${tg('bb','Боллинджер',ind.bb)}${tg('lv','Уровни',ind.lv)}
+        <button class="btn ghost" id="${p}r" style="margin-left:auto">Обновить</button></div>
+      <div id="c-${p}chart" class="chart"></div><div id="c-${p}rsi" class="chart"></div><div id="c-${p}macd" class="chart"></div></div>
     <div class="g g2" style="margin-top:16px">${stkTaCard(c)}${stkMulCard(c)}</div>
     <div class="g c-2-1" style="margin-top:16px">${stkDivCard(c)}${stkRepCard(c)}</div>
     <p class="note">Котировки — Московская биржа (ISS, с задержкой). Индикаторы считаются по ${esc(({D:'дневным',W:'недельным',H:'часовым'})[st.tf])} свечам. ${NIR_NOTE}</p>`;
@@ -144,7 +156,47 @@ function bindStk(){
   stkEnsureList();
   res.onclick=e=>{const b=e.target.closest('[data-stk]');if(b)openStock(b.dataset.stk)};
   document.querySelectorAll('#view [data-stk]').forEach(b=>b.onclick=()=>openStock(b.dataset.stk));
-  const tf=$('#stk-tf');if(tf)tf.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===st.tf)return;st.tf=b.dataset.t;st.card=null;render()};
-  const r=$('#stk-r');if(r)r.onclick=()=>{st.err=null;st.card=null;st.loading=false;loadStk(true);render()};
-  [['stk-s50','s50'],['stk-s200','s200'],['stk-bb','bb'],['stk-lv','lv']].forEach(([id,k])=>{const e=$('#'+id);if(e)e.onchange=()=>{st.ind[k]=e.checked;render()}});
+  bindStkCard(document,'stk-');
 }
+/* обработчики карточки: таймфрейм, «Обновить», переключатели индикаторов; перерисовывается страница или панель по префиксу */
+function bindStkCard(root,p){
+  const st=S.stk,rr=p==='stk-'?render:skRender,g=id=>root.querySelector('#'+p+id);
+  const tf=g('tf');if(tf)tf.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===st.tf)return;st.tf=b.dataset.t;st.card=null;rr()};
+  const r=g('r');if(r)r.onclick=()=>{st.err=null;st.card=null;st.loading=false;loadStk(true);rr()};
+  ['s50','s200','bb','lv'].forEach(k=>{const e=g(k);if(e)e.onchange=()=>{st.ind[k]=e.checked;rr()}});
+}
+/* ── панель «Акция» поверх текущего экрана (как карточка облигации) ── */
+const SK={charts:[]};
+function skClose(){
+  const o=document.getElementById('sk-ov');if(!o)return;
+  o.remove();document.body.classList.remove('sk-open');SK.charts=[];hideTip();
+}
+function skOpen(){
+  let o=document.getElementById('sk-ov');
+  if(!o){
+    o=document.createElement('div');o.id='sk-ov';
+    o.innerHTML='<div class="sk-dr" id="sk-dr" role="dialog" aria-modal="true" aria-label="Карточка акции"><div class="sk-bar" id="sk-bar"></div><div class="sk-body" id="sk-body"></div></div>';
+    o.addEventListener('mousedown',ev=>{if(ev.target===o)skClose()});
+    document.body.appendChild(o);document.body.classList.add('sk-open');
+  }
+  const b=document.getElementById('sk-body');if(b)b.scrollTop=0;
+  skRender();
+}
+function skRender(){
+  const o=document.getElementById('sk-ov');if(!o)return;
+  const st=S.stk,bar=o.querySelector('#sk-bar'),body=o.querySelector('#sk-body'),c=st.card,q=c&&c.secid===st.secid?c.quote:null;
+  const n0=S.charts.length,html=stkCardHtml('skd-');
+  SK.charts=S.charts.splice(n0);   /* графики панели держим отдельно: renderNow страницы обнуляет S.charts */
+  const sc=body.scrollTop;
+  bar.innerHTML=`<div class="sk-t"><b>${esc(q?q.shortname:st.secid)}</b> <span class="mu">${esc(st.secid)}</span></div><span class="sp"></span>
+    <button class="btn ghost" id="sk-page">Открыть страницей</button>${typeof dlOpen==='function'?'<button class="btn ghost" id="sk-dgap" title="Дивидендные гэпы и стратегии по этой акции">Дивидендные гэпы</button>':''}<button class="btn ghost" id="sk-x" aria-label="Закрыть">✕ Закрыть</button>`;
+  body.innerHTML=html;
+  bar.querySelector('#sk-x').onclick=skClose;
+  bar.querySelector('#sk-page').onclick=()=>{const s=st.secid;skClose();openStock(s,{page:true})};
+  const dg=bar.querySelector('#sk-dgap');if(dg)dg.onclick=()=>{const s=st.secid;skClose();dlOpen(s)};
+  bindStkCard(body,'skd-');skMount();body.scrollTop=sc;
+}
+function skMount(){SK.charts.forEach(([id,fn,o])=>{const el=document.getElementById(id);if(el)try{fn(el,o)}catch(e){console.error(e);el.innerHTML='<div class="empty">Не удалось построить график</div>'}})}
+addEventListener('resize',()=>{clearTimeout(SK._t);SK._t=setTimeout(()=>{if(document.getElementById('sk-ov'))skMount()},140)});
+/* Esc: в capture-фазе, чтобы карточка облигации (поверх панели) закрывалась первой */
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.getElementById('sk-ov')&&!document.getElementById('bc-ov')){e.preventDefault();skClose()}},true);

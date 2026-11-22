@@ -36,7 +36,7 @@ $('#period').onclick=e=>{const b=e.target.closest('[data-k]');if(!b||b.dataset.k
 $('#acl').onclick=e=>{const b=e.target.closest('[data-a]');if(!b||b.dataset.a===S.account)return;S.account=b.dataset.a;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
 $('#hideEmpty').onchange=e=>{S.hideEmpty=e.target.checked;persist();renderAccounts()};
 $('#refresh').onclick=()=>load(true);
-function go(p){S.page=p;S.opsN=200;persist();renderNav();render()}
+function go(p){if(typeof skClose==='function')skClose();S.page=p;S.opsN=200;persist();renderNav();render()}
 
 let reqId=0;
 async function load(force,periodOnly){

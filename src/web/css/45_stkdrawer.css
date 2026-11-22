@@ -1,0 +1,13 @@
+/* Панель «Акция» поверх экрана. Ниже карточки облигации (z-index 40), чтобы облигация, открытая из панели, была сверху. */
+#sk-ov{position:fixed;inset:0;z-index:39;display:flex;justify-content:flex-end;background:#0009;backdrop-filter:blur(2px);animation:skov .3s ease}
+@keyframes skov{from{opacity:0}to{opacity:1}}
+#sk-ov .sk-dr{width:min(960px,92vw);height:100%;background:var(--bg);border-left:1px solid var(--line2);display:flex;flex-direction:column;
+  box-shadow:-14px 0 40px #0006;animation:skin .38s cubic-bezier(.16,1,.3,1)}
+@keyframes skin{from{transform:translateX(100%)}to{transform:translateX(0)}}
+.sk-bar{display:flex;gap:8px;align-items:center;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--bg);flex:none}
+.sk-bar .sp{flex:1}
+.sk-bar .btn{padding:7px 12px;font-size:13px}
+.sk-t{font-size:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sk-body{flex:1;overflow:auto;padding:16px 20px 32px}
+body.sk-open{overflow:hidden}
+@media(prefers-reduced-motion:reduce){#sk-ov,#sk-ov .sk-dr{animation:none}}
