@@ -49,7 +49,7 @@ def _calc_segments(key_rate):
 
 
 def _calc_portfolio(cfg, acc):
-    if not cfg.get("token"):
+    if not (cfg.get("token") or "").strip() and not imports_list():
         return None
     pf = {"value": None, "bonds_value": None, "irr": None, "irr_tax": None, "monthly": None, "coupons_12m": None}
     s = None
@@ -225,7 +225,7 @@ def _goal_infl():
 def goal_defaults(cfg, acc):
     """Что известно о портфеле: стоимость, средневзвешенная доходность облигаций, текущий доход в месяц (купоны и дивиденды за 12 мес.)."""
     d = {"value": None, "yield": None, "income_month": None, "income_src": None, "portfolio": False}
-    if not cfg.get("token"):
+    if not (cfg.get("token") or "").strip() and not imports_list():
         return d
     key = ("goal_pf", token_key(cfg), acc)
     hit = _calc_mem.get(key)

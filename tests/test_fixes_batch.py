@@ -147,6 +147,44 @@ class Ghost(unittest.TestCase):
         self.assertAlmostEqual(by["LQDT"]["ghost_val"], 50.0)
 
 
+class GhostPreBenchWithdrawal(unittest.TestCase):
+    def test_withdrawal_before_first_price_is_kept(self):
+        hist = {"days": ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"], "value": [100.0, 0.0, 50.0, 50.0], "invested": [100.0, -50.0, 50.0, 50.0],
+                "bench": {"LQDT": [None, None, None, 1.0], "TMOS": [None] * 4}}
+        by = {x["code"]: x for x in M.pm_ghost_portfolio(hist)["items"]}
+        self.assertAlmostEqual(by["LQDT"]["ghost_val"], 50.0)       # 100 - 150 + 100, а не 100
+
+    def test_net_negative_at_first_price_clamps_to_zero(self):
+        hist = {"days": ["a", "b", "c"], "value": [100.0, 0.0, 0.0], "invested": [100.0, -50.0, -50.0],
+                "bench": {"LQDT": [None, None, 1.0], "TMOS": [None] * 3}}
+        by = {x["code"]: x for x in M.pm_ghost_portfolio(hist)["items"]}
+        self.assertAlmostEqual(by["LQDT"]["ghost_val"], 0.0)
+
+
+class FxNowCbrFallback(unittest.TestCase):
+    def test_no_token(self):
+        class NoClient:
+            ready = False
+        with patched(tax_cbr_rate=lambda c, iso: {"USD": 90.5}.get(c.upper())):
+            r = M.fx_now(NoClient(), ["rub", "usd", "eur"])
+        self.assertEqual(r, {"rub": 1.0, "usd": 90.5})
+
+
+class CalcPortfolioGuard(unittest.TestCase):
+    def test_imports_only_not_none(self):
+        class S:
+            pass
+        with patched(imports_list=lambda: [{"id": "imp:1"}], build_summary=lambda cfg, acc, f: {"portfolio": {"total": 1000.0, "bonds": 400.0}}):
+            try:
+                pf = M._calc_portfolio({"token": "", "sandbox": False}, "all")
+            except Exception:  # noqa: BLE001
+                pf = "boom"
+        self.assertIsInstance(pf, dict)
+        with patched(imports_list=lambda: []):
+            self.assertIsNone(M._calc_portfolio({"token": ""}, "all"))
+            self.assertFalse(M.goal_defaults({"token": ""}, "all")["portfolio"])
+
+
 class CrowdBad(unittest.TestCase):
     def test_markers(self):
         for s in ("доступ ограничен", "подтвердите, что вы не робот", "проверка безопасности", "are you a robot", "cf-browser-verification"):

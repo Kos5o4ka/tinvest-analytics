@@ -38,7 +38,7 @@ function dlSearchBox(){
   return`<div class="dl-top"><div class="stk-sw"><input class="in" id="dl-q" placeholder="Тикер или название: SBER, LKOH…" autocomplete="off" spellcheck="false" value="${esc(D.secid)}"><div id="dl-res" class="stk-res"></div></div>
     <label class="field dl-f"><span>Налог на дивиденды, %</span><input class="in num" id="dl-tax" value="${esc(D.tax)}" inputmode="decimal"></label>
     <label class="field dl-f"><span>Комиссия брокера, %</span><input class="in num" id="dl-fee" value="${esc(D.fee)}" inputmode="decimal"></label>
-    ${D.secid?'<button class="btn ghost" id="dl-r">Обновить</button>':''}</div>`;
+    ${D.secid?'<button class="btn ghost dl-r">Обновить</button>':''}</div>`;
 }
 /* ── вкладка «Мой портфель» ── */
 function dlPortTab(){
@@ -46,7 +46,7 @@ function dlPortTab(){
   if(D.pacc!==S.account&&!D.ploading){D.port=null;dlLoadPort(false)}
   if(!D.port&&!D.ploading&&!D.perr)dlLoadPort(false);
   if(D.ploading&&!D.port)return`<div class="card">${waitBox('Смотрю дивиденды по акциям портфеля и историю отсечек. Первый расчёт может занять до минуты…')}</div>`;
-  if(D.perr)return`<div class="msg err">${esc(D.perr)} <button class="btn ghost" id="dl-r">Повторить</button></div>`;
+  if(D.perr)return`<div class="msg err">${esc(D.perr)} <button class="btn ghost dl-r">Повторить</button></div>`;
   const d=D.port||{},rows=d.rows||[];
   const note=d.error?`<div class="msg info" style="margin-bottom:12px">${esc(d.error)}</div>`:'';
   if(!rows.length){
@@ -140,7 +140,7 @@ function dlStockTab(){
   if(!D.secid)return dlStockHome();
   if(!D.data&&!D.loading&&!D.err)dlLoadStock(false);
   if(D.loading&&!D.data)return`<div class="card">${waitBox('Загружаю свечи за 6 лет, дивиденды и отчётность…')}</div>`;
-  if(D.err)return`<div class="msg err">${esc(D.err)} <button class="btn ghost" id="dl-r">Повторить</button></div>`;
+  if(D.err)return`<div class="msg err">${esc(D.err)} <button class="btn ghost dl-r">Повторить</button></div>`;
   const d=D.data||{},st=d.stats||{count:0};
   const err=d.error?`<div class="msg info" style="margin-bottom:12px">${esc(d.error)}</div>`:'';
   const src=d.div_source==='tinvest'||d.div_source==='tinvest-server'?'T-Invest':'нет источника';
@@ -156,14 +156,14 @@ function dlStockTab(){
 }
 function pDgap(){
   const D=S.dl;
-  const tabs=`<div class="row" style="gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:16px"><div class="seg" id="dl-tabs"><button data-t="port" class="${D.tab==='port'?'on':''}">Мой портфель</button><button data-t="stock" class="${D.tab==='stock'?'on':''}">Анализ акции</button></div>${D.tab==='port'?'<button class="btn ghost" id="dl-r" style="margin-left:auto">Обновить</button>':''}</div>`;
+  const tabs=`<div class="row" style="gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:16px"><div class="seg" id="dl-tabs"><button data-t="port" class="${D.tab==='port'?'on':''}">Мой портфель</button><button data-t="stock" class="${D.tab==='stock'?'on':''}">Анализ акции</button></div>${D.tab==='port'?'<button class="btn ghost dl-r" style="margin-left:auto">Обновить</button>':''}</div>`;
   return tabs+(D.tab==='port'?dlPortTab():dlSearchBox()+dlStockTab());
 }
 function bindDgap(){
   const D=S.dl;
   const t=$('#dl-tabs');if(t)t.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===D.tab)return;D.tab=b.dataset.t;render()};
-  const r=$('#dl-r');if(r)r.onclick=()=>{
-    if(D.tab==='port'){D.port=null;D.perr='';dlLoadPort(true)}else{D.data=null;D.err='';D.loading=false;dlLoadStock(true)}render()};
+  document.querySelectorAll('#view .dl-r').forEach(r=>r.onclick=()=>{
+    if(D.tab==='port'){D.port=null;D.perr='';dlLoadPort(true)}else{D.data=null;D.err='';D.loading=false;dlLoadStock(true)}render()});
   const ts=$('#dl-to-stock');if(ts)ts.onclick=()=>{D.tab='stock';render()};
   document.querySelectorAll('#view [data-dl]').forEach(b=>b.onclick=()=>dlOpen(b.dataset.dl));
   const q=$('#dl-q'),res=$('#dl-res');

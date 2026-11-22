@@ -58,3 +58,7 @@ textarea.in{resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;fo
 .map{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 
+.scr-tbl table th:nth-child(2),.scr-tbl table td:nth-child(2){position:sticky;left:34px;background:var(--card);z-index:1;box-shadow:inset -1px 0 0 var(--line),4px 0 6px -4px #0006}
+.scr-tbl table th:nth-child(2){z-index:3}
+.scr-tbl table tr:hover td:nth-child(2){background:var(--card2)}
+.scr-tbl .wt-sth,.scr-tbl .wt-std{box-sizing:border-box;width:34px;min-width:34px;max-width:34px}

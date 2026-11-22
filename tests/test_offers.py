@@ -78,6 +78,13 @@ class OfferKinds(unittest.TestCase):
 
 
 class OfferPayloadRecords(unittest.TestCase):
+    def setUp(self):
+        self._bc = T._bc_universe
+        T._bc_universe = lambda: []
+
+    def tearDown(self):
+        T._bc_universe = self._bc
+
     def test_call_record_has_no_put_fields_and_put_has_hint(self):
         bz = {"coupons": [], "amort": [], "offers": []}
         offs = T.offer_kinds(bz, {"put": ["2027-01-26"], "call": ["2027-06-01"], "prices": {}}, None, TODAY)

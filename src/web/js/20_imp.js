@@ -64,7 +64,7 @@ async function renderImport(){
       try{const res=await post('/api/import/commit',{filename:im.filename,data:im.data,name:$('#iname').value||im.name,broker:$('#ibroker').value,target:b.dataset.tbc});
         S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
         await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
-      catch(err){document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=false);msg(esc(err.message));renderImport()}})
+      catch(err){document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=false);await renderImport();msg(esc(err.message))}})
   }
   if(im&&im.preview&&!tb){
     document.querySelectorAll('[data-role]').forEach(s=>{const v=im.mapping[s.dataset.role];s.value=v==null?'':String(v);s.onchange=()=>{im.mapping[s.dataset.role]=s.value===''?null:+s.value}});

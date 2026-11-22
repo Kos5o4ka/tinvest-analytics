@@ -110,12 +110,12 @@ def pm_ghost_portfolio(hist):
             if p and p > 0:
                 valid = True
                 if cash_wait:
-                    units += cash_wait / p
+                    units = max(0.0, units + cash_wait / p)     # минус = выводы до первой цены: продаём юниты (не ниже 0)
                     cash_wait = 0.0
                 units = max(0.0, units + flow / p)      # вывод больше стоимости бенчмарка не делает его шортом
                 gv = max(0.0, units * p)
             else:
-                cash_wait = max(0.0, cash_wait + flow)
+                cash_wait += flow
                 gv = max(0.0, cash_wait)
             curve.append(round(gv, 2))
         if not valid:

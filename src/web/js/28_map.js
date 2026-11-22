@@ -46,7 +46,7 @@ function mpScatter(el){
     showTip(`<b>${esc(r.name)}</b><div style="color:var(--mu)">${esc(r.isin||r.id)}${r.sector?' · '+esc(SECT[r.sector]||r.sector):''}</div>`+
       tipRow(c,'Рейтинг',esc(r.rating||'нет'))+tipRow(c,'Доходность',pctp(r.yield,2))+tipRow(c,'Спред к КБД',r.spread!=null?(r.spread>0?'+':'')+f2(r.spread)+' п.п.':'—')+
       tipRow(c,'Дюрация',f2(p.x)+' г')+tipRow(c,'Оборот за день',r.turn?short(r.turn)+' ₽':'—')+(mine.has(r.isin)||mine.has(r.id)?'<div style="color:var(--ac)">в вашем портфеле</div>':'')+'<div style="color:var(--mu);margin-top:5px">нажмите — карточка выпуска</div>',e)};
-  el.onmouseleave=hideTip;
+  el.onmouseleave=hideTip;el.onpointerup=tipTouchHide;
   mpCnt(rs.length,hidden);
 }
 function mpCnt(n,h){const e=$('#mp-cnt');if(e)e.textContent=`Выпусков на графике: ${n}`+(h?` · выше 40 % скрыто: ${h}`:'')}

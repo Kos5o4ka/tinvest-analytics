@@ -141,7 +141,20 @@ def dl_safety(fin):
         comps.append({"id": cid, "name": name, "weight": w, "points": pts, "value": val, "note": note, "available": pts is not None})
 
     fcf, dt = _dl_num(fin.get("fcf")), _dl_num(fin.get("div_total"))
-    if fcf is None or dt is None or dt <= 0:
+    if fin.get("bank"):
+        net = _dl_num(fin.get("net"))
+        if net is None or dt is None or dt <= 0:
+            add("fcf", "Покрытие дивидендов прибылью", 40, None, None, "нет данных" if dt is None or net is None else "нет выплат за 12 мес.")
+        elif net <= 0:
+            flags.append("дивиденды выплачиваются при убытке")
+            add("fcf", "Покрытие дивидендов прибылью", 40, 0, None, "чистая прибыль не положительна")
+        else:
+            po = dt / net
+            pts = 40 if po <= 0.5 else 28 if po <= 0.7 else 16 if po <= 0.9 else 8 if po <= 1.0 else 0
+            if pts == 0:
+                flags.append("дивиденды больше чистой прибыли")
+            add("fcf", "Покрытие дивидендов прибылью", 40, pts, round(po, 2), "дивиденды / чистая прибыль = %d %%" % round(po * 100))
+    elif fcf is None or dt is None or dt <= 0:
         add("fcf", "Покрытие дивидендов свободным денежным потоком", 40, None, None, "нет данных" if dt is None or fcf is None else "нет выплат за 12 мес.")
     else:
         cov = fcf / dt
@@ -187,7 +200,7 @@ def _dl_rub_divs(items):
 def _dl_fin_inputs(secid, q, dv, divs, cfg):
     """Входы dl_safety: МСФО (FCF, долг) + мультипликаторы (ND/EBITDA, ROE) + число лет подряд с выплатами. Любой сбой -> компонент без данных."""
     today = date.today()
-    out = {"fcf": None, "div_total": None, "nd_ebitda": None, "roe": None, "bank": (q or {}).get("sector") == "Банки и финансы", "pay_years": None}
+    out = {"fcf": None, "net": None, "div_total": None, "nd_ebitda": None, "roe": None, "bank": (q or {}).get("sector") == "Банки и финансы", "pay_years": None}
     years = {int(d["record"][:4]) for d in divs if d.get("record") and d["record"] <= today.isoformat()}
     if years:
         out["pay_years"] = dl_streak(years, today.year)
@@ -198,6 +211,7 @@ def _dl_fin_inputs(secid, q, dv, divs, cfg):
         c = (fin.get("ltm") or (fin.get("years") or [None])[-1]) if fin.get("status") == "ok" else None
         if c:
             out["fcf"] = c.get("fcf")
+            out["net"] = c.get("net")
             out["nd_ebitda"] = c.get("nd_ebitda")
             if c.get("roe") is not None:
                 out["roe"] = c["roe"] * 100

@@ -4,7 +4,7 @@ function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}document
 function thmLabel(){const e=document.getElementById('thm-t');if(e)e.textContent=document.documentElement.dataset.theme==='light'?'Тёмная тема':'Светлая тема'}
 function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
 // один клик = видимая смена: от того, что сейчас на экране (раньше цикл auto→light→dark→auto при тёмной системе давал «пустой» клик dark→auto)
-$('#thm').onclick=()=>{const n=document.documentElement.dataset.theme==='light'?'dark':'light';applyTheme(n);post('/api/config',{theme:n}).catch(()=>{});if(S.data)render()};
+$('#thm').onclick=()=>{const n=document.documentElement.dataset.theme==='light'?'dark':'light';applyTheme(n);post('/api/config',{theme:n}).catch(()=>{});render()};
 thmLabel();
 // меню «⋯» в шапке
 function moreOpen(on){const d=$('#more-dd');d.hidden=!on;$('#more').setAttribute('aria-expanded',on?'true':'false')}

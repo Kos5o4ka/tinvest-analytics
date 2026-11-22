@@ -1612,6 +1612,14 @@ def fx_now(client, curs):
     for c, u in need.items():
         if u and lp.get(u):
             out[c] = lp[u]
+    for c in curs:
+        if c not in out:                                # без токена/uid — курс ЦБ РФ
+            try:
+                r = tax_cbr_rate(c, date.today().isoformat())
+                if r:
+                    out[c] = r
+            except Exception:  # noqa: BLE001
+                pass
     return out
 
 
@@ -11340,7 +11348,7 @@ def _calc_segments(key_rate):
 
 
 def _calc_portfolio(cfg, acc):
-    if not cfg.get("token"):
+    if not (cfg.get("token") or "").strip() and not imports_list():
         return None
     pf = {"value": None, "bonds_value": None, "irr": None, "irr_tax": None, "monthly": None, "coupons_12m": None}
     s = None
@@ -11516,7 +11524,7 @@ def _goal_infl():
 def goal_defaults(cfg, acc):
     """Что известно о портфеле: стоимость, средневзвешенная доходность облигаций, текущий доход в месяц (купоны и дивиденды за 12 мес.)."""
     d = {"value": None, "yield": None, "income_month": None, "income_src": None, "portfolio": False}
-    if not cfg.get("token"):
+    if not (cfg.get("token") or "").strip() and not imports_list():
         return d
     key = ("goal_pf", token_key(cfg), acc)
     hit = _calc_mem.get(key)
@@ -22348,12 +22356,12 @@ def pm_ghost_portfolio(hist):
             if p and p > 0:
                 valid = True
                 if cash_wait:
-                    units += cash_wait / p
+                    units = max(0.0, units + cash_wait / p)     # минус = выводы до первой цены: продаём юниты (не ниже 0)
                     cash_wait = 0.0
                 units = max(0.0, units + flow / p)      # вывод больше стоимости бенчмарка не делает его шортом
                 gv = max(0.0, units * p)
             else:
-                cash_wait = max(0.0, cash_wait + flow)
+                cash_wait += flow
                 gv = max(0.0, cash_wait)
             curve.append(round(gv, 2))
         if not valid:
@@ -22535,7 +22543,20 @@ def dl_safety(fin):
         comps.append({"id": cid, "name": name, "weight": w, "points": pts, "value": val, "note": note, "available": pts is not None})
 
     fcf, dt = _dl_num(fin.get("fcf")), _dl_num(fin.get("div_total"))
-    if fcf is None or dt is None or dt <= 0:
+    if fin.get("bank"):
+        net = _dl_num(fin.get("net"))
+        if net is None or dt is None or dt <= 0:
+            add("fcf", "Покрытие дивидендов прибылью", 40, None, None, "нет данных" if dt is None or net is None else "нет выплат за 12 мес.")
+        elif net <= 0:
+            flags.append("дивиденды выплачиваются при убытке")
+            add("fcf", "Покрытие дивидендов прибылью", 40, 0, None, "чистая прибыль не положительна")
+        else:
+            po = dt / net
+            pts = 40 if po <= 0.5 else 28 if po <= 0.7 else 16 if po <= 0.9 else 8 if po <= 1.0 else 0
+            if pts == 0:
+                flags.append("дивиденды больше чистой прибыли")
+            add("fcf", "Покрытие дивидендов прибылью", 40, pts, round(po, 2), "дивиденды / чистая прибыль = %d %%" % round(po * 100))
+    elif fcf is None or dt is None or dt <= 0:
         add("fcf", "Покрытие дивидендов свободным денежным потоком", 40, None, None, "нет данных" if dt is None or fcf is None else "нет выплат за 12 мес.")
     else:
         cov = fcf / dt
@@ -22581,7 +22602,7 @@ def _dl_rub_divs(items):
 def _dl_fin_inputs(secid, q, dv, divs, cfg):
     """Входы dl_safety: МСФО (FCF, долг) + мультипликаторы (ND/EBITDA, ROE) + число лет подряд с выплатами. Любой сбой -> компонент без данных."""
     today = date.today()
-    out = {"fcf": None, "div_total": None, "nd_ebitda": None, "roe": None, "bank": (q or {}).get("sector") == "Банки и финансы", "pay_years": None}
+    out = {"fcf": None, "net": None, "div_total": None, "nd_ebitda": None, "roe": None, "bank": (q or {}).get("sector") == "Банки и финансы", "pay_years": None}
     years = {int(d["record"][:4]) for d in divs if d.get("record") and d["record"] <= today.isoformat()}
     if years:
         out["pay_years"] = dl_streak(years, today.year)
@@ -22592,6 +22613,7 @@ def _dl_fin_inputs(secid, q, dv, divs, cfg):
         c = (fin.get("ltm") or (fin.get("years") or [None])[-1]) if fin.get("status") == "ok" else None
         if c:
             out["fcf"] = c.get("fcf")
+            out["net"] = c.get("net")
             out["nd_ebitda"] = c.get("nd_ebitda")
             if c.get("roe") is not None:
                 out["roe"] = c["roe"] * 100
@@ -23559,6 +23581,10 @@ textarea.in{resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;fo
 .map{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 
+.scr-tbl table th:nth-child(2),.scr-tbl table td:nth-child(2){position:sticky;left:34px;background:var(--card);z-index:1;box-shadow:inset -1px 0 0 var(--line),4px 0 6px -4px #0006}
+.scr-tbl table th:nth-child(2){z-index:3}
+.scr-tbl table tr:hover td:nth-child(2){background:var(--card2)}
+.scr-tbl .wt-sth,.scr-tbl .wt-std{box-sizing:border-box;width:34px;min-width:34px;max-width:34px}
 /* ── светлая тема ── */
 :root[data-theme=light]{--bg:#f3f4f7;--side:#fff;--card:#fff;--card2:#f0f2f6;--line:#e4e7ed;--line2:#d2d7e0;
   --tx:#15171c;--tx2:#4a515f;--mu:#7a8292;--ac-tx:#8a6d00;--pos:#0f8f5c;--neg:#d23b3b;
@@ -24395,7 +24421,7 @@ body.side-mini .nav button{justify-content:center;padding:9px 0}
 body.side-mini .side-foot{justify-content:center;padding:8px 0 0}
 
 /* Выбор счёта в шапке .top (на десктопе скрываем дублирующий список в сайдбаре) */
-@media(min-width:901px){aside .accs{display:none}}
+@media(min-width:761px){aside .accs{display:none}}
 .acc-dd{position:relative}
 .acc-dd-btn{padding:7px 11px;gap:8px;max-width:260px}
 .acc-dd-nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px}
@@ -24678,7 +24704,11 @@ function moveTip(e){const w=tip.offsetWidth,h=tip.offsetHeight;let x=e.clientX+1
   tip.style.left=Math.max(8,x)+'px';tip.style.top=Math.max(8,y)+'px'}
 function hideTip(){tip.style.opacity=0}
 const tipRow=(c,n,v)=>`<div><i style="background:${c}"></i>${esc(n)}<span>${v}</span></div>`;
+document.addEventListener('touchstart',e=>{if(!e.target.closest('[data-i],circle[data-k]'))hideTip()},{passive:true});
+window.addEventListener('scroll',()=>hideTip(),true);
+let _tipT;function tipTouchHide(e){if(e.pointerType==='touch'){clearTimeout(_tipT);_tipT=setTimeout(hideTip,2500)}}
 function bindTip(el,fn){
+  el.onpointerup=tipTouchHide;
   el.onmousemove=e=>{const t=e.target.closest('[data-i]');if(!t||!el.contains(t)){hideTip();el._hl&&el._hl(-1);return}
     const i=+t.dataset.i;showTip(fn(i),e);el._hl&&el._hl(i)};
   el.onmouseleave=()=>{hideTip();el._hl&&el._hl(-1)};
@@ -25201,7 +25231,7 @@ function pPos(){
   const cols=[['name','Инструмент','l'],['type','Тип','l'],['qty','Кол-во'],['avg','Средняя'],['price','Текущая'],['value_rub','Стоимость, ₽'],['share','Доля'],['pnl_rub','P&L, ₽'],['pnl_pct','P&L %']];
   const th=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   const mxs=Math.max(1,...ps.map(x=>x.share||0));
-  const rows=ps.map(x=>`<tr${x.type==='bond'&&(x.isin||x.ticker)?` data-isin="${esc(x.isin||x.ticker)}" title="Открыть карточку выпуска"`:''}><td>${ident(x)}</td>
+  const rows=ps.map(x=>`<tr${x.type==='bond'&&(x.isin||x.ticker)?` data-isin="${esc(x.isin||x.ticker)}" title="Открыть карточку выпуска"`:x.type==='share'&&x.ticker?` data-stk="${esc(x.ticker)}" style="cursor:pointer"`:''}><td>${ident(x)}</td>
     <td class="l"><span class="tag">${TYPES[x.type]||esc(x.type)}</span>${x.blocked?' <span class="tag" style="color:var(--neg)">блок</span>':''}</td>
     <td class="num">${NFQ.format(x.qty)}</td><td class="num">${x.avg&&x.type!=='currency'?M(x.avg,x.cur):'—'}</td><td class="num">${M(x.price,x.cur)}</td>
     <td class="num">${x.value_rub!=null?M(x.value_rub):M(x.value,x.cur)}</td>
@@ -25716,7 +25746,7 @@ function pScr0(){
     <label class="sw"><input type="checkbox" id="f-toff" ${f.toOffer?'checked':''}><i></i><div><b>Считать до оферты</b><small>срок — до ближайшей оферты или погашения</small></div></label>
     <label class="sw"><input type="checkbox" id="f-noffer" ${f.noOffer?'checked':''}><i></i><div><b>Без оферт</b></div></label></div>
     ${flN}
-    <div class="tbl" style="max-height:calc(100vh - 280px)"><table><thead><tr id="scr-head"></tr></thead><tbody id="scr-body"></tbody></table></div>
+    <div class="tbl scr-tbl" style="max-height:calc(100vh - 280px)"><table><thead><tr id="scr-head"></tr></thead><tbody id="scr-body"></tbody></table></div>
     <div class="row" style="margin-top:12px"><button class="btn ghost" id="scr-more">Показать ещё</button></div></div>
   <p class="note">Данные — Московская биржа (ISS, режимы торгов Т+ для корпоративных облигаций и ОФЗ; с задержкой, как в бесплатном доступе). Доходность — по цене последних торгов, спред — к кривой КБД при той же дюрации. Рейтинг найден у ${rated} из ${d.rows.length} выпусков: эмитенты без рейтинга в базе не обязательно ненадёжны. По умолчанию скрыты выпуски с доходностью выше 60% (обычно это дефолтные или почти не торгуемые бумаги) — поле «Доходность до» можно очистить. </p>${NIR_NOTE}`;
 }
@@ -26195,7 +26225,7 @@ async function renderImport(){
       try{const res=await post('/api/import/commit',{filename:im.filename,data:im.data,name:$('#iname').value||im.name,broker:$('#ibroker').value,target:b.dataset.tbc});
         S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
         await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
-      catch(err){document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=false);msg(esc(err.message));renderImport()}})
+      catch(err){document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=false);await renderImport();msg(esc(err.message))}})
   }
   if(im&&im.preview&&!tb){
     document.querySelectorAll('[data-role]').forEach(s=>{const v=im.mapping[s.dataset.role];s.value=v==null?'':String(v);s.onchange=()=>{im.mapping[s.dataset.role]=s.value===''?null:+s.value}});
@@ -26413,7 +26443,7 @@ function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}document
 function thmLabel(){const e=document.getElementById('thm-t');if(e)e.textContent=document.documentElement.dataset.theme==='light'?'Тёмная тема':'Светлая тема'}
 function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
 // один клик = видимая смена: от того, что сейчас на экране (раньше цикл auto→light→dark→auto при тёмной системе давал «пустой» клик dark→auto)
-$('#thm').onclick=()=>{const n=document.documentElement.dataset.theme==='light'?'dark':'light';applyTheme(n);post('/api/config',{theme:n}).catch(()=>{});if(S.data)render()};
+$('#thm').onclick=()=>{const n=document.documentElement.dataset.theme==='light'?'dark':'light';applyTheme(n);post('/api/config',{theme:n}).catch(()=>{});render()};
 thmLabel();
 // меню «⋯» в шапке
 function moreOpen(on){const d=$('#more-dd');d.hidden=!on;$('#more').setAttribute('aria-expanded',on?'true':'false')}
@@ -27294,7 +27324,7 @@ function mpScatter(el){
     showTip(`<b>${esc(r.name)}</b><div style="color:var(--mu)">${esc(r.isin||r.id)}${r.sector?' · '+esc(SECT[r.sector]||r.sector):''}</div>`+
       tipRow(c,'Рейтинг',esc(r.rating||'нет'))+tipRow(c,'Доходность',pctp(r.yield,2))+tipRow(c,'Спред к КБД',r.spread!=null?(r.spread>0?'+':'')+f2(r.spread)+' п.п.':'—')+
       tipRow(c,'Дюрация',f2(p.x)+' г')+tipRow(c,'Оборот за день',r.turn?short(r.turn)+' ₽':'—')+(mine.has(r.isin)||mine.has(r.id)?'<div style="color:var(--ac)">в вашем портфеле</div>':'')+'<div style="color:var(--mu);margin-top:5px">нажмите — карточка выпуска</div>',e)};
-  el.onmouseleave=hideTip;
+  el.onmouseleave=hideTip;el.onpointerup=tipTouchHide;
   mpCnt(rs.length,hidden);
 }
 function mpCnt(n,h){const e=$('#mp-cnt');if(e)e.textContent=`Выпусков на графике: ${n}`+(h?` · выше 40 % скрыто: ${h}`:'')}
@@ -29839,8 +29869,8 @@ PAGES.push(['stk','Акция'],['sst','Скринер акций']);
 NAV_GROUPS.splice(Math.max(0,NAV_GROUPS.findIndex(g=>g[0]==='Рынок')+1),0,['Акции',['stk','sst']]);
 PRO_PAGES.push('sst');
 document.addEventListener('click',e=>{
-  const t=e.target.closest&&e.target.closest('.it[data-stk]');   /* строки дашборда; кнопки и таблицы акций вешают свои обработчики */
-  if(t&&t.dataset.stk&&!e.target.closest('a,input,select'))openStock(t.dataset.stk);
+  const t=e.target.closest&&e.target.closest('.it[data-stk],tr[data-stk]');   /* строки дашборда; кнопки и таблицы акций вешают свои обработчики */
+  if(t&&t.dataset.stk&&!e.target.closest('a,input,select,button,textarea'))openStock(t.dataset.stk);
 });
 PRO_FEATURES.sst={t:'Скринер акций',ic:'sst',b:['Акции Мосбиржи с P/E, P/B, EV/EBITDA, дивидендной доходностью и ростом','Готовые подборки: дешёвые по P/E, высокие дивиденды, быстрый рост','Фильтры по сектору, капитализации и показателям','Переход в карточку акции в один клик'],pv:'table'};
 
@@ -30128,7 +30158,7 @@ function drawHm(el){
       tipRow(c,'Цена',it.price!=null?(f2(it.price)+(bd?' %':' ₽')):'—')+tipRow(c,d.period==='d'?'За день':d.period==='w'?'За неделю':'За месяц',hmFmt(it.chg))+
       (bd&&it.yield!=null?tipRow(c,'Доходность',pctp(it.yield,2)):'')+tipRow(c,'Оборот за день',it.value?short(it.value)+' ₽':'—')+(it.cap?tipRow(c,'Капитализация',short(it.cap)+' ₽'):'')+
       '<div style="color:var(--mu);margin-top:5px">нажмите — карточка</div>',e)};
-  el.onmouseleave=hideTip;
+  el.onmouseleave=hideTip;el.onpointerup=tipTouchHide;
   el.onclick=e=>{const t=e.target.closest('[data-i]');
     if(!t){const gg=e.target.closest('[data-g]');if(gg&&!sg){hideTip();f.sel=gg.dataset.g;render()}return}const it=tiles[+t.dataset.i];if(!it)return;
     if(d.kind==='bonds'){if(typeof openBond==='function')openBond(it.id)}else if(typeof openStock==='function')openStock(it.id)};
@@ -31577,8 +31607,9 @@ function uxTourShow(i){
   if(i>=UX_TOUR_STEPS.length){uxTourStop();return}
   _uxTourI=i;
   const st=UX_TOUR_STEPS[i];
-  const tgt=document.querySelector(st.sel);
-  if(tgt)tgt.classList.add('ux-hl');
+  const tgt=[...document.querySelectorAll(st.sel)].find(e=>e.offsetParent&&getComputedStyle(e).visibility!=='hidden'&&e.getBoundingClientRect().width>0);
+  if(!tgt){uxTourShow(i+1);return}
+  tgt.classList.add('ux-hl');
   let box=$('#ux-tour');
   if(!box){box=document.createElement('div');box.id='ux-tour';box.className='ux-tour';document.body.appendChild(box)}
   box.innerHTML=`<div class="ux-tour-hd"><b>${esc(st.title)}</b><span class="mu">${i+1} / ${UX_TOUR_STEPS.length}</span></div>
@@ -31815,7 +31846,7 @@ function dlSearchBox(){
   return`<div class="dl-top"><div class="stk-sw"><input class="in" id="dl-q" placeholder="Тикер или название: SBER, LKOH…" autocomplete="off" spellcheck="false" value="${esc(D.secid)}"><div id="dl-res" class="stk-res"></div></div>
     <label class="field dl-f"><span>Налог на дивиденды, %</span><input class="in num" id="dl-tax" value="${esc(D.tax)}" inputmode="decimal"></label>
     <label class="field dl-f"><span>Комиссия брокера, %</span><input class="in num" id="dl-fee" value="${esc(D.fee)}" inputmode="decimal"></label>
-    ${D.secid?'<button class="btn ghost" id="dl-r">Обновить</button>':''}</div>`;
+    ${D.secid?'<button class="btn ghost dl-r">Обновить</button>':''}</div>`;
 }
 /* ── вкладка «Мой портфель» ── */
 function dlPortTab(){
@@ -31823,7 +31854,7 @@ function dlPortTab(){
   if(D.pacc!==S.account&&!D.ploading){D.port=null;dlLoadPort(false)}
   if(!D.port&&!D.ploading&&!D.perr)dlLoadPort(false);
   if(D.ploading&&!D.port)return`<div class="card">${waitBox('Смотрю дивиденды по акциям портфеля и историю отсечек. Первый расчёт может занять до минуты…')}</div>`;
-  if(D.perr)return`<div class="msg err">${esc(D.perr)} <button class="btn ghost" id="dl-r">Повторить</button></div>`;
+  if(D.perr)return`<div class="msg err">${esc(D.perr)} <button class="btn ghost dl-r">Повторить</button></div>`;
   const d=D.port||{},rows=d.rows||[];
   const note=d.error?`<div class="msg info" style="margin-bottom:12px">${esc(d.error)}</div>`:'';
   if(!rows.length){
@@ -31917,7 +31948,7 @@ function dlStockTab(){
   if(!D.secid)return dlStockHome();
   if(!D.data&&!D.loading&&!D.err)dlLoadStock(false);
   if(D.loading&&!D.data)return`<div class="card">${waitBox('Загружаю свечи за 6 лет, дивиденды и отчётность…')}</div>`;
-  if(D.err)return`<div class="msg err">${esc(D.err)} <button class="btn ghost" id="dl-r">Повторить</button></div>`;
+  if(D.err)return`<div class="msg err">${esc(D.err)} <button class="btn ghost dl-r">Повторить</button></div>`;
   const d=D.data||{},st=d.stats||{count:0};
   const err=d.error?`<div class="msg info" style="margin-bottom:12px">${esc(d.error)}</div>`:'';
   const src=d.div_source==='tinvest'||d.div_source==='tinvest-server'?'T-Invest':'нет источника';
@@ -31933,14 +31964,14 @@ function dlStockTab(){
 }
 function pDgap(){
   const D=S.dl;
-  const tabs=`<div class="row" style="gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:16px"><div class="seg" id="dl-tabs"><button data-t="port" class="${D.tab==='port'?'on':''}">Мой портфель</button><button data-t="stock" class="${D.tab==='stock'?'on':''}">Анализ акции</button></div>${D.tab==='port'?'<button class="btn ghost" id="dl-r" style="margin-left:auto">Обновить</button>':''}</div>`;
+  const tabs=`<div class="row" style="gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:16px"><div class="seg" id="dl-tabs"><button data-t="port" class="${D.tab==='port'?'on':''}">Мой портфель</button><button data-t="stock" class="${D.tab==='stock'?'on':''}">Анализ акции</button></div>${D.tab==='port'?'<button class="btn ghost dl-r" style="margin-left:auto">Обновить</button>':''}</div>`;
   return tabs+(D.tab==='port'?dlPortTab():dlSearchBox()+dlStockTab());
 }
 function bindDgap(){
   const D=S.dl;
   const t=$('#dl-tabs');if(t)t.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===D.tab)return;D.tab=b.dataset.t;render()};
-  const r=$('#dl-r');if(r)r.onclick=()=>{
-    if(D.tab==='port'){D.port=null;D.perr='';dlLoadPort(true)}else{D.data=null;D.err='';D.loading=false;dlLoadStock(true)}render()};
+  document.querySelectorAll('#view .dl-r').forEach(r=>r.onclick=()=>{
+    if(D.tab==='port'){D.port=null;D.perr='';dlLoadPort(true)}else{D.data=null;D.err='';D.loading=false;dlLoadStock(true)}render()});
   const ts=$('#dl-to-stock');if(ts)ts.onclick=()=>{D.tab='stock';render()};
   document.querySelectorAll('#view [data-dl]').forEach(b=>b.onclick=()=>dlOpen(b.dataset.dl));
   const q=$('#dl-q'),res=$('#dl-res');

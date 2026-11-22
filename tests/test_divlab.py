@@ -201,11 +201,24 @@ class Safety(unittest.TestCase):
         self.assertIsNotNone(s["note"])
 
     def test_bank_excludes_net_debt(self):
-        s = T.dl_safety({"bank": True, "fcf": 130.0, "div_total": 100.0, "nd_ebitda": 9.0, "pay_years": 5, "roe": 22.0})
+        s = T.dl_safety({"bank": True, "net": 300.0, "div_total": 100.0, "nd_ebitda": 9.0, "pay_years": 5, "roe": 22.0})
         nd = s["components"][1]
         self.assertFalse(nd["available"])
         self.assertEqual(s["available_weight"], 70)
         self.assertEqual(s["score"], 100)
+
+    def test_bank_payout_component(self):
+        base = {"bank": True, "div_total": 100.0, "pay_years": 5, "roe": 22.0}
+        for net, pts in ((300.0, 40), (160.0, 28), (120.0, 16), (100.0, 8), (80.0, 0), (-5.0, 0)):
+            s = T.dl_safety(dict(base, net=net))
+            c = s["components"][0]
+            self.assertEqual((c["name"], c["points"]), ("Покрытие дивидендов прибылью", pts))
+            self.assertIsNotNone(s["score"])
+        self.assertIsNone(T.dl_safety(dict(base))["score"])        # нет net -> по-прежнему мало данных
+
+    def test_nonbank_unchanged(self):
+        s = T.dl_safety({"fcf": 130.0, "net": 1.0, "div_total": 100.0, "nd_ebitda": 1.0, "pay_years": 5, "roe": 22.0})
+        self.assertEqual((s["components"][0]["name"], s["score"]), ("Покрытие дивидендов свободным денежным потоком", 100))
 
     def test_zones(self):
         self.assertEqual(T.dl_zone(80)[1], "надёжно")

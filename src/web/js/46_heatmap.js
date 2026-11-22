@@ -73,7 +73,7 @@ function drawHm(el){
       tipRow(c,'Цена',it.price!=null?(f2(it.price)+(bd?' %':' ₽')):'—')+tipRow(c,d.period==='d'?'За день':d.period==='w'?'За неделю':'За месяц',hmFmt(it.chg))+
       (bd&&it.yield!=null?tipRow(c,'Доходность',pctp(it.yield,2)):'')+tipRow(c,'Оборот за день',it.value?short(it.value)+' ₽':'—')+(it.cap?tipRow(c,'Капитализация',short(it.cap)+' ₽'):'')+
       '<div style="color:var(--mu);margin-top:5px">нажмите — карточка</div>',e)};
-  el.onmouseleave=hideTip;
+  el.onmouseleave=hideTip;el.onpointerup=tipTouchHide;
   el.onclick=e=>{const t=e.target.closest('[data-i]');
     if(!t){const gg=e.target.closest('[data-g]');if(gg&&!sg){hideTip();f.sel=gg.dataset.g;render()}return}const it=tiles[+t.dataset.i];if(!it)return;
     if(d.kind==='bonds'){if(typeof openBond==='function')openBond(it.id)}else if(typeof openStock==='function')openStock(it.id)};

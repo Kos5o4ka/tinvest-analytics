@@ -46,6 +46,14 @@ def fx_now(client, curs):
     for c, u in need.items():
         if u and lp.get(u):
             out[c] = lp[u]
+    for c in curs:
+        if c not in out:                                # без токена/uid — курс ЦБ РФ
+            try:
+                r = tax_cbr_rate(c, date.today().isoformat())
+                if r:
+                    out[c] = r
+            except Exception:  # noqa: BLE001
+                pass
     return out
 
 

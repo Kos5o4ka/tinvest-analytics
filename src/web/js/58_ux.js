@@ -219,8 +219,9 @@ function uxTourShow(i){
   if(i>=UX_TOUR_STEPS.length){uxTourStop();return}
   _uxTourI=i;
   const st=UX_TOUR_STEPS[i];
-  const tgt=document.querySelector(st.sel);
-  if(tgt)tgt.classList.add('ux-hl');
+  const tgt=[...document.querySelectorAll(st.sel)].find(e=>e.offsetParent&&getComputedStyle(e).visibility!=='hidden'&&e.getBoundingClientRect().width>0);
+  if(!tgt){uxTourShow(i+1);return}
+  tgt.classList.add('ux-hl');
   let box=$('#ux-tour');
   if(!box){box=document.createElement('div');box.id='ux-tour';box.className='ux-tour';document.body.appendChild(box)}
   box.innerHTML=`<div class="ux-tour-hd"><b>${esc(st.title)}</b><span class="mu">${i+1} / ${UX_TOUR_STEPS.length}</span></div>

@@ -17,7 +17,7 @@ body.side-mini .nav button{justify-content:center;padding:9px 0}
 body.side-mini .side-foot{justify-content:center;padding:8px 0 0}
 
 /* Выбор счёта в шапке .top (на десктопе скрываем дублирующий список в сайдбаре) */
-@media(min-width:901px){aside .accs{display:none}}
+@media(min-width:761px){aside .accs{display:none}}
 .acc-dd{position:relative}
 .acc-dd-btn{padding:7px 11px;gap:8px;max-width:260px}
 .acc-dd-nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px}
