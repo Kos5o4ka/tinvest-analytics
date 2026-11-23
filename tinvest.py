@@ -217,11 +217,11 @@ class Console:
 # Оформление как у самой программы (src/web/css/01_*.css). Только классические tk-виджеты и Canvas:
 # ttk на macOS игнорирует цвета, а tk.Button — фон.
 
-BG, SIDE, CARD, CARD2 = "#0b0c0f", "#0f1115", "#16181d", "#1c1f26"
-LINE, LINE2 = "#252932", "#2f3440"
-TX, TX2, MU = "#eef0f4", "#a8aebb", "#6f7686"
-AC, AC2, POS, NEG = "#ffdd2d", "#ffe866", "#3ecf8e", "#ff6b6b"
-INK = "#121212"                                                  # текст на жёлтой кнопке
+BG, SIDE, CARD, CARD2 = "#06080e", "#0a0d15", "#0f1420", "#161e30"
+LINE, LINE2 = "#1a2236", "#26314b"
+TX, TX2, MU = "#f8fafc", "#94a3b8", "#64748b"
+AC, AC2, POS, NEG = "#3b82f6", "#60a5fa", "#3ecf8e", "#ff6b6b"
+INK = "#ffffff"                                                  # текст на синей кнопке
 FONTS = ("Inter", "SF Pro Text", ".AppleSystemUIFont", "Segoe UI", "Helvetica Neue", "Arial")
 STEPS = ("Проверка", "Загрузка", "Проверка подписи", "Запуск")
 
@@ -281,8 +281,21 @@ class Btn:
         self.c.configure(cursor="")
 
 
+def draw_logo(c, x, y, size):
+    """Знак приложения (как в интерфейсе и иконке): синяя «Т» со стрелкой роста на тёмной подложке."""
+    k = size / 32.0
+    rrect(c, x, y, x + size, y + size, 9 * k, fill=CARD, outline=LINE2, width=1)
+    rrect(c, x + 7 * k, y + 7 * k, x + 25 * k, y + 11.5 * k, 2 * k, fill=AC2, outline=AC2)    # перекладина
+    rrect(c, x + 13.5 * k, y + 9 * k, x + 18.5 * k, y + 25 * k, 2 * k, fill=AC, outline=AC)   # ножка
+    c.create_line(x + 18.5 * k, y + 16 * k, x + 24.5 * k, y + 10 * k, width=max(2, 2.2 * k),
+                  fill="#7dd3fc", capstyle="round")
+    c.create_line(x + 20.5 * k, y + 10 * k, x + 24.5 * k, y + 10 * k, x + 24.5 * k, y + 14 * k,
+                  width=max(2, 2.2 * k), fill="#7dd3fc", capstyle="round", joinstyle="round")
+
+
 class Window:
     W, H = 520, 300
+    draw_logo = staticmethod(draw_logo)
 
     def __init__(self, tk):
         from tkinter import font as tkfont
@@ -312,8 +325,7 @@ class Window:
         self.c = c = tk.Canvas(r, width=w, height=h, bg=BG, highlightthickness=0, bd=0)
         c.pack()
         rrect(c, u(16), u(16), w - u(16), h - u(16), u(16), fill=CARD, outline=LINE, width=1)
-        rrect(c, u(40), u(36), u(76), u(72), u(10), fill=AC, outline=AC)             # метка приложения
-        c.create_text(u(58), u(55), text="T", font=self.f_logo, fill=INK)
+        self.draw_logo(c, u(40), u(36), u(36))
         c.create_text(u(90), u(38), text=TITLE, font=self.f_title, fill=TX, anchor="nw")
         self.ver_t = c.create_text(u(90), u(60), text="", font=self.f_ver, fill=MU, anchor="nw")
         self.set_version()
@@ -766,6 +778,12 @@ def webbrowser_open(url):
 
 
 def main():
+    if sys.platform == "win32":                                  # своя иконка в панели задач, а не python.exe
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TAnalytic.App")
+        except Exception:
+            pass
     argv = sys.argv[1:]
     no_update = "--no-update" in argv
     no_gui = "--no-gui" in argv or os.environ.get("TINVEST_NO_GUI") == "1"

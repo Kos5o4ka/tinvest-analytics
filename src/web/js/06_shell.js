@@ -36,7 +36,7 @@ $('#period').onclick=e=>{const b=e.target.closest('[data-k]');if(!b||b.dataset.k
 $('#acl').onclick=e=>{const b=e.target.closest('[data-a]');if(!b||b.dataset.a===S.account)return;S.account=b.dataset.a;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
 $('#hideEmpty').onchange=e=>{S.hideEmpty=e.target.checked;persist();renderAccounts()};
 $('#refresh').onclick=()=>load(true);
-function go(p){if(typeof skClose==='function')skClose();S.page=p;S.opsN=200;persist();renderNav();render()}
+function go(p){if(typeof skClose==='function')skClose();const prev=S.page;if(typeof dlScrSave==='function')dlScrSave(prev);S.page=p;S.opsN=200;persist();renderNav();render();if(prev!==p&&typeof dlScrRestore==='function')dlScrRestore(p)}
 
 let reqId=0;
 async function load(force,periodOnly){
@@ -49,6 +49,7 @@ async function load(force,periodOnly){
     if(my!==reqId)return;
     S.data=d;S.accounts=d.accounts;if(S.account!==d.account){S.account=d.account}persist();
     $('#upd').textContent='обновлено в '+d.updated;
+    {const rf=$('#refresh');if(rf)rf.title='Обновить данные · обновлено в '+d.updated}
     renderAccounts();renderNav();
     if(!periodOnly||force||!S.bonds||!S.hist)loadExtra(force);
   }catch(e){if(my!==reqId)return;S.err=e.message}

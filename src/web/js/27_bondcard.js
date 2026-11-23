@@ -13,9 +13,19 @@ document.addEventListener('click',e=>{
 });
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.getElementById('bc-ov'))closeBond()});
 
+/* Плавное закрытие выезжающей панели: id снимаем сразу (для кода панель уже закрыта), узел удаляем после анимации. */
+function ovLeave(o){
+  if(!o)return;
+  if(matchMedia('(prefers-reduced-motion: reduce)').matches){o.remove();return}
+  const dr=o.firstElementChild;
+  if(dr){const cs=getComputedStyle(dr);dr.style.cssText+=`;width:${dr.offsetWidth}px;height:100%;flex:none;background:${cs.backgroundColor};overflow:hidden;border-left:${cs.borderLeft};box-shadow:${cs.boxShadow}`;dr.removeAttribute('id')}
+  o.style.cssText+=';position:fixed;inset:0;z-index:41;display:flex;justify-content:flex-end;background:#03050a99';
+  o.removeAttribute('id');
+  o.classList.add('ov-leave');o.style.pointerEvents='none';setTimeout(()=>o.remove(),240);
+}
 function closeBond(){
   BC.stack=[];BC.tok++;
-  const o=document.getElementById('bc-ov');if(o)o.remove();
+  ovLeave(document.getElementById('bc-ov'));
   document.body.classList.remove('bc-open');
 }
 function bcMount(){
@@ -227,7 +237,7 @@ function bcIssuerCurve(el,ic){
   const fl=P.filter(p=>!p.floating);
   if(fl.length>1)g+=`<polyline class="ic-ln" points="${fl.map(p=>X(p.dur).toFixed(1)+','+Y(p.yield).toFixed(1)).join(' ')}"/>`;
   P.slice().sort((a,b)=>a.me-b.me).forEach(p=>{
-    g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'#3987e5'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
+    g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'var(--s1)'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
   el.innerHTML=`<svg width="${W}" height="${H}">${g}</svg>`;
 }
 function bcIssIfrs(j){
@@ -276,8 +286,8 @@ function bcCharts(dr,c){
   const labels=hs.d.map(ddm),p=document.getElementById('bc-ch-p'),y=document.getElementById('bc-ch-y');
   {
     try{
-      if(p)line(p,{h:190,labels,zero:false,fa:v=>bcN(v,1),ft:v=>bcN(v,2)+' %',series:[{n:'Цена',c:'#3987e5',v:hs.p,w:2}]});
-      if(y)line(y,{h:190,labels,zero:false,fa:v=>bcN(v,1),ft:v=>bcN(v,2)+' %',series:[{n:'Доходность',c:'#c98500',v:hs.y,w:2}]});
+      if(p)line(p,{h:190,labels,zero:false,fa:v=>bcN(v,1),ft:v=>bcN(v,2)+' %',series:[{n:'Цена',c:'var(--s1)',v:hs.p,w:2}]});
+      if(y)line(y,{h:190,labels,zero:false,fa:v=>bcN(v,1),ft:v=>bcN(v,2)+' %',series:[{n:'Доходность',c:'var(--s4)',v:hs.y,w:2}]});
     }catch(e){}
   }
 }

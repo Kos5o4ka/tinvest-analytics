@@ -313,7 +313,8 @@ def rows_to_ops(rows, mapping, header=None):
         o = {"id": "imp-" + uuid.uuid4().hex[:12], "date": dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "type": "OPERATION_TYPE_" + kind,
              "payment": to_money(round(amount, 9), cur), "name": name or ticker or isin, "_ident": ident}
         if qty:
-            o["quantity"] = o["quantityDone"] = str(int(abs(qty)))
+            q = abs(qty)
+            o["quantity"] = o["quantityDone"] = str(int(q)) if q == int(q) else repr(round(q, 9))
         if price is not None:
             o["price"] = to_money(abs(price), cur)
         ops.append(o)

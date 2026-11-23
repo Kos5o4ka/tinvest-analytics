@@ -13,8 +13,8 @@ const rkRub=(v,d=0)=>bad(v)?'—':INCOG.on?MASK+' ₽':(v>0?'+':v<0?'−':'')+NF
 const rkPct=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' %';
 function rkScnChart(el){
   const d=S.risk;if(!d||!d.scenarios)return;
-  bars(el,{h:260,stack:true,labels:d.scenarios.map(s=>s.name),series:[{n:'Купоны (получено за год)',c:'#3987e5',v:d.scenarios.map(s=>d.scn_total[s.key].coupons)},
-    {n:'Изменение цены (переоценка, подтягивание к номиналу)',c:'#19a070',v:d.scenarios.map(s=>d.scn_total[s.key].price)}],total:true,fa:short,ft:v=>rkRub(v),empty:'Нет данных'});
+  bars(el,{h:260,stack:true,labels:d.scenarios.map(s=>s.name),series:[{n:'Купоны (получено за год)',c:'var(--s1)',v:d.scenarios.map(s=>d.scn_total[s.key].coupons)},
+    {n:'Изменение цены (переоценка, подтягивание к номиналу)',c:'var(--s3)',v:d.scenarios.map(s=>d.scn_total[s.key].price)}],total:true,fa:short,ft:v=>rkRub(v),empty:'Нет данных'});
 }
 function rkFloatText(d){
   const f=d.floaters.floating,x=d.floaters.fixed;

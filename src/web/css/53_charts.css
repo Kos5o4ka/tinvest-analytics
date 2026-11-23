@@ -1,0 +1,68 @@
+/* ── Графики: единая палитра, волосяная сетка, скруглённые столбики, подсветка при наведении, анимация появления ──
+   Загружается после 52_premium.css. Палитра серий --s1..--s8: синий, голубой, бирюзовый, янтарный, розовый, оливковый, фиолетовый, коралловый
+   (порядок диаграмм задаёт PAL в 01_core.js: синий → бирюзовый → янтарный → фиолетовый → розовый → голубой → оливковый → коралловый). */
+:root{
+  --s1:#4f8ef7;--s2:#4cc3ec;--s3:#2bbf9a;--s4:#e3a540;--s5:#ec6f91;--s6:#a7c35a;--s7:#9b87f5;--s8:#f08a5d;
+  --zero-line:#ffffff2e;
+}
+:root[data-theme=light]{
+  --s1:#3b78e6;--s2:#1fa3d4;--s3:#12a383;--s4:#d08c1c;--s5:#d94f78;--s6:#86a63a;--s7:#7f6ae0;--s8:#e2703a;
+  --zero-line:#0f172a3d;
+}
+
+/* сетка и оси */
+:root .grid-l{stroke:var(--line);stroke-width:1;stroke-dasharray:2 4;shape-rendering:crispEdges}
+:root .grid-l.z{stroke:var(--zero-line);stroke-dasharray:none}
+.ax{fill:var(--mu);font-size:11px;font-variant-numeric:tabular-nums}
+.chart svg{display:block;overflow:visible}
+
+/* столбики: плавное приглушение остальных, рост от базовой линии при первом показе */
+.bg,.bm{transition:opacity .15s}
+.bm{shape-rendering:geometricPrecision}
+@keyframes chBarGrow{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+@keyframes chFade{from{opacity:0}to{opacity:1}}
+@keyframes chDraw{to{stroke-dashoffset:0}}
+@keyframes chArc{from{opacity:0;transform:scale(.92)}to{opacity:1;transform:scale(1)}}
+svg.anim .bg{animation:chBarGrow .45s cubic-bezier(.16,1,.3,1) both}
+svg.anim .ln{stroke-dasharray:1;stroke-dashoffset:1;animation:chDraw 1s cubic-bezier(.16,1,.3,1) .05s forwards}
+svg.anim .ls,svg.anim .la{animation:chFade .8s ease .1s both}
+svg.anim .ld{animation:chFade .35s ease .8s both}
+svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
+@media (prefers-reduced-motion:reduce){svg.anim .bg,svg.anim .ln,svg.anim .ls,svg.anim .la,svg.anim .ld,svg.anim .arc{animation:none!important;stroke-dasharray:none;stroke-dashoffset:0}.bg,.bm,.arc{transition:none}}
+@media print{svg.anim .bg,svg.anim .ln,svg.anim .ls,svg.anim .la,svg.anim .ld,svg.anim .arc{animation:none!important}svg.anim .ln{stroke-dasharray:none;stroke-dashoffset:0}}
+
+/* пончик */
+.arc{transition:opacity .15s,transform .18s cubic-bezier(.2,.7,.3,1)}
+.dn-v{fill:var(--tx);font-weight:600;letter-spacing:-.03em}
+.dn-c{fill:var(--lbl);font-size:11px;font-weight:600;letter-spacing:.07em;text-transform:uppercase}
+.donut-wrap{gap:26px}
+.dl{gap:10px}
+.dl div{grid-template-columns:8px 1fr auto auto;gap:10px;font-size:12.5px;transition:opacity .15s}
+.dl div span{color:var(--tx2)}
+.dl i{width:8px;height:8px;border-radius:50%}
+.dl em{color:var(--mu);font-size:12px}
+
+/* легенды */
+.legend{gap:8px 18px;font-size:12px;color:var(--tx2);margin-bottom:14px}
+.legend span{gap:7px}
+.legend i{width:8px;height:8px;border-radius:50%;flex:none}
+.legend i.iss-hatch{border-radius:2px}
+.lg2{font-size:12px;color:var(--tx2);gap:8px 18px}
+.lg2 span{gap:7px}.lg2 i{width:8px;height:8px;border-radius:50%}
+
+/* горизонтальные полосы */
+.hb .tr{height:8px;background:var(--line);border-radius:4px}
+.hb .tr b{position:relative;border-radius:4px}
+.hb .tr b::after{content:"";position:absolute;inset:0;border-radius:inherit;background:linear-gradient(90deg,#ffffff00,#ffffff2b)}
+:root[data-theme=light] .hb .tr b::after{background:linear-gradient(90deg,#ffffff00,#ffffff40)}
+
+/* подсказка */
+#tip{background:color-mix(in srgb,var(--card) 88%,transparent);backdrop-filter:blur(12px) saturate(1.3);-webkit-backdrop-filter:blur(12px) saturate(1.3);
+  border:1px solid var(--line2);border-radius:10px;padding:10px 12px;font-size:12px;min-width:170px;
+  box-shadow:0 14px 34px -10px #000000a6,0 2px 6px #00000040;transition:opacity .12s}
+:root[data-theme=light] #tip{background:color-mix(in srgb,var(--card) 90%,transparent);box-shadow:0 14px 34px -12px #0f172a40,0 2px 6px #0f172a14}
+#tip b{font-size:12.5px;font-weight:600;margin-bottom:6px}
+#tip div{gap:8px;margin-top:4px;font-size:12px}
+#tip div i{width:8px;height:8px;border-radius:50%}
+#tip div span{font-weight:600;font-variant-numeric:tabular-nums}
+#tip div.tot{border-top:1px solid var(--line2);padding-top:6px;margin-top:7px;color:var(--tx2)}

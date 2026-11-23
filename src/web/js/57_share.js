@@ -46,13 +46,13 @@ function shareMount(){
       $('#shr-st').textContent='PNG-карточка сохранена.';
     },'image/png');
   };
-  $('#shr-cp').onclick=async()=>{
-    const st=$('#shr-st');
-    if(!navigator.clipboard||typeof ClipboardItem==='undefined'){st.textContent='Копирование картинки не поддерживается браузером — нажмите «Скачать PNG».';return}
+  const cpb=$('#shr-cp');
+  if(!navigator.clipboard||typeof ClipboardItem==='undefined'||!navigator.clipboard.write){if(cpb)cpb.remove()}
+  else cpb.onclick=()=>{
     cv.toBlob(async blob=>{
       if(!blob)return;
-      try{await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);st.textContent='Картинка скопирована в буфер обмена — можно вставлять в Telegram (Ctrl+V / ⌘V).'}
-      catch(e){st.textContent='Не удалось скопировать в буфер — нажмите «Скачать PNG».'}
+      try{await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);toast('Картинка скопирована — вставьте в Telegram (Ctrl+V)','ok',3200)}
+      catch(e){toast('Не удалось скопировать — нажмите «Скачать PNG»','err',3200)}
     },'image/png');
   };
 }

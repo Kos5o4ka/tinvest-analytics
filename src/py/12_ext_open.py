@@ -132,14 +132,33 @@ def _direct_note_fail(host, err):
     """Прямой запрос отклонён: 429 всегда, 403/451 — только для хоста, который уже обходит сервер. Пауза: Retry-After или 120 с, 240 … до 1800."""
     if err.code != 429 and not (err.code in (403, 451) and _ds_bypassed(host)):
         return
-    try:
-        ra = float(err.headers.get("Retry-After") or "")
-    except (ValueError, AttributeError, TypeError):
-        ra = None
+    ra = _retry_after_sec(getattr(err, "headers", None))
     with _ds_lock:
         n = _direct_block.get(host, [0.0, 0])[1]
         d = min(max(ra, 30), 21600) if ra is not None else min(DIRECT_BLOCK_BASE * (2 ** n), DIRECT_BLOCK_MAX)
         _direct_block[host] = [time.time() + d, n + 1]
+
+
+def _retry_after_sec(headers):
+    """Retry-After в секундах: число или HTTP-дата (RFC 7231); None, если заголовка нет или он не разбирается."""
+    try:
+        v = (headers.get("Retry-After") or "").strip()
+    except AttributeError:
+        return None
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
 
 
 def _direct_note_ok(host):

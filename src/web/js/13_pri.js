@@ -93,7 +93,7 @@ function priStatsHtml(){
   if(!a.n)return head+(d.loading?waitBox((d.phase||'Готовлю данные')+(d.total?` — ${d.done} из ${d.total}`:'')+'. Первый расчёт занимает 2–3 минуты, потом данные хранятся на компьютере.'):'<div class="empty">Пока нет данных по размещённым выпускам. Проверьте подключение к интернету.</div>')+'</div>';
   const bk=(d.buckets||[]).filter(b=>b.n>=3);
   chart('c-pri-b',bars,{h:260,labels:bk.map(b=>b.bucket+' ('+b.n+')'),zero:true,
-    series:[{n:'1-й день, цена − номинал',c:'#3987e5',v:bk.map(b=>b.p0==null?null:+(b.p0-100).toFixed(2))},{n:'Через 30 дней, цена − номинал',c:'#19a070',v:bk.map(b=>b.p30==null?null:+(b.p30-100).toFixed(2))}],
+    series:[{n:'1-й день, цена − номинал',c:'var(--s1)',v:bk.map(b=>b.p0==null?null:+(b.p0-100).toFixed(2))},{n:'Через 30 дней, цена − номинал',c:'var(--s3)',v:bk.map(b=>b.p30==null?null:+(b.p30-100).toFixed(2))}],
     fa:v=>(+v).toFixed(1).replace('.',','),ft:v=>ppd(v),empty:'Мало данных для графика'});
   const dv=a.p30==null?null:a.p30-100;
   const verdict=a.p30==null?'Через 30 дней данных пока мало.':
@@ -154,7 +154,7 @@ function pvRow(r,today){
     <td class="l"><div class="pv-nm">${r.status!=='upcoming'?`<button class="pv-x${open?' on':''}" data-pvx="${esc(r.secid)}" title="Разбивка по дням" aria-expanded="${open}">›</button>`:'<span class="pv-x0"></span>'}<div><b>${esc(r.name)}</b> <small class="${st[1]}">${st[0]}</small><br><small class="mu num">${isinTxt(r.isin)}</small></div></div></td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
     <td class="l">${r.coupon?esc(r.coupon):'<span class="mu" title="Ставку купона эмитент объявляет в день сбора заявок">—</span>'}</td>
-    <td class="num">${r.start?ddm(r.start):'—'}${r.start===today?'<br><small class="pos">сегодня</small>':''}</td>
+    <td class="num">${r.start?ddm(r.start):'—'}${r.start===today?'<br><small class="pos">сегодня</small>':r.days_on>0&&r.status!=='upcoming'?`<br><small class="mu num" title="Дней с начала размещения">${r.days_on} дн.</small>`:''}</td>
     <td class="num">${r.size_rub?`${pvAmt(r.size_rub,r.cur)}<br><small class="mu num">${short(r.size_pcs)} шт</small>`:'<span class="mu">—</span>'}</td>
     <td class="num">${placed}</td><td class="num">${tod}</td><td class="num">${r.yield?pp1(r.yield):'<span class="mu">—</span>'}</td></tr>`+(open?`<tr class="pv-dd"><td colspan="8">${pvDaysHtml(r.secid)}</td></tr>`:'');
 }
@@ -166,7 +166,7 @@ function pvDaysHtml(secid){
   if(!days.length)return`<div class="empty">Торгов по выпуску пока не было</div>`+(d.errors&&d.errors.length?`<p class="note">${esc(d.errors.join('; '))}</p>`:'');
   const last=days.slice(-45);
   chart('c-pvd-'+secid,bars,{h:170,labels:last.map(x=>ddm(x.d).slice(0,5)),stack:true,zero:true,
-    series:[{n:'Размещение',c:'#3987e5',v:last.map(x=>x.place_v)},{n:'Вторичный рынок',c:'#19a070',v:last.map(x=>x.sec_v)}],fa:v=>short(v),ft:v=>pvRub(v),empty:'Нет сделок'});
+    series:[{n:'Размещение',c:'var(--s1)',v:last.map(x=>x.place_v)},{n:'Вторичный рынок',c:'var(--s3)',v:last.map(x=>x.sec_v)}],fa:v=>short(v),ft:v=>pvRub(v),empty:'Нет сделок'});
   const rows=days.slice().reverse().map(x=>`<tr><td class="num">${ddm(x.d)}${x.live?' <small class="pos">сегодня</small>':''}</td>
     <td class="l">${pvLabels(x.boards).map(b=>`<span class="tag${b.place?' pv-pt':''}" title="${esc(b.ids.join(', '))}: ${pvRub(b.v)}, ${b.n} сд.">${esc(b.label)}</span>`).join(' ')}</td>
     <td class="num">${NFQ.format(Math.round(x.q))}</td><td class="num">${pvRub(x.v)}</td><td class="num">${x.n}</td>

@@ -1,0 +1,62 @@
+/* ── Приятные мелочи: тосты, индикатор загрузки, шпаргалка клавиш ── */
+
+/* тосты: стекло, стек снизу справа */
+#toasts{position:fixed;right:22px;bottom:44px;z-index:1300;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none}
+.toast-i{pointer-events:auto;cursor:pointer;display:flex;align-items:center;gap:10px;max-width:min(420px,calc(100vw - 44px));
+  padding:10px 15px 10px 12px;border-radius:12px;font-size:13px;line-height:1.35;color:var(--tx);
+  background:var(--glass);border:1px solid var(--line2);box-shadow:var(--hl),0 10px 30px -10px #000000a0;
+  backdrop-filter:saturate(1.5) blur(16px);-webkit-backdrop-filter:saturate(1.5) blur(16px);
+  opacity:0;transform:translateY(10px) scale(.98);transition:opacity .22s ease,transform .26s cubic-bezier(.2,.8,.2,1)}
+.toast-i.in{opacity:1;transform:none}
+.toast-i.out{opacity:0;transform:translateX(14px) scale(.98)}
+.toast-i svg{width:18px;height:18px;flex:none;padding:3px;border-radius:50%;box-sizing:content-box;background:color-mix(in srgb,currentColor 14%,transparent)}
+.toast-i.k-ok svg{color:var(--pos)}.toast-i.k-err svg{color:var(--neg)}.toast-i.k-info svg{color:var(--ac-tx)}
+[data-theme=light] .toast-i{box-shadow:var(--hl),0 10px 30px -12px #0f172a40}
+
+/* индикатор фоновой загрузки под верхней панелью */
+#dl-bar{position:absolute;left:0;right:0;bottom:-1px;height:2px;overflow:hidden;opacity:0;pointer-events:none;transition:opacity .28s ease}
+#dl-bar.on{opacity:1}
+#dl-bar i{position:absolute;top:0;bottom:0;left:0;width:40%;border-radius:2px;background:linear-gradient(90deg,transparent,var(--ac),var(--ac-tx),transparent);
+  box-shadow:0 0 10px var(--ac-glow);animation:dlBar 1.15s cubic-bezier(.4,0,.2,1) infinite}
+@keyframes dlBar{from{transform:translateX(-100%)}to{transform:translateX(260%)}}
+
+/* подсказка цепочки g… */
+#dl-chord{position:fixed;left:50%;bottom:48px;z-index:1250;display:flex;gap:6px 14px;align-items:center;flex-wrap:wrap;justify-content:center;max-width:min(760px,calc(100vw - 40px));
+  padding:9px 16px;border-radius:12px;font-size:12.5px;color:var(--tx2);background:var(--glass);border:1px solid var(--line2);
+  box-shadow:var(--hl),0 10px 30px -10px #000000a0;backdrop-filter:saturate(1.5) blur(16px);-webkit-backdrop-filter:saturate(1.5) blur(16px);
+  opacity:0;transform:translate(-50%,8px);transition:opacity .18s,transform .2s;pointer-events:none}
+#dl-chord.in{opacity:1;transform:translate(-50%,0)}
+#dl-chord span{display:inline-flex;gap:6px;align-items:center}
+
+/* клавиши с объёмом */
+#ks kbd,#dl-chord kbd{display:inline-block;min-width:24px;padding:3px 7px 4px;border-radius:7px;text-align:center;
+  font:600 12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--tx);white-space:nowrap;
+  background:linear-gradient(180deg,var(--card-hover),var(--card2));border:1px solid var(--line2);
+  box-shadow:0 1px 0 var(--line2),0 2px 0 #00000055,var(--hl)}
+[data-theme=light] #ks kbd,[data-theme=light] #dl-chord kbd{box-shadow:0 1px 0 var(--line2),0 2px 0 #0f172a1f,var(--hl)}
+
+/* шпаргалка */
+#ks-ov{position:fixed;inset:0;z-index:1200;display:grid;place-items:center;padding:16px;background:#00000099;
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);opacity:0;transition:opacity .18s}
+#ks-ov.in{opacity:1}
+#ks{width:min(820px,100%);max-height:92vh;overflow:auto;padding:22px 26px 18px;border-radius:18px;background:var(--card);
+  border:1px solid var(--line2);box-shadow:var(--hl),0 28px 70px #00000080;transform:translateY(8px) scale(.985);transition:transform .22s cubic-bezier(.2,.8,.2,1)}
+#ks-ov.in #ks{transform:none}
+.ks-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+#ks .ks-hd h2{margin:0;font-size:17px;font-weight:650;letter-spacing:-.02em;text-transform:none;color:var(--tx)}
+.ks-x{border:0;background:transparent;color:var(--mu);font-size:15px;cursor:pointer;padding:4px 8px;border-radius:8px}
+.ks-x:hover{background:var(--card2);color:var(--tx)}
+.ks-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 34px}
+.ks-grid section h3{font-size:11px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em;margin:0 0 6px}
+#ks .ks-r{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:7px 0;border-top:1px solid var(--line);font-size:13.5px}
+#ks .ks-r b{display:inline-flex;gap:4px;align-items:center;font-weight:400;flex:none}
+#ks .ks-r b i{font-style:normal;color:var(--mu);font-size:12px}
+.ks-ft{margin-top:16px;font-size:12px;color:var(--mu)}
+@media(max-width:700px){.ks-grid{grid-template-columns:1fr}}
+
+@media(prefers-reduced-motion:reduce){
+  .toast-i,#ks-ov,#ks,#dl-chord,#dl-bar{transition:opacity .01s!important;transform:none!important}
+  #dl-bar i{animation:none;width:100%;opacity:.7}
+  .toast-i.out{transform:none}
+}
+@media print{#toasts,#dl-bar,#dl-chord,#ks-ov{display:none!important}}

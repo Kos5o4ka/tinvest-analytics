@@ -1,7 +1,7 @@
 /* ── Ставки: КБД и ключевая ставка ── */
 S.ratesDays=365;S.rates=null;
 const RDAYS=[[90,'3 мес'],[180,'6 мес'],[365,'Год'],[730,'2 года']];
-const RT_PRE=[1,2,3,5,10],RT_COL=['#2f6df6','#f59e0b','#8b5cf6','#e5484d','#0ea5a4','#64748b'],RT_MAX=6;
+const RT_PRE=[1,2,3,5,10],RT_COL=['var(--s1)','var(--s4)','var(--s7)','var(--s8)','var(--s3)','var(--s6)'],RT_MAX=6;
 /* выбранные сроки КБД (лет) и свои сроки; хранятся в localStorage */
 (()=>{const j=lsJson('ta_rates_terms',{}),ok=a=>Array.isArray(a)?a.map(Number).filter(t=>t>=0.25&&t<=30):[];
   S.rTerms=[...new Set(ok(j.sel))].sort((x,y)=>x-y).slice(0,RT_MAX);if(!S.rTerms.length)S.rTerms=[2];
@@ -52,10 +52,10 @@ function pMkt(){
   const bt=tms.includes(2)?2:tms[0],bk=K(bt),lastK=bk[i0],lastC=r.key[i0],firstI=bk.findIndex(v=>v!=null),first=bk[firstI];
   const hasSl=tms.includes(1)&&tms.includes(10)&&K(10)[i0]!=null&&K(1)[i0]!=null,sl=hasSl?K(10)[i0]-K(1)[i0]:null;
   chart('c-rates',line,{h:360,zero:false,labels:r.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc1(v),
-    series:[{n:'Ключевая ставка',c:'#3f7a4f',hex:'#3f7a4f',v:r.key,w:2.4,step:true},...tms.map(t=>({n:'КБД · '+rtLab(t),c:rtColor(t),hex:rtColor(t),v:K(t),w:2.2}))],
+    series:[{n:'Ключевая ставка',c:'var(--pos)',v:r.key,w:2.4,step:true},...tms.map(t=>({n:'КБД · '+rtLab(t),c:rtColor(t),v:K(t),w:2.2}))],
     hover:i=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i)},leave:()=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i0)}});
   const dk=lastK!=null&&lastC!=null?lastK-lastC:null;
-  return`<div class="g g4">${kpi('КБД · '+rtLab(bt),pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,rtColor(bt))}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'#3f7a4f')}
+  return`<div class="g g4">${kpi('КБД · '+rtLab(bt),pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,rtColor(bt))}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'var(--pos)')}
     ${kpi('КБД '+rtLab(bt)+' − ключевая',dk!=null?ppf(dk):'—',dk==null?'':'рынок закладывает '+(dk>0?'повышение / удержание':'снижение')+' ставки',dk==null?null:dk>0?'neg':'pos')}
     ${hasSl?kpi('Наклон: 10 лет − 1 год',ppf(sl),sl<0?'кривая инвертирована':'длинные ставки выше коротких',sl<0?'pos':null):
       kpi('КБД '+rtLab(bt)+' за период',lastK!=null&&first!=null?ppf(lastK-first):'—','с '+r.labels[Math.max(0,firstI)],lastK!=null&&first!=null?(lastK-first>0?'neg':'pos'):null)}</div>
@@ -79,8 +79,8 @@ function loadRatesX(force){
   api('/api/rates/extra').then(j=>{S._rxL=0;const ch=rtChanged(S.ratesX,j);S.ratesX=j;if(S.page==='mkt'){if(ch)renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
    .catch(e=>{S._rxL=0;S.ratesX={error:e.message}})
 }
-const RX_COL=['#3b82f6','#3987e5','#19a070','#d95926','#9085e9'];
-const RX_BCOL={'AAA':'#3987e5','AA':'#19a070','A':'#d97706','BBB':'#d95926','BB и ниже':'#e66767'};
+const RX_COL=['var(--s1)','var(--s2)','var(--s3)','var(--s8)','var(--s7)'];
+const RX_BCOL={'AAA':'var(--s1)','AA':'var(--s3)','A':'var(--s4)','BBB':'var(--s8)','BB и ниже':'var(--neg)'};
 function ratesXHtml(){
   if(!S.ratesX)loadRatesX();
   const x=S.ratesX;
@@ -92,7 +92,7 @@ function ratesXHtml(){
   const names=Object.keys(sp.series||{});
   if(sp.dates.length>=2&&names.length){
     chart('c-rx-spr',line,{h:300,zero:false,labels:sp.dates.map(ddm),tipLabels:sp.dates.map(dlabel),fa:v=>(+v).toFixed(1).replace('.',',')+' п.п.',ft:v=>(+v).toFixed(2).replace('.',',')+' п.п.',
-      series:names.map(b=>({n:b,c:RX_BCOL[b]||'#a8aebb',hex:RX_BCOL[b]||'#a8aebb',v:sp.series[b],w:2}))});
+      series:names.map(b=>({n:b,c:RX_BCOL[b]||'#a8aebb',v:sp.series[b],w:2}))});
     h+=`<div class="card rates"><h2>Спреды к КБД по рейтингам во времени<span class="sp">медиана по рублёвым корпоративным облигациям</span></h2>
       <div class="axt">Спред к КБД, п.п.</div><div id="c-rx-spr" class="chart"></div>
       ${(x.spread_notes||[]).map(t=>`<p style="margin:6px 4px;color:var(--tx2)">${esc(t)}</p>`).join('')}
@@ -125,10 +125,10 @@ function curveCard(cv,its){
   const sum=`<ul class="rx-sum"><li>${mv(1,'Короткие (1 год)')}</li><li>${mv(10,'Длинные (10 лет)')}</li><li>Кривая ${dyn}, сейчас ${shape}: 10 лет − 2 года = <b class="num">${fmtS(s1)}</b> (было ${fmtS(s0)}).</li></ul>
     <p class="rx-mean"><b>Что это значит:</b> ${mean} ${lvlT}</p>`;
   const rows=RX_TEN.filter(([t])=>ix(t)>=0).map(([t,n])=>{const a=y(cmp,t),b=y(now,t),d=b-a;return`<tr><td>${n}</td><td class="num"><b>${pc2(b)}</b></td><td class="num">${pc2(a)}</td><td class="num ${dcl(d)}">${pp(d,1)}</td></tr>`}).join('');
-  const AC=document.documentElement.dataset.theme==='light'?'#2563eb':'#3b82f6',nm='Сегодня ('+ddm(now.date)+')',cn=lab+' назад ('+ddm(cmp.date)+')';
+  const AC='var(--s1)',nm='Сегодня ('+ddm(now.date)+')',cn=lab+' назад ('+ddm(cmp.date)+')';
   chart('c-rx-curve',line,{h:320,zero:false,labels:cv.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc2(v),band:{a:1,b:0},
-    series:[{n:cn,c:'#8d95a6',hex:'#8d95a6',v:cmp.y,w:2,dash:true},{n:nm,c:AC,hex:AC,v:now.y,w:3.4}],
-    tip:i=>{const a=cmp.y[i],b=now.y[i],d=b-a;return`<b>Срок: ${esc(cv.labels[i])}</b>`+tipRow(AC,nm,pc2(b))+tipRow('#8d95a6',cn,pc2(a))+`<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Изменение<span class="${dcl(d)}">${pp(d,1)}</span></div>`}});
+    series:[{n:cn,c:'var(--mu)',v:cmp.y,w:2,dash:true},{n:nm,c:AC,v:now.y,w:3.4}],
+    tip:i=>{const a=cmp.y[i],b=now.y[i],d=b-a;return`<b>Срок: ${esc(cv.labels[i])}</b>`+tipRow(AC,nm,pc2(b))+tipRow('var(--mu)',cn,pc2(a))+`<div class="tot">Изменение<span class="${dcl(d)}">${pp(d,1)}</span></div>`}});
   return`<div class="card rates"><h2>Кривая КБД: сегодня и раньше<span class="hq" title="КБД — кривая бескупонной доходности ОФЗ, её считает Мосбиржа: показывает, под какой годовой процент государство занимает на разные сроки.">?</span><span class="sp">Сравнить с: ${seg}</span></h2>
     ${sum}
     <div class="legend rx-lg"><span><i style="background:#3ecf8e55"></i>ниже — ставки снизились</span><span><i style="background:#ff6b6b55"></i>выше — ставки выросли</span></div>
@@ -159,13 +159,13 @@ function inflWeekHtml(){
   const cy=ys[ys.length-1],py=String(+cy-1),W=Array.from({length:52},(_,i)=>i+1);
   const byW=y=>{const a=Array(52).fill(null);(x.years[y]||[]).forEach(r=>{if(r.week>=1&&r.week<=52)a[r.week-1]=r.pct});return a};
   const av=Array(52).fill(null);(x.avg||[]).forEach(([w,v])=>{if(w>=1&&w<=52)av[w-1]=v});
-  const A='#3b82f6',series=[{n:cy,c:A,hex:A,v:byW(cy),w:3}];
-  if(x.years[py])series.push({n:py,c:'#3987e5',hex:'#3987e5',v:byW(py),w:2});
-  if(av.some(v=>v!=null))series.push({n:'Среднее '+(x.avg_label||'2017–2021'),c:'#8d95a6',hex:'#8d95a6',v:av,w:2,dash:true});
+  const A='var(--s1)',series=[{n:cy,c:A,v:byW(cy),w:3}];
+  if(x.years[py])series.push({n:py,c:'var(--s1)',v:byW(py),w:2});
+  if(av.some(v=>v!=null))series.push({n:'Среднее '+(x.avg_label||'2017–2021'),c:'var(--mu)',v:av,w:2,dash:true});
   const last=(x.years[cy]||[]).slice(-1)[0],f=v=>(+v).toFixed(2).replace('.',',')+'%';
   chart('c-infl-w',line,{h:300,zero:true,labels:W.map(String),fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:f,series});
   return`<div class="card rates"><h2>Недельная инфляция<span class="sp">${last?'последняя ('+ddm(last.date)+'): <b>'+f(last.pct)+'</b>':''}</span></h2>
-    <div class="legend rx-lg">${series.map(s=>`<span><i style="background:${s.hex}"></i>${esc(s.n)}</span>`).join('')}</div>
+    <div class="legend rx-lg">${series.map(s=>`<span><i style="background:${s.c}"></i>${esc(s.n)}</span>`).join('')}</div>
     <div class="axt">Прирост цен за неделю, %</div><div id="c-infl-w" class="chart"></div><div class="axt" style="text-align:center">Номер недели года</div>
     <p class="note">Росстат, оценка индекса потребительских цен за неделю (к предыдущей дате регистрации). Данные с ${x.history_from?esc(ddm(x.history_from)+' '+x.history_from.slice(0,4)):'—'}${(x.avg||[]).length?'; пунктир — среднее за '+esc(x.avg_label)+' по номеру недели':'; для среднего за 2017–2021 в архиве Росстата нет доступных заметок'}.${x.loading?' Историю ещё докачиваю…':''}</p></div>`;
 }

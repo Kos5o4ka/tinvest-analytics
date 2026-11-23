@@ -85,7 +85,7 @@ function scrRowHtml(r,fl){
   const id=r.isin||r.id,cls=[];
   if(fl>0&&r.yield<fl)cls.push('scr-low');
   if(typeof KB!=='undefined'&&KB.key===id)cls.push('kb-row');
-  const rt=r.rating?`<div class="cell-stack"><span class="cell-sub">${esc(r.rt_agency||'')}</span><span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}" title="${esc(r.rt_agency||'')}${r.rt_approx?' (приблизительное совпадение названия)':''}">${r.rt_approx?'≈ ':''}${esc(r.rating)}</span></div>`:'<span class="mu">—</span>';
+  const rt=r.rating?`<div class="cell-stack"><span class="cell-sub">${esc(r.rt_agency||'')}</span><span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}${rtClick(r.rt_links).cls}" title="${esc(r.rt_agency||'')}${r.rt_approx?' (приблизительное совпадение названия)':''}${r.rt_links?'\nНажмите, чтобы открыть пресс-релиз':''}"${rtClick(r.rt_links).attr}>${r.rt_approx?'≈ ':''}${esc(r.rating)}</span></div>`:'<span class="mu">—</span>';
   const yrs=r.perp?'<span class="tag">бессрочная</span>':`<div class="cell-stack r"><span>${ddm(r.mat)}</span><span class="cell-sub">${(S.sf.toOffer&&r.yoff!=null?r.yoff:r.years).toFixed(1).replace('.',',')} г${S.sf.toOffer&&r.yoff!=null?' до оферты':''}</span></div>`;
   return`<tr${cls.length?` class="${cls.join(' ')}"`:''}${fl>0&&r.yield<fl?' title="Доходность ниже, чем у фонда ликвидности"':''} data-isin="${esc(id)}"><td class="wt-std">${watchStar(id)}</td>
     <td class="l"><div class="cell-stack"><b>${esc(r.name)}</b><small class="cell-sub mu num">${isinTxt(id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></div></td>

@@ -35,7 +35,7 @@ function txOv(){
     ${kpi(`Оценка НДФЛ за ${cy}`,cur?M(cur.estimate):'—',cur?`база ${short(Math.max(0,cur.trade)+cur.income)} ₽`:'нет дохода',null,S1)}
     ${kpi(`Удержано в ${cy}`,cur?M(cur.withheld):'—','по операциям этого года',null,S3)}
     ${kpi('Ожидается к удержанию',cur?M(Math.max(0,cur.diff)):'—',cur&&cur.diff<0?'удержано больше оценки':'при выводе или в конце года',cur&&cur.diff>0?'neg':'',S2)}</div>`;
-  chart('c-tax',bars,{labels:rows.map(r=>String(r.year)),series:[{n:'Оценка НДФЛ',c:S1,v:rows.map(r=>r.estimate)},{n:'Удержано брокером',c:S2,v:rows.map(r=>r.withheld)}]});
+  chart('c-tax',bars,{labels:rows.map(r=>String(r.year)),series:[{n:'Оценка НДФЛ',c:S1,v:rows.map(r=>r.estimate)},{n:'Удержано брокером',c:S3,v:rows.map(r=>r.withheld)}]});
   out+=`<div class="g c-1-2"><div class="card"><h2>Удержанные налоги по видам</h2>${withheld?hbars(TAXK.filter(k=>lf[k]).map((k,i)=>({n:L[k],v:lf[k],c:PAL[i]})),S1,null,1):'<div class="empty">Налоги не удерживались</div>'}</div>
     <div class="card"><h2>Оценка и факт по годам, ₽</h2><div id="c-tax" class="chart"></div></div></div>`;
   out+=`<div class="card" style="padding:6px 8px"><div class="tbl"><table><thead><tr><th>Год</th><th>Результат сделок</th><th>Дивиденды, купоны, РЕПО</th><th>Налоговая база</th><th>Оценка НДФЛ</th><th>Удержано</th><th>Разница</th></tr></thead><tbody>`+
@@ -59,7 +59,7 @@ function txYr(d){
   if(!ys.length)return`<div class="card empty">Нет операций для расчёта налога</div>`;
   const cy=new Date().getFullYear(),cur=ys.find(r=>r.year===cy)||ys[ys.length-1];
   const tot=ys.reduce((a,r)=>({tax:a.tax+r.tax,wh:a.wh+r.withheld,ldv:a.ldv+r.ldv_saved}),{tax:0,wh:0,ldv:0});
-  chart('c-txy',bars,{labels:ys.map(r=>String(r.year)),series:[{n:'Налог по расчёту',c:S1,v:ys.map(r=>r.tax)},{n:'Удержано брокером',c:S2,v:ys.map(r=>r.withheld)}]});
+  chart('c-txy',bars,{labels:ys.map(r=>String(r.year)),series:[{n:'Налог по расчёту',c:S1,v:ys.map(r=>r.tax)},{n:'Удержано брокером',c:S3,v:ys.map(r=>r.withheld)}]});
   let out=`<div class="g g4">${kpi(`Налог по расчёту за ${cur.year}`,tR(cur.tax),`база ${tR(cur.base)}; ставка 13 %${cur.tax15>0?' и 15 %':''}`,null,S1)}
     ${kpi(`Удержано в ${cur.year}`,tR(cur.withheld),cur.diff_pct==null?'по операциям удержания':`расчёт отличается на ${pct(cur.diff_pct,0)}`,null,S2)}
     ${kpi('Сэкономлено за счёт ЛДВ',tR(tot.ldv),'за все годы',tot.ldv>0?'pos':'',S3)}
@@ -108,10 +108,10 @@ function txIis(d){
     <div class="g g4">${kpi('Открыт',tDt(i.opened),i.opened?'':'укажите дату в настройках',null,S1)}
       ${kpi('Срок владения до',tDt(i.term),i.type==='3'?'5 лет для ИИС-3':'3 года',null,S2)}
       ${kpi('Освобождение дохода',exAvail?(i.term_ok?'действует':'ещё нет'):'не предусмотрено',exAvail?(i.term_ok?'доход внутри счёта не облагается':'до срока при закрытии будет налог'):'для типа А налог платится с дохода',i.term_ok&&exAvail?'pos':'',S3)}
-      ${kpi('Вычет на взносы',dedAvail?tR(i.deduct_total):'не предусмотрен',dedAvail?'13 % от взносов до 400 тыс. ₽ в год':'у типа Б вычета на взносы нет',null,S4)}</div>
-    ${dedAvail?`<div class="tbl" style="margin-top:12px"><table><thead><tr><th>Год</th><th>Взносы</th><th>Учитывается в вычете (до 400 тыс. ₽)</th><th>Вернуть можно (13 %)</th></tr></thead><tbody>${
+      ${kpi('Вычет на взносы',dedAvail?tR(i.deduct_total):'не предусмотрен',dedAvail?`${Math.round(i.deduct_rate*100)} % от взносов до 400 тыс. ₽ в год`:'у типа Б вычета на взносы нет',null,S4)}</div>
+    ${dedAvail?`<div class="tbl" style="margin-top:12px"><table><thead><tr><th>Год</th><th>Взносы</th><th>Учитывается в вычете (до 400 тыс. ₽)</th><th>Вернуть можно (${Math.round(i.deduct_rate*100)} %)</th></tr></thead><tbody>${
       i.years.filter(y=>y.deposits>0).map(y=>`<tr><td><b>${y.year}</b></td><td class="num">${tR(y.deposits)}</td><td class="num">${tR(y.deduct_base)}${y.over>0?`<br><small class="mu">сверх лимита ${tR(y.over)}</small>`:''}</td><td class="num pos">${tR(y.deduct)}</td></tr>`).join('')||'<tr><td colspan="4" class="l mu">Пополнений в истории нет</td></tr>'}</tbody></table></div>
-    <p class="note">Вычет возвращает налог, уплаченный с вашей зарплаты и других доходов по ставке 13 %: больше, чем вы заплатили, вернуть нельзя. Заявляется в декларации 3-НДФЛ или через работодателя.</p>`:''}
+    <p class="note">Вычет возвращает налог, уплаченный с вашей зарплаты и других доходов по ставке ${Math.round(i.deduct_rate*100)} % (её можно изменить в настройках): больше, чем вы заплатили, вернуть нельзя. Заявляется в декларации 3-НДФЛ или через работодателя.</p>`:''}
     ${exAvail?`<p class="note">При закрытии ИИС до срока (${tDt(i.term)}) налог с дохода придётся заплатить; расчётный налог по всему доходу счёта — ${tR(i.tax_if_closed)}. Результат сделок на ИИС: ${tS(i.trade_total)}, дивиденды и купоны: ${tR(i.income_total)}.</p>`:`<p class="note">Для типа А налог на доход внутри ИИС удерживается как обычно; результат сделок: ${tS(i.trade_total)}, дивиденды и купоны: ${tR(i.income_total)}.</p>`}</div>`}).join('')+
     `<p class="note noprint"><a href="#" onclick="txGo('set');return false">Указать тип и дату открытия ИИС</a>. Условия вычета зависят от года открытия счёта — сверьтесь с правилами ФНС.</p>`;
 }
@@ -199,7 +199,7 @@ function txDecl(d){
 
 /* ── Настройки налогов ── */
 function txDraft(d){
-  if(!S.tx.draft){const s=d.settings;S.tx.draft={iis:JSON.parse(JSON.stringify(s.iis||{})),loss:Object.keys(s.loss_carry||{}).sort().map(y=>({y:y,a:String(s.loss_carry[y])})),off:!!s.offset_coupons}}
+  if(!S.tx.draft){const s=d.settings;S.tx.draft={iis:JSON.parse(JSON.stringify(s.iis||{})),loss:Object.keys(s.loss_carry||{}).sort().map(y=>({y:y,a:String(s.loss_carry[y])})),off:!!s.offset_coupons,rate:String(s.ndfl_rate||13)}}
   return S.tx.draft;
 }
 function txIn(el){
@@ -207,6 +207,7 @@ function txIn(el){
   if(k==='iis'){dr.iis[el.dataset.id]=dr.iis[el.dataset.id]||{type:'',opened:''};dr.iis[el.dataset.id][el.dataset.f]=el.value}
   else if(k==='loss'){dr.loss[+el.dataset.i][el.dataset.f]=el.value}
   else if(k==='off'){dr.off=el.checked}
+  else if(k==='rate'){dr.rate=el.value}
 }
 function txLossAdd(y,a){const dr=S.tx.draft;if(y&&dr.loss.some(r=>String(r.y)===String(y)))return;dr.loss.push({y:y?String(y):'',a:a?String(Math.round(a)):''});render()}
 function txLossDel(i){S.tx.draft.loss.splice(i,1);render()}
@@ -214,7 +215,7 @@ async function txSave(btn){
   const dr=S.tx.draft;btn.disabled=true;
   try{
     const lc={};for(const r of dr.loss){const y=String(r.y).trim(),a=parseFloat(String(r.a).replace(/\s/g,'').replace(',','.'));if(y&&a>0)lc[y]=a}
-    await post('/api/tax/settings',{iis:dr.iis,loss_carry:lc,offset_coupons:dr.off});
+    await post('/api/tax/settings',{iis:dr.iis,loss_carry:lc,offset_coupons:dr.off,ndfl_rate:+dr.rate});
     S.tx.msg='Сохранено';S.tx.data=null;S.tx.acc=null;render()
   }catch(e){S.tx.msg=e.message;btn.disabled=false;render()}
 }
@@ -235,6 +236,6 @@ function txSet(d){
       ${loss||'<div class="note" style="margin-bottom:8px">Пока ничего не внесено.</div>'}
       <div class="row" style="gap:10px"><button class="btn ghost" onclick="txLossAdd('','')">+ Добавить год</button></div>
       ${sug.length?`<h3 style="margin:14px 0 6px;font-size:13px">Предложение по расчёту</h3>${sug.map(s=>`<div class="row" style="gap:10px;margin-bottom:6px"><span>${s.year}: убыток по расчёту <b>${tR(s.loss)}</b></span><button class="btn ghost" onclick="txLossAdd(${s.year},${Math.round(s.loss)})">Взять</button></div>`).join('')}`:''}</div>
-    <div class="card"><h2>Правила расчёта</h2><label class="sw"><input type="checkbox" ${dr.off?'checked':''} data-k="off" onchange="txIn(this)"><i></i><div><b>Убыток по сделкам уменьшает купонный доход</b><small>включите, если так считает ваш брокер; по умолчанию убыток гасит только прибыль по сделкам</small></div></label></div>
+    <div class="card"><h2>Правила расчёта</h2><label class="field" style="max-width:330px;margin-bottom:12px"><span>Ставка НДФЛ по основному доходу (для вычета по ИИС)</span><select class="in" data-k="rate" onchange="txIn(this)">${[['13','13 % (доход до 2,4 млн ₽ в год)'],['15','15 % (доход свыше 2,4 млн ₽ в год)']].map(([v,t])=>`<option value="${v}" ${dr.rate===v?'selected':''}>${t}</option>`).join('')}</select></label><label class="sw"><input type="checkbox" ${dr.off?'checked':''} data-k="off" onchange="txIn(this)"><i></i><div><b>Убыток по сделкам уменьшает купонный доход</b><small>включите, если так считает ваш брокер; по умолчанию убыток гасит только прибыль по сделкам</small></div></label></div>
     <div class="row noprint" style="gap:12px;margin-top:6px"><button class="btn" onclick="txSave(this)">Сохранить и пересчитать</button><span class="${/^Сохранено/.test(S.tx.msg)?'pos':'neg'}">${esc(S.tx.msg||'')}</span></div>`;
 }

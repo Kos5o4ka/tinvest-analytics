@@ -73,15 +73,15 @@ function stkSub(el,o){
   const ticks=o.kind==='rsi'?[30,50,70]:[lo/1.1,0,hi/1.1];
   ticks.forEach(v=>{s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}"${o.kind==='rsi'&&v!==50?' stroke-dasharray="4 4"':''}/><text class="ax num" x="${pl-8}" y="${Y(v)+4}" text-anchor="end">${o.kind==='rsi'?v:stkN(v,Math.abs(v)<1?3:2)}</text>`});
   const poly=(a,c,w)=>{const p=[];a.forEach((v,i)=>{if(v!=null)p.push(X(i).toFixed(1)+','+Y(v).toFixed(1))});return p.length>1?`<polyline points="${p.join(' ')}" fill="none" stroke="${c}" stroke-width="${w||1.5}" stroke-linejoin="round"/>`:''};
-  if(o.kind==='rsi')s+=poly(o.rsi,'#9085e9',1.6);
+  if(o.kind==='rsi')s+=poly(o.rsi,'var(--s7)',1.6);
   else{const bw=Math.max(1,Math.min(10,gw*.6));o.hist.forEach((v,i)=>{if(v==null)return;const y0=Y(0),y1=Y(v);s+=`<rect x="${X(i)-bw/2}" y="${Math.min(y0,y1)}" width="${bw}" height="${Math.max(1,Math.abs(y1-y0))}" fill="${v>=0?'var(--pos)':'var(--neg)'}" opacity=".55"/>`});
-    s+=poly(o.macd,'#3987e5',1.5)+poly(o.sig,'#d95926',1.3)}
+    s+=poly(o.macd,'var(--s1)',1.5)+poly(o.sig,'var(--s8)',1.3)}
   s+=`<text class="ax" x="${pl+4}" y="${pt+9}" style="fill:var(--tx2)">${o.kind==='rsi'?'RSI (14)':'MACD (12, 26, 9)'}</text>`;
   let hits='';for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${pl+gw*i}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
   el.innerHTML=`<svg width="${W}" height="${H}">${s}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
-  el._hl=i=>{hv.innerHTML=i<0?'':`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`};
-  bindTip(el,i=>`<b>${esc(o.labels[i])}</b>`+(o.kind==='rsi'?tipRow('#9085e9','RSI',stkN(o.rsi[i],1)):tipRow('#3987e5','MACD',stkN(o.macd[i],3))+tipRow('#d95926','Сигнальная',stkN(o.sig[i],3))+tipRow('var(--mu)','Гистограмма',stkN(o.hist[i],3))));
+  el._hl=i=>{hv.innerHTML=i<0?'':`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-dasharray="3 3"/>`};
+  bindTip(el,i=>`<b>${esc(o.labels[i])}</b>`+(o.kind==='rsi'?tipRow('var(--s7)','RSI',stkN(o.rsi[i],1)):tipRow('var(--s1)','MACD',stkN(o.macd[i],3))+tipRow('var(--s8)','Сигнальная',stkN(o.sig[i],3))+tipRow('var(--mu)','Гистограмма',stkN(o.hist[i],3))));
 }
 function stkTaCard(c){
   const ta=c.ta||{},cls={'покупать':'pos','продавать':'neg'}[ta.signal]||'mu';
@@ -169,7 +169,7 @@ function bindStkCard(root,p){
 const SK={charts:[]};
 function skClose(){
   const o=document.getElementById('sk-ov');if(!o)return;
-  o.remove();document.body.classList.remove('sk-open');SK.charts=[];hideTip();
+  ovLeave(o);document.body.classList.remove('sk-open');SK.charts=[];hideTip();
 }
 function skOpen(){
   let o=document.getElementById('sk-ov');

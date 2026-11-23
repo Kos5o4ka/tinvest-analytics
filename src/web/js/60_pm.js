@@ -18,7 +18,7 @@ function pPm(){
   let ghostHtml='<div class="card"><h2>Призрачный портфель (те же пополнения в те же даты)</h2><div class="empty">Недостаточно истории операций или котировок бенчмарков (LQDT / TMOS).</div></div>';
   if(gh.ok&&gh.items&&gh.items.length){
     const labs=gh.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tips=gh.days.map(dlabel);
-    const ser=[{n:'Мой портфель',c:S1,hex:'#3987e5',v:gh.real,w:2.4}];
+    const ser=[{n:'Мой портфель',c:S1,v:gh.real,w:2.4}];
     if(gh.series.LQDT)ser.push({n:'Призрак LQDT',c:S3,v:gh.series.LQDT,w:1.8,dash:1});
     if(gh.series.TMOS)ser.push({n:'Призрак TMOS',c:S2,v:gh.series.TMOS,w:1.8,dash:1});
     chart('c-pm-gh',line,{h:270,zero:false,labels:labs,tipLabels:tips,series:ser});

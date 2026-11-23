@@ -1,4 +1,5 @@
 """«Простыня» первичных размещений: разбор ответов ISS на маленьких образцах (без сети) и живая проверка (TINVEST_LIVE=1)."""
+import json
 import os
 import sys
 import unittest
@@ -7,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _load import load  # noqa: E402
 
 M = load()
+PVK = "pv_cum1:"
 
 
 def tbl(cols, rows):
@@ -66,7 +68,7 @@ class LiveAndRow(unittest.TestCase):
         r = M.pv_build_row("X1", desc, agg, place, bm, "2026-11-11", None)
         self.assertEqual(r["status"], "placing")
         self.assertEqual(r["size_rub"], 5e10)
-        self.assertEqual(r["placed_src"], "moex")                          # ISSUESIZEPLACED приоритетнее суммы сделок
+        self.assertEqual(r["placed_src"], "moex")                          # ISSUESIZEPLACED больше суммы сделок
         self.assertEqual(r["placed_pct"], 40.0)
         self.assertAlmostEqual(r["today"], 11326776232 + 5000000)
         self.assertEqual((r["coupon"], r["yield"]), ("15,50 %", 15.2))
@@ -162,6 +164,108 @@ class BatchAndCalendar(unittest.TestCase):
         res, _ = self.run_compute(cal=[{"isin": "RU000A10AAA1", "start": "2099-01-01", "short": "A", "issuer": "A"}])
         self.assertFalse(res["errors"])
         self.assertEqual([r["secid"] for r in res["rows"]], ["RU000A10AAA1"])
+
+
+class LongPlacement(unittest.TestCase):
+    """Затянувшееся размещение (старт 90 дней назад, всё ещё открыто на PSAU) не теряется и считается кумулятивно с даты старта."""
+
+    def setUp(self):
+        self.today = M.pv_msk_now().date().isoformat()
+        self.start = M._day_add(self.today, -90)
+        self.sid = "RU000ALONG01"
+        self.calls = []
+        self.saved = (M.pv_json, M.primary_rows, M.pv_days_cached, M.pv_other_boards, M.pv_live_board, M.pv_desc, M.pv_sec_hist, M.store)
+
+        class FakeStore:
+            def __init__(s):
+                s.d = {}
+
+            def get(s, k, ttl=None):
+                return s.d.get(k)
+
+            def put(s, k, v):
+                s.d[k] = json.loads(json.dumps(v))
+        self.st = FakeStore()
+        d = lambda n: M._day_add(self.today, -n)  # noqa: E731
+        self.hist = [{"s": self.sid, "b": "PSAU", "d": d(80), "q": 1000.0, "v": 1e6, "n": 3, "w": 100.0, "c": 100.0, "y": None, "nm": "L", "f": 1000},
+                     {"s": self.sid, "b": "PSAU", "d": d(40), "q": 2000.0, "v": 2e6, "n": 4, "w": 100.0, "c": 100.0, "y": None, "nm": "L", "f": 1000},
+                     {"s": self.sid, "b": "PSAU", "d": d(1), "q": 500.0, "v": 5e5, "n": 1, "w": 100.0, "c": 100.0, "y": None, "nm": "L", "f": 1000},
+                     {"s": self.sid, "b": "TQCB", "d": d(1), "q": 77.0, "v": 77.0, "n": 1, "w": 100.0, "c": 100.0, "y": 15.0, "nm": "L", "f": 1000}]
+        self.live = {self.sid: [{"b": "PSAU", "today": 3e5, "vol": 300.0, "n": 2, "last": None, "wap": 100.0, "yield": None, "placed": None}]}
+
+        def sec_hist(mk, secid, frm, till):
+            self.calls.append((mk, secid, frm, till))
+            return [r for r in self.hist if mk == "ndm" and r["d"] >= frm and r["d"] <= till] if secid == self.sid else []
+        M.store = lambda: self.st
+        M.pv_sec_hist = sec_hist
+        M.pv_json = lambda url, timeout=30: {"securities": tbl(["SECID", "BOARDID"], []), "marketdata": tbl(["SECID", "BOARDID"], [])}
+        M.primary_rows = lambda: []
+        M.pv_days_cached = lambda dates, errs: {}
+        M.pv_other_boards = lambda a, b, e: []
+        M.pv_live_board = lambda mk, b: self.live if (mk, b) == ("ndm", "PSAU") else {}
+        M.pv_desc = lambda s: {"issued": self.start, "name": "Длинный", "full": "Длинный ПАО 1", "isin": s, "face": 1000.0, "size": 10000.0}
+        M._pv_mem.clear()
+
+    def tearDown(self):
+        (M.pv_json, M.primary_rows, M.pv_days_cached, M.pv_other_boards, M.pv_live_board, M.pv_desc, M.pv_sec_hist, M.store) = self.saved
+        M._pv_mem.clear()
+
+    def test_long_placement_cumulative_and_cache(self):
+        res = M.pv_compute()
+        rows = [r for r in res["rows"] if r["secid"] == self.sid]
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["status"], "placing")
+        self.assertEqual(r["placed_pcs"], 3800.0)                       # 1000+2000+500+сегодня 300; TQCB не считается
+        self.assertEqual(r["placed_pct"], 38.0)
+        self.assertEqual(r["placed_src"], "trades")
+        self.assertEqual(r["days_on"], 90)
+        self.assertEqual(r["first_place"], self.start and M._day_add(self.today, -80))
+        self.assertIn(PVK + self.sid, self.st.d)
+        # то же число, что и в детализации по дням
+        M.pv_sec_hist = lambda mk, secid, frm, till: [x for x in self.hist if mk == "ndm" and frm <= x["d"] <= till]
+        M.pv_json = lambda url, timeout=30: ({"securities": tbl(LS, [[self.sid, "PSAU", "L", 1000, None, None, None, None]]),
+                                              "marketdata": tbl(LM, [[self.sid, "PSAU", 3e5, 300, 2, 100.0, 0]])}
+                                             if "markets/ndm/" in url else {})
+        days = M.pv_secid_days(self.sid)
+        self.assertEqual(sum(b["q"] for d in days["days"] for b in d["boards"] if b["place"]), r["placed_pcs"])
+        # повторный вызов: из кэша, без новых запросов истории
+        sec = []
+        M.pv_sec_hist = lambda *a: sec.append(a) or []
+        M.pv_json = lambda url, timeout=30: {"securities": tbl(["SECID", "BOARDID"], []), "marketdata": tbl(["SECID", "BOARDID"], [])}
+        r2 = [x for x in M.pv_compute()["rows"] if x["secid"] == self.sid][0]
+        self.assertEqual(r2["placed_pcs"], 3800.0)                      # из кэша (база + хвост в памяти), историю не качаем
+        self.assertEqual(sec, [])
+
+    def test_stale_multi_year_listing_dropped(self):
+        # старт 3 года назад, на PSAU числится, но сегодня сделок нет и за 30 дней тоже — в «простыню» не попадает
+        M.pv_desc = lambda s: {"issued": M._day_add(self.today, -1100), "name": "Висяк", "full": "Область 1", "isin": s, "face": 1000.0, "size": 10000.0}
+        self.live[self.sid] = [{"b": "PSAU", "today": 0, "vol": 0, "n": 0, "last": None, "wap": None, "yield": None, "placed": None}]
+        self.assertEqual([r for r in M.pv_compute()["rows"] if r["secid"] == self.sid], [])
+
+    def test_cache_incremental(self):
+        errs = []
+        c1 = M.pv_cum(self.sid, self.start, self.today, ["ndm"], errs)
+        self.assertEqual((c1["q"], c1["n"]), (3500.0, 8))
+        n = len(self.calls)
+        # без _pv_mem хвоста: докачка только с даты после last
+        M._pv_mem.clear()
+        c2 = M.pv_cum(self.sid, self.start, self.today, ["ndm"], errs)
+        self.assertEqual(c2["q"], 3500.0)
+        self.assertEqual(len(self.calls), n + 1)
+        self.assertGreater(self.calls[-1][2], self.start)               # не с даты старта
+        self.assertEqual(errs, [])
+        n = len(self.calls)
+        M.pv_cum(self.sid, self.start, self.today, ["ndm"], errs)       # хвост в памяти — запроса нет
+        self.assertEqual(len(self.calls), n)
+
+    def test_moex_placed_only_if_larger(self):
+        desc = {"name": "Х", "issued": self.start, "size": 10000.0, "face": 1000.0}
+        bm = [{"b": "TQCB", "today": 0, "vol": 0, "n": 0, "placed": 9000.0}]
+        r = M.pv_build_row("X", desc, None, [], bm, self.today, None, {"q": 3000.0, "v": 3e6, "n": 5, "first": self.start})
+        self.assertEqual((r["placed_pcs"], r["placed_src"]), (9000.0, "moex"))
+        r = M.pv_build_row("X", desc, None, [], [dict(bm[0], placed=100.0)], self.today, None, {"q": 3000.0, "v": 3e6, "n": 5, "first": self.start})
+        self.assertEqual((r["placed_pcs"], r["placed_src"]), (3000.0, "trades"))
 
 
 @unittest.skipUnless(os.environ.get("TINVEST_LIVE") == "1", "живые тесты: задайте TINVEST_LIVE=1")

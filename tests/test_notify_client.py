@@ -107,6 +107,7 @@ class T(unittest.TestCase):
         M.tg_tick()
         self.assertEqual(len(self.stub.posts), 1)
         self.assertIn("Сводка", self.stub.posts[0][2]["text"])
+        self.assertTrue(self.stub.posts[0][2]["text"].startswith("📈 <b>Сводка TAnalytic</b> · "))
 
     def test_legacy_keys_cleanup_and_save(self):
         self.conf(tg_token="123456:SECRETSECRETSECRETSECRET", tg_chat="42")
@@ -125,6 +126,13 @@ class T(unittest.TestCase):
         self.assertNotIn("/api/tg/find_chat", M.API_POST)
 
 
+    def test_test_message_format(self):
+        M.tg_test({}, {})
+        t = self.stub.posts[0][2]["text"]
+        self.assertTrue(t.startswith("🧪 <b>Тестовое сообщение</b>\n\n"))
+        self.assertTrue(t.endswith(M.TG_DISCLAIMER))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -135,9 +143,80 @@ class DigestEventLabels(unittest.TestCase):
     def test_kinds_are_russian(self):
         for kind, label in (("coupon", "купон"), ("amortization", "амортизация"), ("redemption", "погашение"),
                             ("dividend", "дивиденд"), ("offer", "оферта")):
-            line = M._tg_ev_line(("2026-11-20", kind, "Выпуск", 5000))
-            self.assertEqual(line, "20.11 · %s · Выпуск · 5 000 ₽" % label)
+            line = M._tg_ev_line(("%d-11-20" % M.date.today().year, kind, "Выпуск", 5000))
+            self.assertEqual(line, "20 ноября · <b>Выпуск</b> — %s, 5 000 ₽" % label)
 
     def test_unknown_kind_has_no_english(self):
         for kind in ("something_new", None):
-            self.assertIn(" · выплата · ", M._tg_ev_line(("2026-11-20", kind, "Выпуск", None)))
+            self.assertIn(" — выплата", M._tg_ev_line(("2026-11-20", kind, "Выпуск", None)))
+
+
+class MessageFormat(unittest.TestCase):
+    """Оформление сообщений: числа, даты, ссылки, экранирование, предел длины."""
+
+    def test_numbers(self):
+        self.assertEqual(M._tg_num(1234567.8), "1 234 568")
+        self.assertEqual(M._tg_rub(5000), "5 000 ₽")
+        self.assertEqual(M._tg_rub(12.5), "12,50 ₽")
+        self.assertEqual(M._tg_pct(14.5), "14,50%")
+
+    def test_dates_russian(self):
+        y = M.date.today().year
+        self.assertEqual(M._tg_date("%d-03-05" % y), "5 марта")
+        self.assertEqual(M._tg_date("%d-12-31" % (y + 1)), "31 декабря %d" % (y + 1))
+
+    def test_links_escaped_and_only_http(self):
+        self.assertEqual(M._tg_link("javascript:alert(1)", "x"), "")
+        self.assertEqual(M._tg_link("https://a.ru/?a=1&b=\"2\"", "<б>"), '<a href="https://a.ru/?a=1&amp;b=%222%22">&lt;б&gt;</a>')
+        self.assertIn("issue.aspx?code=RU000A0TEST1", M._tg_moex("RU000A0TEST1"))
+        self.assertEqual(M._tg_moex(""), "")
+
+    def test_alert_line(self):
+        a = {"kind": "rating", "name": "Банк <X>", "message": "рейтинг понижен & отозван", "isin": "RU000A0TEST1", "url": "https://acra-ratings.ru/press/1"}
+        ln = M._tg_alert_line(a)
+        self.assertTrue(ln.startswith("🏷 <b>Банк &lt;X&gt;</b> — рейтинг понижен &amp; отозван\n"))
+        self.assertIn('<a href="https://acra-ratings.ru/press/1">Пресс-релиз</a> · <a href="https://www.moex.com/ru/issue.aspx?code=RU000A0TEST1">на Мосбирже</a>', ln)
+        self.assertEqual(M._tg_alert_line({"kind": "price", "name": "A", "message": "m"}), "📉 <b>A</b> — m")
+        self.assertTrue(M._tg_alert_line({"kind": "goal", "name": "A", "message": "m"}).startswith("⭐"))
+
+    def test_cap_and_fit(self):
+        self.assertEqual(M._tg_cap(["a", "b", "c"], 2), "a\nb\n…и ещё 1")
+        self.assertEqual(M._tg_cap(["a", "b"], 2), "a\nb")
+        t = "<b>Заголовок</b>\n\n" + "\n".join("<i>строка %d</i> <a href=\"https://x.ru\">ссылка</a>" % i for i in range(300))
+        r = M._tg_fit(t, 500)
+        self.assertLessEqual(len(r), 500)
+        self.assertTrue(r.endswith("…"))
+        self.assertEqual(r.count("<a "), r.count("</a>"))
+        self.assertEqual(r.count("<i>"), r.count("</i>"))
+        self.assertEqual(M._tg_fit("коротко", 500), "коротко")
+        z = M._tg_fit("<b>" + "я" * 600, 300)
+        self.assertTrue(z.endswith("</b>") and len(z) <= 300)
+
+    def test_dispatch_format_dedup_and_limit(self):
+        sent, msgs = {}, []
+        orig = M.tg_send
+        M.tg_send = lambda cfg, text: msgs.append(text)
+        try:
+            al = [{"id": "x%d" % i, "kind": "watch", "name": "Бумага %d" % i, "message": "м" * 200, "isin": "RU000A0TEST1"} for i in range(40)]
+            n = M._tg_dispatch({}, "Тревоги по портфелю", al, sent, 1000.0)
+            self.assertEqual(n, len(sent))
+            self.assertLessEqual(len(msgs), 3)
+            self.assertTrue(all(m.startswith("🔔 <b>Тревоги по портфелю</b>\n\n") for m in msgs))
+            self.assertTrue(all(len(m) + len(M.TG_DISCLAIMER) <= M.TG_LIMIT for m in msgs))
+            self.assertIn("…и ещё %d — придут при следующей проверке" % (40 - n), msgs[-1])
+            self.assertEqual(M._tg_dispatch({}, "t", al[:n], sent, 2000.0), 0)       # отправленные не повторяются
+            msgs.clear()
+            M._tg_dispatch({}, "Наблюдение и цели", [{"id": "g1", "kind": "goal", "name": "Б", "message": "цель"}], {}, 1.0, icon="⭐")
+            self.assertTrue(msgs[0].startswith("⭐ <b>Наблюдение и цели</b>"))
+        finally:
+            M.tg_send = orig
+
+    def test_offer_texts_human(self):
+        y = M.date.today().year
+        i = {"isin": "RU1", "name": "Бонд <1>", "kind": "put", "date": "%d-12-26" % (y + 1), "period_start": "%d-12-15" % (y + 1),
+             "period_end": "%d-12-21" % (y + 1), "coupon_status": "announced", "new_rate": 14.5}
+        t = dict(M.tg_offer_due([i], "%d-12-10" % (y + 1)))["ofr|RU1|%d-12-26|coupon" % (y + 1)]
+        self.assertIn("<b>Бонд &lt;1&gt;</b> — ", t)
+        self.assertIn("14,50% годовых", t)
+        self.assertIn("26 декабря %d" % (y + 1), t)
+        self.assertIn("на Мосбирже", t)

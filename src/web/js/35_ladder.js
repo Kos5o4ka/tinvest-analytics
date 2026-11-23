@@ -88,7 +88,7 @@ function ladRun(){
 function ladChart(el){
   const d=S.lad&&S.lad.data;if(!d||!d.cashflow_by_month||!d.cashflow_by_month.length)return emptyChart(el,260,'Нет выплат');
   const cf=d.cashflow_by_month,lb=cf.map(m=>LAD_MN[+m.month.slice(5)-1]+' '+m.month.slice(2,4));
-  bars(el,{h:280,stack:true,labels:lb,series:[{n:'Купоны',c:'#3987e5',v:cf.map(m=>m.coupons)},{n:'Погашения и амортизация',c:'#19a070',v:cf.map(m=>m.principal)}],total:true,fa:short,ft:v=>M(v,'rub',0),empty:'Нет выплат'});
+  bars(el,{h:280,stack:true,labels:lb,series:[{n:'Купоны',c:'var(--s1)',v:cf.map(m=>m.coupons)},{n:'Погашения и амортизация',c:'var(--s3)',v:cf.map(m=>m.principal)}],total:true,fa:short,ft:v=>M(v,'rub',0),empty:'Нет выплат'});
 }
 function ladYTip(b){
   if(b.yield_basis==='put')return'Доходность к пут-оферте: держатель сам решает, предъявлять ли бумагу';

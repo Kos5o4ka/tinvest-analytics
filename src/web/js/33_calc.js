@@ -1,8 +1,8 @@
 /* калькулятор инвестиций */
 /* ── Чистая часть: модель (без DOM, считается на клиенте) ── */
 const CL_BR=[[2.4e6,.13],[Infinity,.15]];   /* шкала НДФЛ для инвестиционных доходов (купоны, продажа бумаг, проценты по вкладам): 13 % до 2,4 млн ₽ в год, 15 % с превышения */
-const CL_STR=[['dep','Вклад','#8a93a6'],['fund','Фонд ликвидности','#19a070'],['ofz','ОФЗ','#3987e5'],['aaa','Корпоративные AAA','#7ab4f5'],['aa','Корпоративные AA','#9085e9'],
-  ['a','Корпоративные A','#c98500'],['hy','ВДО (BB и ниже)','#e66767'],['pf','Мой портфель','#d55181'],['own','Своя ставка','#d95926']];
+const CL_STR=[['dep','Вклад','#8a93a6'],['fund','Фонд ликвидности','var(--s3)'],['ofz','ОФЗ','var(--s1)'],['aaa','Корпоративные AAA','var(--s2)'],['aa','Корпоративные AA','var(--s7)'],
+  ['a','Корпоративные A','var(--s4)'],['hy','ВДО (BB и ниже)','var(--s8)'],['pf','Мой портфель','var(--s5)'],['own','Своя ставка','var(--s8)']];
 const CL_BETA={ofz:.6,aaa:.7,aa:.7,a:.7,hy:.7};
 const CL_ACC=[['plain','Обычный брокерский счёт'],['iis3','ИИС-3 (вычет и освобождение дохода)']];
 function clNdfl(b){if(!(b>0))return 0;let t=0,lo=0;for(const[h,r]of CL_BR){if(b>lo)t+=(Math.min(b,h)-lo)*r;lo=h;if(b<=h)break}return t}
@@ -200,15 +200,15 @@ function clStack(el,o){
   for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(Math.abs(v)<step/1e6?0:v)}</text>`}
   axisTicks(o.labels,X,pl-4,W-pr+4).forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
   cum.forEach(([a,b],j)=>{const up=b.map(pt2);
-    s+=`<polygon points="${up.concat(a.map(pt2).reverse()).join(' ')}" fill="${ser[j].c}" fill-opacity=".5"/><polyline points="${up.join(' ')}" fill="none" stroke="${ser[j].c}" stroke-width="1.6" stroke-linejoin="round"/>`});
+    s+=`<polygon points="${up.concat(a.map(pt2).reverse()).join(' ')}" fill="${ser[j].c}" fill-opacity=".38"/><polyline points="${up.join(' ')}" fill="none" stroke="${ser[j].c}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`});
   let hits='';const cw=pw/(n-1);
   for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${X(i)-cw/2}" y="${pt}" width="${cw}" height="${ph}" fill="transparent"/>`;
   el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}">${s}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
-  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`+
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-dasharray="3 3"/>`+
     cum.map(([a,b],j)=>`<circle cx="${X(i)}" cy="${Y(b[i])}" r="4" fill="${ser[j].c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
   bindTip(el,i=>`<b>${esc(tl[i])}</b>`+ser.slice().reverse().map(se=>tipRow(se.c,se.n,ft(se.v[i]||0))).join('')+
-    `<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${ft(acc[i])}</span></div>`);
+    `<div class="tot">Итого<span>${ft(acc[i])}</span></div>`);
 }
 function clSegTable(P,F,env){
   const rows=[];
@@ -235,7 +235,7 @@ function clOut(){
   /* состав капитала выбранной стратегии: внесено + вычеты ИИС + доход после налогов */
   const RF=cur.id==='dep'?null:clRefunds(p,clAccInfo(p)),sIn=[],sDed=[],sInc=[];let ci=0,cd=0;
   for(let k=0;k<=N;k++){ci+=clContrib(p,k)/dv(k);if(RF)cd+=RF[k]/dv(k);sIn.push(ci);sDed.push(cd);sInc.push(cur.cap[k]/dv(k)-ci-cd)}
-  const ser=[{n:'Внесено',c:'#8a93a6',v:sIn}];if(cd>0)ser.push({n:'Вычеты и возвраты ИИС',c:'#c98500',v:sDed});ser.push({n:'Доход после налогов',c:'#19a070',v:sInc});
+  const ser=[{n:'Внесено',c:'#8a93a6',v:sIn}];if(cd>0)ser.push({n:'Вычеты и возвраты ИИС',c:'var(--s4)',v:sDed});ser.push({n:'Доход после налогов',c:'var(--s3)',v:sInc});
   chart('cl-stack',clStack,{h:300,series:ser,labels,tipLabels:tips,fa:short,ft:v=>clRub(v),empty:'Нет данных'});
   const fin=real?cur.finalReal:cur.final,inc=sInc[N],pas=real?cur.passiveReal:cur.passive;
   const pick=res.length>1?`<div class="cl-view"><span>Итоги и график для</span><select class="in" id="cl-view"><option value="">лучшей стратегии (${esc(best.name)})</option>${
@@ -406,7 +406,7 @@ function cgOut(){
   if(F.value==='' &&d.value!=null)src.push(`текущая стоимость ${clRub(r.value)} взята из портфеля`);
   const ym=clYM(r.months);
   chart('cg-chart',line,{h:300,labels:r.chart.labels.map(l=>l.slice(5)+'.'+l.slice(0,4)),fa:short,ft:v=>clRub(v),empty:'Нет данных',
-    series:[{n:'Капитал при нужном пополнении',c:'#19a070',v:r.chart.capital},{n:'Без пополнений',c:'#8a93a6',dash:1,w:1.6,v:r.chart.no_contrib},{n:'Нужный капитал',c:'#d95926',dash:1,w:1.8,v:r.chart.target}]});
+    series:[{n:'Капитал при нужном пополнении',c:'var(--s3)',v:r.chart.capital},{n:'Без пополнений',c:'#8a93a6',dash:1,w:1.6,v:r.chart.no_contrib},{n:'Нужный капитал',c:'var(--s8)',dash:1,w:1.8,v:r.chart.target}]});
   const cv=r.coverage;
   const cov=cv&&cv.pct!=null?`<div class="card cl-goal"><h2>Где вы сейчас</h2><div class="cl-ans">Сейчас купоны и дивиденды дают около <b>${clRub(cv.income)}</b> в месяц${d.income_src&&F.value===''?` (${esc(d.income_src)})`:''} — это <b>${f2(cv.pct)} %</b> цели. Оценка до налога и без учёта будущих изменений портфеля.</div></div>`:
     `<div class="card"><div class="note">Данных о текущем доходе нет: подключите токен или укажите стоимость портфеля.</div></div>`;

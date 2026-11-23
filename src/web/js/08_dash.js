@@ -24,14 +24,14 @@ function pDash(){
     ${kpi('Плата за маржу',M(t.margin_fee||0),t.varmargin?`вар. маржа ${SM(t.varmargin)}`:'шорт и кредитное плечо',null,S5)}
     ${kpi('Налоги удержано',M(taxes),'подробнее — во вкладке «Налоги»',null,S4)}
     ${kpi('Оборот',M(turn,'rub',0),`покупки ${short(t.buy_turnover||0)} · продажи ${short(t.sell_turnover||0)}`,null,S7)}</div>`;
-  const alloc=[['Акции',p.shares,S1],['Облигации',p.bonds,S2],['Фонды',p.etf,S3],['Валюта и деньги',p.currencies,S4],['Фьючерсы',p.futures,S5],['Структурные',p.sp,S6],['Опционы',p.options,S7],['Прочее',p.other,S8]].map(([n,v,c])=>({n,v,c}));
+  const alloc=[['Акции',p.shares,S1],['Облигации',p.bonds,S3],['Фонды',p.etf,S4],['Валюта и деньги',p.currencies,S7],['Фьючерсы',p.futures,S5],['Структурные',p.sp,S2],['Опционы',p.options,S6],['Прочее',p.other,S8]].map(([n,v,c])=>({n,v,c}));
   chart('c-alloc',donut,{items:alloc,cap:'Портфель'});
   let eq=waitBox('Восстанавливаю историю стоимости по ценам закрытия…');
   if(S.hist&&S.hist.error)eq=`<div class="msg err">${esc(S.hist.error)}</div>`;
   else if(S.hist&&!hs)eq='<div class="empty">Недостаточно истории за период</div>';
   else if(hs){eq='<div id="c-eq" class="chart"></div>';
     chart('c-eq',line,{h:290,area:true,zero:false,labels:hs.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tipLabels:hs.days.map(dlabel),
-      series:[{n:'Стоимость портфеля',c:S1,hex:'#3987e5',v:hs.value},{n:'Вложено',c:'#8b93a7',v:hs.invested,dash:1,w:1.6}]})}
+      series:[{n:'Стоимость портфеля',c:S1,v:hs.value},{n:'Вложено',c:'#8b93a7',v:hs.invested,dash:1,w:1.6}]})}
   let mret=waitBox();
   if(S.hist&&S.hist.monthly){const ms=Object.keys(S.hist.monthly).sort().slice(-12);mret='<div id="c-mret" class="chart"></div>';
     chart('c-mret',bars,{labels:ms.map(mlabel),tipLabels:ms.map(m=>{const[y,mm]=m.split('-');return MONF[+mm-1]+' '+y}),labelsOn:ms.length<=12,

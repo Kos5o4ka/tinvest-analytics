@@ -16,6 +16,7 @@
 #    VOLUME по площадке размещения. Объём в номинале = штуки × номинал (VALUE у дисконтных/структурных может быть заметно меньше).
 
 PV_DAYS = 30
+PV_ACTIVE_MAX_DAYS = 400   # старше — показываем активный выпуск, только если по нему были сделки размещения за PV_DAYS
 PV_PLACE_NDM = ("PSAU", "PAUS", "PACY")
 PV_PLACE_BONDS = ("PACT", "AUCT", "PAYT")
 PV_PLACE = set(PV_PLACE_NDM) | set(PV_PLACE_BONDS)
@@ -24,6 +25,7 @@ PV_BOARD_NAMES = {"PSAU": "размещение", "PAUS": "размещение"
                   "TQIR": "Т+ ПИР", "TQRD": "Т+ Д", "TQOD": "Т+ USD", "TQOE": "Т+ EUR", "TQOY": "Т+ CNY", "TQUD": "Т+ USD Д",
                   "PSOB": "РПС", "PTOB": "РПС с ЦК", "PSDB": "РПС Д"}
 PV_DAY_KEY, PV_DESC_KEY, PV_DAYS_KEY = "pv_day1:", "pv_desc1:", "pv_secdays1:"
+PV_CUM_KEY = "pv_cum1:"       # кумулятив по площадкам размещения с даты старта: {from, last, q, v, n, first}
 _pv = {"running": False, "res": None, "t": 0.0, "phase": "", "err": None}
 _pv_lock = threading.Lock()
 _pv_mem = {}          # короткий кэш по бумагам: ключ -> (время, значение)
@@ -238,6 +240,49 @@ def pv_live_secid(secid):
     return v
 
 
+def pv_sec_hist(mk, secid, frm, till):
+    """История выпуска по рынку (все площадки), записи pv_hist_parse. Общий источник для pv_secid_days и кумулятива."""
+    return pv_hist_parse(pv_paged(PV_ISS + "history/engines/stock/markets/%s/securities/%s.json?iss.meta=off&iss.only=history"
+                                  "&history.columns=%s&from=%s&till=%s" % (mk, secid, _PV_HCOLS, frm, till), "history"))
+
+
+def pv_cum(secid, frm, today, mks, errs):
+    """Размещено с даты старта по площадкам размещения (без сегодняшнего дня): {q, v, n, first, last}.
+    Дни до позавчера неизменны — копим в базе (pv_cum1:) и докачиваем только новые; вчера может поправиться — держим в памяти 3 часа."""
+    st = store()
+    k = PV_CUM_KEY + secid
+    yday, final_to = _day_add(today, -1), _day_add(today, -2)
+    e = st.get(k)
+    if not e or e.get("from") != frm or e.get("mks") != sorted(mks):
+        e = {"from": frm, "mks": sorted(mks), "last": _day_add(frm, -1), "q": 0.0, "v": 0.0, "n": 0, "first": ""}
+    tk = "cumtail:" + secid
+    tail = _pv_mem.get(tk)
+    tail_ok = tail and time.time() - tail[0] < 3 * 3600 and tail[2] == e["last"]
+    if e["last"] < yday and not (e["last"] >= final_to and tail_ok):
+        rows = []
+        for mk in mks:
+            try:
+                rows += [r for r in pv_sec_hist(mk, secid, _day_add(e["last"], 1), yday) if r["b"] in PV_PLACE and r["d"] < today]
+            except Exception as ex:  # noqa: BLE001
+                errs.append("кумулятив %s %s: %s" % (secid, mk, str(ex)[:100]))
+                return None
+        fin = [r for r in rows if r["d"] <= final_to]
+        if fin:
+            e["q"] += sum(r["q"] for r in fin)
+            e["v"] += sum(r["v"] for r in fin)
+            e["n"] += sum(r["n"] for r in fin)
+            e["first"] = e["first"] or min(r["d"] for r in fin)
+        if e["last"] < final_to:
+            e["last"] = final_to
+            st.put(k, e)
+        tl = [r for r in rows if r["d"] > final_to]
+        tail = (time.time(), {"q": sum(r["q"] for r in tl), "v": sum(r["v"] for r in tl), "n": sum(r["n"] for r in tl),
+                              "first": min([r["d"] for r in tl] or [""])}, e["last"])
+        _pv_mem[tk] = tail
+    t = tail[1] if tail and tail[2] == e["last"] else {"q": 0.0, "v": 0.0, "n": 0, "first": ""}
+    return {"q": e["q"] + t["q"], "v": round(e["v"] + t["v"], 2), "n": e["n"] + t["n"], "first": e["first"] or t["first"]}
+
+
 def pv_aggregate(day_rows):
     """Записи истории площадок размещения -> по бумаге: сумма штук, ₽, сделок, первый/последний день, дневной ряд."""
     out = {}
@@ -273,7 +318,7 @@ def pv_coupon_text(live, desc):
     return "", False
 
 
-def pv_build_row(secid, desc, agg, today_place, bm, today, rating):
+def pv_build_row(secid, desc, agg, today_place, bm, today, rating, cum=None):
     """Одна строка «простыни». today_place — строки marketdata площадки размещения, bm — marketdata рынка bonds."""
     face = desc.get("face") or desc.get("face0") or 1000.0
     a = agg or {}
@@ -285,12 +330,17 @@ def pv_build_row(secid, desc, agg, today_place, bm, today, rating):
     tp_val = sum(x.get("today") or 0 for x in today_place or [])
     tp_vol = sum(x.get("vol") or 0 for x in today_place or [])
     tp_n = sum(x.get("n") or 0 for x in today_place or [])
-    trades_pcs = (a.get("q") or 0) + tp_vol
-    placed_pcs, src = (placed_moex, "moex") if placed_moex else ((trades_pcs, "trades") if trades_pcs else (0.0, ""))
+    base = cum if cum is not None else a               # cum — кумулятив с даты старта (бумага сейчас открыта на площадке размещения)
+    trades_pcs = (base.get("q") or 0) + tp_vol
+    placed_pcs, src = (placed_moex, "moex") if placed_moex > trades_pcs else ((trades_pcs, "trades") if trades_pcs else (0.0, ""))
     sec_today = sum(x.get("today") or 0 for x in bm or [])
     pl_days = sorted(a.get("days") or {})
     start = desc.get("issued") or desc.get("start") or a.get("first") or ""
-    if tp_val > 0 or (tp_n > 0):
+    try:
+        days_on = max(0, (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days) if start else None
+    except ValueError:
+        days_on = None
+    if tp_val > 0 or (tp_n > 0) or (cum is not None and trades_pcs):
         status = "placing"
     elif trades_pcs:
         status = "placed"
@@ -299,11 +349,11 @@ def pv_build_row(secid, desc, agg, today_place, bm, today, rating):
     cpn, flt = pv_coupon_text(live, desc)
     return {"secid": secid, "isin": desc.get("isin") or secid, "name": desc.get("name") or a.get("name") or secid, "full": desc.get("full") or "",
             "rating": rating, "coupon": cpn, "floating": flt, "mat": desc.get("mat") or (live or {}).get("mat") or "",
-            "offer": (live or {}).get("offer") or "", "start": start, "first_place": pl_days[0] if pl_days else (today if tp_val > 0 else ""),
+            "offer": (live or {}).get("offer") or "", "start": start, "first_place": (base.get("first") or (pl_days[0] if pl_days else "")) or (today if tp_val > 0 else ""), "days_on": days_on,
             "face": face, "size_pcs": size_pcs, "size_rub": size_pcs * face if size_pcs else None,
             "placed_pcs": placed_pcs, "placed_rub": placed_pcs * face if placed_pcs else None, "placed_src": src,
             "placed_pct": round(100.0 * placed_pcs / size_pcs, 1) if size_pcs and placed_pcs else None,
-            "place_value": round((a.get("v") or 0) + tp_val, 2), "place_trades": (a.get("n") or 0) + tp_n,
+            "place_value": round((base.get("v") or 0) + tp_val, 2), "place_trades": (base.get("n") or 0) + tp_n,
             "today_place": round(tp_val, 2), "today_sec": round(sec_today, 2), "today": round(tp_val + sec_today, 2),
             "today_trades": tp_n + sum(x.get("n") or 0 for x in bm or []),
             "price": (live or {}).get("wap") or (live or {}).get("last"), "yield": (live or {}).get("yield"),
@@ -318,7 +368,7 @@ def pv_upcoming(cal, known_isins, today):
             continue
         out.append({"secid": r.get("isin") or "", "isin": r.get("isin") or "", "name": r.get("short") or r.get("issuer") or "",
                     "full": r.get("desc") or "", "rating": r.get("rating"), "coupon": "", "floating": False, "mat": "", "offer": "",
-                    "start": r["start"], "first_place": "", "face": None, "size_pcs": None, "size_rub": None, "placed_pcs": 0,
+                    "start": r["start"], "first_place": "", "days_on": None, "face": None, "size_pcs": None, "size_rub": None, "placed_pcs": 0,
                     "placed_rub": None, "placed_src": "", "placed_pct": None, "place_value": 0, "place_trades": 0, "today_place": 0,
                     "today_sec": 0, "today": 0, "today_trades": 0, "price": None, "yield": None, "status": "upcoming", "cur": "RUB",
                     "book": r.get("book") or "", "end": r.get("end") or ""})
@@ -416,7 +466,7 @@ def pv_compute():
     elif not cal:
         errs.append("календарь размещений investmint: 0 строк — возможно, изменилась разметка сайта")
     cal_isin = {r["isin"]: r for r in cal if r.get("isin")}
-    cand = set(agg)
+    cand = set(agg) | set(live)                         # всё, что сейчас открыто на площадке размещения, — независимо от даты старта
     for sid, ms in live.items():
         if any((m.get("today") or 0) > 0 or (m.get("n") or 0) > 0 or (m.get("settle") or "") >= cut for m in ms):
             cand.add(sid)
@@ -431,7 +481,31 @@ def pv_compute():
         else:
             errs.append("описание %s: %s" % (s, v))
     lap("desc")
-    new = [s for s, d in descs.items() if (d.get("issued") or d.get("start") or "") >= cut]
+    old_cut = _day_add(today, -PV_ACTIVE_MAX_DAYS)
+
+    def _alive(s):
+        st0 = descs[s].get("issued") or descs[s].get("start") or ""
+        return st0 >= old_cut or s in agg or any((m.get("today") or 0) > 0 or (m.get("n") or 0) > 0 for m in live[s])
+    # открыты на площадке размещения сейчас: затянувшиеся размещения не теряем, но многолетние «висяки»
+    # (региональные выпуски, годами числящиеся на PSAU без сделок) берём, только если по ним были сделки за PV_DAYS дней
+    active = {s for s in live if s in descs and _alive(s)}
+    new = [s for s, d in descs.items() if s in active or (d.get("issued") or d.get("start") or "") >= cut]
+    _pv["phase"] = "Размещено с начала (%d)" % len(active)
+    cums = {}
+
+    def c1(s):
+        d = descs[s]
+        frm = d.get("issued") or d.get("start") or cut
+        mks = sorted({"ndm" if m["b"] in PV_PLACE_NDM else "bonds" for m in live[s] if m["b"] in PV_PLACE}) or ["ndm"]
+        try:
+            return s, pv_cum(s, frm, today, mks, errs)
+        except Exception as ex:  # noqa: BLE001
+            errs.append("кумулятив %s: %s" % (s, str(ex)[:100]))
+            return s, None
+    for s, v in pool_map(c1, sorted(active), workers=8):
+        if v is not None:
+            cums[s] = v
+    lap("cum")
     _pv["phase"] = "Вторичные торги (%d)" % len(new)
     bms = {}
     if bonds_all is not None:
@@ -454,7 +528,7 @@ def pv_compute():
         d = descs[s]
         tp = [m for m in live.get(s, []) if m["b"] in PV_PLACE]
         rt = _pv_rating(d.get("isin") or s, pv_issuer_name(d.get("full") or d.get("name")))
-        row = pv_build_row(s, d, agg.get(s), tp, bms.get(s), today, rt)
+        row = pv_build_row(s, d, agg.get(s), tp, bms.get(s), today, rt, cums.get(s))
         if row["status"] == "upcoming" and (row["start"] or "") < today:
             continue                                    # открыт на площадке, но сделок не было и даты размещения в будущем нет
         rows.append(row)
@@ -561,8 +635,7 @@ def pv_secid_days(secid):
     errs, rows, live = [], [], []
     for mk in ("ndm", "bonds"):
         try:
-            rows += pv_hist_parse(pv_paged(PV_ISS + "history/engines/stock/markets/%s/securities/%s.json?iss.meta=off&iss.only=history"
-                                           "&history.columns=%s&from=%s&till=%s" % (mk, secid, _PV_HCOLS, frm, today), "history"))
+            rows += pv_sec_hist(mk, secid, frm, today)
         except Exception as ex:  # noqa: BLE001
             errs.append("%s: %s" % (mk, str(ex)[:100]))
         try:

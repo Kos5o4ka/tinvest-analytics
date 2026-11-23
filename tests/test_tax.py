@@ -204,6 +204,30 @@ class Netting(unittest.TestCase):
         st2 = M.tax_compute(ops, {}, None, sel, {"iis": {"I": {"type": "A", "opened": ""}}, "loss_carry": {}}, today=date(2024, 12, 1))
         self.assertAlmostEqual(M.tx_iis_table(st2, {})[0]["deduct_total"], 400000 * 0.13)
 
+    def test_iis3_exempt_limit_single_year(self):
+        rows, _ = M.tax_group_years([], {2025: {"div": 35e6}}, None, True)
+        r = rows[0]
+        self.assertAlmostEqual(r["iis_exempt_used"], 30e6)
+        self.assertAlmostEqual(r["tax"], M.tx_ndfl(5e6, 2025)[0])
+
+    def test_iis3_exempt_limit_cumulative(self):
+        rows, _ = M.tax_group_years([], {2024: {"div": 20e6}, 2025: {"div": 15e6}}, None, True)
+        self.assertAlmostEqual(rows[0]["tax"], 0)
+        self.assertAlmostEqual(rows[1]["iis_exempt_used"], 10e6)
+        self.assertAlmostEqual(rows[1]["tax"], M.tx_ndfl(5e6, 2025)[0])
+
+    def test_iis3_small_profit_untaxed(self):
+        rows, _ = M.tax_group_years([], {2025: {"div": 1e6}}, None, True)
+        self.assertAlmostEqual(rows[0]["tax"], 0)
+        self.assertAlmostEqual(rows[0]["iis_exempt_used"], 1e6)
+
+    def test_iis_deduct_rate_15(self):
+        sel = [{"id": "I", "name": "I", "type": "ИИС", "opened": "2019-01-01T00:00:00Z"}]
+        ops = [op("2024-01-10", "INPUT", 500000, acc="I")]
+        st = M.tax_compute(ops, {}, None, sel, {"iis": {"I": {"type": "A", "opened": ""}}, "loss_carry": {}}, today=date(2024, 12, 1))
+        self.assertAlmostEqual(M.tx_iis_table(st, {"ndfl_rate": 15})[0]["deduct_total"], 400000 * 0.15)
+        self.assertAlmostEqual(M.tx_iis_table(st, {})[0]["deduct_total"], 400000 * 0.13)
+
     def test_offset_coupons_option(self):
         ops = [buy("2024-01-10", 10, 100), sell("2024-02-10", 10, 50), op("2024-03-01", "COUPON", 800, itype="bond", uid="b")]
         self.assertAlmostEqual(group(ops, offset=False)[1][2024]["tax"], 800 * 0.13, places=6)
@@ -287,9 +311,9 @@ class Settings(unittest.TestCase):
 
 
 class Progressive(unittest.TestCase):
-    def _row(self, base, year=2025):
+    def _row(self, base, year=2025, iis_used=0.0):
         r = {k: 0.0 for k in M.TAX_SUM_KEYS}
-        r.update(year=year, base=base, tax=M.tx_ndfl(base, year)[0], w={})
+        r.update(year=year, base=base, iis_exempt_used=iis_used, tax=M.tx_ndfl(base - iis_used, year)[0], w={})
         return r
 
     def test_extra_progressive_on_combined_base(self):
@@ -301,7 +325,7 @@ class Progressive(unittest.TestCase):
 
     def test_no_extra_when_below_threshold_or_exempt(self):
         self.assertEqual(M.tx_sum_rows([[self._row(1000000.0)], [self._row(1000000.0)]])[0]["extra_progressive"], 0.0)
-        r = M.tx_sum_rows([[self._row(2000000.0)], [self._row(2000000.0)]], [False, True])[0]
+        r = M.tx_sum_rows([[self._row(2000000.0)], [self._row(2000000.0, iis_used=2000000.0)]], [False, True])[0]
         self.assertEqual(r["extra_progressive"], 0.0)       # освобождённый ИИС в совокупную базу не входит
 
 

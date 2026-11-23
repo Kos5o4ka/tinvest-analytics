@@ -141,20 +141,4 @@ function emptyHint(text,btns,ico){
 }
 
 /* ── 4. Шпаргалка клавиш («?») ── */
-const KS_ROWS=[['Ctrl + K  /  ⌘ + K','Поиск по разделам, бумагам и командам'],['?','Эта шпаргалка'],['Esc','Закрыть окно, карточку бумаги или поиск'],['↑  ↓  Enter','Выбор в поиске'],['J  /  K  или  ↓  ↑','Таблицы: следующая / предыдущая строка'],['Пробел','Таблицы: ★ в список наблюдения'],['Enter','Таблицы: открыть карточку строки'],['F','Скринер: тип Все → Флоатеры → Фиксы → ОФЗ'],['V','Скринер: Комфорт → Компакт → Scatter'],['/','Открыть поиск']];
-function ksToggle(){
-  const o=document.getElementById('ks-ov');
-  if(o){o.remove();return}
-  const el=document.createElement('div');el.id='ks-ov';
-  el.innerHTML=`<div id="ks" role="dialog" aria-label="Горячие клавиши"><h2>Горячие клавиши</h2>${KS_ROWS.map(([k,t])=>`<div class="ks-r"><kbd>${esc(k)}</kbd><span>${esc(t)}</span></div>`).join('')}<div class="mu" style="font-size:12px;margin-top:10px">Esc — закрыть</div></div>`;
-  el.addEventListener('mousedown',e=>{if(e.target===el)el.remove()});
-  document.body.appendChild(el);
-}
-document.addEventListener('keydown',e=>{
-  const o=document.getElementById('ks-ov');
-  if(o&&e.key==='Escape'){e.preventDefault();e.stopPropagation();o.remove();return}
-  if(e.key!=='?'||e.ctrlKey||e.metaKey||e.altKey)return;
-  const a=document.activeElement,t=a&&a.tagName;
-  if(t==='TEXTAREA'||t==='SELECT'||(t==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|file|color)$/.test(a.type))||(a&&a.isContentEditable))return;
-  e.preventDefault();ksToggle();
-},true);
+/* шпаргалка клавиш («?») — в 65_delight.js */

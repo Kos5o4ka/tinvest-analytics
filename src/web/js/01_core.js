@@ -26,16 +26,14 @@ const mlabel=m=>{if(!m||typeof m!=='string'||!m.includes('-'))return'—';const[
 const dlabel=d=>{if(!d||typeof d!=='string'||!d.includes('-'))return'—';const[y,m,dd]=d.split('-');return+dd+' '+(MON[+m-1]||m)+' '+y};
 const ddm=d=>{if(!d||typeof d!=='string'||!d.includes('-'))return'—';const[y,m,dd]=d.split('-');return dd+'.'+m+'.'+y.slice(2)};
 const S1='var(--s1)',S2='var(--s2)',S3='var(--s3)',S4='var(--s4)',S5='var(--s5)',S6='var(--s6)',S7='var(--s7)',S8='var(--s8)';
-const PAL=[S1,S2,S3,S4,S5,S6,S7,S8];
-const HEX=['#3987e5','#d95926','#199e70','#c98500','#d55181','#008300','#9085e9','#e66767'];
+/* порядок серий в диаграммах: синий, бирюзовый, янтарный, фиолетовый, розовый, голубой, оливковый, коралловый */
+const PAL=[S1,S3,S4,S7,S5,S2,S6,S8];
+/* HEX — только для мест, где CSS-переменные недоступны (аватары, canvas); в том же порядке, что PAL, оттенки тёмной темы */
+const HEX=['#4f8ef7','#2bbf9a','#e3a540','#9b87f5','#ec6f91','#4cc3ec','#a7c35a','#f08a5d'];
 
 
 /* ── уведомление-«тост» и копирование в буфер ── */
-function toast(msg,ms){
-  let t=document.getElementById('toast');
-  if(!t){t=document.createElement('div');t.id='toast';t.setAttribute('role','status');document.body.appendChild(t)}
-  t.textContent=msg;t.className='show';clearTimeout(toast._t);toast._t=setTimeout(()=>{t.className=''},ms||2200);
-}
+/* toast(text, kind|ms) — в 65_delight.js */
 function copyText(txt,msg){
   const done=()=>toast(msg||'Скопировано');
   const fb=()=>{try{const a=document.createElement('textarea');a.value=txt;a.style.cssText='position:fixed;opacity:0;top:0;left:0';document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();done()}catch(e){toast('Не удалось скопировать')}};

@@ -349,6 +349,8 @@ def cf_ytm(dirty, flows, settle, tax=False, basis=0.0):
 
 def cf_risk(flows, settle, y):
     """(дюрация Маколея в годах, модифицированная, выпуклость) при доходности y (дробью)."""
+    if y is None or y <= -0.99:
+        return None, None, None
     pvs = [(_bc_t(d, settle), (c + p) / (1 + y) ** _bc_t(d, settle)) for d, c, p in flows if d > settle]
     tot = sum(v for _, v in pvs)
     if not tot:

@@ -82,6 +82,7 @@ function bindPage(){
   {const x=PAGE_EXT[S.page];if(x&&x.bind)x.bind()}
   if(S.page==='reb')bindReb();
   if(S.page==='scr')bindScr();
+  if(S.page==='map'){const b=$('#map-r');if(b)b.onclick=()=>{S.scr=null;render()}}
   if(S.page==='cmp')bindCmp();
   if(S.page==='risk')bindRisk();
   if(S.page==='mon')bindMon();

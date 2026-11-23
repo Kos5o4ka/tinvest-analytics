@@ -8,6 +8,7 @@ TAX_SKIP_TYPES = ("currency", "futures", "dfa")
 TAX_LDV_FROM = date(2014, 1, 1)
 TAX_LDV_LIMIT = 3000000.0
 TAX_IIS_LIMIT = 400000.0
+TAX_IIS3_EXEMPT_LIMIT = 30000000.0   # ст. 219.2 НК РФ: предел освобождаемого финансового результата по ИИС-3 за весь срок
 TAX_SETTINGS_KEY = "tax:settings"
 TAX_SPREAD = 0.001
 
@@ -100,7 +101,8 @@ def tax_settings():
                 carry[str(int(k))] = round(float(v), 2)
         except (TypeError, ValueError):
             pass
-    return {"iis": iis, "loss_carry": carry, "offset_coupons": bool(s.get("offset_coupons"))}
+    return {"iis": iis, "loss_carry": carry, "offset_coupons": bool(s.get("offset_coupons")),
+            "ndfl_rate": 15 if str(s.get("ndfl_rate")) in ("15", "0.15") else 13}
 
 
 def mem_clear_tax():
@@ -121,6 +123,8 @@ def tax_settings_save(cfg, body):
                     except ValueError:
                         raise ApiError("Дата открытия ИИС должна быть в формате ГГГГ-ММ-ДД", 400)
                 cur["iis"][str(k)] = {"type": v.get("type") if v.get("type") in ("A", "B", "3") else "", "opened": op}
+    if "ndfl_rate" in body:
+        cur["ndfl_rate"] = 15 if str(body["ndfl_rate"]).strip() in ("15", "0.15") else 13
     if "offset_coupons" in body:
         cur["offset_coupons"] = bool(body["offset_coupons"])
     if isinstance(body.get("loss_carry"), dict):
@@ -424,6 +428,7 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
         if int(k) not in ys:
             pool.append([int(k), float(v)])
     rows, nkd_pool = [], 0.0
+    iis_left = TAX_IIS3_EXEMPT_LIMIT
     for y in sorted(ys):
         i = inc.get(y, {})
         sec = [s for s in sales if s["bucket"] == "sec" and s["sdate"].year == y]
@@ -459,8 +464,11 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
         deriv = sum(s["result"] for s in dv) + i.get("deriv", 0.0) - i.get("deriv_fee", 0.0)
         base = trade_base + div + coupon_net + over + max(0.0, deriv)
         tax, lo, hi = tx_ndfl(base, y)
+        iis_used = 0.0
         if iis_exempt:
-            tax = 0.0
+            iis_used = min(max(0.0, base), iis_left)
+            iis_left -= iis_used
+            tax, lo, hi = tx_ndfl(base - iis_used, y)
         saved = 0.0
         if exempt > 0.005 and not iis_exempt:
             tb0 = tx_apply_carry(pool_before, trade, y)[1]
@@ -471,7 +479,7 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
             "trade": trade, "ldv_exempt": exempt, "ldv_limit": limit if elig else 0.0, "ldv_saved": saved, "ldv_n": len(elig),
             "carry_used": used, "loss_new": new_loss, "trade_base": trade_base,
             "dividends": div, "coupons": coupon_net, "coupons_gross": i.get("coupon", 0.0), "nkd_adj": i.get("nkd_recv", 0.0) - un, "coupon_offset": coff,
-            "overnight": over, "deriv": deriv, "base": base, "tax": tax, "tax13": lo * 0.13, "tax15": hi * 0.15,
+            "overnight": over, "deriv": deriv, "base": base, "iis_exempt_used": iis_used, "tax": tax, "tax13": lo * 0.13, "tax15": hi * 0.15,
             "withheld": withheld, "w": {k[2:]: v for k, v in i.items() if k.startswith("w_")},
             "diff": tax - withheld, "diff_pct": ((tax - withheld) / withheld * 100.0) if withheld > 1 else None,
             "broker_trade": i.get("bk_yield", 0.0), "deposits": i.get("dep", 0.0), "withdrawals": i.get("wd", 0.0)})
@@ -481,7 +489,7 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
 # ── состояние: группы счетов, ИИС, ЛДВ, подсказки ──
 
 TAX_SUM_KEYS = ("proceeds", "cost", "fees", "trade", "ldv_exempt", "ldv_saved", "carry_used", "loss_new", "trade_base", "dividends", "coupons",
-                "overnight", "deriv", "base", "tax", "tax13", "tax15", "withheld", "broker_trade", "deposits", "withdrawals")
+                "overnight", "deriv", "base", "iis_exempt_used", "tax", "tax13", "tax15", "withheld", "broker_trade", "deposits", "withdrawals")
 
 
 def tx_gkey(a):
@@ -516,6 +524,8 @@ def tx_sum_rows(per_group, exempt=None):
         for r in rows:
             if not (exempt and exempt[gi]):
                 comb[r["year"]] += r["base"]
+            elif r.get("iis_exempt_used") is not None:
+                comb[r["year"]] += r["base"] - r["iis_exempt_used"]
             t = tot.setdefault(r["year"], {"year": r["year"], "w": defaultdict(float)})
             for k in TAX_SUM_KEYS:
                 t[k] = t.get(k, 0.0) + r[k]
@@ -843,6 +853,7 @@ def tx_decl(st):
 
 def tx_iis_table(st, settings):
     out = []
+    dr = 0.15 if str((settings or {}).get("ndfl_rate")) in ("15", "0.15") else 0.13
     for g in st["groups"]:
         if g["kind"] != "iis":
             continue
@@ -853,9 +864,9 @@ def tx_iis_table(st, settings):
             if r["deposits"] > 0 or r["withdrawals"] > 0:
                 b = min(r["deposits"], TAX_IIS_LIMIT)
                 ys.append({"year": r["year"], "deposits": r["deposits"], "withdrawals": r["withdrawals"], "deduct_base": b if ded else 0.0,
-                           "deduct": b * 0.13 if ded else 0.0, "over": max(0.0, r["deposits"] - TAX_IIS_LIMIT)})
+                           "deduct": b * dr if ded else 0.0, "over": max(0.0, r["deposits"] - TAX_IIS_LIMIT)})
         e = dict(i)
-        e.update(years=ys, deduct_total=sum(y["deduct"] for y in ys),
+        e.update(years=ys, deduct_rate=dr, deduct_total=sum(y["deduct"] for y in ys),
                  tax_if_closed=sum(r["tax"] for r in g["rows"]) if not i["exempt"] else 0.0,
                  trade_total=sum(r["trade"] for r in g["rows"]), income_total=sum(r["dividends"] + r["coupons"] for r in g["rows"]))
         out.append(e)

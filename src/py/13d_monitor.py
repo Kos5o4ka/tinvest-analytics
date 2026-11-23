@@ -1,5 +1,5 @@
 # ═══════════════════ мониторинг портфеля: тревоги, ликвидность, история спредов ═══════════════════
-# Источники: журнал рейтинговых действий (ratings_log_v1, канал @issuerRatings), рейтинги и статус «под наблюдением»
+# Источники: журнал рейтинговых действий (ratings_log_v1, каналы @ru_ratings и @issuerRatings), рейтинги и статус «под наблюдением»
 # из каталога T-Invest, история торгов и описание выпуска на Мосбирже (ISS), кривая КБД по датам.
 # Чего программа НЕ видит: факт оплаты купона (ISS его не публикует), поэтому «задержка выплаты» определяется
 # только косвенно: флаги дефолта в описании выпуска на Мосбирже, дефолтный рейтинг (D/RD/C), остановка торгов.
@@ -243,10 +243,10 @@ def _mon_rating_alerts(rows_keys, events, cutoff, today=None):
                 seen[ident]["_lvl"].append(lvl)
                 seen[ident]["message"] = seen[ident]["_msg"] % "эмитент и облигации"
             continue
-        out.append({"id": "rt|%s|%s" % (e["agency"], e["post"]), "severity": sev, "kind": "rating", "date": e["date"],
+        out.append({"id": "rt|%s|%s%s" % (e["agency"], "rr" if e.get("src") == "ru_ratings" else "", e["post"]), "severity": sev, "kind": "rating", "date": e["date"],
                     "isin": hit[0].get("isin"), "isins": [h.get("isin") for h in hit], "name": issuer,
                     "bonds": [h.get("name") for h in hit], "message": msg, "url": e.get("url") or
-                    "https://t.me/issuerRatings/%s" % e["post"], "_lvl": [lvl], "_msg": msg.replace("(" + lvl + ")", "(%s)")})
+                    "https://t.me/%s/%s" % (e.get("src") or "issuerRatings", e["post"]), "_lvl": [lvl], "_msg": msg.replace("(" + lvl + ")", "(%s)")})
         seen[ident] = out[-1]
     for a in out:
         a.pop("_lvl", None)

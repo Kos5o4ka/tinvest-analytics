@@ -27,13 +27,13 @@ function pRet(){
     ${kpi('Худший месяц',worst?pct(worst[1]*100):'—',worst?lab(worst[0]):'',worst&&worst[1]<0?'neg':'',S8)}</div>`;
   if(hs){
     const labs=hs.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tips=hs.days.map(dlabel);
-    const ser=[{n:'Мой портфель',c:S1,hex:'#3987e5',v:hs.twr.map(x=>x*100),w:2.4}];
+    const ser=[{n:'Мой портфель',c:S1,v:hs.twr.map(x=>x*100),w:2.4}];
     if(hs.bench.LQDT)ser.push({n:'Денежный рынок (LQDT)',c:S3,v:hs.bench.LQDT.map(x=>x==null?null:x*100),w:1.6});
     if(hs.bench.TMOS)ser.push({n:'Индекс МосБиржи (фонд TMOS)',c:S2,v:hs.bench.TMOS.map(x=>x==null?null:x*100),w:1.6});
     const fp=v=>(Math.round(v*10)/10).toString().replace('.',',')+'%';
     chart('c-twr',line,{h:300,labels:labs,tipLabels:tips,series:ser,fa:fp,ft:v=>pct(v),zero:false});
-    chart('c-dd',line,{h:200,area:'neg',labels:labs,tipLabels:tips,series:[{n:'Просадка',c:S8,hex:'#e66767',v:hs.dd.map(x=>x*100)}],fa:fp,ft:v=>pct(v)});
-    chart('c-pl',line,{h:200,area:true,labels:labs,tipLabels:tips,series:[{n:'Прибыль (стоимость − вложено)',c:S3,hex:'#199e70',v:hs.value.map((v,i)=>v-hs.invested[i])}]});
+    chart('c-dd',line,{h:200,area:'neg',labels:labs,tipLabels:tips,series:[{n:'Просадка',c:'var(--neg)',v:hs.dd.map(x=>x*100)}],fa:fp,ft:v=>pct(v)});
+    chart('c-pl',line,{h:200,area:true,labels:labs,tipLabels:tips,series:[{n:'Прибыль (стоимость − вложено)',c:'var(--pos)',v:hs.value.map((v,i)=>v-hs.invested[i])}]});
     out+=`<div class="card"><h2>Доходность портфеля и бенчмарков, %<span class="sp">${periodName()}</span></h2><div id="c-twr" class="chart"></div></div>
       <div class="g g2"><div class="card"><h2>Просадка от максимума, %</h2><div id="c-dd" class="chart"></div></div>
       <div class="card"><h2>Прибыль в рублях</h2><div id="c-pl" class="chart"></div></div></div>`;

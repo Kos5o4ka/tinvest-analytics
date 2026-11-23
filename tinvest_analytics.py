@@ -2435,6 +2435,8 @@ def cf_ytm(dirty, flows, settle, tax=False, basis=0.0):
 
 def cf_risk(flows, settle, y):
     """(дюрация Маколея в годах, модифицированная, выпуклость) при доходности y (дробью)."""
+    if y is None or y <= -0.99:
+        return None, None, None
     pvs = [(_bc_t(d, settle), (c + p) / (1 + y) ** _bc_t(d, settle)) for d, c, p in flows if d > settle]
     tot = sum(v for _, v in pvs)
     if not tot:
@@ -3642,7 +3644,8 @@ def rows_to_ops(rows, mapping, header=None):
         o = {"id": "imp-" + uuid.uuid4().hex[:12], "date": dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "type": "OPERATION_TYPE_" + kind,
              "payment": to_money(round(amount, 9), cur), "name": name or ticker or isin, "_ident": ident}
         if qty:
-            o["quantity"] = o["quantityDone"] = str(int(abs(qty)))
+            q = abs(qty)
+            o["quantity"] = o["quantityDone"] = str(int(q)) if q == int(q) else repr(round(q, 9))
         if price is not None:
             o["price"] = to_money(abs(price), cur)
         ops.append(o)
@@ -5254,6 +5257,7 @@ def build_summary(cfg, acc, period, force=False):
 
 BONDS_TTL, HIST_TTL = 600, 900
 _bg = set()
+_bg_lock = threading.Lock()
 
 
 def cached_result(kind, cfg, acc, ttl, compute, force=False):
@@ -5289,8 +5293,10 @@ def cached_result(kind, cfg, acc, ttl, compute, force=False):
         if saved and saved.get("v") is not None and time.time() - saved.get("t", 0) < ttl:
             return mem_put(key, saved["v"])
         if saved and saved.get("v") is not None:
-            if key not in _bg:
+            with _bg_lock:
+                start = key not in _bg
                 _bg.add(key)
+            if start:
 
                 def bg():
                     try:
@@ -5545,14 +5551,33 @@ def _direct_note_fail(host, err):
     """Прямой запрос отклонён: 429 всегда, 403/451 — только для хоста, который уже обходит сервер. Пауза: Retry-After или 120 с, 240 … до 1800."""
     if err.code != 429 and not (err.code in (403, 451) and _ds_bypassed(host)):
         return
-    try:
-        ra = float(err.headers.get("Retry-After") or "")
-    except (ValueError, AttributeError, TypeError):
-        ra = None
+    ra = _retry_after_sec(getattr(err, "headers", None))
     with _ds_lock:
         n = _direct_block.get(host, [0.0, 0])[1]
         d = min(max(ra, 30), 21600) if ra is not None else min(DIRECT_BLOCK_BASE * (2 ** n), DIRECT_BLOCK_MAX)
         _direct_block[host] = [time.time() + d, n + 1]
+
+
+def _retry_after_sec(headers):
+    """Retry-After в секундах: число или HTTP-дата (RFC 7231); None, если заголовка нет или он не разбирается."""
+    try:
+        v = (headers.get("Retry-After") or "").strip()
+    except AttributeError:
+        return None
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
 
 
 def _direct_note_ok(host):
@@ -5847,12 +5872,14 @@ def http_text(url, timeout=25):
 # ни токен, ни состав портфеля никуда не передаются.
 
 
-# ── кредитные рейтинги (канал @issuerRatings: АКРА, Эксперт РА, НКР, НРА) ──
+# ── кредитные рейтинги (каналы @ru_ratings и @issuerRatings: АКРА, Эксперт РА, НКР, НРА) ──
 
-RATING_CH = "https://t.me/s/issuerRatings"
+RT_CHANNELS = ("ru_ratings", "issuerRatings")        # порядок = приоритет при равной дате записей
+RATING_CH = "https://t.me/s/"
+RT_LINK_HOSTS = ("acra-ratings.ru", "raexpert.ru", "ratings.ru", "ra-national.ru", "t.me")
 RATING_SCALE = ["AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-", "BB+", "BB", "BB-",
                 "B+", "B", "B-", "CCC", "CC", "C", "D"]
-RT_KEY, RT_DAYS, RT_MAX_PAGES, RT_TTL, RT_OLD = "ratings_v2", 430, 280, 12 * 3600, 600
+RT_KEY, RT_DAYS, RT_MAX_PAGES, RT_TTL, RT_OLD = "ratings_v3", 430, 280, 12 * 3600, 600      # RT_MAX_PAGES — на каждый канал
 _L = "[AАBВCС]"
 _NOTLET = "(?<![A-Za-zА-Яа-яЁё])"
 _RATING_PATS = [re.compile(p) for p in (
@@ -5996,6 +6023,96 @@ def parse_rating_post(text):
                         "развивающ": "развивающийся"}.get(om.group(1), "") if om else ""}
 
 
+def rt_safe_url(u):
+    """Ссылка на пресс-релиз: только https:// и хосты агентств/Telegram, иначе пустая строка."""
+    u = (u or "").strip()
+    try:
+        pu = urllib.parse.urlsplit(u)
+    except ValueError:
+        return ""
+    h = (pu.hostname or "").lower()
+    if pu.scheme != "https" or not h or pu.username or pu.password:
+        return ""
+    return u if any(h == d or h.endswith("." + d) for d in RT_LINK_HOSTS) else ""
+
+
+def rt_post_url(src, post):
+    return "https://t.me/%s/%s" % (src or "issuerRatings", post) if post else None
+
+
+_RR_AGENCY = (("акра", "АКРА"), ("эксперт", "Эксперт РА"), ("нкр", "НКР"), ("нра", "НРА"))
+_RR_FIELDS = {"🏢": "co", "📝": "txt", "📊": "rt", "📅": "dt", "🔗": "url"}
+_RR_RU = re.compile(r"(?i)\bru|\.ru|\(ru\)|\|ru\|")
+_RT_SKIP = r"ожидаем|\.sf|структурир|сфо|\bкласс|esg|\.gq|качеств|надежност|некредитн|\.am"
+_RR_OUT = {"стабильн": "стабильный", "позитивн": "позитивный", "негативн": "негативный", "развивающ": "развивающийся"}
+
+
+def _ru_fields(text, links=None):
+    """Разбор поста ru_ratings: (агентство, {поле: значение}). Поля: co 🏢, txt 📝, rt 📊, dt 📅, url 🔗."""
+    lines = [x.strip() for x in (text or "").split("\n") if x.strip()]
+    if not lines:
+        return None, {}
+    m = re.match(r"рейтинг\s+от\s+(.+)", lines[0], re.I)
+    if not m:
+        return None, {}
+    nm = m.group(1).lower()
+    agency = next((a for k, a in _RR_AGENCY if nm.startswith(k)), None)
+    f = {}
+    for ln in lines[1:]:
+        for em, k in _RR_FIELDS.items():
+            if ln.startswith(em):
+                f.setdefault(k, ln[len(em):].strip())
+                break
+    url = rt_safe_url(f.get("url", ""))
+    if not url:
+        url = next((rt_safe_url(u) for u in links or [] if rt_safe_url(u)), "")
+    f["url"] = url
+    return agency, f
+
+
+def _ru_body(agency, f):
+    """Текст релиза для общих разборщиков: «📝» (Эксперт РА) либо «📊»/«🏢» (АКРА, НКР, НРА — текст в первой строке)."""
+    parts = [f.get(k) for k in ("txt", "co", "rt") if f.get(k)]
+    if "txt" not in f and "rt" in f:
+        parts = [f["rt"]] + ([f["co"]] if f.get("co") else [])
+    return " ".join(parts)
+
+
+def _ru_iso(f, iso):
+    m = re.fullmatch(r"(\d\d)\.(\d\d)\.(\d{4})", f.get("dt", ""))
+    return "%s-%s-%s" % (m.group(3), m.group(2), m.group(1)) if m else (iso or "")[:10]
+
+
+def parse_ru_ratings_post(text, links=None, iso=None):
+    """Пост @ru_ratings -> {agency, issuer, level, rating, outlook, date, url} (или withdrawn=True), либо None.
+    Структура: «Рейтинг от <агентство>», затем строки 🏢 эмитент, 📝 релиз, 📊 рейтинг, 📅 дата, 🔗 ссылка."""
+    agency, f = _ru_fields(text, links)
+    if not agency:
+        return None
+    body = _ru_body(agency, f)
+    r = parse_rating_post("%s\n%s" % (agency, body))
+    if not r and f.get("co") and "txt" not in f and _RR_RU.search(f.get("rt", "")) \
+            and not re.search(_RT_SKIP, body.lower()):        # регионы и т. п.: только «🏢 название» и «📊 ruA (Стабильный)»
+        v = _rating_token(f["rt"])
+        if v:
+            r = {"issuer": f["co"], "level": "issuer", "rating": v, "outlook": ""}
+    if not r:
+        return None
+    date_ = _ru_iso(f, iso)
+    if not date_:
+        return None
+    r = dict(r, issuer=re.sub(r"\s+", " ", re.sub(r"[«»\"“”]", "", r["issuer"])).strip())      # вложенные кавычки: «НК «РОСНЕФТЬ»
+    out = {"agency": agency, "issuer": r["issuer"], "level": r["level"], "date": date_, "url": f.get("url", "")}
+    if r.get("withdrawn"):
+        out["withdrawn"] = True
+        return out
+    v = _rating_token(f.get("rt", "")) if _RR_RU.search(f.get("rt", "")) else None
+    out["rating"] = v or r["rating"]
+    om = re.search(r"(стабильн|позитивн|негативн|развивающ)", (f.get("rt") or "").lower())
+    out["outlook"] = _RR_OUT[om.group(1)] if om else r.get("outlook", "")
+    return out
+
+
 RT_LOG_KEY, RT_LOG_DAYS = "ratings_log_v1", 730        # журнал рейтинговых действий: отдельно от ratings_v1
 _RT_D = re.compile(r"(?<![A-Za-zА-Яа-яЁё])(?:ru\s?D(?![A-Za-zА-Яа-я])|D\s?\(RU\)|D\.ru|RD(?![A-Za-z]))")
 _RT_ACTIONS = {"присвоен", "подтверждён", "повышен", "понижен", "отозван", "под наблюдением", "прогноз изменён"}
@@ -6070,37 +6187,118 @@ def parse_rating_action(text):
     return out
 
 
-def rating_log_add(log, pid, iso, text):
-    a = parse_rating_action(text)
+def rating_log_add(log, pid, iso, text, src="issuerRatings", links=None):
+    url = ""
+    if src == "ru_ratings":                      # пост ru_ratings: действие читается из «📝»/«📊», дата — из «📅», ссылка — пресс-релиз
+        agency, f = _ru_fields(text, links)
+        if not agency:
+            return
+        a = parse_rating_action("%s: %s\n" % (agency, _ru_body(agency, f)))
+        iso, url = _ru_iso(f, iso), f.get("url", "")
+    else:
+        a = parse_rating_action(text)
     if not a:
         return
     toks = sorted(name_tokens(a["issuer"]))
     if not toks:
         return
-    a.update(post=pid, date=iso[:10], tokens=toks)
+    a.update(post=pid, date=iso[:10], tokens=toks, src=src, url=url or rt_safe_url(a.get("url")))
     log["events"].append(a)
 
 
 def rating_log_trim(log):
     old = (date.today() - timedelta(days=RT_LOG_DAYS)).isoformat()
-    log["events"] = sorted((e for e in log["events"] if e["date"] >= old), key=lambda e: (e["date"], e["post"]))
+    evs = sorted((e for e in log["events"] if e["date"] >= old), key=lambda e: (e["date"], e.get("src") or "", e["post"]))
+    ru = [e for e in evs if e.get("src") == "ru_ratings"]
+
+    def dup(e):       # то же действие уже есть из ru_ratings (даты постов могут различаться на пару дней)
+        if e.get("src") == "ru_ratings":
+            return False
+        d0 = date.fromisoformat(e["date"])
+        return any(x["agency"] == e["agency"] and x["tokens"] == e["tokens"] and x["action"] == e["action"]
+                   and x["level"] == e["level"] and x.get("rating") == e.get("rating") and x.get("prev") == e.get("prev")
+                   and abs((date.fromisoformat(x["date"]) - d0).days) <= 2 for x in ru)
+    log["events"] = [e for e in evs if not dup(e)]
 
 
-def tg_page(before=None):
-    s = http_text(RATING_CH + ("?before=%d" % before if before else ""))
+def tg_parse_page(s, channel):
+    """HTML зеркала t.me/s/<канал> -> (ids, посты [(id, iso, текст, [ссылки])])."""
+    import html as _html
     ids, posts = [], []
     for blk in s.split("tgme_widget_message_wrap")[1:]:
-        m = re.search(r'data-post="issuerRatings/(\d+)"', blk)
+        m = re.search(r'data-post="%s/(\d+)"' % re.escape(channel), blk, re.I)
         if not m:
             continue
         ids.append(int(m.group(1)))
         t = re.search(r'tgme_widget_message_text[^>]*>(.*?)</div>', blk, re.S)
         d = re.search(r'<time datetime="([^"]+)"', blk)
         if t and d:
-            import html as _html
-            txt = _html.unescape(re.sub(r"<br/?>", "\n", re.sub(r"<(?!br)[^>]+>", "", t.group(1))))
-            posts.append((int(m.group(1)), d.group(1), txt))
+            raw = t.group(1)
+            links = [_html.unescape(h) for h in re.findall(r'<a\s[^>]*href="([^"]+)"', raw)]
+            txt = _html.unescape(re.sub(r"<br/?>", "\n", re.sub(r"<(?!br)[^>]+>", "", raw)))
+            posts.append((int(m.group(1)), d.group(1), txt, links))
     return ids, posts
+
+
+def tg_page(before=None, channel="ru_ratings"):
+    return tg_parse_page(http_text("%s%s%s" % (RATING_CH, channel, "?before=%d" % before if before else "")), channel)
+
+
+def rt_post_parse(channel, text, links, iso):
+    """Пост канала -> запись о рейтинге (как parse_rating_post + date/url) либо None."""
+    if channel == "ru_ratings":
+        return parse_ru_ratings_post(text, links, iso)
+    r = parse_rating_post(text)
+    if r:
+        um = re.search(r"https?://\S+", text)
+        r = dict(r, date=iso[:10], url=rt_safe_url(um.group(0).rstrip(".,)")) if um else "")
+    return r
+
+
+def rt_merge(items, key, rec):
+    """Положить запись в items: из того же канала — всегда (посты идут по возрастанию), из другого — только если свежее
+    по дате, при равной дате побеждает канал с меньшим индексом в RT_CHANNELS (ru_ratings)."""
+    old = items.get(key)
+    if old:
+        osrc, nsrc = old.get("src") or "issuerRatings", rec["src"]
+        if osrc != nsrc:
+            rk = lambda c: RT_CHANNELS.index(c) if c in RT_CHANNELS else 99
+            if (rec["date"], -rk(nsrc)) < (old["date"], -rk(osrc)):
+                return
+            if not rec.get("url") and old.get("url") and old.get("rating") == rec.get("rating"):
+                rec = dict(rec, url=old["url"])
+    items[key] = rec
+
+
+def _rt_scan(channel, base_id, cutoff):
+    got, before, pages = {}, None, 0
+    while pages < RT_MAX_PAGES:
+        ids, posts = None, None
+        for _ in range(3):
+            try:
+                ids, posts = tg_page(before, channel)
+                break
+            except Exception:  # noqa: BLE001
+                time.sleep(1.5)
+        if ids is None:
+            raise OSError("не удалось загрузить канал @%s (нет доступа к t.me)" % channel)
+        if not ids:
+            break
+        pages += 1
+        for p in posts:
+            got[p[0]] = p
+        _rt_state["progress"] = "@%s: загружено страниц %d" % (channel, pages)
+        mn = min(ids)
+        oldest = min((p[1] for p in posts), default="9")
+        if base_id and mn <= base_id:
+            break
+        if not base_id and oldest < cutoff:
+            break
+        if before is not None and mn >= before:
+            break
+        before = mn
+        time.sleep(0.25)
+    return got
 
 
 def _ratings_run():
@@ -6110,67 +6308,56 @@ def _ratings_run():
             sites_refresh(force=True)         # НКР: полный список эмитентов с сайта
         except Exception:  # noqa: BLE001
             pass
-        data = st.get(RT_KEY) or {"items": {}, "max_id": 0, "updated": 0}
+        data = st.get(RT_KEY) or {"items": {}, "max_ids": {}, "updated": 0}
         rlog = st.get(RT_LOG_KEY) or {"events": [], "max_id": 0}
-        base_id = min(data["max_id"], rlog["max_id"])      # пока журнал пуст — догружаем канал до границы RT_DAYS
+        dm, lm = data.setdefault("max_ids", {}), rlog.setdefault("max_ids", {"issuerRatings": rlog.get("max_id", 0)})
         cutoff = (datetime.now(timezone.utc) - timedelta(days=RT_DAYS)).isoformat()
-        got, before, pages = {}, None, 0
-        while pages < RT_MAX_PAGES:
-            ids, posts = None, None
-            for _ in range(3):
+        items, errs, okc = data["items"], [], 0
+        for ch in RT_CHANNELS:
+            try:       # пока журнал пуст — догружаем канал до границы RT_DAYS
+                got = _rt_scan(ch, min(dm.get(ch, 0), lm.get(ch, 0)), cutoff)
+            except Exception as e:  # noqa: BLE001
+                errs.append(str(e)[:120])
+                continue
+            okc += 1
+            for pid in sorted(got):
+                _, iso, text, links = got[pid]
+                if pid > lm.get(ch, 0):
+                    try:
+                        rating_log_add(rlog, pid, iso, text, ch, links)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if pid <= dm.get(ch, 0):
+                    continue
                 try:
-                    ids, posts = tg_page(before)
-                    break
+                    r = rt_post_parse(ch, text, links, iso)
                 except Exception:  # noqa: BLE001
-                    time.sleep(1.5)
-            if ids is None:
-                raise OSError("не удалось загрузить канал рейтингов (нет доступа к t.me)")
-            if not ids:
-                break
-            pages += 1
-            for p in posts:
-                got[p[0]] = p
-            _rt_state["progress"] = "загружено страниц: %d" % pages
-            mn = min(ids)
-            oldest = min((p[1] for p in posts), default="9")
-            if base_id and mn <= base_id:
-                break
-            if not base_id and oldest < cutoff:
-                break
-            if before is not None and mn >= before:
-                break
-            before = mn
-            time.sleep(0.25)
-        items = data["items"]
-        for pid in sorted(got):
-            if pid > rlog["max_id"]:
-                try:
-                    rating_log_add(rlog, pid, got[pid][1], got[pid][2])
-                except Exception:  # noqa: BLE001
-                    pass
-            if pid <= data["max_id"]:
-                continue
-            _, iso, text = got[pid]
-            r = parse_rating_post(text)
-            if not r:
-                continue
-            toks = _words_key(name_words(r["issuer"]))
-            if not toks:
-                continue
-            key = "%s|%s|%s" % (toks, r["agency"], r["level"])
-            if r.get("withdrawn"):
-                if r["level"] == "issuer":
-                    items.pop(key, None)
-                continue
-            items[key] = {"issuer": r["issuer"], "agency": r["agency"], "level": r["level"], "rating": r["rating"],
-                          "outlook": r["outlook"], "date": iso[:10], "post": pid}
-        data["max_id"] = max([data["max_id"]] + list(got))
+                    r = None
+                if not r:
+                    continue
+                toks = _words_key(name_words(r["issuer"]))
+                if not toks:
+                    continue
+                key = "%s|%s|%s" % (toks, r["agency"], r["level"])
+                if r.get("withdrawn"):
+                    if r["level"] == "issuer" and (key not in items or items[key]["date"] <= r["date"]):
+                        items.pop(key, None)
+                    continue
+                rt_merge(items, key, {"issuer": r["issuer"], "agency": r["agency"], "level": r["level"],
+                                      "rating": r["rating"], "outlook": r["outlook"], "date": r["date"], "post": pid,
+                                      "src": ch, "url": r.get("url") or ""})
+            if got:
+                dm[ch] = max(dm.get(ch, 0), max(got))
+                lm[ch] = max(lm.get(ch, 0), max(got))
+        if not okc:
+            raise OSError(errs[0] if errs else "не удалось загрузить каналы рейтингов")
+        data["max_id"] = max(dm.values() or [0])
         data["updated"] = time.time()
         st.put(RT_KEY, data)
-        rlog["max_id"] = max([rlog["max_id"]] + list(got))
+        rlog["max_id"] = lm.get("issuerRatings", rlog.get("max_id", 0))
         rating_log_trim(rlog)
         st.put(RT_LOG_KEY, rlog)
-        _rt_state["error"] = ""
+        _rt_state["error"] = "; ".join(errs)
         _rt_idx.clear()
     except Exception as e:  # noqa: BLE001
         _rt_state["error"] = str(e)[:200]
@@ -6198,14 +6385,20 @@ def ratings_status():
             "progress": _rt_state["progress"], "error": _rt_state["error"]}
 
 
+_RT_PREV = {"ratings_v3": ("ratings_v2", "ratings_v1")}
+
+
 def _rt_src(key):
     """Хранилище рейтингов; пока новая версия пуста (после смены ключа идёт пересканирование) — берём прежнюю."""
     st = store()
     d = st.get(key)
     if d and d.get("items"):
         return d, 2
-    old = st.get(key[:-2] + "v1") if key.endswith("_v2") else None
-    return (old, 1) if old and old.get("items") else (d or {}, 2)
+    for i, k in enumerate(_RT_PREV.get(key) or ((key[:-2] + "v1",) if key.endswith("_v2") else ())):
+        old = st.get(k)
+        if old and old.get("items"):
+            return old, 1 + i * 10
+    return d or {}, 2
 
 
 def ratings_stamp():
@@ -6220,7 +6413,8 @@ def _rating_index():
         merged = {}
         for src in (d.get("items") or {}, sd.get("items") or {}, ed.get("items") or {}):
             for k, it in src.items():
-                if it["date"] >= old and (k not in merged or it["date"] >= merged[k]["date"]):
+                if it["date"] >= old and (k not in merged or it["date"] > merged[k]["date"]
+                                          or (it["date"] == merged[k]["date"] and not (merged[k].get("url") or merged[k].get("post")))):
                     merged[k] = it
         items = [(it, name_words(it["issuer"])) for it in merged.values()]
         exact, inv = {}, {}
@@ -6233,6 +6427,12 @@ def _rating_index():
         _rt_idx.clear()
         _rt_idx.update(u=stamp, items=items, exact=exact, inv=inv)
     return _rt_idx
+
+
+def _rt_link(it):
+    """url пресс-релиза (если есть), иначе ссылка на пост в Telegram, иначе None; плюс post/src записи."""
+    post, src = it.get("post"), it.get("src") or ("issuerRatings" if it.get("post") else None)
+    return {"url": rt_safe_url(it.get("url")) or rt_post_url(src, post) or None, "post": post, "src": src}
 
 
 def rating_for(name):
@@ -6263,11 +6463,11 @@ def rating_for(name):
     if not best:
         return None
     allr = [{"agency": a, "rating": it["rating"], "issuer": it["issuer"], "date": it["date"], "outlook": it["outlook"],
-             "approx": sc < 100} for a, (sc, it) in best.items()]
+             "approx": sc < 100, **_rt_link(it)} for a, (sc, it) in best.items()]
     pool = [x for x in allr if not x["approx"]] or allr                  # приблизительные не влияют на «худший», пока есть точные
     low = max(pool, key=lambda x: RATING_SCALE.index(x["rating"]))     # консервативно: худшая из оценок
     return {"v": low["rating"], "agency": low["agency"], "issuer": low["issuer"], "date": low["date"],
-            "approx": low["approx"], "all": allr}
+            "approx": low["approx"], "url": low["url"], "post": low["post"], "src": low["src"], "all": allr}
 
 
 def apply_ratings(rows):
@@ -6508,16 +6708,25 @@ def best_rating(isin, name):
             cur = cat.get(ag)
             if cur is None or dt >= cur["date"]:
                 cat[ag] = {"agency": ag, "rating": v, "issuer": b["br"] or b["n"], "date": dt,
-                           "outlook": (fc or "") + (" · под наблюдением" if watch else ""), "approx": False}
+                           "outlook": (fc or "") + (" · под наблюдением" if watch else ""), "approx": False,
+                           "url": None, "post": None, "src": None}
     if not cat:
         return base
+    for x in (base or {}).get("all") or []:                    # пресс-релиз из канала: тот же уровень — берём ссылку, канал свежее — берём запись
+        c = cat.get(x["agency"])
+        if not c or x.get("approx") or not x.get("url"):
+            continue
+        if x["rating"] == c["rating"]:
+            c.update(url=x["url"], post=x.get("post"), src=x.get("src"))
+        elif (x.get("date") or "") > (c["date"] or ""):
+            cat[x["agency"]] = x
     allr = list(cat.values())
     for x in (base or {}).get("all") or []:
         if x["agency"] not in cat and not x.get("approx"):     # по названию — только точные; приблизительные худший не выбирают
             allr.append(x)
     low = max(allr, key=lambda x: RATING_SCALE.index(x["rating"]))
     return {"v": low["rating"], "agency": low["agency"], "issuer": low["issuer"], "date": low["date"],
-            "approx": low["approx"], "all": allr}
+            "approx": low["approx"], "url": low.get("url"), "post": low.get("post"), "src": low.get("src"), "all": allr}
 # ═══════════════════════════════ документы раскрытия: извлечение текста ═══════════════════════════════
 # doc_text(bytes, ctype, name) -> {"text", "kind": html|pdf|docx|rtf|txt, "needs_ocr"}. Только stdlib, без сети.
 # Вид определяется по сигнатуре (%PDF, PK + word/document.xml, {\rtf), затем по ctype/расширению, затем по началу текста.
@@ -7719,6 +7928,8 @@ def screener_payload():
         r["rating"] = rt["v"] if rt else None
         r["rt_agency"] = rt["agency"] if rt else None
         r["rt_approx"] = bool(rt and rt["approx"])
+        r["rt_links"] = [{"a": x["agency"], "r": x["rating"], "o": x.get("outlook") or "", "d": x.get("date") or "",
+                          "u": x.get("url")} for x in (rt.get("all") or [])] if rt and any(x.get("url") for x in rt.get("all") or []) else None
         info = None
         if ti and r.get("isin"):
             try:
@@ -8692,6 +8903,7 @@ STARTUP_HOOKS.append(_market_daily_start)
 #    VOLUME по площадке размещения. Объём в номинале = штуки × номинал (VALUE у дисконтных/структурных может быть заметно меньше).
 
 PV_DAYS = 30
+PV_ACTIVE_MAX_DAYS = 400   # старше — показываем активный выпуск, только если по нему были сделки размещения за PV_DAYS
 PV_PLACE_NDM = ("PSAU", "PAUS", "PACY")
 PV_PLACE_BONDS = ("PACT", "AUCT", "PAYT")
 PV_PLACE = set(PV_PLACE_NDM) | set(PV_PLACE_BONDS)
@@ -8700,6 +8912,7 @@ PV_BOARD_NAMES = {"PSAU": "размещение", "PAUS": "размещение"
                   "TQIR": "Т+ ПИР", "TQRD": "Т+ Д", "TQOD": "Т+ USD", "TQOE": "Т+ EUR", "TQOY": "Т+ CNY", "TQUD": "Т+ USD Д",
                   "PSOB": "РПС", "PTOB": "РПС с ЦК", "PSDB": "РПС Д"}
 PV_DAY_KEY, PV_DESC_KEY, PV_DAYS_KEY = "pv_day1:", "pv_desc1:", "pv_secdays1:"
+PV_CUM_KEY = "pv_cum1:"       # кумулятив по площадкам размещения с даты старта: {from, last, q, v, n, first}
 _pv = {"running": False, "res": None, "t": 0.0, "phase": "", "err": None}
 _pv_lock = threading.Lock()
 _pv_mem = {}          # короткий кэш по бумагам: ключ -> (время, значение)
@@ -8914,6 +9127,49 @@ def pv_live_secid(secid):
     return v
 
 
+def pv_sec_hist(mk, secid, frm, till):
+    """История выпуска по рынку (все площадки), записи pv_hist_parse. Общий источник для pv_secid_days и кумулятива."""
+    return pv_hist_parse(pv_paged(PV_ISS + "history/engines/stock/markets/%s/securities/%s.json?iss.meta=off&iss.only=history"
+                                  "&history.columns=%s&from=%s&till=%s" % (mk, secid, _PV_HCOLS, frm, till), "history"))
+
+
+def pv_cum(secid, frm, today, mks, errs):
+    """Размещено с даты старта по площадкам размещения (без сегодняшнего дня): {q, v, n, first, last}.
+    Дни до позавчера неизменны — копим в базе (pv_cum1:) и докачиваем только новые; вчера может поправиться — держим в памяти 3 часа."""
+    st = store()
+    k = PV_CUM_KEY + secid
+    yday, final_to = _day_add(today, -1), _day_add(today, -2)
+    e = st.get(k)
+    if not e or e.get("from") != frm or e.get("mks") != sorted(mks):
+        e = {"from": frm, "mks": sorted(mks), "last": _day_add(frm, -1), "q": 0.0, "v": 0.0, "n": 0, "first": ""}
+    tk = "cumtail:" + secid
+    tail = _pv_mem.get(tk)
+    tail_ok = tail and time.time() - tail[0] < 3 * 3600 and tail[2] == e["last"]
+    if e["last"] < yday and not (e["last"] >= final_to and tail_ok):
+        rows = []
+        for mk in mks:
+            try:
+                rows += [r for r in pv_sec_hist(mk, secid, _day_add(e["last"], 1), yday) if r["b"] in PV_PLACE and r["d"] < today]
+            except Exception as ex:  # noqa: BLE001
+                errs.append("кумулятив %s %s: %s" % (secid, mk, str(ex)[:100]))
+                return None
+        fin = [r for r in rows if r["d"] <= final_to]
+        if fin:
+            e["q"] += sum(r["q"] for r in fin)
+            e["v"] += sum(r["v"] for r in fin)
+            e["n"] += sum(r["n"] for r in fin)
+            e["first"] = e["first"] or min(r["d"] for r in fin)
+        if e["last"] < final_to:
+            e["last"] = final_to
+            st.put(k, e)
+        tl = [r for r in rows if r["d"] > final_to]
+        tail = (time.time(), {"q": sum(r["q"] for r in tl), "v": sum(r["v"] for r in tl), "n": sum(r["n"] for r in tl),
+                              "first": min([r["d"] for r in tl] or [""])}, e["last"])
+        _pv_mem[tk] = tail
+    t = tail[1] if tail and tail[2] == e["last"] else {"q": 0.0, "v": 0.0, "n": 0, "first": ""}
+    return {"q": e["q"] + t["q"], "v": round(e["v"] + t["v"], 2), "n": e["n"] + t["n"], "first": e["first"] or t["first"]}
+
+
 def pv_aggregate(day_rows):
     """Записи истории площадок размещения -> по бумаге: сумма штук, ₽, сделок, первый/последний день, дневной ряд."""
     out = {}
@@ -8949,7 +9205,7 @@ def pv_coupon_text(live, desc):
     return "", False
 
 
-def pv_build_row(secid, desc, agg, today_place, bm, today, rating):
+def pv_build_row(secid, desc, agg, today_place, bm, today, rating, cum=None):
     """Одна строка «простыни». today_place — строки marketdata площадки размещения, bm — marketdata рынка bonds."""
     face = desc.get("face") or desc.get("face0") or 1000.0
     a = agg or {}
@@ -8961,12 +9217,17 @@ def pv_build_row(secid, desc, agg, today_place, bm, today, rating):
     tp_val = sum(x.get("today") or 0 for x in today_place or [])
     tp_vol = sum(x.get("vol") or 0 for x in today_place or [])
     tp_n = sum(x.get("n") or 0 for x in today_place or [])
-    trades_pcs = (a.get("q") or 0) + tp_vol
-    placed_pcs, src = (placed_moex, "moex") if placed_moex else ((trades_pcs, "trades") if trades_pcs else (0.0, ""))
+    base = cum if cum is not None else a               # cum — кумулятив с даты старта (бумага сейчас открыта на площадке размещения)
+    trades_pcs = (base.get("q") or 0) + tp_vol
+    placed_pcs, src = (placed_moex, "moex") if placed_moex > trades_pcs else ((trades_pcs, "trades") if trades_pcs else (0.0, ""))
     sec_today = sum(x.get("today") or 0 for x in bm or [])
     pl_days = sorted(a.get("days") or {})
     start = desc.get("issued") or desc.get("start") or a.get("first") or ""
-    if tp_val > 0 or (tp_n > 0):
+    try:
+        days_on = max(0, (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days) if start else None
+    except ValueError:
+        days_on = None
+    if tp_val > 0 or (tp_n > 0) or (cum is not None and trades_pcs):
         status = "placing"
     elif trades_pcs:
         status = "placed"
@@ -8975,11 +9236,11 @@ def pv_build_row(secid, desc, agg, today_place, bm, today, rating):
     cpn, flt = pv_coupon_text(live, desc)
     return {"secid": secid, "isin": desc.get("isin") or secid, "name": desc.get("name") or a.get("name") or secid, "full": desc.get("full") or "",
             "rating": rating, "coupon": cpn, "floating": flt, "mat": desc.get("mat") or (live or {}).get("mat") or "",
-            "offer": (live or {}).get("offer") or "", "start": start, "first_place": pl_days[0] if pl_days else (today if tp_val > 0 else ""),
+            "offer": (live or {}).get("offer") or "", "start": start, "first_place": (base.get("first") or (pl_days[0] if pl_days else "")) or (today if tp_val > 0 else ""), "days_on": days_on,
             "face": face, "size_pcs": size_pcs, "size_rub": size_pcs * face if size_pcs else None,
             "placed_pcs": placed_pcs, "placed_rub": placed_pcs * face if placed_pcs else None, "placed_src": src,
             "placed_pct": round(100.0 * placed_pcs / size_pcs, 1) if size_pcs and placed_pcs else None,
-            "place_value": round((a.get("v") or 0) + tp_val, 2), "place_trades": (a.get("n") or 0) + tp_n,
+            "place_value": round((base.get("v") or 0) + tp_val, 2), "place_trades": (base.get("n") or 0) + tp_n,
             "today_place": round(tp_val, 2), "today_sec": round(sec_today, 2), "today": round(tp_val + sec_today, 2),
             "today_trades": tp_n + sum(x.get("n") or 0 for x in bm or []),
             "price": (live or {}).get("wap") or (live or {}).get("last"), "yield": (live or {}).get("yield"),
@@ -8994,7 +9255,7 @@ def pv_upcoming(cal, known_isins, today):
             continue
         out.append({"secid": r.get("isin") or "", "isin": r.get("isin") or "", "name": r.get("short") or r.get("issuer") or "",
                     "full": r.get("desc") or "", "rating": r.get("rating"), "coupon": "", "floating": False, "mat": "", "offer": "",
-                    "start": r["start"], "first_place": "", "face": None, "size_pcs": None, "size_rub": None, "placed_pcs": 0,
+                    "start": r["start"], "first_place": "", "days_on": None, "face": None, "size_pcs": None, "size_rub": None, "placed_pcs": 0,
                     "placed_rub": None, "placed_src": "", "placed_pct": None, "place_value": 0, "place_trades": 0, "today_place": 0,
                     "today_sec": 0, "today": 0, "today_trades": 0, "price": None, "yield": None, "status": "upcoming", "cur": "RUB",
                     "book": r.get("book") or "", "end": r.get("end") or ""})
@@ -9092,7 +9353,7 @@ def pv_compute():
     elif not cal:
         errs.append("календарь размещений investmint: 0 строк — возможно, изменилась разметка сайта")
     cal_isin = {r["isin"]: r for r in cal if r.get("isin")}
-    cand = set(agg)
+    cand = set(agg) | set(live)                         # всё, что сейчас открыто на площадке размещения, — независимо от даты старта
     for sid, ms in live.items():
         if any((m.get("today") or 0) > 0 or (m.get("n") or 0) > 0 or (m.get("settle") or "") >= cut for m in ms):
             cand.add(sid)
@@ -9107,7 +9368,31 @@ def pv_compute():
         else:
             errs.append("описание %s: %s" % (s, v))
     lap("desc")
-    new = [s for s, d in descs.items() if (d.get("issued") or d.get("start") or "") >= cut]
+    old_cut = _day_add(today, -PV_ACTIVE_MAX_DAYS)
+
+    def _alive(s):
+        st0 = descs[s].get("issued") or descs[s].get("start") or ""
+        return st0 >= old_cut or s in agg or any((m.get("today") or 0) > 0 or (m.get("n") or 0) > 0 for m in live[s])
+    # открыты на площадке размещения сейчас: затянувшиеся размещения не теряем, но многолетние «висяки»
+    # (региональные выпуски, годами числящиеся на PSAU без сделок) берём, только если по ним были сделки за PV_DAYS дней
+    active = {s for s in live if s in descs and _alive(s)}
+    new = [s for s, d in descs.items() if s in active or (d.get("issued") or d.get("start") or "") >= cut]
+    _pv["phase"] = "Размещено с начала (%d)" % len(active)
+    cums = {}
+
+    def c1(s):
+        d = descs[s]
+        frm = d.get("issued") or d.get("start") or cut
+        mks = sorted({"ndm" if m["b"] in PV_PLACE_NDM else "bonds" for m in live[s] if m["b"] in PV_PLACE}) or ["ndm"]
+        try:
+            return s, pv_cum(s, frm, today, mks, errs)
+        except Exception as ex:  # noqa: BLE001
+            errs.append("кумулятив %s: %s" % (s, str(ex)[:100]))
+            return s, None
+    for s, v in pool_map(c1, sorted(active), workers=8):
+        if v is not None:
+            cums[s] = v
+    lap("cum")
     _pv["phase"] = "Вторичные торги (%d)" % len(new)
     bms = {}
     if bonds_all is not None:
@@ -9130,7 +9415,7 @@ def pv_compute():
         d = descs[s]
         tp = [m for m in live.get(s, []) if m["b"] in PV_PLACE]
         rt = _pv_rating(d.get("isin") or s, pv_issuer_name(d.get("full") or d.get("name")))
-        row = pv_build_row(s, d, agg.get(s), tp, bms.get(s), today, rt)
+        row = pv_build_row(s, d, agg.get(s), tp, bms.get(s), today, rt, cums.get(s))
         if row["status"] == "upcoming" and (row["start"] or "") < today:
             continue                                    # открыт на площадке, но сделок не было и даты размещения в будущем нет
         rows.append(row)
@@ -9237,8 +9522,7 @@ def pv_secid_days(secid):
     errs, rows, live = [], [], []
     for mk in ("ndm", "bonds"):
         try:
-            rows += pv_hist_parse(pv_paged(PV_ISS + "history/engines/stock/markets/%s/securities/%s.json?iss.meta=off&iss.only=history"
-                                           "&history.columns=%s&from=%s&till=%s" % (mk, secid, _PV_HCOLS, frm, today), "history"))
+            rows += pv_sec_hist(mk, secid, frm, today)
         except Exception as ex:  # noqa: BLE001
             errs.append("%s: %s" % (mk, str(ex)[:100]))
         try:
@@ -10451,7 +10735,7 @@ def signals_payload(cfg, acc, q=None):
             "meta": meta, "params": {"min_turn": min_turn, "fee": fee * 100, "threshold": thr, "tax": tax_rate * 100},
             "replacements": repl, "skipped": skipped, "eps": SIG_EPS}
 # ═══════════════════ мониторинг портфеля: тревоги, ликвидность, история спредов ═══════════════════
-# Источники: журнал рейтинговых действий (ratings_log_v1, канал @issuerRatings), рейтинги и статус «под наблюдением»
+# Источники: журнал рейтинговых действий (ratings_log_v1, каналы @ru_ratings и @issuerRatings), рейтинги и статус «под наблюдением»
 # из каталога T-Invest, история торгов и описание выпуска на Мосбирже (ISS), кривая КБД по датам.
 # Чего программа НЕ видит: факт оплаты купона (ISS его не публикует), поэтому «задержка выплаты» определяется
 # только косвенно: флаги дефолта в описании выпуска на Мосбирже, дефолтный рейтинг (D/RD/C), остановка торгов.
@@ -10695,10 +10979,10 @@ def _mon_rating_alerts(rows_keys, events, cutoff, today=None):
                 seen[ident]["_lvl"].append(lvl)
                 seen[ident]["message"] = seen[ident]["_msg"] % "эмитент и облигации"
             continue
-        out.append({"id": "rt|%s|%s" % (e["agency"], e["post"]), "severity": sev, "kind": "rating", "date": e["date"],
+        out.append({"id": "rt|%s|%s%s" % (e["agency"], "rr" if e.get("src") == "ru_ratings" else "", e["post"]), "severity": sev, "kind": "rating", "date": e["date"],
                     "isin": hit[0].get("isin"), "isins": [h.get("isin") for h in hit], "name": issuer,
                     "bonds": [h.get("name") for h in hit], "message": msg, "url": e.get("url") or
-                    "https://t.me/issuerRatings/%s" % e["post"], "_lvl": [lvl], "_msg": msg.replace("(" + lvl + ")", "(%s)")})
+                    "https://t.me/%s/%s" % (e.get("src") or "issuerRatings", e["post"]), "_lvl": [lvl], "_msg": msg.replace("(" + lvl + ")", "(%s)")})
         seen[ident] = out[-1]
     for a in out:
         a.pop("_lvl", None)
@@ -14048,6 +14332,71 @@ def _tg_esc(s):
 
 
 TG_DISCLAIMER = "\n\n<i>Не является индивидуальной инвестиционной рекомендацией.</i>"
+TG_LIMIT = 3500                  # предел текста одного сообщения вместе с припиской
+_TG_MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
+
+
+def _tg_num(x, dec=0):
+    """1234567.8 -> «1 234 568» (пробел — разделитель тысяч), с dec знаками — запятая-разделитель."""
+    return ("{:,.%df}" % dec).format(x).replace(",", " ").replace(".", ",")
+
+
+def _tg_rub(x):
+    return _tg_num(x, 0 if abs(x) >= 100 or x == int(x) else 2) + " ₽"
+
+
+def _tg_pct(x, dec=2):
+    return _tg_num(x, dec) + "%"
+
+
+def _tg_date(iso):
+    """«2026-11-20» -> «20 ноября» (год — только если он не текущий)."""
+    try:
+        d = datetime.strptime(str(iso)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return _tg_esc(iso)
+    return "%d %s%s" % (d.day, _TG_MONTHS[d.month - 1], "" if d.year == date.today().year else " %d" % d.year)
+
+
+def _tg_link(url, text):
+    u = str(url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        return ""
+    return '<a href="%s">%s</a>' % (u.replace("&", "&amp;").replace('"', "%22").replace("<", "%3C").replace(">", "%3E"), _tg_esc(text))
+
+
+def _tg_moex(isin):
+    return _tg_link("https://www.moex.com/ru/issue.aspx?code=%s" % urllib.parse.quote(str(isin or "")), "на Мосбирже") if isin else ""
+
+
+def _tg_head(icon, title, sub=""):
+    return "%s <b>%s</b>%s" % (icon, _tg_esc(title), (" · " + _tg_esc(sub)) if sub else "")
+
+
+def _tg_cap(lines, shown, more=""):
+    """Первые shown строк + «…и ещё N» (more — пояснение после числа)."""
+    out = list(lines[:shown])
+    if len(lines) > shown:
+        out.append("…и ещё %d%s" % (len(lines) - shown, more))
+    return "\n".join(out)
+
+
+def _tg_fit(text, limit):
+    """Обрезка по границе строки с закрытием незакрытых тегов (иначе Telegram не разберёт разметку)."""
+    if len(text) <= limit:
+        return text
+    cut = text[:max(limit - 40, 1)]
+    cut = cut.rsplit("\n", 1)[0] if "\n" in cut else cut
+    cut = re.sub(r"<[^>]*$", "", cut)             # оборванный тег
+    cut = re.sub(r"&[a-z#0-9]*$", "", cut)        # оборванная сущность
+    stack = []
+    for m in re.finditer(r"<(/?)(b|i|a|code)\b[^>]*>", cut):
+        if m.group(1):
+            if m.group(2) in stack:
+                stack = stack[:len(stack) - stack[::-1].index(m.group(2)) - 1]
+        else:
+            stack.append(m.group(2))
+    return cut.rstrip() + "\n…" + "".join("</%s>" % t for t in reversed(stack))
 
 
 def tg_send(cfg, text):
@@ -14057,8 +14406,7 @@ def tg_send(cfg, text):
         raise ApiError("Уведомления работают через сервер данных, а он выключен («off»). Включите сервер данных в настройках.", 400)
     if not key:
         raise ApiError("Войдите по ключу из бота.", 400)
-    if len(text) > 3400:
-        text = text[:3400].rsplit("\n", 1)[0] if "\n" in text[:3400] else text[:3400]
+    text = _tg_fit(text, TG_LIMIT - len(TG_DISCLAIMER))
     try:
         code, j = tg_post_notify(srv, key, text + TG_DISCLAIMER)
     except Exception:  # noqa: BLE001
@@ -14110,7 +14458,8 @@ def tg_info(cfg, acc, q, force):
 
 
 def tg_test(cfg, body):
-    tg_send(load_config(), "✅ <b>TAnalytic</b>: тестовое сообщение. Уведомления подключены.")
+    tg_send(load_config(), "%s\n\nTAnalytic подключён к Telegram. Сюда будут приходить тревоги, выплаты и ежедневная сводка — "
+            "что именно, настраивается в приложении." % _tg_head("🧪", "Тестовое сообщение"))
     return {"ok": True}
 
 
@@ -14126,7 +14475,7 @@ API_POST["/api/tg/run"] = tg_run_now
 
 
 _TG_KIND = {"price": "📉", "spread": "📈", "offer": "🔔", "default": "⛔", "rating": "🏷", "watch": "👁", "outlook": "👁",
-            "halt": "⏸", "liquidity": "💧", "goal": "🎯", "reminder": "📝"}
+            "halt": "⏸", "liquidity": "💧", "goal": "⭐", "reminder": "📝"}
 _TG_COOL = {"price": 7 * DAY, "spread": 7 * DAY}      # повтор не раньше, чем через неделю; остальные тревоги — один раз
 
 
@@ -14138,12 +14487,22 @@ def _tg_key(a):
 
 
 def _tg_alert_line(a):
+    """«📉 <b>Бумага</b> — сообщение» и строка со ссылками (пресс-релиз/источник, бумага на Мосбирже)."""
     nm = a.get("name") or ""
-    return "%s <b>%s</b>: %s" % (_TG_KIND.get(a.get("kind"), "•"), _tg_esc(nm), _tg_esc(a.get("message")))
+    line = "%s <b>%s</b> — %s" % (_TG_KIND.get(a.get("kind"), "•"), _tg_esc(nm), _tg_esc(a.get("message")))
+    url = str(a.get("url") or "")
+    links = []
+    if url and "moex.com/ru/issue" not in url:
+        links.append(_tg_link(url, "Пресс-релиз" if a.get("kind") == "rating" else "Подробнее"))
+    if a.get("isin"):
+        links.append(_tg_moex(a["isin"]))
+    links = [x for x in links if x]
+    return line + ("\n" + " · ".join(links) if links else "")
 
 
-def _tg_dispatch(cfg, title, alerts, sent, now):
-    """Отправляет ещё не отправленные тревоги одним сообщением (до 10 штук). Возвращает число тревог."""
+def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
+    """Отправляет ещё не отправленные тревоги: до трёх сообщений за проверку, до 10 тревог и в предел длины каждое;
+    остальное уйдёт в следующий раз (в последнем сообщении об этом сказано). Возвращает число отправленных тревог."""
     fresh = []
     for a in alerts:
         k = _tg_key(a)
@@ -14153,10 +14512,23 @@ def _tg_dispatch(cfg, title, alerts, sent, now):
         fresh.append((k, a))
     if not fresh:
         return 0
-    sent_n = 0
-    for i in range(0, min(len(fresh), 30), 10):          # до трёх сообщений за проверку; остальное уйдёт в следующий раз
-        chunk = fresh[i:i + 10]
-        tg_send(cfg, "<b>%s</b>\n\n%s" % (_tg_esc(title), "\n\n".join(_tg_alert_line(a) for k, a in chunk)))
+    head = _tg_head(icon, title)
+    room = TG_LIMIT - len(TG_DISCLAIMER) - len(head) - 120
+    sent_n, i = 0, 0
+    for msg_no in range(3):
+        if i >= len(fresh):
+            break
+        chunk, lines, size = [], [], 0
+        while i < len(fresh) and len(chunk) < 10:
+            ln = _tg_alert_line(fresh[i][1])
+            if chunk and size + len(ln) + 2 > room:
+                break
+            chunk.append(fresh[i])
+            lines.append(ln)
+            size += len(ln) + 2
+            i += 1
+        tail = ("\n\n…и ещё %d — придут при следующей проверке" % (len(fresh) - i)) if msg_no == 2 and i < len(fresh) else ""
+        tg_send(cfg, "%s\n\n%s%s" % (head, "\n\n".join(lines), tail))
         for k, a in chunk:
             sent[k] = now
         sent_n += len(chunk)
@@ -14189,13 +14561,13 @@ def defaults_alerts(cfg, sent=None, rows=None, isins=None):
                 "date": r.get("date") or date.today().isoformat(), "url": r.get("url") or ""}
         what = "дефолт" if r.get("status") == "default" else "технический дефолт"
         ob = (r.get("obligation") or "обязательство").lower()
-        amt = (", %s ₽" % "{:,.0f}".format(r["amount"]).replace(",", " ")) if r.get("amount") else ""
-        due = (", срок %s" % _tg_dmy(r["due_date"])) if r.get("due_date") else ""
+        amt = (", %s" % _tg_rub(r["amount"])) if r.get("amount") else ""
+        due = (", срок %s" % _tg_date(r["due_date"])) if r.get("due_date") else ""
         kd, kx = "dfl|%s|%s" % (isin, tail), "dflx|%s|%s" % (isin, tail)
         if r.get("executed"):
             if kd in sent:
                 out.append(dict(base, id=kx, kind="default_ok", severity="medium",
-                                message="%s по бумаге исполнен(о): %s%s, раскрытие о выплате от %s" % (what, ob, amt, _tg_dmy(r["executed"]))))
+                                message="%s по бумаге исполнен(о): %s%s, раскрытие о выплате от %s" % (what, ob, amt, _tg_date(r["executed"]))))
         else:
             out.append(dict(base, id=kd, kind="default", severity="high",
                             message="%s по бумаге: %s%s%s (%s)" % (what, ob, amt, due, r.get("basis") or "")))
@@ -14220,26 +14592,27 @@ def tg_offer_due(items, today):
         if not isin or not od or od <= today:
             continue
         nm = _tg_esc(it.get("name") or isin)
+        lk = "\n" + _tg_moex(isin)
         ps, pe = it.get("period_start"), it.get("period_end")
         base = "ofr|%s|%s|" % (isin, od)
         if kind == "put":
             if it.get("coupon_status") == "announced" and it.get("new_rate") is not None and (not pe or today <= pe):
-                out.append((base + "coupon", "🔔 <b>%s</b>: эмитент объявил купон после пут-оферты (%s): %s %% годовых. Приём заявок открывается в период предъявления."
-                            % (nm, _tg_dmy(od), _f2(it["new_rate"]))))
+                out.append((base + "coupon", "🔔 <b>%s</b> — эмитент объявил купон после пут-оферты (%s): %s годовых. Приём заявок открывается в период предъявления.%s"
+                            % (nm, _tg_date(od), _tg_pct(it["new_rate"]), lk)))
             if ps and pe and ps <= today <= pe:
-                out.append((base + "open", "🔔 <b>%s</b>: открыт приём заявок по пут-оферте, с %s по %s (выкуп %s). Заявку подаёт брокер."
-                            % (nm, _tg_dmy(ps), _tg_dmy(pe), _tg_dmy(od))))
+                out.append((base + "open", "🔔 <b>%s</b> — открыт приём заявок по пут-оферте: с %s по %s (выкуп %s). Заявку подаёт брокер.%s"
+                            % (nm, _tg_date(ps), _tg_date(pe), _tg_date(od), lk)))
             if pe:
                 left = _of_days(today, pe)
                 if 0 <= left <= TG_OFR_CLOSE_DAYS and (not ps or ps <= today):
                     t = ("осталось %d дня подать заявку" % left if left >= 2 else "остался 1 день, чтобы подать заявку" if left == 1
                          else "сегодня последний день подачи заявки")
-                    out.append((base + "close", "⏰ <b>%s</b>: %s на пут-оферту (последний день %s, выкуп %s)." % (nm, t, _tg_dmy(pe), _tg_dmy(od))))
+                    out.append((base + "close", "⏰ <b>%s</b> — %s на пут-оферту (последний день %s, выкуп %s).%s" % (nm, t, _tg_date(pe), _tg_date(od), lk)))
         elif kind == "call":
             left = _of_days(today, od)
             if 0 < left <= TG_OFR_CALL_DAYS:
-                out.append((base + "call", "🔔 <b>%s</b>: возможное досрочное погашение (колл) %s, через %d дн. Решает эмитент, заявку подавать не нужно."
-                            % (nm, _tg_dmy(od), left)))
+                out.append((base + "call", "🔔 <b>%s</b> — возможное досрочное погашение (колл) %s, через %d дн. Решает эмитент, заявку подавать не нужно.%s"
+                            % (nm, _tg_date(od), left, lk)))
     return out
 
 
@@ -14278,42 +14651,42 @@ _TG_EV = {"coupon": "купон", "dividend": "дивиденд", "amortization"
 
 
 def _tg_ev_line(e):
-    amt = " · %s ₽" % ("{:,.0f}".format(e[3]).replace(",", " ")) if e[3] else ""
-    return "%s · %s · %s%s" % (e[0][8:] + "." + e[0][5:7], _TG_EV.get(e[1], "выплата"), _tg_esc(e[2]), amt)
+    """«20 ноября · <b>Выпуск</b> — купон, 5 000 ₽»."""
+    amt = ", %s" % _tg_rub(e[3]) if e[3] else ""
+    return "%s · <b>%s</b> — %s%s" % (_tg_date(e[0]), _tg_esc(e[2]), _TG_EV.get(e[1], "выплата"), amt)
 
 
 def tg_digest_text(cfg):
-    parts = ["<b>Сводка TAnalytic · %s</b>" % date.today().strftime("%d.%m.%Y")]
+    parts = [_tg_head("📈", "Сводка TAnalytic", _tg_date(date.today().isoformat()))]
     if cfg.get("token"):
         try:
             s = build_summary(cfg, "all", "all")
             p = s.get("portfolio") or {}
             if p.get("total") is not None:
                 d = p.get("daily")
-                parts.append("Портфель: %s ₽%s" % ("{:,.0f}".format(p["total"]).replace(",", " "),
-                             (" (за день %s%s ₽)" % ("+" if d >= 0 else "−", "{:,.0f}".format(abs(d)).replace(",", " "))) if d is not None else ""))
+                parts.append("💼 <b>Портфель</b> — %s%s" % (_tg_rub(p["total"]),
+                             (" (за день %s%s)" % ("+" if d >= 0 else "−", _tg_rub(abs(d)))) if d is not None else ""))
         except Exception:  # noqa: BLE001
             pass
         try:
             ev = _tg_payments(cfg, 7)
             if ev:
-                parts.append("Ближайшие 7 дней:\n" + "\n".join(_tg_ev_line(e) for e in ev[:8]) + ("\n…и ещё %d" % (len(ev) - 8) if len(ev) > 8 else ""))
+                parts.append("💰 <b>Ближайшие 7 дней</b>\n" + _tg_cap([_tg_ev_line(e) for e in ev], 8))
             else:
-                parts.append("Ближайшие 7 дней: выплат нет.")
+                parts.append("💰 <b>Ближайшие 7 дней</b> — выплат нет")
         except Exception:  # noqa: BLE001
             pass
         try:
             m = build_monitor(cfg, "all")
-            parts.append("Мониторинг портфеля: высоких тревог — %d, средних — %d." % (m["summary"]["high"], m["summary"]["medium"]))
+            parts.append("🔔 <b>Мониторинг</b> — высоких тревог: %d, средних: %d" % (m["summary"]["high"], m["summary"]["medium"]))
         except Exception:  # noqa: BLE001
             pass
     try:
         w = watch_payload(cfg)
         if w["items"]:
-            ln = []
-            for r in w["items"][:8]:
-                ln.append("%s: %s" % (_tg_esc(r["name"]), ("доходность %s %%" % _f2(r["yield_"])) if r.get("yield_") is not None else "нет данных"))
-            parts.append("Наблюдение (%d, тревог: %d):\n%s" % (len(w["items"]), len(w["alerts"]), "\n".join(ln)))
+            ln = ["<b>%s</b> — %s" % (_tg_esc(r["name"]), ("доходность %s" % _tg_pct(r["yield_"])) if r.get("yield_") is not None else "нет данных")
+                  for r in w["items"]]
+            parts.append("👁 <b>Наблюдение</b> (бумаг: %d, тревог: %d)\n%s" % (len(w["items"]), len(w["alerts"]), _tg_cap(ln, 8)))
     except Exception:  # noqa: BLE001
         pass
     return "\n\n".join(parts)
@@ -14344,7 +14717,7 @@ def tg_tick(force_digest=False, manual=False):
                 today_ = date.today().isoformat()
                 due = [(k, t) for k, t in tg_offer_due(_tg_offer_items(cfg, today_), today_) if k not in sent][:10]
                 if due:
-                    tg_send(cfg, "<b>Оферты по портфелю</b>\n\n" + "\n\n".join(t for _k, t in due))
+                    tg_send(cfg, _tg_head("🔔", "Оферты по портфелю") + "\n\n" + "\n\n".join(t for _k, t in due))
                     for k, _t in due:
                         sent[k] = now
                     n += len(due)
@@ -14353,7 +14726,7 @@ def tg_tick(force_digest=False, manual=False):
         try:
             if cfg.get("tg_on_watch", True) and (watch_isins() or notes_all()):
                 al = [a for a in watch_payload(cfg)["alerts"] if a["severity"] != "info"]
-                n += _tg_dispatch(cfg, "Наблюдение и цели", al, sent, now)
+                n += _tg_dispatch(cfg, "Наблюдение и цели", al, sent, now, icon="⭐")
         except Exception:  # noqa: BLE001
             pass
         try:        # крупные сделки и всплески объёма по бумагам списка (13v_flows.py; ключ дедупликации — id тревоги)
@@ -14376,7 +14749,7 @@ def tg_tick(force_digest=False, manual=False):
                     if k not in sent:
                         fresh.append((k, e))
                 if fresh:
-                    tg_send(cfg, "<b>Ближайшие выплаты (%d дн.)</b>\n\n%s" % (days, "\n".join(_tg_ev_line(e) for k, e in fresh[:15])))
+                    tg_send(cfg, "%s\n\n%s" % (_tg_head("💰", "Ближайшие выплаты", "%d дн." % days), _tg_cap([_tg_ev_line(e) for k, e in fresh], 15)))
                     for k, e in fresh:
                         sent[k] = now
                     n += len(fresh)
@@ -14430,6 +14803,7 @@ TAX_SKIP_TYPES = ("currency", "futures", "dfa")
 TAX_LDV_FROM = date(2014, 1, 1)
 TAX_LDV_LIMIT = 3000000.0
 TAX_IIS_LIMIT = 400000.0
+TAX_IIS3_EXEMPT_LIMIT = 30000000.0   # ст. 219.2 НК РФ: предел освобождаемого финансового результата по ИИС-3 за весь срок
 TAX_SETTINGS_KEY = "tax:settings"
 TAX_SPREAD = 0.001
 
@@ -14522,7 +14896,8 @@ def tax_settings():
                 carry[str(int(k))] = round(float(v), 2)
         except (TypeError, ValueError):
             pass
-    return {"iis": iis, "loss_carry": carry, "offset_coupons": bool(s.get("offset_coupons"))}
+    return {"iis": iis, "loss_carry": carry, "offset_coupons": bool(s.get("offset_coupons")),
+            "ndfl_rate": 15 if str(s.get("ndfl_rate")) in ("15", "0.15") else 13}
 
 
 def mem_clear_tax():
@@ -14543,6 +14918,8 @@ def tax_settings_save(cfg, body):
                     except ValueError:
                         raise ApiError("Дата открытия ИИС должна быть в формате ГГГГ-ММ-ДД", 400)
                 cur["iis"][str(k)] = {"type": v.get("type") if v.get("type") in ("A", "B", "3") else "", "opened": op}
+    if "ndfl_rate" in body:
+        cur["ndfl_rate"] = 15 if str(body["ndfl_rate"]).strip() in ("15", "0.15") else 13
     if "offset_coupons" in body:
         cur["offset_coupons"] = bool(body["offset_coupons"])
     if isinstance(body.get("loss_carry"), dict):
@@ -14846,6 +15223,7 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
         if int(k) not in ys:
             pool.append([int(k), float(v)])
     rows, nkd_pool = [], 0.0
+    iis_left = TAX_IIS3_EXEMPT_LIMIT
     for y in sorted(ys):
         i = inc.get(y, {})
         sec = [s for s in sales if s["bucket"] == "sec" and s["sdate"].year == y]
@@ -14881,8 +15259,11 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
         deriv = sum(s["result"] for s in dv) + i.get("deriv", 0.0) - i.get("deriv_fee", 0.0)
         base = trade_base + div + coupon_net + over + max(0.0, deriv)
         tax, lo, hi = tx_ndfl(base, y)
+        iis_used = 0.0
         if iis_exempt:
-            tax = 0.0
+            iis_used = min(max(0.0, base), iis_left)
+            iis_left -= iis_used
+            tax, lo, hi = tx_ndfl(base - iis_used, y)
         saved = 0.0
         if exempt > 0.005 and not iis_exempt:
             tb0 = tx_apply_carry(pool_before, trade, y)[1]
@@ -14893,7 +15274,7 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
             "trade": trade, "ldv_exempt": exempt, "ldv_limit": limit if elig else 0.0, "ldv_saved": saved, "ldv_n": len(elig),
             "carry_used": used, "loss_new": new_loss, "trade_base": trade_base,
             "dividends": div, "coupons": coupon_net, "coupons_gross": i.get("coupon", 0.0), "nkd_adj": i.get("nkd_recv", 0.0) - un, "coupon_offset": coff,
-            "overnight": over, "deriv": deriv, "base": base, "tax": tax, "tax13": lo * 0.13, "tax15": hi * 0.15,
+            "overnight": over, "deriv": deriv, "base": base, "iis_exempt_used": iis_used, "tax": tax, "tax13": lo * 0.13, "tax15": hi * 0.15,
             "withheld": withheld, "w": {k[2:]: v for k, v in i.items() if k.startswith("w_")},
             "diff": tax - withheld, "diff_pct": ((tax - withheld) / withheld * 100.0) if withheld > 1 else None,
             "broker_trade": i.get("bk_yield", 0.0), "deposits": i.get("dep", 0.0), "withdrawals": i.get("wd", 0.0)})
@@ -14903,7 +15284,7 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
 # ── состояние: группы счетов, ИИС, ЛДВ, подсказки ──
 
 TAX_SUM_KEYS = ("proceeds", "cost", "fees", "trade", "ldv_exempt", "ldv_saved", "carry_used", "loss_new", "trade_base", "dividends", "coupons",
-                "overnight", "deriv", "base", "tax", "tax13", "tax15", "withheld", "broker_trade", "deposits", "withdrawals")
+                "overnight", "deriv", "base", "iis_exempt_used", "tax", "tax13", "tax15", "withheld", "broker_trade", "deposits", "withdrawals")
 
 
 def tx_gkey(a):
@@ -14938,6 +15319,8 @@ def tx_sum_rows(per_group, exempt=None):
         for r in rows:
             if not (exempt and exempt[gi]):
                 comb[r["year"]] += r["base"]
+            elif r.get("iis_exempt_used") is not None:
+                comb[r["year"]] += r["base"] - r["iis_exempt_used"]
             t = tot.setdefault(r["year"], {"year": r["year"], "w": defaultdict(float)})
             for k in TAX_SUM_KEYS:
                 t[k] = t.get(k, 0.0) + r[k]
@@ -15265,6 +15648,7 @@ def tx_decl(st):
 
 def tx_iis_table(st, settings):
     out = []
+    dr = 0.15 if str((settings or {}).get("ndfl_rate")) in ("15", "0.15") else 0.13
     for g in st["groups"]:
         if g["kind"] != "iis":
             continue
@@ -15275,9 +15659,9 @@ def tx_iis_table(st, settings):
             if r["deposits"] > 0 or r["withdrawals"] > 0:
                 b = min(r["deposits"], TAX_IIS_LIMIT)
                 ys.append({"year": r["year"], "deposits": r["deposits"], "withdrawals": r["withdrawals"], "deduct_base": b if ded else 0.0,
-                           "deduct": b * 0.13 if ded else 0.0, "over": max(0.0, r["deposits"] - TAX_IIS_LIMIT)})
+                           "deduct": b * dr if ded else 0.0, "over": max(0.0, r["deposits"] - TAX_IIS_LIMIT)})
         e = dict(i)
-        e.update(years=ys, deduct_total=sum(y["deduct"] for y in ys),
+        e.update(years=ys, deduct_rate=dr, deduct_total=sum(y["deduct"] for y in ys),
                  tax_if_closed=sum(r["tax"] for r in g["rows"]) if not i["exempt"] else 0.0,
                  trade_total=sum(r["trade"] for r in g["rows"]), income_total=sum(r["dividends"] + r["coupons"] for r in g["rows"]))
         out.append(e)
@@ -21038,7 +21422,7 @@ def dbx_xirr(flows):
     """Годовая эффективная ставка по потокам [(date, сумма)]; None, если знаки не меняются."""
     if not flows or not any(a < 0 for _, a in flows) or not any(a > 0 for _, a in flows):
         return None
-    t0 = flows[0][0]
+    t0 = min(d for d, _ in flows)
 
     def npv(r):
         return sum(a / (1 + r) ** ((d - t0).days / 365.0) for d, a in flows)
@@ -23588,7 +23972,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def ok_host(self):
         port = self.server.server_address[1]
-        return self.headers.get("Host", "") in ("127.0.0.1:%d" % port, "localhost:%d" % port)
+        return self.headers.get("Host", "") in ("127.0.0.1:%d" % port, "localhost:%d" % port, "[::1]:%d" % port)
 
     def guard(self, fn):
         try:
@@ -23871,6 +24255,12 @@ def find_app_browser():
 
 
 def open_window(url):
+    if sys.platform == "win32":                                  # своя иконка в панели задач, а не python.exe
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TAnalytic.App")
+        except Exception:
+            pass
     exe = find_app_browser()
     if exe:
         try:
@@ -24681,20 +25071,7 @@ tr.scr-low td{opacity:.5}
   .kb-main{padding:16px 14px}
   .kb-main h2.kb-t{font-size:19px}
 }
-/* ── Настройки: оглавление, группы, данные на компьютере ── */
-.set-toc{position:sticky;top:0;z-index:6;display:flex;flex-wrap:wrap;gap:6px;padding:10px 0;margin:0 0 6px;background:var(--bg);border-bottom:1px solid var(--line)}
-.set-toc a{padding:5px 12px;border-radius:999px;border:1px solid var(--line2);background:var(--card);color:var(--tx2);font-size:12.5px;text-decoration:none;white-space:nowrap}
-.set-toc a:hover{color:var(--tx);background:var(--card2)}
-.set-sec{display:grid;gap:14px;margin-top:22px;scroll-margin-top:64px}
-.set-sec>.card{margin:0}
-.set-gh{font-size:17px;font-weight:650;letter-spacing:-.01em;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
-.set-gh span{font-size:12px;font-weight:500;color:var(--mu)}
-.set-sub{border-top:1px solid var(--line);padding-top:14px}
-.set-adv{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px 20px}
-.set-adv>summary{cursor:pointer;font-weight:600;color:var(--tx2)}
-.set-adv>summary span{margin-left:10px;font-weight:400;font-size:12px;color:var(--mu)}
-.set-adv .card{background:var(--card2)}
-.ld-path{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-size:13px;word-break:break-all}
+/* ── Настройки: данные на компьютере (остальное — в 56_settings_v2.css) ── */
 .ld-parts{display:grid;gap:8px}
 .ld-tot{font-size:13px;color:var(--tx2)}
 .ld-row{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(60px,1fr) 70px;gap:12px;align-items:center;font-size:13px}
@@ -24702,11 +25079,6 @@ tr.scr-low td{opacity:.5}
 .ld-bar{height:6px;border-radius:4px;background:var(--card2);overflow:hidden}
 .ld-bar i{display:block;height:100%;background:var(--s1);border-radius:4px}
 .ld-v{text-align:right;color:var(--tx2)}
-.ld-danger{border-top:1px solid var(--line);padding-top:14px}
-@media(max-width:760px){
-  .set-toc{top:0;gap:4px;padding:6px 0}.set-toc a{padding:3px 9px;font-size:12px}.set-sec{scroll-margin-top:96px}
-  .ld-row{grid-template-columns:1fr auto;gap:4px 10px}.ld-bar{grid-column:1/3;order:3}
-}
 /* ── Тарифы Free / Pro: заглушка, плашки, бейджи ── */
 .pro-b{font-style:normal;font-size:9px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-left:auto;padding:1px 5px;border-radius:5px;background:#3b82f622;color:var(--ac);border:1px solid #3b82f644}
 #nav button{position:relative}
@@ -25318,6 +25690,519 @@ body.sk-open{overflow:hidden}
 .cf36-in{width:70px;background:var(--card);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 8px}
 .cf36-src{font-size:12px;color:var(--mu);margin-bottom:10px}
 @media(max-width:700px){.cf36-grid{min-width:620px}}
+/* ── Премиальный слой оформления: спокойная палитра, тонкие линии, глубина, строгая типографика ──
+   Загружается последним и переопределяет базовые стили; светлая тема получает свои токены ниже. */
+:root{
+  --bg:#07090d;--side:#090c12;--card:#0c1017;--card2:#131923;--card-hover:#171e2a;
+  --line:#ffffff0f;--line2:#ffffff1c;
+  --tx:#edf1f7;--tx2:#9aa5b6;--mu:#6b7688;
+  --ac:#3b82f6;--ac2:#2f6fe0;--ac-tx:#7aa8f8;--ac-glow:rgba(59,130,246,.22);
+  --pos:#2bc48a;--neg:#f0626a;
+  --sk-1:#0c1017;--sk-2:#151b26;
+  --hl:inset 0 1px 0 #ffffff08;
+  --elev:0 1px 2px #00000066,0 8px 24px -12px #00000080;
+  --glass:rgba(7,9,13,.72);
+  --lbl:#7d889a;
+  --r:16px;
+}
+:root[data-theme=light]{
+  --bg:#f5f6f8;--side:#fbfbfc;--card:#ffffff;--card2:#f3f5f8;--card-hover:#f7f8fa;
+  --line:#0f172a12;--line2:#0f172a21;
+  --tx:#0b1220;--tx2:#4a5568;--mu:#6b7486;
+  --ac:#2563eb;--ac2:#1d4fd7;--ac-tx:#1d4ed8;
+  --hl:inset 0 1px 0 #ffffff;
+  --elev:0 1px 2px #0f172a0d,0 8px 24px -14px #0f172a26;
+  --glass:rgba(245,246,248,.78);
+  --lbl:#6b7486;
+}
+
+body{font-feature-settings:"cv11","ss01","ss03";letter-spacing:-.008em}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:#ffffff14;border:2px solid transparent;background-clip:padding-box;border-radius:8px}
+::-webkit-scrollbar-thumb:hover{background:#ffffff26;background-clip:padding-box}
+[data-theme=light] ::-webkit-scrollbar-thumb{background:#0f172a1f;background-clip:padding-box}
+
+/* ── боковая панель ── */
+aside{background:var(--side);border-right:1px solid var(--line)}
+.logo{padding:4px 8px 18px}
+.logo small{letter-spacing:.01em}
+.nav{gap:2px}
+.nav button{padding:8px 11px;border-radius:10px;font-size:13.5px;color:var(--tx2)}
+.nav button:hover{background:#ffffff08;color:var(--tx)}
+.nav button.on{background:linear-gradient(90deg,#3b82f61f,#3b82f608 70%,transparent);color:var(--tx);box-shadow:inset 2px 0 0 var(--ac)}
+.nav button.on svg{opacity:1;color:var(--ac-tx)}
+[data-theme=light] .nav button:hover{background:#0f172a08}
+[data-theme=light] .nav button.on{background:linear-gradient(90deg,#2563eb17,#2563eb05 70%,transparent)}
+.nav .sep{background:var(--line);margin:10px 8px}
+.acl button.on{background:#ffffff08;box-shadow:inset 2px 0 0 var(--ac)}
+[data-theme=light] .acl button.on{background:#0f172a08}
+
+/* ── верхняя панель: одна строка, стекло ── */
+.top{position:relative;z-index:5;gap:10px;padding:12px 28px;border-bottom:1px solid var(--line);background:var(--glass);backdrop-filter:saturate(1.4) blur(14px);-webkit-backdrop-filter:saturate(1.4) blur(14px)}
+.top h1{font-size:19px;font-weight:650;letter-spacing:-.025em}
+.top h1 small{font-size:12.5px;font-weight:500;color:var(--mu)}
+.top .seg button{padding:5px 11px;font-size:12.5px}
+.top .btn{padding:7px 11px;font-size:12.5px}
+#refresh .btn-tx{display:none}#refresh{padding:7px 9px}
+.srch-pill{padding:6px 10px}
+.upd{font-size:11.5px}
+.top h1 small{display:none}
+@media(max-width:1680px){.top .upd{display:none}.srch-pill .srch-tx{display:none}.srch-pill{gap:6px}}
+.tkr{height:28px;background:var(--side);border-bottom:1px solid var(--line);font-size:11.5px}
+.tkr .tk-it{border-right-color:var(--line)}
+.disc{padding:5px 28px;font-size:10.5px;color:var(--mu);border-top:1px solid var(--line);background:var(--side);opacity:.85}
+
+/* ── демо-баннер: тонкая строка, а не плашка ── */
+#demo-bar{margin:0;padding:7px 28px;border-radius:0;border:0;border-bottom:1px solid var(--line);
+  background:linear-gradient(90deg,#3b82f61a,#3b82f608 60%,transparent);font-size:12.5px;color:var(--tx2)}
+#demo-bar b,#demo-bar strong{color:var(--tx)}
+#demo-bar .btn{padding:4px 10px;font-size:12px;border-radius:8px}
+
+/* ── поверхности ── */
+.card{background:linear-gradient(180deg,#ffffff05,#ffffff00 120px),var(--card);border:1px solid var(--line);border-radius:var(--r);
+  box-shadow:var(--hl),var(--elev);padding:20px 22px}
+[data-theme=light] .card{background:var(--card)}
+.card h2{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em;margin-bottom:16px}
+.card h2 .sp{text-transform:none;letter-spacing:0;font-size:12px}
+.card h2 .btn,.card h2 button,.card h2 a{text-transform:none;letter-spacing:0}
+.wrap{gap:18px}
+.g{gap:18px}
+
+/* ── главный блок «Стоимость портфеля» ── */
+.hero{background:radial-gradient(90% 140% at 100% 0%,#3b82f61f 0%,transparent 55%),radial-gradient(60% 90% at 0% 100%,#2bc48a0d 0%,transparent 60%),linear-gradient(180deg,#ffffff06,#ffffff00),var(--card);padding:26px 28px}
+.hero:after{display:none}
+[data-theme=light] .hero{background:radial-gradient(90% 140% at 100% 0%,#2563eb14 0%,transparent 55%),var(--card)}
+.hero .lbl{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em}
+.hero .val{font-size:46px;font-weight:600;letter-spacing:-.04em;margin-top:8px}
+.hero .val small{font-size:26px;font-weight:500;color:var(--mu)}
+.hero .meta{gap:34px}
+.hero .meta div span{font-size:11.5px;color:var(--lbl)}
+.hero .meta div b{font-size:18px;font-weight:600;letter-spacing:-.02em}
+
+/* ── KPI ── */
+.kpi{padding:18px 20px}
+.kpi .k{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em}
+.kpi .k i{width:6px;height:6px;border-radius:50%}
+.kpi .v{font-size:23px;font-weight:600;letter-spacing:-.03em;margin-top:10px}
+.kpi .s{font-size:12px;margin-top:4px}
+
+/* ── пилюли и метки ── */
+.pill{font-weight:600;padding:3px 9px}
+.pill.pos{background:#2bc48a14;box-shadow:inset 0 0 0 1px #2bc48a29}
+.pill.neg{background:#f0626a14;box-shadow:inset 0 0 0 1px #f0626a29}
+.tag{background:#ffffff08;box-shadow:inset 0 0 0 1px var(--line);color:var(--tx2);border-radius:6px}
+[data-theme=light] .tag{background:#0f172a06}
+.cap{color:var(--cap-tx,#fff);font-weight:650;letter-spacing:.04em}
+.cap-fix{background:#2bc48a1f;--cap-tx:#5fe0ae;box-shadow:inset 0 0 0 1px #2bc48a40}
+.cap-lnk{background:#0ea5e91f;--cap-tx:#67cdf5;box-shadow:inset 0 0 0 1px #0ea5e940}
+.cap-fl{background:#7c3aed24;--cap-tx:#b9a1fb;box-shadow:inset 0 0 0 1px #7c3aed4d}
+[data-theme=light] .cap-fix{--cap-tx:#047857}
+[data-theme=light] .cap-lnk{--cap-tx:#0369a1}
+[data-theme=light] .cap-fl{--cap-tx:#6d28d9}
+
+/* ── кнопки и переключатели ── */
+.btn{border-radius:10px;background:linear-gradient(180deg,#ffffff1f,#ffffff00),var(--ac);
+  box-shadow:inset 0 1px 0 #ffffff2e,0 0 0 1px #1d4fd7,0 1px 2px #0000004d;transition:background-color .15s,box-shadow .15s,transform .15s}
+.btn:hover{background:linear-gradient(180deg,#ffffff24,#ffffff00),var(--ac2);box-shadow:inset 0 1px 0 #ffffff2e,0 0 0 1px #1d4fd7,0 0 0 4px var(--ac-glow)}
+.btn:active{transform:translateY(.5px)}
+.btn.ghost{background:#ffffff06;color:var(--tx);border:0;box-shadow:inset 0 0 0 1px var(--line2)}
+.btn.ghost:hover{background:#ffffff0d;box-shadow:inset 0 0 0 1px #ffffff2b}
+[data-theme=light] .btn.ghost{background:#fff;box-shadow:inset 0 0 0 1px var(--line2),0 1px 2px #0f172a0d}
+[data-theme=light] .btn.ghost:hover{background:var(--card2)}
+.btn.danger{box-shadow:inset 0 0 0 1px #f0626a55;border:0;background:transparent}
+
+.seg{background:#ffffff05;border:1px solid var(--line);border-radius:11px;padding:3px}
+.seg button{border-radius:8px;color:var(--tx2)}
+.seg button.on{background:var(--card2);color:var(--tx);box-shadow:inset 0 1px 0 #ffffff0d,0 0 0 1px var(--line2),0 1px 2px #00000040}
+[data-theme=light] .seg{background:#0f172a08}
+[data-theme=light] .seg button.on{background:#fff;box-shadow:0 0 0 1px var(--line2),0 1px 2px #0f172a14}
+
+.scr-chip{background:transparent;border-color:var(--line2)}
+.scr-chip.on{background:#3b82f61a;color:var(--ac-tx);border-color:#3b82f659}
+
+input.in,.in,select.in,textarea.in{background:#ffffff05;border:1px solid var(--line2);border-radius:10px;transition:border-color .15s,box-shadow .15s}
+.in:focus{outline:0;border-color:#3b82f699;box-shadow:0 0 0 3px var(--ac-glow)}
+[data-theme=light] .in{background:#fff}
+
+/* ── навигация раздела: подчёркнутые вкладки вместо коробки ── */
+.ux-sub{background:transparent;border:0;border-bottom:1px solid var(--line);border-radius:0;padding:0;gap:22px}
+.ux-sub button{padding:9px 1px 11px;border-radius:0;font-size:13.5px;color:var(--mu)}
+.ux-sub button:hover{color:var(--tx)}
+.ux-sub button.on{background:transparent;color:var(--tx);box-shadow:inset 0 -2px 0 var(--ac)}
+[data-theme=light] .ux-sub button.on{background:transparent;box-shadow:inset 0 -2px 0 var(--ac)}
+.ux-subwrap{margin-bottom:0;width:100%}
+.ux-subwrap .ux-sub{flex:1}
+.ux-why{background:transparent;border:0;padding:0 2px;color:var(--mu);font-size:12.5px}
+.ux-why-x{border-color:var(--line)}
+
+/* ── таблицы ── */
+th{background:var(--card);color:var(--lbl);font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.06em;padding:10px 10px;border-bottom:1px solid var(--line)}
+td{padding:11px 10px;border-bottom:1px solid #ffffff08}
+[data-theme=light] td{border-bottom-color:#0f172a0b}
+tr:hover td{background:#ffffff05}
+.tbl table tr:hover td:first-child{background:#141a24}
+[data-theme=light] .tbl table tr:hover td:first-child{background:#f7f8fa}
+.tk b{font-weight:600;letter-spacing:-.01em}
+
+/* ── аватары бумаг: приглушённый тон вместо «радуги» ── */
+.av{background:color-mix(in srgb,var(--avc,#64748b) 22%,#0c1017);color:color-mix(in srgb,var(--avc,#64748b) 45%,#fff);
+  box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--avc,#64748b) 40%,transparent);font-weight:650;letter-spacing:.02em}
+[data-theme=light] .av{background:color-mix(in srgb,var(--avc,#64748b) 14%,#fff);color:color-mix(in srgb,var(--avc,#64748b) 80%,#000)}
+
+/* ── мелочи ── */
+.note{color:var(--mu)}
+.msg{border-radius:12px}
+#tip{border-radius:10px;box-shadow:0 12px 32px -8px #000000b3,0 0 0 1px var(--line2)}
+
+/* ── выезжающие панели: глубже тень, плавное закрытие ── */
+#bc-ov,#sk-ov{background:#03050a99;backdrop-filter:blur(3px) saturate(1.2);-webkit-backdrop-filter:blur(3px) saturate(1.2)}
+#bc-ov .bc-dr,#sk-ov .sk-dr{border-left:1px solid var(--line2);box-shadow:-24px 0 64px -12px #000000a6}
+.ov-leave{animation:ovFade .22s ease forwards!important}
+.ov-leave>div{animation:ovOut .22s cubic-bezier(.4,0,1,1) forwards!important}
+@keyframes ovFade{to{opacity:0}}
+@keyframes ovOut{to{transform:translateX(100%)}}
+/* ── Графики: единая палитра, волосяная сетка, скруглённые столбики, подсветка при наведении, анимация появления ──
+   Загружается после 52_premium.css. Палитра серий --s1..--s8: синий, голубой, бирюзовый, янтарный, розовый, оливковый, фиолетовый, коралловый
+   (порядок диаграмм задаёт PAL в 01_core.js: синий → бирюзовый → янтарный → фиолетовый → розовый → голубой → оливковый → коралловый). */
+:root{
+  --s1:#4f8ef7;--s2:#4cc3ec;--s3:#2bbf9a;--s4:#e3a540;--s5:#ec6f91;--s6:#a7c35a;--s7:#9b87f5;--s8:#f08a5d;
+  --zero-line:#ffffff2e;
+}
+:root[data-theme=light]{
+  --s1:#3b78e6;--s2:#1fa3d4;--s3:#12a383;--s4:#d08c1c;--s5:#d94f78;--s6:#86a63a;--s7:#7f6ae0;--s8:#e2703a;
+  --zero-line:#0f172a3d;
+}
+
+/* сетка и оси */
+:root .grid-l{stroke:var(--line);stroke-width:1;stroke-dasharray:2 4;shape-rendering:crispEdges}
+:root .grid-l.z{stroke:var(--zero-line);stroke-dasharray:none}
+.ax{fill:var(--mu);font-size:11px;font-variant-numeric:tabular-nums}
+.chart svg{display:block;overflow:visible}
+
+/* столбики: плавное приглушение остальных, рост от базовой линии при первом показе */
+.bg,.bm{transition:opacity .15s}
+.bm{shape-rendering:geometricPrecision}
+@keyframes chBarGrow{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+@keyframes chFade{from{opacity:0}to{opacity:1}}
+@keyframes chDraw{to{stroke-dashoffset:0}}
+@keyframes chArc{from{opacity:0;transform:scale(.92)}to{opacity:1;transform:scale(1)}}
+svg.anim .bg{animation:chBarGrow .45s cubic-bezier(.16,1,.3,1) both}
+svg.anim .ln{stroke-dasharray:1;stroke-dashoffset:1;animation:chDraw 1s cubic-bezier(.16,1,.3,1) .05s forwards}
+svg.anim .ls,svg.anim .la{animation:chFade .8s ease .1s both}
+svg.anim .ld{animation:chFade .35s ease .8s both}
+svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
+@media (prefers-reduced-motion:reduce){svg.anim .bg,svg.anim .ln,svg.anim .ls,svg.anim .la,svg.anim .ld,svg.anim .arc{animation:none!important;stroke-dasharray:none;stroke-dashoffset:0}.bg,.bm,.arc{transition:none}}
+@media print{svg.anim .bg,svg.anim .ln,svg.anim .ls,svg.anim .la,svg.anim .ld,svg.anim .arc{animation:none!important}svg.anim .ln{stroke-dasharray:none;stroke-dashoffset:0}}
+
+/* пончик */
+.arc{transition:opacity .15s,transform .18s cubic-bezier(.2,.7,.3,1)}
+.dn-v{fill:var(--tx);font-weight:600;letter-spacing:-.03em}
+.dn-c{fill:var(--lbl);font-size:11px;font-weight:600;letter-spacing:.07em;text-transform:uppercase}
+.donut-wrap{gap:26px}
+.dl{gap:10px}
+.dl div{grid-template-columns:8px 1fr auto auto;gap:10px;font-size:12.5px;transition:opacity .15s}
+.dl div span{color:var(--tx2)}
+.dl i{width:8px;height:8px;border-radius:50%}
+.dl em{color:var(--mu);font-size:12px}
+
+/* легенды */
+.legend{gap:8px 18px;font-size:12px;color:var(--tx2);margin-bottom:14px}
+.legend span{gap:7px}
+.legend i{width:8px;height:8px;border-radius:50%;flex:none}
+.legend i.iss-hatch{border-radius:2px}
+.lg2{font-size:12px;color:var(--tx2);gap:8px 18px}
+.lg2 span{gap:7px}.lg2 i{width:8px;height:8px;border-radius:50%}
+
+/* горизонтальные полосы */
+.hb .tr{height:8px;background:var(--line);border-radius:4px}
+.hb .tr b{position:relative;border-radius:4px}
+.hb .tr b::after{content:"";position:absolute;inset:0;border-radius:inherit;background:linear-gradient(90deg,#ffffff00,#ffffff2b)}
+:root[data-theme=light] .hb .tr b::after{background:linear-gradient(90deg,#ffffff00,#ffffff40)}
+
+/* подсказка */
+#tip{background:color-mix(in srgb,var(--card) 88%,transparent);backdrop-filter:blur(12px) saturate(1.3);-webkit-backdrop-filter:blur(12px) saturate(1.3);
+  border:1px solid var(--line2);border-radius:10px;padding:10px 12px;font-size:12px;min-width:170px;
+  box-shadow:0 14px 34px -10px #000000a6,0 2px 6px #00000040;transition:opacity .12s}
+:root[data-theme=light] #tip{background:color-mix(in srgb,var(--card) 90%,transparent);box-shadow:0 14px 34px -12px #0f172a40,0 2px 6px #0f172a14}
+#tip b{font-size:12.5px;font-weight:600;margin-bottom:6px}
+#tip div{gap:8px;margin-top:4px;font-size:12px}
+#tip div i{width:8px;height:8px;border-radius:50%}
+#tip div span{font-weight:600;font-variant-numeric:tabular-nums}
+#tip div.tot{border-top:1px solid var(--line2);padding-top:6px;margin-top:7px;color:var(--tx2)}
+/* поповер с пресс-релизами у тега рейтинга */
+.tag.rt-click{cursor:pointer}
+.tag.rt-click:hover{filter:brightness(1.15)}
+.tag.rt-click:focus-visible{outline:2px solid var(--ac);outline-offset:1px}
+#rt-pop{position:fixed;z-index:90;min-width:240px;max-width:360px;background:var(--card);border:1px solid var(--line2);border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.35);padding:6px;font-size:12.5px;color:var(--tx)}
+#rt-pop .rt-pop-r{display:flex;align-items:baseline;gap:8px;padding:6px 8px;border-radius:8px;flex-wrap:wrap}
+#rt-pop .rt-pop-r:hover{background:var(--card2)}
+#rt-pop .rt-pop-r b{min-width:68px}
+#rt-pop .rt-pop-r>span{color:var(--tx2);flex:1}
+#rt-pop a{color:var(--ac-tx);text-decoration:none;white-space:nowrap}
+#rt-pop a:hover{text-decoration:underline}
+:root[data-theme=light] #rt-pop{box-shadow:0 10px 28px rgba(15,23,42,.16)}
+/* ── Приятные мелочи: тосты, индикатор загрузки, шпаргалка клавиш ── */
+
+/* тосты: стекло, стек снизу справа */
+#toasts{position:fixed;right:22px;bottom:44px;z-index:1300;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none}
+.toast-i{pointer-events:auto;cursor:pointer;display:flex;align-items:center;gap:10px;max-width:min(420px,calc(100vw - 44px));
+  padding:10px 15px 10px 12px;border-radius:12px;font-size:13px;line-height:1.35;color:var(--tx);
+  background:var(--glass);border:1px solid var(--line2);box-shadow:var(--hl),0 10px 30px -10px #000000a0;
+  backdrop-filter:saturate(1.5) blur(16px);-webkit-backdrop-filter:saturate(1.5) blur(16px);
+  opacity:0;transform:translateY(10px) scale(.98);transition:opacity .22s ease,transform .26s cubic-bezier(.2,.8,.2,1)}
+.toast-i.in{opacity:1;transform:none}
+.toast-i.out{opacity:0;transform:translateX(14px) scale(.98)}
+.toast-i svg{width:18px;height:18px;flex:none;padding:3px;border-radius:50%;box-sizing:content-box;background:color-mix(in srgb,currentColor 14%,transparent)}
+.toast-i.k-ok svg{color:var(--pos)}.toast-i.k-err svg{color:var(--neg)}.toast-i.k-info svg{color:var(--ac-tx)}
+[data-theme=light] .toast-i{box-shadow:var(--hl),0 10px 30px -12px #0f172a40}
+
+/* индикатор фоновой загрузки под верхней панелью */
+#dl-bar{position:absolute;left:0;right:0;bottom:-1px;height:2px;overflow:hidden;opacity:0;pointer-events:none;transition:opacity .28s ease}
+#dl-bar.on{opacity:1}
+#dl-bar i{position:absolute;top:0;bottom:0;left:0;width:40%;border-radius:2px;background:linear-gradient(90deg,transparent,var(--ac),var(--ac-tx),transparent);
+  box-shadow:0 0 10px var(--ac-glow);animation:dlBar 1.15s cubic-bezier(.4,0,.2,1) infinite}
+@keyframes dlBar{from{transform:translateX(-100%)}to{transform:translateX(260%)}}
+
+/* подсказка цепочки g… */
+#dl-chord{position:fixed;left:50%;bottom:48px;z-index:1250;display:flex;gap:6px 14px;align-items:center;flex-wrap:wrap;justify-content:center;max-width:min(760px,calc(100vw - 40px));
+  padding:9px 16px;border-radius:12px;font-size:12.5px;color:var(--tx2);background:var(--glass);border:1px solid var(--line2);
+  box-shadow:var(--hl),0 10px 30px -10px #000000a0;backdrop-filter:saturate(1.5) blur(16px);-webkit-backdrop-filter:saturate(1.5) blur(16px);
+  opacity:0;transform:translate(-50%,8px);transition:opacity .18s,transform .2s;pointer-events:none}
+#dl-chord.in{opacity:1;transform:translate(-50%,0)}
+#dl-chord span{display:inline-flex;gap:6px;align-items:center}
+
+/* клавиши с объёмом */
+#ks kbd,#dl-chord kbd{display:inline-block;min-width:24px;padding:3px 7px 4px;border-radius:7px;text-align:center;
+  font:600 12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--tx);white-space:nowrap;
+  background:linear-gradient(180deg,var(--card-hover),var(--card2));border:1px solid var(--line2);
+  box-shadow:0 1px 0 var(--line2),0 2px 0 #00000055,var(--hl)}
+[data-theme=light] #ks kbd,[data-theme=light] #dl-chord kbd{box-shadow:0 1px 0 var(--line2),0 2px 0 #0f172a1f,var(--hl)}
+
+/* шпаргалка */
+#ks-ov{position:fixed;inset:0;z-index:1200;display:grid;place-items:center;padding:16px;background:#00000099;
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);opacity:0;transition:opacity .18s}
+#ks-ov.in{opacity:1}
+#ks{width:min(820px,100%);max-height:92vh;overflow:auto;padding:22px 26px 18px;border-radius:18px;background:var(--card);
+  border:1px solid var(--line2);box-shadow:var(--hl),0 28px 70px #00000080;transform:translateY(8px) scale(.985);transition:transform .22s cubic-bezier(.2,.8,.2,1)}
+#ks-ov.in #ks{transform:none}
+.ks-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+#ks .ks-hd h2{margin:0;font-size:17px;font-weight:650;letter-spacing:-.02em;text-transform:none;color:var(--tx)}
+.ks-x{border:0;background:transparent;color:var(--mu);font-size:15px;cursor:pointer;padding:4px 8px;border-radius:8px}
+.ks-x:hover{background:var(--card2);color:var(--tx)}
+.ks-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 34px}
+.ks-grid section h3{font-size:11px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em;margin:0 0 6px}
+#ks .ks-r{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:7px 0;border-top:1px solid var(--line);font-size:13.5px}
+#ks .ks-r b{display:inline-flex;gap:4px;align-items:center;font-weight:400;flex:none}
+#ks .ks-r b i{font-style:normal;color:var(--mu);font-size:12px}
+.ks-ft{margin-top:16px;font-size:12px;color:var(--mu)}
+@media(max-width:700px){.ks-grid{grid-template-columns:1fr}}
+
+@media(prefers-reduced-motion:reduce){
+  .toast-i,#ks-ov,#ks,#dl-chord,#dl-bar{transition:opacity .01s!important;transform:none!important}
+  #dl-bar i{animation:none;width:100%;opacity:.7}
+  .toast-i.out{transform:none}
+}
+@media print{#toasts,#dl-bar,#dl-chord,#ks-ov{display:none!important}}
+/* ── Настройки v2: две панели, панель состояния, строки-настройки, единые переключатели ── */
+:root{--sw-off:#2d3441;--st-warn:#e5a63a}
+:root[data-theme=light]{--sw-off:#cdd3de;--st-warn:#c98500}
+
+/* единый переключатель 34×20 (настройки, фильтры, калькуляторы) */
+.sw i,.msw i,.st-sw i{width:34px;height:20px;border-radius:999px;background:var(--sw-off);position:relative;flex:none;transition:background-color .2s,box-shadow .2s;box-shadow:inset 0 0 0 1px var(--line)}
+.sw i:after,.msw i:after,.st-sw i:after{content:"";position:absolute;left:2px;top:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0000004d;transition:transform .22s cubic-bezier(.3,1.35,.5,1)}
+.sw input:checked+i:after,.msw input:checked+i:after,.st-sw input:checked+i:after{left:2px;transform:translateX(14px)}
+.sw input:checked+i,.msw input:checked+i,.st-sw input:checked+i{background:var(--ac);box-shadow:inset 0 0 0 1px #ffffff1f}
+.sw input:focus-visible+i,.msw input:focus-visible+i,.st-sw input:focus-visible+i{outline:2px solid var(--ac);outline-offset:2px}
+.st-sw{position:relative;display:inline-flex;cursor:pointer;flex:none}
+.st-sw input{position:absolute;opacity:0;width:1px;height:1px;pointer-events:none}
+.st-sw input:disabled+i{opacity:.5}
+@media(prefers-reduced-motion:reduce){.sw i,.msw i,.st-sw i,.sw i:after,.msw i:after,.st-sw i:after{transition:none}}
+
+/* раскладка */
+.st{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:228px minmax(0,1fr);gap:40px;align-items:start}
+.st-side{position:sticky;top:0;align-self:start;display:flex;flex-direction:column;gap:14px;padding-top:2px;background:var(--bg);z-index:3}
+.st-main{display:grid;gap:36px;min-width:0}
+.st-search{display:flex;align-items:center;gap:8px;padding:0 10px;border:1px solid var(--line2);border-radius:10px;background:var(--card);height:36px;color:var(--mu);transition:border-color .15s,box-shadow .15s}
+.st-search:focus-within{border-color:#3b82f699;box-shadow:0 0 0 3px var(--ac-glow);color:var(--tx2)}
+.st-search svg{width:15px;height:15px;flex:none}
+.st-search input{all:unset;flex:1;min-width:0;font-size:13px;color:var(--tx);height:100%}
+.st-search input::placeholder{color:var(--mu)}
+.st-search input::-webkit-search-cancel-button{display:none}
+.st-search button{all:unset;cursor:pointer;font-size:10.5px;font-weight:600;color:var(--mu);border:1px solid var(--line2);border-radius:5px;padding:1px 5px}
+.st-search button:hover{color:var(--tx)}.st-search button:focus-visible{outline:2px solid var(--ac)}
+#set-nav{display:grid;gap:2px}
+#set-nav a{display:flex;align-items:center;gap:11px;padding:8px 11px;border-radius:10px;font-size:13.5px;font-weight:500;color:var(--tx2);text-decoration:none;position:relative;transition:background-color .15s,color .15s}
+#set-nav a[hidden]{display:none}
+#set-nav a svg{width:16px;height:16px;flex:none;opacity:.85}
+#set-nav a:hover{background:#ffffff08;color:var(--tx)}
+:root[data-theme=light] #set-nav a:hover{background:#0f172a08}
+#set-nav a.on{background:linear-gradient(90deg,#3b82f61f,#3b82f608 70%,transparent);color:var(--tx);box-shadow:inset 2px 0 0 var(--ac)}
+:root[data-theme=light] #set-nav a.on{background:linear-gradient(90deg,#2563eb17,#2563eb05 70%,transparent)}
+#set-nav a.on svg{opacity:1;color:var(--ac-tx)}
+#set-nav a:focus-visible{outline:2px solid var(--ac);outline-offset:-2px}
+.st-nb{margin-left:auto;width:7px;height:7px;border-radius:50%;background:transparent;flex:none}
+.st-nb.warn{background:var(--st-warn);box-shadow:0 0 0 3px #e5a63a22}
+.st-nb.neg{background:var(--neg);box-shadow:0 0 0 3px #f0626a22}
+.st-sv{display:flex;align-items:center;gap:8px;padding:10px 11px 0;margin-top:2px;border-top:1px solid var(--line);font-size:12px;color:var(--mu)}
+.st-sv .mono{color:var(--tx2);font-weight:600}
+
+/* приветствие и панель состояния */
+.st-welcome[hidden]{display:none}
+.st-welcome{display:grid;gap:4px;padding:16px 20px;border-radius:var(--r);border:1px solid #3b82f640;background:linear-gradient(90deg,#3b82f61c,#3b82f608)}
+.st-welcome b{font-size:15px;font-weight:650}.st-welcome span{font-size:13px;color:var(--tx2)}
+.st-tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.st-tiles[hidden],.st-sec[hidden],.st-card[hidden],.st-nomatch{display:none}
+.st-tile{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--hl),var(--elev);padding:16px 16px 14px;display:flex;flex-direction:column;gap:3px;min-width:0}
+.st-tl{display:flex;align-items:center;gap:8px;font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
+.st-tl i{display:grid;place-items:center;width:20px;height:20px;color:var(--tx2)}.st-tl i svg{width:16px;height:16px}
+.st-dot{margin-left:auto;width:8px;height:8px;border-radius:50%;flex:none;background:var(--mu)}
+.st-dot.pos{background:var(--pos);box-shadow:0 0 0 3px #2bc48a22}
+.st-dot.warn{background:var(--st-warn);box-shadow:0 0 0 3px #e5a63a22}
+.st-dot.neg{background:var(--neg);box-shadow:0 0 0 3px #f0626a22}
+.st-dot.mu{background:var(--mu);opacity:.7}
+.st-tv{font-size:15px;font-weight:620;letter-spacing:-.015em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.st-ts{font-size:12px;color:var(--mu);min-height:34px;line-height:1.4;overflow-wrap:anywhere}
+.st-ta{align-self:flex-start;margin-top:8px;padding:5px 11px;font-size:12px}
+
+/* раздел */
+.st-sec{display:grid;gap:14px;scroll-margin-top:18px}
+.st-sh{display:flex;gap:12px;align-items:center;margin-bottom:2px}
+.st-sh>i{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--card2);box-shadow:inset 0 0 0 1px var(--line2);color:var(--ac-tx);flex:none}
+.st-sh>i svg{width:18px;height:18px}
+.st-sh h2{margin:0;font-size:19px;font-weight:650;letter-spacing:-.025em;text-transform:none;color:var(--tx)}
+.st-sh p{margin:1px 0 0;font-size:12.5px;color:var(--mu)}
+.st-sec.danger-s .st-sh>i{color:var(--neg)}
+#set-danger .st-sh>i{color:var(--neg);box-shadow:inset 0 0 0 1px #f0626a40}
+
+/* карточка-группа и строки */
+.st-card{background:linear-gradient(180deg,#ffffff05,#ffffff00 120px),var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--hl),var(--elev);overflow:hidden}
+:root[data-theme=light] .st-card{background:var(--card)}
+.st-gh{display:flex;align-items:baseline;gap:10px;padding:14px 20px 12px}
+.st-gh h3{margin:0;font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em}
+.st-gh span{margin-left:auto;font-size:12px;color:var(--mu)}
+.st-row{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:14px 20px;border-top:1px solid var(--line);min-height:56px;transition:background-color .2s}
+.st-row[hidden]{display:none}
+.st-t{min-width:0;flex:1 1 46%;display:grid;gap:2px}
+.st-t b{font-size:13.5px;font-weight:550;letter-spacing:-.01em}
+.st-t small{font-size:12px;color:var(--mu);line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.st-t small code,.st-more code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;background:var(--card2);border-radius:4px;padding:1px 4px}
+.st-c{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex:0 1 auto;flex-wrap:wrap;min-width:0}
+.st-row.stack{flex-direction:column;align-items:stretch;gap:10px}
+.st-row.stack .st-c{justify-content:flex-start;flex-wrap:nowrap}
+.st-row.stack .st-wide{flex:1}
+.st-row.stack .ld-path{flex:1}
+.st-row.hit{background:#3b82f60d;box-shadow:inset 2px 0 0 var(--ac)}
+.st-pad{padding:4px 20px 18px}
+.st-line{margin:0;padding:12px 20px;border-top:1px solid var(--line);font-size:12.5px;color:var(--mu);line-height:1.5}
+.st-line:empty{display:none}
+.st-line b{color:var(--tx2);font-weight:600}
+.st-foot{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 20px;border-top:1px solid var(--line);font-size:12px;color:var(--mu)}
+.st-callout{margin:0 20px 14px;padding:11px 14px;border-radius:12px;font-size:12.5px;line-height:1.5;border:1px solid var(--line2);background:var(--card2);color:var(--tx2)}
+.st-callout.warn{border-color:#e5a63a55;background:#e5a63a14;color:var(--tx)}
+.st-sug{padding:0 20px 12px;font-size:12px;color:var(--mu)}
+.st-sug:empty{display:none}
+.st-dis .st-row.sub{opacity:.5}
+.st-dis .st-row.sub:hover,.st-dis .st-row.sub:focus-within{opacity:.85}
+.st-who{font-size:12.5px;color:var(--tx2);text-align:right}
+.st-unit{font-size:12.5px;color:var(--mu)}
+.st-num{width:86px;text-align:right}.st-time{width:112px}.st-sel{min-width:270px}
+.in.mono,.mono.in{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;letter-spacing:0}
+.st-c .in{height:34px;padding:0 11px}
+.st-c textarea.in{height:auto;padding:8px 11px;line-height:1.5;resize:vertical}
+.st-c .st-wide{width:340px;max-width:100%}
+.st-row.stack .st-c .st-wide{width:auto}
+.st-secret{display:flex;align-items:center;gap:6px}
+.st-secret .in{width:300px;max-width:100%}
+.st-ib{all:unset;cursor:pointer;display:grid;place-items:center;width:34px;height:34px;border-radius:9px;color:var(--mu);box-shadow:inset 0 0 0 1px var(--line2);transition:background-color .15s,color .15s;flex:none}
+.st-ib svg{width:16px;height:16px}
+.st-ib:hover{background:var(--card2);color:var(--tx)}
+.st-ib:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.st-ib.done{color:var(--pos)}
+.ld-path{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:12.5px;word-break:break-all;user-select:all}
+.st-restore{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 10px}.st-restore .in{flex:1;min-width:180px}
+
+/* «Сохранено ✓» */
+.st-ok{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:600;color:var(--pos);animation:stIn .2s ease;transition:opacity .3s}
+.st-ok svg{width:13px;height:13px}.st-ok.out{opacity:0}
+@keyframes stIn{from{opacity:0;transform:translateX(4px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.st-ok{animation:none}}
+
+/* «Подробнее» */
+.st-more{border-top:1px solid var(--line);padding:0 20px}
+.st-more summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:7px;padding:12px 0;font-size:12.5px;font-weight:550;color:var(--tx2);user-select:none}
+.st-more summary::-webkit-details-marker{display:none}
+.st-more summary:before{content:"";width:6px;height:6px;border-right:1.6px solid currentColor;border-bottom:1.6px solid currentColor;transform:rotate(-45deg);transition:transform .15s;margin:0 3px 0 1px}
+.st-more[open] summary:before{transform:rotate(45deg)}
+.st-more summary:hover{color:var(--tx)}
+.st-more summary:focus-visible{outline:2px solid var(--ac);outline-offset:2px;border-radius:6px}
+.st-more>div{padding:0 0 16px 17px;font-size:12.5px;line-height:1.65;color:var(--mu)}
+.st-more>div b{color:var(--tx2)}
+.st-more>div p{margin:8px 0 0}
+.st-more a{color:var(--ac-tx)}
+
+/* карточки темы */
+.st-themes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;padding-top:2px}
+.st-themes>button{all:unset;cursor:pointer;display:grid;gap:10px;padding:8px 8px 10px;border-radius:14px;border:1px solid var(--line2);background:var(--card2);position:relative;transition:border-color .15s,box-shadow .15s,transform .15s}
+.st-themes>button:hover{border-color:#3b82f666}
+.st-themes>button:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.st-themes>button.on{border-color:var(--ac);box-shadow:0 0 0 3px var(--ac-glow)}
+.th-n{display:flex;align-items:baseline;gap:8px;padding:0 4px}
+.th-n b{font-size:13px;font-weight:600}.th-n small{font-size:12px;color:var(--mu)}
+.th-c{position:absolute;top:14px;right:14px;width:20px;height:20px;border-radius:50%;background:var(--ac);color:#fff;display:grid;place-items:center;opacity:0;transform:scale(.6);transition:.18s}
+.th-c svg{width:12px;height:12px}
+.st-themes>button.on .th-c{opacity:1;transform:none}
+.th-prev{display:block;position:relative;height:104px;border-radius:9px;overflow:hidden;--tb:#07090d;--ts:#0c1017;--tc:#131923;--tl:#ffffff1c;--tx:#3b82f6}
+.th-prev .s{position:absolute;left:0;top:0;bottom:0;width:26%;background:var(--ts);border-right:1px solid var(--tl)}
+.th-prev .h{position:absolute;left:34%;top:12px;width:30%;height:7px;border-radius:4px;background:var(--tl)}
+.th-prev .b{position:absolute;bottom:12px;width:11%;border-radius:3px 3px 0 0;background:var(--tx);opacity:.85}
+.th-prev .b1{left:34%;height:34px}.th-prev .b2{left:50%;height:52px;opacity:.55}.th-prev .b3{left:66%;height:26px;opacity:.7}
+.th-prev{background:var(--tb)}
+.th-light{--tb:#f5f6f8;--ts:#ffffff;--tl:#0f172a1f}
+.th-light .s{box-shadow:1px 0 0 #0f172a0f}
+.th-auto{background:transparent}
+.th-auto>.th-prev{position:absolute;inset:0;height:auto}
+.th-auto>.th-light{clip-path:polygon(56% 0,100% 0,100% 100%,44% 100%)}
+.th-light .h{background:#0f172a1f}
+
+/* пилюли разделов меню */
+.st-menu{display:grid;gap:14px}
+.st-ml{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
+.st-chips{display:flex;flex-wrap:wrap;gap:7px}
+.st-chip{position:relative;cursor:pointer}
+.st-chip input{position:absolute;opacity:0;width:1px;height:1px}
+.st-chip span{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:999px;border:1px solid var(--line2);font-size:12.5px;color:var(--mu);transition:.15s;user-select:none;text-decoration:line-through;text-decoration-color:transparent}
+.st-chip input:checked+span{background:#3b82f61a;border-color:#3b82f659;color:var(--ac-tx)}
+.st-chip:hover span{border-color:#3b82f680;color:var(--tx)}
+.st-chip input:focus-visible+span{outline:2px solid var(--ac);outline-offset:2px}
+.st-chip.lock{cursor:default}.st-chip.lock span{opacity:.6}
+.st-chip.lock input:checked+span:after{content:"·всегда";font-size:10.5px;opacity:.8;margin-left:2px}
+:root[data-theme=light] .st-chip input:checked+span{background:#2563eb14;border-color:#2563eb4d}
+
+/* версия и журнал */
+.st-ver{display:flex;align-items:center;gap:16px;padding:18px 20px;border-bottom:1px solid var(--line);background:radial-gradient(80% 160% at 0% 0%,#3b82f61a,transparent 60%)}
+.st-vn{font-size:26px;font-weight:650;letter-spacing:-.03em;padding:6px 14px;border-radius:12px;background:var(--card2);box-shadow:inset 0 0 0 1px var(--line2)}
+.st-vt{display:grid;gap:2px}.st-vt b{font-size:15px;font-weight:650}.st-vt span{font-size:12.5px;color:var(--mu)}
+#whatsnew .cl .vh b{font-size:14px}
+#whatsnew .st-more>div{padding-left:0}
+
+/* опасная зона */
+.st-card.danger{border-color:#f0626a55;background:linear-gradient(180deg,#f0626a0d,transparent 140px),var(--card)}
+.st-card.danger .st-row{border-top-color:#f0626a22}
+.st-card.danger .st-gh h3{color:var(--neg)}
+.st-card.danger .btn.danger{color:var(--neg)}
+
+/* тост */
+.st-toast{position:fixed;right:28px;bottom:26px;z-index:60;display:grid;max-width:min(440px,calc(100vw - 56px));pointer-events:none}
+.st-toast .msg{pointer-events:auto;cursor:pointer;box-shadow:0 12px 32px -8px #000000b3,0 0 0 1px var(--line2);animation:stUp .22s ease;line-height:1.45}
+.st-toast .msg.ok{background:linear-gradient(#3ecf8e1f,#3ecf8e1f),var(--card)}
+.st-toast .msg.err{background:linear-gradient(#ff6b6b1f,#ff6b6b1f),var(--card)}
+.st-toast .msg.mini{padding:7px 13px;font-size:12.5px;font-weight:600}
+@keyframes stUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.st-toast .msg{animation:none}}
+
+/* адаптация под узкое окно ПК */
+@media(max-width:1380px){.st-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:1100px){.st{grid-template-columns:190px minmax(0,1fr);gap:26px}.st-c .st-wide,.st-secret .in{width:240px}.st-sel{min-width:220px}}
 </style></head>
 <body>
 <div id="boot-splash" class="boot-splash" aria-hidden="true"><div class="boot-box"><div class="boot-logo"><svg width="64" height="64" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bsg" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#2563eb"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient><linearGradient id="bsa" x1="12" y1="6" x2="26" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.08)"/><path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="url(#bsg)"/><path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="url(#bsg)"/><path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="url(#bsa)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="boot-title">TAnalytic <span class="boot-ver">Pro</span></div><div class="boot-bar"><div class="boot-bar-fill"></div></div><div class="boot-status" id="boot-status">Загружаю портфель…</div></div></div>
@@ -25351,6 +26236,7 @@ body.sk-open{overflow:hidden}
         <button class="mi" id="thm" role="menuitem"><span class="mi-ic">◐</span><span class="mi-t" id="thm-t">Светлая тема</span></button>
         <button class="mi" id="share" role="menuitem" title="Карточка доходности для Telegram без абсолютных сумм"><span class="mi-ic">PNG</span><span class="mi-t">Поделиться картинкой</span></button>
         <button class="mi" id="pdf" role="menuitem"><span class="mi-ic">PDF</span><span class="mi-t">Печать / сохранить PDF</span></button>
+        <button class="mi" id="kbhelp" role="menuitem"><span class="mi-ic">?</span><span class="mi-t">Горячие клавиши</span></button>
       </div>
     </div>
   </div>
@@ -25387,16 +26273,14 @@ const mlabel=m=>{if(!m||typeof m!=='string'||!m.includes('-'))return'—';const[
 const dlabel=d=>{if(!d||typeof d!=='string'||!d.includes('-'))return'—';const[y,m,dd]=d.split('-');return+dd+' '+(MON[+m-1]||m)+' '+y};
 const ddm=d=>{if(!d||typeof d!=='string'||!d.includes('-'))return'—';const[y,m,dd]=d.split('-');return dd+'.'+m+'.'+y.slice(2)};
 const S1='var(--s1)',S2='var(--s2)',S3='var(--s3)',S4='var(--s4)',S5='var(--s5)',S6='var(--s6)',S7='var(--s7)',S8='var(--s8)';
-const PAL=[S1,S2,S3,S4,S5,S6,S7,S8];
-const HEX=['#3987e5','#d95926','#199e70','#c98500','#d55181','#008300','#9085e9','#e66767'];
+/* порядок серий в диаграммах: синий, бирюзовый, янтарный, фиолетовый, розовый, голубой, оливковый, коралловый */
+const PAL=[S1,S3,S4,S7,S5,S2,S6,S8];
+/* HEX — только для мест, где CSS-переменные недоступны (аватары, canvas); в том же порядке, что PAL, оттенки тёмной темы */
+const HEX=['#4f8ef7','#2bbf9a','#e3a540','#9b87f5','#ec6f91','#4cc3ec','#a7c35a','#f08a5d'];
 
 
 /* ── уведомление-«тост» и копирование в буфер ── */
-function toast(msg,ms){
-  let t=document.getElementById('toast');
-  if(!t){t=document.createElement('div');t.id='toast';t.setAttribute('role','status');document.body.appendChild(t)}
-  t.textContent=msg;t.className='show';clearTimeout(toast._t);toast._t=setTimeout(()=>{t.className=''},ms||2200);
-}
+/* toast(text, kind|ms) — в 65_delight.js */
 function copyText(txt,msg){
   const done=()=>toast(msg||'Скопировано');
   const fb=()=>{try{const a=document.createElement('textarea');a.value=txt;a.style.cssText='position:fixed;opacity:0;top:0;left:0';document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();done()}catch(e){toast('Не удалось скопировать')}};
@@ -25550,44 +26434,69 @@ function axisTicks(labels,X,x0,x1,gap=12){
   return out;
 }
 
+/* «красивая» шкала с запасом ~10 % сверху/снизу, если крайнее значение упирается в край */
+function niceP(mn,mx,t){
+  let r=nice(mn,mx,t);
+  if(mx>0&&r.hi-mx<(r.hi-r.lo)*.05)r=nice(mn,mx+(mx-mn)*.1,t);
+  if(mn<0&&mn-r.lo<(r.hi-r.lo)*.05)r=nice(mn-(mx-mn)*.1,mx,t);
+  return r;
+}
+/* градиенты столбиков: сверху цвет серии 100 %, снизу ~70 %; id уникальны на каждую отрисовку */
+let _gidN=0;
+function gradSet(){
+  const m={},defs=[],pre='gb'+(++_gidN)+'_';
+  return{u:c=>{if(!m[c]){const id=pre+defs.length;m[c]=id;defs.push(`<linearGradient id="${id}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" style="stop-color:${c}"/><stop offset="1" style="stop-color:${c};stop-opacity:.7"/></linearGradient>`)}return`url(#${m[c]})`},defs:()=>defs.length?`<defs>${defs.join('')}</defs>`:''};
+}
+/* анимация появления — только при первом показе графика с данным id (перерисовки и resize не анимируются) */
+const _animSeen=new Map();
+function animOnce(el){
+  const k=el.id;if(!k)return false;
+  if(window.matchMedia&&matchMedia('(prefers-reduced-motion:reduce)').matches)return false;
+  const t=Date.now(),t0=_animSeen.get(k);
+  if(t0==null){_animSeen.set(k,t);return true}
+  return t-t0<1300; /* перерисовка сразу после показа (догрузка данных) не обрывает анимацию */
+}
+const gridLines=(lo,hi,step,pl,x2,Y,fa)=>{let s='';for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v),z=Math.abs(v)<step/1e6;s+=`<line class="grid-l${z?' z':''}" x1="${pl}" x2="${x2}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(z?0:v)}</text>`}return s};
+
 function bars(el,o){
-  const W=el.clientWidth,H=o.h||240,pl=58,pr=6,pt=8,pb=26,n=o.labels.length;
+  const W=el.clientWidth,H=o.h||240,pl=58,pr=6,pt=10,pb=26,n=o.labels.length;
   if(!n||W<50)return emptyChart(el,H,o.empty);
   const ser=o.series,k=ser.length,stack=!!o.stack,fa=o.fa||short,ft=o.ft||(v=>M(v));
   let mn=0,mx=0;
   for(let i=0;i<n;i++){if(stack){let p=0,q=0;ser.forEach(s=>{const v=s.v[i]||0;v>0?p+=v:q+=v});mx=Math.max(mx,p);mn=Math.min(mn,q)}
     else ser.forEach(s=>{mx=Math.max(mx,s.v[i]||0);mn=Math.min(mn,s.v[i]||0)})}
   if(mx===0&&mn===0)return emptyChart(el,H,o.empty);
-  const{lo,hi,step}=nice(mn,mx),pw=W-pl-pr,ph=H-pt-pb,gw=pw/n,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
-  const cols=stack?1:k,gap=2,bw=Math.max(2,Math.min(30,(gw*.72-(cols-1)*gap)/cols));
-  let s='';
-  for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"${Math.abs(v)<step/1e6?' style="stroke:var(--zero-line)"':''}/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(Math.abs(v)<step/1e6?0:v)}</text>`}
+  const{lo,hi,step}=niceP(mn,mx),pw=W-pl-pr,ph=H-pt-pb,gw=pw/n,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
+  const cols=stack?1:k,gap=3,raw=(gw*.62-(cols-1)*gap)/cols,bw=Math.max(Math.min(6,gw*.8/cols),Math.min(cols>1?44:56,raw)),R=5;
+  const G=gradSet(),an=animOnce(el),y0=Y(0);
+  let s=gridLines(lo,hi,step,pl,W-pr,Y,fa);
   const bx=i=>pl+gw*i+gw/2,bt=axisTicks(o.labels,bx,pl-4,W-pr+4);
   let marks='',hits='';
   for(let i=0;i<n;i++){
     const gx=pl+gw*i,x0=gx+(gw-(cols*bw+(cols-1)*gap))/2;
-    let pp=0,nn=0;const pos=[],neg=[];
+    let pp=0,nn=0,gm='';const pos=[],neg=[];
     ser.forEach((se,j)=>{const v=se.v[i]||0;if(!v)return;
       if(stack){if(v>0){pos.push([j,pp,pp+v]);pp+=v}else{neg.push([j,nn+v,nn]);nn+=v}}
       else{const x=x0+j*(bw+gap),y=v>0?Y(v):Y(0),h=Math.abs(Y(v)-Y(0)),c=o.colorOf?o.colorOf(v,i):se.c;
-        marks+=`<path class="bm" data-g="${i}" d="${v>0?rtop(x,y,bw,h,4):rbot(x,y,bw,h,4)}" fill="${c}"/>`}});
+        gm+=`<path class="bm" d="${v>0?rtop(x,y,bw,h,R):rbot(x,y,bw,h,R)}" fill="${G.u(c)}"/>`}});
     if(stack){
-      pos.forEach(([j,a,b],q)=>{const y1=Y(b),y0=Y(a),h=Math.max(0,y0-y1-(q?gap:0));marks+=`<path class="bm" data-g="${i}" d="${q===pos.length-1?rtop(x0,y1,bw,h,4):`M${x0},${y1}h${bw}v${h}h${-bw}Z`}" fill="${ser[j].c}"/>`});
-      neg.forEach(([j,a,b],q)=>{const y0=Y(b),h=Math.max(0,Y(a)-y0-(q?gap:0));marks+=`<path class="bm" data-g="${i}" d="${q===neg.length-1?rbot(x0,y0+(q?gap:0),bw,h,4):`M${x0},${y0+(q?gap:0)}h${bw}v${h}h${-bw}Z`}" fill="${ser[j].c}"/>`});
+      pos.forEach(([j,a,b],q)=>{const y1=Y(b),ya=Y(a),h=Math.max(0,ya-y1-(q?1.5:0));gm+=`<path class="bm" d="${q===pos.length-1?rtop(x0,y1,bw,h,R):`M${x0},${y1}h${bw}v${h}h${-bw}Z`}" fill="${G.u(ser[j].c)}"/>`});
+      neg.forEach(([j,a,b],q)=>{const yb=Y(b),h=Math.max(0,Y(a)-yb-(q?1.5:0));gm+=`<path class="bm" d="${q===neg.length-1?rbot(x0,yb+(q?1.5:0),bw,h,R):`M${x0},${yb+(q?1.5:0)}h${bw}v${h}h${-bw}Z`}" fill="${G.u(ser[j].c)}"/>`});
     }
+    marks+=`<g class="bg" data-g="${i}" style="transform-origin:0 ${y0}px;animation-delay:${Math.min(i,24)*18}ms">${gm}</g>`;
     if(o.labelsOn){const v=ser[0].v[i];if(v)s+=`<text class="ax num" x="${gx+gw/2}" y="${v>0?Y(v)-5:Y(v)+12}" text-anchor="middle" style="fill:var(--tx2)">${fa(v)}</text>`}
     hits+=`<rect data-i="${i}" x="${gx}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
   }
   bt.forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
-  el.innerHTML=(o.legend===false?'':legend(ser))+`<svg width="${W}" height="${H}">${s}<g>${marks}</g>${hits}</svg>`;
-  const mk=el.querySelectorAll('.bm');
-  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?1:.35);
+  el.innerHTML=(o.legend===false?'':legend(ser))+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g>${marks}</g>${hits}</svg>`;
+  const mk=el.querySelectorAll('.bg');
+  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
   bindTip(el,i=>{let h=`<b>${esc(o.tipLabels?o.tipLabels[i]:o.labels[i])}</b>`;ser.forEach(se=>{const v=se.v[i]||0;if(v||!o.skipZero)h+=tipRow(o.colorOf?o.colorOf(v,i):se.c,se.n,ft(v))});
-    if(o.total){const t=ser.reduce((a,se)=>a+(se.v[i]||0),0);h+=`<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${ft(t)}</span></div>`}return h});
+    if(o.total){const t=ser.reduce((a,se)=>a+(se.v[i]||0),0);h+=`<div class="tot">Итого<span>${ft(t)}</span></div>`}return h});
 }
 
 function line(el,o){
-  const W=el.clientWidth,H=o.h||240,pl=62,pr=10,pt=10,pb=26;
+  const W=el.clientWidth,H=o.h||240,pl=62,pr=14,pt=12,pb=26;
   let labels=o.labels,ser=o.series,tl=o.tipLabels||labels;
   if(labels.length>420){const k=Math.ceil(labels.length/420),idx=[];for(let i=0;i<labels.length;i+=k)idx.push(i);if(idx[idx.length-1]!==labels.length-1)idx.push(labels.length-1);
     labels=idx.map(i=>labels[i]);tl=idx.map(i=>(o.tipLabels||o.labels)[i]);ser=ser.map(s=>({...s,v:idx.map(i=>s.v[i])}))}
@@ -25596,47 +26505,52 @@ function line(el,o){
   const fa=o.fa||short,ft=o.ft||(v=>M(v));
   let mn=Infinity,mx=-Infinity;
   ser.forEach(s=>s.v.forEach(v=>{if(v==null||isNaN(v))return;mn=Math.min(mn,v);mx=Math.max(mx,v)}));
-  if(o.zero!==false)mn=Math.min(mn,0);if(!isFinite(mn)||mx===mn)return emptyChart(el,H,o.empty);
-  const{lo,hi,step}=nice(mn,mx),pw=W-pl-pr,ph=H-pt-pb,X=i=>pl+i/(n-1)*pw,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
-  let s='';
-  for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"${Math.abs(v)<step/1e6?' style="stroke:var(--zero-line)"':''}/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(Math.abs(v)<step/1e6?0:v)}</text>`}
+  if(o.zero!==false)mn=Math.min(mn,0);if(!isFinite(mn))return emptyChart(el,H,o.empty);
+  if(mx===mn){if(mx===0)return emptyChart(el,H,o.empty);const d=Math.abs(mx)*.02;mn-=d;mx+=d}
+  const{lo,hi,step}=niceP(mn,mx),pw=W-pl-pr,ph=H-pt-pb,X=i=>pl+i/(n-1)*pw,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
+  const an=animOnce(el);
+  let s=gridLines(lo,hi,step,pl,W-pr,Y,fa);
   axisTicks(labels,X,pl-4,W-pr+4).forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(labels[i])}</text>`);
   const gid='g'+Math.random().toString(36).slice(2,8);
-  if(o.band){const A=ser[o.band.a].v,B=ser[o.band.b].v,poly=(pts,up)=>{if(pts.length>2)s+=`<polygon points="${pts.map(q=>q[0].toFixed(1)+','+q[1].toFixed(1)).join(' ')}" fill="${up?'#ff6b6b':'#3ecf8e'}" fill-opacity=".22"/>`};
+  if(o.band){const A=ser[o.band.a].v,B=ser[o.band.b].v,poly=(pts,up)=>{if(pts.length>2)s+=`<polygon points="${pts.map(q=>q[0].toFixed(1)+','+q[1].toFixed(1)).join(' ')}" fill="${up?'var(--neg)':'var(--pos)'}" fill-opacity=".2"/>`};
     for(let i=0;i<n-1;i++){const a0=A[i],a1=A[i+1],b0=B[i],b1=B[i+1];if([a0,a1,b0,b1].some(v=>v==null||isNaN(v)))continue;
       const d0=a0-b0,d1=a1-b1,x0=X(i),x1=X(i+1);
       if(d0*d1>=0)poly([[x0,Y(a0)],[x1,Y(a1)],[x1,Y(b1)],[x0,Y(b0)]],d0+d1>0);
       else{const t=d0/(d0-d1),xc=x0+(x1-x0)*t,yc=Y(a0+(a1-a0)*t);poly([[x0,Y(a0)],[xc,yc],[x0,Y(b0)]],d0>0);poly([[xc,yc],[x1,Y(a1)],[x1,Y(b1)]],d1>0)}}}
+  let ends='';
   ser.forEach((se,j)=>{
-    const segs=[];let cur=[],pv=null;se.v.forEach((v,i)=>{if(v==null||isNaN(v)){if(cur.length)segs.push(cur);cur=[];pv=null}else{if(se.step&&pv!=null)cur.push(X(i).toFixed(1)+','+Y(pv).toFixed(1));cur.push(X(i).toFixed(1)+','+Y(v).toFixed(1));pv=v}});if(cur.length)segs.push(cur);
-    if(j===0&&o.area){const base=Y(Math.max(lo,Math.min(0,hi)));s+=`<defs><linearGradient id="${gid}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="${se.hex||'#3987e5'}" stop-opacity="${o.area==='neg'?0:.28}"/><stop offset="1" stop-color="${se.hex||'#3987e5'}" stop-opacity="${o.area==='neg'?.28:0}"/></linearGradient></defs>`;
-      segs.forEach(sg=>{const f=sg[0].split(','),l=sg[sg.length-1].split(',');s+=`<polygon points="${f[0]},${base} ${sg.join(' ')} ${l[0]},${base}" fill="url(#${gid})"/>`})}
-    segs.forEach(sg=>s+=`<polyline points="${sg.join(' ')}" fill="none" stroke="${se.c}" stroke-width="${se.w||2}" stroke-linejoin="round" stroke-linecap="round"${se.dash?' stroke-dasharray="5 4"':''}/>`)});
+    const segs=[];let cur=[],pv=null,last=-1;se.v.forEach((v,i)=>{if(v==null||isNaN(v)){if(cur.length)segs.push(cur);cur=[];pv=null}else{if(se.step&&pv!=null)cur.push(X(i).toFixed(1)+','+Y(pv).toFixed(1));cur.push(X(i).toFixed(1)+','+Y(v).toFixed(1));pv=v;last=i}});if(cur.length)segs.push(cur);
+    if(j===0&&o.area){const base=Y(Math.max(lo,Math.min(0,hi)));s+=`<defs><linearGradient id="${gid}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" style="stop-color:${se.c};stop-opacity:${o.area==='neg'?0:.22}"/><stop offset="1" style="stop-color:${se.c};stop-opacity:${o.area==='neg'?.22:0}"/></linearGradient></defs>`;
+      segs.forEach(sg=>{const f=sg[0].split(','),l=sg[sg.length-1].split(',');s+=`<polygon class="la" points="${f[0]},${base} ${sg.join(' ')} ${l[0]},${base}" fill="url(#${gid})"/>`})}
+    segs.forEach(sg=>s+=`<polyline${se.dash?' class="ls"':' class="ln" pathLength="1"'} points="${sg.join(' ')}" fill="none" stroke="${se.c}" stroke-width="${se.w||2}" stroke-linejoin="round" stroke-linecap="round"${se.dash?' stroke-dasharray="5 4"':''}/>`);
+    if(!se.dash&&last>=0)ends+=`<g class="ld"><circle cx="${X(last).toFixed(1)}" cy="${Y(se.v[last]).toFixed(1)}" r="8" fill="${se.c}" fill-opacity=".18"/><circle cx="${X(last).toFixed(1)}" cy="${Y(se.v[last]).toFixed(1)}" r="3.5" fill="${se.c}" stroke="var(--card)" stroke-width="1.5"/></g>`});
   let hits='';const cw=pw/(n-1);
   for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${X(i)-cw/2}" y="${pt}" width="${cw}" height="${ph}" fill="transparent"/>`;
-  el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}">${s}<g class="hv"></g>${hits}</svg>`;
+  el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${s}${ends}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
-  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`+
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`+
     ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>`<circle cx="${X(i)}" cy="${Y(se.v[i])}" r="4.5" fill="${se.c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
   bindTip(el,i=>{o.hover&&o.hover(i);if(o.tip)return o.tip(i);return`<b>${esc(tl[i])}</b>`+ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>tipRow(se.c,se.n,ft(se.v[i]))).join('')});
   if(o.leave){const ol=el.onmouseleave;el.onmouseleave=e=>{ol(e);o.leave()}}
 }
 
 function donut(el,o){
-  const items=o.items.filter(x=>x.v>0.005),tot=items.reduce((a,x)=>a+x.v,0),D=o.size||180,R=D/2,r=R-22;
+  const items=o.items.filter(x=>x.v>0.005),tot=items.reduce((a,x)=>a+x.v,0),D=o.size||180,R=D/2,r=R*.62;
   if(!tot)return emptyChart(el,D,'Нет активов');
-  let a=-Math.PI/2,arcs='';const g=items.length>1?0.012:0;
-  items.forEach((x,i)=>{const da=x.v/tot*Math.PI*2,a0=a+g,a1=a+da-g;a+=da;if(a1<=a0)return;
+  const an=animOnce(el);
+  let a=-Math.PI/2,arcs='';
+  items.forEach((x,i)=>{const da=x.v/tot*Math.PI*2,a0=a,a1=a+da;a+=da;if(a1<=a0)return;
     const big=a1-a0>Math.PI?1:0,p=(t,rr)=>[R+rr*Math.cos(t),R+rr*Math.sin(t)].map(v=>v.toFixed(2)).join(',');
     const d=items.length===1?`M${R},0A${R},${R} 0 1 1 ${R-0.01},0L${R-0.01},${R-r}A${r},${r} 0 1 0 ${R},${R-r}Z`:
       `M${p(a0,R)}A${R},${R} 0 ${big} 1 ${p(a1,R)}L${p(a1,r)}A${r},${r} 0 ${big} 0 ${p(a0,r)}Z`;
-    arcs+=`<path data-i="${i}" class="arc" d="${d}" fill="${x.c}"/>`});
-  el.innerHTML=`<div class="donut-wrap"><svg width="${D}" height="${D}" style="flex:none">${arcs}
-    <text x="${R}" y="${R-4}" text-anchor="middle" style="fill:var(--mu);font-size:12px">${esc(o.cap||'Всего')}</text>
-    <text x="${R}" y="${R+18}" text-anchor="middle" class="num" style="fill:var(--tx);font-size:17px;font-weight:700">${short(tot)}${o.unit===''?'':' ₽'}</text></svg>
+    arcs+=`<path data-i="${i}" class="arc" d="${d}" fill="${x.c}" stroke="${items.length>1?'var(--card)':'none'}" stroke-width="2" stroke-linejoin="round" style="transform-origin:${R}px ${R}px;animation-delay:${i*40}ms"/>`});
+  const tx=short(tot)+(o.unit===''?'':' ₽'),fs=tx.length>10?16:tx.length>8?18:21;
+  el.innerHTML=`<div class="donut-wrap"><svg width="${D}" height="${D}" style="flex:none"${an?' class="anim"':''}>${arcs}
+    <text x="${R}" y="${R-3}" text-anchor="middle" class="dn-v num" style="font-size:${fs}px">${tx}</text>
+    <text x="${R}" y="${R+16}" text-anchor="middle" class="dn-c">${esc(o.cap||'Всего')}</text></svg>
     <div class="dl">${items.map((x,i)=>`<div data-i="${i}"><i style="background:${x.c}"></i><span>${esc(x.n)}</span><b class="num" style="font-weight:600">${short(x.v)}</b><em class="num">${(x.v/tot*100).toFixed(1).replace('.',',')}%</em></div>`).join('')}</div></div>`;
-  const arcsEl=el.querySelectorAll('.arc');
-  el._hl=i=>arcsEl.forEach(p=>p.style.opacity=i<0||+p.dataset.i===i?1:.35);
+  const arcsEl=el.querySelectorAll('.arc'),rows=el.querySelectorAll('.dl>div');
+  el._hl=i=>{arcsEl.forEach(p=>{const on=+p.dataset.i===i;p.style.opacity=i<0||on?'':.4;p.style.transform=on?'scale(1.035)':''});rows.forEach(d=>d.style.opacity=i<0||+d.dataset.i===i?'':.5)};
   bindTip(el,i=>`<b>${esc(items[i].n)}</b>`+tipRow(items[i].c,'Стоимость',M(items[i].v))+tipRow(items[i].c,'Доля',(items[i].v/tot*100).toFixed(1).replace('.',',')+' %'));
 }
 
@@ -25660,38 +26574,40 @@ function barLabelsPick(items,lh){
   return keep;
 }
 function stackedMonths(el,o){
-  const W=el.clientWidth,H=o.h||260,pl=58,pr=6,pt=o.vl?22:8,pb=26,n=o.labels.length,fa=o.fa||short,ft=o.ft||(v=>short(v)+' ₽');
+  const W=el.clientWidth,H=o.h||260,pl=58,pr=6,pt=o.vl?22:10,pb=26,n=o.labels.length,fa=o.fa||short,ft=o.ft||(v=>short(v)+' ₽');
   if(!n||W<50)return emptyChart(el,H,o.empty);
   const tot=m=>m.segs.reduce((a,s)=>a+s.v,0);
   let mx=0;o.months.forEach(m=>{mx=Math.max(mx,tot(m),m.call||0)});
   if(!mx)return emptyChart(el,H,o.empty);
-  const{lo,hi,step}=nice(0,mx),pw=W-pl-pr,ph=H-pt-pb,gw=pw/n,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
-  const hasCall=o.months.some(m=>m.call>0),cols=hasCall?2:1,gap=2,bw=Math.max(3,Math.min(26,(gw*.8-(cols-1)*gap)/cols));
-  const uid='sm'+Math.random().toString(36).slice(2,7);
+  const{lo,hi,step}=niceP(0,mx),pw=W-pl-pr,ph=H-pt-pb,gw=pw/n,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
+  const hasCall=o.months.some(m=>m.call>0),cols=hasCall?2:1,gap=3,raw=(gw*.62-(cols-1)*gap)/cols,bw=Math.max(Math.min(6,gw*.8/cols),Math.min(cols>1?36:48,raw)),R=5;
+  const uid='sm'+Math.random().toString(36).slice(2,7),G=gradSet(),an=animOnce(el),y0=Y(0);
   let s=`<defs><pattern id="${uid}" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="var(--card)"/><rect width="2.6" height="6" fill="var(--s4)"/></pattern></defs>`,marks='',hits='';
-  for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(v)}</text>`}
+  s+=gridLines(lo,hi,step,pl,W-pr,Y,fa);
   const bt=axisTicks(o.labels,i=>pl+gw*i+gw/2,pl-4,W-pr+4);
   const vls=[];
   o.months.forEach((m,i)=>{
-    const gx=pl+gw*i,x0=gx+(gw-(cols*bw+(cols-1)*gap))/2;let acc=0;
-    m.segs.forEach(sg=>{if(!(sg.v>0))return;const y1=Y(acc+sg.v),y0=Y(acc),h=Math.max(0,y0-y1-.5),c=o.colors[sg.k]||'var(--s1)';
-      marks+=`<rect class="bm" data-g="${i}" x="${x0}" y="${y1}" width="${bw}" height="${h}" fill="${c}"${sg.est?' opacity=".5"':''}/>`;acc+=sg.v});
-    if(m.call>0){const x=x0+(cols-1)*(bw+gap),y=Y(m.call);marks+=`<rect class="bm" data-g="${i}" x="${x}" y="${y}" width="${bw}" height="${Math.max(0,Y(0)-y)}" fill="url(#${uid})" stroke="var(--s4)" stroke-width="1"/>`}
+    const gx=pl+gw*i,x0=gx+(gw-(cols*bw+(cols-1)*gap))/2;let acc=0,gm='';
+    const vs=m.segs.filter(sg=>sg.v>0);
+    vs.forEach((sg,q)=>{const y1=Y(acc+sg.v),ya=Y(acc),h=Math.max(0,ya-y1-(q?1:0)),c=o.colors[sg.k]||'var(--s1)',last=q===vs.length-1;
+      gm+=`<path class="bm" d="${last?rtop(x0,y1,bw,h,R):`M${x0},${y1}h${bw}v${h}h${-bw}Z`}" fill="${G.u(c)}"${sg.est?' opacity=".5"':''}/>`;acc+=sg.v});
+    if(m.call>0){const x=x0+(cols-1)*(bw+gap),y=Y(m.call);gm+=`<path class="bm" d="${rtop(x,y,bw,Math.max(0,Y(0)-y),R)}" fill="url(#${uid})" stroke="var(--s4)" stroke-width="1"/>`}
+    marks+=`<g class="bg" data-g="${i}" style="transform-origin:0 ${y0}px;animation-delay:${Math.min(i,24)*18}ms">${gm}</g>`;
     hits+=`<rect data-i="${i}" x="${gx}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
     if(o.vl){const fv=o.fv||short,cw=11*.56,t=tot(m);
-      if(t>0){const tx=fv(t);vls.push({x:x0+bw/2,y:Y(t)-4,w:tx.length*cw,v:t,tx,c:''})}
-      if(m.call>0){const tx=fv(m.call);vls.push({x:x0+(cols-1)*(bw+gap)+bw/2,y:Y(m.call)-4,w:tx.length*cw,v:m.call,tx,c:' vl-call'})}}
+      if(t>0){const tx=fv(t);vls.push({x:x0+bw/2,y:Y(t)-5,w:tx.length*cw,v:t,tx,c:''})}
+      if(m.call>0){const tx=fv(m.call);vls.push({x:x0+(cols-1)*(bw+gap)+bw/2,y:Y(m.call)-5,w:tx.length*cw,v:m.call,tx,c:' vl-call'})}}
   });
   bt.forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
   let vt='';
   if(o.vl)barLabelsPick(vls,13).forEach(l=>{const x=Math.max(pl+l.w/2,Math.min(W-pr-l.w/2,l.x));vt+=`<text class="ax num vl${l.c}" x="${x}" y="${l.y}" text-anchor="middle"${l.c?' style="fill:var(--s7)"':''}>${esc(l.tx)}</text>`});
-  el.innerHTML=`<svg width="${W}" height="${H}">${s}<g>${marks}</g>${vt}${hits}</svg>`;
-  const mk=el.querySelectorAll('.bm');
-  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.3);
+  el.innerHTML=`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g>${marks}</g>${vt}${hits}</svg>`;
+  const mk=el.querySelectorAll('.bg');
+  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
   bindTip(el,i=>{const m=o.months[i];let h=`<b>${esc(o.tipLabels?o.tipLabels[i]:o.labels[i])}</b>`;
     m.segs.filter(x=>x.v>0).forEach(x=>{h+=tipRow(o.colors[x.k]||'var(--s1)',(o.names[x.k]||x.k)+(x.est?' (прогноз)':''),ft(x.v))});
     if(m.call>0)h+=tipRow('var(--s4)','возможный CALL',ft(m.call));
-    h+=`<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${ft(tot(m))}</span></div>`;return h});
+    h+=`<div class="tot">Итого<span>${ft(tot(m))}</span></div>`;return h});
 }
 
 
@@ -25726,7 +26642,7 @@ function candles(id,data,o){
   let hits='';for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${pl+gw*i}" y="${pt}" width="${gw}" height="${H-pt-pb}" fill="transparent"/>`;
   el.innerHTML=`<svg width="${W}" height="${H}">${s}${vol}${marks}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
-  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph+vh+8}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`};
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph+vh+8}" stroke="var(--line2)" stroke-dasharray="3 3"/>`};
   bindTip(el,i=>{o.hover&&o.hover(i);if(o.ft)return o.ft(i);const c=data[i],up=c.c>=c.o;
     let h=`<b>${esc(lab(c.t))}</b>`+tipRow(up?'var(--pos)':'var(--neg)','Закрытие',fmt(c.c))+tipRow('var(--mu)','Открытие',fmt(c.o))+tipRow('var(--mu)','Максимум',fmt(c.h))+tipRow('var(--mu)','Минимум',fmt(c.l));
     if(c.v)h+=tipRow('var(--mu)','Объём',short(c.v));
@@ -25737,7 +26653,7 @@ const LOGO_BAD=new Set();
 function colorFor(t){return HEX[(t||'?').split('').reduce((a,ch)=>a+ch.charCodeAt(0),0)%8]}
 function logo(r,size=30){
   const t=(r.ticker&&!/^[A-Z]{2}[A-Z0-9]{9}\d$/.test(r.ticker)&&r.ticker.length<=6?r.ticker:(r.name||r.ticker||'?')).replace(/^(ПАО|АО|ООО|МФК|ПКО|ОФЗ)\s+/i,''),w=t.split(/[\s\-«»"]+/).filter(x=>/[A-Za-zА-Яа-яЁё0-9]/.test(x)),init=esc((w.length>1&&!(r.ticker&&r.ticker.length<=6&&t===r.ticker)?w[0][0]+w[1][0]:(t.replace(/[^A-Za-zА-Яа-яЁё0-9]/g,'')||'?').slice(0,2)).toUpperCase());
-  return`<span class="av" style="width:${size}px;height:${size}px;background:${esc(r.color||colorFor(t))};font-size:${Math.round(size*.36)}px"><b>${init}</b>${r.logo&&!LOGO_BAD.has(r.logo)?`<img src="/logo/${encodeURIComponent(r.logo)}" alt="" loading="lazy" data-l="${esc(r.logo)}" onerror="LOGO_BAD.add(this.dataset.l);this.remove()">`:''}</span>`;
+  return`<span class="av" style="width:${size}px;height:${size}px;--avc:${esc(r.color||colorFor(t))};font-size:${Math.round(size*.36)}px"><b>${init}</b>${r.logo&&!LOGO_BAD.has(r.logo)?`<img src="/logo/${encodeURIComponent(r.logo)}" alt="" loading="lazy" data-l="${esc(r.logo)}" onerror="LOGO_BAD.add(this.dataset.l);this.remove()">`:''}</span>`;
 }
 const ident=(r,sub)=>`<div class="tk">${logo(r)}<div><b title="${esc(r.name)}">${esc(r.name||r.ticker)}</b><small>${esc(sub!=null?sub:(r.ticker&&r.ticker!==r.name?r.ticker:''))}</small></div></div>`;
 
@@ -25779,7 +26695,7 @@ $('#period').onclick=e=>{const b=e.target.closest('[data-k]');if(!b||b.dataset.k
 $('#acl').onclick=e=>{const b=e.target.closest('[data-a]');if(!b||b.dataset.a===S.account)return;S.account=b.dataset.a;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
 $('#hideEmpty').onchange=e=>{S.hideEmpty=e.target.checked;persist();renderAccounts()};
 $('#refresh').onclick=()=>load(true);
-function go(p){if(typeof skClose==='function')skClose();S.page=p;S.opsN=200;persist();renderNav();render()}
+function go(p){if(typeof skClose==='function')skClose();const prev=S.page;if(typeof dlScrSave==='function')dlScrSave(prev);S.page=p;S.opsN=200;persist();renderNav();render();if(prev!==p&&typeof dlScrRestore==='function')dlScrRestore(p)}
 
 let reqId=0;
 async function load(force,periodOnly){
@@ -25792,6 +26708,7 @@ async function load(force,periodOnly){
     if(my!==reqId)return;
     S.data=d;S.accounts=d.accounts;if(S.account!==d.account){S.account=d.account}persist();
     $('#upd').textContent='обновлено в '+d.updated;
+    {const rf=$('#refresh');if(rf)rf.title='Обновить данные · обновлено в '+d.updated}
     renderAccounts();renderNav();
     if(!periodOnly||force||!S.bonds||!S.hist)loadExtra(force);
   }catch(e){if(my!==reqId)return;S.err=e.message}
@@ -25923,14 +26840,14 @@ function pDash(){
     ${kpi('Плата за маржу',M(t.margin_fee||0),t.varmargin?`вар. маржа ${SM(t.varmargin)}`:'шорт и кредитное плечо',null,S5)}
     ${kpi('Налоги удержано',M(taxes),'подробнее — во вкладке «Налоги»',null,S4)}
     ${kpi('Оборот',M(turn,'rub',0),`покупки ${short(t.buy_turnover||0)} · продажи ${short(t.sell_turnover||0)}`,null,S7)}</div>`;
-  const alloc=[['Акции',p.shares,S1],['Облигации',p.bonds,S2],['Фонды',p.etf,S3],['Валюта и деньги',p.currencies,S4],['Фьючерсы',p.futures,S5],['Структурные',p.sp,S6],['Опционы',p.options,S7],['Прочее',p.other,S8]].map(([n,v,c])=>({n,v,c}));
+  const alloc=[['Акции',p.shares,S1],['Облигации',p.bonds,S3],['Фонды',p.etf,S4],['Валюта и деньги',p.currencies,S7],['Фьючерсы',p.futures,S5],['Структурные',p.sp,S2],['Опционы',p.options,S6],['Прочее',p.other,S8]].map(([n,v,c])=>({n,v,c}));
   chart('c-alloc',donut,{items:alloc,cap:'Портфель'});
   let eq=waitBox('Восстанавливаю историю стоимости по ценам закрытия…');
   if(S.hist&&S.hist.error)eq=`<div class="msg err">${esc(S.hist.error)}</div>`;
   else if(S.hist&&!hs)eq='<div class="empty">Недостаточно истории за период</div>';
   else if(hs){eq='<div id="c-eq" class="chart"></div>';
     chart('c-eq',line,{h:290,area:true,zero:false,labels:hs.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tipLabels:hs.days.map(dlabel),
-      series:[{n:'Стоимость портфеля',c:S1,hex:'#3987e5',v:hs.value},{n:'Вложено',c:'#8b93a7',v:hs.invested,dash:1,w:1.6}]})}
+      series:[{n:'Стоимость портфеля',c:S1,v:hs.value},{n:'Вложено',c:'#8b93a7',v:hs.invested,dash:1,w:1.6}]})}
   let mret=waitBox();
   if(S.hist&&S.hist.monthly){const ms=Object.keys(S.hist.monthly).sort().slice(-12);mret='<div id="c-mret" class="chart"></div>';
     chart('c-mret',bars,{labels:ms.map(mlabel),tipLabels:ms.map(m=>{const[y,mm]=m.split('-');return MONF[+mm-1]+' '+y}),labelsOn:ms.length<=12,
@@ -25997,13 +26914,13 @@ function pRet(){
     ${kpi('Худший месяц',worst?pct(worst[1]*100):'—',worst?lab(worst[0]):'',worst&&worst[1]<0?'neg':'',S8)}</div>`;
   if(hs){
     const labs=hs.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tips=hs.days.map(dlabel);
-    const ser=[{n:'Мой портфель',c:S1,hex:'#3987e5',v:hs.twr.map(x=>x*100),w:2.4}];
+    const ser=[{n:'Мой портфель',c:S1,v:hs.twr.map(x=>x*100),w:2.4}];
     if(hs.bench.LQDT)ser.push({n:'Денежный рынок (LQDT)',c:S3,v:hs.bench.LQDT.map(x=>x==null?null:x*100),w:1.6});
     if(hs.bench.TMOS)ser.push({n:'Индекс МосБиржи (фонд TMOS)',c:S2,v:hs.bench.TMOS.map(x=>x==null?null:x*100),w:1.6});
     const fp=v=>(Math.round(v*10)/10).toString().replace('.',',')+'%';
     chart('c-twr',line,{h:300,labels:labs,tipLabels:tips,series:ser,fa:fp,ft:v=>pct(v),zero:false});
-    chart('c-dd',line,{h:200,area:'neg',labels:labs,tipLabels:tips,series:[{n:'Просадка',c:S8,hex:'#e66767',v:hs.dd.map(x=>x*100)}],fa:fp,ft:v=>pct(v)});
-    chart('c-pl',line,{h:200,area:true,labels:labs,tipLabels:tips,series:[{n:'Прибыль (стоимость − вложено)',c:S3,hex:'#199e70',v:hs.value.map((v,i)=>v-hs.invested[i])}]});
+    chart('c-dd',line,{h:200,area:'neg',labels:labs,tipLabels:tips,series:[{n:'Просадка',c:'var(--neg)',v:hs.dd.map(x=>x*100)}],fa:fp,ft:v=>pct(v)});
+    chart('c-pl',line,{h:200,area:true,labels:labs,tipLabels:tips,series:[{n:'Прибыль (стоимость − вложено)',c:'var(--pos)',v:hs.value.map((v,i)=>v-hs.invested[i])}]});
     out+=`<div class="card"><h2>Доходность портфеля и бенчмарков, %<span class="sp">${periodName()}</span></h2><div id="c-twr" class="chart"></div></div>
       <div class="g g2"><div class="card"><h2>Просадка от максимума, %</h2><div id="c-dd" class="chart"></div></div>
       <div class="card"><h2>Прибыль в рублях</h2><div id="c-pl" class="chart"></div></div></div>`;
@@ -26058,14 +26975,60 @@ function pPos(){
 /* ── кредитные рейтинги ── */
 const RSC=['AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-','BB+','BB','BB-','B+','B','B-','CCC','CC','C','D'];
 const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
+/* Пресс-релиз по клику на тег рейтинга: только https и хосты агентств/Telegram */
+const RT_HOSTS=['acra-ratings.ru','raexpert.ru','ratings.ru','ra-national.ru','t.me'];
+function rtSafeUrl(u){
+  try{const x=new URL(String(u||''));
+    if(x.protocol!=='https:'||x.username||x.password)return'';
+    const h=x.hostname.toLowerCase();
+    return RT_HOSTS.some(d=>h===d||h.endsWith('.'+d))?x.href:'';
+  }catch(e){return''}
+}
 function ratingTag(r,short){
   if(!r)return'';
   if(typeof r==='string')r={v:r,all:[]};
   const all=Array.isArray(r.all)?r.all:[];
-  const t=all.map(x=>`${x.agency}: ${x.rating}${x.outlook?' · '+x.outlook:''} · от ${x.date} · ${x.issuer}${x.approx?' (приблизительное совпадение названия)':''}`).join('\n');
+  const links=all.map(x=>({a:x.agency,r:x.rating,o:x.outlook||'',d:x.date||'',u:rtSafeUrl(x.url)}));
+  const has=links.some(x=>x.u);
+  let t=all.map(x=>`${x.agency}: ${x.rating}${x.outlook?' · '+x.outlook:''} · от ${x.date} · ${x.issuer}${x.approx?' (приблизительное совпадение названия)':''}`).join('\n');
+  if(has)t+=(t?'\n':'')+'Нажмите, чтобы открыть пресс-релиз';
   const n=Math.max(0,all.length-1),ag=short||!r.agency?'':` <small class="rt-ag">· ${esc(r.agency)}${n>0?' +'+n:''}</small>`;
-  return`<span class="tag rt rt-${rBucket(r.v).split(' ')[0]}" style="white-space:nowrap" title="${esc(t)}">${r.approx?'≈ ':''}${esc(r.v)}${ag}</span>`;
+  const act=has?` role="button" tabindex="0" data-rt="${esc(JSON.stringify(links))}"`:'';
+  return`<span class="tag rt rt-${rBucket(r.v).split(' ')[0]}${has?' rt-click':''}" style="white-space:nowrap" title="${esc(t)}"${act}>${r.approx?'≈ ':''}${esc(r.v)}${ag}</span>`;
 }
+/* атрибуты кликабельного тега по готовому списку [{a,r,o,d,u}] — для таблиц, которые рисуют тег сами */
+function rtClick(L){
+  const links=(Array.isArray(L)?L:[]).map(x=>({a:x.a,r:x.r,o:x.o||'',d:x.d||'',u:rtSafeUrl(x.u)}));
+  return links.some(x=>x.u)?{cls:' rt-click',attr:` role="button" tabindex="0" data-rt="${esc(JSON.stringify(links))}"`}:{cls:'',attr:''};
+}
+function rtPopClose(){const p=document.getElementById('rt-pop');if(p)p.remove()}
+/* как обычная ссылка target=_blank: окно pywebview отдаёт такие в системный браузер, window.open там ненадёжен */
+function rtOpenUrl(u){if(!(u=rtSafeUrl(u)))return;const a=document.createElement('a');a.href=u;a.target='_blank';a.rel='noopener noreferrer';a.style.display='none';document.body.appendChild(a);a.click();a.remove()}
+function rtPopOpen(el){
+  let L;try{L=JSON.parse(el.dataset.rt||'[]')}catch(e){L=[]}
+  rtPopClose();
+  const withUrl=L.filter(x=>x.u);
+  if(!withUrl.length)return;
+  if(L.length===1){rtOpenUrl(withUrl[0].u);return}
+  const pop=document.createElement('div');pop.id='rt-pop';pop.setAttribute('role','dialog');
+  pop.innerHTML=L.map(x=>`<div class="rt-pop-r"><b>${esc(x.a)}</b><span>${esc(x.r)}${x.o?' · '+esc(x.o):''}${x.d?' · '+esc(typeof ddm==='function'&&/^\d{4}-/.test(x.d)?ddm(x.d):x.d):''}</span>${x.u?`<a href="${esc(x.u)}" target="_blank" rel="noopener noreferrer">Пресс-релиз ↗</a>`:'<span class="mu">нет ссылки</span>'}</div>`).join('');
+  document.body.appendChild(pop);
+  const b=el.getBoundingClientRect(),w=pop.offsetWidth,h=pop.offsetHeight;
+  pop.style.left=Math.max(8,Math.min(b.left,innerWidth-w-8))+'px';
+  pop.style.top=(b.bottom+6+h>innerHeight-8?Math.max(8,b.top-h-6):b.bottom+6)+'px';
+}
+/* делегированные обработчики: рендеры перерисовывают DOM; capture + stopPropagation — клик по тегу не открывает карточку строки */
+document.addEventListener('click',e=>{
+  const el=e.target.closest&&e.target.closest('[data-rt]');
+  if(el){e.preventDefault();e.stopPropagation();const open=document.getElementById('rt-pop');const same=open&&open._for===el;rtPopClose();if(!same){rtPopOpen(el);const p=document.getElementById('rt-pop');if(p)p._for=el}return}
+  if(e.target.closest&&e.target.closest('#rt-pop a')){e.stopPropagation();setTimeout(rtPopClose,0);return}
+  if(document.getElementById('rt-pop')&&!(e.target.closest&&e.target.closest('#rt-pop')))rtPopClose();
+},true);
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape')rtPopClose();
+  else if((e.key==='Enter'||e.key===' ')&&e.target.closest&&e.target.closest('[data-rt]')){e.preventDefault();e.stopPropagation();e.target.closest('[data-rt]').click()}
+},true);
+window.addEventListener('scroll',rtPopClose,true);
 function ratingsCard(b){
   const info=b.ratings_info||{},tot=(b.ratings||[]).reduce((a,x)=>a+x[1],0)||1;
   const COL={'AAA':S3,'AA':S3,'A':S1,'BBB':S4,'BB и ниже':S8,'нет рейтинга':'#6f7686'};
@@ -26166,7 +27129,7 @@ function pBonds(){
   const presetBar=`<div class="seg noprint" style="margin:0 0 10px">${Object.entries(BC_PRE).map(([k2,v])=>`<button class="${k2===pre?'on':''}" onclick="bondsPreset('${k2}')">${v[0]}</button>`).join('')}</div>`;
   const sk=['-3','-2','-1','1','2','3'],st=m.stress||{};
   chart('c-stress',bars,{h:220,labels:sk.map(x=>(x>0?'+':'−')+Math.abs(x)+' п.п.'),series:[{n:'Изменение стоимости',c:S3,v:sk.map(x=>(st[x]||{}).rub||0)}],legend:false,
-    colorOf:v=>v>=0?'#19a070':'#d5524a',empty:'Нет данных для стресс-теста'});
+    colorOf:v=>v>=0?'var(--pos)':'var(--neg)',empty:'Нет данных для стресс-теста'});
   const hy=m.high_yield||[],kr=m.keyrate;
   chart('c-ladder',bars,{h:220,labels:b.ladder.map(x=>x[0]),series:[{n:'Погашается / пут-оферта',c:S1,v:b.ladder.map(x=>x[1])}],legend:false});
   return`<div class="g g4">${kpi('Облигации',M(m.value,'rub',0),`${m.count} выпусков · ${m.issuers} эмитентов · ${pctp(m.value/tot*100)} портфеля`,null,S1)}
@@ -26288,7 +27251,7 @@ function priStatsHtml(){
   if(!a.n)return head+(d.loading?waitBox((d.phase||'Готовлю данные')+(d.total?` — ${d.done} из ${d.total}`:'')+'. Первый расчёт занимает 2–3 минуты, потом данные хранятся на компьютере.'):'<div class="empty">Пока нет данных по размещённым выпускам. Проверьте подключение к интернету.</div>')+'</div>';
   const bk=(d.buckets||[]).filter(b=>b.n>=3);
   chart('c-pri-b',bars,{h:260,labels:bk.map(b=>b.bucket+' ('+b.n+')'),zero:true,
-    series:[{n:'1-й день, цена − номинал',c:'#3987e5',v:bk.map(b=>b.p0==null?null:+(b.p0-100).toFixed(2))},{n:'Через 30 дней, цена − номинал',c:'#19a070',v:bk.map(b=>b.p30==null?null:+(b.p30-100).toFixed(2))}],
+    series:[{n:'1-й день, цена − номинал',c:'var(--s1)',v:bk.map(b=>b.p0==null?null:+(b.p0-100).toFixed(2))},{n:'Через 30 дней, цена − номинал',c:'var(--s3)',v:bk.map(b=>b.p30==null?null:+(b.p30-100).toFixed(2))}],
     fa:v=>(+v).toFixed(1).replace('.',','),ft:v=>ppd(v),empty:'Мало данных для графика'});
   const dv=a.p30==null?null:a.p30-100;
   const verdict=a.p30==null?'Через 30 дней данных пока мало.':
@@ -26349,7 +27312,7 @@ function pvRow(r,today){
     <td class="l"><div class="pv-nm">${r.status!=='upcoming'?`<button class="pv-x${open?' on':''}" data-pvx="${esc(r.secid)}" title="Разбивка по дням" aria-expanded="${open}">›</button>`:'<span class="pv-x0"></span>'}<div><b>${esc(r.name)}</b> <small class="${st[1]}">${st[0]}</small><br><small class="mu num">${isinTxt(r.isin)}</small></div></div></td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
     <td class="l">${r.coupon?esc(r.coupon):'<span class="mu" title="Ставку купона эмитент объявляет в день сбора заявок">—</span>'}</td>
-    <td class="num">${r.start?ddm(r.start):'—'}${r.start===today?'<br><small class="pos">сегодня</small>':''}</td>
+    <td class="num">${r.start?ddm(r.start):'—'}${r.start===today?'<br><small class="pos">сегодня</small>':r.days_on>0&&r.status!=='upcoming'?`<br><small class="mu num" title="Дней с начала размещения">${r.days_on} дн.</small>`:''}</td>
     <td class="num">${r.size_rub?`${pvAmt(r.size_rub,r.cur)}<br><small class="mu num">${short(r.size_pcs)} шт</small>`:'<span class="mu">—</span>'}</td>
     <td class="num">${placed}</td><td class="num">${tod}</td><td class="num">${r.yield?pp1(r.yield):'<span class="mu">—</span>'}</td></tr>`+(open?`<tr class="pv-dd"><td colspan="8">${pvDaysHtml(r.secid)}</td></tr>`:'');
 }
@@ -26361,7 +27324,7 @@ function pvDaysHtml(secid){
   if(!days.length)return`<div class="empty">Торгов по выпуску пока не было</div>`+(d.errors&&d.errors.length?`<p class="note">${esc(d.errors.join('; '))}</p>`:'');
   const last=days.slice(-45);
   chart('c-pvd-'+secid,bars,{h:170,labels:last.map(x=>ddm(x.d).slice(0,5)),stack:true,zero:true,
-    series:[{n:'Размещение',c:'#3987e5',v:last.map(x=>x.place_v)},{n:'Вторичный рынок',c:'#19a070',v:last.map(x=>x.sec_v)}],fa:v=>short(v),ft:v=>pvRub(v),empty:'Нет сделок'});
+    series:[{n:'Размещение',c:'var(--s1)',v:last.map(x=>x.place_v)},{n:'Вторичный рынок',c:'var(--s3)',v:last.map(x=>x.sec_v)}],fa:v=>short(v),ft:v=>pvRub(v),empty:'Нет сделок'});
   const rows=days.slice().reverse().map(x=>`<tr><td class="num">${ddm(x.d)}${x.live?' <small class="pos">сегодня</small>':''}</td>
     <td class="l">${pvLabels(x.boards).map(b=>`<span class="tag${b.place?' pv-pt':''}" title="${esc(b.ids.join(', '))}: ${pvRub(b.v)}, ${b.n} сд.">${esc(b.label)}</span>`).join(' ')}</td>
     <td class="num">${NFQ.format(Math.round(x.q))}</td><td class="num">${pvRub(x.v)}</td><td class="num">${x.n}</td>
@@ -26501,7 +27464,7 @@ function scrRowHtml(r,fl){
   const id=r.isin||r.id,cls=[];
   if(fl>0&&r.yield<fl)cls.push('scr-low');
   if(typeof KB!=='undefined'&&KB.key===id)cls.push('kb-row');
-  const rt=r.rating?`<div class="cell-stack"><span class="cell-sub">${esc(r.rt_agency||'')}</span><span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}" title="${esc(r.rt_agency||'')}${r.rt_approx?' (приблизительное совпадение названия)':''}">${r.rt_approx?'≈ ':''}${esc(r.rating)}</span></div>`:'<span class="mu">—</span>';
+  const rt=r.rating?`<div class="cell-stack"><span class="cell-sub">${esc(r.rt_agency||'')}</span><span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}${rtClick(r.rt_links).cls}" title="${esc(r.rt_agency||'')}${r.rt_approx?' (приблизительное совпадение названия)':''}${r.rt_links?'\nНажмите, чтобы открыть пресс-релиз':''}"${rtClick(r.rt_links).attr}>${r.rt_approx?'≈ ':''}${esc(r.rating)}</span></div>`:'<span class="mu">—</span>';
   const yrs=r.perp?'<span class="tag">бессрочная</span>':`<div class="cell-stack r"><span>${ddm(r.mat)}</span><span class="cell-sub">${(S.sf.toOffer&&r.yoff!=null?r.yoff:r.years).toFixed(1).replace('.',',')} г${S.sf.toOffer&&r.yoff!=null?' до оферты':''}</span></div>`;
   return`<tr${cls.length?` class="${cls.join(' ')}"`:''}${fl>0&&r.yield<fl?' title="Доходность ниже, чем у фонда ликвидности"':''} data-isin="${esc(id)}"><td class="wt-std">${watchStar(id)}</td>
     <td class="l"><div class="cell-stack"><b>${esc(r.name)}</b><small class="cell-sub mu num">${isinTxt(id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></div></td>
@@ -26755,21 +27718,22 @@ function dayBars(el,o){
   if(!n)return emptyChart(el,H,'Выплат в выбранном периоде нет');
   const mx=Math.max(...days.map(d=>d.total)),{lo,hi,step:ys}=nice(0,mx),ph=H-pt-pb,Y=v=>pt+ph-(v-lo)/(hi-lo)*ph;
   let ax='',grid='';
-  for(let v=lo;v<=hi+ys/2;v+=ys){const y=Y(v);ax+=`<text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${v===0?'0':short(v)}</text>`;grid+=`<line class="grid-l" x1="0" x2="100000" y1="${y}" y2="${y}"/>`}
+  for(let v=lo;v<=hi+ys/2;v+=ys){const y=Y(v);ax+=`<text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${v===0?'0':short(v)}</text>`;grid+=`<line class="grid-l${v===0?' z':''}" x1="0" x2="100000" y1="${y}" y2="${y}"/>`}
   ax+=`<text class="ax" transform="translate(14 ${pt+ph/2}) rotate(-90)" text-anchor="middle">Сумма выплат, ₽</text>`;
-  const bw=Math.min(40,step*.62);let marks='',lab='',hits='';
-  days.forEach((d,i)=>{const cx=step*i+step/2;let acc=0;
-    d.items.forEach((it,k)=>{const y1=Y(acc+it.amount),y0=Y(acc),h=Math.max(0,y0-y1-(k?1:0));
-      marks+=`<path class="bm" data-g="${i}" d="${k===d.items.length-1?rtop(cx-bw/2,y1,bw,h,4):`M${cx-bw/2},${y1}h${bw}v${h}h${-bw}Z`}" fill="${it.c}"${it.kind==='dividend'?'':''}/>`;acc+=it.amount});
+  const bw=Math.max(8,Math.min(48,step*.62)),G=gradSet(),an=animOnce(el),y0=Y(0);let marks='',lab='',hits='';
+  days.forEach((d,i)=>{const cx=step*i+step/2;let acc=0,gm='';
+    d.items.forEach((it,k)=>{const y1=Y(acc+it.amount),ya=Y(acc),h=Math.max(0,ya-y1-(k?1:0));
+      gm+=`<path class="bm" d="${k===d.items.length-1?rtop(cx-bw/2,y1,bw,h,5):`M${cx-bw/2},${y1}h${bw}v${h}h${-bw}Z`}" fill="${G.u(it.c)}"/>`;acc+=it.amount});
+    marks+=`<g class="bg" data-g="${i}" style="transform-origin:0 ${y0}px;animation-delay:${Math.min(i,24)*18}ms">${gm}</g>`;
     lab+=`<text class="ax num" x="${cx}" y="${Y(d.total)-7}" text-anchor="middle" style="fill:var(--tx);font-weight:600">${short(d.total)}</text>`;
     lab+=`<text class="ax" transform="translate(${cx+4} ${H-pb+14}) rotate(-45)" text-anchor="end">${d.label}</text>`;
     hits+=`<rect data-i="${i}" x="${step*i}" y="${pt}" width="${step}" height="${ph}" fill="transparent"/>`});
   const W=Math.max(step*n,el.clientWidth-pl-4);
-  el.innerHTML=`<div class="dwrap"><svg width="${pl}" height="${H}" style="flex:none">${ax}</svg><div class="dscroll"><svg width="${W}" height="${H}">${grid}<g>${marks}</g>${lab}${hits}</svg></div></div>
+  el.innerHTML=`<div class="dwrap"><svg width="${pl}" height="${H}" style="flex:none">${ax}</svg><div class="dscroll"><svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${grid}<g>${marks}</g>${lab}${hits}</svg></div></div>
     <div class="lg2">${o.legend.map(l=>`<span><i style="background:${l.c}"></i>${esc(l.n)}${l.tag?` <em>${l.tag}</em>`:''}</span>`).join('')}</div>`;
-  const mk=el.querySelectorAll('.bm');el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?1:.35);
+  const mk=el.querySelectorAll('.bg');el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
   bindTip(el,i=>{const d=days[i];return`<b>${esc(d.full)}</b>`+d.items.map(it=>tipRow(it.c,it.name+' · '+it.kl,M(it.amount))).join('')+
-    `<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${M(d.total)}</span></div>`});
+    `<div class="tot">Итого<span>${M(d.total)}</span></div>`});
 }
 function payDays(ps,limit){
   const to=new Date(Date.now()+limit*864e5).toISOString().slice(0,10),from=new Date().toISOString().slice(0,10);
@@ -26853,7 +27817,7 @@ function cf36Tip(i){
   let h=`<b>${MONF[+mm-1]} ${y}</b>`;
   if(m.total<=0)return h+'<div>Выплат нет</div>';
   CF36_K.forEach(([k,n,c])=>{if(m.by[k])h+=tipRow(c,n,M(m.by[k]))});
-  h+=`<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${M(m.total)}</span></div>`;
+  h+=`<div class="tot">Итого<span>${M(m.total)}</span></div>`;
   if(m.est>0)h+=`<div>в т. ч. оценка<span>${M(m.est)}</span></div>`;
   (m.top||[]).forEach(t=>h+=`<div style="color:var(--tx2)">${esc(t.name)}${t.est?' (оценка)':''}<span>${M(t.amount)}</span></div>`);
   return h;
@@ -27050,7 +28014,7 @@ function txOv(){
     ${kpi(`Оценка НДФЛ за ${cy}`,cur?M(cur.estimate):'—',cur?`база ${short(Math.max(0,cur.trade)+cur.income)} ₽`:'нет дохода',null,S1)}
     ${kpi(`Удержано в ${cy}`,cur?M(cur.withheld):'—','по операциям этого года',null,S3)}
     ${kpi('Ожидается к удержанию',cur?M(Math.max(0,cur.diff)):'—',cur&&cur.diff<0?'удержано больше оценки':'при выводе или в конце года',cur&&cur.diff>0?'neg':'',S2)}</div>`;
-  chart('c-tax',bars,{labels:rows.map(r=>String(r.year)),series:[{n:'Оценка НДФЛ',c:S1,v:rows.map(r=>r.estimate)},{n:'Удержано брокером',c:S2,v:rows.map(r=>r.withheld)}]});
+  chart('c-tax',bars,{labels:rows.map(r=>String(r.year)),series:[{n:'Оценка НДФЛ',c:S1,v:rows.map(r=>r.estimate)},{n:'Удержано брокером',c:S3,v:rows.map(r=>r.withheld)}]});
   out+=`<div class="g c-1-2"><div class="card"><h2>Удержанные налоги по видам</h2>${withheld?hbars(TAXK.filter(k=>lf[k]).map((k,i)=>({n:L[k],v:lf[k],c:PAL[i]})),S1,null,1):'<div class="empty">Налоги не удерживались</div>'}</div>
     <div class="card"><h2>Оценка и факт по годам, ₽</h2><div id="c-tax" class="chart"></div></div></div>`;
   out+=`<div class="card" style="padding:6px 8px"><div class="tbl"><table><thead><tr><th>Год</th><th>Результат сделок</th><th>Дивиденды, купоны, РЕПО</th><th>Налоговая база</th><th>Оценка НДФЛ</th><th>Удержано</th><th>Разница</th></tr></thead><tbody>`+
@@ -27074,7 +28038,7 @@ function txYr(d){
   if(!ys.length)return`<div class="card empty">Нет операций для расчёта налога</div>`;
   const cy=new Date().getFullYear(),cur=ys.find(r=>r.year===cy)||ys[ys.length-1];
   const tot=ys.reduce((a,r)=>({tax:a.tax+r.tax,wh:a.wh+r.withheld,ldv:a.ldv+r.ldv_saved}),{tax:0,wh:0,ldv:0});
-  chart('c-txy',bars,{labels:ys.map(r=>String(r.year)),series:[{n:'Налог по расчёту',c:S1,v:ys.map(r=>r.tax)},{n:'Удержано брокером',c:S2,v:ys.map(r=>r.withheld)}]});
+  chart('c-txy',bars,{labels:ys.map(r=>String(r.year)),series:[{n:'Налог по расчёту',c:S1,v:ys.map(r=>r.tax)},{n:'Удержано брокером',c:S3,v:ys.map(r=>r.withheld)}]});
   let out=`<div class="g g4">${kpi(`Налог по расчёту за ${cur.year}`,tR(cur.tax),`база ${tR(cur.base)}; ставка 13 %${cur.tax15>0?' и 15 %':''}`,null,S1)}
     ${kpi(`Удержано в ${cur.year}`,tR(cur.withheld),cur.diff_pct==null?'по операциям удержания':`расчёт отличается на ${pct(cur.diff_pct,0)}`,null,S2)}
     ${kpi('Сэкономлено за счёт ЛДВ',tR(tot.ldv),'за все годы',tot.ldv>0?'pos':'',S3)}
@@ -27123,10 +28087,10 @@ function txIis(d){
     <div class="g g4">${kpi('Открыт',tDt(i.opened),i.opened?'':'укажите дату в настройках',null,S1)}
       ${kpi('Срок владения до',tDt(i.term),i.type==='3'?'5 лет для ИИС-3':'3 года',null,S2)}
       ${kpi('Освобождение дохода',exAvail?(i.term_ok?'действует':'ещё нет'):'не предусмотрено',exAvail?(i.term_ok?'доход внутри счёта не облагается':'до срока при закрытии будет налог'):'для типа А налог платится с дохода',i.term_ok&&exAvail?'pos':'',S3)}
-      ${kpi('Вычет на взносы',dedAvail?tR(i.deduct_total):'не предусмотрен',dedAvail?'13 % от взносов до 400 тыс. ₽ в год':'у типа Б вычета на взносы нет',null,S4)}</div>
-    ${dedAvail?`<div class="tbl" style="margin-top:12px"><table><thead><tr><th>Год</th><th>Взносы</th><th>Учитывается в вычете (до 400 тыс. ₽)</th><th>Вернуть можно (13 %)</th></tr></thead><tbody>${
+      ${kpi('Вычет на взносы',dedAvail?tR(i.deduct_total):'не предусмотрен',dedAvail?`${Math.round(i.deduct_rate*100)} % от взносов до 400 тыс. ₽ в год`:'у типа Б вычета на взносы нет',null,S4)}</div>
+    ${dedAvail?`<div class="tbl" style="margin-top:12px"><table><thead><tr><th>Год</th><th>Взносы</th><th>Учитывается в вычете (до 400 тыс. ₽)</th><th>Вернуть можно (${Math.round(i.deduct_rate*100)} %)</th></tr></thead><tbody>${
       i.years.filter(y=>y.deposits>0).map(y=>`<tr><td><b>${y.year}</b></td><td class="num">${tR(y.deposits)}</td><td class="num">${tR(y.deduct_base)}${y.over>0?`<br><small class="mu">сверх лимита ${tR(y.over)}</small>`:''}</td><td class="num pos">${tR(y.deduct)}</td></tr>`).join('')||'<tr><td colspan="4" class="l mu">Пополнений в истории нет</td></tr>'}</tbody></table></div>
-    <p class="note">Вычет возвращает налог, уплаченный с вашей зарплаты и других доходов по ставке 13 %: больше, чем вы заплатили, вернуть нельзя. Заявляется в декларации 3-НДФЛ или через работодателя.</p>`:''}
+    <p class="note">Вычет возвращает налог, уплаченный с вашей зарплаты и других доходов по ставке ${Math.round(i.deduct_rate*100)} % (её можно изменить в настройках): больше, чем вы заплатили, вернуть нельзя. Заявляется в декларации 3-НДФЛ или через работодателя.</p>`:''}
     ${exAvail?`<p class="note">При закрытии ИИС до срока (${tDt(i.term)}) налог с дохода придётся заплатить; расчётный налог по всему доходу счёта — ${tR(i.tax_if_closed)}. Результат сделок на ИИС: ${tS(i.trade_total)}, дивиденды и купоны: ${tR(i.income_total)}.</p>`:`<p class="note">Для типа А налог на доход внутри ИИС удерживается как обычно; результат сделок: ${tS(i.trade_total)}, дивиденды и купоны: ${tR(i.income_total)}.</p>`}</div>`}).join('')+
     `<p class="note noprint"><a href="#" onclick="txGo('set');return false">Указать тип и дату открытия ИИС</a>. Условия вычета зависят от года открытия счёта — сверьтесь с правилами ФНС.</p>`;
 }
@@ -27214,7 +28178,7 @@ function txDecl(d){
 
 /* ── Настройки налогов ── */
 function txDraft(d){
-  if(!S.tx.draft){const s=d.settings;S.tx.draft={iis:JSON.parse(JSON.stringify(s.iis||{})),loss:Object.keys(s.loss_carry||{}).sort().map(y=>({y:y,a:String(s.loss_carry[y])})),off:!!s.offset_coupons}}
+  if(!S.tx.draft){const s=d.settings;S.tx.draft={iis:JSON.parse(JSON.stringify(s.iis||{})),loss:Object.keys(s.loss_carry||{}).sort().map(y=>({y:y,a:String(s.loss_carry[y])})),off:!!s.offset_coupons,rate:String(s.ndfl_rate||13)}}
   return S.tx.draft;
 }
 function txIn(el){
@@ -27222,6 +28186,7 @@ function txIn(el){
   if(k==='iis'){dr.iis[el.dataset.id]=dr.iis[el.dataset.id]||{type:'',opened:''};dr.iis[el.dataset.id][el.dataset.f]=el.value}
   else if(k==='loss'){dr.loss[+el.dataset.i][el.dataset.f]=el.value}
   else if(k==='off'){dr.off=el.checked}
+  else if(k==='rate'){dr.rate=el.value}
 }
 function txLossAdd(y,a){const dr=S.tx.draft;if(y&&dr.loss.some(r=>String(r.y)===String(y)))return;dr.loss.push({y:y?String(y):'',a:a?String(Math.round(a)):''});render()}
 function txLossDel(i){S.tx.draft.loss.splice(i,1);render()}
@@ -27229,7 +28194,7 @@ async function txSave(btn){
   const dr=S.tx.draft;btn.disabled=true;
   try{
     const lc={};for(const r of dr.loss){const y=String(r.y).trim(),a=parseFloat(String(r.a).replace(/\s/g,'').replace(',','.'));if(y&&a>0)lc[y]=a}
-    await post('/api/tax/settings',{iis:dr.iis,loss_carry:lc,offset_coupons:dr.off});
+    await post('/api/tax/settings',{iis:dr.iis,loss_carry:lc,offset_coupons:dr.off,ndfl_rate:+dr.rate});
     S.tx.msg='Сохранено';S.tx.data=null;S.tx.acc=null;render()
   }catch(e){S.tx.msg=e.message;btn.disabled=false;render()}
 }
@@ -27250,7 +28215,7 @@ function txSet(d){
       ${loss||'<div class="note" style="margin-bottom:8px">Пока ничего не внесено.</div>'}
       <div class="row" style="gap:10px"><button class="btn ghost" onclick="txLossAdd('','')">+ Добавить год</button></div>
       ${sug.length?`<h3 style="margin:14px 0 6px;font-size:13px">Предложение по расчёту</h3>${sug.map(s=>`<div class="row" style="gap:10px;margin-bottom:6px"><span>${s.year}: убыток по расчёту <b>${tR(s.loss)}</b></span><button class="btn ghost" onclick="txLossAdd(${s.year},${Math.round(s.loss)})">Взять</button></div>`).join('')}`:''}</div>
-    <div class="card"><h2>Правила расчёта</h2><label class="sw"><input type="checkbox" ${dr.off?'checked':''} data-k="off" onchange="txIn(this)"><i></i><div><b>Убыток по сделкам уменьшает купонный доход</b><small>включите, если так считает ваш брокер; по умолчанию убыток гасит только прибыль по сделкам</small></div></label></div>
+    <div class="card"><h2>Правила расчёта</h2><label class="field" style="max-width:330px;margin-bottom:12px"><span>Ставка НДФЛ по основному доходу (для вычета по ИИС)</span><select class="in" data-k="rate" onchange="txIn(this)">${[['13','13 % (доход до 2,4 млн ₽ в год)'],['15','15 % (доход свыше 2,4 млн ₽ в год)']].map(([v,t])=>`<option value="${v}" ${dr.rate===v?'selected':''}>${t}</option>`).join('')}</select></label><label class="sw"><input type="checkbox" ${dr.off?'checked':''} data-k="off" onchange="txIn(this)"><i></i><div><b>Убыток по сделкам уменьшает купонный доход</b><small>включите, если так считает ваш брокер; по умолчанию убыток гасит только прибыль по сделкам</small></div></label></div>
     <div class="row noprint" style="gap:12px;margin-top:6px"><button class="btn" onclick="txSave(this)">Сохранить и пересчитать</button><span class="${/^Сохранено/.test(S.tx.msg)?'pos':'neg'}">${esc(S.tx.msg||'')}</span></div>`;
 }
 /* ── Импорт ── */
@@ -27341,36 +28306,111 @@ async function renderImport(){
   document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{S.account=b.dataset.open;S.bonds=S.hist=null;persist();S.page='dash';renderNav();load(false)});
 }
 
-/* ── Настройки ── */
-/* какие разделы показывать в меню (скрытые остаются доступными через поиск Ctrl+K) */
+/* ── Настройки: двухпанельный экран (навигация слева, панель состояния, строки-настройки) ── */
+/* ── кирпичики разметки ── */
+const ST_ICO={
+ conn:'<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+ acc:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/>',
+ look:'<circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" opacity=".35"/>',
+ calc:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2M12 11h2M8 15h2M12 15h2M8 18h2M12 18h4"/>',
+ local:'<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>',
+ adv:'<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>',
+ news:'<path d="M12 3l2.4 5.6 6.1.6-4.6 4 1.4 6-5.3-3.2L6.7 19.2l1.4-6-4.6-4 6.1-.6z"/>',
+ danger:'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
+ eye:'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+ eyeoff:'<path d="M3 3l18 18M10.6 5.1A9.7 9.7 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4M6.5 6.6A17 17 0 0 0 2 12s3.6 7 10 7a9.6 9.6 0 0 0 4-.9M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
+ copy:'<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+ check:'<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+ srv:'<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
+ tg:'<path d="M21 4L3 11l6 2.5L11.5 20l3-4.5L19 19z"/><path d="M9 13.5L21 4"/>',
+ search:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>'};
+const stIco=(k,sw)=>svgI(ST_ICO[k],sw||1.8);
+const SET_TOC=[['set-conn','Подключение','conn','Токен Т-Инвестиций и сервер данных'],
+  ['set-acc','Аккаунт','acc','Вход по ключу и уведомления в Telegram'],
+  ['set-look','Внешний вид','look','Тема, напоминания и разделы меню'],
+  ['set-calc','Расчёты','calc','Прогноз ключевой ставки и сбор раскрытий'],
+  ['set-local','Данные','local','Хранилище, резервные копии и экспорт'],
+  ['set-adv','Для опытных','adv','Адреса API и сертификаты — обычно не трогают'],
+  ['set-news','Что нового','news','Версия программы, изменения и планы'],
+  ['set-danger','Опасная зона','danger','Очистка и удаление данных']];
+const stTxt=h=>String(h==null?'':h).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+/* строка настройки: слева название и описание, справа контрол */
+function stRow(t,d,ctl,o){o=o||{};
+  const q=(stTxt(t)+' '+stTxt(d)+' '+(o.kw||'')).toLowerCase();
+  return`<div class="st-row${o.stack?' stack':''}${o.cls?' '+o.cls:''}" data-q="${esc(q)}"${o.id?` id="${o.id}"`:''}${o.hidden?' hidden':''}><div class="st-t"><b>${t}</b>${d?`<small>${d}</small>`:''}</div><div class="st-c">${ctl||''}</div></div>`}
+function stSw(id,on,label){return`<label class="st-sw"><input type="checkbox" id="${id}" ${on?'checked':''} aria-label="${esc(label)}"><i></i></label>`}
+/* поле с секретом: моноширинный текст, показать/скрыть, скопировать */
+function stSecret(id,ph,attrs,label){return`<div class="st-secret"><input class="in mono" type="password" id="${id}" placeholder="${esc(ph||'')}" ${attrs||'autocomplete="off"'} spellcheck="false" aria-label="${esc(label||'')}"><button type="button" class="st-ib" data-eye="${id}" aria-label="Показать" title="Показать/скрыть">${stIco('eye')}</button><button type="button" class="st-ib" data-cp="${id}" aria-label="Скопировать" title="Скопировать">${stIco('copy')}</button></div>`}
+function stGroup(t,body,o){o=o||{};
+  return`<section class="st-card${o.cls?' '+o.cls:''}"${o.id?` id="${o.id}"`:''} data-q="${esc((stTxt(t)+' '+stTxt(o.hint)+' '+(o.q||'')).toLowerCase())}"><header class="st-gh"><h3>${t}</h3>${o.hint!=null?`<span${o.hintId?` id="${o.hintId}"`:''}>${o.hint}</span>`:''}</header>${body}</section>`}
+function stMore(t,html){return`<details class="st-more" data-q="${esc((stTxt(t)+' '+stTxt(html)).toLowerCase())}"><summary>${t}</summary><div>${html}</div></details>`}
+function stSec(id,title,hint,ico,body){
+  return`<section class="st-sec" id="${id}" aria-labelledby="${id}-h"><div class="st-sh"><i>${stIco(ico)}</i><div><h2 id="${id}-h">${esc(title)}</h2><p>${esc(hint)}</p></div></div>${body}</section>`}
+/* подтверждение «Сохранено ✓»: у строки или маленьким тостом */
+function stOk(el){
+  const row=el&&el.closest&&el.closest('.st-row');
+  if(!row){stMsg('Сохранено',1,true);return}
+  const c=row.querySelector('.st-c');if(!c)return;
+  let o=c.querySelector('.st-ok');
+  if(!o){o=document.createElement('span');o.className='st-ok';o.setAttribute('role','status');c.insertBefore(o,c.firstChild)}
+  o.innerHTML=stIco('check',2.4)+'Сохранено';o.classList.remove('out');
+  clearTimeout(o._t);o._t=setTimeout(()=>{o.classList.add('out');o._t=setTimeout(()=>o.remove(),300)},1800);
+}
+/* тост-сообщение (ошибки остаются дольше) */
+function stMsg(t,ok,mini){
+  if(typeof toast==='function')return toast(t,ok?'ok':'err',mini?1600:ok?4500:9000);
+  let h=document.getElementById('st-toast');
+  if(!h){h=document.createElement('div');h.id='st-toast';h.className='st-toast';h.setAttribute('aria-live','polite');h.onclick=()=>{h.innerHTML=''};document.body.appendChild(h)}
+  h.innerHTML=`<div class="msg ${ok?'ok':'err'}${mini?' mini':''}" role="${ok?'status':'alert'}">${esc(t)}</div>`;
+  clearTimeout(h._t);h._t=setTimeout(()=>{h.innerHTML=''},mini?1600:ok?4500:9000);
+}
+/* кнопка «Сохранить» активна, только когда поля изменились */
+function stDirty(btn,ids){
+  const g=id=>document.getElementById(id),b=typeof btn==='string'?g(btn):btn;
+  const els=ids.map(g).filter(Boolean);if(!b)return{rebase(){},upd(){}};
+  const snap=()=>els.map(e=>e.type==='checkbox'?e.checked:e.value).join('\u0001');
+  let base=snap();const upd=()=>{b.disabled=snap()===base};
+  els.forEach(e=>{e.addEventListener('input',upd);e.addEventListener('change',upd)});b.disabled=true;
+  return{rebase(){base=snap();upd()},upd};
+}
+function stEnter(ids,btn){ids.forEach(id=>{const e=document.getElementById(id);if(e)e.addEventListener('keydown',ev=>{if(ev.key!=='Enter'||ev.isComposing)return;const b=document.getElementById(btn);if(b&&!b.disabled){ev.preventDefault();b.click()}})})}
+/* показать/скрыть и скопировать для полей с секретом */
+function stSecretBind(root){
+  (root||document).querySelectorAll('[data-eye]').forEach(b=>b.onclick=()=>{const i=document.getElementById(b.dataset.eye);if(!i)return;const sh=i.type==='password';i.type=sh?'text':'password';b.innerHTML=stIco(sh?'eyeoff':'eye');b.setAttribute('aria-label',sh?'Скрыть':'Показать')});
+  (root||document).querySelectorAll('[data-cp]').forEach(b=>b.onclick=async()=>{const i=document.getElementById(b.dataset.cp);if(!i||!i.value)return stMsg('Нечего копировать: поле пустое.');
+    try{await navigator.clipboard.writeText(i.value)}catch(e){i.type='text';i.select();try{document.execCommand('copy')}catch(x){}}
+    b.classList.add('done');b.innerHTML=stIco('check',2.4);setTimeout(()=>{b.classList.remove('done');b.innerHTML=stIco('copy')},1200);stMsg('Скопировано',1,true)});
+}
+/* ── разделы меню ── */
 function setMenuHtml(){
   const hid=S.navHidden||[];
-  const grp=NAV_GROUPS.map(([g,keys])=>`<div><div class="note" style="margin:8px 0 6px"><b>${esc(g)}</b></div><div class="kmenu">${keys.map(k=>{const t=(PAGES.find(p=>p&&p[0]===k)||[])[1];if(!t)return'';
-    const lock=NAV_PINNED.includes(k);return`<label><input type="checkbox" ${hid.includes(k)?'':'checked'} ${lock?'disabled':''} onchange="navToggle('${k}',this.checked)">${esc(t)}${lock?' <span class="mu">(всегда)</span>':''}</label>`}).join('')}</div></div>`).join('');
-  return`<div class="card"><h2>Разделы меню<span class="sp">скрывайте то, чем не пользуетесь</span></h2><div style="display:grid;gap:6px">${grp}
-    <div class="row" style="margin-top:8px"><button class="btn ghost" onclick="navShowAll()">Показать все</button></div>
-    <p class="note">Скрытый раздел по-прежнему открывается через поиск (Ctrl+K / Cmd+K). «Обзор» и «Настройки» скрыть нельзя.</p></div></div>`;
+  const names=[];
+  const grp=NAV_GROUPS.map(([g,keys])=>`<div class="st-mg"><div class="st-ml">${esc(g)}</div><div class="st-chips">${keys.map(k=>{const t=(PAGES.find(p=>p&&p[0]===k)||[])[1];if(!t)return'';names.push(t);
+    const lock=NAV_PINNED.includes(k);return`<label class="st-chip${lock?' lock':''}"><input type="checkbox" ${hid.includes(k)?'':'checked'} ${lock?'disabled':''} onchange="navToggle('${k}',this.checked,this)"><span>${esc(t)}</span></label>`}).join('')}</div></div>`).join('');
+  return stGroup('Разделы меню',`<div class="st-pad st-menu">${grp}</div>
+    <div class="st-foot"><span>Скрытый раздел по-прежнему открывается через поиск (Ctrl+K / Cmd+K). «Обзор» и «Настройки» скрыть нельзя.</span><button class="btn ghost" onclick="navShowAll()">Показать все</button></div>`,{hint:'скрывайте то, чем не пользуетесь',q:names.join(' ')});
 }
-function navToggle(k,on){
+function navToggle(k,on,el){
   if(NAV_PINNED.includes(k))return;
   S.navHidden=S.navHidden.filter(x=>x!==k);if(!on)S.navHidden.push(k);
-  lsSet('ta_nav_hidden',JSON.stringify(S.navHidden));renderNav();
+  lsSet('ta_nav_hidden',JSON.stringify(S.navHidden));renderNav();if(el)stOk(el);
 }
 function navShowAll(){S.navHidden=[];lsSet('ta_nav_hidden','[]');renderNav();renderSettings()}
 /* ── Сервер данных ── */
 function setDsHtml(c){
   const keySet=c.secret_set&&c.secret_set.data_key;
-  return`<div class="card" id="ds-card"><h2>Сервер данных</h2><div style="display:grid;gap:14px">
-    <p class="note">Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через ваш сервер — быстрее и без лишних запросов к источникам. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.</p>
-    <label class="field"><span>Адрес сервера (пусто — сервер по умолчанию, off — напрямую к источникам)</span><input class="in" id="ds-url" value="${esc(c.data_server||'')}" placeholder="сервер по умолчанию" autocomplete="off" spellcheck="false"></label>
-    <label class="field"><span>Ключ доступа (из @${esc(AUTH.bot)}) ${keySet?'<span class="pos">· сохранён. Оставьте пустым, чтобы не менять</span>':''}</span><input class="in" type="password" id="ds-key" autocomplete="off" spellcheck="false"></label>
-    <div class="row"><button class="btn" id="ds-save">Сохранить</button><button class="btn ghost" id="ds-test">Проверить</button>${keySet?'<button class="btn danger" id="ds-clr">Удалить ключ</button>':''}</div>
-    <p class="note" id="ds-st">Загружаю…</p></div></div>`;
+  return stGroup('Сервер данных',
+    stRow('Адрес сервера','Пусто — сервер по умолчанию, <code>off</code> — напрямую к источникам',`<input class="in mono st-wide" id="ds-url" value="${esc(c.data_server||'')}" placeholder="сервер по умолчанию" autocomplete="off" spellcheck="false" aria-label="Адрес сервера данных">`)+
+    stRow('Ключ доступа',`Выдаёт @${esc(AUTH.bot)}${keySet?' · <span class="pos">сохранён</span>, пустое поле ничего не меняет':''}`,stSecret('ds-key',keySet?'••••••••':'вставьте ключ','autocomplete="off"','Ключ доступа к серверу данных'))+
+    stRow('Действия','',`<button class="btn" id="ds-save" disabled>Сохранить</button><button class="btn ghost" id="ds-test">Проверить</button>${keySet?'<button class="btn ghost danger" id="ds-clr">Удалить ключ</button>':''}`)+
+    `<p class="st-line" id="ds-st">Загружаю…</p>`+
+    stMore('Что передаётся на сервер','Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через ваш сервер — быстрее и без лишних запросов к источникам. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.'),
+    {id:'ds-card',hint:'данные рынка'});
 }
 async function dsStatus(){
   const el=document.getElementById('ds-st');if(!el)return;
   try{const d=await api('/api/dataserver');
-    const cnt=`Ответов с сервера с начала работы: из кэша ${d.hit}, свежих ${d.miss}${d.stale?`, устаревших ${d.stale}`:''}; напрямую: ${d.direct}.`;
+    const cnt=`Ответов с начала работы: из кэша ${d.hit}, свежих ${d.miss}${d.stale?`, устаревших ${d.stale}`:''}; напрямую: ${d.direct}.`;
     const as=AUTH.st,au=as&&as.state==='offline'?` Вход: сервер недоступен, работаем напрямую (${esc(as.error)}).`:as&&as.state==='ok'&&as.expires?` Ключ действует до ${esc(authTime(as.expires))}.`:'';
     el.innerHTML=d.mode==='direct'?`Режим: <b>напрямую</b> к источникам. ${esc(cnt)}`:d.mode==='server'?`Режим: <b>через сервер</b> ${esc(d.url)}. ${esc(cnt)}`:`Режим: <b>временно напрямую</b> — сервер недоступен (${esc(d.error)}), повтор через ${d.retry_in} с. ${esc(cnt)}`;
     if(au)el.innerHTML+=au}
@@ -27379,9 +28419,11 @@ async function dsStatus(){
 function bindSetDs(c,msg){
   const g=id=>document.getElementById(id);
   dsStatus();
+  const dirty=stDirty('ds-save',['ds-url','ds-key']);
+  stEnter(['ds-url','ds-key'],'ds-save');
   const save=async()=>{const b={data_server:g('ds-url').value};if(g('ds-key').value)b.data_key=g('ds-key').value;await post('/api/config',b);
     c.data_server=g('ds-url').value.trim();if(g('ds-key').value)c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
-  g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Сохранено. Новые запросы пойдут '+(c.data_server.toLowerCase()==='off'?'напрямую.':'через сервер.'),1);authCheck(true);renderSettings()}catch(x){msg(x.message)}finally{b.disabled=false}};
+  g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Сохранено. Новые запросы пойдут '+(c.data_server.toLowerCase()==='off'?'напрямую.':'через сервер.'),1);authCheck(true);renderSettings()}catch(x){msg(x.message);dirty.upd()}};
   g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{url:g('ds-url').value,key:g('ds-key').value});
     msg(`Сервер работает: версия ${r.version}, записей в кэше ${r.cache_items}.`,1)}catch(x){msg(x.message)}finally{b.disabled=false}};
   if(g('ds-clr'))g('ds-clr').onclick=async()=>{try{if(!confirm('Удалить сохранённый ключ сервера данных?'))return;await post('/api/config',{clear_data_key:true});authCheck(true);c.secret_set=Object.assign({},c.secret_set,{data_key:false});renderSettings()}catch(x){msg(x.message)}};
@@ -27394,16 +28436,12 @@ function ldBytes(n){
   return (n/1048576).toFixed(n<10485760?1:0)+' МБ';
 }
 function setLocalHtml(c){
-  return`<div class="card" id="ld-card"><h2>Данные на компьютере</h2><div style="display:grid;gap:14px">
-    <p class="note" style="margin:0">Всё, что программа запоминает — операции, история цен, справочник бумаг, логотипы, настройки, — лежит в одной папке на этом компьютере. В интернет она не отправляется.</p>
-    <div><div class="note" style="margin-bottom:4px">Папка с данными</div><div class="mono ld-path" id="ld-dir">${esc(c.data_dir)}</div></div>
-    <div id="ld-parts" class="ld-parts"><div class="note">Считаю размер…</div></div>
-    <div class="row"><button class="btn ghost" id="ld-open">Открыть папку</button><button class="btn ghost" id="cache" title="Заново загрузить операции и цены из Т-Инвестиций">Перезагрузить всё из API</button><a class="btn ghost" href="/api/backup" download>Скачать резервную копию (zip)</a></div>
-    <p class="note" style="margin:0">Простая резервная копия — zip с базой и настройками, токен в неё не входит. Зашифрованные копии по расписанию — в блоке «Резервная копия» ниже.</p>
-    <div class="ld-danger"><div class="row"><button class="btn ghost" id="ld-clear">Очистить кэш</button><button class="btn danger" id="ld-wipe">Удалить все данные</button></div>
-      <p class="note" style="margin:8px 0 0"><b>Очистить кэш</b> — удаляет логотипы и временные данные рынка (цены, рейтинги, справочники); они скачаются заново. Ваши операции, импорты, список наблюдения, заметки и настройки остаются.<br>
-      <b>Удалить все данные</b> — стирает токен, ключ входа, базу и настройки. Вернуть их нельзя.</p></div>
-    <p class="note" style="margin:0"><b>Чтобы удалить программу полностью:</b> закройте её, удалите папку <span class="mono">${esc(c.data_dir)}</span> и само приложение (на Mac — из «Программ», на Windows — файл или ярлык программы).</p></div></div>`;
+  return stGroup('Хранилище',
+    stRow('Папка с данными','Операции, история цен, справочник бумаг, логотипы и настройки — всё лежит здесь и в интернет не отправляется',`<span class="mono ld-path" id="ld-dir">${esc(c.data_dir)}</span><button class="btn ghost" id="ld-open">Открыть папку</button>`,{stack:1})+
+    `<div class="st-pad"><div id="ld-parts" class="ld-parts"><div class="note">Считаю размер…</div></div></div>`+
+    stRow('Перезагрузить данные из API','Заново загрузить операции и цены из Т-Инвестиций (может занять время)',`<button class="btn ghost" id="cache">Перезагрузить</button>`)+
+    stRow('Простая копия (zip)','База и настройки, токен в неё не входит. Копии по расписанию — ниже',`<a class="btn ghost" href="/api/backup" download>Скачать zip</a>`),
+    {id:'ld-card',hint:'на этом компьютере'});
 }
 async function ldLoad(){
   const el=document.getElementById('ld-parts');if(!el)return;
@@ -27411,7 +28449,14 @@ async function ldLoad(){
     const mx=Math.max(1,...d.parts.map(p=>p.bytes));
     const desc={db:'база операций и кэш',cache:'кэш',logos:'логотипы бумаг',app:'скачанная программа',window:'данные окна приложения',config:'настройки, токен и ключ',other:'прочие файлы'};
     el.innerHTML=`<div class="ld-tot">Всего: <b>${ldBytes(d.total)}</b></div>`+d.parts.map(p=>`<div class="ld-row"><span class="ld-n"><span class="mono">${esc(p.name)}</span> <span class="mu">${esc(desc[p.key]||p.title)}</span></span><span class="ld-bar"><i style="width:${Math.max(p.bytes?2:0,Math.round(p.bytes/mx*100))}%"></i></span><span class="ld-v num">${ldBytes(p.bytes)}</span></div>`).join('')}
-  catch(e){el.innerHTML=`<div class="note neg">${esc(e.message)}</div>`}
+  catch(e){el.innerHTML=`<div class="msg err">${esc(e.message)}</div>`}
+}
+function setDangerHtml(c){
+  return stGroup('Очистка и удаление',
+    stRow('Очистить кэш','Удаляет логотипы и временные данные рынка — они скачаются заново. Операции, импорты, список наблюдения, заметки и настройки остаются',`<button class="btn ghost" id="ld-clear">Очистить кэш</button>`)+
+    stRow('Удалить все данные','Стирает токен, ключ входа, базу и настройки. Вернуть их нельзя — сделайте копию заранее',`<button class="btn danger" id="ld-wipe">Удалить все данные</button>`)+
+    stMore('Как удалить программу полностью',`Закройте программу, удалите папку <span class="mono">${esc(c.data_dir)}</span> и само приложение (на Mac — из «Программ», на Windows — файл или ярлык программы).`),
+    {cls:'danger',hint:'необратимые действия'});
 }
 function bindSetLocal(c,msg,busy,reset){
   const g=id=>document.getElementById(id);
@@ -27428,10 +28473,10 @@ function bindSetLocal(c,msg,busy,reset){
 }
 /* ── Аккаунт и доступ ── */
 function setAccHtml(){
-  return`<div class="card" id="acc-card"><h2>Аккаунт и доступ</h2><div style="display:grid;gap:12px">
-    <p class="note" style="margin:0">Вход в программу выполняется по ключу из Telegram-бота. Ключ действует 7 дней, токен Т-Инвестиций боту не передаётся.</p>
-    <div id="acc-who" class="ld-path">Проверяю…</div>
-    <div class="row"><button class="btn ghost" id="acc-out" style="display:none">Выйти</button><a class="btn ghost" href="https://t.me/${esc(AUTH.bot)}" target="_blank" rel="noopener noreferrer">Открыть @${esc(AUTH.bot)}</a></div></div></div>`;
+  return stGroup('Вход в программу',
+    stRow('Статус входа','Вход выполняется по ключу из Telegram-бота. Ключ действует 7 дней, токен Т-Инвестиций боту не передаётся',`<span class="st-who" id="acc-who">Проверяю…</span><button class="btn ghost" id="acc-out" style="display:none">Выйти</button>`,{stack:1})+
+    stRow('Telegram-бот','Новый ключ — командой <code>/key</code>',`<a class="btn ghost" href="https://t.me/${esc(AUTH.bot)}" target="_blank" rel="noopener noreferrer">Открыть @${esc(AUTH.bot)}</a>`),
+    {id:'acc-card',hint:'ключ из бота'});
 }
 async function bindSetAcc(msg){
   const el=document.getElementById('acc-who');if(!el)return;
@@ -27446,74 +28491,169 @@ async function bindSetAcc(msg){
   if(out&&s&&s.state==='ok'&&(s.username||s.expires)){out.style.display='';
     out.onclick=async()=>{try{if(!confirm('Выйти и стереть ключ с этого компьютера?'))return;AUTH.st=await post('/api/auth/logout');authApply()}catch(e){msg(e.message)}}}
 }
-/* ── оглавление ── */
-const SET_TOC=[['set-conn','Подключение'],['set-acc','Аккаунт'],['set-look','Внешний вид'],['set-calc','Расчёты'],['set-local','Данные на компьютере'],['set-adv','Для опытных'],['set-news','Что нового']];
-function setSec(id,title,hint,body){
-  return`<section class="set-sec" id="${id}">${title?`<div class="set-gh">${esc(title)}${hint?`<span>${esc(hint)}</span>`:''}</div>`:''}${body}</section>`;
+/* ── панель состояния ── */
+function stTile(id,lbl,ico,go){return`<div class="st-tile" id="${id}"><div class="st-tl"><i>${stIco(ico)}</i>${lbl}<span class="st-dot mu" data-d></span></div><div class="st-tv" data-v>…</div><div class="st-ts" data-s>Загружаю</div><button class="btn ghost st-ta" data-to="${go}" data-a>Открыть</button></div>`}
+function stTileSet(id,dot,v,s,act){const t=document.getElementById(id);if(!t)return;
+  t.querySelector('[data-d]').className='st-dot '+dot;t.querySelector('[data-v]').textContent=v;t.querySelector('[data-s]').textContent=s;if(act)t.querySelector('[data-a]').textContent=act}
+function stBadge(sec,cls){const a=document.querySelector(`#set-nav [data-to="${sec}"] .st-nb`);if(a)a.className='st-nb'+(cls?' '+cls:'')}
+async function stTiles(c){
+  const tz=async p=>{try{return await api(p)}catch(e){return null}};
+  /* Т-Инвестиции */
+  stTileSet('st-t1',c.token_set?'pos':'warn',c.token_set?'Токен сохранён':'Токен не задан',
+    c.token_set?`только чтение · ${c.token_hint}${c.sandbox?' · песочница':''}`:'Добавьте токен, чтобы увидеть портфель',c.token_set?'Изменить':'Добавить');
+  stBadge('set-conn',c.token_set?'':'warn');
+  const [ds,au,tg,ld,bk]=await Promise.all([tz('/api/dataserver'),tz('/api/auth/status'),isPro()?tz('/api/tg/info'):Promise.resolve(null),tz('/api/localdata'),tz('/api/backup/status')]);
+  if(!document.getElementById('st-t2'))return;
+  if(au)AUTH.st=au;
+  /* сервер данных */
+  if(!ds)stTileSet('st-t2','mu','Нет данных','Не удалось получить статус');
+  else if(ds.mode==='server')stTileSet('st-t2','pos','Подключён',String(ds.url||'').replace(/^https?:\/\//,''));
+  else if(ds.mode==='direct')stTileSet('st-t2','mu','Напрямую',(c.data_server||'').toLowerCase()==='off'?'Сервер отключён вручную':'Прямые запросы к источникам');
+  else stTileSet('st-t2','warn','Недоступен','Работаем напрямую, повтор через '+(ds.retry_in||'…')+' с');
+  /* Telegram-бот */
+  const loggedIn=au&&au.state==='ok'&&(au.username||au.expires);
+  const tgOn=!!c.tg_enabled;
+  if(!isPro())stTileSet('st-t3','mu','Доступно в Pro','Уведомления в Telegram','Подробнее');
+  else if(au&&au.state==='offline')stTileSet('st-t3','warn','Сервер недоступен','Вход проверить не удалось');
+  else if(!loggedIn)stTileSet('st-t3','warn','Вход не выполнен','Нужен ключ из бота');
+  else stTileSet('st-t3',tgOn?'pos':'mu','Вход выполнен'+(au.username?' · @'+au.username:''),`${au.expires?'ключ до '+authTime(au.expires)+' · ':''}уведомления ${tgOn?'включены':'выключены'}`,'Настроить');
+  stBadge('set-acc',isPro()&&!loggedIn&&!(au&&au.state==='ok')?'warn':'');
+  /* данные на компьютере */
+  const last=bk&&bk.last;
+  stTileSet('st-t4',!last?(bk&&bk.dir?'warn':'mu'):last.ok?'pos':'neg',ld?ldBytes(ld.total):'—',
+    !last?'Резервных копий ещё не делали':last.ok?'Копия: '+new Date(last.t*1000).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'Последняя копия не удалась','Копии');
+  stBadge('set-local',last&&!last.ok?'neg':'');
+}
+/* ── поиск по настройкам ── */
+function stSearch(q){
+  q=String(q||'').trim().toLowerCase();
+  const root=document.getElementById('st-main');if(!root)return;
+  let any=false;
+  root.querySelectorAll('.st-sec').forEach(sec=>{
+    let vis=0;const secHit=q&&(sec.querySelector('.st-sh').textContent.toLowerCase().includes(q));
+    sec.querySelectorAll('.st-card').forEach(card=>{
+      const rows=[...card.querySelectorAll('.st-row,.st-more')],cardHit=!q||card.dataset.q.includes(q)||secHit;
+      let n=0;
+      rows.forEach(r=>{const h=!q||cardHit||(r.dataset.q||'').includes(q);r.classList.toggle('st-nomatch',!h);r.classList.toggle('st-hit',!!q&&h&&(r.dataset.q||'').includes(q));if(h)n++});
+      const show=!q||cardHit||n>0;card.hidden=!show;if(show)vis++;
+    });
+    sec.hidden=!!q&&!vis;if(!sec.hidden)any=true;
+    const a=document.querySelector(`#set-nav [data-to="${sec.id}"]`);if(a)a.hidden=!!q&&sec.hidden;
+  });
+  const tl=document.getElementById('st-tiles');if(tl)tl.hidden=!!q;const wl=document.getElementById('st-welcome');if(wl)wl.hidden=!!q;
+  const e=document.getElementById('st-empty');if(e)e.hidden=!q||any;
+  if(q){const b=document.getElementById('st-q-clear');if(b)b.hidden=false}else{const b=document.getElementById('st-q-clear');if(b)b.hidden=true}
+}
+/* scroll-spy: подсвечиваем раздел, который сейчас у верхней границы */
+function stSpy(){
+  const view=document.getElementById('view'),nav=document.getElementById('set-nav');
+  if(!view||!nav){if(window._stSpyH&&view)view.removeEventListener('scroll',window._stSpyH);return}
+  const secs=[...view.querySelectorAll('.st-sec')].filter(s=>!s.hidden);if(!secs.length)return;
+  const top=view.getBoundingClientRect().top+90;let cur=secs[0];
+  for(const s of secs)if(s.getBoundingClientRect().top<=top)cur=s;
+  if(view.scrollTop+view.clientHeight>=view.scrollHeight-4)cur=secs[secs.length-1];
+  nav.querySelectorAll('[data-to]').forEach(a=>{const on=a.dataset.to===cur.id;a.classList.toggle('on',on);if(on)a.setAttribute('aria-current','true');else a.removeAttribute('aria-current')});
+}
+function stGoto(id){
+  const t=document.getElementById(id),v=document.getElementById('view');if(!t||!v)return;
+  const red=window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches;
+  v.scrollTo({top:Math.max(0,t.getBoundingClientRect().top-v.getBoundingClientRect().top+v.scrollTop-18),behavior:red?'auto':'smooth'});
+  document.querySelectorAll('#set-nav [data-to]').forEach(a=>{const on=a.dataset.to===id;a.classList.toggle('on',on);if(on)a.setAttribute('aria-current','true');else a.removeAttribute('aria-current')});
+}
+/* ── версия и список изменений ── */
+function stChangelog(list){return`<div class="cl">${list.map(([v,d,items])=>`<div><div class="vh"><b>Версия ${v}</b><span>${d}</span></div><ul>${items.map(i=>`<li>${i}</li>`).join('')}</ul></div>`).join('')}</div>`}
+function setNewsHtml(c){
+  const cur=CHANGELOG[0]||['',''];
+  return`<div class="st-card" id="whatsnew" data-q="версия что нового изменения журнал"><div class="st-ver"><div class="st-vn mono">v${esc(c.version||'')}</div><div class="st-vt"><b>TAnalytic</b><span>${cur[1]?'Обновление от '+esc(cur[1]):'Текущая версия'}</span></div></div>
+    <div class="st-pad">${stChangelog(CHANGELOG.slice(0,1))}</div>
+    ${CHANGELOG.length>1?stMore('Предыдущие версии ('+(CHANGELOG.length-1)+')',stChangelog(CHANGELOG.slice(1))):''}</div>`+
+    stGroup('Роадмап',`<div class="st-pad">${roadmapHtml()}</div>`,{hint:'что планируется'});
 }
 async function renderSettings(){
   S.charts=[];
-  try{S.cfg=await api('/api/config')}catch(e){$('#view').innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
+  const view=$('#view'),keep=view.querySelector('.st')?view.scrollTop:0;
+  try{S.cfg=await api('/api/config')}catch(e){view.innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
   const c=S.cfg;
-  const conn=`<div class="card"><h2>Подключение к Т-Инвестициям${c.token_set?'<span class="sp pos">токен сохранён</span>':'<span class="sp">токен не задан</span>'}</h2><div style="display:grid;gap:18px">
-    <label class="field"><span>API-токен ${c.token_set?`<span class="pos">· сохранён (…${esc(c.token_hint.slice(1))}). Оставьте пустым, чтобы не менять</span>`:''}</span>
-      <input class="in" type="password" id="tok" placeholder="t.XXXXXXXXXXXXXXXXXXXX" autocomplete="off" spellcheck="false"></label>
-    <div class="row"><button class="btn" id="save">Сохранить и подключиться</button><button class="btn ghost" id="test">Проверить</button>
-      ${c.token_set?'<button class="btn danger" id="clr">Удалить токен</button>':''}</div>
-    <div class="ro-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><div><b>Нужен токен только для чтения.</b> С ним нельзя торговать, выводить деньги или менять настройки счёта — это ограничение на стороне Т-Банка. Токен хранится только на этом компьютере.</div></div>
-    <div class="note" style="line-height:1.6"><b>Как получить токен</b> (1 минута):<br>
-      1. Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении Т-Инвестиции: Профиль → Настройки → Токены T-Invest API).<br>
+  const msg=stMsg;
+  /* подключение */
+  const conn=stGroup('Т-Инвестиции',
+    stRow('API-токен',`Только для чтения — торговать с ним нельзя. Хранится на этом компьютере${c.token_set?` · <span class="pos">сохранён (${esc(c.token_hint)})</span>`:''}`,
+      stSecret('tok',c.token_set?'вставьте новый токен, чтобы заменить':'t.XXXXXXXXXXXXXXXXXXXX','autocomplete="off"','API-токен Т-Инвестиций'),{id:'row-tok'})+
+    stRow('Действия','',`<button class="btn" id="save" disabled>Сохранить и подключиться</button><button class="btn ghost" id="test">Проверить</button>${c.token_set?'<button class="btn ghost danger" id="clr">Удалить токен</button>':''}`)+
+    stRow('Режим песочницы','Виртуальный счёт без реальных денег. Токен песочницы работает только с этим режимом, боевой — только без него',stSw('sb',c.sandbox,'Режим песочницы'))+
+    stRow('Новый счёт в песочнице','Песочница сначала пуста — откройте виртуальный счёт',`<button class="btn ghost" id="sbopen">Открыть счёт</button>`,{id:'row-sbo',hidden:!(c.sandbox&&c.token_set),kw:'песочница'})+
+    stRow('Пополнить счёт','Виртуальные рубли на выбранный слева счёт',`<input class="in num st-num" type="number" id="amt" value="1000000" min="1" step="1000" aria-label="Сумма пополнения, рублей"><span class="st-unit">₽</span><button class="btn ghost" id="sbpay">Пополнить</button>`,{id:'row-sbp',hidden:!(c.sandbox&&c.token_set),kw:'песочница'})+
+    stMore('Как получить токен (1 минута)',`1. Откройте <a href="https://www.tbank.ru/invest/settings/api/" target="_blank" rel="noopener noreferrer">tbank.ru/invest/settings/api</a> и войдите в Т-Банк (или в приложении Т-Инвестиции: Профиль → Настройки → Токены T-Invest API).<br>
       2. Нажмите «Создать токен», выберите доступ <b>«Только для чтения»</b> и все счета (или только нужные).<br>
       3. Скопируйте токен сразу — второй раз его не покажут — и вставьте в поле выше.<br>
-      Торговый токен не нужен: программа ничего не покупает и не продаёт. Отозвать токен можно на той же странице в любой момент.</div>
-    <div class="set-sub"><label class="sw"><input type="checkbox" id="sb" ${c.sandbox?'checked':''}><i></i><div><b>Режим песочницы</b><small>Для пробы без реальных денег. Токен песочницы работает только с этим режимом, боевой — только без него. После переключения нажмите «Сохранить и подключиться».</small></div></label>
-      ${c.sandbox&&c.token_set?`<div class="row" style="margin-top:12px"><button class="btn ghost" id="sbopen">Открыть новый счёт</button>
-      <input class="in num" type="number" id="amt" value="1000000" min="1" step="1000" style="width:160px"><button class="btn ghost" id="sbpay">Пополнить выбранный счёт, ₽</button></div>
-      <p class="note" style="margin-top:8px">Песочница — виртуальный счёт без реальных данных: сначала он пуст.</p>`:''}</div></div></div>`;
-  const look=`<div class="card"><h2>Оформление и напоминания</h2><div style="display:grid;gap:16px">
-    <div class="row"><div class="seg" id="thsel">${[['auto','Авто'],['light','Светлая'],['dark','Тёмная']].map(([k,t])=>`<button data-t="${k}" class="${curTheme()===k?'on':''}">${t}</button>`).join('')}</div></div>
-    <div class="row"><label class="sw"><input type="checkbox" id="snd" ${lsGet('ta_sound')==='1'?'checked':''}><i></i><div><b>Звук интерфейса</b><small>Тихий «тик» при переходах в туре по интерфейсу. По умолчанию выключен.</small></div></label></div>
-    <div class="row"><label class="field" style="max-width:260px"><span>Напоминать о выплатах за, дней (0 — выключить)</span><input class="in num" id="nd" type="number" min="0" max="60" value="${c.notify_days??7}"></label>
-      <button class="btn ghost" id="ndsave" style="align-self:flex-end">Сохранить</button><button class="btn ghost" id="ntf" style="align-self:flex-end">Разрешить системные уведомления</button></div>
-    <p class="note">Напоминания показываются на «Обзоре» и «Выплатах», а системные уведомления приходят, пока программа открыта. Печать отчёта: кнопка PDF сверху → «Сохранить как PDF» (печатается текущий раздел и период).</p></div></div>
-    ${setMenuHtml()}`;
-  const calc=`<div class="card"><h2>Прогноз ключевой ставки<span class="sp">для флоатеров</span></h2><div style="display:grid;gap:14px">
-    <div class="row"><label class="field" style="max-width:420px"><span>Источник прогноза</span><select class="in" id="krmode">${[['cbr','Прогноз Банка России (по умолчанию)'],['survey','Опрос аналитиков Банка России'],['market','Рынок: форварды КБД'],['flat','Без изменений (текущая ставка)']].map(([k,t])=>`<option value="${k}" ${(c.keyrate_mode||'cbr')===k?'selected':''}>${t}</option>`).join('')}</select></label>
-      <button class="btn ghost" id="krsave" style="align-self:flex-end">Сохранить</button></div>
-    <p class="note" id="krinfo">Загружаю…</p>
-    <p class="note">Ставка ещё не объявленных купонов флоатера = ключевая ставка на начало купонного периода + спред эмитента (по последним известным купонам). «Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.</p></div></div>`;
-  const adv=`<details class="set-adv" id="adv-d" ${S.setAdvOpen?'open':''}><summary>Для опытных<span>сервер данных, адреса API, сертификат — обычно трогать не нужно</span></summary><div style="display:grid;gap:16px;margin-top:14px">
-    ${setDsHtml(c)}
-    <div class="card"><h2>Адреса и сертификаты</h2><div style="display:grid;gap:18px">
-    <label class="field"><span>Адреса REST API (боевой), по одному в строке</span><textarea class="in" id="hp" rows="2">${esc(c.hosts_prod.join('\n'))}</textarea></label>
-    <label class="field"><span>Адреса REST API (песочница)</span><textarea class="in" id="hs" rows="2">${esc(c.hosts_sandbox.join('\n'))}</textarea></label>
-    <label class="field"><span>Дополнительный файл сертификата (обычно не нужен: сертификат Минцифры уже встроен в программу)</span><input class="in" id="ca" value="${esc(c.ca_file)}" placeholder="/path/to/cert.pem"></label>
-    <label class="sw"><input type="checkbox" id="vs" ${c.verify_ssl?'checked':''}><i></i><div><b>Проверять SSL-сертификат</b><small>Отключайте только для отладки</small></div></label>
-    <div class="row"><button class="btn ghost" id="save2">Сохранить</button></div></div></div></div></details>`;
-  $('#view').innerHTML=`<div class="wrap fade" style="max-width:820px">
-  ${!c.token_set?`<div class="card hero" style="display:block"><div class="val" style="font-size:24px">Добро пожаловать 👋</div><p class="t2" style="margin-top:8px;position:relative;z-index:1">Вставьте API-токен Т-Инвестиций, чтобы увидеть аналитику, или импортируйте отчёт другого брокера. Всё хранится только на этом компьютере.</p></div>`:''}
-  <nav class="set-toc" id="set-toc" aria-label="Разделы настроек">${SET_TOC.map(([id,t])=>`<a href="#${id}" data-to="${id}">${esc(t)}</a>`).join('')}</nav>
-  <div id="msg"></div>
-  ${setSec('set-conn','Подключение к Т-Инвестициям','',conn)}
-  ${setSec('set-acc','Аккаунт и доступ','вход по ключу и Telegram',setAccHtml()+setTgHtml(c))}
-  ${setSec('set-look','Внешний вид и меню','',look)}
-  ${setSec('set-calc','Данные и расчёты','',calc+setCrowdHtml(c))}
-  ${setSec('set-local','Данные на компьютере','хранение, копии, очистка',setLocalHtml(c)+setBackupHtml(c))}
-  ${setSec('set-adv','','',adv)}
-  ${setSec('set-news','Что нового и планы','',`<div class="card" id="whatsnew"><h2>Что нового<span class="sp">версия ${esc(c.version||'')}</span></h2>${changelogHtml()}</div>
-  <div class="card"><h2>Роадмап<span class="sp">что планируется</span></h2>${roadmapHtml()}</div>`)}</div>`;
-  const msg=(t,ok)=>{$('#msg').innerHTML=`<div class="msg ${ok?'ok':'err'}">${esc(t)}</div>`;const m=$('#msg');if(m&&m.scrollIntoView)m.scrollIntoView({block:'nearest'})};
-  $('#set-toc').onclick=e=>{const a=e.target.closest('[data-to]');if(!a)return;e.preventDefault();
-    if(a.dataset.to==='set-adv'){const d=$('#adv-d');if(d){d.open=true;S.setAdvOpen=true}}
-    const t=document.getElementById(a.dataset.to);if(t)t.scrollIntoView({behavior:'smooth',block:'start'})};
-  $('#adv-d').addEventListener('toggle',e=>{S.setAdvOpen=e.currentTarget.open});
-  $('#thsel').onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;applyTheme(b.dataset.t);post('/api/config',{theme:b.dataset.t}).catch(()=>{});$('#thsel').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b))};
+      Торговый токен не нужен: программа ничего не покупает и не продаёт. Отозвать токен можно на той же странице в любой момент.`),
+    {id:'conn-card',hint:c.token_set?'<span class="pos">токен сохранён</span>':'токен не задан'});
+  /* внешний вид */
+  const th=curTheme();
+  const prev=k=>`<span class="th-prev th-${k}"><i class="s"></i><i class="h"></i><i class="b b1"></i><i class="b b2"></i><i class="b b3"></i></span>`;
+  const themes=[['auto','Авто','как в системе'],['light','Светлая',''],['dark','Тёмная','']];
+  const perm=('Notification' in window)?Notification.permission:'unsupported';
+  const look=stGroup('Тема оформления',
+    `<div class="st-pad"><div class="st-themes" id="thsel" role="group" aria-label="Тема оформления">${themes.map(([k,t,d])=>`<button type="button" data-t="${k}" class="${th===k?'on':''}" aria-pressed="${th===k}">${k==='auto'?`<span class="th-prev th-auto">${prev('dark')}${prev('light')}</span>`:prev(k)}<span class="th-n"><b>${t}</b>${d?`<small>${d}</small>`:''}</span><em class="th-c">${stIco('check',2.6)}</em></button>`).join('')}</div></div>`,{hint:'применяется сразу',q:'светлая тёмная авто оформление'})+
+    stGroup('Напоминания',
+    stRow('Напоминать о выплатах','За сколько дней предупреждать на «Обзоре» и в «Выплатах» (0 — выключить)',`<input class="in num st-num" id="nd" type="number" min="0" max="60" value="${c.notify_days??7}" aria-label="За сколько дней напоминать о выплатах"><span class="st-unit">дн.</span>`)+
+    stRow('Системные уведомления','Приходят, пока программа открыта',`<span class="st-who" id="ntf-st">${perm==='granted'?'Разрешены':perm==='denied'?'Запрещены в браузере':perm==='unsupported'?'Не поддерживаются':'Не разрешены'}</span><button class="btn ghost" id="ntf" ${perm==='granted'||perm==='unsupported'?'disabled':''}>Разрешить</button>`)+
+    stMore('Печать отчёта','Кнопка PDF сверху → «Сохранить как PDF»: печатается текущий раздел и период.'),{hint:'выплаты и уведомления'})+
+    setMenuHtml();
+  /* расчёты */
+  const calc=stGroup('Прогноз ключевой ставки',
+    stRow('Источник прогноза','Для флоатеров: ставка не объявленных купонов = ключевая на начало периода + спред эмитента',`<select class="in st-sel" id="krmode" aria-label="Источник прогноза ключевой ставки">${[['cbr','Прогноз Банка России (по умолчанию)'],['survey','Опрос аналитиков Банка России'],['market','Рынок: форварды КБД'],['flat','Без изменений (текущая ставка)']].map(([k,t])=>`<option value="${k}" ${(c.keyrate_mode||'cbr')===k?'selected':''}>${t}</option>`).join('')}</select>`)+
+    `<p class="st-line" id="krinfo">Загружаю…</p>`+
+    stMore('Чем отличаются источники','«Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.'),
+    {hint:'для флоатеров'})+setCrowdHtml(c);
+  /* для опытных */
+  const adv=stGroup('Адреса и сертификаты',
+    stRow('Адреса REST API (боевой)','По одному в строке',`<textarea class="in mono st-wide" id="hp" rows="2" spellcheck="false" aria-label="Адреса REST API боевого контура">${esc(c.hosts_prod.join('\n'))}</textarea>`,{stack:1})+
+    stRow('Адреса REST API (песочница)','По одному в строке',`<textarea class="in mono st-wide" id="hs" rows="2" spellcheck="false" aria-label="Адреса REST API песочницы">${esc(c.hosts_sandbox.join('\n'))}</textarea>`,{stack:1})+
+    stRow('Дополнительный сертификат','Обычно не нужен: сертификат Минцифры уже встроен в программу',`<input class="in mono st-wide" id="ca" value="${esc(c.ca_file)}" placeholder="/path/to/cert.pem" spellcheck="false" aria-label="Файл сертификата">`,{stack:1})+
+    stRow('Проверять SSL-сертификат','Отключайте только для отладки',stSw('vs',c.verify_ssl,'Проверять SSL-сертификат'))+
+    stRow('Применить','',`<button class="btn" id="save2" disabled>Сохранить</button>`),{hint:'обычно не трогать'});
+  const sec=(i,body)=>stSec(SET_TOC[i][0],SET_TOC[i][1],SET_TOC[i][3],SET_TOC[i][2],body);
+  view.innerHTML=`<div class="st fade">
+  <aside class="st-side" aria-label="Навигация по настройкам">
+    <label class="st-search">${stIco('search')}<input id="st-q" type="search" placeholder="Найти настройку…" autocomplete="off" spellcheck="false" aria-label="Найти настройку"><button type="button" id="st-q-clear" hidden aria-label="Очистить поиск">Esc</button></label>
+    <nav id="set-nav" aria-label="Разделы настроек">${SET_TOC.map(([id,t,ic])=>`<a href="#${id}" data-to="${id}">${stIco(ic)}<span>${esc(t)}</span><i class="st-nb"></i></a>`).join('')}</nav>
+    <div class="st-sv"><span class="mono">v${esc(c.version||'')}</span><span>TAnalytic</span></div>
+  </aside>
+  <div class="st-main" id="st-main">
+    ${!c.token_set?`<div class="st-welcome" id="st-welcome"><b>Добро пожаловать</b><span>Вставьте API-токен Т-Инвестиций, чтобы увидеть аналитику, или импортируйте отчёт другого брокера. Всё хранится только на этом компьютере.</span></div>`:''}
+    <div class="st-tiles" id="st-tiles">${stTile('st-t1','Т-Инвестиции','conn','set-conn')}${stTile('st-t2','Сервер данных','srv','ds-card')}${stTile('st-t3','Telegram-бот','tg','set-acc')}${stTile('st-t4','Данные','local','set-local')}</div>
+    <div class="msg info" id="st-empty" hidden>Ничего не найдено. Попробуйте другое слово, например «токен», «тема» или «копия».</div>
+  </div></div>`;
+  const main=document.getElementById('st-main');
+  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)),
+    sec(5,adv),sec(6,setNewsHtml(c)),sec(7,setDangerHtml(c))];
+  main.insertAdjacentHTML('beforeend',html.join(''));
+  if(keep){view.scrollTop=keep;const st=view.querySelector('.st');if(st)st.classList.remove('fade')}
+  stSecretBind(main);
+  /* навигация, поиск, scroll-spy */
+  $('#set-nav').onclick=e=>{const a=e.target.closest('[data-to]');if(!a)return;e.preventDefault();stGoto(a.dataset.to)};
+  main.querySelector('#st-tiles').onclick=e=>{const b=e.target.closest('[data-to]');if(b)stGoto(b.dataset.to)};
+  const q=$('#st-q');
+  q.oninput=()=>stSearch(q.value);
+  q.onkeydown=e=>{if(e.key==='Escape'&&q.value){e.preventDefault();e.stopPropagation();q.value='';stSearch('');stSpy()}};
+  $('#st-q-clear').onclick=()=>{q.value='';stSearch('');q.focus()};
+  if(window._stSpyH)view.removeEventListener('scroll',window._stSpyH);
+  let raf=0;window._stSpyH=()=>{if(raf)return;raf=requestAnimationFrame(()=>{raf=0;stSpy()})};
+  view.addEventListener('scroll',window._stSpyH,{passive:true});stSpy();
+  stTiles(c);
+  /* тема: сохраняется сразу */
+  $('#thsel').onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;applyTheme(b.dataset.t);post('/api/config',{theme:b.dataset.t}).then(()=>stOk(b)).catch(()=>{});
+    $('#thsel').querySelectorAll('button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-pressed',on)});stMsg('Тема сохранена',1,true)};
+  /* ключевая ставка: сохраняется сразу */
   const krShow=async()=>{try{const k=await api('/api/keyrate');$('#krinfo').innerHTML=k.source==='none'?'Прогноз сейчас недоступен: купоны флоатеров считаются по последней известной ставке.':`Сейчас используется: <b>${esc(k.name)}</b>${k.as_of?`, на ${esc(k.as_of)}`:''}${k.mode!==k.source?` (выбранный источник «${esc(k.mode)}» недоступен)`:''}. Ключевая ставка сейчас ${pctp(k.key_rate,2)}; средняя по годам: ${(k.yearly||[]).slice(0,4).map(y=>y.year+' — '+pctp(y.mid,1)).join(', ')}.`}catch(e){$('#krinfo').textContent='Не удалось получить прогноз: '+e.message}};
   krShow();
-  $('#krsave').onclick=async()=>{try{$('#krinfo').textContent='Загружаю…';await post('/api/config',{keyrate_mode:$('#krmode').value});S.cfg.keyrate_mode=$('#krmode').value;S.bonds=null;msg('Сохранено. Доходности облигаций пересчитаются при следующем открытии раздела.',1);krShow()}catch(e){msg(e.message)}};
-  {const sn=$('#snd');if(sn)sn.onchange=()=>{lsSet('ta_sound',sn.checked?'1':'0');if(sn.checked&&typeof uxTick==='function')uxTick()}}
-  $('#ndsave').onclick=async()=>{try{await post('/api/config',{notify_days:$('#nd').value});S.cfg.notify_days=+$('#nd').value;msg('Сохранено',1)}catch(e){msg(e.message)}};
-  $('#ntf').onclick=async()=>{try{if(!('Notification' in window))return msg('Браузер не поддерживает уведомления');const r=await Notification.requestPermission();msg(r==='granted'?'Уведомления разрешены':'Уведомления не разрешены',r==='granted')}catch(e){msg(e.message)}};
+  $('#krmode').onchange=async e=>{const el=e.currentTarget;try{$('#krinfo').textContent='Загружаю…';await post('/api/config',{keyrate_mode:el.value});S.cfg.keyrate_mode=el.value;S.bonds=null;stOk(el);krShow()}catch(x){msg(x.message);krShow()}};
+  /* напоминания: сохраняются сразу */
+  $('#nd').onchange=async e=>{const el=e.currentTarget;try{await post('/api/config',{notify_days:el.value});S.cfg.notify_days=+el.value;stOk(el)}catch(x){msg(x.message)}};
+  $('#ntf').onclick=async()=>{try{if(!('Notification' in window))return msg('Браузер не поддерживает уведомления');const r=await Notification.requestPermission();
+    $('#ntf-st').textContent=r==='granted'?'Разрешены':r==='denied'?'Запрещены в браузере':'Не разрешены';if(r==='granted')$('#ntf').disabled=true;
+    msg(r==='granted'?'Уведомления разрешены':'Уведомления не разрешены',r==='granted')}catch(e){msg(e.message)}};
   try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
@@ -27524,14 +28664,139 @@ async function renderSettings(){
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
   const reset=()=>{S.data=S.bonds=S.hist=null;S.account='all';persist()};
   try{bindSetLocal(c,msg,busy,reset)}catch(e){}
-  $('#save').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/config',body());const r=await post('/api/test');reset();
-    msg(`Подключено. Счетов: ${r.accounts}.`,1);S.page='dash';persist();renderNav();load(true)});
-  $('#save2').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/config',body());reset();msg('Сохранено.',1);load(true)});
+  /* токен: кнопка активна, пока в поле есть новое значение */
+  const dTok=stDirty('save',['tok','sb']);stEnter(['tok'],'save');
+  $('#save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await post('/api/config',body());const r=await post('/api/test');reset();
+    msg(`Подключено. Счетов: ${r.accounts}.`,1);S.page='dash';persist();renderNav();load(true)}catch(x){msg(x.message);dTok.upd()}};
   $('#test').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/config',body());const r=await post('/api/test');msg(`Подключение работает. Счетов: ${r.accounts}.`,1)});
+  /* песочница и SSL — переключатели сохраняются сразу */
+  /* песочница меняет и адреса API, и нужный токен — применяется вместе с токеном по «Сохранить и подключиться», а не сразу */
+  $('#sb').onchange=e=>{const el=e.currentTarget;if(el.checked===!!c.sandbox)return;
+    stMsg(el.checked?'Вставьте токен песочницы и нажмите «Сохранить и подключиться».':'Вставьте боевой токен (только чтение) и нажмите «Сохранить и подключиться».',1)};
+  $('#vs').onchange=async e=>{const el=e.currentTarget;try{await post('/api/config',{verify_ssl:el.checked});c.verify_ssl=el.checked;stOk(el)}catch(x){el.checked=!el.checked;msg(x.message)}};
+  /* адреса и сертификат: по кнопке, пока есть изменения */
+  const dAdv=stDirty('save2',['hp','hs','ca']);
+  $('#save2').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await post('/api/config',body());reset();msg('Сохранено.',1);stOk(b);dAdv.rebase();load(true)}catch(x){msg(x.message);dAdv.upd()}};
   $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Заново загрузить все операции и цены из Т-Инвестиций? Это может занять время.'))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
   if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
   if($('#sbpay'))$('#sbpay').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sandbox/payin',{accountId:S.account,amount:$('#amt').value});S.data=S.bonds=S.hist=null;msg('Счёт пополнен на '+M(+$('#amt').value,'rub',0),1);load(true)});
+}
+/* ── Настройки: Telegram, резервная копия, экспорт, помощь с раскрытиями (строки-настройки, мгновенное сохранение) ── */
+/* ── Telegram: уведомления идут через сервер данных и общего бота ── */
+function setTgHtml(c){
+  if(!isPro())return stGroup('Уведомления в Telegram',`<div class="st-pad">${proTeaser('Уведомления в Telegram — в Pro: тревоги, выплаты и сводка прямо в мессенджере')}</div>`,{id:'tg-lock',hint:'Pro'});
+  const on=(k,d)=>c[k]==null?d:!!c[k];
+  const en=on('tg_enabled',false);
+  return stGroup('Уведомления в Telegram',
+    stRow('Присылать уведомления','Главный выключатель. Отключить можно и в боте командой <code>/notify_off</code>',stSw('tg-en',en,'Присылать уведомления в Telegram'))+
+    stRow('Тревоги мониторинга','Только высокой важности: дефолт, понижение рейтинга, сильное падение цены',stSw('tg-mon',on('tg_on_mon',true),'Тревоги мониторинга'),{cls:'sub'})+
+    stRow('Наблюдение и цели','Тревоги по списку наблюдения, достигнутые цели, напоминания из дневника',stSw('tg-wat',on('tg_on_watch',true),'Наблюдение и цели'),{cls:'sub'})+
+    stRow('Ближайшие выплаты','За сколько дней сообщать о выплатах (0 — выключить)',`<input class="in num st-num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}" aria-label="За сколько дней сообщать о выплатах"><span class="st-unit">дн.</span>`,{cls:'sub'})+
+    stRow('Ежедневная сводка','Портфель, выплаты на неделю, тревоги',`<input class="in num st-time" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}" aria-label="Время сводки">${stSw('tg-dg',on('tg_digest',false),'Ежедневная сводка')}`,{cls:'sub'})+
+    stRow('Проверка','Отправить пробное сообщение или сразу проверить тревоги',`<button class="btn ghost" id="tg-test">Тестовое сообщение</button><button class="btn ghost" id="tg-run" title="Проверить тревоги и отправить новые прямо сейчас">Проверить сейчас</button>`)+
+    `<p class="st-line" id="tg-state"></p>`+
+    stMore('Что нужно знать','Уведомления приходят от <b id="tg-bot">@tanalyticbot</b> — того же бота, который выдаёт ключ входа. Текст уведомлений (названия бумаг и суммы) проходит через сервер данных и бот и удаляется сразу после отправки; токен Т-Инвестиций никуда не передаётся. Уведомления приходят, <b>только пока программа запущена</b>; проверка выполняется раз в 10–15 минут, одна и та же тревога повторно не отправляется. Нужен вход по ключу из бота.'),
+    {id:'tg-card',hint:'по желанию',cls:en?'':'st-dis'});
+}
+function bindSetTg(c,msg){
+  const g=id=>document.getElementById(id);if(!g('tg-card'))return;
+  const body=()=>({tg_enabled:g('tg-en').checked,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
+    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00'});
+  const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
+  const save=async()=>{const r=await post('/api/tg/save',body());Object.assign(c,r.settings);return r};
+  const dim=()=>g('tg-card').classList.toggle('st-dis',!g('tg-en').checked);
+  ['tg-en','tg-mon','tg-wat','tg-pay','tg-time','tg-dg'].forEach(id=>g(id).addEventListener('change',async e=>{
+    const el=e.currentTarget;dim();
+    try{await save();stOk(el)}catch(x){msg(x.message)}}));
+  api('/api/tg/info').then(i=>{
+    g('tg-bot').textContent='@'+String(i.bot||'tanalyticbot').replace(/^@/,'');
+    g('tg-state').textContent=!i.server?'Сервер данных выключен («off»): уведомления работают через него. Включите сервер данных в разделе «Подключение».':
+      i.state==='need_login'?'Войдите по ключу из бота — иначе уведомления отправить нельзя.':i.state==='offline'?'Сервер недоступен.':'';
+  }).catch(()=>{});
+  g('tg-test').onclick=e=>busy(e.currentTarget,async()=>{await save();await post('/api/tg/test');msg('Тестовое сообщение отправлено — проверьте Telegram.',1)});
+  g('tg-run').onclick=e=>busy(e.currentTarget,async()=>{await save();const r=await post('/api/tg/run');msg(r.sent?'Отправлено новых пунктов: '+r.sent+'.':'Новых тревог для отправки нет.',1)});
+}
+
+/* ── Зашифрованная резервная копия и экспорт ── */
+function setBackupHtml(c){
+  const q=encodeURIComponent(S.account||'all');
+  const ex=(w,t)=>stRow(t,'',`<a class="btn ghost" href="/api/export?what=${w}&fmt=csv&account=${q}" download>CSV</a><a class="btn ghost" href="/api/export?what=${w}&fmt=xlsx&account=${q}" download>Excel</a>`);
+  return stGroup('Резервная копия',
+    `<div class="st-callout warn">Без пароля копию открыть нельзя, а пароль восстановить невозможно. Запишите его и храните отдельно от копии. Токен API и пароль в копию не входят.</div>`+
+    stRow('Папка для копий','Облачный диск или любая папка',`<input class="in st-wide" id="bkdir" placeholder="/Users/имя/Library/CloudStorage/…" spellcheck="false" aria-label="Папка для копий">`,{stack:1})+
+    `<div id="bksug" class="bk-sug st-sug"></div>`+
+    stRow('Пароль копии','<span id="bkpwst"></span>',stSecret('bkpw','не короче 6 символов','autocomplete="new-password"','Пароль копии'))+
+    stRow('Хранить копий','Старые сверх лимита удаляются',`<input class="in num st-num" type="number" id="bkkeep" min="1" max="365" value="14" aria-label="Сколько копий хранить">`)+
+    stRow('Автоматически раз в день','Работает, пока программа запущена и сохранён пароль',stSw('bkauto',false,'Автоматическая резервная копия раз в день'))+
+    stRow('Действия','',`<button class="btn" id="bksave" disabled>Сохранить настройки</button><button class="btn ghost" id="bkrun">Сделать копию сейчас</button><button class="btn ghost danger" id="bkclr" style="display:none">Забыть пароль</button>`)+
+    `<p class="st-line" id="bkinfo">Загружаю…</p><div id="bkfiles" class="st-line"></div>`+
+    stMore('Восстановить из копии',`<div class="st-restore"><input type="file" id="bkfile" accept=".tinvbak" class="in" aria-label="Файл копии"><input class="in" type="password" id="bkrpw" placeholder="пароль этой копии" autocomplete="off" aria-label="Пароль копии для восстановления"><button class="btn ghost" id="bkrest">Восстановить</button></div><p>Копия будет применена при следующем запуске программы — перезапустите её (до этого на экране прежние данные). Текущая база сохранится рядом как data.db.before-restore. Токен не меняется.</p>`),
+    {id:'bkcard',hint:'зашифрована паролем'})+
+  stGroup('Экспорт данных',
+    ex('positions','Позиции')+ex('bonds','Облигации')+ex('payments','Выплаты на год вперёд')+ex('ops','Операции')+ex('screener','Скринер облигаций')+
+    stMore('О форматах','CSV — в UTF-8 с разделителем «;» (открывается в Excel без настройки), Excel — файл .xlsx с числами и датами. Данные берутся по выбранному слева счёту.'),
+    {hint:'для Excel'});
+}
+function bindSetBackup(c,msg){
+  if(!$('#bkcard'))return;
+  const kb=n=>n>=1048576?(n/1048576).toFixed(1)+' МБ':Math.max(1,Math.round(n/1024))+' КБ';
+  const dt=t=>new Date(t*1000).toLocaleString('ru-RU');
+  let timer=null,first=true;
+  const dirty=stDirty('bksave',['bkdir','bkpw','bkkeep']);
+  const show=async()=>{
+    let s;try{s=await api('/api/backup/status')}catch(e){return}
+    if(first){first=false;$('#bkdir').value=s.dir||'';$('#bkkeep').value=s.keep;$('#bkauto').checked=s.auto;dirty.rebase();
+      $('#bksug').innerHTML=s.suggest.length?'Найдены папки: '+s.suggest.map(x=>`<button class="btn ghost bk-chip" data-p="${esc(x.path)}">${esc(x.label)}</button>`).join(' '):
+      `Подсказки: Яндекс Диск — ${s.windows?'C:\\Users\\имя\\Yandex.Disk':'~/Yandex.Disk'}; iCloud Drive — ${s.windows?'C:\\Users\\имя\\iCloudDrive':'~/Library/Mobile Documents/com~apple~CloudDocs'}; Google Drive — ${s.windows?'G:\\Мой диск':'~/Library/CloudStorage/GoogleDrive-…'}`;
+      $('#bksug').onclick=e=>{const b=e.target.closest('[data-p]');if(b){$('#bkdir').value=b.dataset.p+(b.dataset.p.endsWith('/')?'':'/')+'TInvestBackup';dirty.upd()}}}
+    $('#bkpwst').innerHTML=s.pw_set?'<span class="pos">Пароль сохранён</span>':'<span class="mu">Пароль не сохранён</span>';
+    $('#bkclr').style.display=s.pw_set?'':'none';
+    restoreBar(!!s.restore_pending);
+    const l=s.last;
+    $('#bkinfo').innerHTML=s.running?'Делаю копию (шифрование занимает до минуты)…':l?(l.ok?`Последняя копия: ${esc(dt(l.t))}, ${esc(l.file)}, ${kb(l.size)}, ${l.sec} с${l.removed?`; удалено старых: ${l.removed}`:''}.`:`<span class="neg">Последняя попытка (${esc(dt(l.t))}) не удалась: ${esc(l.error)}</span>`):'Копий ещё не делали.';
+    $('#bkfiles').innerHTML=s.dir_ok&&s.files.length?`В папке (${s.files.length}): ${s.files.slice(0,5).map(f=>esc(f.name)+' · '+kb(f.size)).join('; ')}${s.files.length>5?'…':''}`:(s.dir&&!s.dir_ok?`<span class="neg">${esc(s.dir_msg)}</span>`:'');
+    clearTimeout(timer);if(s.running)timer=setTimeout(show,2500);
+    return s;
+  };
+  show();
+  const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
+  const save=async()=>{await post('/api/backup/settings',{backup_dir:$('#bkdir').value,backup_auto:$('#bkauto').checked,backup_keep:$('#bkkeep').value,backup_password:$('#bkpw').value});$('#bkpw').value=''};
+  stEnter(['bkdir','bkpw','bkkeep'],'bksave');
+  $('#bksave').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();dirty.rebase();stOk(b);show()}catch(x){msg(x.message);dirty.upd()}};
+  $('#bkauto').onchange=async e=>{const el=e.currentTarget;try{await save();dirty.rebase();stOk(el);show()}catch(x){el.checked=!el.checked;msg(x.message)}};
+  $('#bkclr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Забыть пароль? Автоматические копии отключатся. Сами копии останутся и откроются прежним паролем.'))return;await post('/api/backup/settings',{clear_password:true});$('#bkauto').checked=false;msg('Пароль удалён из настроек.',1);show()});
+  $('#bkrun').onclick=e=>busy(e.currentTarget,async()=>{
+    const pw=$('#bkpw').value;await post('/api/backup/settings',{backup_dir:$('#bkdir').value,backup_keep:$('#bkkeep').value});
+    await post('/api/backup/run',{password:pw});msg('Копия запущена, статус обновится ниже.',1);setTimeout(show,800)});
+  $('#bkrest').onclick=e=>busy(e.currentTarget,async()=>{
+    const f=$('#bkfile').files[0];if(!f)return msg('Выберите файл копии (.tinvbak).');
+    if(!confirm('Восстановить данные из этой копии? Текущая база будет сохранена рядом, замена произойдёт при следующем запуске.'))return;
+    msg('Расшифровываю и проверяю копию…',1);
+    const b64=await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]||'');r.onerror=()=>no(new Error('Не удалось прочитать файл'));r.readAsDataURL(f)});
+    await post('/api/backup/restore',{data:b64,password:$('#bkrpw').value});$('#bkrpw').value='';
+    restoreBar(true);
+    msg('Копия проверена и принята. Копия будет применена при следующем запуске программы — перезапустите её. До перезапуска на экране остаются прежние данные.',1)});
+}
+
+/* ── Помощь в сборе раскрытий эмитентов ── */
+function setCrowdHtml(c){
+  return stGroup('Помощь в сборе раскрытий',
+    stRow('Помогать собирать раскрытия эмитентов','Работает только пока программа открыта и подключён сервер данных',stSw('crowd-on',false,'Помогать собирать раскрытия эмитентов'))+
+    `<p class="st-line" id="crowd-info">Загружаю…</p>`+
+    stMore('Как это работает','Включено по умолчанию. Сообщения эмитентов о купонах, выкупах и дефолтах лежат на сайте e-disclosure.azipi.ru, а наш сервер данных его открыть не может. <b>Пока программа открыта</b>, она скачивает публичные страницы этого сайта <b>с вашего интернет-подключения — примерно одну страницу раз в 15 секунд</b> — и отправляет их на сервер данных. Так все пользователи видят купоны, выкупы и дефолты по своим облигациям. Токен, портфель и другие ваши данные не отправляются; в страницах только то, что видно любому посетителю сайта. Сайт видит ваш IP-адрес, как при обычном заходе в браузере. При ошибках сайта программа делает паузу на 30 минут. Выключить можно в любой момент.'),
+    {id:'crowd-card',hint:'',hintId:'crowd-sp'});
+}
+async function bindSetCrowd(c,msg){
+  const on=document.getElementById('crowd-on');if(!on)return;
+  const show=async()=>{const s=await crowdLoad();if(!s||!document.getElementById('crowd-info'))return;
+    on.checked=!!s.enabled;
+    const stt=s.enabled&&s.state==='off'?'запускается…':(CROWD_STATE[s.state]||s.state);   // включили, а поток ещё не проснулся
+    document.getElementById('crowd-sp').textContent=s.enabled?stt:'выключено';
+    document.getElementById('crowd-info').innerHTML=`Отправлено страниц, принятых сервером: <b>${s.accepted}</b>${s.fetched?` (скачано ${s.fetched})`:''}.${s.enabled?` Состояние: ${esc(stt)}${s.message?' — '+esc(s.message):''}.`:''}${!s.available?' Подключите сервер данных и войдите по ключу — без этого помощь не работает.':''}`;
+    clearTimeout(CROWD.t);if(s.enabled)CROWD.t=setTimeout(show,5000)};
+  on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});stOk(on);msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
+  show();
 }
 /* ── тема, печать ── */
 function themeNow(t){return t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}
@@ -27595,7 +28860,7 @@ function notifyMon(d){
 /* ── Ставки: КБД и ключевая ставка ── */
 S.ratesDays=365;S.rates=null;
 const RDAYS=[[90,'3 мес'],[180,'6 мес'],[365,'Год'],[730,'2 года']];
-const RT_PRE=[1,2,3,5,10],RT_COL=['#2f6df6','#f59e0b','#8b5cf6','#e5484d','#0ea5a4','#64748b'],RT_MAX=6;
+const RT_PRE=[1,2,3,5,10],RT_COL=['var(--s1)','var(--s4)','var(--s7)','var(--s8)','var(--s3)','var(--s6)'],RT_MAX=6;
 /* выбранные сроки КБД (лет) и свои сроки; хранятся в localStorage */
 (()=>{const j=lsJson('ta_rates_terms',{}),ok=a=>Array.isArray(a)?a.map(Number).filter(t=>t>=0.25&&t<=30):[];
   S.rTerms=[...new Set(ok(j.sel))].sort((x,y)=>x-y).slice(0,RT_MAX);if(!S.rTerms.length)S.rTerms=[2];
@@ -27646,10 +28911,10 @@ function pMkt(){
   const bt=tms.includes(2)?2:tms[0],bk=K(bt),lastK=bk[i0],lastC=r.key[i0],firstI=bk.findIndex(v=>v!=null),first=bk[firstI];
   const hasSl=tms.includes(1)&&tms.includes(10)&&K(10)[i0]!=null&&K(1)[i0]!=null,sl=hasSl?K(10)[i0]-K(1)[i0]:null;
   chart('c-rates',line,{h:360,zero:false,labels:r.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc1(v),
-    series:[{n:'Ключевая ставка',c:'#3f7a4f',hex:'#3f7a4f',v:r.key,w:2.4,step:true},...tms.map(t=>({n:'КБД · '+rtLab(t),c:rtColor(t),hex:rtColor(t),v:K(t),w:2.2}))],
+    series:[{n:'Ключевая ставка',c:'var(--pos)',v:r.key,w:2.4,step:true},...tms.map(t=>({n:'КБД · '+rtLab(t),c:rtColor(t),v:K(t),w:2.2}))],
     hover:i=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i)},leave:()=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i0)}});
   const dk=lastK!=null&&lastC!=null?lastK-lastC:null;
-  return`<div class="g g4">${kpi('КБД · '+rtLab(bt),pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,rtColor(bt))}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'#3f7a4f')}
+  return`<div class="g g4">${kpi('КБД · '+rtLab(bt),pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,rtColor(bt))}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'var(--pos)')}
     ${kpi('КБД '+rtLab(bt)+' − ключевая',dk!=null?ppf(dk):'—',dk==null?'':'рынок закладывает '+(dk>0?'повышение / удержание':'снижение')+' ставки',dk==null?null:dk>0?'neg':'pos')}
     ${hasSl?kpi('Наклон: 10 лет − 1 год',ppf(sl),sl<0?'кривая инвертирована':'длинные ставки выше коротких',sl<0?'pos':null):
       kpi('КБД '+rtLab(bt)+' за период',lastK!=null&&first!=null?ppf(lastK-first):'—','с '+r.labels[Math.max(0,firstI)],lastK!=null&&first!=null?(lastK-first>0?'neg':'pos'):null)}</div>
@@ -27673,8 +28938,8 @@ function loadRatesX(force){
   api('/api/rates/extra').then(j=>{S._rxL=0;const ch=rtChanged(S.ratesX,j);S.ratesX=j;if(S.page==='mkt'){if(ch)renderSoon();if(j.loading)setTimeout(()=>{if(S.page==='mkt')loadRatesX(true)},5000)}})
    .catch(e=>{S._rxL=0;S.ratesX={error:e.message}})
 }
-const RX_COL=['#3b82f6','#3987e5','#19a070','#d95926','#9085e9'];
-const RX_BCOL={'AAA':'#3987e5','AA':'#19a070','A':'#d97706','BBB':'#d95926','BB и ниже':'#e66767'};
+const RX_COL=['var(--s1)','var(--s2)','var(--s3)','var(--s8)','var(--s7)'];
+const RX_BCOL={'AAA':'var(--s1)','AA':'var(--s3)','A':'var(--s4)','BBB':'var(--s8)','BB и ниже':'var(--neg)'};
 function ratesXHtml(){
   if(!S.ratesX)loadRatesX();
   const x=S.ratesX;
@@ -27686,7 +28951,7 @@ function ratesXHtml(){
   const names=Object.keys(sp.series||{});
   if(sp.dates.length>=2&&names.length){
     chart('c-rx-spr',line,{h:300,zero:false,labels:sp.dates.map(ddm),tipLabels:sp.dates.map(dlabel),fa:v=>(+v).toFixed(1).replace('.',',')+' п.п.',ft:v=>(+v).toFixed(2).replace('.',',')+' п.п.',
-      series:names.map(b=>({n:b,c:RX_BCOL[b]||'#a8aebb',hex:RX_BCOL[b]||'#a8aebb',v:sp.series[b],w:2}))});
+      series:names.map(b=>({n:b,c:RX_BCOL[b]||'#a8aebb',v:sp.series[b],w:2}))});
     h+=`<div class="card rates"><h2>Спреды к КБД по рейтингам во времени<span class="sp">медиана по рублёвым корпоративным облигациям</span></h2>
       <div class="axt">Спред к КБД, п.п.</div><div id="c-rx-spr" class="chart"></div>
       ${(x.spread_notes||[]).map(t=>`<p style="margin:6px 4px;color:var(--tx2)">${esc(t)}</p>`).join('')}
@@ -27719,10 +28984,10 @@ function curveCard(cv,its){
   const sum=`<ul class="rx-sum"><li>${mv(1,'Короткие (1 год)')}</li><li>${mv(10,'Длинные (10 лет)')}</li><li>Кривая ${dyn}, сейчас ${shape}: 10 лет − 2 года = <b class="num">${fmtS(s1)}</b> (было ${fmtS(s0)}).</li></ul>
     <p class="rx-mean"><b>Что это значит:</b> ${mean} ${lvlT}</p>`;
   const rows=RX_TEN.filter(([t])=>ix(t)>=0).map(([t,n])=>{const a=y(cmp,t),b=y(now,t),d=b-a;return`<tr><td>${n}</td><td class="num"><b>${pc2(b)}</b></td><td class="num">${pc2(a)}</td><td class="num ${dcl(d)}">${pp(d,1)}</td></tr>`}).join('');
-  const AC=document.documentElement.dataset.theme==='light'?'#2563eb':'#3b82f6',nm='Сегодня ('+ddm(now.date)+')',cn=lab+' назад ('+ddm(cmp.date)+')';
+  const AC='var(--s1)',nm='Сегодня ('+ddm(now.date)+')',cn=lab+' назад ('+ddm(cmp.date)+')';
   chart('c-rx-curve',line,{h:320,zero:false,labels:cv.labels,fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:v=>pc2(v),band:{a:1,b:0},
-    series:[{n:cn,c:'#8d95a6',hex:'#8d95a6',v:cmp.y,w:2,dash:true},{n:nm,c:AC,hex:AC,v:now.y,w:3.4}],
-    tip:i=>{const a=cmp.y[i],b=now.y[i],d=b-a;return`<b>Срок: ${esc(cv.labels[i])}</b>`+tipRow(AC,nm,pc2(b))+tipRow('#8d95a6',cn,pc2(a))+`<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Изменение<span class="${dcl(d)}">${pp(d,1)}</span></div>`}});
+    series:[{n:cn,c:'var(--mu)',v:cmp.y,w:2,dash:true},{n:nm,c:AC,v:now.y,w:3.4}],
+    tip:i=>{const a=cmp.y[i],b=now.y[i],d=b-a;return`<b>Срок: ${esc(cv.labels[i])}</b>`+tipRow(AC,nm,pc2(b))+tipRow('var(--mu)',cn,pc2(a))+`<div class="tot">Изменение<span class="${dcl(d)}">${pp(d,1)}</span></div>`}});
   return`<div class="card rates"><h2>Кривая КБД: сегодня и раньше<span class="hq" title="КБД — кривая бескупонной доходности ОФЗ, её считает Мосбиржа: показывает, под какой годовой процент государство занимает на разные сроки.">?</span><span class="sp">Сравнить с: ${seg}</span></h2>
     ${sum}
     <div class="legend rx-lg"><span><i style="background:#3ecf8e55"></i>ниже — ставки снизились</span><span><i style="background:#ff6b6b55"></i>выше — ставки выросли</span></div>
@@ -27753,13 +29018,13 @@ function inflWeekHtml(){
   const cy=ys[ys.length-1],py=String(+cy-1),W=Array.from({length:52},(_,i)=>i+1);
   const byW=y=>{const a=Array(52).fill(null);(x.years[y]||[]).forEach(r=>{if(r.week>=1&&r.week<=52)a[r.week-1]=r.pct});return a};
   const av=Array(52).fill(null);(x.avg||[]).forEach(([w,v])=>{if(w>=1&&w<=52)av[w-1]=v});
-  const A='#3b82f6',series=[{n:cy,c:A,hex:A,v:byW(cy),w:3}];
-  if(x.years[py])series.push({n:py,c:'#3987e5',hex:'#3987e5',v:byW(py),w:2});
-  if(av.some(v=>v!=null))series.push({n:'Среднее '+(x.avg_label||'2017–2021'),c:'#8d95a6',hex:'#8d95a6',v:av,w:2,dash:true});
+  const A='var(--s1)',series=[{n:cy,c:A,v:byW(cy),w:3}];
+  if(x.years[py])series.push({n:py,c:'var(--s1)',v:byW(py),w:2});
+  if(av.some(v=>v!=null))series.push({n:'Среднее '+(x.avg_label||'2017–2021'),c:'var(--mu)',v:av,w:2,dash:true});
   const last=(x.years[cy]||[]).slice(-1)[0],f=v=>(+v).toFixed(2).replace('.',',')+'%';
   chart('c-infl-w',line,{h:300,zero:true,labels:W.map(String),fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:f,series});
   return`<div class="card rates"><h2>Недельная инфляция<span class="sp">${last?'последняя ('+ddm(last.date)+'): <b>'+f(last.pct)+'</b>':''}</span></h2>
-    <div class="legend rx-lg">${series.map(s=>`<span><i style="background:${s.hex}"></i>${esc(s.n)}</span>`).join('')}</div>
+    <div class="legend rx-lg">${series.map(s=>`<span><i style="background:${s.c}"></i>${esc(s.n)}</span>`).join('')}</div>
     <div class="axt">Прирост цен за неделю, %</div><div id="c-infl-w" class="chart"></div><div class="axt" style="text-align:center">Номер недели года</div>
     <p class="note">Росстат, оценка индекса потребительских цен за неделю (к предыдущей дате регистрации). Данные с ${x.history_from?esc(ddm(x.history_from)+' '+x.history_from.slice(0,4)):'—'}${(x.avg||[]).length?'; пунктир — среднее за '+esc(x.avg_label)+' по номеру недели':'; для среднего за 2017–2021 в архиве Росстата нет доступных заметок'}.${x.loading?' Историю ещё докачиваю…':''}</p></div>`;
 }
@@ -27959,6 +29224,7 @@ function bindPage(){
   {const x=PAGE_EXT[S.page];if(x&&x.bind)x.bind()}
   if(S.page==='reb')bindReb();
   if(S.page==='scr')bindScr();
+  if(S.page==='map'){const b=$('#map-r');if(b)b.onclick=()=>{S.scr=null;render()}}
   if(S.page==='cmp')bindCmp();
   if(S.page==='risk')bindRisk();
   if(S.page==='mon')bindMon();
@@ -28030,9 +29296,19 @@ document.addEventListener('click',e=>{
 });
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.getElementById('bc-ov'))closeBond()});
 
+/* Плавное закрытие выезжающей панели: id снимаем сразу (для кода панель уже закрыта), узел удаляем после анимации. */
+function ovLeave(o){
+  if(!o)return;
+  if(matchMedia('(prefers-reduced-motion: reduce)').matches){o.remove();return}
+  const dr=o.firstElementChild;
+  if(dr){const cs=getComputedStyle(dr);dr.style.cssText+=`;width:${dr.offsetWidth}px;height:100%;flex:none;background:${cs.backgroundColor};overflow:hidden;border-left:${cs.borderLeft};box-shadow:${cs.boxShadow}`;dr.removeAttribute('id')}
+  o.style.cssText+=';position:fixed;inset:0;z-index:41;display:flex;justify-content:flex-end;background:#03050a99';
+  o.removeAttribute('id');
+  o.classList.add('ov-leave');o.style.pointerEvents='none';setTimeout(()=>o.remove(),240);
+}
 function closeBond(){
   BC.stack=[];BC.tok++;
-  const o=document.getElementById('bc-ov');if(o)o.remove();
+  ovLeave(document.getElementById('bc-ov'));
   document.body.classList.remove('bc-open');
 }
 function bcMount(){
@@ -28244,7 +29520,7 @@ function bcIssuerCurve(el,ic){
   const fl=P.filter(p=>!p.floating);
   if(fl.length>1)g+=`<polyline class="ic-ln" points="${fl.map(p=>X(p.dur).toFixed(1)+','+Y(p.yield).toFixed(1)).join(' ')}"/>`;
   P.slice().sort((a,b)=>a.me-b.me).forEach(p=>{
-    g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'#3987e5'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
+    g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'var(--s1)'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
   el.innerHTML=`<svg width="${W}" height="${H}">${g}</svg>`;
 }
 function bcIssIfrs(j){
@@ -28293,8 +29569,8 @@ function bcCharts(dr,c){
   const labels=hs.d.map(ddm),p=document.getElementById('bc-ch-p'),y=document.getElementById('bc-ch-y');
   {
     try{
-      if(p)line(p,{h:190,labels,zero:false,fa:v=>bcN(v,1),ft:v=>bcN(v,2)+' %',series:[{n:'Цена',c:'#3987e5',v:hs.p,w:2}]});
-      if(y)line(y,{h:190,labels,zero:false,fa:v=>bcN(v,1),ft:v=>bcN(v,2)+' %',series:[{n:'Доходность',c:'#c98500',v:hs.y,w:2}]});
+      if(p)line(p,{h:190,labels,zero:false,fa:v=>bcN(v,1),ft:v=>bcN(v,2)+' %',series:[{n:'Цена',c:'var(--s1)',v:hs.p,w:2}]});
+      if(y)line(y,{h:190,labels,zero:false,fa:v=>bcN(v,1),ft:v=>bcN(v,2)+' %',series:[{n:'Доходность',c:'var(--s4)',v:hs.y,w:2}]});
     }catch(e){}
   }
 }
@@ -28390,7 +29666,7 @@ function bindCmp(){
   res.onclick=e=>{const b=e.target.closest('[data-a]');if(b)add(b.dataset.a)};
 }
 /* ── Карта рынка: доходность и дюрация, спреды по рейтингам ── */
-const MP_COL={'AAA':'#199e70','AA':'#3ecf8e','A':'#3987e5','BBB':'#e3a21a','BB и ниже':'#ff6b6b','нет рейтинга':'#8a90a0'};
+const MP_COL={'AAA':'var(--s3)','AA':'var(--pos)','A':'var(--s1)','BBB':'var(--s4)','BB и ниже':'var(--neg)','нет рейтинга':'#8a90a0'};
 const MP_BK=['AAA','AA','A','BBB','BB и ниже','нет рейтинга'];
 S.mp={rb:{'AAA':true,'AA':true,'A':true,'BBB':true,'BB и ниже':true,'нет рейтинга':true},sector:'',dmax:'5',liquid:true,mine:false,all:false};
 function mpMine(){const s=new Set();((S.bonds&&S.bonds.rows)||[]).forEach(b=>{if(b.isin)s.add(b.isin);if(b.ticker)s.add(b.ticker)});return s}
@@ -28464,7 +29740,7 @@ function mpHist(el){
 function pMap(){
   const d=S.scr;
   if(!d){loadScr();return`<div class="card">${waitBox('Загружаю торги облигациями с Мосбиржи…')}</div>`}
-  if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="scr-r">Повторить</button></div>`;
+  if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="map-r">Повторить</button></div>`;
   const f=S.mp,sectors=[...new Set(d.rows.map(r=>r.sector).filter(Boolean))].sort((a,b)=>(SECT[a]||a).localeCompare(SECT[b]||b));
   const opt=(v,t,cur)=>`<option value="${v}" ${String(cur)===String(v)?'selected':''}>${t}</option>`;
   const hasP=mpMine().size>0;
@@ -28494,7 +29770,6 @@ function bindMap(){
   $('#mp-liq').onchange=e=>{f.liquid=e.target.checked;redraw()};
   $('#mp-mine').onchange=e=>{f.mine=e.target.checked;redraw()};
   $('#mp-all').onchange=e=>{f.all=e.target.checked;redraw()};
-  const r=$('#scr-r');if(r)r.onclick=()=>{S.scr=null;render()};
   if(!window._mpRs){window._mpRs=1;let t;addEventListener('resize',()=>{clearTimeout(t);t=setTimeout(()=>{if(S.page==='map'){const e=$('#map-sc');if(e&&S.scr&&!S.scr.error)mpScatter(e);const h=$('#map-hist');if(h&&S.scr&&!S.scr.error)mpHist(h)}},200)})}
 }
 /* ── Риски и сценарии: вероятность дефолта, ожидаемая доходность, сценарии ключевой ставки ── */
@@ -28512,8 +29787,8 @@ const rkRub=(v,d=0)=>bad(v)?'—':INCOG.on?MASK+' ₽':(v>0?'+':v<0?'−':'')+NF
 const rkPct=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' %';
 function rkScnChart(el){
   const d=S.risk;if(!d||!d.scenarios)return;
-  bars(el,{h:260,stack:true,labels:d.scenarios.map(s=>s.name),series:[{n:'Купоны (получено за год)',c:'#3987e5',v:d.scenarios.map(s=>d.scn_total[s.key].coupons)},
-    {n:'Изменение цены (переоценка, подтягивание к номиналу)',c:'#19a070',v:d.scenarios.map(s=>d.scn_total[s.key].price)}],total:true,fa:short,ft:v=>rkRub(v),empty:'Нет данных'});
+  bars(el,{h:260,stack:true,labels:d.scenarios.map(s=>s.name),series:[{n:'Купоны (получено за год)',c:'var(--s1)',v:d.scenarios.map(s=>d.scn_total[s.key].coupons)},
+    {n:'Изменение цены (переоценка, подтягивание к номиналу)',c:'var(--s3)',v:d.scenarios.map(s=>d.scn_total[s.key].price)}],total:true,fa:short,ft:v=>rkRub(v),empty:'Нет данных'});
 }
 function rkFloatText(d){
   const f=d.floaters.floating,x=d.floaters.fixed;
@@ -28801,7 +30076,7 @@ function bindMon(){
 /* ── Сравнение с рынком: индексы облигаций, фонды ликвидности и облигационные БПИФ ── */
 S.bn={};S.bnSel=new Set(['LQDT','RUCBTRNS']);S.bnLoad=null;
 const BN_COL={RGBITR:[S2],RUCBTRNS:[S4],RUCBHYTR:[S8],LQDT:[S3],TMON:[S6],SBMM:[S7],AKMM:[S2,1],SBRB:[S4,1],AKMB:[S5,1],TBRU:[S7,1],RUSFAR:[S6,1]};
-const BN_LC={d1:'#19a070',d5:'#e3a21a',dm:'#e66767',na:'#8a90a0'};
+const BN_LC={d1:'var(--s3)',d5:'var(--s4)',dm:'var(--s8)',na:'#8a90a0'};
 const bnRub=v=>bad(v)?'—':(v>0?'+':v<0?'−':'')+NF0.format(Math.abs(v))+' ₽';
 const bnPct=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' %';
 const bnPp=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' п.п.';
@@ -28821,7 +30096,7 @@ function bnLoadData(){
 }
 function bnCur(){const e=S.bn[bnKey()];return e&&Date.now()-e.t<10*60*1000?e:null}
 function bnSeries(d){
-  const s=d.series,ser=[{n:'Мой портфель',c:S1,hex:'#3987e5',v:s.portfolio,w:2.6}];
+  const s=d.series,ser=[{n:'Мой портфель',c:S1,v:s.portfolio,w:2.6}];
   d.bench.forEach(b=>{if(!b.available||!S.bnSel.has(b.code)||!s.bench[b.code])return;const c=BN_COL[b.code]||[S2];
     ser.push({n:b.name,c:c[0],v:s.bench[b.code],w:1.7,dash:!!c[1]})});
   return ser;
@@ -28869,7 +30144,7 @@ function bnLiquidity(d){
   const slow=l.slowest.length?`<div class="tbl" style="margin-top:10px"><table><thead><tr><th class="l">Самые медленные позиции</th><th>Стоимость</th><th>Дней на продажу</th></tr></thead><tbody>${
     l.slowest.map(r=>`<tr${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l">${esc(r.name)}</td><td class="num">${M(r.value_rub,'rub',0)}</td><td class="num ${r.days>5?'neg':r.days>1?'':'pos'}">${r.days>=10?Math.round(r.days):f2(r.days)}</td></tr>`).join('')}</tbody></table></div>`:'';
   return`<div class="card"><h2>Как быстро можно продать<span class="sp">облигации в портфеле${cov!=null?', '+cov.toFixed(0)+' % портфеля':''}</span></h2>
-    ${hbars(items,'#3987e5',x=>pctp(x.v,0),true)}
+    ${hbars(items,'var(--s1)',x=>pctp(x.v,0),true)}
     ${slow}
     <p class="note" style="margin-top:10px">«Дней на продажу» — за сколько дней можно продать позицию целиком, если забирать не более ${f2(l.part)} % среднего дневного оборота выпуска, чтобы не двигать цену. Фонд ликвидности (LQDT) продаётся в день сделки, без скидки к цене. Оценка по облигациям; акции и фонды в расчёт не входят.</p></div>`;
 }
@@ -28933,8 +30208,8 @@ function bindBench(){
 /* калькулятор инвестиций */
 /* ── Чистая часть: модель (без DOM, считается на клиенте) ── */
 const CL_BR=[[2.4e6,.13],[Infinity,.15]];   /* шкала НДФЛ для инвестиционных доходов (купоны, продажа бумаг, проценты по вкладам): 13 % до 2,4 млн ₽ в год, 15 % с превышения */
-const CL_STR=[['dep','Вклад','#8a93a6'],['fund','Фонд ликвидности','#19a070'],['ofz','ОФЗ','#3987e5'],['aaa','Корпоративные AAA','#7ab4f5'],['aa','Корпоративные AA','#9085e9'],
-  ['a','Корпоративные A','#c98500'],['hy','ВДО (BB и ниже)','#e66767'],['pf','Мой портфель','#d55181'],['own','Своя ставка','#d95926']];
+const CL_STR=[['dep','Вклад','#8a93a6'],['fund','Фонд ликвидности','var(--s3)'],['ofz','ОФЗ','var(--s1)'],['aaa','Корпоративные AAA','var(--s2)'],['aa','Корпоративные AA','var(--s7)'],
+  ['a','Корпоративные A','var(--s4)'],['hy','ВДО (BB и ниже)','var(--s8)'],['pf','Мой портфель','var(--s5)'],['own','Своя ставка','var(--s8)']];
 const CL_BETA={ofz:.6,aaa:.7,aa:.7,a:.7,hy:.7};
 const CL_ACC=[['plain','Обычный брокерский счёт'],['iis3','ИИС-3 (вычет и освобождение дохода)']];
 function clNdfl(b){if(!(b>0))return 0;let t=0,lo=0;for(const[h,r]of CL_BR){if(b>lo)t+=(Math.min(b,h)-lo)*r;lo=h;if(b<=h)break}return t}
@@ -29132,15 +30407,15 @@ function clStack(el,o){
   for(let v=lo;v<=hi+step/2;v+=step){const y=Y(v);s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-10}" y="${y+4}" text-anchor="end">${fa(Math.abs(v)<step/1e6?0:v)}</text>`}
   axisTicks(o.labels,X,pl-4,W-pr+4).forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
   cum.forEach(([a,b],j)=>{const up=b.map(pt2);
-    s+=`<polygon points="${up.concat(a.map(pt2).reverse()).join(' ')}" fill="${ser[j].c}" fill-opacity=".5"/><polyline points="${up.join(' ')}" fill="none" stroke="${ser[j].c}" stroke-width="1.6" stroke-linejoin="round"/>`});
+    s+=`<polygon points="${up.concat(a.map(pt2).reverse()).join(' ')}" fill="${ser[j].c}" fill-opacity=".38"/><polyline points="${up.join(' ')}" fill="none" stroke="${ser[j].c}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`});
   let hits='';const cw=pw/(n-1);
   for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${X(i)-cw/2}" y="${pt}" width="${cw}" height="${ph}" fill="transparent"/>`;
   el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}">${s}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
-  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`+
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-dasharray="3 3"/>`+
     cum.map(([a,b],j)=>`<circle cx="${X(i)}" cy="${Y(b[i])}" r="4" fill="${ser[j].c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
   bindTip(el,i=>`<b>${esc(tl[i])}</b>`+ser.slice().reverse().map(se=>tipRow(se.c,se.n,ft(se.v[i]||0))).join('')+
-    `<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${ft(acc[i])}</span></div>`);
+    `<div class="tot">Итого<span>${ft(acc[i])}</span></div>`);
 }
 function clSegTable(P,F,env){
   const rows=[];
@@ -29167,7 +30442,7 @@ function clOut(){
   /* состав капитала выбранной стратегии: внесено + вычеты ИИС + доход после налогов */
   const RF=cur.id==='dep'?null:clRefunds(p,clAccInfo(p)),sIn=[],sDed=[],sInc=[];let ci=0,cd=0;
   for(let k=0;k<=N;k++){ci+=clContrib(p,k)/dv(k);if(RF)cd+=RF[k]/dv(k);sIn.push(ci);sDed.push(cd);sInc.push(cur.cap[k]/dv(k)-ci-cd)}
-  const ser=[{n:'Внесено',c:'#8a93a6',v:sIn}];if(cd>0)ser.push({n:'Вычеты и возвраты ИИС',c:'#c98500',v:sDed});ser.push({n:'Доход после налогов',c:'#19a070',v:sInc});
+  const ser=[{n:'Внесено',c:'#8a93a6',v:sIn}];if(cd>0)ser.push({n:'Вычеты и возвраты ИИС',c:'var(--s4)',v:sDed});ser.push({n:'Доход после налогов',c:'var(--s3)',v:sInc});
   chart('cl-stack',clStack,{h:300,series:ser,labels,tipLabels:tips,fa:short,ft:v=>clRub(v),empty:'Нет данных'});
   const fin=real?cur.finalReal:cur.final,inc=sInc[N],pas=real?cur.passiveReal:cur.passive;
   const pick=res.length>1?`<div class="cl-view"><span>Итоги и график для</span><select class="in" id="cl-view"><option value="">лучшей стратегии (${esc(best.name)})</option>${
@@ -29338,7 +30613,7 @@ function cgOut(){
   if(F.value==='' &&d.value!=null)src.push(`текущая стоимость ${clRub(r.value)} взята из портфеля`);
   const ym=clYM(r.months);
   chart('cg-chart',line,{h:300,labels:r.chart.labels.map(l=>l.slice(5)+'.'+l.slice(0,4)),fa:short,ft:v=>clRub(v),empty:'Нет данных',
-    series:[{n:'Капитал при нужном пополнении',c:'#19a070',v:r.chart.capital},{n:'Без пополнений',c:'#8a93a6',dash:1,w:1.6,v:r.chart.no_contrib},{n:'Нужный капитал',c:'#d95926',dash:1,w:1.8,v:r.chart.target}]});
+    series:[{n:'Капитал при нужном пополнении',c:'var(--s3)',v:r.chart.capital},{n:'Без пополнений',c:'#8a93a6',dash:1,w:1.6,v:r.chart.no_contrib},{n:'Нужный капитал',c:'var(--s8)',dash:1,w:1.8,v:r.chart.target}]});
   const cv=r.coverage;
   const cov=cv&&cv.pct!=null?`<div class="card cl-goal"><h2>Где вы сейчас</h2><div class="cl-ans">Сейчас купоны и дивиденды дают около <b>${clRub(cv.income)}</b> в месяц${d.income_src&&F.value===''?` (${esc(d.income_src)})`:''} — это <b>${f2(cv.pct)} %</b> цели. Оценка до налога и без учёта будущих изменений портфеля.</div></div>`:
     `<div class="card"><div class="note">Данных о текущем доходе нет: подключите токен или укажите стоимость портфеля.</div></div>`;
@@ -29561,7 +30836,7 @@ function ladRun(){
 function ladChart(el){
   const d=S.lad&&S.lad.data;if(!d||!d.cashflow_by_month||!d.cashflow_by_month.length)return emptyChart(el,260,'Нет выплат');
   const cf=d.cashflow_by_month,lb=cf.map(m=>LAD_MN[+m.month.slice(5)-1]+' '+m.month.slice(2,4));
-  bars(el,{h:280,stack:true,labels:lb,series:[{n:'Купоны',c:'#3987e5',v:cf.map(m=>m.coupons)},{n:'Погашения и амортизация',c:'#19a070',v:cf.map(m=>m.principal)}],total:true,fa:short,ft:v=>M(v,'rub',0),empty:'Нет выплат'});
+  bars(el,{h:280,stack:true,labels:lb,series:[{n:'Купоны',c:'var(--s1)',v:cf.map(m=>m.coupons)},{n:'Погашения и амортизация',c:'var(--s3)',v:cf.map(m=>m.principal)}],total:true,fa:short,ft:v=>M(v,'rub',0),empty:'Нет выплат'});
 }
 function ladYTip(b){
   if(b.yield_basis==='put')return'Доходность к пут-оферте: держатель сам решает, предъявлять ли бумагу';
@@ -30164,39 +31439,6 @@ document.addEventListener('click',async e=>{
   e.stopPropagation();b.disabled=true;
   try{await watchToggle(b.dataset.wstar)}catch(er){alert(er.message)}finally{b.disabled=false}
 },true);
-
-/* ── Telegram: карточка в «Настройках» (уведомления идут через сервер данных и общего бота) ── */
-function setTgHtml(c){
-  if(!isPro())return`<div class="card" id="tg-lock"><h2>Уведомления в Telegram<span class="sp">Pro</span></h2>${proTeaser('Уведомления в Telegram — в Pro: тревоги, выплаты и сводка прямо в мессенджере')}</div>`;
-  const on=(k,d)=>c[k]==null?d:!!c[k];
-  return`<div class="card" id="tg-card"><h2>Уведомления в Telegram<span class="sp">по желанию</span></h2>
-    <div style="display:grid;gap:16px">
-    <p class="note" style="margin:0">Уведомления приходят от <b id="tg-bot">@tanalyticbot</b> — того же бота, который выдаёт ключ входа. Ничего настраивать не нужно.</p>
-    <p class="note" id="tg-state" style="margin:0"></p>
-    <label class="sw"><input type="checkbox" id="tg-en" ${on('tg_enabled',false)?'checked':''}><i></i><div><b>Присылать уведомления</b><small>Главный выключатель; отключить можно и в самом боте командой <code>/notify_off</code></small></div></label>
-    <label class="sw"><input type="checkbox" id="tg-mon" ${on('tg_on_mon',true)?'checked':''}><i></i><div><b>Тревоги мониторинга</b><small>Только высокой важности: дефолт, понижение рейтинга, сильное падение цены</small></div></label>
-    <label class="sw"><input type="checkbox" id="tg-wat" ${on('tg_on_watch',true)?'checked':''}><i></i><div><b>Наблюдение и цели</b><small>Тревоги по списку наблюдения, достигнутые цели и напоминания из дневника</small></div></label>
-    <div class="row"><label class="field" style="max-width:300px"><span>Ближайшие выплаты: за сколько дней сообщать (0 — выключить)</span><input class="in num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}"></label></div>
-    <div class="row"><label class="sw"><input type="checkbox" id="tg-dg" ${on('tg_digest',false)?'checked':''}><i></i><div><b>Ежедневная сводка</b><small>Портфель, выплаты на неделю, тревоги</small></div></label>
-      <label class="field" style="max-width:130px"><span>Время</span><input class="in num" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}"></label></div>
-    <div class="row"><button class="btn" id="tg-save">Сохранить</button><button class="btn ghost" id="tg-test">Отправить тестовое сообщение</button><button class="btn ghost" id="tg-run" title="Проверить тревоги и отправить новые прямо сейчас">Проверить сейчас</button></div>
-    <p class="note"><b>Что нужно знать.</b> Текст уведомлений (названия бумаг и суммы) проходит через сервер данных и бот @tanalyticbot и удаляется сразу после отправки; токен Т-Инвестиций никуда не передаётся. Уведомления приходят, <b>только пока программа запущена</b>; проверка выполняется раз в 10–15 минут, одна и та же тревога повторно не отправляется. Нужен вход по ключу из бота (раздел «Сервер данных»).</p></div></div>`;
-}
-function bindSetTg(c,msg){
-  const g=id=>document.getElementById(id);if(!g('tg-card'))return;
-  const body=()=>({tg_enabled:g('tg-en').checked,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
-    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00'});
-  const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
-  const save=async()=>{const r=await post('/api/tg/save',body());Object.assign(c,r.settings);return r};
-  api('/api/tg/info').then(i=>{
-    g('tg-bot').textContent='@'+String(i.bot||'tanalyticbot').replace(/^@/,'');
-    g('tg-state').textContent=!i.server?'Сервер данных выключен («off»): уведомления работают через него. Включите сервер данных в настройках.':
-      i.state==='need_login'?'Войдите по ключу из бота — иначе уведомления отправить нельзя.':i.state==='offline'?'Сервер недоступен.':'';
-  }).catch(()=>{});
-  g('tg-save').onclick=e=>busy(e.currentTarget,async()=>{await save();msg('Настройки уведомлений сохранены.',1)});
-  g('tg-test').onclick=e=>busy(e.currentTarget,async()=>{await save();await post('/api/tg/test');msg('Тестовое сообщение отправлено — проверьте Telegram.',1)});
-  g('tg-run').onclick=e=>busy(e.currentTarget,async()=>{await save();const r=await post('/api/tg/run');msg(r.sent?'Отправлено новых пунктов: '+r.sent+'.':'Новых тревог для отправки нет.',1)});
-}
 /* ── Зашифрованная резервная копия и экспорт ── */
 /* постоянная плашка: копия принята, но применится только при следующем запуске */
 function restoreBar(on){
@@ -30208,61 +31450,6 @@ function restoreBar(on){
   const v=document.getElementById('view');v.parentNode.insertBefore(b,v);
 }
 setTimeout(()=>{api('/api/backup/status').then(s=>restoreBar(!!(s&&s.restore_pending))).catch(()=>{})},2500);
-function setBackupHtml(c){
-  const ex=(w,t)=>`<div class="bk-ex"><span>${t}</span><a class="btn ghost" href="/api/export?what=${w}&fmt=csv&account=${encodeURIComponent(S.account||'all')}" download>CSV</a><a class="btn ghost" href="/api/export?what=${w}&fmt=xlsx&account=${encodeURIComponent(S.account||'all')}" download>Excel</a></div>`;
-  return`<div class="card" id="bkcard"><h2>Резервная копия<span class="sp">зашифрована паролем</span></h2><div style="display:grid;gap:14px">
-    <div class="bk-warn">Без пароля копию открыть нельзя, а пароль восстановить невозможно. Запишите его и храните отдельно от копии. Токен API и пароль в копию не входят.</div>
-    <label class="field"><span>Папка для копий (облачный диск или любая папка)</span><input class="in" id="bkdir" placeholder="/Users/имя/Library/CloudStorage/… или C:\\Users\\имя\\Yandex.Disk" spellcheck="false"></label>
-    <div id="bksug" class="bk-sug"></div>
-    <div class="row"><label class="field" style="flex:1;min-width:200px"><span>Пароль копии <span id="bkpwst"></span></span><input class="in" type="password" id="bkpw" autocomplete="new-password" placeholder="не короче 6 символов"></label>
-      <label class="field" style="width:150px"><span>Хранить копий</span><input class="in num" type="number" id="bkkeep" min="1" max="365" value="14"></label></div>
-    <label class="sw"><input type="checkbox" id="bkauto"><i></i><div><b>Автоматически раз в день</b><small>Работает, пока программа запущена, и только если пароль сохранён. Старые копии сверх лимита удаляются.</small></div></label>
-    <div class="row"><button class="btn" id="bksave">Сохранить настройки</button><button class="btn ghost" id="bkrun">Сделать копию сейчас</button>
-      <button class="btn ghost danger" id="bkclr" style="display:none">Забыть сохранённый пароль</button></div>
-    <p class="note" id="bkinfo">Загружаю…</p><div id="bkfiles"></div>
-    <h3 style="margin:6px 0 0;font-size:14px">Восстановление</h3>
-    <div class="row"><input type="file" id="bkfile" accept=".tinvbak" class="in" style="flex:1;min-width:200px"><input class="in" type="password" id="bkrpw" placeholder="пароль этой копии" autocomplete="off" style="width:200px"><button class="btn ghost" id="bkrest">Восстановить</button></div>
-    <p class="note">Копия будет применена при следующем запуске программы — перезапустите её (до этого на экране прежние данные). Текущая база сохранится рядом как data.db.before-restore. Токен не меняется.</p></div></div>
-  <div class="card"><h2>Экспорт данных<span class="sp">для Excel</span></h2><div style="display:grid;gap:8px">
-    ${ex('positions','Позиции')}${ex('bonds','Облигации')}${ex('payments','Выплаты на год вперёд')}${ex('ops','Операции')}${ex('screener','Скринер облигаций')}
-    <p class="note">CSV — в UTF-8 с разделителем «;» (открывается в Excel без настройки), Excel — файл .xlsx с числами и датами. Данные берутся по выбранному слева счёту.</p></div></div>`}
-function bindSetBackup(c,msg){
-  if(!$('#bkcard'))return;
-  const kb=n=>n>=1048576?(n/1048576).toFixed(1)+' МБ':Math.max(1,Math.round(n/1024))+' КБ';
-  const dt=t=>new Date(t*1000).toLocaleString('ru-RU');
-  let timer=null,first=true;
-  const show=async()=>{
-    let s;try{s=await api('/api/backup/status')}catch(e){return}
-    if(first){first=false;$('#bkdir').value=s.dir||'';$('#bkkeep').value=s.keep;$('#bkauto').checked=s.auto;
-      $('#bksug').innerHTML=s.suggest.length?'Найдены папки: '+s.suggest.map(x=>`<button class="btn ghost bk-chip" data-p="${esc(x.path)}">${esc(x.label)}</button>`).join(' '):
-      `Подсказки: Яндекс Диск — ${s.windows?'C:\\Users\\имя\\Yandex.Disk':'~/Yandex.Disk'}; iCloud Drive — ${s.windows?'C:\\Users\\имя\\iCloudDrive':'~/Library/Mobile Documents/com~apple~CloudDocs'}; Google Drive — ${s.windows?'G:\\Мой диск':'~/Library/CloudStorage/GoogleDrive-…'}`;
-      $('#bksug').onclick=e=>{const b=e.target.closest('[data-p]');if(b)$('#bkdir').value=b.dataset.p+(b.dataset.p.endsWith('/')?'':'/')+'TInvestBackup'}}
-    $('#bkpwst').innerHTML=s.pw_set?'<span class="pos">· сохранён</span>':'<span class="mu">· не сохранён</span>';
-    $('#bkclr').style.display=s.pw_set?'':'none';
-    restoreBar(!!s.restore_pending);
-    const l=s.last;
-    $('#bkinfo').innerHTML=s.running?'Делаю копию (шифрование занимает до минуты)…':l?(l.ok?`Последняя копия: ${esc(dt(l.t))}, ${esc(l.file)}, ${kb(l.size)}, ${l.sec} с${l.removed?`; удалено старых: ${l.removed}`:''}.`:`<span class="neg">Последняя попытка (${esc(dt(l.t))}) не удалась: ${esc(l.error)}</span>`):'Копий ещё не делали.';
-    $('#bkfiles').innerHTML=s.dir_ok&&s.files.length?`<div class="note">В папке (${s.files.length}): ${s.files.slice(0,5).map(f=>esc(f.name)+' · '+kb(f.size)).join('; ')}${s.files.length>5?'…':''}</div>`:(s.dir&&!s.dir_ok?`<div class="note neg">${esc(s.dir_msg)}</div>`:'');
-    clearTimeout(timer);if(s.running)timer=setTimeout(show,2500);
-    return s;
-  };
-  show();
-  const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
-  const save=async()=>{await post('/api/backup/settings',{backup_dir:$('#bkdir').value,backup_auto:$('#bkauto').checked,backup_keep:$('#bkkeep').value,backup_password:$('#bkpw').value});$('#bkpw').value=''};
-  $('#bksave').onclick=e=>busy(e.currentTarget,async()=>{await save();msg('Настройки резервной копии сохранены.',1);show()});
-  $('#bkclr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Забыть пароль? Автоматические копии отключатся. Сами копии останутся и откроются прежним паролем.'))return;await post('/api/backup/settings',{clear_password:true});$('#bkauto').checked=false;msg('Пароль удалён из настроек.',1);show()});
-  $('#bkrun').onclick=e=>busy(e.currentTarget,async()=>{
-    const pw=$('#bkpw').value;await post('/api/backup/settings',{backup_dir:$('#bkdir').value,backup_keep:$('#bkkeep').value});
-    await post('/api/backup/run',{password:pw});msg('Копия запущена, статус обновится ниже.',1);setTimeout(show,800)});
-  $('#bkrest').onclick=e=>busy(e.currentTarget,async()=>{
-    const f=$('#bkfile').files[0];if(!f)return msg('Выберите файл копии (.tinvbak).');
-    if(!confirm('Восстановить данные из этой копии? Текущая база будет сохранена рядом, замена произойдёт при следующем запуске.'))return;
-    msg('Расшифровываю и проверяю копию…',1);
-    const b64=await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]||'');r.onerror=()=>no(new Error('Не удалось прочитать файл'));r.readAsDataURL(f)});
-    await post('/api/backup/restore',{data:b64,password:$('#bkrpw').value});$('#bkrpw').value='';
-    restoreBar(true);
-    msg('Копия проверена и принята. Копия будет применена при следующем запуске программы — перезапустите её. До перезапуска на экране остаются прежние данные.',1)});
-}
 /* ── инкогнито и палитра команд (Ctrl+K / Cmd+K) ── */
 function setIncog(on){
   INCOG.on=!!on;lsSet('ta_incog',on?'1':'0');
@@ -30296,7 +31483,10 @@ function kpCommands(){
     {g:'Команды',t:'Поделиться портфелем (PNG без сумм)',k:'поделиться png карточка картинка share telegram',run:()=>{if(typeof shareOpen==='function')shareOpen()}},
     {g:'Команды',t:'Экспорт PDF (печать)',k:'экспорт pdf печать',run:()=>window.print()},
     {g:'Команды',t:INCOG.on?'Показать суммы':'Скрыть суммы (инкогнито)',k:'инкогнито скрыть суммы показать',run:()=>setIncog(!INCOG.on)},
-    {g:'Команды',t:'Сменить тему',k:'тема оформление светлая тёмная',run:()=>$('#thm').click()}];
+    {g:'Команды',t:'Сменить тему',k:'тема оформление светлая тёмная',run:()=>$('#thm').click()},
+    {g:'Команды',t:'Экспорт операций (CSV)',k:'экспорт операции csv скачать выгрузка',run:()=>{location.href='/api/operations.csv?'+new URLSearchParams({period:S.period,account:S.account});toast('Загрузка CSV…','info')}},
+    {g:'Команды',t:'Горячие клавиши',k:'горячие клавиши шпаргалка помощь hotkeys shortcuts',run:()=>{if(typeof ksToggle==='function')ksToggle()}},
+    {g:'Команды',t:'Перейти в настройки',k:'настройки конфигурация токен settings',run:()=>go('set')}];
 }
 function kpSecurities(q){
   const out=[],seen=new Set();
@@ -30323,7 +31513,9 @@ function kpBuild(raw){
   PAGES.filter(Boolean).forEach(p=>{const sc=kpScore(p[1],q);if(sc)res.push({g:'Разделы',t:p[1],sc,s:S.navHidden.includes(p[0])&&!NAV_PINNED.includes(p[0])?'скрыт в меню':'',run:()=>go(p[0])})});
   if(q)KB.forEach((a,i)=>{const tk=kpNorm(a.t+' '+a.k),sc=q.split(/\s+/).filter(Boolean).every(w=>tk.includes(w))?kpScore(a.t+' '+a.k,q):0;if(sc)res.push({g:'База знаний',t:a.t,s:a.c,sc,run:()=>kbOpen(a.id)})});
   if(q)res.push(...kpSecurities(q));
-  const order={'Команды':q?1:0,'Разделы':q?0:1,'База знаний':2,'Бумаги':3};
+  const order={'Калькулятор':-1,'Команды':q?1:0,'Разделы':q?0:1,'База знаний':2,'Бумаги':3};
+  const calc=typeof calcEval==='function'?calcEval(raw):null;
+  if(calc!==null)res.push({g:'Калькулятор',t:'= '+calcFmt(calc),s:'Enter — скопировать',sc:99,run:()=>copyText(calcRaw(calc),'Скопировано: '+calcFmt(calc))});
   res.sort((a,b)=>order[a.g]-order[b.g]||(q?b.sc-a.sc:0));
   return res.slice(0,40);
 }
@@ -30339,7 +31531,7 @@ function kpDraw(){
 function kpOpen(){
   if(KP.open)return;KP.open=true;
   const o=document.createElement('div');o.id='kp-ov';
-  o.innerHTML='<div id="kp" role="dialog" aria-label="Поиск"><input id="kp-q" placeholder="Раздел, бумага, ISIN или команда…" autocomplete="off" spellcheck="false"><div id="kp-l"></div><div id="kp-f">↑↓ выбор · Enter открыть · Esc закрыть</div></div>';
+  o.innerHTML='<div id="kp" role="dialog" aria-label="Поиск"><input id="kp-q" placeholder="Раздел, бумага, ISIN или команда…" autocomplete="off" spellcheck="false"><div id="kp-l"></div><div id="kp-f">↑↓ выбор · Enter открыть · Esc закрыть · можно считать: 150000*0,13</div></div>';
   document.body.appendChild(o);
   o.addEventListener('mousedown',e=>{if(e.target===o)kpClose()});
   o.querySelector('#kp-l').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b)kpRun(+b.dataset.i)});
@@ -30908,23 +32100,7 @@ function emptyHint(text,btns,ico){
 }
 
 /* ── 4. Шпаргалка клавиш («?») ── */
-const KS_ROWS=[['Ctrl + K  /  ⌘ + K','Поиск по разделам, бумагам и командам'],['?','Эта шпаргалка'],['Esc','Закрыть окно, карточку бумаги или поиск'],['↑  ↓  Enter','Выбор в поиске'],['J  /  K  или  ↓  ↑','Таблицы: следующая / предыдущая строка'],['Пробел','Таблицы: ★ в список наблюдения'],['Enter','Таблицы: открыть карточку строки'],['F','Скринер: тип Все → Флоатеры → Фиксы → ОФЗ'],['V','Скринер: Комфорт → Компакт → Scatter'],['/','Открыть поиск']];
-function ksToggle(){
-  const o=document.getElementById('ks-ov');
-  if(o){o.remove();return}
-  const el=document.createElement('div');el.id='ks-ov';
-  el.innerHTML=`<div id="ks" role="dialog" aria-label="Горячие клавиши"><h2>Горячие клавиши</h2>${KS_ROWS.map(([k,t])=>`<div class="ks-r"><kbd>${esc(k)}</kbd><span>${esc(t)}</span></div>`).join('')}<div class="mu" style="font-size:12px;margin-top:10px">Esc — закрыть</div></div>`;
-  el.addEventListener('mousedown',e=>{if(e.target===el)el.remove()});
-  document.body.appendChild(el);
-}
-document.addEventListener('keydown',e=>{
-  const o=document.getElementById('ks-ov');
-  if(o&&e.key==='Escape'){e.preventDefault();e.stopPropagation();o.remove();return}
-  if(e.key!=='?'||e.ctrlKey||e.metaKey||e.altKey)return;
-  const a=document.activeElement,t=a&&a.tagName;
-  if(t==='TEXTAREA'||t==='SELECT'||(t==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|file|color)$/.test(a.type))||(a&&a.isContentEditable))return;
-  e.preventDefault();ksToggle();
-},true);
+/* шпаргалка клавиш («?») — в 65_delight.js */
 /* ── Демо-режим: модельный портфель без токена. Плашка на каждой странице + вход/выход ── */
 const DEMO={on:false,at:0,busy:false};
 function demoReset(){S.data=S.bonds=S.hist=S.today=null;S.account='all';persist()}
@@ -31050,15 +32226,15 @@ function stkSub(el,o){
   const ticks=o.kind==='rsi'?[30,50,70]:[lo/1.1,0,hi/1.1];
   ticks.forEach(v=>{s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}"${o.kind==='rsi'&&v!==50?' stroke-dasharray="4 4"':''}/><text class="ax num" x="${pl-8}" y="${Y(v)+4}" text-anchor="end">${o.kind==='rsi'?v:stkN(v,Math.abs(v)<1?3:2)}</text>`});
   const poly=(a,c,w)=>{const p=[];a.forEach((v,i)=>{if(v!=null)p.push(X(i).toFixed(1)+','+Y(v).toFixed(1))});return p.length>1?`<polyline points="${p.join(' ')}" fill="none" stroke="${c}" stroke-width="${w||1.5}" stroke-linejoin="round"/>`:''};
-  if(o.kind==='rsi')s+=poly(o.rsi,'#9085e9',1.6);
+  if(o.kind==='rsi')s+=poly(o.rsi,'var(--s7)',1.6);
   else{const bw=Math.max(1,Math.min(10,gw*.6));o.hist.forEach((v,i)=>{if(v==null)return;const y0=Y(0),y1=Y(v);s+=`<rect x="${X(i)-bw/2}" y="${Math.min(y0,y1)}" width="${bw}" height="${Math.max(1,Math.abs(y1-y0))}" fill="${v>=0?'var(--pos)':'var(--neg)'}" opacity=".55"/>`});
-    s+=poly(o.macd,'#3987e5',1.5)+poly(o.sig,'#d95926',1.3)}
+    s+=poly(o.macd,'var(--s1)',1.5)+poly(o.sig,'var(--s8)',1.3)}
   s+=`<text class="ax" x="${pl+4}" y="${pt+9}" style="fill:var(--tx2)">${o.kind==='rsi'?'RSI (14)':'MACD (12, 26, 9)'}</text>`;
   let hits='';for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${pl+gw*i}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
   el.innerHTML=`<svg width="${W}" height="${H}">${s}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
-  el._hl=i=>{hv.innerHTML=i<0?'':`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--mu)" stroke-opacity=".6" stroke-dasharray="3 3"/>`};
-  bindTip(el,i=>`<b>${esc(o.labels[i])}</b>`+(o.kind==='rsi'?tipRow('#9085e9','RSI',stkN(o.rsi[i],1)):tipRow('#3987e5','MACD',stkN(o.macd[i],3))+tipRow('#d95926','Сигнальная',stkN(o.sig[i],3))+tipRow('var(--mu)','Гистограмма',stkN(o.hist[i],3))));
+  el._hl=i=>{hv.innerHTML=i<0?'':`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-dasharray="3 3"/>`};
+  bindTip(el,i=>`<b>${esc(o.labels[i])}</b>`+(o.kind==='rsi'?tipRow('var(--s7)','RSI',stkN(o.rsi[i],1)):tipRow('var(--s1)','MACD',stkN(o.macd[i],3))+tipRow('var(--s8)','Сигнальная',stkN(o.sig[i],3))+tipRow('var(--mu)','Гистограмма',stkN(o.hist[i],3))));
 }
 function stkTaCard(c){
   const ta=c.ta||{},cls={'покупать':'pos','продавать':'neg'}[ta.signal]||'mu';
@@ -31146,7 +32322,7 @@ function bindStkCard(root,p){
 const SK={charts:[]};
 function skClose(){
   const o=document.getElementById('sk-ov');if(!o)return;
-  o.remove();document.body.classList.remove('sk-open');SK.charts=[];hideTip();
+  ovLeave(o);document.body.classList.remove('sk-open');SK.charts=[];hideTip();
 }
 function skOpen(){
   let o=document.getElementById('sk-ov');
@@ -32156,7 +33332,7 @@ function txoPrefill(y){S.txo.F=Object.assign(txoF(),{open_year:y});S.txo.p=null;
 function txoSave(){try{localStorage.setItem('txo_iis3',JSON.stringify(S.txo.F))}catch(e){}}
 function pTxo(){
   const p=S.txo.p;
-  if(p&&p.rows.length)chart('txo-ch',line,{labels:p.rows.map(r=>String(r.year)),h:220,series:[{n:'ИИС-3',c:S1,v:p.rows.map(r=>r.iis_capital)},{n:'Обычный счёт',c:S2,v:p.rows.map(r=>r.broker_capital)},{n:'Свои взносы',c:S4,v:p.rows.map(r=>r.own)}]});
+  if(p&&p.rows.length)chart('txo-ch',line,{labels:p.rows.map(r=>String(r.year)),h:220,series:[{n:'ИИС-3',c:S1,v:p.rows.map(r=>r.iis_capital)},{n:'Обычный счёт',c:S3,v:p.rows.map(r=>r.broker_capital)},{n:'Свои взносы',c:S4,v:p.rows.map(r=>r.own)}]});
   return`<div class="txo"><div class="card"><h2>Сбор налоговых убытков (${new Date().getFullYear()} год)</h2>
     <p class="note">Модель показывает, при каком наборе продаж налог текущего года снизился бы сильнее всего и сколько останется после комиссий. Это не рекомендация что-либо продавать.</p>${txoHarvest()}</div>
     <div class="card"><h2>Планировщик ИИС-3 <span class="sp">сравнение с обычным счётом</span></h2>${txoPlanner()}</div>${TXO_NOTE}${NIR_NOTE}</div>`;
@@ -32373,13 +33549,13 @@ function shareMount(){
       $('#shr-st').textContent='PNG-карточка сохранена.';
     },'image/png');
   };
-  $('#shr-cp').onclick=async()=>{
-    const st=$('#shr-st');
-    if(!navigator.clipboard||typeof ClipboardItem==='undefined'){st.textContent='Копирование картинки не поддерживается браузером — нажмите «Скачать PNG».';return}
+  const cpb=$('#shr-cp');
+  if(!navigator.clipboard||typeof ClipboardItem==='undefined'||!navigator.clipboard.write){if(cpb)cpb.remove()}
+  else cpb.onclick=()=>{
     cv.toBlob(async blob=>{
       if(!blob)return;
-      try{await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);st.textContent='Картинка скопирована в буфер обмена — можно вставлять в Telegram (Ctrl+V / ⌘V).'}
-      catch(e){st.textContent='Не удалось скопировать в буфер — нажмите «Скачать PNG».'}
+      try{await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);toast('Картинка скопирована — вставьте в Telegram (Ctrl+V)','ok',3200)}
+      catch(e){toast('Не удалось скопировать — нажмите «Скачать PNG»','err',3200)}
     },'image/png');
   };
 }
@@ -32815,22 +33991,6 @@ const TOUR_STEPS=[
 ];
 const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0};
 
-/* ── Звуковой «тик» (по умолчанию выключен: Настройки → Оформление) ── */
-let _uxAC=null;
-function uxTick(){
-  try{
-    if(lsGet('ta_sound')!=='1')return;
-    const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
-    if(!_uxAC)_uxAC=new AC();
-    if(_uxAC.state==='suspended')_uxAC.resume();
-    const t=_uxAC.currentTime,o=_uxAC.createOscillator(),g=_uxAC.createGain();
-    o.type='sine';o.frequency.value=800;
-    g.gain.setValueAtTime(0.04,t);g.gain.exponentialRampToValueAtTime(0.0001,t+0.015);
-    o.connect(g);g.connect(_uxAC.destination);o.start(t);o.stop(t+0.02);
-  }catch(e){}
-}
-window.uxTick=uxTick;
-
 function tourFind(st){
   for(const s of st.sel){
     let els;try{els=document.querySelectorAll(s)}catch(e){continue}
@@ -32915,7 +34075,6 @@ function tourShow(i,dir){
 function tourNext(d){
   if(!TOUR.on)return;
   if(d<0&&TOUR.i===0)return;
-  uxTick();
   if(d>0&&TOUR.i>=TOUR.list.length-1){tourStop();return}
   tourShow(TOUR.i+d,d);
 }
@@ -33143,7 +34302,7 @@ function pPm(){
   let ghostHtml='<div class="card"><h2>Призрачный портфель (те же пополнения в те же даты)</h2><div class="empty">Недостаточно истории операций или котировок бенчмарков (LQDT / TMOS).</div></div>';
   if(gh.ok&&gh.items&&gh.items.length){
     const labs=gh.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tips=gh.days.map(dlabel);
-    const ser=[{n:'Мой портфель',c:S1,hex:'#3987e5',v:gh.real,w:2.4}];
+    const ser=[{n:'Мой портфель',c:S1,v:gh.real,w:2.4}];
     if(gh.series.LQDT)ser.push({n:'Призрак LQDT',c:S3,v:gh.series.LQDT,w:1.8,dash:1});
     if(gh.series.TMOS)ser.push({n:'Призрак TMOS',c:S2,v:gh.series.TMOS,w:1.8,dash:1});
     chart('c-pm-gh',line,{h:270,zero:false,labels:labs,tipLabels:tips,series:ser});
@@ -33185,23 +34344,6 @@ const CROWD={st:null};
 function crowdLoad(){return api('/api/crowd/status').then(s=>{CROWD.st=s;return s}).catch(()=>null)}
 setTimeout(crowdLoad,3000);
 const CROWD_STATE={off:'выключено',idle:'ждёт заданий',working:'работает',backoff:'пауза после ошибки сайта',no_server:'нет связи с сервером данных'};
-function setCrowdHtml(c){
-  return`<div class="card" id="crowd-card"><h2>Помогать собирать раскрытия эмитентов<span class="sp" id="crowd-sp"></span></h2><div style="display:grid;gap:12px">
-    <p class="note" style="margin:0">Включено по умолчанию. Сообщения эмитентов о купонах, выкупах и дефолтах лежат на сайте e-disclosure.azipi.ru, а наш сервер данных его открыть не может. <b>Пока программа открыта</b>, она скачивает публичные страницы этого сайта <b>с вашего интернет-подключения — примерно одну страницу раз в 15 секунд</b> — и отправляет их на сервер данных. Так все пользователи видят купоны, выкупы и дефолты по своим облигациям. Токен, портфель и другие ваши данные не отправляются; в страницах только то, что видно любому посетителю сайта. Сайт видит ваш IP-адрес, как при обычном заходе в браузере. При ошибках сайта программа делает паузу на 30 минут. Выключить можно в любой момент.</p>
-    <label class="sw"><input type="checkbox" id="crowd-on"><i></i><div><b>Помогать собирать раскрытия</b><small>Работает только пока программа запущена и подключён сервер данных.</small></div></label>
-    <p class="note" id="crowd-info">Загружаю…</p></div></div>`;
-}
-async function bindSetCrowd(c,msg){
-  const on=document.getElementById('crowd-on');if(!on)return;
-  const show=async()=>{const s=await crowdLoad();if(!s||!document.getElementById('crowd-info'))return;
-    on.checked=!!s.enabled;
-    const stt=s.enabled&&s.state==='off'?'запускается…':(CROWD_STATE[s.state]||s.state);   // включили, а поток ещё не проснулся
-    document.getElementById('crowd-sp').textContent=s.enabled?stt:'выключено';
-    document.getElementById('crowd-info').innerHTML=`Отправлено страниц, принятых сервером: <b>${s.accepted}</b>${s.fetched?` (скачано ${s.fetched})`:''}.${s.enabled?` Состояние: ${esc(stt)}${s.message?' — '+esc(s.message):''}.`:''}${!s.available?' Подключите сервер данных и войдите по ключу — без этого помощь не работает.':''}`;
-    clearTimeout(CROWD.t);if(s.enabled)CROWD.t=setTimeout(show,5000)};
-  on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
-  show();
-}
 /* одноразовая карточка-приглашение (в разделе «Раскрытие эмитента» карточки облигации) */
 function crowdInviteHtml(){
   const s=CROWD.st;if(!s||s.enabled||s.dismissed)return'';
@@ -33301,18 +34443,18 @@ function dlHistChart(el,o){
   const h=o.hist,W=el.clientWidth||600,H=230,pl=30,pr=10,pt=18,pb=52,n=h.length,pw=W-pl-pr,ph=H-pt-pb,bw=pw/n;
   const mx=Math.max(1,...h.map(x=>x.n));
   const col=x=>x.label==='не закрыт'?'var(--neg)':x.label==='ещё открыт'?'var(--mu)':'var(--s3)';
-  let s='';
+  let s='';const G=gradSet();
   (mx<=2?[0,1]:[0,.5,1]).forEach(f=>{const y=pt+ph-f*ph;s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-6}" y="${y+4}" text-anchor="end">${Math.round(mx*f)}</text>`});
   h.forEach((x,i)=>{
     const bh=x.n/mx*ph,bx=pl+i*bw+bw*.18,w=bw*.64;
-    s+=`<rect x="${bx}" y="${pt+ph-bh}" width="${w}" height="${Math.max(bh,x.n?1.5:0)}" rx="3" fill="${col(x)}" fill-opacity=".85"/>`;
+    s+=`<path d="${rtop(bx,pt+ph-Math.max(bh,x.n?1.5:0),w,Math.max(bh,x.n?1.5:0),5)}" fill="${G.u(col(x))}"/>`;
     if(x.n)s+=`<text class="ax num" x="${bx+w/2}" y="${pt+ph-bh-5}" text-anchor="middle">${x.n}</text>`;
     const words=x.label.split(' ');
     s+=`<text class="ax" x="${bx+w/2}" y="${H-pb+16}" text-anchor="middle">${esc(words.slice(0,Math.ceil(words.length/2)).join(' '))}</text>`;
     if(words.length>1)s+=`<text class="ax" x="${bx+w/2}" y="${H-pb+30}" text-anchor="middle">${esc(words.slice(Math.ceil(words.length/2)).join(' '))}</text>`;
   });
   let hits='';h.forEach((x,i)=>hits+=`<rect data-i="${i}" x="${pl+i*bw}" y="${pt}" width="${bw}" height="${ph+pb-8}" fill="transparent"/>`);
-  el.innerHTML=`<svg width="${W}" height="${H}" role="img" aria-label="Гистограмма сроков закрытия дивидендных гэпов">${s}${hits}</svg>`;
+  el.innerHTML=`<svg width="${W}" height="${H}" role="img" aria-label="Гистограмма сроков закрытия дивидендных гэпов">${G.defs()}${s}${hits}</svg>`;
   bindTip(el,i=>`<b>${esc(h[i].label)}</b>`+tipRow(col(h[i]),'событий',String(h[i].n)));
 }
 function dlGapsTable(gs){
@@ -33425,13 +34567,13 @@ function ofzTpChart(el,o){
   const W=el.clientWidth||600,H=220,pl=44,pr=10,pt=14,pb=28,pw=W-pl-pr,ph=H-pt-pb,n=tp.length,bw=pw/n;
   const mx=Math.max(10,...tp.map(x=>x.bp)),mn=Math.min(0,...tp.map(x=>x.bp)),g=nice(mn,mx,4);
   const Y=v=>pt+ph-(v-g.lo)/(g.hi-g.lo)*ph;
-  let s='';
+  let s='';const G=gradSet();
   for(let v=g.lo;v<=g.hi+1e-9;v+=g.step)s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}"/><text class="ax num" x="${pl-6}" y="${Y(v)+4}" text-anchor="end">${Math.round(v)}</text>`;
   tp.forEach((x,i)=>{const y0=Y(0),y1=Y(x.bp),bx=pl+i*bw+bw*.15,w=bw*.7,c=x.bp>=0?'var(--ac)':'var(--neg)';
-    s+=`<rect x="${bx}" y="${Math.min(y0,y1)}" width="${w}" height="${Math.max(1.5,Math.abs(y1-y0))}" rx="2" fill="${c}" fill-opacity=".85"/>`;
+    s+=`<path d="${(x.bp>=0?rtop:rbot)(bx,Math.min(y0,y1),w,Math.max(1.5,Math.abs(y1-y0)),4)}" fill="${G.u(c)}"/>`;
     if(n<=15&&(i%(W<420?2:1)===0))s+=`<text class="ax num" x="${bx+w/2}" y="${H-10}" text-anchor="middle">${x.t}</text>`;
     s+=`<rect data-i="${i}" x="${pl+i*bw}" y="${pt}" width="${bw}" height="${ph}" fill="transparent"/>`});
-  el.innerHTML=`<svg width="${W}" height="${H}" role="img" aria-label="Премия за каждый год срока, базисных пунктов">${s}</svg>`;
+  el.innerHTML=`<svg width="${W}" height="${H}" role="img" aria-label="Премия за каждый год срока, базисных пунктов">${G.defs()}${s}</svg>`;
   bindTip(el,i=>`<b>${tp[i].t===1?'до 1 года':'год срока '+tp[i].t}</b>`+tipRow(tp[i].bp>=0?'var(--ac)':'var(--neg)','Прирост КБД',ofzBp(tp[i].bp)));
 }
 function ofzTable(bs){
@@ -33474,6 +34616,206 @@ function bindOfz(){
 regPage('ofz',{title:'ОФЗ-Спредер',group:'Рынок',icon:'<path d="M3 18c4 0 5-9 9-9s5 4 9 4"/><path d="M3 21h18"/><circle cx="8" cy="12" r="1.4"/><circle cx="15" cy="9" r="1.4"/>',render:pOfz,bind:bindOfz,pro:true});
 if(typeof renderNav==='function')try{renderNav()}catch(e){}
 document.addEventListener('click',e=>{if(e.target.closest&&e.target.closest('.ofz-go'))go('ofz')});
+/* ── «Приятность»: тосты, индикатор фоновой загрузки, память прокрутки, горячие клавиши и шпаргалка ── */
+
+/* 1. Тосты: toast(text, kind?, ms?) — kind: 'ok' | 'info' | 'err'; второй аргумент-число = длительность (совместимо со старым вызовом) */
+var TOAST_IC={
+  ok:'<path d="M5 12.5l4.2 4.2L19 7"/>',
+  info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+  err:'<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16h.01"/>'
+};
+function toast(msg,a,b){
+  let kind='info',ms=2500;
+  if(typeof a==='number')ms=a;else if(typeof a==='string'){kind=TOAST_IC[a]?a:'info';if(typeof b==='number')ms=b}
+  if(kind==='info'&&typeof a!=='string'&&/^(не удалось|ошибка)/i.test(String(msg)))kind='err';
+  else if(kind==='info'&&typeof a!=='string'&&/(скопирован|добавлен|сохран|показан|скрыт)/i.test(String(msg)))kind='ok';
+  let box=document.getElementById('toasts');
+  if(!box){box=document.createElement('div');box.id='toasts';box.setAttribute('role','status');box.setAttribute('aria-live','polite');document.body.appendChild(box)}
+  msg=String(msg);
+  const same=[...box.children].find(x=>x._msg===msg&&!x._gone);
+  if(same){clearTimeout(same._t);same._t=setTimeout(same._close,ms);return}
+  const el=document.createElement('div');
+  el.className='toast-i k-'+kind;el._msg=msg;
+  el.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+TOAST_IC[kind]+'</svg><span></span>';
+  el.lastChild.textContent=msg;
+  el._close=()=>{if(el._gone)return;el._gone=true;clearTimeout(el._t);el.classList.remove('in');el.classList.add('out');setTimeout(()=>el.remove(),260)};
+  el.onclick=el._close;
+  box.appendChild(el);
+  while(box.children.length>4)box.firstChild._close&&box.firstChild._close(),box.firstChild.remove();
+  requestAnimationFrame(()=>requestAnimationFrame(()=>el.classList.add('in')));
+  el._t=setTimeout(el._close,ms);
+}
+
+/* 2. Тонкая полоса фоновой загрузки под верхней панелью: показывается, если /api/* висит дольше 300 мс */
+(function(){
+  if(typeof window==='undefined'||!window.fetch||window._dlFetch)return;
+  window._dlFetch=1;
+  const orig=window.fetch.bind(window);
+  let active=0,showT=0,shown=0,shownAt=0,hideT=0;
+  const bar=()=>{
+    let b=document.getElementById('dl-bar');
+    if(!b){const top=document.querySelector('.top');if(!top)return null;b=document.createElement('div');b.id='dl-bar';b.setAttribute('aria-hidden','true');b.innerHTML='<i></i>';top.appendChild(b)}
+    return b;
+  };
+  const show=()=>{showT=0;if(!active)return;const b=bar();if(!b)return;clearTimeout(hideT);shown=1;shownAt=Date.now();b.classList.add('on')};
+  const hide=()=>{
+    clearTimeout(showT);showT=0;
+    if(!shown)return;
+    const wait=Math.max(0,450-(Date.now()-shownAt));
+    hideT=setTimeout(()=>{if(active)return;shown=0;const b=document.getElementById('dl-bar');if(b)b.classList.remove('on')},wait);
+  };
+  const tracked=(inp,opt)=>{
+    try{
+      const u=typeof inp==='string'?inp:(inp&&inp.url)||'';
+      if(!/^(\/api\/|https?:\/\/[^/]+\/api\/)/.test(u))return false;
+      if(/\/api\/ping\b|stream|\/events\b/.test(u))return false;
+      const h=opt&&opt.headers;
+      if(h&&/event-stream/i.test(typeof h.get==='function'?(h.get('Accept')||''):String(h.Accept||h.accept||'')))return false;
+      return true;
+    }catch(e){return false}
+  };
+  window.fetch=function(inp,opt){
+    if(!tracked(inp,opt))return orig(inp,opt);
+    active++;if(active===1&&!showT)showT=setTimeout(show,300);
+    const done=()=>{active=Math.max(0,active-1);if(!active)hide()};
+    const p=orig(inp,opt);
+    p.then(done,done);
+    return p;
+  };
+})();
+
+/* 3. Память прокрутки #view по разделам (в пределах сессии) */
+var _dlScr;
+function dlScrSave(page){try{const v=document.getElementById('view');if(!v||!page)return;(_dlScr=_dlScr||new Map()).set(page,v.scrollTop)}catch(e){}}
+function dlScrRestore(page){
+  try{
+    const y=_dlScr&&_dlScr.get(page),v=document.getElementById('view');
+    if(!v)return;
+    if(!y){v.scrollTop=0;return}
+    v.scrollTop=y;
+    /* контент мог дорисоваться асинхронно — повторяем, пока позиция не стала достижимой */
+    [120,400,900].forEach(ms=>setTimeout(()=>{if(S.page===page&&v.scrollTop<y&&v.scrollHeight>=y+v.clientHeight*.5&&Math.abs(v.scrollTop)<2)v.scrollTop=y},ms));
+  }catch(e){}
+}
+
+/* 4. Горячие клавиши. Блокировка при вводе/модалках — kbBlocked() из 14a_scr_keys.js. «/», j/k/Пробел/Enter/f/v обрабатывает 14a_scr_keys.js */
+const KS_GO=[['h','dash','Главная'],['p','pos','Портфель'],['v','pay','Выплаты'],['b','bonds','Облигации'],['t','tax','Налоги'],['c','calc','Калькулятор'],['s','set','Настройки']];
+const KS_CODE={KeyG:'g',KeyH:'h',KeyP:'p',KeyV:'v',KeyB:'b',KeyT:'t',KeyC:'c',KeyS:'s',KeyR:'r'};
+const DLK={chord:0,t:0};
+function dlKey(e){return KS_CODE[e.code]||(e.key&&e.key.length===1?e.key.toLowerCase():e.key)}
+function dlChordHide(){DLK.chord=0;clearTimeout(DLK.t);const c=document.getElementById('dl-chord');if(c){c.classList.remove('in');setTimeout(()=>{if(!DLK.chord)c.remove()},180)}}
+function dlChordShow(){
+  DLK.chord=1;clearTimeout(DLK.t);DLK.t=setTimeout(dlChordHide,1500);
+  let c=document.getElementById('dl-chord');
+  if(!c){
+    c=document.createElement('div');c.id='dl-chord';
+    c.innerHTML='<kbd>g</kbd>'+KS_GO.map(([k,,t])=>`<span><kbd>${k}</kbd>${t}</span>`).join('');
+    document.body.appendChild(c);requestAnimationFrame(()=>requestAnimationFrame(()=>c.classList.add('in')));
+  }
+}
+function dlThemeToggle(){const t=document.getElementById('thm');if(t)t.click()}
+document.addEventListener('keydown',e=>{
+  if(e.repeat||(typeof kbBlocked==='function'?kbBlocked(e):e.ctrlKey||e.metaKey||e.altKey))return;
+  if(e.key==='Shift'||e.key==='Control'||e.key==='Alt'||e.key==='Meta')return;
+  const isQ=e.key==='?'||(e.shiftKey&&e.code==='Slash');
+  if(isQ){e.preventDefault();dlChordHide();ksToggle();return}
+  if(e.shiftKey)return;
+  const k=dlKey(e);
+  if(DLK.chord){
+    const hit=KS_GO.find(x=>x[0]===k);
+    dlChordHide();
+    if(hit&&PAGES.some(p=>p&&p[0]===hit[1])){e.preventDefault();go(hit[1])}
+    else if(k==='Escape')e.preventDefault();
+    return;
+  }
+  if(k==='g'){e.preventDefault();dlChordShow();return}
+  if(k==='r'){e.preventDefault();const r=document.getElementById('refresh');if(r&&!r.disabled)r.click();return}
+  if(k==='h'){e.preventDefault();setIncog(!INCOG.on);return}
+  if(k==='t'){e.preventDefault();dlThemeToggle();return}
+});
+
+/* Шпаргалка («?» или пункт меню «…»): сетка групп, клавиши в <kbd> с объёмом */
+const KS_GROUPS=[
+  ['Навигация',[[['g','h'],'Главная'],[['g','p'],'Портфель'],[['g','v'],'Выплаты'],[['g','b'],'Облигации'],[['g','t'],'Налоги'],[['g','c'],'Калькулятор'],[['g','s'],'Настройки']]],
+  ['Действия',[[['/'],'Поиск'],[['Ctrl','K'],'Палитра команд и калькулятор'],[['r'],'Обновить данные'],[['h'],'Скрыть / показать суммы'],[['t'],'Тёмная / светлая тема'],[['?'],'Эта шпаргалка'],[['Esc'],'Закрыть окно']]],
+  ['Таблицы',[[['j','k'],'Строка вниз / вверх'],[['↓','↑'],'То же, когда строка выбрана'],[['Пробел'],'★ в список наблюдения'],[['Enter'],'Открыть карточку строки']]],
+  ['Скринер',[[['f'],'Тип: Все → Флоатеры → Фиксы → ОФЗ'],[['v'],'Плотность: Комфорт → Компакт → Scatter']]]
+];
+function ksToggle(){
+  const o=document.getElementById('ks-ov');
+  if(o){ksClose();return}
+  if(typeof kpClose==='function'&&KP.open)kpClose();
+  const el=document.createElement('div');el.id='ks-ov';
+  const kb=a=>a.map(x=>`<kbd>${esc(x)}</kbd>`).join('<i>затем</i>').replace(/<i>затем<\/i>/g,'<i>›</i>');
+  el.innerHTML=`<div id="ks" role="dialog" aria-modal="true" aria-label="Горячие клавиши">
+    <div class="ks-hd"><h2>Горячие клавиши</h2><button class="ks-x" aria-label="Закрыть">✕</button></div>
+    <div class="ks-grid">${KS_GROUPS.map(([g,rows])=>`<section><h3>${esc(g)}</h3>${rows.map(([k,t])=>`<div class="ks-r"><span>${esc(t)}</span><b>${kb(k)}</b></div>`).join('')}</section>`).join('')}</div>
+    <div class="ks-ft">Клавиши не срабатывают, пока вы печатаете в поле или открыто окно · Esc — закрыть</div></div>`;
+  el.addEventListener('mousedown',e=>{if(e.target===el)ksClose()});
+  el.querySelector('.ks-x').onclick=ksClose;
+  document.body.appendChild(el);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>el.classList.add('in')));
+}
+function ksClose(){const o=document.getElementById('ks-ov');if(!o||o._c)return;o._c=1;o.classList.remove('in');setTimeout(()=>o.remove(),180)}
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&document.getElementById('ks-ov')){e.preventDefault();e.stopPropagation();ksClose()}
+},true);
+{const b=document.getElementById('kbhelp');if(b)b.onclick=()=>ksToggle()}
+/* ── Мини-калькулятор для палитры команд: собственный разбор выражений (без eval/new Function) ──
+   calcEval('150000*0,13') → 19500; '(2+3)*4' → 20; '10%' → 0.1; '100+10%' → 110; мусор / деление на 0 → null */
+function calcEval(raw){
+  if(typeof raw!=='string')return null;
+  let s=raw.trim();
+  if(!s||s.length>120||!/^[\d\s  +\-−*/×÷().,%^]+$/.test(s)||!/\d/.test(s))return null;
+  if(!/[+\-−*/×÷^%]/.test(s.replace(/^[\s+\-−]+/,'')))return null;       /* одно число — не выражение */
+  s=s.replace(/(\d)[   ]+(?=\d{3}(?!\d))/g,'$1').replace(/[\s  ]+/g,'').replace(/−/g,'-').replace(/×/g,'*').replace(/÷/g,'/').replace(/,/g,'.');
+  let i=0,depth=0;const bad=new Error('calc');
+  /* возвращает {v, p}: p=true, если значение — процентный литерал (нужно для «100+10%» = 110) */
+  const num=()=>{
+    const m=/^(\d+\.?\d*|\.\d+)/.exec(s.slice(i));
+    if(!m)throw bad;i+=m[0].length;return parseFloat(m[0]);
+  };
+  const primary=()=>{
+    if(s[i]==='('){
+      if(++depth>40)throw bad;i++;const r=expr();
+      if(s[i]!==')')throw bad;i++;depth--;return r;
+    }
+    return{v:num(),p:false};
+  };
+  const post=()=>{let r=primary();while(s[i]==='%'){i++;r={v:r.v/100,p:true}}return r};
+  const unary=()=>{
+    if(s[i]==='-'){i++;const r=unary();return{v:-r.v,p:r.p}}
+    if(s[i]==='+'){i++;return unary()}
+    const b=post();
+    if(s[i]==='^'){i++;const e=unary();const v=Math.pow(b.v,e.v);if(!isFinite(v))throw bad;return{v,p:false}}
+    return b;
+  };
+  const term=()=>{
+    let a=unary();
+    while(s[i]==='*'||s[i]==='/'){
+      const op=s[i++],b=unary();
+      if(op==='/'){if(b.v===0)throw bad;a={v:a.v/b.v,p:false}}else a={v:a.v*b.v,p:false};
+    }
+    return a;
+  };
+  const expr=()=>{
+    let a=term();
+    while(s[i]==='+'||s[i]==='-'){
+      const op=s[i++],b=term();
+      if(b.p&&!a.p)a={v:op==='+'?a.v*(1+b.v):a.v*(1-b.v),p:false};   /* 100+10% → 110, 200−15% → 170 */
+      else a={v:op==='+'?a.v+b.v:a.v-b.v,p:false};
+    }
+    return a;
+  };
+  try{
+    const r=expr();
+    if(i!==s.length)return null;
+    const v=Math.round(r.v*1e9)/1e9;
+    return isFinite(v)&&Math.abs(v)<1e15?v:null;
+  }catch(e){return null}
+}
+const calcFmt=v=>v.toLocaleString('ru-RU',{maximumFractionDigits:6});
+const calcRaw=v=>String(Math.round(v*1e8)/1e8).replace('.',',');
 </script></body></html>
 '''
 

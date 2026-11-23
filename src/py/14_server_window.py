@@ -37,7 +37,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def ok_host(self):
         port = self.server.server_address[1]
-        return self.headers.get("Host", "") in ("127.0.0.1:%d" % port, "localhost:%d" % port)
+        return self.headers.get("Host", "") in ("127.0.0.1:%d" % port, "localhost:%d" % port, "[::1]:%d" % port)
 
     def guard(self, fn):
         try:
@@ -320,6 +320,12 @@ def find_app_browser():
 
 
 def open_window(url):
+    if sys.platform == "win32":                                  # своя иконка в панели задач, а не python.exe
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TAnalytic.App")
+        except Exception:
+            pass
     exe = find_app_browser()
     if exe:
         try:

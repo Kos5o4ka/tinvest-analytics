@@ -1,7 +1,7 @@
 /* ── Сравнение с рынком: индексы облигаций, фонды ликвидности и облигационные БПИФ ── */
 S.bn={};S.bnSel=new Set(['LQDT','RUCBTRNS']);S.bnLoad=null;
 const BN_COL={RGBITR:[S2],RUCBTRNS:[S4],RUCBHYTR:[S8],LQDT:[S3],TMON:[S6],SBMM:[S7],AKMM:[S2,1],SBRB:[S4,1],AKMB:[S5,1],TBRU:[S7,1],RUSFAR:[S6,1]};
-const BN_LC={d1:'#19a070',d5:'#e3a21a',dm:'#e66767',na:'#8a90a0'};
+const BN_LC={d1:'var(--s3)',d5:'var(--s4)',dm:'var(--s8)',na:'#8a90a0'};
 const bnRub=v=>bad(v)?'—':(v>0?'+':v<0?'−':'')+NF0.format(Math.abs(v))+' ₽';
 const bnPct=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' %';
 const bnPp=(v,d=1)=>bad(v)?'—':(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(d).replace('.',',')+' п.п.';
@@ -21,7 +21,7 @@ function bnLoadData(){
 }
 function bnCur(){const e=S.bn[bnKey()];return e&&Date.now()-e.t<10*60*1000?e:null}
 function bnSeries(d){
-  const s=d.series,ser=[{n:'Мой портфель',c:S1,hex:'#3987e5',v:s.portfolio,w:2.6}];
+  const s=d.series,ser=[{n:'Мой портфель',c:S1,v:s.portfolio,w:2.6}];
   d.bench.forEach(b=>{if(!b.available||!S.bnSel.has(b.code)||!s.bench[b.code])return;const c=BN_COL[b.code]||[S2];
     ser.push({n:b.name,c:c[0],v:s.bench[b.code],w:1.7,dash:!!c[1]})});
   return ser;
@@ -69,7 +69,7 @@ function bnLiquidity(d){
   const slow=l.slowest.length?`<div class="tbl" style="margin-top:10px"><table><thead><tr><th class="l">Самые медленные позиции</th><th>Стоимость</th><th>Дней на продажу</th></tr></thead><tbody>${
     l.slowest.map(r=>`<tr${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l">${esc(r.name)}</td><td class="num">${M(r.value_rub,'rub',0)}</td><td class="num ${r.days>5?'neg':r.days>1?'':'pos'}">${r.days>=10?Math.round(r.days):f2(r.days)}</td></tr>`).join('')}</tbody></table></div>`:'';
   return`<div class="card"><h2>Как быстро можно продать<span class="sp">облигации в портфеле${cov!=null?', '+cov.toFixed(0)+' % портфеля':''}</span></h2>
-    ${hbars(items,'#3987e5',x=>pctp(x.v,0),true)}
+    ${hbars(items,'var(--s1)',x=>pctp(x.v,0),true)}
     ${slow}
     <p class="note" style="margin-top:10px">«Дней на продажу» — за сколько дней можно продать позицию целиком, если забирать не более ${f2(l.part)} % среднего дневного оборота выпуска, чтобы не двигать цену. Фонд ликвидности (LQDT) продаётся в день сделки, без скидки к цене. Оценка по облигациям; акции и фонды в расчёт не входят.</p></div>`;
 }

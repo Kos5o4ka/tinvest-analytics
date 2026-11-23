@@ -67,7 +67,7 @@ function cf36Tip(i){
   let h=`<b>${MONF[+mm-1]} ${y}</b>`;
   if(m.total<=0)return h+'<div>Выплат нет</div>';
   CF36_K.forEach(([k,n,c])=>{if(m.by[k])h+=tipRow(c,n,M(m.by[k]))});
-  h+=`<div style="border-top:1px solid var(--line2);padding-top:5px;margin-top:6px">Итого<span>${M(m.total)}</span></div>`;
+  h+=`<div class="tot">Итого<span>${M(m.total)}</span></div>`;
   if(m.est>0)h+=`<div>в т. ч. оценка<span>${M(m.est)}</span></div>`;
   (m.top||[]).forEach(t=>h+=`<div style="color:var(--tx2)">${esc(t.name)}${t.est?' (оценка)':''}<span>${M(t.amount)}</span></div>`);
   return h;

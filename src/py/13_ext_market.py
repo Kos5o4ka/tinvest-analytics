@@ -240,6 +240,8 @@ def screener_payload():
         r["rating"] = rt["v"] if rt else None
         r["rt_agency"] = rt["agency"] if rt else None
         r["rt_approx"] = bool(rt and rt["approx"])
+        r["rt_links"] = [{"a": x["agency"], "r": x["rating"], "o": x.get("outlook") or "", "d": x.get("date") or "",
+                          "u": x.get("url")} for x in (rt.get("all") or [])] if rt and any(x.get("url") for x in rt.get("all") or []) else None
         info = None
         if ti and r.get("isin"):
             try:

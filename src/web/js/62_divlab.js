@@ -88,18 +88,18 @@ function dlHistChart(el,o){
   const h=o.hist,W=el.clientWidth||600,H=230,pl=30,pr=10,pt=18,pb=52,n=h.length,pw=W-pl-pr,ph=H-pt-pb,bw=pw/n;
   const mx=Math.max(1,...h.map(x=>x.n));
   const col=x=>x.label==='не закрыт'?'var(--neg)':x.label==='ещё открыт'?'var(--mu)':'var(--s3)';
-  let s='';
+  let s='';const G=gradSet();
   (mx<=2?[0,1]:[0,.5,1]).forEach(f=>{const y=pt+ph-f*ph;s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${y}" y2="${y}"/><text class="ax num" x="${pl-6}" y="${y+4}" text-anchor="end">${Math.round(mx*f)}</text>`});
   h.forEach((x,i)=>{
     const bh=x.n/mx*ph,bx=pl+i*bw+bw*.18,w=bw*.64;
-    s+=`<rect x="${bx}" y="${pt+ph-bh}" width="${w}" height="${Math.max(bh,x.n?1.5:0)}" rx="3" fill="${col(x)}" fill-opacity=".85"/>`;
+    s+=`<path d="${rtop(bx,pt+ph-Math.max(bh,x.n?1.5:0),w,Math.max(bh,x.n?1.5:0),5)}" fill="${G.u(col(x))}"/>`;
     if(x.n)s+=`<text class="ax num" x="${bx+w/2}" y="${pt+ph-bh-5}" text-anchor="middle">${x.n}</text>`;
     const words=x.label.split(' ');
     s+=`<text class="ax" x="${bx+w/2}" y="${H-pb+16}" text-anchor="middle">${esc(words.slice(0,Math.ceil(words.length/2)).join(' '))}</text>`;
     if(words.length>1)s+=`<text class="ax" x="${bx+w/2}" y="${H-pb+30}" text-anchor="middle">${esc(words.slice(Math.ceil(words.length/2)).join(' '))}</text>`;
   });
   let hits='';h.forEach((x,i)=>hits+=`<rect data-i="${i}" x="${pl+i*bw}" y="${pt}" width="${bw}" height="${ph+pb-8}" fill="transparent"/>`);
-  el.innerHTML=`<svg width="${W}" height="${H}" role="img" aria-label="Гистограмма сроков закрытия дивидендных гэпов">${s}${hits}</svg>`;
+  el.innerHTML=`<svg width="${W}" height="${H}" role="img" aria-label="Гистограмма сроков закрытия дивидендных гэпов">${G.defs()}${s}${hits}</svg>`;
   bindTip(el,i=>`<b>${esc(h[i].label)}</b>`+tipRow(col(h[i]),'событий',String(h[i].n)));
 }
 function dlGapsTable(gs){

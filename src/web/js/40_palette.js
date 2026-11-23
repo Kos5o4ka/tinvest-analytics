@@ -31,7 +31,10 @@ function kpCommands(){
     {g:'Команды',t:'Поделиться портфелем (PNG без сумм)',k:'поделиться png карточка картинка share telegram',run:()=>{if(typeof shareOpen==='function')shareOpen()}},
     {g:'Команды',t:'Экспорт PDF (печать)',k:'экспорт pdf печать',run:()=>window.print()},
     {g:'Команды',t:INCOG.on?'Показать суммы':'Скрыть суммы (инкогнито)',k:'инкогнито скрыть суммы показать',run:()=>setIncog(!INCOG.on)},
-    {g:'Команды',t:'Сменить тему',k:'тема оформление светлая тёмная',run:()=>$('#thm').click()}];
+    {g:'Команды',t:'Сменить тему',k:'тема оформление светлая тёмная',run:()=>$('#thm').click()},
+    {g:'Команды',t:'Экспорт операций (CSV)',k:'экспорт операции csv скачать выгрузка',run:()=>{location.href='/api/operations.csv?'+new URLSearchParams({period:S.period,account:S.account});toast('Загрузка CSV…','info')}},
+    {g:'Команды',t:'Горячие клавиши',k:'горячие клавиши шпаргалка помощь hotkeys shortcuts',run:()=>{if(typeof ksToggle==='function')ksToggle()}},
+    {g:'Команды',t:'Перейти в настройки',k:'настройки конфигурация токен settings',run:()=>go('set')}];
 }
 function kpSecurities(q){
   const out=[],seen=new Set();
@@ -58,7 +61,9 @@ function kpBuild(raw){
   PAGES.filter(Boolean).forEach(p=>{const sc=kpScore(p[1],q);if(sc)res.push({g:'Разделы',t:p[1],sc,s:S.navHidden.includes(p[0])&&!NAV_PINNED.includes(p[0])?'скрыт в меню':'',run:()=>go(p[0])})});
   if(q)KB.forEach((a,i)=>{const tk=kpNorm(a.t+' '+a.k),sc=q.split(/\s+/).filter(Boolean).every(w=>tk.includes(w))?kpScore(a.t+' '+a.k,q):0;if(sc)res.push({g:'База знаний',t:a.t,s:a.c,sc,run:()=>kbOpen(a.id)})});
   if(q)res.push(...kpSecurities(q));
-  const order={'Команды':q?1:0,'Разделы':q?0:1,'База знаний':2,'Бумаги':3};
+  const order={'Калькулятор':-1,'Команды':q?1:0,'Разделы':q?0:1,'База знаний':2,'Бумаги':3};
+  const calc=typeof calcEval==='function'?calcEval(raw):null;
+  if(calc!==null)res.push({g:'Калькулятор',t:'= '+calcFmt(calc),s:'Enter — скопировать',sc:99,run:()=>copyText(calcRaw(calc),'Скопировано: '+calcFmt(calc))});
   res.sort((a,b)=>order[a.g]-order[b.g]||(q?b.sc-a.sc:0));
   return res.slice(0,40);
 }
@@ -74,7 +79,7 @@ function kpDraw(){
 function kpOpen(){
   if(KP.open)return;KP.open=true;
   const o=document.createElement('div');o.id='kp-ov';
-  o.innerHTML='<div id="kp" role="dialog" aria-label="Поиск"><input id="kp-q" placeholder="Раздел, бумага, ISIN или команда…" autocomplete="off" spellcheck="false"><div id="kp-l"></div><div id="kp-f">↑↓ выбор · Enter открыть · Esc закрыть</div></div>';
+  o.innerHTML='<div id="kp" role="dialog" aria-label="Поиск"><input id="kp-q" placeholder="Раздел, бумага, ISIN или команда…" autocomplete="off" spellcheck="false"><div id="kp-l"></div><div id="kp-f">↑↓ выбор · Enter открыть · Esc закрыть · можно считать: 150000*0,13</div></div>';
   document.body.appendChild(o);
   o.addEventListener('mousedown',e=>{if(e.target===o)kpClose()});
   o.querySelector('#kp-l').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b)kpRun(+b.dataset.i)});

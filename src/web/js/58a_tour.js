@@ -9,22 +9,6 @@ const TOUR_STEPS=[
 ];
 const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0};
 
-/* ── Звуковой «тик» (по умолчанию выключен: Настройки → Оформление) ── */
-let _uxAC=null;
-function uxTick(){
-  try{
-    if(lsGet('ta_sound')!=='1')return;
-    const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
-    if(!_uxAC)_uxAC=new AC();
-    if(_uxAC.state==='suspended')_uxAC.resume();
-    const t=_uxAC.currentTime,o=_uxAC.createOscillator(),g=_uxAC.createGain();
-    o.type='sine';o.frequency.value=800;
-    g.gain.setValueAtTime(0.04,t);g.gain.exponentialRampToValueAtTime(0.0001,t+0.015);
-    o.connect(g);g.connect(_uxAC.destination);o.start(t);o.stop(t+0.02);
-  }catch(e){}
-}
-window.uxTick=uxTick;
-
 function tourFind(st){
   for(const s of st.sel){
     let els;try{els=document.querySelectorAll(s)}catch(e){continue}
@@ -109,7 +93,6 @@ function tourShow(i,dir){
 function tourNext(d){
   if(!TOUR.on)return;
   if(d<0&&TOUR.i===0)return;
-  uxTick();
   if(d>0&&TOUR.i>=TOUR.list.length-1){tourStop();return}
   tourShow(TOUR.i+d,d);
 }

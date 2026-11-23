@@ -1,5 +1,5 @@
 /* ── Карта рынка: доходность и дюрация, спреды по рейтингам ── */
-const MP_COL={'AAA':'#199e70','AA':'#3ecf8e','A':'#3987e5','BBB':'#e3a21a','BB и ниже':'#ff6b6b','нет рейтинга':'#8a90a0'};
+const MP_COL={'AAA':'var(--s3)','AA':'var(--pos)','A':'var(--s1)','BBB':'var(--s4)','BB и ниже':'var(--neg)','нет рейтинга':'#8a90a0'};
 const MP_BK=['AAA','AA','A','BBB','BB и ниже','нет рейтинга'];
 S.mp={rb:{'AAA':true,'AA':true,'A':true,'BBB':true,'BB и ниже':true,'нет рейтинга':true},sector:'',dmax:'5',liquid:true,mine:false,all:false};
 function mpMine(){const s=new Set();((S.bonds&&S.bonds.rows)||[]).forEach(b=>{if(b.isin)s.add(b.isin);if(b.ticker)s.add(b.ticker)});return s}
@@ -73,7 +73,7 @@ function mpHist(el){
 function pMap(){
   const d=S.scr;
   if(!d){loadScr();return`<div class="card">${waitBox('Загружаю торги облигациями с Мосбиржи…')}</div>`}
-  if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="scr-r">Повторить</button></div>`;
+  if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="map-r">Повторить</button></div>`;
   const f=S.mp,sectors=[...new Set(d.rows.map(r=>r.sector).filter(Boolean))].sort((a,b)=>(SECT[a]||a).localeCompare(SECT[b]||b));
   const opt=(v,t,cur)=>`<option value="${v}" ${String(cur)===String(v)?'selected':''}>${t}</option>`;
   const hasP=mpMine().size>0;
@@ -103,6 +103,5 @@ function bindMap(){
   $('#mp-liq').onchange=e=>{f.liquid=e.target.checked;redraw()};
   $('#mp-mine').onchange=e=>{f.mine=e.target.checked;redraw()};
   $('#mp-all').onchange=e=>{f.all=e.target.checked;redraw()};
-  const r=$('#scr-r');if(r)r.onclick=()=>{S.scr=null;render()};
   if(!window._mpRs){window._mpRs=1;let t;addEventListener('resize',()=>{clearTimeout(t);t=setTimeout(()=>{if(S.page==='map'){const e=$('#map-sc');if(e&&S.scr&&!S.scr.error)mpScatter(e);const h=$('#map-hist');if(h&&S.scr&&!S.scr.error)mpHist(h)}},200)})}
 }

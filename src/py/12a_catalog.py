@@ -91,13 +91,22 @@ def best_rating(isin, name):
             cur = cat.get(ag)
             if cur is None or dt >= cur["date"]:
                 cat[ag] = {"agency": ag, "rating": v, "issuer": b["br"] or b["n"], "date": dt,
-                           "outlook": (fc or "") + (" · под наблюдением" if watch else ""), "approx": False}
+                           "outlook": (fc or "") + (" · под наблюдением" if watch else ""), "approx": False,
+                           "url": None, "post": None, "src": None}
     if not cat:
         return base
+    for x in (base or {}).get("all") or []:                    # пресс-релиз из канала: тот же уровень — берём ссылку, канал свежее — берём запись
+        c = cat.get(x["agency"])
+        if not c or x.get("approx") or not x.get("url"):
+            continue
+        if x["rating"] == c["rating"]:
+            c.update(url=x["url"], post=x.get("post"), src=x.get("src"))
+        elif (x.get("date") or "") > (c["date"] or ""):
+            cat[x["agency"]] = x
     allr = list(cat.values())
     for x in (base or {}).get("all") or []:
         if x["agency"] not in cat and not x.get("approx"):     # по названию — только точные; приблизительные худший не выбирают
             allr.append(x)
     low = max(allr, key=lambda x: RATING_SCALE.index(x["rating"]))
     return {"v": low["rating"], "agency": low["agency"], "issuer": low["issuer"], "date": low["date"],
-            "approx": low["approx"], "all": allr}
+            "approx": low["approx"], "url": low.get("url"), "post": low.get("post"), "src": low.get("src"), "all": allr}

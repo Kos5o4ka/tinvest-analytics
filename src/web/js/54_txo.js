@@ -98,7 +98,7 @@ function txoPrefill(y){S.txo.F=Object.assign(txoF(),{open_year:y});S.txo.p=null;
 function txoSave(){try{localStorage.setItem('txo_iis3',JSON.stringify(S.txo.F))}catch(e){}}
 function pTxo(){
   const p=S.txo.p;
-  if(p&&p.rows.length)chart('txo-ch',line,{labels:p.rows.map(r=>String(r.year)),h:220,series:[{n:'ИИС-3',c:S1,v:p.rows.map(r=>r.iis_capital)},{n:'Обычный счёт',c:S2,v:p.rows.map(r=>r.broker_capital)},{n:'Свои взносы',c:S4,v:p.rows.map(r=>r.own)}]});
+  if(p&&p.rows.length)chart('txo-ch',line,{labels:p.rows.map(r=>String(r.year)),h:220,series:[{n:'ИИС-3',c:S1,v:p.rows.map(r=>r.iis_capital)},{n:'Обычный счёт',c:S3,v:p.rows.map(r=>r.broker_capital)},{n:'Свои взносы',c:S4,v:p.rows.map(r=>r.own)}]});
   return`<div class="txo"><div class="card"><h2>Сбор налоговых убытков (${new Date().getFullYear()} год)</h2>
     <p class="note">Модель показывает, при каком наборе продаж налог текущего года снизился бы сильнее всего и сколько останется после комиссий. Это не рекомендация что-либо продавать.</p>${txoHarvest()}</div>
     <div class="card"><h2>Планировщик ИИС-3 <span class="sp">сравнение с обычным счётом</span></h2>${txoPlanner()}</div>${TXO_NOTE}${NIR_NOTE}</div>`;

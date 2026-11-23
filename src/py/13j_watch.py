@@ -265,6 +265,71 @@ def _tg_esc(s):
 
 
 TG_DISCLAIMER = "\n\n<i>Не является индивидуальной инвестиционной рекомендацией.</i>"
+TG_LIMIT = 3500                  # предел текста одного сообщения вместе с припиской
+_TG_MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
+
+
+def _tg_num(x, dec=0):
+    """1234567.8 -> «1 234 568» (пробел — разделитель тысяч), с dec знаками — запятая-разделитель."""
+    return ("{:,.%df}" % dec).format(x).replace(",", " ").replace(".", ",")
+
+
+def _tg_rub(x):
+    return _tg_num(x, 0 if abs(x) >= 100 or x == int(x) else 2) + " ₽"
+
+
+def _tg_pct(x, dec=2):
+    return _tg_num(x, dec) + "%"
+
+
+def _tg_date(iso):
+    """«2026-11-20» -> «20 ноября» (год — только если он не текущий)."""
+    try:
+        d = datetime.strptime(str(iso)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return _tg_esc(iso)
+    return "%d %s%s" % (d.day, _TG_MONTHS[d.month - 1], "" if d.year == date.today().year else " %d" % d.year)
+
+
+def _tg_link(url, text):
+    u = str(url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        return ""
+    return '<a href="%s">%s</a>' % (u.replace("&", "&amp;").replace('"', "%22").replace("<", "%3C").replace(">", "%3E"), _tg_esc(text))
+
+
+def _tg_moex(isin):
+    return _tg_link("https://www.moex.com/ru/issue.aspx?code=%s" % urllib.parse.quote(str(isin or "")), "на Мосбирже") if isin else ""
+
+
+def _tg_head(icon, title, sub=""):
+    return "%s <b>%s</b>%s" % (icon, _tg_esc(title), (" · " + _tg_esc(sub)) if sub else "")
+
+
+def _tg_cap(lines, shown, more=""):
+    """Первые shown строк + «…и ещё N» (more — пояснение после числа)."""
+    out = list(lines[:shown])
+    if len(lines) > shown:
+        out.append("…и ещё %d%s" % (len(lines) - shown, more))
+    return "\n".join(out)
+
+
+def _tg_fit(text, limit):
+    """Обрезка по границе строки с закрытием незакрытых тегов (иначе Telegram не разберёт разметку)."""
+    if len(text) <= limit:
+        return text
+    cut = text[:max(limit - 40, 1)]
+    cut = cut.rsplit("\n", 1)[0] if "\n" in cut else cut
+    cut = re.sub(r"<[^>]*$", "", cut)             # оборванный тег
+    cut = re.sub(r"&[a-z#0-9]*$", "", cut)        # оборванная сущность
+    stack = []
+    for m in re.finditer(r"<(/?)(b|i|a|code)\b[^>]*>", cut):
+        if m.group(1):
+            if m.group(2) in stack:
+                stack = stack[:len(stack) - stack[::-1].index(m.group(2)) - 1]
+        else:
+            stack.append(m.group(2))
+    return cut.rstrip() + "\n…" + "".join("</%s>" % t for t in reversed(stack))
 
 
 def tg_send(cfg, text):
@@ -274,8 +339,7 @@ def tg_send(cfg, text):
         raise ApiError("Уведомления работают через сервер данных, а он выключен («off»). Включите сервер данных в настройках.", 400)
     if not key:
         raise ApiError("Войдите по ключу из бота.", 400)
-    if len(text) > 3400:
-        text = text[:3400].rsplit("\n", 1)[0] if "\n" in text[:3400] else text[:3400]
+    text = _tg_fit(text, TG_LIMIT - len(TG_DISCLAIMER))
     try:
         code, j = tg_post_notify(srv, key, text + TG_DISCLAIMER)
     except Exception:  # noqa: BLE001
@@ -327,7 +391,8 @@ def tg_info(cfg, acc, q, force):
 
 
 def tg_test(cfg, body):
-    tg_send(load_config(), "✅ <b>TAnalytic</b>: тестовое сообщение. Уведомления подключены.")
+    tg_send(load_config(), "%s\n\nTAnalytic подключён к Telegram. Сюда будут приходить тревоги, выплаты и ежедневная сводка — "
+            "что именно, настраивается в приложении." % _tg_head("🧪", "Тестовое сообщение"))
     return {"ok": True}
 
 
@@ -343,7 +408,7 @@ API_POST["/api/tg/run"] = tg_run_now
 
 
 _TG_KIND = {"price": "📉", "spread": "📈", "offer": "🔔", "default": "⛔", "rating": "🏷", "watch": "👁", "outlook": "👁",
-            "halt": "⏸", "liquidity": "💧", "goal": "🎯", "reminder": "📝"}
+            "halt": "⏸", "liquidity": "💧", "goal": "⭐", "reminder": "📝"}
 _TG_COOL = {"price": 7 * DAY, "spread": 7 * DAY}      # повтор не раньше, чем через неделю; остальные тревоги — один раз
 
 
@@ -355,12 +420,22 @@ def _tg_key(a):
 
 
 def _tg_alert_line(a):
+    """«📉 <b>Бумага</b> — сообщение» и строка со ссылками (пресс-релиз/источник, бумага на Мосбирже)."""
     nm = a.get("name") or ""
-    return "%s <b>%s</b>: %s" % (_TG_KIND.get(a.get("kind"), "•"), _tg_esc(nm), _tg_esc(a.get("message")))
+    line = "%s <b>%s</b> — %s" % (_TG_KIND.get(a.get("kind"), "•"), _tg_esc(nm), _tg_esc(a.get("message")))
+    url = str(a.get("url") or "")
+    links = []
+    if url and "moex.com/ru/issue" not in url:
+        links.append(_tg_link(url, "Пресс-релиз" if a.get("kind") == "rating" else "Подробнее"))
+    if a.get("isin"):
+        links.append(_tg_moex(a["isin"]))
+    links = [x for x in links if x]
+    return line + ("\n" + " · ".join(links) if links else "")
 
 
-def _tg_dispatch(cfg, title, alerts, sent, now):
-    """Отправляет ещё не отправленные тревоги одним сообщением (до 10 штук). Возвращает число тревог."""
+def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
+    """Отправляет ещё не отправленные тревоги: до трёх сообщений за проверку, до 10 тревог и в предел длины каждое;
+    остальное уйдёт в следующий раз (в последнем сообщении об этом сказано). Возвращает число отправленных тревог."""
     fresh = []
     for a in alerts:
         k = _tg_key(a)
@@ -370,10 +445,23 @@ def _tg_dispatch(cfg, title, alerts, sent, now):
         fresh.append((k, a))
     if not fresh:
         return 0
-    sent_n = 0
-    for i in range(0, min(len(fresh), 30), 10):          # до трёх сообщений за проверку; остальное уйдёт в следующий раз
-        chunk = fresh[i:i + 10]
-        tg_send(cfg, "<b>%s</b>\n\n%s" % (_tg_esc(title), "\n\n".join(_tg_alert_line(a) for k, a in chunk)))
+    head = _tg_head(icon, title)
+    room = TG_LIMIT - len(TG_DISCLAIMER) - len(head) - 120
+    sent_n, i = 0, 0
+    for msg_no in range(3):
+        if i >= len(fresh):
+            break
+        chunk, lines, size = [], [], 0
+        while i < len(fresh) and len(chunk) < 10:
+            ln = _tg_alert_line(fresh[i][1])
+            if chunk and size + len(ln) + 2 > room:
+                break
+            chunk.append(fresh[i])
+            lines.append(ln)
+            size += len(ln) + 2
+            i += 1
+        tail = ("\n\n…и ещё %d — придут при следующей проверке" % (len(fresh) - i)) if msg_no == 2 and i < len(fresh) else ""
+        tg_send(cfg, "%s\n\n%s%s" % (head, "\n\n".join(lines), tail))
         for k, a in chunk:
             sent[k] = now
         sent_n += len(chunk)
@@ -406,13 +494,13 @@ def defaults_alerts(cfg, sent=None, rows=None, isins=None):
                 "date": r.get("date") or date.today().isoformat(), "url": r.get("url") or ""}
         what = "дефолт" if r.get("status") == "default" else "технический дефолт"
         ob = (r.get("obligation") or "обязательство").lower()
-        amt = (", %s ₽" % "{:,.0f}".format(r["amount"]).replace(",", " ")) if r.get("amount") else ""
-        due = (", срок %s" % _tg_dmy(r["due_date"])) if r.get("due_date") else ""
+        amt = (", %s" % _tg_rub(r["amount"])) if r.get("amount") else ""
+        due = (", срок %s" % _tg_date(r["due_date"])) if r.get("due_date") else ""
         kd, kx = "dfl|%s|%s" % (isin, tail), "dflx|%s|%s" % (isin, tail)
         if r.get("executed"):
             if kd in sent:
                 out.append(dict(base, id=kx, kind="default_ok", severity="medium",
-                                message="%s по бумаге исполнен(о): %s%s, раскрытие о выплате от %s" % (what, ob, amt, _tg_dmy(r["executed"]))))
+                                message="%s по бумаге исполнен(о): %s%s, раскрытие о выплате от %s" % (what, ob, amt, _tg_date(r["executed"]))))
         else:
             out.append(dict(base, id=kd, kind="default", severity="high",
                             message="%s по бумаге: %s%s%s (%s)" % (what, ob, amt, due, r.get("basis") or "")))
@@ -437,26 +525,27 @@ def tg_offer_due(items, today):
         if not isin or not od or od <= today:
             continue
         nm = _tg_esc(it.get("name") or isin)
+        lk = "\n" + _tg_moex(isin)
         ps, pe = it.get("period_start"), it.get("period_end")
         base = "ofr|%s|%s|" % (isin, od)
         if kind == "put":
             if it.get("coupon_status") == "announced" and it.get("new_rate") is not None and (not pe or today <= pe):
-                out.append((base + "coupon", "🔔 <b>%s</b>: эмитент объявил купон после пут-оферты (%s): %s %% годовых. Приём заявок открывается в период предъявления."
-                            % (nm, _tg_dmy(od), _f2(it["new_rate"]))))
+                out.append((base + "coupon", "🔔 <b>%s</b> — эмитент объявил купон после пут-оферты (%s): %s годовых. Приём заявок открывается в период предъявления.%s"
+                            % (nm, _tg_date(od), _tg_pct(it["new_rate"]), lk)))
             if ps and pe and ps <= today <= pe:
-                out.append((base + "open", "🔔 <b>%s</b>: открыт приём заявок по пут-оферте, с %s по %s (выкуп %s). Заявку подаёт брокер."
-                            % (nm, _tg_dmy(ps), _tg_dmy(pe), _tg_dmy(od))))
+                out.append((base + "open", "🔔 <b>%s</b> — открыт приём заявок по пут-оферте: с %s по %s (выкуп %s). Заявку подаёт брокер.%s"
+                            % (nm, _tg_date(ps), _tg_date(pe), _tg_date(od), lk)))
             if pe:
                 left = _of_days(today, pe)
                 if 0 <= left <= TG_OFR_CLOSE_DAYS and (not ps or ps <= today):
                     t = ("осталось %d дня подать заявку" % left if left >= 2 else "остался 1 день, чтобы подать заявку" if left == 1
                          else "сегодня последний день подачи заявки")
-                    out.append((base + "close", "⏰ <b>%s</b>: %s на пут-оферту (последний день %s, выкуп %s)." % (nm, t, _tg_dmy(pe), _tg_dmy(od))))
+                    out.append((base + "close", "⏰ <b>%s</b> — %s на пут-оферту (последний день %s, выкуп %s).%s" % (nm, t, _tg_date(pe), _tg_date(od), lk)))
         elif kind == "call":
             left = _of_days(today, od)
             if 0 < left <= TG_OFR_CALL_DAYS:
-                out.append((base + "call", "🔔 <b>%s</b>: возможное досрочное погашение (колл) %s, через %d дн. Решает эмитент, заявку подавать не нужно."
-                            % (nm, _tg_dmy(od), left)))
+                out.append((base + "call", "🔔 <b>%s</b> — возможное досрочное погашение (колл) %s, через %d дн. Решает эмитент, заявку подавать не нужно.%s"
+                            % (nm, _tg_date(od), left, lk)))
     return out
 
 
@@ -495,42 +584,42 @@ _TG_EV = {"coupon": "купон", "dividend": "дивиденд", "amortization"
 
 
 def _tg_ev_line(e):
-    amt = " · %s ₽" % ("{:,.0f}".format(e[3]).replace(",", " ")) if e[3] else ""
-    return "%s · %s · %s%s" % (e[0][8:] + "." + e[0][5:7], _TG_EV.get(e[1], "выплата"), _tg_esc(e[2]), amt)
+    """«20 ноября · <b>Выпуск</b> — купон, 5 000 ₽»."""
+    amt = ", %s" % _tg_rub(e[3]) if e[3] else ""
+    return "%s · <b>%s</b> — %s%s" % (_tg_date(e[0]), _tg_esc(e[2]), _TG_EV.get(e[1], "выплата"), amt)
 
 
 def tg_digest_text(cfg):
-    parts = ["<b>Сводка TAnalytic · %s</b>" % date.today().strftime("%d.%m.%Y")]
+    parts = [_tg_head("📈", "Сводка TAnalytic", _tg_date(date.today().isoformat()))]
     if cfg.get("token"):
         try:
             s = build_summary(cfg, "all", "all")
             p = s.get("portfolio") or {}
             if p.get("total") is not None:
                 d = p.get("daily")
-                parts.append("Портфель: %s ₽%s" % ("{:,.0f}".format(p["total"]).replace(",", " "),
-                             (" (за день %s%s ₽)" % ("+" if d >= 0 else "−", "{:,.0f}".format(abs(d)).replace(",", " "))) if d is not None else ""))
+                parts.append("💼 <b>Портфель</b> — %s%s" % (_tg_rub(p["total"]),
+                             (" (за день %s%s)" % ("+" if d >= 0 else "−", _tg_rub(abs(d)))) if d is not None else ""))
         except Exception:  # noqa: BLE001
             pass
         try:
             ev = _tg_payments(cfg, 7)
             if ev:
-                parts.append("Ближайшие 7 дней:\n" + "\n".join(_tg_ev_line(e) for e in ev[:8]) + ("\n…и ещё %d" % (len(ev) - 8) if len(ev) > 8 else ""))
+                parts.append("💰 <b>Ближайшие 7 дней</b>\n" + _tg_cap([_tg_ev_line(e) for e in ev], 8))
             else:
-                parts.append("Ближайшие 7 дней: выплат нет.")
+                parts.append("💰 <b>Ближайшие 7 дней</b> — выплат нет")
         except Exception:  # noqa: BLE001
             pass
         try:
             m = build_monitor(cfg, "all")
-            parts.append("Мониторинг портфеля: высоких тревог — %d, средних — %d." % (m["summary"]["high"], m["summary"]["medium"]))
+            parts.append("🔔 <b>Мониторинг</b> — высоких тревог: %d, средних: %d" % (m["summary"]["high"], m["summary"]["medium"]))
         except Exception:  # noqa: BLE001
             pass
     try:
         w = watch_payload(cfg)
         if w["items"]:
-            ln = []
-            for r in w["items"][:8]:
-                ln.append("%s: %s" % (_tg_esc(r["name"]), ("доходность %s %%" % _f2(r["yield_"])) if r.get("yield_") is not None else "нет данных"))
-            parts.append("Наблюдение (%d, тревог: %d):\n%s" % (len(w["items"]), len(w["alerts"]), "\n".join(ln)))
+            ln = ["<b>%s</b> — %s" % (_tg_esc(r["name"]), ("доходность %s" % _tg_pct(r["yield_"])) if r.get("yield_") is not None else "нет данных")
+                  for r in w["items"]]
+            parts.append("👁 <b>Наблюдение</b> (бумаг: %d, тревог: %d)\n%s" % (len(w["items"]), len(w["alerts"]), _tg_cap(ln, 8)))
     except Exception:  # noqa: BLE001
         pass
     return "\n\n".join(parts)
@@ -561,7 +650,7 @@ def tg_tick(force_digest=False, manual=False):
                 today_ = date.today().isoformat()
                 due = [(k, t) for k, t in tg_offer_due(_tg_offer_items(cfg, today_), today_) if k not in sent][:10]
                 if due:
-                    tg_send(cfg, "<b>Оферты по портфелю</b>\n\n" + "\n\n".join(t for _k, t in due))
+                    tg_send(cfg, _tg_head("🔔", "Оферты по портфелю") + "\n\n" + "\n\n".join(t for _k, t in due))
                     for k, _t in due:
                         sent[k] = now
                     n += len(due)
@@ -570,7 +659,7 @@ def tg_tick(force_digest=False, manual=False):
         try:
             if cfg.get("tg_on_watch", True) and (watch_isins() or notes_all()):
                 al = [a for a in watch_payload(cfg)["alerts"] if a["severity"] != "info"]
-                n += _tg_dispatch(cfg, "Наблюдение и цели", al, sent, now)
+                n += _tg_dispatch(cfg, "Наблюдение и цели", al, sent, now, icon="⭐")
         except Exception:  # noqa: BLE001
             pass
         try:        # крупные сделки и всплески объёма по бумагам списка (13v_flows.py; ключ дедупликации — id тревоги)
@@ -593,7 +682,7 @@ def tg_tick(force_digest=False, manual=False):
                     if k not in sent:
                         fresh.append((k, e))
                 if fresh:
-                    tg_send(cfg, "<b>Ближайшие выплаты (%d дн.)</b>\n\n%s" % (days, "\n".join(_tg_ev_line(e) for k, e in fresh[:15])))
+                    tg_send(cfg, "%s\n\n%s" % (_tg_head("💰", "Ближайшие выплаты", "%d дн." % days), _tg_cap([_tg_ev_line(e) for k, e in fresh], 15)))
                     for k, e in fresh:
                         sent[k] = now
                     n += len(fresh)

@@ -172,6 +172,7 @@ def build_summary(cfg, acc, period, force=False):
 
 BONDS_TTL, HIST_TTL = 600, 900
 _bg = set()
+_bg_lock = threading.Lock()
 
 
 def cached_result(kind, cfg, acc, ttl, compute, force=False):
@@ -207,8 +208,10 @@ def cached_result(kind, cfg, acc, ttl, compute, force=False):
         if saved and saved.get("v") is not None and time.time() - saved.get("t", 0) < ttl:
             return mem_put(key, saved["v"])
         if saved and saved.get("v") is not None:
-            if key not in _bg:
+            with _bg_lock:
+                start = key not in _bg
                 _bg.add(key)
+            if start:
 
                 def bg():
                     try:

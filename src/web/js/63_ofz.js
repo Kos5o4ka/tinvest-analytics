@@ -32,13 +32,13 @@ function ofzTpChart(el,o){
   const W=el.clientWidth||600,H=220,pl=44,pr=10,pt=14,pb=28,pw=W-pl-pr,ph=H-pt-pb,n=tp.length,bw=pw/n;
   const mx=Math.max(10,...tp.map(x=>x.bp)),mn=Math.min(0,...tp.map(x=>x.bp)),g=nice(mn,mx,4);
   const Y=v=>pt+ph-(v-g.lo)/(g.hi-g.lo)*ph;
-  let s='';
+  let s='';const G=gradSet();
   for(let v=g.lo;v<=g.hi+1e-9;v+=g.step)s+=`<line class="grid-l" x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}"/><text class="ax num" x="${pl-6}" y="${Y(v)+4}" text-anchor="end">${Math.round(v)}</text>`;
   tp.forEach((x,i)=>{const y0=Y(0),y1=Y(x.bp),bx=pl+i*bw+bw*.15,w=bw*.7,c=x.bp>=0?'var(--ac)':'var(--neg)';
-    s+=`<rect x="${bx}" y="${Math.min(y0,y1)}" width="${w}" height="${Math.max(1.5,Math.abs(y1-y0))}" rx="2" fill="${c}" fill-opacity=".85"/>`;
+    s+=`<path d="${(x.bp>=0?rtop:rbot)(bx,Math.min(y0,y1),w,Math.max(1.5,Math.abs(y1-y0)),4)}" fill="${G.u(c)}"/>`;
     if(n<=15&&(i%(W<420?2:1)===0))s+=`<text class="ax num" x="${bx+w/2}" y="${H-10}" text-anchor="middle">${x.t}</text>`;
     s+=`<rect data-i="${i}" x="${pl+i*bw}" y="${pt}" width="${bw}" height="${ph}" fill="transparent"/>`});
-  el.innerHTML=`<svg width="${W}" height="${H}" role="img" aria-label="Премия за каждый год срока, базисных пунктов">${s}</svg>`;
+  el.innerHTML=`<svg width="${W}" height="${H}" role="img" aria-label="Премия за каждый год срока, базисных пунктов">${G.defs()}${s}</svg>`;
   bindTip(el,i=>`<b>${tp[i].t===1?'до 1 года':'год срока '+tp[i].t}</b>`+tipRow(tp[i].bp>=0?'var(--ac)':'var(--neg)','Прирост КБД',ofzBp(tp[i].bp)));
 }
 function ofzTable(bs){

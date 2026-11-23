@@ -223,7 +223,7 @@ def dbx_xirr(flows):
     """Годовая эффективная ставка по потокам [(date, сумма)]; None, если знаки не меняются."""
     if not flows or not any(a < 0 for _, a in flows) or not any(a > 0 for _, a in flows):
         return None
-    t0 = flows[0][0]
+    t0 = min(d for d, _ in flows)
 
     def npv(r):
         return sum(a / (1 + r) ** ((d - t0).days / 365.0) for d, a in flows)

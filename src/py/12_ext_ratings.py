@@ -3,12 +3,14 @@
 # ни токен, ни состав портфеля никуда не передаются.
 
 
-# ── кредитные рейтинги (канал @issuerRatings: АКРА, Эксперт РА, НКР, НРА) ──
+# ── кредитные рейтинги (каналы @ru_ratings и @issuerRatings: АКРА, Эксперт РА, НКР, НРА) ──
 
-RATING_CH = "https://t.me/s/issuerRatings"
+RT_CHANNELS = ("ru_ratings", "issuerRatings")        # порядок = приоритет при равной дате записей
+RATING_CH = "https://t.me/s/"
+RT_LINK_HOSTS = ("acra-ratings.ru", "raexpert.ru", "ratings.ru", "ra-national.ru", "t.me")
 RATING_SCALE = ["AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-", "BB+", "BB", "BB-",
                 "B+", "B", "B-", "CCC", "CC", "C", "D"]
-RT_KEY, RT_DAYS, RT_MAX_PAGES, RT_TTL, RT_OLD = "ratings_v2", 430, 280, 12 * 3600, 600
+RT_KEY, RT_DAYS, RT_MAX_PAGES, RT_TTL, RT_OLD = "ratings_v3", 430, 280, 12 * 3600, 600      # RT_MAX_PAGES — на каждый канал
 _L = "[AАBВCС]"
 _NOTLET = "(?<![A-Za-zА-Яа-яЁё])"
 _RATING_PATS = [re.compile(p) for p in (
@@ -152,6 +154,96 @@ def parse_rating_post(text):
                         "развивающ": "развивающийся"}.get(om.group(1), "") if om else ""}
 
 
+def rt_safe_url(u):
+    """Ссылка на пресс-релиз: только https:// и хосты агентств/Telegram, иначе пустая строка."""
+    u = (u or "").strip()
+    try:
+        pu = urllib.parse.urlsplit(u)
+    except ValueError:
+        return ""
+    h = (pu.hostname or "").lower()
+    if pu.scheme != "https" or not h or pu.username or pu.password:
+        return ""
+    return u if any(h == d or h.endswith("." + d) for d in RT_LINK_HOSTS) else ""
+
+
+def rt_post_url(src, post):
+    return "https://t.me/%s/%s" % (src or "issuerRatings", post) if post else None
+
+
+_RR_AGENCY = (("акра", "АКРА"), ("эксперт", "Эксперт РА"), ("нкр", "НКР"), ("нра", "НРА"))
+_RR_FIELDS = {"🏢": "co", "📝": "txt", "📊": "rt", "📅": "dt", "🔗": "url"}
+_RR_RU = re.compile(r"(?i)\bru|\.ru|\(ru\)|\|ru\|")
+_RT_SKIP = r"ожидаем|\.sf|структурир|сфо|\bкласс|esg|\.gq|качеств|надежност|некредитн|\.am"
+_RR_OUT = {"стабильн": "стабильный", "позитивн": "позитивный", "негативн": "негативный", "развивающ": "развивающийся"}
+
+
+def _ru_fields(text, links=None):
+    """Разбор поста ru_ratings: (агентство, {поле: значение}). Поля: co 🏢, txt 📝, rt 📊, dt 📅, url 🔗."""
+    lines = [x.strip() for x in (text or "").split("\n") if x.strip()]
+    if not lines:
+        return None, {}
+    m = re.match(r"рейтинг\s+от\s+(.+)", lines[0], re.I)
+    if not m:
+        return None, {}
+    nm = m.group(1).lower()
+    agency = next((a for k, a in _RR_AGENCY if nm.startswith(k)), None)
+    f = {}
+    for ln in lines[1:]:
+        for em, k in _RR_FIELDS.items():
+            if ln.startswith(em):
+                f.setdefault(k, ln[len(em):].strip())
+                break
+    url = rt_safe_url(f.get("url", ""))
+    if not url:
+        url = next((rt_safe_url(u) for u in links or [] if rt_safe_url(u)), "")
+    f["url"] = url
+    return agency, f
+
+
+def _ru_body(agency, f):
+    """Текст релиза для общих разборщиков: «📝» (Эксперт РА) либо «📊»/«🏢» (АКРА, НКР, НРА — текст в первой строке)."""
+    parts = [f.get(k) for k in ("txt", "co", "rt") if f.get(k)]
+    if "txt" not in f and "rt" in f:
+        parts = [f["rt"]] + ([f["co"]] if f.get("co") else [])
+    return " ".join(parts)
+
+
+def _ru_iso(f, iso):
+    m = re.fullmatch(r"(\d\d)\.(\d\d)\.(\d{4})", f.get("dt", ""))
+    return "%s-%s-%s" % (m.group(3), m.group(2), m.group(1)) if m else (iso or "")[:10]
+
+
+def parse_ru_ratings_post(text, links=None, iso=None):
+    """Пост @ru_ratings -> {agency, issuer, level, rating, outlook, date, url} (или withdrawn=True), либо None.
+    Структура: «Рейтинг от <агентство>», затем строки 🏢 эмитент, 📝 релиз, 📊 рейтинг, 📅 дата, 🔗 ссылка."""
+    agency, f = _ru_fields(text, links)
+    if not agency:
+        return None
+    body = _ru_body(agency, f)
+    r = parse_rating_post("%s\n%s" % (agency, body))
+    if not r and f.get("co") and "txt" not in f and _RR_RU.search(f.get("rt", "")) \
+            and not re.search(_RT_SKIP, body.lower()):        # регионы и т. п.: только «🏢 название» и «📊 ruA (Стабильный)»
+        v = _rating_token(f["rt"])
+        if v:
+            r = {"issuer": f["co"], "level": "issuer", "rating": v, "outlook": ""}
+    if not r:
+        return None
+    date_ = _ru_iso(f, iso)
+    if not date_:
+        return None
+    r = dict(r, issuer=re.sub(r"\s+", " ", re.sub(r"[«»\"“”]", "", r["issuer"])).strip())      # вложенные кавычки: «НК «РОСНЕФТЬ»
+    out = {"agency": agency, "issuer": r["issuer"], "level": r["level"], "date": date_, "url": f.get("url", "")}
+    if r.get("withdrawn"):
+        out["withdrawn"] = True
+        return out
+    v = _rating_token(f.get("rt", "")) if _RR_RU.search(f.get("rt", "")) else None
+    out["rating"] = v or r["rating"]
+    om = re.search(r"(стабильн|позитивн|негативн|развивающ)", (f.get("rt") or "").lower())
+    out["outlook"] = _RR_OUT[om.group(1)] if om else r.get("outlook", "")
+    return out
+
+
 RT_LOG_KEY, RT_LOG_DAYS = "ratings_log_v1", 730        # журнал рейтинговых действий: отдельно от ratings_v1
 _RT_D = re.compile(r"(?<![A-Za-zА-Яа-яЁё])(?:ru\s?D(?![A-Za-zА-Яа-я])|D\s?\(RU\)|D\.ru|RD(?![A-Za-z]))")
 _RT_ACTIONS = {"присвоен", "подтверждён", "повышен", "понижен", "отозван", "под наблюдением", "прогноз изменён"}
@@ -226,37 +318,118 @@ def parse_rating_action(text):
     return out
 
 
-def rating_log_add(log, pid, iso, text):
-    a = parse_rating_action(text)
+def rating_log_add(log, pid, iso, text, src="issuerRatings", links=None):
+    url = ""
+    if src == "ru_ratings":                      # пост ru_ratings: действие читается из «📝»/«📊», дата — из «📅», ссылка — пресс-релиз
+        agency, f = _ru_fields(text, links)
+        if not agency:
+            return
+        a = parse_rating_action("%s: %s\n" % (agency, _ru_body(agency, f)))
+        iso, url = _ru_iso(f, iso), f.get("url", "")
+    else:
+        a = parse_rating_action(text)
     if not a:
         return
     toks = sorted(name_tokens(a["issuer"]))
     if not toks:
         return
-    a.update(post=pid, date=iso[:10], tokens=toks)
+    a.update(post=pid, date=iso[:10], tokens=toks, src=src, url=url or rt_safe_url(a.get("url")))
     log["events"].append(a)
 
 
 def rating_log_trim(log):
     old = (date.today() - timedelta(days=RT_LOG_DAYS)).isoformat()
-    log["events"] = sorted((e for e in log["events"] if e["date"] >= old), key=lambda e: (e["date"], e["post"]))
+    evs = sorted((e for e in log["events"] if e["date"] >= old), key=lambda e: (e["date"], e.get("src") or "", e["post"]))
+    ru = [e for e in evs if e.get("src") == "ru_ratings"]
+
+    def dup(e):       # то же действие уже есть из ru_ratings (даты постов могут различаться на пару дней)
+        if e.get("src") == "ru_ratings":
+            return False
+        d0 = date.fromisoformat(e["date"])
+        return any(x["agency"] == e["agency"] and x["tokens"] == e["tokens"] and x["action"] == e["action"]
+                   and x["level"] == e["level"] and x.get("rating") == e.get("rating") and x.get("prev") == e.get("prev")
+                   and abs((date.fromisoformat(x["date"]) - d0).days) <= 2 for x in ru)
+    log["events"] = [e for e in evs if not dup(e)]
 
 
-def tg_page(before=None):
-    s = http_text(RATING_CH + ("?before=%d" % before if before else ""))
+def tg_parse_page(s, channel):
+    """HTML зеркала t.me/s/<канал> -> (ids, посты [(id, iso, текст, [ссылки])])."""
+    import html as _html
     ids, posts = [], []
     for blk in s.split("tgme_widget_message_wrap")[1:]:
-        m = re.search(r'data-post="issuerRatings/(\d+)"', blk)
+        m = re.search(r'data-post="%s/(\d+)"' % re.escape(channel), blk, re.I)
         if not m:
             continue
         ids.append(int(m.group(1)))
         t = re.search(r'tgme_widget_message_text[^>]*>(.*?)</div>', blk, re.S)
         d = re.search(r'<time datetime="([^"]+)"', blk)
         if t and d:
-            import html as _html
-            txt = _html.unescape(re.sub(r"<br/?>", "\n", re.sub(r"<(?!br)[^>]+>", "", t.group(1))))
-            posts.append((int(m.group(1)), d.group(1), txt))
+            raw = t.group(1)
+            links = [_html.unescape(h) for h in re.findall(r'<a\s[^>]*href="([^"]+)"', raw)]
+            txt = _html.unescape(re.sub(r"<br/?>", "\n", re.sub(r"<(?!br)[^>]+>", "", raw)))
+            posts.append((int(m.group(1)), d.group(1), txt, links))
     return ids, posts
+
+
+def tg_page(before=None, channel="ru_ratings"):
+    return tg_parse_page(http_text("%s%s%s" % (RATING_CH, channel, "?before=%d" % before if before else "")), channel)
+
+
+def rt_post_parse(channel, text, links, iso):
+    """Пост канала -> запись о рейтинге (как parse_rating_post + date/url) либо None."""
+    if channel == "ru_ratings":
+        return parse_ru_ratings_post(text, links, iso)
+    r = parse_rating_post(text)
+    if r:
+        um = re.search(r"https?://\S+", text)
+        r = dict(r, date=iso[:10], url=rt_safe_url(um.group(0).rstrip(".,)")) if um else "")
+    return r
+
+
+def rt_merge(items, key, rec):
+    """Положить запись в items: из того же канала — всегда (посты идут по возрастанию), из другого — только если свежее
+    по дате, при равной дате побеждает канал с меньшим индексом в RT_CHANNELS (ru_ratings)."""
+    old = items.get(key)
+    if old:
+        osrc, nsrc = old.get("src") or "issuerRatings", rec["src"]
+        if osrc != nsrc:
+            rk = lambda c: RT_CHANNELS.index(c) if c in RT_CHANNELS else 99
+            if (rec["date"], -rk(nsrc)) < (old["date"], -rk(osrc)):
+                return
+            if not rec.get("url") and old.get("url") and old.get("rating") == rec.get("rating"):
+                rec = dict(rec, url=old["url"])
+    items[key] = rec
+
+
+def _rt_scan(channel, base_id, cutoff):
+    got, before, pages = {}, None, 0
+    while pages < RT_MAX_PAGES:
+        ids, posts = None, None
+        for _ in range(3):
+            try:
+                ids, posts = tg_page(before, channel)
+                break
+            except Exception:  # noqa: BLE001
+                time.sleep(1.5)
+        if ids is None:
+            raise OSError("не удалось загрузить канал @%s (нет доступа к t.me)" % channel)
+        if not ids:
+            break
+        pages += 1
+        for p in posts:
+            got[p[0]] = p
+        _rt_state["progress"] = "@%s: загружено страниц %d" % (channel, pages)
+        mn = min(ids)
+        oldest = min((p[1] for p in posts), default="9")
+        if base_id and mn <= base_id:
+            break
+        if not base_id and oldest < cutoff:
+            break
+        if before is not None and mn >= before:
+            break
+        before = mn
+        time.sleep(0.25)
+    return got
 
 
 def _ratings_run():
@@ -266,67 +439,56 @@ def _ratings_run():
             sites_refresh(force=True)         # НКР: полный список эмитентов с сайта
         except Exception:  # noqa: BLE001
             pass
-        data = st.get(RT_KEY) or {"items": {}, "max_id": 0, "updated": 0}
+        data = st.get(RT_KEY) or {"items": {}, "max_ids": {}, "updated": 0}
         rlog = st.get(RT_LOG_KEY) or {"events": [], "max_id": 0}
-        base_id = min(data["max_id"], rlog["max_id"])      # пока журнал пуст — догружаем канал до границы RT_DAYS
+        dm, lm = data.setdefault("max_ids", {}), rlog.setdefault("max_ids", {"issuerRatings": rlog.get("max_id", 0)})
         cutoff = (datetime.now(timezone.utc) - timedelta(days=RT_DAYS)).isoformat()
-        got, before, pages = {}, None, 0
-        while pages < RT_MAX_PAGES:
-            ids, posts = None, None
-            for _ in range(3):
+        items, errs, okc = data["items"], [], 0
+        for ch in RT_CHANNELS:
+            try:       # пока журнал пуст — догружаем канал до границы RT_DAYS
+                got = _rt_scan(ch, min(dm.get(ch, 0), lm.get(ch, 0)), cutoff)
+            except Exception as e:  # noqa: BLE001
+                errs.append(str(e)[:120])
+                continue
+            okc += 1
+            for pid in sorted(got):
+                _, iso, text, links = got[pid]
+                if pid > lm.get(ch, 0):
+                    try:
+                        rating_log_add(rlog, pid, iso, text, ch, links)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if pid <= dm.get(ch, 0):
+                    continue
                 try:
-                    ids, posts = tg_page(before)
-                    break
+                    r = rt_post_parse(ch, text, links, iso)
                 except Exception:  # noqa: BLE001
-                    time.sleep(1.5)
-            if ids is None:
-                raise OSError("не удалось загрузить канал рейтингов (нет доступа к t.me)")
-            if not ids:
-                break
-            pages += 1
-            for p in posts:
-                got[p[0]] = p
-            _rt_state["progress"] = "загружено страниц: %d" % pages
-            mn = min(ids)
-            oldest = min((p[1] for p in posts), default="9")
-            if base_id and mn <= base_id:
-                break
-            if not base_id and oldest < cutoff:
-                break
-            if before is not None and mn >= before:
-                break
-            before = mn
-            time.sleep(0.25)
-        items = data["items"]
-        for pid in sorted(got):
-            if pid > rlog["max_id"]:
-                try:
-                    rating_log_add(rlog, pid, got[pid][1], got[pid][2])
-                except Exception:  # noqa: BLE001
-                    pass
-            if pid <= data["max_id"]:
-                continue
-            _, iso, text = got[pid]
-            r = parse_rating_post(text)
-            if not r:
-                continue
-            toks = _words_key(name_words(r["issuer"]))
-            if not toks:
-                continue
-            key = "%s|%s|%s" % (toks, r["agency"], r["level"])
-            if r.get("withdrawn"):
-                if r["level"] == "issuer":
-                    items.pop(key, None)
-                continue
-            items[key] = {"issuer": r["issuer"], "agency": r["agency"], "level": r["level"], "rating": r["rating"],
-                          "outlook": r["outlook"], "date": iso[:10], "post": pid}
-        data["max_id"] = max([data["max_id"]] + list(got))
+                    r = None
+                if not r:
+                    continue
+                toks = _words_key(name_words(r["issuer"]))
+                if not toks:
+                    continue
+                key = "%s|%s|%s" % (toks, r["agency"], r["level"])
+                if r.get("withdrawn"):
+                    if r["level"] == "issuer" and (key not in items or items[key]["date"] <= r["date"]):
+                        items.pop(key, None)
+                    continue
+                rt_merge(items, key, {"issuer": r["issuer"], "agency": r["agency"], "level": r["level"],
+                                      "rating": r["rating"], "outlook": r["outlook"], "date": r["date"], "post": pid,
+                                      "src": ch, "url": r.get("url") or ""})
+            if got:
+                dm[ch] = max(dm.get(ch, 0), max(got))
+                lm[ch] = max(lm.get(ch, 0), max(got))
+        if not okc:
+            raise OSError(errs[0] if errs else "не удалось загрузить каналы рейтингов")
+        data["max_id"] = max(dm.values() or [0])
         data["updated"] = time.time()
         st.put(RT_KEY, data)
-        rlog["max_id"] = max([rlog["max_id"]] + list(got))
+        rlog["max_id"] = lm.get("issuerRatings", rlog.get("max_id", 0))
         rating_log_trim(rlog)
         st.put(RT_LOG_KEY, rlog)
-        _rt_state["error"] = ""
+        _rt_state["error"] = "; ".join(errs)
         _rt_idx.clear()
     except Exception as e:  # noqa: BLE001
         _rt_state["error"] = str(e)[:200]
@@ -354,14 +516,20 @@ def ratings_status():
             "progress": _rt_state["progress"], "error": _rt_state["error"]}
 
 
+_RT_PREV = {"ratings_v3": ("ratings_v2", "ratings_v1")}
+
+
 def _rt_src(key):
     """Хранилище рейтингов; пока новая версия пуста (после смены ключа идёт пересканирование) — берём прежнюю."""
     st = store()
     d = st.get(key)
     if d and d.get("items"):
         return d, 2
-    old = st.get(key[:-2] + "v1") if key.endswith("_v2") else None
-    return (old, 1) if old and old.get("items") else (d or {}, 2)
+    for i, k in enumerate(_RT_PREV.get(key) or ((key[:-2] + "v1",) if key.endswith("_v2") else ())):
+        old = st.get(k)
+        if old and old.get("items"):
+            return old, 1 + i * 10
+    return d or {}, 2
 
 
 def ratings_stamp():
@@ -376,7 +544,8 @@ def _rating_index():
         merged = {}
         for src in (d.get("items") or {}, sd.get("items") or {}, ed.get("items") or {}):
             for k, it in src.items():
-                if it["date"] >= old and (k not in merged or it["date"] >= merged[k]["date"]):
+                if it["date"] >= old and (k not in merged or it["date"] > merged[k]["date"]
+                                          or (it["date"] == merged[k]["date"] and not (merged[k].get("url") or merged[k].get("post")))):
                     merged[k] = it
         items = [(it, name_words(it["issuer"])) for it in merged.values()]
         exact, inv = {}, {}
@@ -389,6 +558,12 @@ def _rating_index():
         _rt_idx.clear()
         _rt_idx.update(u=stamp, items=items, exact=exact, inv=inv)
     return _rt_idx
+
+
+def _rt_link(it):
+    """url пресс-релиза (если есть), иначе ссылка на пост в Telegram, иначе None; плюс post/src записи."""
+    post, src = it.get("post"), it.get("src") or ("issuerRatings" if it.get("post") else None)
+    return {"url": rt_safe_url(it.get("url")) or rt_post_url(src, post) or None, "post": post, "src": src}
 
 
 def rating_for(name):
@@ -419,11 +594,11 @@ def rating_for(name):
     if not best:
         return None
     allr = [{"agency": a, "rating": it["rating"], "issuer": it["issuer"], "date": it["date"], "outlook": it["outlook"],
-             "approx": sc < 100} for a, (sc, it) in best.items()]
+             "approx": sc < 100, **_rt_link(it)} for a, (sc, it) in best.items()]
     pool = [x for x in allr if not x["approx"]] or allr                  # приблизительные не влияют на «худший», пока есть точные
     low = max(pool, key=lambda x: RATING_SCALE.index(x["rating"]))     # консервативно: худшая из оценок
     return {"v": low["rating"], "agency": low["agency"], "issuer": low["issuer"], "date": low["date"],
-            "approx": low["approx"], "all": allr}
+            "approx": low["approx"], "url": low["url"], "post": low["post"], "src": low["src"], "all": allr}
 
 
 def apply_ratings(rows):
