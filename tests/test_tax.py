@@ -433,3 +433,75 @@ class Forecast(unittest.TestCase):
         self.assertEqual(sk[0]["ldv_days"], 11)
         self.assertIn("ЛДВ", sk[0]["reason"])
         self.assertNotIn("w", [c["uid"] for c in f["harvest"]])
+
+
+class FeeKeyAllocation(unittest.TestCase):
+    def test_same_second_fees_not_multiplied_n_squared(self):
+        # Две покупки в одну секунду без parentOperationId + две комиссии -5 и -5 -> суммарная комиссия 10, а не 20
+        ts = "2025-01-10T12:00:00Z"
+        b1 = buy("2025-01-10", 1, 1000)
+        b2 = buy("2025-01-10", 1, 1000)
+        f1 = op("2025-01-10", "BROKER_FEE", -5)
+        f2 = op("2025-01-10", "BROKER_FEE", -5)
+        for o in (b1, b2, f1, f2):
+            o["date"] = ts
+        s = sell("2025-02-10", 2, 1100)
+        eng = M.tax_engine([b1, b2, f1, f2, s], None, None)
+        self.assertAlmostEqual(sum(r["cost"] for r in eng["sales"]), 2010.0, places=6)
+
+    def test_fee_key_proportional_partial_coverage_and_zero_turnover(self):
+        # t1 имеет собственную commission=-3; t4 привязана через parentOperationId (-7 не должна утечь в fee_key);
+        # t2 (оборот 1000) и t3 (оборот 2000) делят общую комиссию 12 пропорционально 1:2 -> 4 и 8
+        ts = "2025-01-10T12:00:00Z"
+        t1 = buy("2025-01-10", 1, 1000, comm=3)
+        t2 = buy("2025-01-10", 1, 1000)
+        t3 = buy("2025-01-10", 1, 2000)
+        t4 = buy("2025-01-10", 1, 500)
+        f_parent = op("2025-01-10", "BROKER_FEE", -7)
+        f_parent["parentOperationId"] = t4["id"]
+        f_shared = op("2025-01-10", "BROKER_FEE", -12)
+        for o in (t1, t2, t3, t4, f_parent, f_shared):
+            o["date"] = ts
+        eng = M.tax_engine([t1, t2, t3, t4, f_parent, f_shared], None, None)
+        units = [round(l["unit"], 6) for l in eng["open"]]
+        self.assertEqual(units, [1003.0, 1004.0, 2008.0, 507.0])
+
+        # Нулевой оборот у трёх сделок в одну секунду -> равное деление с остатком на последнюю сделку, сумма строго 10.0
+        z1 = op("2025-01-11", "BUY", 0.0, qty=1, uid="uz")
+        z2 = op("2025-01-11", "BUY", 0.0, qty=1, uid="uz")
+        z3 = op("2025-01-11", "BUY", 0.0, qty=1, uid="uz")
+        fz = op("2025-01-11", "BROKER_FEE", -10, uid="uz")
+        for o in (z1, z2, z3, fz):
+            o["date"] = "2025-01-11T12:00:00Z"
+        eng_z = M.tax_engine([z1, z2, z3, fz], None, None)
+        self.assertAlmostEqual(sum(l["qty"] * l["unit"] for l in eng_z["open"]), 10.0, places=9)
+
+    def test_finalize_import_preserves_imp_uid_on_fee_and_tax(self):
+        class Offline:
+            ready = False
+
+        raw_ops = [
+            {"id": "imp-1", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_BUY",
+             "payment": money(-1000), "quantity": "1", "quantityDone": "1", "price": money(1000),
+             "name": "Unknown", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-1-f", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_BROKER_FEE",
+             "payment": money(-5), "name": "Комиссия: Unknown", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-1-t", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_TAX",
+             "payment": money(-13), "name": "Налог", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-1-dt", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_DIVIDEND_TAX",
+             "payment": money(-2), "name": "Налог див", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-1-ct", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_BOND_TAX",
+             "payment": money(-1), "name": "Налог куп", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-2", "date": "2025-02-10T12:00:00Z", "type": "OPERATION_TYPE_SELL",
+             "payment": money(1200), "quantity": "1", "quantityDone": "1", "price": money(1200),
+             "name": "Unknown", "_ident": "UNKNOWNISIN"},
+        ]
+        finalized, _ = M.finalize_import(Offline(), raw_ops, keep_demo=True, synth=False)
+        by_id = {o["id"]: o for o in finalized}
+        self.assertEqual(by_id["imp-1-f"].get("instrumentUid"), "imp:UNKNOWNISIN")
+        self.assertEqual(by_id["imp-1-t"].get("instrumentUid"), "imp:UNKNOWNISIN")
+        self.assertEqual(by_id["imp-1-dt"].get("instrumentUid"), "imp:UNKNOWNISIN")
+        self.assertEqual(by_id["imp-1-ct"].get("instrumentUid"), "imp:UNKNOWNISIN")
+        eng = M.tax_engine(finalized, None, None)
+        self.assertEqual(len(eng["sales"]), 1)
+        self.assertAlmostEqual(eng["sales"][0]["cost"], 1005.0, places=6)

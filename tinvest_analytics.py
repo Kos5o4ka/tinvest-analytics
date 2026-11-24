@@ -4169,7 +4169,8 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
                 o["instrumentKind"] = "INSTRUMENT_TYPE_" + r["type"].upper()
             if classify(o["type"]) in ("buy", "sell", "coupons", "dividends", "repayments") and r.get("name"):
                 o["name"] = r["name"]
-        elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out"):
+        elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out",
+                                               "fee_broker", "tax_trade", "tax_dividend", "tax_coupon"):
             o["instrumentUid"] = "imp:" + ident
     ops = import_merge_ops(existing, ops, periods) if existing else sorted(ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
     ops = import_apply_splits(ops)   # пары обмена на дни сплитов по всей истории счёта
@@ -15790,27 +15791,67 @@ def tax_engine(ops, types=None, fx=None, held=None):
 
     ops = sorted([o for o in ops if not str(o.get("state") or "").endswith("CANCELED")], key=lambda o: o.get("date") or "")
     fee_parent, fee_key = defaultdict(float), defaultdict(float)
+
+    def fee_k(o):
+        return (o.get("_acc") or "", (o.get("date") or "")[:19], o.get("instrumentUid") or o.get("figi") or o.get("_ident") or "")
+
     for o in ops:
         if classify(o.get("type")) == "fee_broker":
             dt = parse_dt(o.get("date"))
             amt = abs(qf(o.get("payment"))) * rate(cur_of(o.get("payment")), dt.date())
             if o.get("parentOperationId"):
                 fee_parent[o["parentOperationId"]] += amt
-            fee_key[(o.get("_acc") or "", (o.get("date") or "")[:19], o.get("instrumentUid") or o.get("figi") or "")] += amt
+            else:
+                fee_key[fee_k(o)] += amt
 
-    def fee_of(o, dt):
+    # Без parentOperationId комиссии в одной секунде делятся между сделками без собственной комиссии пропорционально обороту
+    fee_trades = defaultdict(list)
+    for idx, o in enumerate(ops):
+        if classify(o.get("type")) in ("buy", "sell"):
+            c = o.get("commission")
+            if (c and qf(c)) or (o.get("id") and o["id"] in fee_parent):
+                continue
+            uid = o.get("instrumentUid") or o.get("figi") or o.get("_ident") or ""
+            info = types.get(uid) or {}
+            itype = o.get("instrumentType") or info.get("type") or ""
+            itype = {"bonds": "bond", "shares": "share"}.get(itype, itype) or "share"
+            if itype != "futures" and (itype in TAX_SKIP_TYPES or not uid or not op_qty(o)):
+                continue
+            k = fee_k(o)
+            if k in fee_key:
+                dt = parse_dt(o.get("date"))
+                fee_trades[k].append((idx, abs(qf(o.get("payment"))) * rate(cur_of(o.get("payment")), dt.date())))
+
+    fee_alloc = {}
+    for k, items in fee_trades.items():
+        tot_fee = fee_key.get(k, 0.0)
+        if not tot_fee or not items:
+            continue
+        tot_turn = sum(tr for _, tr in items)
+        left_fee = tot_fee
+        for i, (idx, tr) in enumerate(items):
+            if i == len(items) - 1:
+                part = left_fee
+            elif tot_turn > 0:
+                part = min(left_fee, tot_fee * (tr / tot_turn))
+            else:
+                part = min(left_fee, tot_fee / len(items))
+            fee_alloc[idx] = part
+            left_fee -= part
+
+    def fee_of(idx, o, dt):
         c = o.get("commission")
         if c and qf(c):
             return abs(qf(c)) * rate(cur_of(c), dt.date())
         if o.get("id") and o["id"] in fee_parent:
             return fee_parent[o["id"]]
-        return fee_key.get((o.get("_acc") or "", (o.get("date") or "")[:19], o.get("instrumentUid") or o.get("figi") or ""), 0.0)
+        return fee_alloc.pop(idx, 0.0)
 
     books, sales, meta = {}, [], {}
     moved, convs = {}, []
     inc = defaultdict(tx_inc_new)
     turn = [0.0, 0.0]
-    for o in ops:
+    for idx, o in enumerate(ops):
         kind = classify(o.get("type"))
         acc = o.get("_acc") or ""
         dt = parse_dt(o.get("date"))
@@ -15842,7 +15883,7 @@ def tax_engine(ops, types=None, fx=None, held=None):
             I["deriv"] += pay * r
         elif kind in ("buy", "sell"):
             q = op_qty(o)
-            fee = fee_of(o, dt)
+            fee = fee_of(idx, o, dt)
             if itype == "futures":
                 I["deriv_fee"] += fee
                 continue

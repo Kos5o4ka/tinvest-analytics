@@ -434,7 +434,8 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
                 o["instrumentKind"] = "INSTRUMENT_TYPE_" + r["type"].upper()
             if classify(o["type"]) in ("buy", "sell", "coupons", "dividends", "repayments") and r.get("name"):
                 o["name"] = r["name"]
-        elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out"):
+        elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out",
+                                               "fee_broker", "tax_trade", "tax_dividend", "tax_coupon"):
             o["instrumentUid"] = "imp:" + ident
     ops = import_merge_ops(existing, ops, periods) if existing else sorted(ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
     ops = import_apply_splits(ops)   # пары обмена на дни сплитов по всей истории счёта
