@@ -46,5 +46,88 @@ class BenchWindow(unittest.TestCase):
             self.assertAlmostEqual(len(days) - 1 - i0, n + 1, delta=1)
 
 
+class RiskBondFlowsMode(unittest.TestCase):
+    def test_build_risk_uses_maturity_flows_when_to_is_maturity(self):
+        today = A.date.today()
+        d_off = (today + A.timedelta(days=180)).isoformat()
+        d_c2 = (today + A.timedelta(days=360)).isoformat()
+        d_c3 = (today + A.timedelta(days=540)).isoformat()
+        d_mat = (today + A.timedelta(days=730)).isoformat()
+        bz = {
+            "coupons": [
+                {"coupondate": d_off, "value": 50.0},
+                {"coupondate": d_c2, "value": 50.0},
+                {"coupondate": d_c3, "value": 50.0},
+                {"coupondate": d_mat, "value": 50.0},
+            ],
+            "amort": [],
+            "offers": [{"offerdate": d_off, "offertype": "Оферта", "price": 100.0}],
+        }
+        rep = {
+            "rows": [{
+                "isin": "RU000TEST005", "name": "TestBond", "ticker": "TB5", "uid": "u5",
+                "value_rub": 1000.0, "share": 100.0, "rating": None, "ytm": 25.0, "spread": 5.0,
+                "dur": 1.6, "mdur": 1.4, "floating": False, "nominal": 1000.0,
+                "end": d_mat, "maturity": d_mat, "to": "maturity", "cf_source": "moex",
+            }]
+        }
+        old_bb, old_bz, old_kr, old_inf = A.build_bonds, A.moex_bondization, A.keyrate_forecast_info, A.inflation_forecast
+        A.mem_clear()
+        A.build_bonds = lambda cfg, acc: rep
+        A.moex_bondization = lambda isin: bz
+        A.keyrate_forecast_info = lambda kind="cbr": {"key_rate": 20.0, "path": [(today.isoformat(), 20.0), (d_c2, 20.0)], "source": "cbr", "source_name": "ЦБ"}
+        A.inflation_forecast = lambda: {"source": "none", "yearly": []}
+        try:
+            res = A.build_risk({"sandbox": False, "token": ""}, "acc_calc05_mat")
+        finally:
+            A.build_bonds, A.moex_bondization, A.keyrate_forecast_info, A.inflation_forecast = old_bb, old_bz, old_kr, old_inf
+        scn = res["rows"][0]["scn"]
+        # При погашении через 2 года снижение ставки до 10% переоценивает тело после 365д выше, чем hold
+        self.assertGreater(scn["fix10"]["total"], scn["hold"]["total"])
+        # За первые 365д приходят оба купона (d_off и d_c2), а не только первый до оферты
+        dirty_mat = A._bc_pv(A.bond_flows(bz, today.isoformat(), 1000.0, mode="maturity")[0], today.isoformat(), 0.25)
+        self.assertAlmostEqual(scn["hold"]["coupons"], 100.0 / dirty_mat * 1000.0, places=4)
+
+    def test_build_risk_respects_specific_offer_end_date(self):
+        today = A.date.today()
+        d_off1 = (today + A.timedelta(days=180)).isoformat()
+        d_off2 = (today + A.timedelta(days=540)).isoformat()
+        d_mat = (today + A.timedelta(days=730)).isoformat()
+        bz = {
+            "coupons": [
+                {"coupondate": d_off1, "value": 50.0},
+                {"coupondate": (today + A.timedelta(days=360)).isoformat(), "value": 50.0},
+                {"coupondate": d_off2, "value": 50.0},
+                {"coupondate": d_mat, "value": 50.0},
+            ],
+            "amort": [],
+            "offers": [
+                {"offerdate": d_off1, "offertype": "Оферта", "price": 100.0},
+                {"offerdate": d_off2, "offertype": "Оферта", "price": 102.0},
+            ],
+        }
+        rep = {
+            "rows": [{
+                "isin": "RU000TEST05B", "name": "TestBond2", "ticker": "TB5B", "uid": "u5b",
+                "value_rub": 1000.0, "share": 100.0, "rating": None, "ytm": 25.0, "spread": 5.0,
+                "dur": 1.3, "mdur": 1.1, "floating": False, "nominal": 1000.0,
+                "end": d_off2, "maturity": d_mat, "to": "offer", "cf_source": "moex",
+            }]
+        }
+        old_bb, old_bz, old_kr, old_inf = A.build_bonds, A.moex_bondization, A.keyrate_forecast_info, A.inflation_forecast
+        A.mem_clear()
+        A.build_bonds = lambda cfg, acc: rep
+        A.moex_bondization = lambda isin: bz
+        A.keyrate_forecast_info = lambda kind="cbr": {"key_rate": 20.0, "path": [(today.isoformat(), 20.0), (d_off2, 20.0)], "source": "cbr", "source_name": "ЦБ"}
+        A.inflation_forecast = lambda: {"source": "none", "yearly": []}
+        try:
+            res = A.build_risk({"sandbox": False, "token": ""}, "acc_calc05_off")
+        finally:
+            A.build_bonds, A.moex_bondization, A.keyrate_forecast_info, A.inflation_forecast = old_bb, old_bz, old_kr, old_inf
+        scn = res["rows"][0]["scn"]
+        # Оферта d_off2 (+540д) > hd (+365д), поэтому rem не пуст и fix10 > hold
+        self.assertGreater(scn["fix10"]["total"], scn["hold"]["total"])
+
+
 if __name__ == "__main__":
     unittest.main()

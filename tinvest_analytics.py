@@ -3167,7 +3167,9 @@ def build_risk(cfg, acc, q=None):
         if row["exact"]:
             try:
                 bz = moex_bondization(isin)
-                flows, kind, _e = bond_flows(bz, today, face, floating=bool(r.get("floating")), est_out=est) if bz else (None, None, None)
+                mode = r.get("to") if r.get("to") in ("maturity", "offer") else "auto"
+                cut = (r["end"], next((o.get("price") for o in ((bz or {}).get("offers") or []) if o.get("offerdate") == r["end"] and o.get("price")), 100.0)) if mode == "offer" and r.get("end") else None
+                flows, kind, _e = bond_flows(bz, today, face, mode=mode, floating=bool(r.get("floating")), est_out=est, cut=cut) if bz else (None, None, None)
             except Exception:  # noqa: BLE001
                 flows = None
         if flows:
