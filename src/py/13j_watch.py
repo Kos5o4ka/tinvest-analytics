@@ -1,10 +1,12 @@
 # ═══════════════════════════════ список наблюдения, заметки, уведомления в Telegram ═══════════════════════════════
 # Список наблюдения и дневник хранятся только в локальной базе. Уведомления в Telegram идут через сервер данных
 # (POST /v1/notify с ключом из бота) и общий бот: наружу уходят только тексты уведомлений, токен Т-Инвестиций — никогда.
+# По желанию (tg_server) на сервер уходит ещё «подписка» на тревоги по публичным данным — см. раздел «проверка на сервере» ниже.
 # Прежний «личный бот» (tg_token, tg_chat) удалён; старые значения стираются из настроек при запуске.
 
 WATCH_KEY, NOTES_KEY, TG_SENT_KEY, TG_STATE_KEY = "watch_v1", "notes_v1", "tg_sent_v1", "tg_state_v1"
-TG_DEFAULTS = {"tg_enabled": False, "tg_on_mon": True, "tg_on_watch": True, "tg_pay_days": 0, "tg_digest": False, "tg_digest_time": "10:00"}
+TG_DEFAULTS = {"tg_enabled": False, "tg_on_mon": True, "tg_on_watch": True, "tg_pay_days": 0, "tg_digest": False, "tg_digest_time": "10:00",
+               "tg_server": False}
 TG_LEGACY_KEYS = ("tg_token", "tg_chat")
 _watch_lock = threading.Lock()
 _tg_lock = threading.Lock()
@@ -94,6 +96,7 @@ def watch_post(cfg, body):
                     cur.pop("note", None)
         store().put(WATCH_KEY, items)
     mem_clear_watch()
+    tg_srv_kick()
     return {"ok": True, "isins": [x["isin"] for x in items], "in_watch": any(x["isin"] == isin for x in items)}
 
 
@@ -159,6 +162,7 @@ def notes_post(cfg, body):
             raise ApiError("Неизвестное действие.", 400)
         store().put(NOTES_KEY, items)
     mem_clear_watch()
+    tg_srv_kick()
     return {"ok": True}
 
 
@@ -187,14 +191,7 @@ def watch_payload(cfg, acc=None, q=None, force=False):
                    mat=(s or {}).get("mat") or ci.get("maturity"), offer=(s or {}).get("offer"), cur=(s or {}).get("cur"),
                    coupon=(s or {}).get("coupon"), chg5=m.get("chg5"), chg30=m.get("chg30"), spread_chg30=m.get("spread_chg30"),
                    spark=m.get("spark"), flags=m.get("flags") or [], rating_state=m.get("rating"))
-        base = {"isin": isin, "isins": [isin], "name": row["name"], "bonds": [row["name"]]}
-        ty, tp = it.get("target_yield"), it.get("target_price")
-        if s and ty is not None and s.get("yield") is not None and s["yield"] >= ty:
-            alerts.append(dict(base, id="gy|%s|%s" % (isin, ty), severity="medium", kind="goal", date=today,
-                               message="Цель достигнута: доходность %s %% (цель — от %s %%)" % (_f2(s["yield"]), _f2(ty)), url=""))
-        if s and tp is not None and s.get("price") is not None and s["price"] <= tp:
-            alerts.append(dict(base, id="gp|%s|%s" % (isin, tp), severity="medium", kind="goal", date=today,
-                               message="Цель достигнута: цена %s %% (цель — не выше %s %%)" % (_f2(s["price"]), _f2(tp)), url=""))
+        alerts += watch_goal_alerts(isin, row["name"], s, it.get("target_yield"), it.get("target_price"), today)
         if not s:
             row["flags"] = row["flags"] + ["нет данных Мосбиржи"]
         rows.append(row)
@@ -215,6 +212,21 @@ def watch_payload(cfg, acc=None, q=None, force=False):
 
 def _f2(x):
     return ("%.2f" % x).replace(".", ",")
+
+
+def watch_goal_alerts(isin, name, s, ty, tp, today):
+    """Цели по бумаге списка наблюдения. Чистая функция; её зеркало на сервере — alerts.goal_alerts (тест на совпадение)."""
+    out = []
+    if not s:
+        return out
+    base = {"isin": isin, "isins": [isin], "name": name, "bonds": [name]}
+    if ty is not None and s.get("yield") is not None and s["yield"] >= ty:
+        out.append(dict(base, id="gy|%s|%s" % (isin, ty), severity="medium", kind="goal", date=today,
+                        message="Цель достигнута: доходность %s %% (цель — от %s %%)" % (_f2(s["yield"]), _f2(ty)), url=""))
+    if tp is not None and s.get("price") is not None and s["price"] <= tp:
+        out.append(dict(base, id="gp|%s|%s" % (isin, tp), severity="medium", kind="goal", date=today,
+                        message="Цель достигнута: цена %s %% (цель — не выше %s %%)" % (_f2(s["price"]), _f2(tp)), url=""))
+    return out
 
 
 def watch_isins_get(cfg, acc, q, force):
@@ -366,7 +378,8 @@ def tg_public(cfg):
 
 def tg_save(cfg, body):
     cfg = load_config()
-    for k in ("tg_enabled", "tg_on_mon", "tg_on_watch", "tg_digest"):
+    was = bool(cfg.get("tg_server") and cfg.get("tg_enabled"))
+    for k in ("tg_enabled", "tg_on_mon", "tg_on_watch", "tg_digest", "tg_server"):
         if k in body:
             cfg[k] = bool(body[k])
     if "tg_pay_days" in body:
@@ -380,7 +393,17 @@ def tg_save(cfg, body):
     for k in TG_LEGACY_KEYS:
         cfg.pop(k, None)
     save_config(cfg)
-    return {"ok": True, "settings": tg_public(cfg)}
+    res = {"ok": True, "settings": tg_public(cfg)}
+    now_on = bool(cfg.get("tg_server") and cfg.get("tg_enabled"))
+    if was and not now_on and _tg_srv_state():
+        try:                     # режим выключен: данные с сервера удаляем сразу
+            with _tg_lock:
+                tg_srv_delete()
+        except ApiError as e:
+            res["warning"] = str(e)
+    elif now_on and was:
+        tg_srv_kick()            # разделы или число дней изменились — обновить подписку (первое включение синхронизирует UI явно)
+    return res
 
 
 def tg_info(cfg, acc, q, force):
@@ -433,9 +456,10 @@ def _tg_alert_line(a):
     return line + ("\n" + " · ".join(links) if links else "")
 
 
-def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
-    """Отправляет ещё не отправленные тревоги: до трёх сообщений за проверку, до 10 тревог и в предел длины каждое;
-    остальное уйдёт в следующий раз (в последнем сообщении об этом сказано). Возвращает число отправленных тревог."""
+def tg_dispatch_plan(title, alerts, sent, now, icon="🔔"):
+    """Раскладка ещё не отправленных тревог по сообщениям: до трёх сообщений за проверку, до 10 тревог и в предел длины
+    каждое; остальное уйдёт в следующий раз (в последнем сообщении об этом сказано). -> [(текст, [(ключ, тревога)])].
+    Чистая функция; зеркало на сервере — alerts.dispatch_plan."""
     fresh = []
     for a in alerts:
         k = _tg_key(a)
@@ -444,10 +468,10 @@ def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
             continue
         fresh.append((k, a))
     if not fresh:
-        return 0
+        return []
     head = _tg_head(icon, title)
     room = TG_LIMIT - len(TG_DISCLAIMER) - len(head) - 120
-    sent_n, i = 0, 0
+    plan, i = [], 0
     for msg_no in range(3):
         if i >= len(fresh):
             break
@@ -461,7 +485,15 @@ def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
             size += len(ln) + 2
             i += 1
         tail = ("\n\n…и ещё %d — придут при следующей проверке" % (len(fresh) - i)) if msg_no == 2 and i < len(fresh) else ""
-        tg_send(cfg, "%s\n\n%s%s" % (head, "\n\n".join(lines), tail))
+        plan.append(("%s\n\n%s%s" % (head, "\n\n".join(lines), tail), chunk))
+    return plan
+
+
+def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
+    """Отправляет план tg_dispatch_plan. Возвращает число отправленных тревог."""
+    sent_n = 0
+    for text, chunk in tg_dispatch_plan(title, alerts, sent, now, icon):
+        tg_send(cfg, text)
         for k, a in chunk:
             sent[k] = now
         sent_n += len(chunk)
@@ -589,6 +621,20 @@ def _tg_ev_line(e):
     return "%s · <b>%s</b> — %s%s" % (_tg_date(e[0]), _tg_esc(e[2]), _TG_EV.get(e[1], "выплата"), amt)
 
 
+def tg_pay_fresh(ev, sent):
+    """Ещё не отправленные выплаты -> [(ключ «pay|дата|вид|название», событие)]. Зеркало на сервере — alerts.pay_fresh."""
+    out = []
+    for e in ev:
+        k = "pay|%s|%s|%s" % (e[0], e[1], e[2])
+        if k not in sent:
+            out.append((k, e))
+    return out
+
+
+def tg_pay_text(days, fresh):
+    return "%s\n\n%s" % (_tg_head("💰", "Ближайшие выплаты", "%d дн." % days), _tg_cap([_tg_ev_line(e) for k, e in fresh], 15))
+
+
 def tg_digest_text(cfg):
     parts = [_tg_head("📈", "Сводка TAnalytic", _tg_date(date.today().isoformat()))]
     if cfg.get("token"):
@@ -639,6 +685,14 @@ def tg_tick(force_digest=False, manual=False):
         now = time.time()
         sent = {k: v for k, v in (st.get(TG_SENT_KEY) or {}).items() if now - v < 400 * DAY}
         n = 0
+        srv = False
+        try:        # серверная проверка: обновить подписку и не дублировать то, что отправит сервер
+            if cfg.get("tg_server") and cfg.get("tg_enabled"):
+                _tg_srv_sync(cfg, sent, force=not _tg_srv_boot[0])
+                _tg_srv_boot[0] = True
+            srv = tg_srv_active(cfg)
+        except Exception:  # noqa: BLE001
+            srv = tg_srv_active(cfg)
         try:
             if cfg.get("tg_on_mon", True) and cfg.get("token"):
                 al = [a for a in build_monitor(cfg, "all")["alerts"] if a["severity"] == "high"]
@@ -646,7 +700,7 @@ def tg_tick(force_digest=False, manual=False):
         except Exception:  # noqa: BLE001
             pass
         try:
-            if cfg.get("tg_on_mon", True) and cfg.get("token"):
+            if cfg.get("tg_on_mon", True) and cfg.get("token") and not srv:
                 today_ = date.today().isoformat()
                 due = [(k, t) for k, t in tg_offer_due(_tg_offer_items(cfg, today_), today_) if k not in sent][:10]
                 if due:
@@ -658,7 +712,8 @@ def tg_tick(force_digest=False, manual=False):
             pass
         try:
             if cfg.get("tg_on_watch", True) and (watch_isins() or notes_all()):
-                al = [a for a in watch_payload(cfg)["alerts"] if a["severity"] != "info"]
+                al = [a for a in watch_payload(cfg)["alerts"] if a["severity"] != "info"
+                      and not (srv and a.get("kind") in TG_SRV_KINDS)]
                 n += _tg_dispatch(cfg, "Наблюдение и цели", al, sent, now, icon="⭐")
         except Exception:  # noqa: BLE001
             pass
@@ -674,15 +729,10 @@ def tg_tick(force_digest=False, manual=False):
             pass
         try:
             days = int(cfg.get("tg_pay_days") or 0)
-            if days > 0 and cfg.get("token"):
-                ev = [e for e in _tg_payments(cfg, days)]
-                fresh = []
-                for e in ev:
-                    k = "pay|%s|%s|%s" % (e[0], e[1], e[2])
-                    if k not in sent:
-                        fresh.append((k, e))
+            if days > 0 and cfg.get("token") and not srv:
+                fresh = tg_pay_fresh(_tg_payments(cfg, days), sent)
                 if fresh:
-                    tg_send(cfg, "%s\n\n%s" % (_tg_head("💰", "Ближайшие выплаты", "%d дн." % days), _tg_cap([_tg_ev_line(e) for k, e in fresh], 15)))
+                    tg_send(cfg, tg_pay_text(days, fresh))
                     for k, e in fresh:
                         sent[k] = now
                     n += len(fresh)
@@ -708,6 +758,220 @@ def tg_tick(force_digest=False, manual=False):
         return 0            # сеть/Telegram недоступны — попробуем в следующий раз; детали (с токеном) не пишем
     finally:
         _tg_lock.release()
+
+
+# ═══════════════ проверка на сервере, пока программа закрыта (по желанию, переключатель tg_server) ═══════════════
+# Приложение отправляет на сервер данных «подписку» — только правила по публичным данным (см. tg_srv_payload и
+# server/alerts.py): цели по бумагам наблюдения, даты напоминаний дневника (без текста), ближайшие оферты и выплаты
+# по облигациям портфеля. Токен, номера счетов, стоимость портфеля и остатки денег не отправляются никогда.
+# Пока режим включён и сервер принял подписку, эти виды (TG_SRV_KINDS, оферты, выплаты) шлёт только сервер — без дублей:
+# ключи уже отправленного передаются в обе стороны (поле sent).
+
+TG_SRV_KEY = "tg_srv_v1"
+TG_SRV_KINDS = ("goal", "reminder")
+TG_SRV_PREFIX = ("gy|", "gp|", "rm|", "ofr|", "pay|")
+TG_SRV_REFRESH = 6 * 3600         # подписку с прежним содержимым обновляем не чаще раза в 6 ч (даты выплат, статус купона после оферты)
+TG_SRV_PAY_EXTRA = 8              # выплаты — с запасом на срок жизни подписки (ключ из бота действует 7 дней)
+_tg_srv_boot = [False]            # первая проверка после запуска синхронизирует подписку принудительно
+_tg_srv_kick_on = [False]
+
+
+def tg_srv_payload(cfg, sent):
+    """Подписка для сервера. Только ISIN, названия бумаг, пороги, даты и суммы ближайших выплат; ничего о счетах."""
+    today = date.today().isoformat()
+    p = {"v": 1, "goals": [], "reminders": [], "offers": [], "pay_days": 0, "pays": [], "sent": []}
+    if cfg.get("tg_on_watch", True):
+        items = watch_items()
+        notes = [n for n in notes_all() if n.get("remind_on")]
+        sec = _scr_by_isin() if items or notes else {}
+        for it in items:
+            g = {k: it[k] for k in ("target_yield", "target_price") if it.get(k) is not None}
+            if g:
+                p["goals"].append(dict(g, isin=it["isin"], name=str(_bond_name(it["isin"], sec))[:120]))
+        for n in notes:
+            p["reminders"].append({"id": n["id"], "isin": n["isin"], "name": str(_bond_name(n["isin"], sec))[:120],
+                                   "date": n["date"], "remind_on": n["remind_on"]})
+    if cfg.get("tg_on_mon", True) and cfg.get("token"):
+        try:
+            p["offers"] = [{k: o.get(k) for k in ("isin", "name", "kind", "date", "period_start", "period_end", "coupon_status", "new_rate")}
+                           for o in _tg_offer_items(cfg, today)]
+        except Exception:  # noqa: BLE001
+            pass
+    days = int(cfg.get("tg_pay_days") or 0)
+    if days > 0 and cfg.get("token"):
+        try:
+            p["pays"] = [{"date": e[0], "kind": e[1], "name": str(e[2] or "")[:120], "amount": round(e[3], 2) if e[3] else None}
+                         for e in _tg_payments(cfg, days + TG_SRV_PAY_EXTRA)][:1000]
+            p["pay_days"] = days
+        except Exception:  # noqa: BLE001
+            pass
+    for k in ("offers", "goals", "reminders"):
+        p[k] = p[k][:300]
+    p["sent"] = sorted(k for k in sent if k.startswith(TG_SRV_PREFIX))[-5000:]
+    return p
+
+
+def tg_srv_req(path, body=None, timeout=20):
+    """{сервер}/v1/alerts/<path> -> (код, dict). GET без тела, иначе POST JSON. Бросает исключение при сетевой ошибке."""
+    srv, key = ds_conf()
+    if not srv or not key:
+        raise ApiError("Нужен сервер данных и вход по ключу из бота.", 400)
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(srv.rstrip("/") + "/v1/alerts/" + path, data=data, method="GET" if body is None else "POST",
+                                 headers={"Content-Type": "application/json", "X-Client-Key": key, "User-Agent": EXT_UA["User-Agent"]})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+            code, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        code, raw = e.code, e.read()
+    try:
+        j = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        j = None
+    return code, (j if isinstance(j, dict) else {})
+
+
+_TG_SRV_ERR = {404: "Сервер данных пока не поддерживает проверку тревог — уведомления отправляет программа, пока она запущена.",
+               402: "Проверка на сервере доступна в тарифе Pro.", 401: "Войдите по ключу из бота.", 403: "Войдите по ключу из бота.",
+               429: "Слишком частые обновления, повторим позже.",
+               409: "Проверка на сервере остановлена в боте (/alerts). Чтобы возобновить, снова включите её здесь."}
+
+
+def _tg_srv_state():
+    return dict(store().get(TG_SRV_KEY) or {})
+
+
+def tg_srv_active(cfg):
+    """Сервер принял подписку и сам шлёт TG_SRV_KINDS, оферты и выплаты: программе их отправлять не нужно."""
+    return bool(cfg.get("tg_server") and cfg.get("tg_enabled") and _tg_srv_state().get("active"))
+
+
+def _tg_srv_merge(sent, keys, now):
+    for k in keys or []:
+        if isinstance(k, str) and k.startswith(TG_SRV_PREFIX):
+            sent.setdefault(k, now)
+
+
+def _tg_srv_sync(cfg, sent, force=False, resume=False):
+    """Отправляет подписку, если она изменилась, устарела или force. Состояние — в TG_SRV_KEY. -> True, если подписка на сервере.
+    resume=True — только по явному включению пользователем: снимает остановку, сделанную в боте (/alerts)."""
+    st, now = _tg_srv_state(), time.time()
+    p = tg_srv_payload(cfg, sent)
+    if resume:
+        p["resume"] = True
+    h = hashlib.sha256(json.dumps({k: v for k, v in p.items() if k not in ("sent", "resume")}, sort_keys=True).encode("utf-8")).hexdigest()
+    if not force and st.get("active") and st.get("hash") == h and now - (st.get("ok") or 0) < TG_SRV_REFRESH:
+        return True
+    try:
+        code, j = tg_srv_req("sync", p)
+    except ApiError as e:
+        st.update(err=str(e), at=now)
+        store().put(TG_SRV_KEY, st)
+        return bool(st.get("active"))
+    except Exception:  # noqa: BLE001
+        st.update(err="Сервер недоступен, повторим при следующей проверке.", at=now)
+        store().put(TG_SRV_KEY, st)
+        return bool(st.get("active"))      # сервер недоступен: и программа отправить не сможет (уведомления идут через него)
+    if code == 200 and j.get("ok"):
+        _tg_srv_merge(sent, j.get("sent"), now)
+        st = {"active": True, "ok": now, "hash": h, "err": "", "at": now, "counts": j.get("counts") or {}}
+    else:
+        st.update(err=_TG_SRV_ERR.get(code) or "Сервер не принял подписку (код %s)." % code, at=now)
+        if code in (400, 401, 402, 403, 404, 409, 413):     # подписки на сервере нет или она не действует: отправляет программа
+            st["active"] = False
+        if code == 409:                                     # остановлено в боте: режим выключаем, пока пользователь не включит снова
+            c = load_config()
+            c["tg_server"] = False
+            save_config(c)
+    store().put(TG_SRV_KEY, st)
+    return bool(st.get("active"))
+
+
+def tg_srv_delete(sent=None):
+    """Удаляет подписку с сервера; ключи отправленного сервером переносятся к себе, чтобы программа их не повторила."""
+    try:
+        code, j = tg_srv_req("delete", {})
+    except ApiError:
+        raise
+    except Exception:  # noqa: BLE001
+        raise ApiError("Сервер недоступен — данные не удалены. Они удалятся автоматически, когда истечёт ключ из бота.", 502)
+    if code == 404:
+        store().put(TG_SRV_KEY, {})
+        return {"deleted": False}
+    if code != 200 or not j.get("ok"):
+        raise ApiError(_TG_SRV_ERR.get(code) or "Не удалось удалить данные с сервера (код %s)." % code, 502)
+    own = sent is None
+    if own:
+        sent = dict(store().get(TG_SENT_KEY) or {})
+    _tg_srv_merge(sent, j.get("sent"), time.time())
+    if own:
+        store().put(TG_SENT_KEY, sent)
+    store().put(TG_SRV_KEY, {})
+    return {"deleted": bool(j.get("deleted"))}
+
+
+def tg_srv_kick():
+    """После изменения списка наблюдения, дневника или настроек — обновить подписку в фоне (через 3 с, одним потоком)."""
+    try:
+        cfg = load_config()
+    except Exception:  # noqa: BLE001
+        return
+    if not (cfg.get("tg_server") and cfg.get("tg_enabled")) or _tg_srv_kick_on[0]:
+        return
+    _tg_srv_kick_on[0] = True
+
+    def run():
+        try:
+            time.sleep(3)
+            if _tg_lock.acquire(timeout=120):
+                try:
+                    st = store()
+                    sent = dict(st.get(TG_SENT_KEY) or {})
+                    _tg_srv_sync(load_config(), sent, force=True)
+                    st.put(TG_SENT_KEY, sent)
+                finally:
+                    _tg_lock.release()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _tg_srv_kick_on[0] = False
+    threading.Thread(target=run, daemon=True, name="tg-srv-sync").start()
+
+
+def tg_srv_get(cfg, acc, q, force):
+    st = _tg_srv_state()
+    return {"enabled": bool(cfg.get("tg_server")), "active": tg_srv_active(cfg), "ok": st.get("ok"), "error": st.get("err") or "",
+            "counts": st.get("counts") or {}}
+
+
+def tg_srv_post(cfg, body):
+    """{action: sync|delete}. sync — сразу отправить подписку; delete — удалить данные с сервера и выключить режим."""
+    act = str(body.get("action") or "")
+    if act == "delete":
+        c = load_config()
+        c["tg_server"] = False          # сначала выключаем режим: даже если сервер недоступен, новых данных туда не уйдёт
+        save_config(c)
+        with _tg_lock:
+            r = tg_srv_delete()
+        return dict(r, ok=True)
+    if act == "sync":
+        c = load_config()
+        if not (c.get("tg_server") and c.get("tg_enabled")):
+            raise ApiError("Включите уведомления и проверку на сервере.", 400)
+        with _tg_lock:
+            st = store()
+            sent = dict(st.get(TG_SENT_KEY) or {})
+            ok = _tg_srv_sync(c, sent, force=True, resume=True)
+            st.put(TG_SENT_KEY, sent)
+        s_ = _tg_srv_state()
+        if not ok:
+            raise ApiError(s_.get("err") or "Сервер не принял подписку.", 502)
+        return {"ok": True, "counts": s_.get("counts") or {}}
+    raise ApiError("Неизвестное действие.", 400)
+
+
+API_GET["/api/tg/server"] = tg_srv_get
+API_POST["/api/tg/server"] = tg_srv_post
 
 
 def _tg_loop():

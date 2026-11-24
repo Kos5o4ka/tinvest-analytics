@@ -91,6 +91,13 @@ class Holdings(unittest.TestCase):
         self.assertEqual((r["status"], r["items"]), ("none", []))
         self.assertTrue(r["note"])
 
+    def test_tbank_400_is_no_data(self):
+        err = m.urllib.error.HTTPError("u", 400, "Bad Request", {}, None)       # T-Bank так отвечает по фондам других УК
+        self.fake({"tbank.ru": err})
+        r = m.fund_holdings("VDOR", force=True, category="Облигации")
+        self.assertEqual((r["status"], r["items"]), ("none", []))
+        self.assertNotIn("недоступен", r["note"])
+
     def test_error_short_ttl(self):
         self.fake({"tbank.ru": OSError("нет сети")})
         r = m.fund_holdings("ZZFN", force=True)
@@ -107,8 +114,88 @@ class Holdings(unittest.TestCase):
             m.fund_holdings("../x")
 
 
+class Nav(unittest.TestCase):
+    """СЧА и iNAV с Мосбиржи: apps/infogrid/ppif/rates, securities/<тикер>/inavs, доска INAV (реальные ответы ISS в fixtures)."""
+    def setUp(self):
+        self.saved = {"http_text": m.http_text}
+        self.calls = []
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(m, k, v)
+
+    def fake(self, mapping):
+        Holdings.fake(self, mapping)
+
+    def test_rates_parse(self):
+        r = m.fnd_rates_parse(fx("iss_ppif_rates_vdor.json"), "VDOR")
+        self.assertGreater(r["nav"], 1e8)
+        self.assertRegex(r["nav_date"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertEqual((r["nav_cur"], r["issue_date"]), ("RUB", "2026-04-21"))
+        self.assertIn("РенКап", r["manager"])
+        self.assertIsNone(m.fnd_rates_parse(fx("iss_ppif_rates_vdor.json"), "VDO"))     # поиск нашёл другой тикер — не подставляем
+        self.assertIsNone(m.fnd_rates_parse({}, "VDOR"))
+
+    def test_inavs_pick(self):
+        j = fx("iss_inavs_tgld.json")
+        self.assertEqual(m.fnd_inavs_pick(j, "RUB"), {"code": "TGLDB", "cur": "RUB"})
+        self.assertEqual(m.fnd_inavs_pick(j, "USD")["code"], "TGLDA")
+        self.assertIsNone(m.fnd_inavs_pick({"inavs": {"columns": ["secid"], "data": []}}))
+
+    def test_inav_parse(self):
+        r = m.fnd_inav_parse(fx("iss_inav_vdora.json"))
+        self.assertEqual((r["cur"], r["date"]), ("RUB", "2026-11-24"))
+        self.assertGreater(r["value"], 900)
+        self.assertGreater(r["prev"], 900)
+        j = fx("iss_inav_vdora.json")
+        j["marketdata"]["data"][0][1] = None                          # нет текущего значения — берём закрытие прошлого дня, без времени
+        r2 = m.fnd_inav_parse(j)
+        self.assertEqual((r2["value"], r2["time"]), (r["prev"], None))
+        self.assertIsNone(m.fnd_inav_parse({}))
+
+    def test_fund_nav_premium_and_cache(self):
+        inavs = {"inavs": {"columns": ["secid", "boardid", "ticker", "currencyid"], "data": [["VDORA", "INAV", "VDOR", "RUB"]]}}
+        self.fake({"ppif/rates": fx("iss_ppif_rates_vdor.json"), "VDOR/inavs": inavs, "INAV/securities/VDORA": fx("iss_inav_vdora.json")})
+        iv = m.fnd_inav_parse(fx("iss_inav_vdora.json"))["value"]
+        r = m.fund_nav("VDOR", price=iv * 1.01)
+        self.assertGreater(r["nav"], 1e8)
+        self.assertEqual((r["inav_code"], r["inav_cur"], r["errors"]), ("VDORA", "RUB", []))
+        self.assertAlmostEqual(r["premium"], 1.0, places=2)
+        self.assertIn("moex.com", r["source_url"])
+        n = len(self.calls)
+        m.fund_nav("VDOR", price=iv)                                  # второй раз — из кэша
+        self.assertEqual(len(self.calls), n)
+
+    def test_fund_nav_no_inav_and_errors(self):
+        empty = {"inavs": {"columns": ["secid"], "data": []}}
+        self.fake({"ppif/rates": OSError("нет сети"), "ZZNV/inavs": empty})
+        r = m.fund_nav("ZZNV", price=100)
+        self.assertIsNone(r["nav"])
+        self.assertIsNone(r["inav"])
+        self.assertIsNone(r["premium"])
+        self.assertTrue(r["errors"] and r["errors"][0].startswith("СЧА"))
+        n = len(self.calls)
+        m.fund_nav("ZZNV")                                            # ошибка помнится 15 минут: сеть не дёргаем
+        self.assertEqual(len(self.calls), n)
+
+
+class Category(unittest.TestCase):
+    def test_names(self):
+        c = m.stk_fund_category
+        cases = {("VDOR", "БПИФ Ренкап Высокодоходные обл"): "Облигации", ("AMFL", "БПИФ АТОН – Флоатеры"): "Облигации",
+                 ("AKMP", "БПИФ Альфа Денежный рынок Плюс"): "Денежный рынок", ("GOOD", "ДОХОДЪ Стратегии денеж. рынка"): "Денежный рынок",
+                 ("SBCN", "БПИФ Первая Сберегат. в юанях"): "Валюта", ("AMVY", "АТОН – Облигации в юанях"): "Облигации",
+                 ("AKPP", "БПИФ Альфа Платина-Палладий"): "Золото и металлы", ("AMIX", "АТОН – Индекс МосБиржи"): "Акции",
+                 ("SBBC", "БПИФ Первая Голубые фишки"): "Акции", ("BCSW", "БПИФ БКС Всепогодный портфель"): "Смешанные",
+                 ("XHOUSE", "ЗПИФ Инвестиции в недв"): "Недвижимость", ("ZZZZ", "Нечто"): "Прочие фонды"}
+        for (t, n), cat in cases.items():
+            self.assertEqual(c(t, n), cat, n)
+        self.assertEqual(c("MKBD", "БПИФ МКБ Российские Див. Акции"), "Акции")
+
+
 class FundCard(unittest.TestCase):
-    NAMES = ("stocks_universe", "funds_universe", "stock_candles", "stock_dividends", "fund_meta", "stock_multiples", "stock_next_report")
+    NAMES = ("stocks_universe", "funds_universe", "stock_candles", "stock_dividends", "fund_meta", "fund_nav", "stock_multiples",
+             "stock_next_report")
 
     def setUp(self):
         self.saved = {k: getattr(m, k) for k in self.NAMES}
@@ -121,6 +208,7 @@ class FundCard(unittest.TestCase):
         m.stock_candles = lambda s, i=24, d=400: cs
         m.stock_dividends = lambda *a, **k: {"items": [], "ttm_value": 0, "yield_ttm": None, "next": None, "source": "none"}
         m.fund_meta = lambda secid, category=None: {"category": category, "manager": "ООО \"Т-Капитал\"", "type_name": "Пай биржевого ПИФа"}
+        m.fund_nav = lambda secid, price=None: {"nav": 1.4e10, "nav_date": "2026-11-19", "inav": 5.9, "premium": round((price / 5.9 - 1) * 100, 2)}
         m.stock_multiples = m.stock_next_report = lambda *a, **k: self.fail("для фонда мультипликаторы и отчётность не запрашиваются")
 
     def tearDown(self):
@@ -134,6 +222,7 @@ class FundCard(unittest.TestCase):
         self.assertIsNone(c["report"])
         self.assertEqual(c["fund"]["manager"], "ООО \"Т-Капитал\"")
         self.assertEqual(len(c["candles"]), 220)
+        self.assertEqual((c["fund"]["nav"]["nav"], c["fund"]["nav"]["premium"]), (1.4e10, 1.69))
         self.assertTrue(c["ta"].get("votes"))
 
     def test_share_still_share(self):
@@ -163,6 +252,18 @@ class FundCard(unittest.TestCase):
         finally:
             m._stk_tqtf_rows = orig
         self.assertEqual((c["kind"], c["quote"]["sector"]), ("fund", "Золото и металлы"))
+
+    def test_category_from_full_name(self):
+        orig = m.funds_universe
+        m.funds_universe = lambda: [{"secid": "ZZRC", "shortname": "ZZRC ETF", "name": "БПИФ Нечто", "sector": "Прочие фонды", "price": 1.0,
+                                     "isin": "RU2", "lot": 10, "is_fund": True}]
+        m.fund_meta = lambda secid, category=None: {"category": category, "full_name": "БПИФ Нечто",
+                                                    "issue_name": "паи БПИФ «Нечто – Высокодоходные облигации»"}
+        try:
+            c = m.stock_card("ZZRC")
+        finally:
+            m.funds_universe = orig
+        self.assertEqual((c["quote"]["sector"], c["fund"]["category"]), ("Облигации", "Облигации"))
 
 
 if __name__ == "__main__":

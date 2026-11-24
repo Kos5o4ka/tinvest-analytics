@@ -61,7 +61,7 @@ class Universe(unittest.TestCase):
         self.assertEqual(st, {"SBER"})
         self.assertEqual(set(fu), {"LQDT", "TMOS", "RU000A109QR5", "XXXXXX"})
         self.assertEqual((fu["LQDT"]["sector"], fu["TMOS"]["sector"]), ("Денежный рынок", "Акции"))
-        self.assertEqual((fu["RU000A109QR5"]["sector"], fu["XXXXXX"]["sector"]), ("Золото и металлы", "Прочие фонды"))
+        self.assertEqual((fu["RU000A109QR5"]["sector"], fu["XXXXXX"]["sector"]), ("Золото и металлы", "Недвижимость"))   # «Рентал ПРО» — ЗПИФ арендной недвижимости
 
     def test_fund_fallback_tqtf(self):
         paths = []

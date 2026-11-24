@@ -1,0 +1,9 @@
+{
+"inavs": {
+	"columns": ["secid", "boardid", "ticker", "descr", "decimals", "issuedate", "currencyid"], 
+	"data": [
+		["TGLDA", "INAV", "TGLD", null, 4, null, "USD"],
+		["TGLDB", "INAV", "TGLD", null, 4, "2023-03-21", "RUB"]
+	]
+}}
+

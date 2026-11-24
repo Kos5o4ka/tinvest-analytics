@@ -1,0 +1,14 @@
+{
+"securities": {
+	"columns": ["SECID", "NAME", "CURRENCYID", "DECIMALS"], 
+	"data": [
+		["VDORA", "Расчётная цена одного пая Биржевого ПИФа РФИ «РенКап - Высокодоходные облигации»", "RUB", 4]
+	]
+},
+"marketdata": {
+	"columns": ["SECID", "CURRENTVALUE", "LASTVALUE", "CAPITALIZATION", "TRADEDATE", "UPDATETIME"], 
+	"data": [
+		["VDORA", 1049.0146, 1044.4956, 912608095.5943, "2026-11-24", "19:00:02"]
+	]
+}}
+

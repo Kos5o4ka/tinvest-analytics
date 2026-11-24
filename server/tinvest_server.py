@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, quote, urlparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tinvest_md  # noqa: E402  (токен владельца сервера, только чтение; см. tinvest_md.py)
 import crowd  # noqa: E402  (очередь и приём страниц раскрытия от приложений пользователей, см. crowd.py)
+import alerts  # noqa: E402  (серверная проверка тревог, пока приложение закрыто; см. alerts.py)
 
 VERSION = "1.1.0"
 MIN, HOUR, DAY = 60, 3600, 86400
@@ -810,6 +811,9 @@ class DataServer:
         self.bot = (bot or "tanalyticbot").strip().lstrip("@")
         self.keystore = KeyStore(keys_db, clock) if keys_db else None
         self.notifier = Notifier(self.keystore, clock) if self.keystore else None
+        self.alerts = alerts.AlertStore(keys_db, clock) if keys_db else None
+        self.checker = alerts.AlertChecker(self.alerts, self.notifier, self.fetch_json, clock,
+                                           quiet_hours=_quiet_env()) if self.alerts else None
         self.allowed = dict(ALLOWED_HOSTS)
         for h in extra_allow:                       # для тестов: "127.0.0.1:PORT"
             self.allowed[h] = None
@@ -1018,6 +1022,16 @@ class DataServer:
         self._stat(host, "miss")
         return res
 
+    def fetch_json(self, url):
+        """GET через кэш сервера -> разобранный JSON или None (для проверки тревог)."""
+        r = self.fetch("GET", url)
+        if r.error or r.status != 200:
+            return None
+        try:
+            return json.loads(r.body.decode("utf-8", "replace"))
+        except ValueError:
+            return None
+
     def parsed(self, name, params):
         """Разбор страницы источника -> (http-код, json). Страница берётся через fetch() (кэш, TTL, лимиты); результат разбора
         запоминается по хэшу тела страницы, так что повторный запрос при неизменной странице не парсит заново."""
@@ -1152,7 +1166,8 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(n)
         if u.path == "/v1/health":
             return self._send(200, {"ok": True, "version": VERSION, "uptime": int(time.time() - app.started),
-                                    "cache_items": app.cache.count(), "auth": auth_mode(app), "bot": app.bot})
+                                    "cache_items": app.cache.count(), "auth": auth_mode(app), "bot": app.bot,
+                                    "alerts": bool(app.alerts)})
         client, reason, info = authorize_ex(app, self.headers)
         if client is None:
             return self._send(401, {"ok": False, "error": reason or "invalid", "bot": app.bot})
@@ -1163,6 +1178,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "trial": bool(info and info.get("trial")), "bot": app.bot})
         if u.path == "/v1/notify":
             return self._notify(client, info, body)
+        if u.path.startswith("/v1/alerts/"):
+            return self._alerts(u, info, body)
         if u.path == "/v1/stats":
             return self._send(200, app.stats())
         if u.path == "/v1/fetch":
@@ -1249,11 +1266,57 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(e.code, {"ok": False, "error": e.error})
         self._send(200, {"ok": True, "queued": qid})
 
+    def _alerts(self, u, info, body):
+        """Подписка на серверную проверку тревог: /v1/alerts/sync (POST), /status (GET), /delete (POST). Только Pro по ключу из бота."""
+        st = self.app.alerts
+        name = u.path[len("/v1/alerts/"):]
+        if name not in ("sync", "status", "delete"):
+            return self._send(404, {"ok": False, "error": "not found"})
+        want = "GET" if name == "status" else "POST"
+        if self.command != want:
+            return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", want)])
+        if not st or not info:
+            return self._send(403, {"ok": False, "error": "key_required"})
+        uid = info["tg_id"]
+        try:
+            if name == "status":
+                g = st.get(uid)
+                return self._send(200, {"ok": True, "active": bool(g), "updated": g and g["updated"], "checked": g and g["checked"],
+                                        "sent_n": g and g["sent_n"], "counts": alerts.summary(g["sub"]) if g else None})
+            if name == "delete":
+                had, keys = st.delete(uid)
+                return self._send(200, {"ok": True, "deleted": had, "sent": keys})
+            if info.get("plan") != "pro":
+                return self._send(402, {"ok": False, "error": "pro_required"})
+            if len(body) > alerts.SUB_MAX_BYTES:
+                return self._send(413, {"ok": False, "error": "too_large"})
+            if not st.rate_ok(uid):
+                return self._send(429, {"ok": False, "error": "rate_limit"})
+            try:
+                sub = alerts.validate(json.loads(body.decode("utf-8")))
+            except (ValueError, UnicodeDecodeError):
+                return self._send(400, {"ok": False, "error": "bad_json"})
+            keys = st.put(uid, sub)
+            return self._send(200, {"ok": True, "counts": alerts.summary(sub), "sent": keys})
+        except alerts.AlertError as e:
+            return self._send(e.code, {"ok": False, "error": e.error})
+        except sqlite3.Error:
+            return self._send(503, {"ok": False, "error": "unavailable"})
+
     def do_GET(self):
         self._handle()
 
     def do_POST(self):
         self._handle()
+
+
+def _quiet_env():
+    """TINVEST_ALERTS_QUIET="22-8" (часы МСК, когда серверные тревоги не отправляются); "off" — без тихих часов."""
+    v = os.environ.get("TINVEST_ALERTS_QUIET", "22-8").strip().lower()
+    m = re.match(r"^(\d{1,2})-(\d{1,2})$", v)
+    if v in ("off", "0", "") or not m:
+        return None
+    return int(m.group(1)) % 24, int(m.group(2)) % 24
 
 
 def make_http_server(app, host="127.0.0.1", port=8780):
@@ -1284,6 +1347,9 @@ def main(argv=None):
         return 0
     app = DataServer(a.data, a.key, a.max_mb, extra_allow=a.allow, verbose=a.verbose, keys_db=a.keys_db, bot=a.bot, token_file=a.token_file)
     srv = make_http_server(app, a.host, a.port)
+    if app.checker and os.environ.get("TINVEST_ALERTS", "1") != "0":
+        period = max(60, int(os.environ.get("TINVEST_ALERTS_PERIOD") or 900))
+        threading.Thread(target=app.checker.loop, args=(threading.Event(), period), daemon=True, name="alerts").start()
     print("tinvest-data %s: http://%s:%d, кэш %s%s" % (VERSION, a.host, a.port, a.data, (", ключ включён" if a.key else "") + (", вход по ключам бота @%s" % app.bot if app.keystore else "")), flush=True)
     try:
         srv.serve_forever()

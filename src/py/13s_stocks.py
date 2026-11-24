@@ -96,17 +96,30 @@ def stk_rows_from_iss(j, sector_of=None, default_sector=STK_DEFAULT_SECTOR):
 
 
 STK_FUND_CATS = {
-    "Денежный рынок": "LQDT AKMM SBMM TMON AMNR CASH MONY OLIQ PSMM FMMM TSAV",
+    "Денежный рынок": "LQDT AKMM SBMM TMON AMNR CASH MONY OLIQ PSMM FMMM TSAV BCSD",
     "Золото и металлы": "GOLD TGLD AKGD SBGD BCSG PSGM",
-    "Облигации": "SBGB OBLG AKMB TBRU SBRB TOFZ INFL OFZS WOFZ SUGB SBCB CORP BOND ROBL BNDA BNDB BNDC AMGB PSRB MKBD TLCB SBLB SBHI SBFR AKFB TPAY",
-    "Акции": "TMOS SBMX EQMX AKME TDIV DIVD AKIE AKAI AIIQ",
-    "Валюта": "TUSD TEUR TCNY YUAN CNYM WUSD AMNY BCSD",
+    "Облигации": "SBGB OBLG AKMB TBRU SBRB TOFZ INFL OFZS WOFZ SUGB SBCB CORP BOND ROBL BNDA BNDB BNDC AMGB PSRB TLCB SBLB SBHI SBFR AKFB TPAY",
+    "Акции": "TMOS SBMX EQMX AKME TDIV DIVD AKIE AKAI AIIQ MKBD",
+    "Валюта": "TUSD TEUR TCNY YUAN CNYM WUSD AMNY",
 }
 STK_FUND_CAT_OF = {t: c for c, ts in STK_FUND_CATS.items() for t in ts.split()}
 STK_FUND_OTHER = "Прочие фонды"
-_STK_FUND_WORDS = (("Золото и металлы", ("золот", "драгмет", "металл")), ("Денежный рынок", ("денеж", "ликвид", "казна", "казнач")),
-                   ("Облигации", ("облиг", "офз", "бонд")), ("Акции", ("акци", "акц ", "акцрост", "див")),
-                   ("Валюта", ("валют", "юан", "доллар")))
+# Эвристика по названию (SECNAME / полное название выпуска из ISS), порядок важен: первое совпадение решает.
+# «Валютные облигации», «облигации в юанях» — облигации; «денежный рынок в юанях», «накопительный в юанях» — валюта.
+_STK_FUND_RULES = (
+    ("Золото и металлы", r"золот|драгмет|драгоцен|металл|платин|паллад"),
+    ("Недвижимость", r"недв|арендн|складск|промышленные парки|\bндв\b|лахта|фжн|парус|рентал|рентн|комнед|термы|термолэнд|"
+                     r"современн\w* \d|активо"),
+    ("Облигации", r"облиг|\bобл\b|\bобл\.|офз|бонд|еврообл|флоатер|переменн\w* купон|долгов|гособлиг|корп\.? обл|высокодоходн|"
+                  r"\bвдо\b|суборд"),
+    ("Валюта", r"юан|доллар|\bевро\b|валют|\bcny\b|\busd\b"),
+    ("Денежный рынок", r"денеж\w*\.? рын|\bден\.? рын|ликвид|казна|казнач|накопит|сберегат|ежедневн\w* процент|\bрепо\b|\bmm\b"),
+    ("Акции", r"акци|\bакц|индекс|дивид|фишк|ммвб|мосбирж|лидер|технолог|интеллект|потреб|финансов|роста|айпио|\bipo\b|квант|трендов|"
+              r"халял|российские акции|устойч|ответств|первичных размещ"),
+    ("Смешанные", r"портф|всепогод|лежебок|моя цель|смеш|баланс|стратеги|смарт|разумн|консерв|осторожн|антиинфляц|инфляц|"
+                  r"пассивн\w* доход|ежемесячн\w* доход|абсолютн"),
+)
+_STK_FUND_RX = [(c, re.compile(rx)) for c, rx in _STK_FUND_RULES]
 
 
 def stk_fund_category(secid, name=""):
@@ -114,9 +127,9 @@ def stk_fund_category(secid, name=""):
     c = STK_FUND_CAT_OF.get((secid or "").upper())
     if c:
         return c
-    n = (name or "").lower() + " "
-    for cat, words in _STK_FUND_WORDS:
-        if any(w in n for w in words):
+    n = " ".join(str(name or "").lower().replace("ё", "е").replace("–", "-").replace("«", " ").replace("»", " ").replace('"', " ").split())
+    for cat, rx in _STK_FUND_RX:
+        if rx.search(n):
             return cat
     return STK_FUND_OTHER
 
@@ -463,7 +476,15 @@ def stock_card(secid, interval="D", cfg=None):
             divs = stock_dividends(secid, q["price"], None, cfg, history=False)
         except Exception:  # noqa: BLE001 — дивиденды фонда не обязательны
             divs = {"items": [], "ttm_value": 0, "yield_ttm": None, "next": None, "source": "none"}
-        out.update(multiples=None, report=None, dividends=divs, fund=fund_meta(secid, q.get("sector")))
+        fm = fund_meta(secid, q.get("sector"))
+        if q.get("sector") == STK_FUND_OTHER and (fm.get("issue_name") or fm.get("full_name")):   # короткое имя TQBR не подсказало — пробуем полное
+            cat = stk_fund_category(secid, (fm.get("issue_name") or "") + " " + (fm.get("full_name") or ""))
+            q["sector"] = fm["category"] = cat
+        try:
+            fm["nav"] = fund_nav(secid, q.get("price"))
+        except Exception:  # noqa: BLE001 — СЧА и iNAV не обязательны для карточки
+            fm["nav"] = None
+        out.update(multiples=None, report=None, dividends=divs, fund=fm)
         return out
     out.update(multiples=stock_multiples(secid, q.get("cap"), auid, cfg), dividends=stock_dividends(secid, q["price"], uid, cfg, history=True),
                report=stock_next_report(uid, cfg, secid))

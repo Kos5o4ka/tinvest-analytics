@@ -1,6 +1,8 @@
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
+# секреты, которые окно настроек может показать по кнопке «глаз» (GET /api/config/secret)
+UI_SECRET_NAMES = ("token", "data_key", "backup_password")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -85,6 +87,16 @@ class Handler(BaseHTTPRequestHandler):
                            imports=[dict(x, broker_id=broker_of_account(x)[0]) for x in imports_list()],
                            brokers=BROKERS, data_dir=APP_DIR, version=APP_VERSION)
                 return self.send(200, pub)
+            if u.path == "/api/config/secret":
+                # Сохранённый секрет — только своему окну: Host проверен выше, плюс собственный заголовок
+                # (чужая страница не может его поставить без CORS-preflight, который мы не разрешаем). Не логируем.
+                if self.headers.get("X-TA-Secret") != "1" or \
+                        self.headers.get("Sec-Fetch-Site") not in (None, "same-origin"):
+                    return self.send(403, {"error": "forbidden"})
+                name = q.get("name", "")
+                if name not in UI_SECRET_NAMES or name not in SECRET_KEYS:
+                    return self.send(400, {"error": "unknown secret"})
+                return self.send(200, {"name": name, "value": str(cfg.get(name) or "")})
             if u.path == "/api/summary":
                 return self.send(200, build_summary(cfg, acc, q.get("period", "all"), f))
             if u.path == "/api/bonds":

@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "TAnalytic"
-APP_VERSION = "0.28"
+APP_VERSION = "0.29"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -14582,10 +14582,12 @@ API_GET["/api/events.ics"] = _api_events_ics
 # ═══════════════════════════════ список наблюдения, заметки, уведомления в Telegram ═══════════════════════════════
 # Список наблюдения и дневник хранятся только в локальной базе. Уведомления в Telegram идут через сервер данных
 # (POST /v1/notify с ключом из бота) и общий бот: наружу уходят только тексты уведомлений, токен Т-Инвестиций — никогда.
+# По желанию (tg_server) на сервер уходит ещё «подписка» на тревоги по публичным данным — см. раздел «проверка на сервере» ниже.
 # Прежний «личный бот» (tg_token, tg_chat) удалён; старые значения стираются из настроек при запуске.
 
 WATCH_KEY, NOTES_KEY, TG_SENT_KEY, TG_STATE_KEY = "watch_v1", "notes_v1", "tg_sent_v1", "tg_state_v1"
-TG_DEFAULTS = {"tg_enabled": False, "tg_on_mon": True, "tg_on_watch": True, "tg_pay_days": 0, "tg_digest": False, "tg_digest_time": "10:00"}
+TG_DEFAULTS = {"tg_enabled": False, "tg_on_mon": True, "tg_on_watch": True, "tg_pay_days": 0, "tg_digest": False, "tg_digest_time": "10:00",
+               "tg_server": False}
 TG_LEGACY_KEYS = ("tg_token", "tg_chat")
 _watch_lock = threading.Lock()
 _tg_lock = threading.Lock()
@@ -14675,6 +14677,7 @@ def watch_post(cfg, body):
                     cur.pop("note", None)
         store().put(WATCH_KEY, items)
     mem_clear_watch()
+    tg_srv_kick()
     return {"ok": True, "isins": [x["isin"] for x in items], "in_watch": any(x["isin"] == isin for x in items)}
 
 
@@ -14740,6 +14743,7 @@ def notes_post(cfg, body):
             raise ApiError("Неизвестное действие.", 400)
         store().put(NOTES_KEY, items)
     mem_clear_watch()
+    tg_srv_kick()
     return {"ok": True}
 
 
@@ -14768,14 +14772,7 @@ def watch_payload(cfg, acc=None, q=None, force=False):
                    mat=(s or {}).get("mat") or ci.get("maturity"), offer=(s or {}).get("offer"), cur=(s or {}).get("cur"),
                    coupon=(s or {}).get("coupon"), chg5=m.get("chg5"), chg30=m.get("chg30"), spread_chg30=m.get("spread_chg30"),
                    spark=m.get("spark"), flags=m.get("flags") or [], rating_state=m.get("rating"))
-        base = {"isin": isin, "isins": [isin], "name": row["name"], "bonds": [row["name"]]}
-        ty, tp = it.get("target_yield"), it.get("target_price")
-        if s and ty is not None and s.get("yield") is not None and s["yield"] >= ty:
-            alerts.append(dict(base, id="gy|%s|%s" % (isin, ty), severity="medium", kind="goal", date=today,
-                               message="Цель достигнута: доходность %s %% (цель — от %s %%)" % (_f2(s["yield"]), _f2(ty)), url=""))
-        if s and tp is not None and s.get("price") is not None and s["price"] <= tp:
-            alerts.append(dict(base, id="gp|%s|%s" % (isin, tp), severity="medium", kind="goal", date=today,
-                               message="Цель достигнута: цена %s %% (цель — не выше %s %%)" % (_f2(s["price"]), _f2(tp)), url=""))
+        alerts += watch_goal_alerts(isin, row["name"], s, it.get("target_yield"), it.get("target_price"), today)
         if not s:
             row["flags"] = row["flags"] + ["нет данных Мосбиржи"]
         rows.append(row)
@@ -14796,6 +14793,21 @@ def watch_payload(cfg, acc=None, q=None, force=False):
 
 def _f2(x):
     return ("%.2f" % x).replace(".", ",")
+
+
+def watch_goal_alerts(isin, name, s, ty, tp, today):
+    """Цели по бумаге списка наблюдения. Чистая функция; её зеркало на сервере — alerts.goal_alerts (тест на совпадение)."""
+    out = []
+    if not s:
+        return out
+    base = {"isin": isin, "isins": [isin], "name": name, "bonds": [name]}
+    if ty is not None and s.get("yield") is not None and s["yield"] >= ty:
+        out.append(dict(base, id="gy|%s|%s" % (isin, ty), severity="medium", kind="goal", date=today,
+                        message="Цель достигнута: доходность %s %% (цель — от %s %%)" % (_f2(s["yield"]), _f2(ty)), url=""))
+    if tp is not None and s.get("price") is not None and s["price"] <= tp:
+        out.append(dict(base, id="gp|%s|%s" % (isin, tp), severity="medium", kind="goal", date=today,
+                        message="Цель достигнута: цена %s %% (цель — не выше %s %%)" % (_f2(s["price"]), _f2(tp)), url=""))
+    return out
 
 
 def watch_isins_get(cfg, acc, q, force):
@@ -14947,7 +14959,8 @@ def tg_public(cfg):
 
 def tg_save(cfg, body):
     cfg = load_config()
-    for k in ("tg_enabled", "tg_on_mon", "tg_on_watch", "tg_digest"):
+    was = bool(cfg.get("tg_server") and cfg.get("tg_enabled"))
+    for k in ("tg_enabled", "tg_on_mon", "tg_on_watch", "tg_digest", "tg_server"):
         if k in body:
             cfg[k] = bool(body[k])
     if "tg_pay_days" in body:
@@ -14961,7 +14974,17 @@ def tg_save(cfg, body):
     for k in TG_LEGACY_KEYS:
         cfg.pop(k, None)
     save_config(cfg)
-    return {"ok": True, "settings": tg_public(cfg)}
+    res = {"ok": True, "settings": tg_public(cfg)}
+    now_on = bool(cfg.get("tg_server") and cfg.get("tg_enabled"))
+    if was and not now_on and _tg_srv_state():
+        try:                     # режим выключен: данные с сервера удаляем сразу
+            with _tg_lock:
+                tg_srv_delete()
+        except ApiError as e:
+            res["warning"] = str(e)
+    elif now_on and was:
+        tg_srv_kick()            # разделы или число дней изменились — обновить подписку (первое включение синхронизирует UI явно)
+    return res
 
 
 def tg_info(cfg, acc, q, force):
@@ -15014,9 +15037,10 @@ def _tg_alert_line(a):
     return line + ("\n" + " · ".join(links) if links else "")
 
 
-def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
-    """Отправляет ещё не отправленные тревоги: до трёх сообщений за проверку, до 10 тревог и в предел длины каждое;
-    остальное уйдёт в следующий раз (в последнем сообщении об этом сказано). Возвращает число отправленных тревог."""
+def tg_dispatch_plan(title, alerts, sent, now, icon="🔔"):
+    """Раскладка ещё не отправленных тревог по сообщениям: до трёх сообщений за проверку, до 10 тревог и в предел длины
+    каждое; остальное уйдёт в следующий раз (в последнем сообщении об этом сказано). -> [(текст, [(ключ, тревога)])].
+    Чистая функция; зеркало на сервере — alerts.dispatch_plan."""
     fresh = []
     for a in alerts:
         k = _tg_key(a)
@@ -15025,10 +15049,10 @@ def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
             continue
         fresh.append((k, a))
     if not fresh:
-        return 0
+        return []
     head = _tg_head(icon, title)
     room = TG_LIMIT - len(TG_DISCLAIMER) - len(head) - 120
-    sent_n, i = 0, 0
+    plan, i = [], 0
     for msg_no in range(3):
         if i >= len(fresh):
             break
@@ -15042,7 +15066,15 @@ def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
             size += len(ln) + 2
             i += 1
         tail = ("\n\n…и ещё %d — придут при следующей проверке" % (len(fresh) - i)) if msg_no == 2 and i < len(fresh) else ""
-        tg_send(cfg, "%s\n\n%s%s" % (head, "\n\n".join(lines), tail))
+        plan.append(("%s\n\n%s%s" % (head, "\n\n".join(lines), tail), chunk))
+    return plan
+
+
+def _tg_dispatch(cfg, title, alerts, sent, now, icon="🔔"):
+    """Отправляет план tg_dispatch_plan. Возвращает число отправленных тревог."""
+    sent_n = 0
+    for text, chunk in tg_dispatch_plan(title, alerts, sent, now, icon):
+        tg_send(cfg, text)
         for k, a in chunk:
             sent[k] = now
         sent_n += len(chunk)
@@ -15170,6 +15202,20 @@ def _tg_ev_line(e):
     return "%s · <b>%s</b> — %s%s" % (_tg_date(e[0]), _tg_esc(e[2]), _TG_EV.get(e[1], "выплата"), amt)
 
 
+def tg_pay_fresh(ev, sent):
+    """Ещё не отправленные выплаты -> [(ключ «pay|дата|вид|название», событие)]. Зеркало на сервере — alerts.pay_fresh."""
+    out = []
+    for e in ev:
+        k = "pay|%s|%s|%s" % (e[0], e[1], e[2])
+        if k not in sent:
+            out.append((k, e))
+    return out
+
+
+def tg_pay_text(days, fresh):
+    return "%s\n\n%s" % (_tg_head("💰", "Ближайшие выплаты", "%d дн." % days), _tg_cap([_tg_ev_line(e) for k, e in fresh], 15))
+
+
 def tg_digest_text(cfg):
     parts = [_tg_head("📈", "Сводка TAnalytic", _tg_date(date.today().isoformat()))]
     if cfg.get("token"):
@@ -15220,6 +15266,14 @@ def tg_tick(force_digest=False, manual=False):
         now = time.time()
         sent = {k: v for k, v in (st.get(TG_SENT_KEY) or {}).items() if now - v < 400 * DAY}
         n = 0
+        srv = False
+        try:        # серверная проверка: обновить подписку и не дублировать то, что отправит сервер
+            if cfg.get("tg_server") and cfg.get("tg_enabled"):
+                _tg_srv_sync(cfg, sent, force=not _tg_srv_boot[0])
+                _tg_srv_boot[0] = True
+            srv = tg_srv_active(cfg)
+        except Exception:  # noqa: BLE001
+            srv = tg_srv_active(cfg)
         try:
             if cfg.get("tg_on_mon", True) and cfg.get("token"):
                 al = [a for a in build_monitor(cfg, "all")["alerts"] if a["severity"] == "high"]
@@ -15227,7 +15281,7 @@ def tg_tick(force_digest=False, manual=False):
         except Exception:  # noqa: BLE001
             pass
         try:
-            if cfg.get("tg_on_mon", True) and cfg.get("token"):
+            if cfg.get("tg_on_mon", True) and cfg.get("token") and not srv:
                 today_ = date.today().isoformat()
                 due = [(k, t) for k, t in tg_offer_due(_tg_offer_items(cfg, today_), today_) if k not in sent][:10]
                 if due:
@@ -15239,7 +15293,8 @@ def tg_tick(force_digest=False, manual=False):
             pass
         try:
             if cfg.get("tg_on_watch", True) and (watch_isins() or notes_all()):
-                al = [a for a in watch_payload(cfg)["alerts"] if a["severity"] != "info"]
+                al = [a for a in watch_payload(cfg)["alerts"] if a["severity"] != "info"
+                      and not (srv and a.get("kind") in TG_SRV_KINDS)]
                 n += _tg_dispatch(cfg, "Наблюдение и цели", al, sent, now, icon="⭐")
         except Exception:  # noqa: BLE001
             pass
@@ -15255,15 +15310,10 @@ def tg_tick(force_digest=False, manual=False):
             pass
         try:
             days = int(cfg.get("tg_pay_days") or 0)
-            if days > 0 and cfg.get("token"):
-                ev = [e for e in _tg_payments(cfg, days)]
-                fresh = []
-                for e in ev:
-                    k = "pay|%s|%s|%s" % (e[0], e[1], e[2])
-                    if k not in sent:
-                        fresh.append((k, e))
+            if days > 0 and cfg.get("token") and not srv:
+                fresh = tg_pay_fresh(_tg_payments(cfg, days), sent)
                 if fresh:
-                    tg_send(cfg, "%s\n\n%s" % (_tg_head("💰", "Ближайшие выплаты", "%d дн." % days), _tg_cap([_tg_ev_line(e) for k, e in fresh], 15)))
+                    tg_send(cfg, tg_pay_text(days, fresh))
                     for k, e in fresh:
                         sent[k] = now
                     n += len(fresh)
@@ -15289,6 +15339,220 @@ def tg_tick(force_digest=False, manual=False):
         return 0            # сеть/Telegram недоступны — попробуем в следующий раз; детали (с токеном) не пишем
     finally:
         _tg_lock.release()
+
+
+# ═══════════════ проверка на сервере, пока программа закрыта (по желанию, переключатель tg_server) ═══════════════
+# Приложение отправляет на сервер данных «подписку» — только правила по публичным данным (см. tg_srv_payload и
+# server/alerts.py): цели по бумагам наблюдения, даты напоминаний дневника (без текста), ближайшие оферты и выплаты
+# по облигациям портфеля. Токен, номера счетов, стоимость портфеля и остатки денег не отправляются никогда.
+# Пока режим включён и сервер принял подписку, эти виды (TG_SRV_KINDS, оферты, выплаты) шлёт только сервер — без дублей:
+# ключи уже отправленного передаются в обе стороны (поле sent).
+
+TG_SRV_KEY = "tg_srv_v1"
+TG_SRV_KINDS = ("goal", "reminder")
+TG_SRV_PREFIX = ("gy|", "gp|", "rm|", "ofr|", "pay|")
+TG_SRV_REFRESH = 6 * 3600         # подписку с прежним содержимым обновляем не чаще раза в 6 ч (даты выплат, статус купона после оферты)
+TG_SRV_PAY_EXTRA = 8              # выплаты — с запасом на срок жизни подписки (ключ из бота действует 7 дней)
+_tg_srv_boot = [False]            # первая проверка после запуска синхронизирует подписку принудительно
+_tg_srv_kick_on = [False]
+
+
+def tg_srv_payload(cfg, sent):
+    """Подписка для сервера. Только ISIN, названия бумаг, пороги, даты и суммы ближайших выплат; ничего о счетах."""
+    today = date.today().isoformat()
+    p = {"v": 1, "goals": [], "reminders": [], "offers": [], "pay_days": 0, "pays": [], "sent": []}
+    if cfg.get("tg_on_watch", True):
+        items = watch_items()
+        notes = [n for n in notes_all() if n.get("remind_on")]
+        sec = _scr_by_isin() if items or notes else {}
+        for it in items:
+            g = {k: it[k] for k in ("target_yield", "target_price") if it.get(k) is not None}
+            if g:
+                p["goals"].append(dict(g, isin=it["isin"], name=str(_bond_name(it["isin"], sec))[:120]))
+        for n in notes:
+            p["reminders"].append({"id": n["id"], "isin": n["isin"], "name": str(_bond_name(n["isin"], sec))[:120],
+                                   "date": n["date"], "remind_on": n["remind_on"]})
+    if cfg.get("tg_on_mon", True) and cfg.get("token"):
+        try:
+            p["offers"] = [{k: o.get(k) for k in ("isin", "name", "kind", "date", "period_start", "period_end", "coupon_status", "new_rate")}
+                           for o in _tg_offer_items(cfg, today)]
+        except Exception:  # noqa: BLE001
+            pass
+    days = int(cfg.get("tg_pay_days") or 0)
+    if days > 0 and cfg.get("token"):
+        try:
+            p["pays"] = [{"date": e[0], "kind": e[1], "name": str(e[2] or "")[:120], "amount": round(e[3], 2) if e[3] else None}
+                         for e in _tg_payments(cfg, days + TG_SRV_PAY_EXTRA)][:1000]
+            p["pay_days"] = days
+        except Exception:  # noqa: BLE001
+            pass
+    for k in ("offers", "goals", "reminders"):
+        p[k] = p[k][:300]
+    p["sent"] = sorted(k for k in sent if k.startswith(TG_SRV_PREFIX))[-5000:]
+    return p
+
+
+def tg_srv_req(path, body=None, timeout=20):
+    """{сервер}/v1/alerts/<path> -> (код, dict). GET без тела, иначе POST JSON. Бросает исключение при сетевой ошибке."""
+    srv, key = ds_conf()
+    if not srv or not key:
+        raise ApiError("Нужен сервер данных и вход по ключу из бота.", 400)
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(srv.rstrip("/") + "/v1/alerts/" + path, data=data, method="GET" if body is None else "POST",
+                                 headers={"Content-Type": "application/json", "X-Client-Key": key, "User-Agent": EXT_UA["User-Agent"]})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+            code, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        code, raw = e.code, e.read()
+    try:
+        j = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        j = None
+    return code, (j if isinstance(j, dict) else {})
+
+
+_TG_SRV_ERR = {404: "Сервер данных пока не поддерживает проверку тревог — уведомления отправляет программа, пока она запущена.",
+               402: "Проверка на сервере доступна в тарифе Pro.", 401: "Войдите по ключу из бота.", 403: "Войдите по ключу из бота.",
+               429: "Слишком частые обновления, повторим позже.",
+               409: "Проверка на сервере остановлена в боте (/alerts). Чтобы возобновить, снова включите её здесь."}
+
+
+def _tg_srv_state():
+    return dict(store().get(TG_SRV_KEY) or {})
+
+
+def tg_srv_active(cfg):
+    """Сервер принял подписку и сам шлёт TG_SRV_KINDS, оферты и выплаты: программе их отправлять не нужно."""
+    return bool(cfg.get("tg_server") and cfg.get("tg_enabled") and _tg_srv_state().get("active"))
+
+
+def _tg_srv_merge(sent, keys, now):
+    for k in keys or []:
+        if isinstance(k, str) and k.startswith(TG_SRV_PREFIX):
+            sent.setdefault(k, now)
+
+
+def _tg_srv_sync(cfg, sent, force=False, resume=False):
+    """Отправляет подписку, если она изменилась, устарела или force. Состояние — в TG_SRV_KEY. -> True, если подписка на сервере.
+    resume=True — только по явному включению пользователем: снимает остановку, сделанную в боте (/alerts)."""
+    st, now = _tg_srv_state(), time.time()
+    p = tg_srv_payload(cfg, sent)
+    if resume:
+        p["resume"] = True
+    h = hashlib.sha256(json.dumps({k: v for k, v in p.items() if k not in ("sent", "resume")}, sort_keys=True).encode("utf-8")).hexdigest()
+    if not force and st.get("active") and st.get("hash") == h and now - (st.get("ok") or 0) < TG_SRV_REFRESH:
+        return True
+    try:
+        code, j = tg_srv_req("sync", p)
+    except ApiError as e:
+        st.update(err=str(e), at=now)
+        store().put(TG_SRV_KEY, st)
+        return bool(st.get("active"))
+    except Exception:  # noqa: BLE001
+        st.update(err="Сервер недоступен, повторим при следующей проверке.", at=now)
+        store().put(TG_SRV_KEY, st)
+        return bool(st.get("active"))      # сервер недоступен: и программа отправить не сможет (уведомления идут через него)
+    if code == 200 and j.get("ok"):
+        _tg_srv_merge(sent, j.get("sent"), now)
+        st = {"active": True, "ok": now, "hash": h, "err": "", "at": now, "counts": j.get("counts") or {}}
+    else:
+        st.update(err=_TG_SRV_ERR.get(code) or "Сервер не принял подписку (код %s)." % code, at=now)
+        if code in (400, 401, 402, 403, 404, 409, 413):     # подписки на сервере нет или она не действует: отправляет программа
+            st["active"] = False
+        if code == 409:                                     # остановлено в боте: режим выключаем, пока пользователь не включит снова
+            c = load_config()
+            c["tg_server"] = False
+            save_config(c)
+    store().put(TG_SRV_KEY, st)
+    return bool(st.get("active"))
+
+
+def tg_srv_delete(sent=None):
+    """Удаляет подписку с сервера; ключи отправленного сервером переносятся к себе, чтобы программа их не повторила."""
+    try:
+        code, j = tg_srv_req("delete", {})
+    except ApiError:
+        raise
+    except Exception:  # noqa: BLE001
+        raise ApiError("Сервер недоступен — данные не удалены. Они удалятся автоматически, когда истечёт ключ из бота.", 502)
+    if code == 404:
+        store().put(TG_SRV_KEY, {})
+        return {"deleted": False}
+    if code != 200 or not j.get("ok"):
+        raise ApiError(_TG_SRV_ERR.get(code) or "Не удалось удалить данные с сервера (код %s)." % code, 502)
+    own = sent is None
+    if own:
+        sent = dict(store().get(TG_SENT_KEY) or {})
+    _tg_srv_merge(sent, j.get("sent"), time.time())
+    if own:
+        store().put(TG_SENT_KEY, sent)
+    store().put(TG_SRV_KEY, {})
+    return {"deleted": bool(j.get("deleted"))}
+
+
+def tg_srv_kick():
+    """После изменения списка наблюдения, дневника или настроек — обновить подписку в фоне (через 3 с, одним потоком)."""
+    try:
+        cfg = load_config()
+    except Exception:  # noqa: BLE001
+        return
+    if not (cfg.get("tg_server") and cfg.get("tg_enabled")) or _tg_srv_kick_on[0]:
+        return
+    _tg_srv_kick_on[0] = True
+
+    def run():
+        try:
+            time.sleep(3)
+            if _tg_lock.acquire(timeout=120):
+                try:
+                    st = store()
+                    sent = dict(st.get(TG_SENT_KEY) or {})
+                    _tg_srv_sync(load_config(), sent, force=True)
+                    st.put(TG_SENT_KEY, sent)
+                finally:
+                    _tg_lock.release()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _tg_srv_kick_on[0] = False
+    threading.Thread(target=run, daemon=True, name="tg-srv-sync").start()
+
+
+def tg_srv_get(cfg, acc, q, force):
+    st = _tg_srv_state()
+    return {"enabled": bool(cfg.get("tg_server")), "active": tg_srv_active(cfg), "ok": st.get("ok"), "error": st.get("err") or "",
+            "counts": st.get("counts") or {}}
+
+
+def tg_srv_post(cfg, body):
+    """{action: sync|delete}. sync — сразу отправить подписку; delete — удалить данные с сервера и выключить режим."""
+    act = str(body.get("action") or "")
+    if act == "delete":
+        c = load_config()
+        c["tg_server"] = False          # сначала выключаем режим: даже если сервер недоступен, новых данных туда не уйдёт
+        save_config(c)
+        with _tg_lock:
+            r = tg_srv_delete()
+        return dict(r, ok=True)
+    if act == "sync":
+        c = load_config()
+        if not (c.get("tg_server") and c.get("tg_enabled")):
+            raise ApiError("Включите уведомления и проверку на сервере.", 400)
+        with _tg_lock:
+            st = store()
+            sent = dict(st.get(TG_SENT_KEY) or {})
+            ok = _tg_srv_sync(c, sent, force=True, resume=True)
+            st.put(TG_SENT_KEY, sent)
+        s_ = _tg_srv_state()
+        if not ok:
+            raise ApiError(s_.get("err") or "Сервер не принял подписку.", 502)
+        return {"ok": True, "counts": s_.get("counts") or {}}
+    raise ApiError("Неизвестное действие.", 400)
+
+
+API_GET["/api/tg/server"] = tg_srv_get
+API_POST["/api/tg/server"] = tg_srv_post
 
 
 def _tg_loop():
@@ -18980,6 +19244,11 @@ API_GET["/api/inflation_weekly"] = lambda cfg, acc, q, force: weekly_inflation(f
 #      по фондам других УК приходит пустой список. Даты среза в ответе нет — показываем дату получения.
 #   2) Мосбиржа ISS: веса бумаг в индексе, за которым следует фонд (таблица FND_INDEX_OF). Это не фактический портфель,
 #      а «состав индекса, за которым следует фонд» — так и подписывается.
+# СЧА и расчётная цена пая (fund_nav, поле fund.nav карточки) — Мосбиржа ISS, те же запросы, что у карточки фонда на moex.com:
+#   apps/infogrid/ppif/rates.json?q=<тикер> — NAV (СЧА, руб.) и NAV_DATE (обычно раз в несколько дней, по отчётам УК);
+#   securities/<тикер>/inavs.json — коды индикативной цены пая (iNAV) на доске INAV, по валютам (TGLD: TGLDA в USD, TGLDB в RUB);
+#   engines/stock/markets/index/boards/INAV/securities/<код>.json — текущее значение iNAV (CURRENTVALUE), закрытие прошлого дня.
+# Поэлементного состава фондов в открытых данных Мосбиржи нет (страница фонда на moex.com его тоже не показывает).
 # Кэш: удачный ответ — сутки, ошибка источника — 15 минут. Модуль загружается раньше 13s_stocks.py: на уровне модуля
 # нельзя ссылаться на имена оттуда (только внутри функций). Префикс имён fnd_ / FND_.
 
@@ -18989,6 +19258,13 @@ FND_ISS_IDX = "https://iss.moex.com/iss/statistics/engines/stock/markets/index/a
 FND_ISS_IDX_PAGE = "https://www.moex.com/ru/index/%s/constituents"
 FND_ISS_DESC = "https://iss.moex.com/iss/securities/%s.json?iss.meta=off&iss.only=description"
 FND_ISS_EMIT = "https://iss.moex.com/iss/emitters/%s.json?iss.meta=off"
+FND_ISS_RATES = "https://iss.moex.com/iss/apps/infogrid/ppif/rates.json?iss.meta=off&q=%s"
+FND_ISS_INAVS = "https://iss.moex.com/iss/securities/%s/inavs.json?iss.meta=off"
+FND_ISS_INAV = ("https://iss.moex.com/iss/engines/stock/markets/index/boards/INAV/securities/%s.json?iss.meta=off&iss.only=securities,marketdata"
+                "&securities.columns=SECID,NAME,CURRENCYID,DECIMALS&marketdata.columns=SECID,CURRENTVALUE,LASTVALUE,CAPITALIZATION,TRADEDATE,UPDATETIME")
+FND_MOEX_PAGE = "https://www.moex.com/ru/issue.aspx?code=%s"
+FND_INAV_PAGE = "https://www.moex.com/ru/index/%s?index=inav"
+FND_INAV_TTL = 10 * 60                             # iNAV меняется в течение торгов
 FND_TTL = DAY
 FND_ERR_TTL = 15 * 60
 FND_META_TTL = 7 * DAY
@@ -19080,7 +19356,12 @@ def fnd_index_holdings(index):
 
 
 def _fnd_from_tb(secid):
-    raw = http_text(FND_TB_URL % urllib.parse.quote(secid), timeout=15)
+    try:
+        raw = http_text(FND_TB_URL % urllib.parse.quote(secid), timeout=15)
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404):                   # фонд не из линейки T-Bank: «record not found» — состава там нет, это не сбой
+            return None
+        raise
     return fnd_tb_parse(json.loads(raw))
 
 
@@ -19136,20 +19417,110 @@ def fund_holdings(secid, force=False, category=None):
     return res
 
 
-def fund_meta(secid, category=None):
-    """Паспорт фонда из ISS: {category, type_name, full_name, issue_date, manager, manager_url}. Ошибки сети не критичны (поля None)."""
+def _fnd_rows(j, name):
+    t = (j or {}).get(name) or {}
+    cols = t.get("columns") or []
+    return [dict(zip(cols, r)) for r in t.get("data") or [] if isinstance(r, list)]
+
+
+def fnd_rates_parse(j, secid):
+    """ISS apps/infogrid/ppif/rates.json -> {nav, nav_date, nav_cur, issue_date, manager, manager_url} для точного тикера или None.
+    Поиск q= может вернуть несколько фондов — берём строку с тем же SECID."""
+    r = next((x for x in _fnd_rows(j, "rates") if str(x.get("SECID") or "").upper() == secid), None)
+    if r is None:
+        return None
+    nav = _fnd_f(r.get("NAV"))
+    cur = str(r.get("FACEUNIT") or "RUB").upper().replace("SUR", "RUB").replace("RUR", "RUB")
+    return {"nav": nav if nav and nav > 0 else None, "nav_date": r.get("NAV_DATE") if nav else None, "nav_cur": cur,
+            "issue_date": r.get("ISSUEDATE") or None, "manager": r.get("EMITENT_SHORT_NAME") or None, "manager_url": r.get("EMITENT_URL") or None}
+
+
+def fnd_inavs_pick(j, cur="RUB"):
+    """ISS securities/<тикер>/inavs.json -> код iNAV в валюте фонда (иначе первый) или None: {code, cur}."""
+    rows = [r for r in _fnd_rows(j, "inavs") if r.get("secid")]
+    if not rows:
+        return None
+    r = next((x for x in rows if str(x.get("currencyid") or "").upper() == cur), rows[0])
+    return {"code": r["secid"], "cur": str(r.get("currencyid") or "RUB").upper()}
+
+
+def fnd_inav_parse(j):
+    """ISS доска INAV, одна бумага -> {value, prev, date, time, cur} или None. value — текущее значение (иначе закрытие прошлого дня)."""
+    md = (_fnd_rows(j, "marketdata") or [{}])[0]
+    sec = (_fnd_rows(j, "securities") or [{}])[0]
+    cur_v, prev = _fnd_f(md.get("CURRENTVALUE")), _fnd_f(md.get("LASTVALUE"))
+    v = cur_v if cur_v and cur_v > 0 else (prev if prev and prev > 0 else None)
+    if v is None:
+        return None
+    return {"value": v, "prev": prev if prev and prev > 0 else None, "date": md.get("TRADEDATE") or None,
+            "time": (md.get("UPDATETIME") or None) if cur_v else None, "cur": str(sec.get("CURRENCYID") or "RUB").upper()}
+
+
+def _fnd_cached(key, ttl, fn):
+    """Значение из store (ttl) или fn(); ошибка источника запоминается в памяти на FND_ERR_TTL. -> (значение, ошибка-строка | None)."""
+    hit = store().get(key, ttl)
+    if hit is not None:
+        return hit.get("v"), None
+    err = mem_get(("fnd_err", key), FND_ERR_TTL)
+    if err is not None:
+        return None, err
+    try:
+        v = fn()
+    except Exception as e:  # noqa: BLE001 — сеть, JSON, HTTP-ошибка источника
+        err = str(e)[:80] or e.__class__.__name__
+        mem_put(("fnd_err", key), err)
+        return None, err
+    store().put(key, {"v": v})
+    return v, None
+
+
+def fund_nav(secid, price=None):
+    """СЧА и расчётная цена пая с Мосбиржи. -> {nav, nav_date, nav_cur, inav, inav_prev, inav_cur, inav_date, inav_time, inav_code,
+    premium (биржевая цена к iNAV, %), issue_date, manager, manager_url, source_url, inav_url, errors}. Нет данных — поля None."""
     secid = _fnd_secid(secid)
-    key = "fnd_meta_v1_" + secid
+    q = urllib.parse.quote(secid)
+    out = {"nav": None, "nav_date": None, "nav_cur": None, "inav": None, "inav_prev": None, "inav_cur": None, "inav_date": None,
+           "inav_time": None, "inav_code": None, "premium": None, "issue_date": None, "manager": None, "manager_url": None,
+           "source_url": FND_MOEX_PAGE % q, "inav_url": None, "errors": []}
+    rates, err = _fnd_cached("fnd_rates_v1_" + secid, FND_TTL, lambda: fnd_rates_parse(json.loads(http_text(FND_ISS_RATES % q, timeout=15)), secid))
+    if err:
+        out["errors"].append("СЧА: " + err)
+    if rates:
+        out.update(rates)
+    cur = (rates or {}).get("nav_cur") or "RUB"
+    pick, err = _fnd_cached("fnd_inavs_v1_" + secid, FND_META_TTL, lambda: fnd_inavs_pick(json.loads(http_text(FND_ISS_INAVS % q, timeout=15)), cur))
+    if err:
+        out["errors"].append("iNAV: " + err)
+    if pick:
+        code = pick["code"]
+        iv, err = _fnd_cached("fnd_inav_v1_" + code, FND_INAV_TTL,
+                              lambda: fnd_inav_parse(json.loads(http_text(FND_ISS_INAV % urllib.parse.quote(code), timeout=15))))
+        if err:
+            out["errors"].append("iNAV: " + err)
+        if iv:
+            out.update(inav=iv["value"], inav_prev=iv["prev"], inav_cur=iv["cur"] or pick["cur"], inav_date=iv["date"], inav_time=iv["time"],
+                       inav_code=code, inav_url=FND_INAV_PAGE % urllib.parse.quote(code))
+            p = _fnd_f(price)
+            if p and p > 0 and out["inav_cur"] == "RUB" and cur == "RUB":
+                out["premium"] = round((p / iv["value"] - 1) * 100, 2)
+    return out
+
+
+def fund_meta(secid, category=None):
+    """Паспорт фонда из ISS: {category, type_name, full_name, issue_name, issue_date, manager, manager_url}. Ошибки сети не критичны (поля None)."""
+    secid = _fnd_secid(secid)
+    key = "fnd_meta_v2_" + secid
     hit = store().get(key, FND_META_TTL)
     if hit is None:
         hit = mem_get(("fnd_meta_err", secid), FND_ERR_TTL)
     if hit is None:
-        hit, ok = {"type_name": None, "full_name": None, "issue_date": None, "manager": None, "manager_url": None}, True
+        hit, ok = {"type_name": None, "full_name": None, "issue_name": None, "issue_date": None, "manager": None, "manager_url": None}, True
         try:
             j = json.loads(http_text(FND_ISS_DESC % urllib.parse.quote(secid), timeout=10))
             t = j.get("description") or {}
             d = {r[0]: r[2] for r in t.get("data") or [] if r}
-            hit.update(type_name=d.get("TYPENAME"), full_name=d.get("NAME") or d.get("ISSUENAME"), issue_date=d.get("ISSUEDATE"))
+            hit.update(type_name=d.get("TYPENAME"), full_name=d.get("NAME") or d.get("ISSUENAME"), issue_name=d.get("ISSUENAME"),
+                       issue_date=d.get("ISSUEDATE"))
             em = d.get("EMITTER_ID")
             if em:
                 e = json.loads(http_text(FND_ISS_EMIT % urllib.parse.quote(str(em)), timeout=10))
@@ -19276,17 +19647,30 @@ def stk_rows_from_iss(j, sector_of=None, default_sector=STK_DEFAULT_SECTOR):
 
 
 STK_FUND_CATS = {
-    "Денежный рынок": "LQDT AKMM SBMM TMON AMNR CASH MONY OLIQ PSMM FMMM TSAV",
+    "Денежный рынок": "LQDT AKMM SBMM TMON AMNR CASH MONY OLIQ PSMM FMMM TSAV BCSD",
     "Золото и металлы": "GOLD TGLD AKGD SBGD BCSG PSGM",
-    "Облигации": "SBGB OBLG AKMB TBRU SBRB TOFZ INFL OFZS WOFZ SUGB SBCB CORP BOND ROBL BNDA BNDB BNDC AMGB PSRB MKBD TLCB SBLB SBHI SBFR AKFB TPAY",
-    "Акции": "TMOS SBMX EQMX AKME TDIV DIVD AKIE AKAI AIIQ",
-    "Валюта": "TUSD TEUR TCNY YUAN CNYM WUSD AMNY BCSD",
+    "Облигации": "SBGB OBLG AKMB TBRU SBRB TOFZ INFL OFZS WOFZ SUGB SBCB CORP BOND ROBL BNDA BNDB BNDC AMGB PSRB TLCB SBLB SBHI SBFR AKFB TPAY",
+    "Акции": "TMOS SBMX EQMX AKME TDIV DIVD AKIE AKAI AIIQ MKBD",
+    "Валюта": "TUSD TEUR TCNY YUAN CNYM WUSD AMNY",
 }
 STK_FUND_CAT_OF = {t: c for c, ts in STK_FUND_CATS.items() for t in ts.split()}
 STK_FUND_OTHER = "Прочие фонды"
-_STK_FUND_WORDS = (("Золото и металлы", ("золот", "драгмет", "металл")), ("Денежный рынок", ("денеж", "ликвид", "казна", "казнач")),
-                   ("Облигации", ("облиг", "офз", "бонд")), ("Акции", ("акци", "акц ", "акцрост", "див")),
-                   ("Валюта", ("валют", "юан", "доллар")))
+# Эвристика по названию (SECNAME / полное название выпуска из ISS), порядок важен: первое совпадение решает.
+# «Валютные облигации», «облигации в юанях» — облигации; «денежный рынок в юанях», «накопительный в юанях» — валюта.
+_STK_FUND_RULES = (
+    ("Золото и металлы", r"золот|драгмет|драгоцен|металл|платин|паллад"),
+    ("Недвижимость", r"недв|арендн|складск|промышленные парки|\bндв\b|лахта|фжн|парус|рентал|рентн|комнед|термы|термолэнд|"
+                     r"современн\w* \d|активо"),
+    ("Облигации", r"облиг|\bобл\b|\bобл\.|офз|бонд|еврообл|флоатер|переменн\w* купон|долгов|гособлиг|корп\.? обл|высокодоходн|"
+                  r"\bвдо\b|суборд"),
+    ("Валюта", r"юан|доллар|\bевро\b|валют|\bcny\b|\busd\b"),
+    ("Денежный рынок", r"денеж\w*\.? рын|\bден\.? рын|ликвид|казна|казнач|накопит|сберегат|ежедневн\w* процент|\bрепо\b|\bmm\b"),
+    ("Акции", r"акци|\bакц|индекс|дивид|фишк|ммвб|мосбирж|лидер|технолог|интеллект|потреб|финансов|роста|айпио|\bipo\b|квант|трендов|"
+              r"халял|российские акции|устойч|ответств|первичных размещ"),
+    ("Смешанные", r"портф|всепогод|лежебок|моя цель|смеш|баланс|стратеги|смарт|разумн|консерв|осторожн|антиинфляц|инфляц|"
+                  r"пассивн\w* доход|ежемесячн\w* доход|абсолютн"),
+)
+_STK_FUND_RX = [(c, re.compile(rx)) for c, rx in _STK_FUND_RULES]
 
 
 def stk_fund_category(secid, name=""):
@@ -19294,9 +19678,9 @@ def stk_fund_category(secid, name=""):
     c = STK_FUND_CAT_OF.get((secid or "").upper())
     if c:
         return c
-    n = (name or "").lower() + " "
-    for cat, words in _STK_FUND_WORDS:
-        if any(w in n for w in words):
+    n = " ".join(str(name or "").lower().replace("ё", "е").replace("–", "-").replace("«", " ").replace("»", " ").replace('"', " ").split())
+    for cat, rx in _STK_FUND_RX:
+        if rx.search(n):
             return cat
     return STK_FUND_OTHER
 
@@ -19643,7 +20027,15 @@ def stock_card(secid, interval="D", cfg=None):
             divs = stock_dividends(secid, q["price"], None, cfg, history=False)
         except Exception:  # noqa: BLE001 — дивиденды фонда не обязательны
             divs = {"items": [], "ttm_value": 0, "yield_ttm": None, "next": None, "source": "none"}
-        out.update(multiples=None, report=None, dividends=divs, fund=fund_meta(secid, q.get("sector")))
+        fm = fund_meta(secid, q.get("sector"))
+        if q.get("sector") == STK_FUND_OTHER and (fm.get("issue_name") or fm.get("full_name")):   # короткое имя TQBR не подсказало — пробуем полное
+            cat = stk_fund_category(secid, (fm.get("issue_name") or "") + " " + (fm.get("full_name") or ""))
+            q["sector"] = fm["category"] = cat
+        try:
+            fm["nav"] = fund_nav(secid, q.get("price"))
+        except Exception:  # noqa: BLE001 — СЧА и iNAV не обязательны для карточки
+            fm["nav"] = None
+        out.update(multiples=None, report=None, dividends=divs, fund=fm)
         return out
     out.update(multiples=stock_multiples(secid, q.get("cap"), auid, cfg), dividends=stock_dividends(secid, q["price"], uid, cfg, history=True),
                report=stock_next_report(uid, cfg, secid))
@@ -25125,6 +25517,8 @@ API_GET["/api/shell"] = lambda cfg, acc, q, force: shell_status()
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
+# секреты, которые окно настроек может показать по кнопке «глаз» (GET /api/config/secret)
+UI_SECRET_NAMES = ("token", "data_key", "backup_password")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -25209,6 +25603,16 @@ class Handler(BaseHTTPRequestHandler):
                            imports=[dict(x, broker_id=broker_of_account(x)[0]) for x in imports_list()],
                            brokers=BROKERS, data_dir=APP_DIR, version=APP_VERSION)
                 return self.send(200, pub)
+            if u.path == "/api/config/secret":
+                # Сохранённый секрет — только своему окну: Host проверен выше, плюс собственный заголовок
+                # (чужая страница не может его поставить без CORS-preflight, который мы не разрешаем). Не логируем.
+                if self.headers.get("X-TA-Secret") != "1" or \
+                        self.headers.get("Sec-Fetch-Site") not in (None, "same-origin"):
+                    return self.send(403, {"error": "forbidden"})
+                name = q.get("name", "")
+                if name not in UI_SECRET_NAMES or name not in SECRET_KEYS:
+                    return self.send(400, {"error": "unknown secret"})
+                return self.send(200, {"name": name, "value": str(cfg.get(name) or "")})
             if u.path == "/api/summary":
                 return self.send(200, build_summary(cfg, acc, q.get("period", "all"), f))
             if u.path == "/api/bonds":
@@ -26465,6 +26869,14 @@ tr.scr-low td{opacity:.5}
 .fh-bar{display:inline-block;width:min(140px,18vw);height:6px;border-radius:3px;background:#ffffff12;margin-right:10px;vertical-align:middle;overflow:hidden}
 .fh-bar i{display:block;height:100%;background:var(--s1);border-radius:3px}
 [data-theme=light] .fh-bar{background:#0000000f}[data-theme=light] .fh-t tr.fh-lnk:hover td{background:#00000006}
+/* «О фонде»: подпись слева, значение справа; значение переносится, а не обрезается */
+.fi-l{display:grid;grid-template-columns:minmax(110px,38%) minmax(0,1fr);margin:0;font-size:13px}
+.fi-l dt,.fi-l dd{margin:0;padding:9px 0;border-bottom:1px solid #ffffff08}
+.fi-l dt{color:var(--mu);padding-right:12px}
+.fi-l dd{text-align:right;overflow-wrap:anywhere;min-width:0}
+.fi-l dd small{display:block;margin-top:2px;font-size:11.5px}
+.fi-l dt:nth-last-child(2),.fi-l dd:last-child{border-bottom:0}
+[data-theme=light] .fi-l dt,[data-theme=light] .fi-l dd{border-bottom-color:#00000010}
 .hm-bar{display:flex;flex-wrap:wrap;gap:4px 18px;align-items:center}
 .hm-st{display:flex;flex-wrap:wrap;gap:4px 18px;font-size:13px;color:var(--mu);margin:2px 0 12px}
 .hm-st b{color:var(--tx);font-weight:600}.hm-st b.pos{color:var(--pos)}.hm-st b.neg{color:var(--neg)}
@@ -29625,7 +30037,6 @@ const ST_ICO={
  look:'<circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" opacity=".35"/>',
  calc:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2M12 11h2M8 15h2M12 15h2M8 18h2M12 18h4"/>',
  local:'<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>',
- adv:'<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>',
  news:'<path d="M12 3l2.4 5.6 6.1.6-4.6 4 1.4 6-5.3-3.2L6.7 19.2l1.4-6-4.6-4 6.1-.6z"/>',
  danger:'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
  eye:'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
@@ -29641,7 +30052,6 @@ const SET_TOC=[['set-conn','Подключение','conn','Токен Т-Инв
   ['set-look','Внешний вид','look','Тема, напоминания и разделы меню'],
   ['set-calc','Расчёты','calc','Прогноз ключевой ставки и сбор раскрытий'],
   ['set-local','Данные','local','Хранилище, резервные копии и экспорт'],
-  ['set-adv','Для опытных','adv','Адреса API и сертификаты — обычно не трогают'],
   ['set-news','Что нового','news','Версия программы, изменения и планы'],
   ['set-danger','Опасная зона','danger','Очистка и удаление данных']];
 const stTxt=h=>String(h==null?'':h).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
@@ -29679,17 +30089,44 @@ function stMsg(t,ok,mini){
 function stDirty(btn,ids){
   const g=id=>document.getElementById(id),b=typeof btn==='string'?g(btn):btn;
   const els=ids.map(g).filter(Boolean);if(!b)return{rebase(){},upd(){}};
-  const snap=()=>els.map(e=>e.type==='checkbox'?e.checked:e.value).join('\u0001');
+  const snap=()=>els.map(e=>e.type==='checkbox'?e.checked:stSecVal(e)).join('\u0001');
   let base=snap();const upd=()=>{b.disabled=snap()===base};
   els.forEach(e=>{e.addEventListener('input',upd);e.addEventListener('change',upd)});b.disabled=true;
   return{rebase(){base=snap();upd()},upd};
 }
 function stEnter(ids,btn){ids.forEach(id=>{const e=document.getElementById(id);if(e)e.addEventListener('keydown',ev=>{if(ev.key!=='Enter'||ev.isComposing)return;const b=document.getElementById(btn);if(b&&!b.disabled){ev.preventDefault();b.click()}})})}
-/* показать/скрыть и скопировать для полей с секретом */
+/* показать/скрыть и скопировать для полей с секретом.
+   Сохранённый секрет в поле не лежит (видны только точки-подсказка): «глаз» и «копировать» берут его у локального сервера.
+   Показанное, но не изменённое значение считается «без изменений» (stSecVal) — повторно не сохраняется. */
+const ST_SECRET_NAME={tok:'token','ds-key':'data_key',bkpw:'backup_password'};
+function stSecVal(i){if(typeof i==='string')i=document.getElementById(i);if(!i)return'';return i._stRev!=null&&i.value===i._stRev?'':i.value}
+async function stSecFetch(id){
+  const n=ST_SECRET_NAME[id];if(!n)return'';
+  const r=await api('/api/config/secret?name='+encodeURIComponent(n),{headers:{'X-TA-Secret':'1'}});
+  return String((r&&r.value)||'');
+}
+function stEyeSet(b,sh){b.innerHTML=stIco(sh?'eyeoff':'eye');b.setAttribute('aria-label',sh?'Скрыть':'Показать')}
 function stSecretBind(root){
-  (root||document).querySelectorAll('[data-eye]').forEach(b=>b.onclick=()=>{const i=document.getElementById(b.dataset.eye);if(!i)return;const sh=i.type==='password';i.type=sh?'text':'password';b.innerHTML=stIco(sh?'eyeoff':'eye');b.setAttribute('aria-label',sh?'Скрыть':'Показать')});
-  (root||document).querySelectorAll('[data-cp]').forEach(b=>b.onclick=async()=>{const i=document.getElementById(b.dataset.cp);if(!i||!i.value)return stMsg('Нечего копировать: поле пустое.');
-    try{await navigator.clipboard.writeText(i.value)}catch(e){i.type='text';i.select();try{document.execCommand('copy')}catch(x){}}
+  (root||document).querySelectorAll('[data-eye]').forEach(b=>b.onclick=async()=>{const i=document.getElementById(b.dataset.eye);if(!i)return;
+    if(i.type==='password'){
+      if(!i.value&&ST_SECRET_NAME[i.id]){
+        let v='';try{v=await stSecFetch(i.id)}catch(e){return stMsg(e.message)}
+        if(!v)return stMsg('Сохранённого значения нет — поле пустое.',1,true);
+        if(i.value)return;                       /* пока ждали ответ, пользователь начал вводить */
+        i._stRev=v;i.value=v;
+      }
+      i.type='text';stEyeSet(b,true);
+    }else{
+      if(i._stRev!=null){if(i.value===i._stRev)i.value='';i._stRev=null}
+      i.type='password';stEyeSet(b,false);
+    }});
+  (root||document).querySelectorAll('[data-cp]').forEach(b=>b.onclick=async()=>{const i=document.getElementById(b.dataset.cp);if(!i)return;
+    let v=i.value;
+    if(!v&&ST_SECRET_NAME[i.id]){try{v=await stSecFetch(i.id)}catch(e){return stMsg(e.message)}}
+    if(!v)return stMsg('Нечего копировать: поле пустое.');
+    let ok=false;try{await navigator.clipboard.writeText(v);ok=true}catch(e){}
+    if(!ok){const t=document.createElement('textarea');t.value=v;t.setAttribute('readonly','');t.style.cssText='position:fixed;left:-9999px;top:0;opacity:0';document.body.appendChild(t);t.select();try{ok=document.execCommand('copy')}catch(x){}t.remove()}
+    if(!ok)return stMsg('Не удалось скопировать.');
     b.classList.add('done');b.innerHTML=stIco('check',2.4);setTimeout(()=>{b.classList.remove('done');b.innerHTML=stIco('copy')},1200);stMsg('Скопировано',1,true)});
 }
 /* ── разделы меню ── */
@@ -29732,8 +30169,8 @@ function bindSetDs(c,msg){
   dsStatus();
   const dirty=stDirty('ds-save',['ds-url','ds-key']);
   stEnter(['ds-url','ds-key'],'ds-save');
-  const save=async()=>{const b={data_server:g('ds-url').value};if(g('ds-key').value)b.data_key=g('ds-key').value;await post('/api/config',b);
-    c.data_server=g('ds-url').value.trim();if(g('ds-key').value)c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
+  const save=async()=>{const k=stSecVal('ds-key'),b={data_server:g('ds-url').value};if(k)b.data_key=k;await post('/api/config',b);
+    c.data_server=g('ds-url').value.trim();if(k)c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
   g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Сохранено. Новые запросы пойдут '+(c.data_server.toLowerCase()==='off'?'напрямую.':'через сервер.'),1);authCheck(true);renderSettings()}catch(x){msg(x.message);dirty.upd()}};
   g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{url:g('ds-url').value,key:g('ds-key').value});
     msg(`Сервер работает: версия ${r.version}, записей в кэше ${r.cache_items}.`,1)}catch(x){msg(x.message)}finally{b.disabled=false}};
@@ -29917,13 +30354,6 @@ async function renderSettings(){
     `<p class="st-line" id="krinfo">Загружаю…</p>`+
     stMore('Чем отличаются источники','«Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.'),
     {hint:'для флоатеров'})+setCrowdHtml(c);
-  /* для опытных */
-  const adv=stGroup('Адреса и сертификаты',
-    stRow('Адреса REST API (боевой)','По одному в строке',`<textarea class="in mono st-wide" id="hp" rows="2" spellcheck="false" aria-label="Адреса REST API боевого контура">${esc(c.hosts_prod.join('\n'))}</textarea>`,{stack:1})+
-    stRow('Адреса REST API (песочница)','По одному в строке',`<textarea class="in mono st-wide" id="hs" rows="2" spellcheck="false" aria-label="Адреса REST API песочницы">${esc(c.hosts_sandbox.join('\n'))}</textarea>`,{stack:1})+
-    stRow('Дополнительный сертификат','Обычно не нужен: сертификат Минцифры уже встроен в программу',`<input class="in mono st-wide" id="ca" value="${esc(c.ca_file)}" placeholder="/path/to/cert.pem" spellcheck="false" aria-label="Файл сертификата">`,{stack:1})+
-    stRow('Проверять SSL-сертификат','Отключайте только для отладки',stSw('vs',c.verify_ssl,'Проверять SSL-сертификат'))+
-    stRow('Применить','',`<button class="btn" id="save2" disabled>Сохранить</button>`),{hint:'обычно не трогать'});
   const sec=(i,body)=>stSec(SET_TOC[i][0],SET_TOC[i][1],SET_TOC[i][3],SET_TOC[i][2],body);
   view.innerHTML=`<div class="st fade">
   <aside class="st-side" aria-label="Навигация по настройкам">
@@ -29938,7 +30368,7 @@ async function renderSettings(){
   </div></div>`;
   const main=document.getElementById('st-main');
   const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)),
-    sec(5,adv),sec(6,setNewsHtml(c)),sec(7,setDangerHtml(c))];
+    sec(5,setNewsHtml(c)),sec(6,setDangerHtml(c))];
   main.insertAdjacentHTML('beforeend',html.join(''));
   if(keep){view.scrollTop=keep;const st=view.querySelector('.st');if(st)st.classList.remove('fade')}
   stSecretBind(main);
@@ -29970,8 +30400,8 @@ async function renderSettings(){
   try{bindSetBackup(c,msg)}catch(e){}
   try{bindSetCrowd(c,msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
-  const body=()=>({token:$('#tok').value,sandbox:$('#sb').checked,verify_ssl:$('#vs').checked,ca_file:$('#ca').value,
-    hosts_prod:$('#hp').value.split('\n'),hosts_sandbox:$('#hs').value.split('\n')});
+  /* адреса API, сертификат и проверка SSL больше не редактируются в окне: в настройках остаются как были */
+  const body=()=>({token:stSecVal('tok'),sandbox:$('#sb').checked});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
   const reset=()=>{S.data=S.bonds=S.hist=null;S.account='all';persist()};
   try{bindSetLocal(c,msg,busy,reset)}catch(e){}
@@ -29984,10 +30414,6 @@ async function renderSettings(){
   /* песочница меняет и адреса API, и нужный токен — применяется вместе с токеном по «Сохранить и подключиться», а не сразу */
   $('#sb').onchange=e=>{const el=e.currentTarget;if(el.checked===!!c.sandbox)return;
     stMsg(el.checked?'Вставьте токен песочницы и нажмите «Сохранить и подключиться».':'Вставьте боевой токен (только чтение) и нажмите «Сохранить и подключиться».',1)};
-  $('#vs').onchange=async e=>{const el=e.currentTarget;try{await post('/api/config',{verify_ssl:el.checked});c.verify_ssl=el.checked;stOk(el)}catch(x){el.checked=!el.checked;msg(x.message)}};
-  /* адреса и сертификат: по кнопке, пока есть изменения */
-  const dAdv=stDirty('save2',['hp','hs','ca']);
-  $('#save2').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await post('/api/config',body());reset();msg('Сохранено.',1);stOk(b);dAdv.rebase();load(true)}catch(x){msg(x.message);dAdv.upd()}};
   $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Заново загрузить все операции и цены из Т-Инвестиций? Это может занять время.'))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
   if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
@@ -30005,21 +30431,43 @@ function setTgHtml(c){
     stRow('Наблюдение и цели','Тревоги по списку наблюдения, достигнутые цели, напоминания из дневника',stSw('tg-wat',on('tg_on_watch',true),'Наблюдение и цели'),{cls:'sub'})+
     stRow('Ближайшие выплаты','За сколько дней сообщать о выплатах (0 — выключить)',`<input class="in num st-num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}" aria-label="За сколько дней сообщать о выплатах"><span class="st-unit">дн.</span>`,{cls:'sub'})+
     stRow('Ежедневная сводка','Портфель, выплаты на неделю, тревоги',`<input class="in num st-time" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}" aria-label="Время сводки">${stSw('tg-dg',on('tg_digest',false),'Ежедневная сводка')}`,{cls:'sub'})+
+    stRow('Проверять на сервере, когда программа закрыта','Цели по наблюдению, напоминания дневника, оферты и выплаты по портфелю проверяет сервер данных — раз в 15 минут, кроме ночи (22:00–08:00 МСК)',stSw('tg-srv',on('tg_server',false),'Проверять тревоги на сервере, когда программа закрыта'),{cls:'sub'})+
+    `<p class="st-line" id="tg-srv-state"></p>`+
+    stRow('Данные на сервере','Подписка удаляется и сама — когда истекает ключ из бота',`<button class="btn ghost danger" id="tg-srv-del">Удалить данные с сервера</button>`,{cls:'sub',id:'tg-srv-row',hidden:!on('tg_server',false)})+
     stRow('Проверка','Отправить пробное сообщение или сразу проверить тревоги',`<button class="btn ghost" id="tg-test">Тестовое сообщение</button><button class="btn ghost" id="tg-run" title="Проверить тревоги и отправить новые прямо сейчас">Проверить сейчас</button>`)+
     `<p class="st-line" id="tg-state"></p>`+
-    stMore('Что нужно знать','Уведомления приходят от <b id="tg-bot">@tanalyticbot</b> — того же бота, который выдаёт ключ входа. Текст уведомлений (названия бумаг и суммы) проходит через сервер данных и бот и удаляется сразу после отправки; токен Т-Инвестиций никуда не передаётся. Уведомления приходят, <b>только пока программа запущена</b>; проверка выполняется раз в 10–15 минут, одна и та же тревога повторно не отправляется. Нужен вход по ключу из бота.'),
+    stMore('Что нужно знать','Уведомления приходят от <b id="tg-bot">@tanalyticbot</b> — того же бота, который выдаёт ключ входа. Текст уведомлений (названия бумаг и суммы) проходит через сервер данных и бот и удаляется сразу после отправки; токен Т-Инвестиций никуда не передаётся. Пока программа запущена, она проверяет тревоги раз в 10–15 минут; одна и та же тревога повторно не отправляется. Нужен вход по ключу из бота.'+
+      '<br><br><b>Проверка на сервере</b> (выключена, пока вы её не включите) нужна, чтобы уведомления приходили и при закрытой программе. На сервер данных уходит только «подписка»: ISIN и названия бумаг из списка наблюдения с вашими целями по доходности/цене; ISIN, название и даты напоминаний дневника (<b>без текста заметок</b>); ISIN, название и даты ближайших оферт облигаций портфеля; даты, названия и суммы ближайших выплат (если включены «Ближайшие выплаты»); ключи уже отправленных уведомлений, чтобы не было повторов. '+
+      '<b>Токен Т-Инвестиций, номера счетов, стоимость портфеля и остатки денег не передаются.</b> Подписка обновляется при изменениях и при запуске программы; когда режим включён, эти уведомления отправляет только сервер, без дублей. '+
+      'Данные удаляются кнопкой «Удалить данные с сервера», при выключении режима, кнопкой в боте (<code>/alerts</code>) и автоматически, когда истекает ключ из бота (7 дней). '+
+      'Только при запущенной программе работают: тревоги мониторинга портфеля и наблюдения (падение цены, спред, рейтинг, дефолты, остановка торгов, ликвидность), крупные сделки и всплески объёма, ежедневная сводка.'),
     {id:'tg-card',hint:'по желанию',cls:en?'':'st-dis'});
 }
 function bindSetTg(c,msg){
   const g=id=>document.getElementById(id);if(!g('tg-card'))return;
   const body=()=>({tg_enabled:g('tg-en').checked,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
-    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00'});
+    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00',tg_server:g('tg-srv').checked});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
   const save=async()=>{const r=await post('/api/tg/save',body());Object.assign(c,r.settings);return r};
   const dim=()=>g('tg-card').classList.toggle('st-dis',!g('tg-en').checked);
+  const srvShow=()=>api('/api/tg/server').then(s=>{
+    g('tg-srv-row').hidden=!(s.enabled||s.ok);const n=s.counts||{};
+    g('tg-srv-state').textContent=!s.enabled?'':s.error?s.error:s.active?`Сервер проверяет: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}. Обновлено ${new Date(s.ok*1000).toLocaleString('ru-RU')}.`:'Подписка ещё не отправлена на сервер.';
+  }).catch(()=>{});
   ['tg-en','tg-mon','tg-wat','tg-pay','tg-time','tg-dg'].forEach(id=>g(id).addEventListener('change',async e=>{
     const el=e.currentTarget;dim();
-    try{await save();stOk(el)}catch(x){msg(x.message)}}));
+    try{const r=await save();stOk(el);if(r.warning)msg(r.warning);setTimeout(srvShow,4500)}catch(x){msg(x.message)}}));
+  g('tg-srv').addEventListener('change',async e=>{
+    const el=e.currentTarget;
+    if(el.checked&&!confirm('Включить проверку на сервере?\n\nНа сервер данных будут отправлены: ISIN и названия бумаг из списка наблюдения с целями, даты напоминаний дневника (без текста), даты ближайших оферт и выплат по облигациям портфеля (с суммами выплат). Токен, счета и стоимость портфеля не передаются.\n\nУдалить данные можно в любой момент кнопкой «Удалить данные с сервера» или в боте командой /alerts.')){el.checked=false;return}
+    try{const r=await save();
+      if(el.checked){const s=await post('/api/tg/server',{action:'sync'});const n=s.counts||{};msg(`Сервер будет проверять: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}.`,1)}
+      else msg(r.warning||'Проверка на сервере выключена, данные удалены с сервера.',!r.warning);
+    }catch(x){msg(x.message)}finally{srvShow()}});
+  g('tg-srv-del').onclick=e=>busy(e.currentTarget,async()=>{
+    if(!confirm('Удалить подписку на тревоги с сервера и выключить проверку на сервере?'))return;
+    await post('/api/tg/server',{action:'delete'});g('tg-srv').checked=false;c.tg_server=false;msg('Данные удалены с сервера.',1);srvShow()});
+  srvShow();
   api('/api/tg/info').then(i=>{
     g('tg-bot').textContent='@'+String(i.bot||'tanalyticbot').replace(/^@/,'');
     g('tg-state').textContent=!i.server?'Сервер данных выключен («off»): уведомления работают через него. Включите сервер данных в разделе «Подключение».':
@@ -30453,6 +30901,7 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+  ['0.29','25.11.2026',['<b>Проверка тревог на сервере, пока программа закрыта</b>: цели по наблюдению, напоминания дневника (без текста заметок), ближайшие оферты и выплаты по облигациям портфеля проверяются сервером данных каждые 15 минут, кроме ночи (22:00–08:00 МСК). Включается в «Настройках»; управлять и удалить подписку можно и в боте командой <code>/alerts</code>','<b>СЧА и расчётная цена (iNAV) фондов</b>: в карточке фонда показываются текущая iNAV Мосбиржи, отклонение биржевой цены от расчётной, последняя СЧА по отчётам УК, дата и управляющая компания','<b>Настройки</b>: кнопка «глаз» теперь показывает ранее сохранённые секреты (токен, ключ сервера данных, пароль резервной копии) с проверкой доступа только из окна программы','<b>Обучающий тур и дивиденды</b>: рамка тура отслеживает сдвиги интерфейса и появление бегущей строки; таблица дивидендных гэпов в карточке акции открывается сразу развёрнутой']],
   ['0.28','24.11.2026',['<b>Фонды</b> открываются в карточке: котировка, график, теханализ, управляющая компания и <b>состав фонда</b> с долями бумаг (у фондов Т-Капитала — фактический, у индексных — состав индекса)','<b>Дивиденды в карточке акции</b>: история выплат с 2000-х (dohod.ru), рост за 5 и 10 лет, сколько лет подряд платят, надёжность, закрытие гэпа, «держать или продать» и ваши полученные дивиденды. Выплаты, операции, календарь и скринер открывают карточку сразу на этой вкладке','<b>Комиссии</b>: оптимизатор тарифа считает только счета Т-Инвестиций и всегда за последние 12 месяцев. Брокер импортированного отчёта определяется автоматически; для других брокеров — свой блок с выбором тарифа (пока заданы тарифы ВТБ)','<b>Календарь</b>: купоны по импортированным отчётам и демо-портфелю теперь видны (график берётся с Мосбиржи), строка с ключевой ставкой и днями до следующего заседания ЦБ','Облигации в юанях и долларах получают цену с Мосбиржи без токена (по курсу ЦБ)','Рейтинги в карточке облигации ведут на пресс-релизы агентств; на кривой эмитента подписано, что значит линия','Новый экран загрузки и обновления в стиле программы, плавный переход в основное окно. Если ваше приложение устарело, программа предложит скачать новое','Обучающий тур запускается только после обновления, подсказки стали непрозрачными; база данных сама чистится от устаревшего кэша; плавное закрытие выезжающей панели']],
   ['0.27','23.11.2026',['<b>Премиальный облик</b>: спокойная графитовая палитра, карточки с глубиной, шапка в одну строку, аккуратные вкладки разделов, приглушённые значки бумаг, новая иконка приложения и лаунчер в том же стиле','<b>Графики</b> в едином стиле: широкие скруглённые столбики, тонкая сетка, линии с заливкой, пончик с зазорами, плавное появление и новые подсказки','<b>Настройки</b> заново: разделы слева и поиск по настройкам, плитки состояния (токен, сервер данных, бот, данные), переключатели сохраняются сразу, опасные действия — в отдельной зоне','<b>Рейтинги из канала @ru_ratings</b>: клик по рейтингу открывает пресс-релиз агентства, при нескольких агентствах — список','<b>Горячие клавиши</b> (? — шпаргалка): g и буква — переход в раздел, r — обновить, h — скрыть суммы, t — тема; в поиске Ctrl+K — калькулятор (например 150000*0,13) и быстрые команды','<b>Первичка</b>: затянувшиеся размещения больше не теряются, «размещено» считается с даты старта, видно число дней размещения','<b>Налоги</b>: лимит освобождения ИИС-3 (30 млн ₽), ставка вычета ИИС 13 или 15 % — в настройках налогов','Уведомления в Telegram оформлены аккуратнее; звук интерфейса убран','Исправлено: дробные количества при импорте отчётов, доходность XIRR при неупорядоченных потоках, ошибка дюрации у дефолтных бумаг, кнопка «Повторить» на карте рынка, повторные фоновые пересчёты, вход по адресу [::1]']],
  ['0.26','22.11.2026',['<b>Новый облик</b>: тёмная и светлая палитры, логотип, заставка при запуске, чёткие шрифты, плавная смена темы и анимации (отключаются системной настройкой «уменьшить движение»)','<b>Скринер облигаций</b>: бейджи «фикс / флоатер / линкер / суборд», формула купона, пометка «доходность к оферте через N дн.», реальная доходность над ожидаемой инфляцией, мини-графики цены за 30 дней, режимы «Обычный / Плотный / Карта» с выделением области на карте, управление с клавиатуры (j/k, пробел, Enter, f, v, /)','<b>ОФЗ-Спредер</b> (раздел «Пульс рынка»): наклон и кривизна кривой КБД, премия за каждый год дюрации, bullet против barbell, какие ОФЗ дешевле или дороже кривой','<b>Налоговый щит</b>: в сборе убытков отмечены продажи лотов со стажем 2–3 года (сбрасывают срок для ЛДВ) и оценка потерянной льготы; можно не предлагать такие лоты','<b>Матрица выплат на 3 года</b> на экране «Выплаты» и симулятор реинвестирования «Снежный ком»','<b>Тур по интерфейсу</b> с подсветкой элементов; по желанию — тихий звук кликов (в «Настройках»)','Исправлено: оценка надёжности дивидендов банков, валютные остатки в отчётах брокера без токена (курс ЦБ), калькулятор «Мой портфель» для импортированных отчётов, кнопка «Повторить» в дивидендных гэпах, исчезающая ошибка импорта, закреплённое название в скринере, клик по акциям в «Позициях», два списка счетов на планшетах, «залипшие» подсказки на телефонах, перерисовка графиков при смене темы']],
@@ -33657,17 +34106,37 @@ function fhLoad(sec,force){
   api('/api/fund/holdings?'+new URLSearchParams({secid:sec})+(force?'&force=1':'')).then(j=>{h.data=j}).catch(e=>{h.err=e.message||String(e)})
     .then(()=>{h.loading=false;if(S.stk.secid!==sec)return;if(S.page==='stk')renderSoon();skRender()});
 }
+/* «О фонде»: список «подпись — значение», значение переносится (длинные названия УК, ссылки, пояснения не обрезаются) */
+const fiDate=d=>/^\d{4}-\d{2}-\d{2}/.test(d||'')?d.slice(0,10).split('-').reverse().join('.'):'';
+const fiNo=(t)=>`<span class="mu">${t||'нет данных'}</span>`;
+const fiUnits=n=>{n=+n||1;const a=n%10,b=n%100;return n+' '+(a===1&&b!==11?'пай':a>=2&&a<=4&&(b<10||b>=20)?'пая':'паёв')};
 function stkFundInfo(c){
-  const f=c.fund||{},q=c.quote,h=(S.fh[c.secid]||{}).data,d=c.dividends||{items:[]};
-  const url=f.manager_url?(/^https?:/i.test(f.manager_url)?f.manager_url:'https://'+f.manager_url):'';
-  const rows=[['Категория',esc(f.category||q.sector||'—')],['Вид бумаги',esc(f.type_name||'Пай биржевого фонда')],
-    ['Управляющая компания',f.manager?esc(f.manager)+(url?`<br><small><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(f.manager_url)}</a></small>`:''):'<span class="mu">—</span>'],
-    ['Начало торгов',f.issue_date?ddm(f.issue_date):'<span class="mu">—</span>'],
-    ['Стоимость чистых активов',h&&h.nav?fhMoney(h.nav,h.nav_cur)+'<br><small class="mu">по данным '+esc((h.source||{}).name||'источника')+'</small>':'<span class="mu">—</span>'],
-    ['Выплаты',d.items.length?'выплачивает доход'+(d.yield_ttm!=null?', за 12 мес. '+stkN(d.yield_ttm,2)+' %':''):'<span class="mu">выплат не найдено — доход, вероятно, остаётся в цене пая</span>'],
-    ['Лот',esc(String(q.lot||1))+' пай']];
-  return`<div class="card"><h2>О фонде</h2><div class="tbl"><table><tbody>${rows.map(r=>`<tr><td class="l">${r[0]}</td><td class="num">${r[1]}</td></tr>`).join('')}</tbody></table></div>
-    <p class="note">Комиссии управляющей компании программа не определяет — они указаны в правилах фонда на сайте УК.</p></div>`;
+  const f=c.fund||{},q=c.quote,h=(S.fh[c.secid]||{}).data,d=c.dividends||{items:[]},n=f.nav||{};
+  const mgr=f.manager||n.manager,murl=f.manager_url||n.manager_url;
+  const url=murl?(/^https?:/i.test(murl)?murl:'https://'+murl):'';
+  const lnk=(u,t)=>`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`;
+  const start=fiDate(f.issue_date||n.issue_date);
+  let nav;
+  if(n.nav)nav=`${fhMoney(n.nav,n.nav_cur)}<small class="mu">${n.nav_date?'на '+fiDate(n.nav_date)+', ':''}${lnk(n.source_url,'Мосбиржа')}</small>`;
+  else if(h&&h.nav)nav=`${fhMoney(h.nav,h.nav_cur)}<small class="mu">по данным ${esc((h.source||{}).name||'источника')}</small>`;
+  else nav=fiNo(n.errors&&n.errors.length?'Мосбиржа сейчас не ответила':'Мосбиржа не публикует');
+  let inav,prem=null;
+  if(n.inav){
+    const cur=n.inav_cur&&n.inav_cur!=='RUB'?' '+esc(n.inav_cur):' ₽';
+    inav=`${stkPrice(n.inav)}${cur}<small class="mu">${n.inav_date?fiDate(n.inav_date)+(n.inav_time?' '+esc(n.inav_time.slice(0,5)):''):''}${n.inav_url?' · '+lnk(n.inav_url,'iNAV '+n.inav_code):''}</small>`;
+    if(n.premium!=null){const p=n.premium,ab=Math.abs(p)<0.005;
+      prem=`${stkPrice(q.price)} ₽ · <b class="${ab?'':p>0?'neg':'pos'}">${ab?'на уровне расчётной':(p>0?'премия ':'дисконт ')+stkN(Math.abs(p),2)+' %'}</b><small class="mu">${ab?'':p>0?'биржевая цена выше расчётной стоимости пая':'биржевая цена ниже расчётной стоимости пая'}</small>`}
+  }else inav=fiNo(n.errors&&n.errors.length?'Мосбиржа сейчас не ответила':'Мосбиржа не рассчитывает для этого фонда');
+  const rows=[['Категория',esc(f.category||q.sector||'')||fiNo()],['Вид бумаги',esc(f.type_name||'Пай биржевого фонда')],
+    ['Управляющая компания',mgr?esc(mgr)+(url?`<small>${lnk(url,murl)}</small>`:''):fiNo()],
+    ['Начало торгов',start||fiNo()],
+    ['Стоимость чистых активов (СЧА)',nav],
+    ['Расчётная цена пая (iNAV)',inav]];
+  if(prem)rows.push(['Биржевая цена к iNAV',prem]);
+  rows.push(['Выплаты',d.items.length?'выплачивает доход'+(d.yield_ttm!=null?', за 12 мес. '+stkN(d.yield_ttm,2)+' %':''):fiNo('выплат не найдено — доход, вероятно, остаётся в цене пая')],
+    ['Лот',fiUnits(q.lot)]);
+  return`<div class="card"><h2>О фонде</h2><dl class="fi-l">${rows.map(r=>`<dt>${r[0]}</dt><dd>${r[1]}</dd>`).join('')}</dl>
+    <p class="note">iNAV — расчётная стоимость пая, которую Мосбиржа пересчитывает в течение торгов; СЧА публикуется по отчётам управляющей компании, обычно с задержкой в несколько дней. Комиссии управляющей компании программа не определяет — они указаны в правилах фонда на сайте УК.</p></div>`;
 }
 function stkFundHold(c,p){
   const sec=c.secid;let H=S.fh[sec];
@@ -35438,7 +35907,21 @@ const TOUR_STEPS=[
   {sel:['#nav [data-p="dgap"]','#nav button[title="Акции и фонды"]'],title:'Дивиденды',text:'Ближайшие дивиденды по акциям портфеля, их надёжность и поведение цены в день отсечки. Полный анализ любой акции — вкладка «Дивиденды» в её карточке. Раздел для режима «Профи».'},
   {sel:['#srch'],title:'Быстрый поиск ⌘K / Ctrl+K',text:'Находите бумаги, эмитентов и разделы программы с клавиатуры.'}
 ];
-const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0};
+const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0,ro:null,loop:0,lr:''};
+/* слежение за целью: бегущая строка, догрузка данных и т. п. сдвигают раскладку — подсветка и подсказка едут следом.
+   ResizeObserver ловит изменения размеров, а дешёвая проверка getBoundingClientRect раз в кадр — сдвиги без ресайза цели. */
+function tourRect(){const t=TOUR.tgt;if(!t)return'';const r=t.getBoundingClientRect();return Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+','+Math.round(r.height)+','+window.innerWidth+','+window.innerHeight}
+function tourLoop(){
+  TOUR.loop=0;if(!TOUR.on)return;
+  if(TOUR.tgt&&!document.body.contains(TOUR.tgt)){const st=TOUR.list[TOUR.i],t=st&&tourFind(st);if(t){TOUR.tgt=t;tourObserve()}}
+  const k=tourRect();if(k!==TOUR.lr){TOUR.lr=k;tourPlace()}
+  TOUR.loop=requestAnimationFrame(tourLoop);
+}
+function tourObserve(){
+  if(!TOUR.ro)return;
+  TOUR.ro.disconnect();
+  [document.body,document.querySelector('main'),document.getElementById('view'),document.getElementById('tkr'),TOUR.tgt].forEach(e=>{if(e)try{TOUR.ro.observe(e)}catch(x){}});
+}
 
 function tourFind(st){
   for(const s of st.sel){
@@ -35505,7 +35988,7 @@ function tourShow(i,dir){
   dir=dir||1;
   while(i>=0&&i<TOUR.list.length){
     const st=TOUR.list[i],t=tourFind(st);
-    if(t){TOUR.i=i;TOUR.tgt=t;break}
+    if(t){TOUR.i=i;TOUR.tgt=t;tourObserve();break}
     i+=dir;
   }
   if(i<0||i>=TOUR.list.length){if(i>=TOUR.list.length)tourStop();return}
@@ -35532,6 +36015,8 @@ function tourStop(){
   TOUR.on=false;uiSet(TOUR_KEY,tourVer());
   clearTimeout(TOUR.tm);clearTimeout(TOUR.tm2);
   if(TOUR.raf){cancelAnimationFrame(TOUR.raf);TOUR.raf=0}
+  if(TOUR.loop){cancelAnimationFrame(TOUR.loop);TOUR.loop=0}
+  if(TOUR.ro){TOUR.ro.disconnect();TOUR.ro=null}
   if(TOUR.ov)TOUR.ov.remove();if(TOUR.pop)TOUR.pop.remove();
   TOUR.ov=TOUR.pop=TOUR.tgt=null;
   window.removeEventListener('resize',tourSched);window.removeEventListener('scroll',tourSched,true);
@@ -35574,7 +36059,9 @@ function tourStart(){
   TOUR.ov=ov;TOUR.pop=pop;TOUR.hole=ov.querySelector('#tour-hole');TOUR.ring=ov.querySelector('.tour-ring');TOUR.bk=[...ov.querySelectorAll('.tour-bk')];
   window.addEventListener('resize',tourSched);window.addEventListener('scroll',tourSched,true);
   document.addEventListener('keydown',tourKey,true);document.addEventListener('click',tourClick,true);
+  if(window.ResizeObserver)TOUR.ro=new ResizeObserver(tourSched);
   tourShow(0,1);
+  TOUR.lr=tourRect();TOUR.loop=requestAnimationFrame(tourLoop);
 }
 window.tourStart=tourStart;
 
@@ -35587,6 +36074,8 @@ function tourAutoCheck(tries){
   const wait=n=>setTimeout(()=>{
     if(TOUR.on||tourSeen())return;
     if(document.getElementById('boot-splash')&&n<20){wait(n+1);return}
+    /* бегущая строка появляется над шапкой и сдвигает её — ждём её (до ~4 с), чтобы первый шаг не прыгал */
+    if(typeof TKR!=='undefined'&&!TKR.items.length&&!(typeof tkrOff==='function'&&tkrOff())&&n<8){wait(n+1);return}
     tourStart();
   },n?500:1200);
   wait(0);
@@ -36044,7 +36533,7 @@ function stkDivTab(c,p){
     <div style="margin-top:16px">${stkDvPayoff(d,p)}</div>
     ${d.received?`<div style="margin-top:16px">${stkDvMine(d)}</div>`:''}
     <div style="margin-top:16px">${stkDvHist(d)}</div>
-    ${(d.gaps||[]).length?`<details class="card sd-det" style="margin-top:16px"><summary><b>История гэпов по отсечкам</b> <span class="mu">${d.gaps.length} ${dlEv(d.gaps.length,'событие','события','событий')}</span></summary>${dlGapsTable(d.gaps)}</details>`:''}
+    ${(d.gaps||[]).length?`<details class="card sd-det" open style="margin-top:16px"><summary><b>История гэпов по отсечкам</b> <span class="mu">${d.gaps.length} ${dlEv(d.gaps.length,'событие','события','событий')}</span></summary>${dlGapsTable(d.gaps)}</details>`:''}
     <p class="note">Дивиденды: T-Invest${(d.div_hist||{}).added?' и dohod.ru':''}; котировки — Мосбиржа. Описательная статистика по прошлым выплатам, не прогноз и не инвестиционная рекомендация. <button class="btn ghost" id="${p}dvr" style="margin-left:6px">Обновить данные</button></p>`;
 }
 function bindStkDiv(root,p){

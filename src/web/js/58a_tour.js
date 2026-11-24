@@ -9,7 +9,21 @@ const TOUR_STEPS=[
   {sel:['#nav [data-p="dgap"]','#nav button[title="Акции и фонды"]'],title:'Дивиденды',text:'Ближайшие дивиденды по акциям портфеля, их надёжность и поведение цены в день отсечки. Полный анализ любой акции — вкладка «Дивиденды» в её карточке. Раздел для режима «Профи».'},
   {sel:['#srch'],title:'Быстрый поиск ⌘K / Ctrl+K',text:'Находите бумаги, эмитентов и разделы программы с клавиатуры.'}
 ];
-const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0};
+const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0,ro:null,loop:0,lr:''};
+/* слежение за целью: бегущая строка, догрузка данных и т. п. сдвигают раскладку — подсветка и подсказка едут следом.
+   ResizeObserver ловит изменения размеров, а дешёвая проверка getBoundingClientRect раз в кадр — сдвиги без ресайза цели. */
+function tourRect(){const t=TOUR.tgt;if(!t)return'';const r=t.getBoundingClientRect();return Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+','+Math.round(r.height)+','+window.innerWidth+','+window.innerHeight}
+function tourLoop(){
+  TOUR.loop=0;if(!TOUR.on)return;
+  if(TOUR.tgt&&!document.body.contains(TOUR.tgt)){const st=TOUR.list[TOUR.i],t=st&&tourFind(st);if(t){TOUR.tgt=t;tourObserve()}}
+  const k=tourRect();if(k!==TOUR.lr){TOUR.lr=k;tourPlace()}
+  TOUR.loop=requestAnimationFrame(tourLoop);
+}
+function tourObserve(){
+  if(!TOUR.ro)return;
+  TOUR.ro.disconnect();
+  [document.body,document.querySelector('main'),document.getElementById('view'),document.getElementById('tkr'),TOUR.tgt].forEach(e=>{if(e)try{TOUR.ro.observe(e)}catch(x){}});
+}
 
 function tourFind(st){
   for(const s of st.sel){
@@ -76,7 +90,7 @@ function tourShow(i,dir){
   dir=dir||1;
   while(i>=0&&i<TOUR.list.length){
     const st=TOUR.list[i],t=tourFind(st);
-    if(t){TOUR.i=i;TOUR.tgt=t;break}
+    if(t){TOUR.i=i;TOUR.tgt=t;tourObserve();break}
     i+=dir;
   }
   if(i<0||i>=TOUR.list.length){if(i>=TOUR.list.length)tourStop();return}
@@ -103,6 +117,8 @@ function tourStop(){
   TOUR.on=false;uiSet(TOUR_KEY,tourVer());
   clearTimeout(TOUR.tm);clearTimeout(TOUR.tm2);
   if(TOUR.raf){cancelAnimationFrame(TOUR.raf);TOUR.raf=0}
+  if(TOUR.loop){cancelAnimationFrame(TOUR.loop);TOUR.loop=0}
+  if(TOUR.ro){TOUR.ro.disconnect();TOUR.ro=null}
   if(TOUR.ov)TOUR.ov.remove();if(TOUR.pop)TOUR.pop.remove();
   TOUR.ov=TOUR.pop=TOUR.tgt=null;
   window.removeEventListener('resize',tourSched);window.removeEventListener('scroll',tourSched,true);
@@ -145,7 +161,9 @@ function tourStart(){
   TOUR.ov=ov;TOUR.pop=pop;TOUR.hole=ov.querySelector('#tour-hole');TOUR.ring=ov.querySelector('.tour-ring');TOUR.bk=[...ov.querySelectorAll('.tour-bk')];
   window.addEventListener('resize',tourSched);window.addEventListener('scroll',tourSched,true);
   document.addEventListener('keydown',tourKey,true);document.addEventListener('click',tourClick,true);
+  if(window.ResizeObserver)TOUR.ro=new ResizeObserver(tourSched);
   tourShow(0,1);
+  TOUR.lr=tourRect();TOUR.loop=requestAnimationFrame(tourLoop);
 }
 window.tourStart=tourStart;
 
@@ -158,6 +176,8 @@ function tourAutoCheck(tries){
   const wait=n=>setTimeout(()=>{
     if(TOUR.on||tourSeen())return;
     if(document.getElementById('boot-splash')&&n<20){wait(n+1);return}
+    /* бегущая строка появляется над шапкой и сдвигает её — ждём её (до ~4 с), чтобы первый шаг не прыгал */
+    if(typeof TKR!=='undefined'&&!TKR.items.length&&!(typeof tkrOff==='function'&&tkrOff())&&n<8){wait(n+1);return}
     tourStart();
   },n?500:1200);
   wait(0);

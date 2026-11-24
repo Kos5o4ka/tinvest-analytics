@@ -170,17 +170,37 @@ function fhLoad(sec,force){
   api('/api/fund/holdings?'+new URLSearchParams({secid:sec})+(force?'&force=1':'')).then(j=>{h.data=j}).catch(e=>{h.err=e.message||String(e)})
     .then(()=>{h.loading=false;if(S.stk.secid!==sec)return;if(S.page==='stk')renderSoon();skRender()});
 }
+/* «О фонде»: список «подпись — значение», значение переносится (длинные названия УК, ссылки, пояснения не обрезаются) */
+const fiDate=d=>/^\d{4}-\d{2}-\d{2}/.test(d||'')?d.slice(0,10).split('-').reverse().join('.'):'';
+const fiNo=(t)=>`<span class="mu">${t||'нет данных'}</span>`;
+const fiUnits=n=>{n=+n||1;const a=n%10,b=n%100;return n+' '+(a===1&&b!==11?'пай':a>=2&&a<=4&&(b<10||b>=20)?'пая':'паёв')};
 function stkFundInfo(c){
-  const f=c.fund||{},q=c.quote,h=(S.fh[c.secid]||{}).data,d=c.dividends||{items:[]};
-  const url=f.manager_url?(/^https?:/i.test(f.manager_url)?f.manager_url:'https://'+f.manager_url):'';
-  const rows=[['Категория',esc(f.category||q.sector||'—')],['Вид бумаги',esc(f.type_name||'Пай биржевого фонда')],
-    ['Управляющая компания',f.manager?esc(f.manager)+(url?`<br><small><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(f.manager_url)}</a></small>`:''):'<span class="mu">—</span>'],
-    ['Начало торгов',f.issue_date?ddm(f.issue_date):'<span class="mu">—</span>'],
-    ['Стоимость чистых активов',h&&h.nav?fhMoney(h.nav,h.nav_cur)+'<br><small class="mu">по данным '+esc((h.source||{}).name||'источника')+'</small>':'<span class="mu">—</span>'],
-    ['Выплаты',d.items.length?'выплачивает доход'+(d.yield_ttm!=null?', за 12 мес. '+stkN(d.yield_ttm,2)+' %':''):'<span class="mu">выплат не найдено — доход, вероятно, остаётся в цене пая</span>'],
-    ['Лот',esc(String(q.lot||1))+' пай']];
-  return`<div class="card"><h2>О фонде</h2><div class="tbl"><table><tbody>${rows.map(r=>`<tr><td class="l">${r[0]}</td><td class="num">${r[1]}</td></tr>`).join('')}</tbody></table></div>
-    <p class="note">Комиссии управляющей компании программа не определяет — они указаны в правилах фонда на сайте УК.</p></div>`;
+  const f=c.fund||{},q=c.quote,h=(S.fh[c.secid]||{}).data,d=c.dividends||{items:[]},n=f.nav||{};
+  const mgr=f.manager||n.manager,murl=f.manager_url||n.manager_url;
+  const url=murl?(/^https?:/i.test(murl)?murl:'https://'+murl):'';
+  const lnk=(u,t)=>`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`;
+  const start=fiDate(f.issue_date||n.issue_date);
+  let nav;
+  if(n.nav)nav=`${fhMoney(n.nav,n.nav_cur)}<small class="mu">${n.nav_date?'на '+fiDate(n.nav_date)+', ':''}${lnk(n.source_url,'Мосбиржа')}</small>`;
+  else if(h&&h.nav)nav=`${fhMoney(h.nav,h.nav_cur)}<small class="mu">по данным ${esc((h.source||{}).name||'источника')}</small>`;
+  else nav=fiNo(n.errors&&n.errors.length?'Мосбиржа сейчас не ответила':'Мосбиржа не публикует');
+  let inav,prem=null;
+  if(n.inav){
+    const cur=n.inav_cur&&n.inav_cur!=='RUB'?' '+esc(n.inav_cur):' ₽';
+    inav=`${stkPrice(n.inav)}${cur}<small class="mu">${n.inav_date?fiDate(n.inav_date)+(n.inav_time?' '+esc(n.inav_time.slice(0,5)):''):''}${n.inav_url?' · '+lnk(n.inav_url,'iNAV '+n.inav_code):''}</small>`;
+    if(n.premium!=null){const p=n.premium,ab=Math.abs(p)<0.005;
+      prem=`${stkPrice(q.price)} ₽ · <b class="${ab?'':p>0?'neg':'pos'}">${ab?'на уровне расчётной':(p>0?'премия ':'дисконт ')+stkN(Math.abs(p),2)+' %'}</b><small class="mu">${ab?'':p>0?'биржевая цена выше расчётной стоимости пая':'биржевая цена ниже расчётной стоимости пая'}</small>`}
+  }else inav=fiNo(n.errors&&n.errors.length?'Мосбиржа сейчас не ответила':'Мосбиржа не рассчитывает для этого фонда');
+  const rows=[['Категория',esc(f.category||q.sector||'')||fiNo()],['Вид бумаги',esc(f.type_name||'Пай биржевого фонда')],
+    ['Управляющая компания',mgr?esc(mgr)+(url?`<small>${lnk(url,murl)}</small>`:''):fiNo()],
+    ['Начало торгов',start||fiNo()],
+    ['Стоимость чистых активов (СЧА)',nav],
+    ['Расчётная цена пая (iNAV)',inav]];
+  if(prem)rows.push(['Биржевая цена к iNAV',prem]);
+  rows.push(['Выплаты',d.items.length?'выплачивает доход'+(d.yield_ttm!=null?', за 12 мес. '+stkN(d.yield_ttm,2)+' %':''):fiNo('выплат не найдено — доход, вероятно, остаётся в цене пая')],
+    ['Лот',fiUnits(q.lot)]);
+  return`<div class="card"><h2>О фонде</h2><dl class="fi-l">${rows.map(r=>`<dt>${r[0]}</dt><dd>${r[1]}</dd>`).join('')}</dl>
+    <p class="note">iNAV — расчётная стоимость пая, которую Мосбиржа пересчитывает в течение торгов; СЧА публикуется по отчётам управляющей компании, обычно с задержкой в несколько дней. Комиссии управляющей компании программа не определяет — они указаны в правилах фонда на сайте УК.</p></div>`;
 }
 function stkFundHold(c,p){
   const sec=c.secid;let H=S.fh[sec];

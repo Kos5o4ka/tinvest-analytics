@@ -1,0 +1,604 @@
+# -*- coding: utf-8 -*-
+"""Серверная проверка тревог TAnalytic: работает, пока приложение пользователя закрыто (по желанию пользователя).
+
+Приложение присылает «подписку» (POST /v1/alerts/sync) — только правила по публичным данным:
+  goals     — цели по бумагам списка наблюдения: ISIN, название, целевая доходность/цена;
+  reminders — напоминания дневника: id заметки, ISIN, название, дата заметки и дата напоминания (БЕЗ текста заметки);
+  offers    — ближайшие оферты облигаций портфеля: ISIN, название, тип, даты (график Мосбиржи), объявлен ли новый купон;
+  pay_days, pays — ближайшие выплаты: дата, вид, название, сумма (≈ число бумаг × купон по графику Мосбиржи);
+  sent      — ключи уже отправленных приложением уведомлений (чтобы сервер их не повторил).
+Токен Т-Инвестиций, номера счетов, стоимость портфеля, остатки денег сюда не попадают: лишние поля отклоняются (400).
+
+Хранение: таблицы alert_subs / alert_sent в общей базе бота (keys.sqlite, та же, что у outbox). Подписка удаляется
+командой приложения (POST /v1/alerts/delete), кнопкой в боте (/alerts) и автоматически, когда у пользователя не осталось
+действующего ключа (ключи — 7 дней), он удалён (/delete) или заблокирован.
+
+Проверка (AlertChecker) — раз в ~15 минут, сообщения кладутся в outbox через Notifier (лимиты и флаг notify как у /v1/notify),
+в тихие часы (по умолчанию 22:00–08:00 МСК) не отправляется ничего. Тексты и ключи дедупликации совпадают с приложением
+(13j_watch.py): проверяется тестами tests/test_watch_server.py. Только стандартная библиотека.
+"""
+import json
+import re
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+MSK = timezone(timedelta(hours=3))
+DAY = 86400
+SUB_V = 1
+SUB_MAX_BYTES = 128 * 1024
+LIMITS = {"goals": 300, "reminders": 300, "offers": 500, "pays": 1000, "sent": 5000}
+SENT_PREFIXES = ("gy|", "gp|", "rm|", "ofr|", "pay|")
+SENT_KEEP = 400 * DAY
+SYNC_PER_HOUR = 60
+
+SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS alert_subs(tg_id INTEGER PRIMARY KEY, data TEXT NOT NULL, created REAL NOT NULL, "
+    "updated REAL NOT NULL, checked REAL, sent_n INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS alert_sent(tg_id INTEGER NOT NULL, k TEXT NOT NULL, t REAL NOT NULL, PRIMARY KEY(tg_id, k))",
+)
+
+
+class AlertError(Exception):
+    def __init__(self, code, error):
+        Exception.__init__(self, error)
+        self.code, self.error = code, error
+
+
+# ───────────────────────── проверка подписки ─────────────────────────
+ISIN_RX = re.compile(r"^[A-Z0-9]{6,16}$")
+DATE_RX = re.compile(r"^\d{4}-\d\d-\d\d$")
+NOTE_RX = re.compile(r"^n\d{1,24}$")
+PAY_KINDS = ("coupon", "dividend", "amortization", "redemption", "maturity", "offer", "call", "put", "buyback")
+FIELDS = {
+    "goals": {"isin", "name", "target_yield", "target_price"},
+    "reminders": {"id", "isin", "name", "date", "remind_on"},
+    "offers": {"isin", "name", "kind", "date", "period_start", "period_end", "coupon_status", "new_rate"},
+    "pays": {"date", "kind", "name", "amount"},
+}
+TOP = {"v", "goals", "reminders", "offers", "pay_days", "pays", "sent", "resume"}
+
+
+def _bad(what):
+    raise AlertError(400, "bad_" + what)
+
+
+def _s(x, n=120):
+    if x is None:
+        return ""
+    if not isinstance(x, str):
+        _bad("string")
+    return re.sub(r"[\x00-\x1f\x7f]", " ", x).strip()[:n]
+
+
+def _isin(x):
+    if not isinstance(x, str) or not ISIN_RX.match(x):
+        _bad("isin")
+    return x
+
+
+def _date(x, opt=False):
+    if x is None and opt:
+        return None
+    if not isinstance(x, str) or not DATE_RX.match(x):
+        _bad("date")
+    return x
+
+
+def _numf(x, opt=True, lo=0.0, hi=1e12):
+    if x is None and opt:
+        return None
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or x != x or not lo <= x <= hi:
+        _bad("number")
+    return float(x)
+
+
+def validate(p):
+    """Подписка из запроса -> очищенная копия. Любое неизвестное поле, неверный тип или превышение лимита -> AlertError(400)."""
+    if not isinstance(p, dict) or p.get("v") != SUB_V:
+        _bad("version")
+    if set(p) - TOP:
+        _bad("field")
+    if not isinstance(p.get("resume", False), bool):
+        _bad("resume")
+    out = {"v": SUB_V, "resume": bool(p.get("resume"))}
+    for name in ("goals", "reminders", "offers", "pays"):
+        lst = p.get(name) or []
+        if not isinstance(lst, list) or len(lst) > LIMITS[name]:
+            _bad(name)
+        for it in lst:
+            if not isinstance(it, dict) or set(it) - FIELDS[name]:
+                _bad("field")
+    out["goals"] = []
+    for it in p.get("goals") or []:
+        g = {"isin": _isin(it.get("isin")), "name": _s(it.get("name"))}
+        for k in ("target_yield", "target_price"):
+            v = _numf(it.get(k), hi=1e6)
+            if v is not None and v > 0:
+                g[k] = v
+        if "target_yield" in g or "target_price" in g:
+            out["goals"].append(g)
+    out["reminders"] = []
+    for it in p.get("reminders") or []:
+        nid = it.get("id")
+        if not isinstance(nid, str) or not NOTE_RX.match(nid):
+            _bad("id")
+        out["reminders"].append({"id": nid, "isin": _isin(it.get("isin")), "name": _s(it.get("name")),
+                                 "date": _date(it.get("date")), "remind_on": _date(it.get("remind_on"))})
+    out["offers"] = []
+    for it in p.get("offers") or []:
+        if it.get("kind") not in ("put", "call"):
+            _bad("kind")
+        cs = it.get("coupon_status")
+        if cs is not None and (not isinstance(cs, str) or not re.match(r"^[a-z_]{1,20}$", cs)):
+            _bad("coupon_status")
+        out["offers"].append({"isin": _isin(it.get("isin")), "name": _s(it.get("name")), "kind": it["kind"],
+                              "date": _date(it.get("date")), "period_start": _date(it.get("period_start"), True),
+                              "period_end": _date(it.get("period_end"), True), "coupon_status": it.get("coupon_status"),
+                              "new_rate": _numf(it.get("new_rate"), lo=-100.0, hi=1000.0)})
+    pd = p.get("pay_days", 0)
+    if isinstance(pd, bool) or not isinstance(pd, int) or not 0 <= pd <= 60:
+        _bad("pay_days")
+    out["pay_days"] = pd
+    out["pays"] = []
+    for it in p.get("pays") or []:
+        if it.get("kind") not in PAY_KINDS:
+            _bad("kind")
+        out["pays"].append({"date": _date(it.get("date")), "kind": it["kind"], "name": _s(it.get("name")),
+                            "amount": _numf(it.get("amount"))})
+    sent = p.get("sent") or []
+    if not isinstance(sent, list) or len(sent) > LIMITS["sent"]:
+        _bad("sent")
+    out["sent"] = [k for k in sent if isinstance(k, str) and len(k) <= 240 and k.startswith(SENT_PREFIXES)]
+    return out
+
+
+# ───────────────────────── форматирование (зеркало 13j_watch.py, проверяется тестами на совпадение) ─────────────────────────
+TG_DISCLAIMER = "\n\n<i>Не является индивидуальной инвестиционной рекомендацией.</i>"
+TG_LIMIT = 3500
+MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
+TG_OFR_CALL_DAYS, TG_OFR_CLOSE_DAYS = 14, 2
+KIND_ICON = {"goal": "⭐", "reminder": "📝"}
+EV = {"coupon": "купон", "dividend": "дивиденд", "amortization": "амортизация", "redemption": "погашение",
+      "maturity": "погашение", "offer": "оферта", "call": "оферта CALL", "put": "оферта PUT", "buyback": "выкуп"}
+
+
+def esc(s):
+    return str(s if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def num(x, dec=0):
+    return ("{:,.%df}" % dec).format(x).replace(",", " ").replace(".", ",")
+
+
+def rub(x):
+    return num(x, 0 if abs(x) >= 100 or x == int(x) else 2) + " ₽"
+
+
+def pct(x, dec=2):
+    return num(x, dec) + "%"
+
+
+def f2(x):
+    return ("%.2f" % x).replace(".", ",")
+
+
+def tdate(iso, today):
+    try:
+        d = datetime.strptime(str(iso)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return esc(iso)
+    return "%d %s%s" % (d.day, MONTHS[d.month - 1], "" if d.year == int(today[:4]) else " %d" % d.year)
+
+
+def link(url, text):
+    u = str(url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        return ""
+    return '<a href="%s">%s</a>' % (u.replace("&", "&amp;").replace('"', "%22").replace("<", "%3C").replace(">", "%3E"), esc(text))
+
+
+def moex(isin):
+    from urllib.parse import quote
+    return link("https://www.moex.com/ru/issue.aspx?code=%s" % quote(str(isin or "")), "на Мосбирже") if isin else ""
+
+
+def head(icon, title, sub=""):
+    return "%s <b>%s</b>%s" % (icon, esc(title), (" · " + esc(sub)) if sub else "")
+
+
+def cap(lines, shown, more=""):
+    out = list(lines[:shown])
+    if len(lines) > shown:
+        out.append("…и ещё %d%s" % (len(lines) - shown, more))
+    return "\n".join(out)
+
+
+def fit(text, limit):
+    if len(text) <= limit:
+        return text
+    cut = text[:max(limit - 40, 1)]
+    cut = cut.rsplit("\n", 1)[0] if "\n" in cut else cut
+    cut = re.sub(r"<[^>]*$", "", cut)
+    cut = re.sub(r"&[a-z#0-9]*$", "", cut)
+    stack = []
+    for m in re.finditer(r"<(/?)(b|i|a|code)\b[^>]*>", cut):
+        if m.group(1):
+            if m.group(2) in stack:
+                stack = stack[:len(stack) - stack[::-1].index(m.group(2)) - 1]
+        else:
+            stack.append(m.group(2))
+    return cut.rstrip() + "\n…" + "".join("</%s>" % t for t in reversed(stack))
+
+
+def days_between(a, b):
+    return (datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
+
+
+def alert_line(a):
+    line = "%s <b>%s</b> — %s" % (KIND_ICON.get(a.get("kind"), "•"), esc(a.get("name") or ""), esc(a.get("message")))
+    url = str(a.get("url") or "")
+    links = []
+    if url and "moex.com/ru/issue" not in url:
+        links.append(link(url, "Подробнее"))
+    if a.get("isin"):
+        links.append(moex(a["isin"]))
+    links = [x for x in links if x]
+    return line + ("\n" + " · ".join(links) if links else "")
+
+
+def goal_alerts(g, q, today):
+    """Цели по бумаге (как watch_goal_alerts в приложении). q — {price, yield} с Мосбиржи или None."""
+    out = []
+    if not q:
+        return out
+    base = {"isin": g["isin"], "name": q.get("name") or g.get("name") or g["isin"], "url": "", "date": today, "severity": "medium", "kind": "goal"}
+    ty, tp = g.get("target_yield"), g.get("target_price")
+    if ty is not None and q.get("yield") is not None and q["yield"] >= ty:
+        out.append(dict(base, id="gy|%s|%s" % (g["isin"], ty),
+                        message="Цель достигнута: доходность %s %% (цель — от %s %%)" % (f2(q["yield"]), f2(ty))))
+    if tp is not None and q.get("price") is not None and q["price"] <= tp:
+        out.append(dict(base, id="gp|%s|%s" % (g["isin"], tp),
+                        message="Цель достигнута: цена %s %% (цель — не выше %s %%)" % (f2(q["price"]), f2(tp))))
+    return out
+
+
+def reminder_alerts(rems, today):
+    """Напоминания дневника: текст заметки на сервер не передаётся, поэтому в сообщении только бумага и дата."""
+    out = []
+    for n in rems:
+        if n["remind_on"] <= today:
+            d = n.get("date") or n["remind_on"]
+            out.append({"isin": n["isin"], "name": n.get("name") or n["isin"], "id": "rm|" + n["id"], "severity": "medium",
+                        "kind": "reminder", "date": n["remind_on"], "url": "",
+                        "message": "Напоминание из дневника от %s (текст заметки — в TAnalytic)" % (d[8:] + "." + d[5:7])})
+    return out
+
+
+def dispatch_plan(title, alerts, sent, icon="🔔"):
+    """Как tg_dispatch_plan в приложении: до трёх сообщений, до 10 тревог в каждом -> [(текст, [ключ, ...])]."""
+    fresh = [(a["id"], a) for a in alerts if a["id"] not in sent]
+    if not fresh:
+        return []
+    hd = head(icon, title)
+    room = TG_LIMIT - len(TG_DISCLAIMER) - len(hd) - 120
+    out, i = [], 0
+    for msg_no in range(3):
+        if i >= len(fresh):
+            break
+        chunk, lines, size = [], [], 0
+        while i < len(fresh) and len(chunk) < 10:
+            ln = alert_line(fresh[i][1])
+            if chunk and size + len(ln) + 2 > room:
+                break
+            chunk.append(fresh[i][0])
+            lines.append(ln)
+            size += len(ln) + 2
+            i += 1
+        tail = ("\n\n…и ещё %d — придут при следующей проверке" % (len(fresh) - i)) if msg_no == 2 and i < len(fresh) else ""
+        out.append(("%s\n\n%s%s" % (hd, "\n\n".join(lines), tail), chunk))
+    return out
+
+
+def offer_due(items, today):
+    """Зеркало tg_offer_due (13j_watch.py) -> [(ключ, текст)]."""
+    out = []
+    for it in items:
+        isin, kind, od = it.get("isin"), it.get("kind"), it.get("date")
+        if not isin or not od or od <= today:
+            continue
+        nm = esc(it.get("name") or isin)
+        lk = "\n" + moex(isin)
+        ps, pe = it.get("period_start"), it.get("period_end")
+        base = "ofr|%s|%s|" % (isin, od)
+        if kind == "put":
+            if it.get("coupon_status") == "announced" and it.get("new_rate") is not None and (not pe or today <= pe):
+                out.append((base + "coupon", "🔔 <b>%s</b> — эмитент объявил купон после пут-оферты (%s): %s годовых. Приём заявок открывается в период предъявления.%s"
+                            % (nm, tdate(od, today), pct(it["new_rate"]), lk)))
+            if ps and pe and ps <= today <= pe:
+                out.append((base + "open", "🔔 <b>%s</b> — открыт приём заявок по пут-оферте: с %s по %s (выкуп %s). Заявку подаёт брокер.%s"
+                            % (nm, tdate(ps, today), tdate(pe, today), tdate(od, today), lk)))
+            if pe:
+                left = days_between(today, pe)
+                if 0 <= left <= TG_OFR_CLOSE_DAYS and (not ps or ps <= today):
+                    t = ("осталось %d дня подать заявку" % left if left >= 2 else "остался 1 день, чтобы подать заявку" if left == 1
+                         else "сегодня последний день подачи заявки")
+                    out.append((base + "close", "⏰ <b>%s</b> — %s на пут-оферту (последний день %s, выкуп %s).%s"
+                                % (nm, t, tdate(pe, today), tdate(od, today), lk)))
+        elif kind == "call":
+            left = days_between(today, od)
+            if 0 < left <= TG_OFR_CALL_DAYS:
+                out.append((base + "call", "🔔 <b>%s</b> — возможное досрочное погашение (колл) %s, через %d дн. Решает эмитент, заявку подавать не нужно.%s"
+                            % (nm, tdate(od, today), left, lk)))
+    return out
+
+
+def offers_text(due):
+    return head("🔔", "Оферты по портфелю") + "\n\n" + "\n\n".join(t for _k, t in due)
+
+
+def ev_line(e, today):
+    amt = ", %s" % rub(e[3]) if e[3] else ""
+    return "%s · <b>%s</b> — %s%s" % (tdate(e[0], today), esc(e[2]), EV.get(e[1], "выплата"), amt)
+
+
+def pay_fresh(events, sent):
+    """Зеркало tg_pay_fresh: [(ключ, (дата, вид, название, сумма))] ещё не отправленных."""
+    out = []
+    for e in events:
+        k = "pay|%s|%s|%s" % (e[0], e[1], e[2])
+        if k not in sent:
+            out.append((k, e))
+    return out
+
+
+def pay_text(days, fresh, today):
+    return "%s\n\n%s" % (head("💰", "Ближайшие выплаты", "%d дн." % days), cap([ev_line(e, today) for _k, e in fresh], 15))
+
+
+def pay_events(pays, today, days):
+    """Выплаты из подписки в окне [today, today+days], отсортированные как в приложении (_tg_payments)."""
+    end = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
+    ev = [(p["date"], p["kind"], p["name"], p.get("amount")) for p in pays if today <= p["date"] <= end]
+    return sorted(ev, key=lambda x: (x[0], str(x[2])))
+
+
+# ───────────────────────── котировки облигаций (как screener_rows в приложении) ─────────────────────────
+ISS_URL = ("https://iss.moex.com/iss/engines/stock/markets/bonds/boards/%s/securities.json?iss.meta=off"
+           "&iss.only=securities,marketdata&securities.columns=SECID,ISIN,SHORTNAME,MATDATE,PREVLEGALCLOSEPRICE,YIELDATPREVWAPRICE"
+           "&marketdata.columns=SECID,WAPRICE,LAST,YIELD,YIELDATWAPRICE")
+BOARDS = ("TQCB", "TQOB")
+
+
+def _table(j, name):
+    t = (j or {}).get(name) or {}
+    cols = t.get("columns") or []
+    return [dict(zip(cols, r)) for r in t.get("data") or []]
+
+
+def quotes_from_iss(j, out=None):
+    """Ответ ISS по одному режиму торгов -> {isin: {price, yield, name}} по тем же правилам, что screener_rows."""
+    out = {} if out is None else out
+    md = {r["SECID"]: r for r in _table(j, "marketdata")}
+    for s in _table(j, "securities"):
+        m = md.get(s["SECID"], {})
+        price = m.get("WAPRICE") or m.get("LAST") or s.get("PREVLEGALCLOSEPRICE")
+        yld = m.get("YIELD") or m.get("YIELDATWAPRICE") or s.get("YIELDATPREVWAPRICE")
+        if not price or not yld or not s.get("MATDATE") or str(s["MATDATE"]).startswith("0000"):
+            continue
+        out[s.get("ISIN") or s["SECID"]] = {"price": round(price, 3), "yield": round(float(yld), 2), "name": s.get("SHORTNAME")}
+    return out
+
+
+# ───────────────────────── хранилище ─────────────────────────
+class AlertStore:
+    """Подписки и отправленные ключи в общей базе бота. Своё соединение на поток (как KeyStore)."""
+
+    def __init__(self, path, clock=time.time):
+        self.path, self.clock = path, clock
+        self._local = threading.local()
+        self._ready = False
+        self._sync_lock, self._syncs = threading.Lock(), {}
+
+    def conn(self):
+        c = getattr(self._local, "c", None)
+        if c is None:
+            from urllib.parse import quote
+            c = sqlite3.connect("file:%s?mode=rw" % quote(self.path.replace("\\", "/"), safe="/:"), uri=True, timeout=5,
+                                isolation_level=None, check_same_thread=False)
+            c.execute("PRAGMA busy_timeout=5000")
+            self._local.c = c
+        if not self._ready:
+            for q in SCHEMA:
+                c.execute(q)
+            self._ready = True
+        return c
+
+    def rate_ok(self, tg_id):
+        now = self.clock()
+        with self._sync_lock:
+            xs = [t for t in self._syncs.get(tg_id, []) if now - t < 3600]
+            if len(xs) >= SYNC_PER_HOUR:
+                self._syncs[tg_id] = xs
+                return False
+            xs.append(now)
+            if len(self._syncs) > 10000:
+                self._syncs.clear()
+            self._syncs[tg_id] = xs
+            return True
+
+    def put(self, tg_id, sub):
+        """Сохраняет подписку (без sent) и добавляет присланные приложением ключи в отправленные. -> все отправленные ключи."""
+        now = self.clock()
+        data = {k: v for k, v in sub.items() if k not in ("sent", "resume")}
+        raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        if len(raw.encode("utf-8")) > SUB_MAX_BYTES:
+            raise AlertError(413, "too_large")
+        c = self.conn()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            mk = "alerts_stop:%d" % int(tg_id)
+            try:          # пользователь остановил проверку в боте (/alerts): автоматическая синхронизация её не возвращает
+                stopped = c.execute("SELECT 1 FROM meta WHERE k=?", (mk,)).fetchone()
+                if stopped and sub.get("resume"):
+                    c.execute("DELETE FROM meta WHERE k=?", (mk,))
+                elif stopped:
+                    raise AlertError(409, "stopped_in_bot")
+            except sqlite3.OperationalError:
+                pass
+            c.execute("INSERT INTO alert_subs(tg_id, data, created, updated) VALUES(?,?,?,?) "
+                      "ON CONFLICT(tg_id) DO UPDATE SET data=excluded.data, updated=excluded.updated", (tg_id, raw, now, now))
+            c.executemany("INSERT OR IGNORE INTO alert_sent(tg_id, k, t) VALUES(?,?,?)", [(tg_id, k, now) for k in sub.get("sent") or []])
+            c.execute("DELETE FROM alert_sent WHERE tg_id=? AND t<?", (tg_id, now - SENT_KEEP))
+            c.execute("COMMIT")
+        except BaseException:
+            c.execute("ROLLBACK")
+            raise
+        return self.sent_keys(tg_id)
+
+    def get(self, tg_id):
+        r = self.conn().execute("SELECT data, created, updated, checked, sent_n FROM alert_subs WHERE tg_id=?", (tg_id,)).fetchone()
+        if not r:
+            return None
+        return {"sub": json.loads(r[0]), "created": r[1], "updated": r[2], "checked": r[3], "sent_n": r[4]}
+
+    def users(self):
+        return [r[0] for r in self.conn().execute("SELECT tg_id FROM alert_subs ORDER BY tg_id")]
+
+    def sent_keys(self, tg_id):
+        return [r[0] for r in self.conn().execute("SELECT k FROM alert_sent WHERE tg_id=? ORDER BY t DESC LIMIT ?", (tg_id, LIMITS["sent"]))]
+
+    def mark_sent(self, tg_id, keys):
+        now = self.clock()
+        c = self.conn()
+        c.executemany("INSERT OR REPLACE INTO alert_sent(tg_id, k, t) VALUES(?,?,?)", [(tg_id, k, now) for k in keys])
+        c.execute("UPDATE alert_subs SET sent_n=sent_n+? WHERE tg_id=?", (len(keys), tg_id))
+
+    def checked(self, tg_id):
+        self.conn().execute("UPDATE alert_subs SET checked=? WHERE tg_id=?", (self.clock(), tg_id))
+
+    def delete(self, tg_id):
+        """Удаляет подписку и отправленные ключи. -> (была ли подписка, ключи отправленного — вернуть приложению)."""
+        keys = self.sent_keys(tg_id)
+        c = self.conn()
+        n = c.execute("DELETE FROM alert_subs WHERE tg_id=?", (tg_id,)).rowcount
+        c.execute("DELETE FROM alert_sent WHERE tg_id=?", (tg_id,))
+        return bool(n), keys
+
+    def user_state(self, tg_id):
+        """-> gone (нет пользователя/заблокирован/нет действующего ключа) | paused (не Pro или уведомления выключены) | ok."""
+        c, now = self.conn(), self.clock()
+        try:
+            u = c.execute("SELECT banned, notify, plan_until FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+        except sqlite3.OperationalError:
+            u = c.execute("SELECT banned, 1, NULL FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+        if not u or u[0]:
+            return "gone"
+        k = c.execute("SELECT COUNT(*) FROM keys WHERE tg_id=? AND revoked=0 AND expires>?", (tg_id, now)).fetchone()[0]
+        if not k:
+            return "gone"
+        if not u[1] or not (u[2] and u[2] > now):
+            return "paused"
+        return "ok"
+
+
+def summary(sub):
+    return {"goals": len(sub.get("goals") or []), "reminders": len(sub.get("reminders") or []),
+            "offers": len(sub.get("offers") or []), "pays": len(sub.get("pays") or []), "pay_days": sub.get("pay_days") or 0}
+
+
+# ───────────────────────── проверка ─────────────────────────
+def msk_now(now):
+    return datetime.fromtimestamp(now, MSK)
+
+
+def quiet(now, start=22, end=8):
+    h = msk_now(now).hour
+    return (h >= start or h < end) if start > end else start <= h < end
+
+
+def build_messages(sub, quotes, today, sent):
+    """Подписка + котировки -> [(текст без приписки, [ключи])] в порядке приложения: оферты, наблюдение и цели, выплаты."""
+    msgs = []
+    due = [(k, t) for k, t in offer_due(sub.get("offers") or [], today) if k not in sent][:10]
+    if due:
+        msgs.append((offers_text(due), [k for k, _t in due]))
+    al = []
+    for g in sub.get("goals") or []:
+        al += goal_alerts(g, quotes.get(g["isin"]), today)
+    al += reminder_alerts(sub.get("reminders") or [], today)
+    msgs += dispatch_plan("Наблюдение и цели", al, sent, icon="⭐")
+    days = int(sub.get("pay_days") or 0)
+    if days > 0:
+        fresh = pay_fresh(pay_events(sub.get("pays") or [], today, days), sent)
+        if fresh:
+            msgs.append((pay_text(days, fresh, today), [k for k, _e in fresh]))
+    return msgs
+
+
+class AlertChecker:
+    """Обход подписок: purge ушедших, котировки Мосбиржи через кэш сервера (fetch), сообщения в outbox через Notifier."""
+
+    def __init__(self, store, notifier, fetch_json, clock=time.time, quiet_hours=(22, 8)):
+        self.store, self.notifier, self.fetch_json, self.clock = store, notifier, fetch_json, clock
+        self.quiet_hours = quiet_hours
+        self.last = {"t": None, "users": 0, "sent": 0, "purged": 0}
+
+    def quotes(self, isins):
+        if not isins:
+            return {}
+        out = {}
+        for b in BOARDS:
+            try:
+                j = self.fetch_json(ISS_URL % b)
+            except Exception:  # noqa: BLE001
+                j = None
+            if j:
+                quotes_from_iss(j, out)
+        return out
+
+    def run_once(self):
+        now = self.clock()
+        stats = {"t": now, "users": 0, "sent": 0, "purged": 0}
+        users = self.store.users()
+        live = []
+        for uid in users:
+            st = self.store.user_state(uid)
+            if st == "gone":
+                self.store.delete(uid)
+                stats["purged"] += 1
+            elif st == "ok":
+                live.append(uid)
+        if live and not (self.quiet_hours and quiet(now, *self.quiet_hours)):
+            today = msk_now(now).strftime("%Y-%m-%d")
+            subs = {uid: (self.store.get(uid) or {}).get("sub") or {} for uid in live}
+            need = {g["isin"] for s in subs.values() for g in s.get("goals") or []}
+            q = self.quotes(need)
+            for uid, sub in subs.items():
+                stats["users"] += 1
+                sent = set(self.store.sent_keys(uid))
+                for text, keys in build_messages(sub, q, today, sent):
+                    try:
+                        self.notifier.enqueue(uid, fit(text, TG_LIMIT - len(TG_DISCLAIMER)) + TG_DISCLAIMER)
+                    except Exception as e:  # noqa: BLE001   NotifyError: лимит/notify_off/нет пользователя — попробуем в следующий раз
+                        if getattr(e, "error", "") == "unknown_user":
+                            self.store.delete(uid)
+                        break
+                    self.store.mark_sent(uid, keys)
+                    stats["sent"] += len(keys)
+                self.store.checked(uid)
+        self.last = stats
+        return stats
+
+    def loop(self, stop, period=900, first_delay=60):
+        if stop.wait(first_delay):
+            return
+        while True:
+            try:
+                self.run_once()
+            except Exception as e:  # noqa: BLE001
+                import sys
+                sys.stderr.write("alerts: %s\n" % type(e).__name__)
+            if stop.wait(period):
+                return

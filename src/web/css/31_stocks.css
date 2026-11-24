@@ -26,3 +26,11 @@
 .fh-bar{display:inline-block;width:min(140px,18vw);height:6px;border-radius:3px;background:#ffffff12;margin-right:10px;vertical-align:middle;overflow:hidden}
 .fh-bar i{display:block;height:100%;background:var(--s1);border-radius:3px}
 [data-theme=light] .fh-bar{background:#0000000f}[data-theme=light] .fh-t tr.fh-lnk:hover td{background:#00000006}
+/* «О фонде»: подпись слева, значение справа; значение переносится, а не обрезается */
+.fi-l{display:grid;grid-template-columns:minmax(110px,38%) minmax(0,1fr);margin:0;font-size:13px}
+.fi-l dt,.fi-l dd{margin:0;padding:9px 0;border-bottom:1px solid #ffffff08}
+.fi-l dt{color:var(--mu);padding-right:12px}
+.fi-l dd{text-align:right;overflow-wrap:anywhere;min-width:0}
+.fi-l dd small{display:block;margin-top:2px;font-size:11.5px}
+.fi-l dt:nth-last-child(2),.fi-l dd:last-child{border-bottom:0}
+[data-theme=light] .fi-l dt,[data-theme=light] .fi-l dd{border-bottom-color:#00000010}

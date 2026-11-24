@@ -111,7 +111,7 @@ function stkDivTab(c,p){
     <div style="margin-top:16px">${stkDvPayoff(d,p)}</div>
     ${d.received?`<div style="margin-top:16px">${stkDvMine(d)}</div>`:''}
     <div style="margin-top:16px">${stkDvHist(d)}</div>
-    ${(d.gaps||[]).length?`<details class="card sd-det" style="margin-top:16px"><summary><b>История гэпов по отсечкам</b> <span class="mu">${d.gaps.length} ${dlEv(d.gaps.length,'событие','события','событий')}</span></summary>${dlGapsTable(d.gaps)}</details>`:''}
+    ${(d.gaps||[]).length?`<details class="card sd-det" open style="margin-top:16px"><summary><b>История гэпов по отсечкам</b> <span class="mu">${d.gaps.length} ${dlEv(d.gaps.length,'событие','события','событий')}</span></summary>${dlGapsTable(d.gaps)}</details>`:''}
     <p class="note">Дивиденды: T-Invest${(d.div_hist||{}).added?' и dohod.ru':''}; котировки — Мосбиржа. Описательная статистика по прошлым выплатам, не прогноз и не инвестиционная рекомендация. <button class="btn ghost" id="${p}dvr" style="margin-left:6px">Обновить данные</button></p>`;
 }
 function bindStkDiv(root,p){

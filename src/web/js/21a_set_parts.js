@@ -10,21 +10,43 @@ function setTgHtml(c){
     stRow('Наблюдение и цели','Тревоги по списку наблюдения, достигнутые цели, напоминания из дневника',stSw('tg-wat',on('tg_on_watch',true),'Наблюдение и цели'),{cls:'sub'})+
     stRow('Ближайшие выплаты','За сколько дней сообщать о выплатах (0 — выключить)',`<input class="in num st-num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}" aria-label="За сколько дней сообщать о выплатах"><span class="st-unit">дн.</span>`,{cls:'sub'})+
     stRow('Ежедневная сводка','Портфель, выплаты на неделю, тревоги',`<input class="in num st-time" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}" aria-label="Время сводки">${stSw('tg-dg',on('tg_digest',false),'Ежедневная сводка')}`,{cls:'sub'})+
+    stRow('Проверять на сервере, когда программа закрыта','Цели по наблюдению, напоминания дневника, оферты и выплаты по портфелю проверяет сервер данных — раз в 15 минут, кроме ночи (22:00–08:00 МСК)',stSw('tg-srv',on('tg_server',false),'Проверять тревоги на сервере, когда программа закрыта'),{cls:'sub'})+
+    `<p class="st-line" id="tg-srv-state"></p>`+
+    stRow('Данные на сервере','Подписка удаляется и сама — когда истекает ключ из бота',`<button class="btn ghost danger" id="tg-srv-del">Удалить данные с сервера</button>`,{cls:'sub',id:'tg-srv-row',hidden:!on('tg_server',false)})+
     stRow('Проверка','Отправить пробное сообщение или сразу проверить тревоги',`<button class="btn ghost" id="tg-test">Тестовое сообщение</button><button class="btn ghost" id="tg-run" title="Проверить тревоги и отправить новые прямо сейчас">Проверить сейчас</button>`)+
     `<p class="st-line" id="tg-state"></p>`+
-    stMore('Что нужно знать','Уведомления приходят от <b id="tg-bot">@tanalyticbot</b> — того же бота, который выдаёт ключ входа. Текст уведомлений (названия бумаг и суммы) проходит через сервер данных и бот и удаляется сразу после отправки; токен Т-Инвестиций никуда не передаётся. Уведомления приходят, <b>только пока программа запущена</b>; проверка выполняется раз в 10–15 минут, одна и та же тревога повторно не отправляется. Нужен вход по ключу из бота.'),
+    stMore('Что нужно знать','Уведомления приходят от <b id="tg-bot">@tanalyticbot</b> — того же бота, который выдаёт ключ входа. Текст уведомлений (названия бумаг и суммы) проходит через сервер данных и бот и удаляется сразу после отправки; токен Т-Инвестиций никуда не передаётся. Пока программа запущена, она проверяет тревоги раз в 10–15 минут; одна и та же тревога повторно не отправляется. Нужен вход по ключу из бота.'+
+      '<br><br><b>Проверка на сервере</b> (выключена, пока вы её не включите) нужна, чтобы уведомления приходили и при закрытой программе. На сервер данных уходит только «подписка»: ISIN и названия бумаг из списка наблюдения с вашими целями по доходности/цене; ISIN, название и даты напоминаний дневника (<b>без текста заметок</b>); ISIN, название и даты ближайших оферт облигаций портфеля; даты, названия и суммы ближайших выплат (если включены «Ближайшие выплаты»); ключи уже отправленных уведомлений, чтобы не было повторов. '+
+      '<b>Токен Т-Инвестиций, номера счетов, стоимость портфеля и остатки денег не передаются.</b> Подписка обновляется при изменениях и при запуске программы; когда режим включён, эти уведомления отправляет только сервер, без дублей. '+
+      'Данные удаляются кнопкой «Удалить данные с сервера», при выключении режима, кнопкой в боте (<code>/alerts</code>) и автоматически, когда истекает ключ из бота (7 дней). '+
+      'Только при запущенной программе работают: тревоги мониторинга портфеля и наблюдения (падение цены, спред, рейтинг, дефолты, остановка торгов, ликвидность), крупные сделки и всплески объёма, ежедневная сводка.'),
     {id:'tg-card',hint:'по желанию',cls:en?'':'st-dis'});
 }
 function bindSetTg(c,msg){
   const g=id=>document.getElementById(id);if(!g('tg-card'))return;
   const body=()=>({tg_enabled:g('tg-en').checked,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
-    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00'});
+    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00',tg_server:g('tg-srv').checked});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
   const save=async()=>{const r=await post('/api/tg/save',body());Object.assign(c,r.settings);return r};
   const dim=()=>g('tg-card').classList.toggle('st-dis',!g('tg-en').checked);
+  const srvShow=()=>api('/api/tg/server').then(s=>{
+    g('tg-srv-row').hidden=!(s.enabled||s.ok);const n=s.counts||{};
+    g('tg-srv-state').textContent=!s.enabled?'':s.error?s.error:s.active?`Сервер проверяет: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}. Обновлено ${new Date(s.ok*1000).toLocaleString('ru-RU')}.`:'Подписка ещё не отправлена на сервер.';
+  }).catch(()=>{});
   ['tg-en','tg-mon','tg-wat','tg-pay','tg-time','tg-dg'].forEach(id=>g(id).addEventListener('change',async e=>{
     const el=e.currentTarget;dim();
-    try{await save();stOk(el)}catch(x){msg(x.message)}}));
+    try{const r=await save();stOk(el);if(r.warning)msg(r.warning);setTimeout(srvShow,4500)}catch(x){msg(x.message)}}));
+  g('tg-srv').addEventListener('change',async e=>{
+    const el=e.currentTarget;
+    if(el.checked&&!confirm('Включить проверку на сервере?\n\nНа сервер данных будут отправлены: ISIN и названия бумаг из списка наблюдения с целями, даты напоминаний дневника (без текста), даты ближайших оферт и выплат по облигациям портфеля (с суммами выплат). Токен, счета и стоимость портфеля не передаются.\n\nУдалить данные можно в любой момент кнопкой «Удалить данные с сервера» или в боте командой /alerts.')){el.checked=false;return}
+    try{const r=await save();
+      if(el.checked){const s=await post('/api/tg/server',{action:'sync'});const n=s.counts||{};msg(`Сервер будет проверять: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}.`,1)}
+      else msg(r.warning||'Проверка на сервере выключена, данные удалены с сервера.',!r.warning);
+    }catch(x){msg(x.message)}finally{srvShow()}});
+  g('tg-srv-del').onclick=e=>busy(e.currentTarget,async()=>{
+    if(!confirm('Удалить подписку на тревоги с сервера и выключить проверку на сервере?'))return;
+    await post('/api/tg/server',{action:'delete'});g('tg-srv').checked=false;c.tg_server=false;msg('Данные удалены с сервера.',1);srvShow()});
+  srvShow();
   api('/api/tg/info').then(i=>{
     g('tg-bot').textContent='@'+String(i.bot||'tanalyticbot').replace(/^@/,'');
     g('tg-state').textContent=!i.server?'Сервер данных выключен («off»): уведомления работают через него. Включите сервер данных в разделе «Подключение».':

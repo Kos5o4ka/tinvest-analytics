@@ -6,7 +6,6 @@ const ST_ICO={
  look:'<circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" opacity=".35"/>',
  calc:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2M12 11h2M8 15h2M12 15h2M8 18h2M12 18h4"/>',
  local:'<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>',
- adv:'<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>',
  news:'<path d="M12 3l2.4 5.6 6.1.6-4.6 4 1.4 6-5.3-3.2L6.7 19.2l1.4-6-4.6-4 6.1-.6z"/>',
  danger:'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
  eye:'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
@@ -22,7 +21,6 @@ const SET_TOC=[['set-conn','Подключение','conn','Токен Т-Инв
   ['set-look','Внешний вид','look','Тема, напоминания и разделы меню'],
   ['set-calc','Расчёты','calc','Прогноз ключевой ставки и сбор раскрытий'],
   ['set-local','Данные','local','Хранилище, резервные копии и экспорт'],
-  ['set-adv','Для опытных','adv','Адреса API и сертификаты — обычно не трогают'],
   ['set-news','Что нового','news','Версия программы, изменения и планы'],
   ['set-danger','Опасная зона','danger','Очистка и удаление данных']];
 const stTxt=h=>String(h==null?'':h).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
@@ -60,17 +58,44 @@ function stMsg(t,ok,mini){
 function stDirty(btn,ids){
   const g=id=>document.getElementById(id),b=typeof btn==='string'?g(btn):btn;
   const els=ids.map(g).filter(Boolean);if(!b)return{rebase(){},upd(){}};
-  const snap=()=>els.map(e=>e.type==='checkbox'?e.checked:e.value).join('\u0001');
+  const snap=()=>els.map(e=>e.type==='checkbox'?e.checked:stSecVal(e)).join('\u0001');
   let base=snap();const upd=()=>{b.disabled=snap()===base};
   els.forEach(e=>{e.addEventListener('input',upd);e.addEventListener('change',upd)});b.disabled=true;
   return{rebase(){base=snap();upd()},upd};
 }
 function stEnter(ids,btn){ids.forEach(id=>{const e=document.getElementById(id);if(e)e.addEventListener('keydown',ev=>{if(ev.key!=='Enter'||ev.isComposing)return;const b=document.getElementById(btn);if(b&&!b.disabled){ev.preventDefault();b.click()}})})}
-/* показать/скрыть и скопировать для полей с секретом */
+/* показать/скрыть и скопировать для полей с секретом.
+   Сохранённый секрет в поле не лежит (видны только точки-подсказка): «глаз» и «копировать» берут его у локального сервера.
+   Показанное, но не изменённое значение считается «без изменений» (stSecVal) — повторно не сохраняется. */
+const ST_SECRET_NAME={tok:'token','ds-key':'data_key',bkpw:'backup_password'};
+function stSecVal(i){if(typeof i==='string')i=document.getElementById(i);if(!i)return'';return i._stRev!=null&&i.value===i._stRev?'':i.value}
+async function stSecFetch(id){
+  const n=ST_SECRET_NAME[id];if(!n)return'';
+  const r=await api('/api/config/secret?name='+encodeURIComponent(n),{headers:{'X-TA-Secret':'1'}});
+  return String((r&&r.value)||'');
+}
+function stEyeSet(b,sh){b.innerHTML=stIco(sh?'eyeoff':'eye');b.setAttribute('aria-label',sh?'Скрыть':'Показать')}
 function stSecretBind(root){
-  (root||document).querySelectorAll('[data-eye]').forEach(b=>b.onclick=()=>{const i=document.getElementById(b.dataset.eye);if(!i)return;const sh=i.type==='password';i.type=sh?'text':'password';b.innerHTML=stIco(sh?'eyeoff':'eye');b.setAttribute('aria-label',sh?'Скрыть':'Показать')});
-  (root||document).querySelectorAll('[data-cp]').forEach(b=>b.onclick=async()=>{const i=document.getElementById(b.dataset.cp);if(!i||!i.value)return stMsg('Нечего копировать: поле пустое.');
-    try{await navigator.clipboard.writeText(i.value)}catch(e){i.type='text';i.select();try{document.execCommand('copy')}catch(x){}}
+  (root||document).querySelectorAll('[data-eye]').forEach(b=>b.onclick=async()=>{const i=document.getElementById(b.dataset.eye);if(!i)return;
+    if(i.type==='password'){
+      if(!i.value&&ST_SECRET_NAME[i.id]){
+        let v='';try{v=await stSecFetch(i.id)}catch(e){return stMsg(e.message)}
+        if(!v)return stMsg('Сохранённого значения нет — поле пустое.',1,true);
+        if(i.value)return;                       /* пока ждали ответ, пользователь начал вводить */
+        i._stRev=v;i.value=v;
+      }
+      i.type='text';stEyeSet(b,true);
+    }else{
+      if(i._stRev!=null){if(i.value===i._stRev)i.value='';i._stRev=null}
+      i.type='password';stEyeSet(b,false);
+    }});
+  (root||document).querySelectorAll('[data-cp]').forEach(b=>b.onclick=async()=>{const i=document.getElementById(b.dataset.cp);if(!i)return;
+    let v=i.value;
+    if(!v&&ST_SECRET_NAME[i.id]){try{v=await stSecFetch(i.id)}catch(e){return stMsg(e.message)}}
+    if(!v)return stMsg('Нечего копировать: поле пустое.');
+    let ok=false;try{await navigator.clipboard.writeText(v);ok=true}catch(e){}
+    if(!ok){const t=document.createElement('textarea');t.value=v;t.setAttribute('readonly','');t.style.cssText='position:fixed;left:-9999px;top:0;opacity:0';document.body.appendChild(t);t.select();try{ok=document.execCommand('copy')}catch(x){}t.remove()}
+    if(!ok)return stMsg('Не удалось скопировать.');
     b.classList.add('done');b.innerHTML=stIco('check',2.4);setTimeout(()=>{b.classList.remove('done');b.innerHTML=stIco('copy')},1200);stMsg('Скопировано',1,true)});
 }
 /* ── разделы меню ── */
@@ -113,8 +138,8 @@ function bindSetDs(c,msg){
   dsStatus();
   const dirty=stDirty('ds-save',['ds-url','ds-key']);
   stEnter(['ds-url','ds-key'],'ds-save');
-  const save=async()=>{const b={data_server:g('ds-url').value};if(g('ds-key').value)b.data_key=g('ds-key').value;await post('/api/config',b);
-    c.data_server=g('ds-url').value.trim();if(g('ds-key').value)c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
+  const save=async()=>{const k=stSecVal('ds-key'),b={data_server:g('ds-url').value};if(k)b.data_key=k;await post('/api/config',b);
+    c.data_server=g('ds-url').value.trim();if(k)c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
   g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Сохранено. Новые запросы пойдут '+(c.data_server.toLowerCase()==='off'?'напрямую.':'через сервер.'),1);authCheck(true);renderSettings()}catch(x){msg(x.message);dirty.upd()}};
   g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{url:g('ds-url').value,key:g('ds-key').value});
     msg(`Сервер работает: версия ${r.version}, записей в кэше ${r.cache_items}.`,1)}catch(x){msg(x.message)}finally{b.disabled=false}};
@@ -298,13 +323,6 @@ async function renderSettings(){
     `<p class="st-line" id="krinfo">Загружаю…</p>`+
     stMore('Чем отличаются источники','«Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.'),
     {hint:'для флоатеров'})+setCrowdHtml(c);
-  /* для опытных */
-  const adv=stGroup('Адреса и сертификаты',
-    stRow('Адреса REST API (боевой)','По одному в строке',`<textarea class="in mono st-wide" id="hp" rows="2" spellcheck="false" aria-label="Адреса REST API боевого контура">${esc(c.hosts_prod.join('\n'))}</textarea>`,{stack:1})+
-    stRow('Адреса REST API (песочница)','По одному в строке',`<textarea class="in mono st-wide" id="hs" rows="2" spellcheck="false" aria-label="Адреса REST API песочницы">${esc(c.hosts_sandbox.join('\n'))}</textarea>`,{stack:1})+
-    stRow('Дополнительный сертификат','Обычно не нужен: сертификат Минцифры уже встроен в программу',`<input class="in mono st-wide" id="ca" value="${esc(c.ca_file)}" placeholder="/path/to/cert.pem" spellcheck="false" aria-label="Файл сертификата">`,{stack:1})+
-    stRow('Проверять SSL-сертификат','Отключайте только для отладки',stSw('vs',c.verify_ssl,'Проверять SSL-сертификат'))+
-    stRow('Применить','',`<button class="btn" id="save2" disabled>Сохранить</button>`),{hint:'обычно не трогать'});
   const sec=(i,body)=>stSec(SET_TOC[i][0],SET_TOC[i][1],SET_TOC[i][3],SET_TOC[i][2],body);
   view.innerHTML=`<div class="st fade">
   <aside class="st-side" aria-label="Навигация по настройкам">
@@ -319,7 +337,7 @@ async function renderSettings(){
   </div></div>`;
   const main=document.getElementById('st-main');
   const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)),
-    sec(5,adv),sec(6,setNewsHtml(c)),sec(7,setDangerHtml(c))];
+    sec(5,setNewsHtml(c)),sec(6,setDangerHtml(c))];
   main.insertAdjacentHTML('beforeend',html.join(''));
   if(keep){view.scrollTop=keep;const st=view.querySelector('.st');if(st)st.classList.remove('fade')}
   stSecretBind(main);
@@ -351,8 +369,8 @@ async function renderSettings(){
   try{bindSetBackup(c,msg)}catch(e){}
   try{bindSetCrowd(c,msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
-  const body=()=>({token:$('#tok').value,sandbox:$('#sb').checked,verify_ssl:$('#vs').checked,ca_file:$('#ca').value,
-    hosts_prod:$('#hp').value.split('\n'),hosts_sandbox:$('#hs').value.split('\n')});
+  /* адреса API, сертификат и проверка SSL больше не редактируются в окне: в настройках остаются как были */
+  const body=()=>({token:stSecVal('tok'),sandbox:$('#sb').checked});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
   const reset=()=>{S.data=S.bonds=S.hist=null;S.account='all';persist()};
   try{bindSetLocal(c,msg,busy,reset)}catch(e){}
@@ -365,10 +383,6 @@ async function renderSettings(){
   /* песочница меняет и адреса API, и нужный токен — применяется вместе с токеном по «Сохранить и подключиться», а не сразу */
   $('#sb').onchange=e=>{const el=e.currentTarget;if(el.checked===!!c.sandbox)return;
     stMsg(el.checked?'Вставьте токен песочницы и нажмите «Сохранить и подключиться».':'Вставьте боевой токен (только чтение) и нажмите «Сохранить и подключиться».',1)};
-  $('#vs').onchange=async e=>{const el=e.currentTarget;try{await post('/api/config',{verify_ssl:el.checked});c.verify_ssl=el.checked;stOk(el)}catch(x){el.checked=!el.checked;msg(x.message)}};
-  /* адреса и сертификат: по кнопке, пока есть изменения */
-  const dAdv=stDirty('save2',['hp','hs','ca']);
-  $('#save2').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await post('/api/config',body());reset();msg('Сохранено.',1);stOk(b);dAdv.rebase();load(true)}catch(x){msg(x.message);dAdv.upd()}};
   $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Заново загрузить все операции и цены из Т-Инвестиций? Это может занять время.'))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
   if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
