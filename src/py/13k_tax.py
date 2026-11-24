@@ -417,7 +417,8 @@ def tx_apply_carry(pool, trade_t, year=9999):
     return used, max(0.0, trade_t - used)
 
 
-def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, offset_coupons=False):
+def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, offset_coupons=False,
+                    iis_limit=TAX_IIS3_EXEMPT_LIMIT):
     """sales — строки продаж группы; inc — {год: суммы}; carry_user — {"2023": сумма} убытки прошлых лет из деклараций.
     Возвращает (строки по годам, остатки убытков [[год, сумма]])."""
     sales = list(sales) + list(extra or [])
@@ -428,7 +429,7 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
         if int(k) not in ys:
             pool.append([int(k), float(v)])
     rows, nkd_pool = [], 0.0
-    iis_left = TAX_IIS3_EXEMPT_LIMIT
+    iis_left = iis_limit
     for y in sorted(ys):
         i = inc.get(y, {})
         sec = [s for s in sales if s["bucket"] == "sec" and s["sdate"].year == y]
@@ -466,8 +467,11 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
         tax, lo, hi = tx_ndfl(base, y)
         iis_used = 0.0
         if iis_exempt:
-            iis_used = min(max(0.0, base), iis_left)
-            iis_left -= iis_used
+            # вычет ИИС-Б / ИИС-3 не освобождает дивиденды; лимит 30 млн действует только на ИИС-3
+            exempt_base = min(max(0.0, base), max(0.0, trade_base + coupon_net + over + max(0.0, deriv)))
+            iis_used = exempt_base if iis_left is None else min(exempt_base, iis_left)
+            if iis_left is not None:
+                iis_left -= iis_used
             tax, lo, hi = tx_ndfl(base - iis_used, y)
         saved = 0.0
         if exempt > 0.005 and not iis_exempt:
@@ -600,6 +604,7 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resol
                 for k, x in v.items():
                     inc[y][k] += x
         exempt = False
+        iis_limit = TAX_IIS3_EXEMPT_LIMIT
         if gk == "gen":
             g["name"] = "Обычные счета" if len(ids) > 1 else accs[g["accounts"][0]]["name"]
             g["kind"] = "gen"
@@ -608,11 +613,12 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resol
             iinfo = tx_iis_info(a, settings["iis"].get(a["id"]) or {}, first_by_acc.get(a["id"]), today)
             iis_list.append(iinfo)
             exempt = iinfo["exempt"]
+            iis_limit = TAX_IIS3_EXEMPT_LIMIT if iinfo["type"] == "3" else None
             g["name"] = "ИИС: " + a["name"]
             g["kind"] = "iis"
             g["iis"] = iinfo
             sales = [dict(s, ldv=False, yrs=0) for s in sales]
-        rows, pool = tax_group_years(sales, inc, settings["loss_carry"] if gk == "gen" else None, exempt, None, off)
+        rows, pool = tax_group_years(sales, inc, settings["loss_carry"] if gk == "gen" else None, exempt, None, off, iis_limit)
         g["rows"], g["pool"], g["sales"], g["inc"] = rows, pool, sales, inc
         per_rows.append(rows)
         per_exempt.append(exempt)

@@ -205,21 +205,39 @@ class Netting(unittest.TestCase):
         self.assertAlmostEqual(M.tx_iis_table(st2, {})[0]["deduct_total"], 400000 * 0.13)
 
     def test_iis3_exempt_limit_single_year(self):
-        rows, _ = M.tax_group_years([], {2025: {"div": 35e6}}, None, True)
+        rows, _ = M.tax_group_years([], {2025: {"coupon": 35e6}}, None, True)
         r = rows[0]
         self.assertAlmostEqual(r["iis_exempt_used"], 30e6)
         self.assertAlmostEqual(r["tax"], M.tx_ndfl(5e6, 2025)[0])
 
     def test_iis3_exempt_limit_cumulative(self):
-        rows, _ = M.tax_group_years([], {2024: {"div": 20e6}, 2025: {"div": 15e6}}, None, True)
+        rows, _ = M.tax_group_years([], {2024: {"coupon": 20e6}, 2025: {"coupon": 15e6}}, None, True)
         self.assertAlmostEqual(rows[0]["tax"], 0)
         self.assertAlmostEqual(rows[1]["iis_exempt_used"], 10e6)
         self.assertAlmostEqual(rows[1]["tax"], M.tx_ndfl(5e6, 2025)[0])
 
     def test_iis3_small_profit_untaxed(self):
-        rows, _ = M.tax_group_years([], {2025: {"div": 1e6}}, None, True)
+        rows, _ = M.tax_group_years([], {2025: {"coupon": 1e6}}, None, True)
         self.assertAlmostEqual(rows[0]["tax"], 0)
         self.assertAlmostEqual(rows[0]["iis_exempt_used"], 1e6)
+
+    def test_iis_dividends_taxed_and_iis_b_unlimited(self):
+        rows, _ = M.tax_group_years([], {2025: {"div": 1e6, "coupon": 1e6}}, None, True)
+        self.assertAlmostEqual(rows[0]["iis_exempt_used"], 1e6)
+        self.assertAlmostEqual(rows[0]["tax"], M.tx_ndfl(1e6, 2025)[0])
+
+        sel = [{"id": "I", "name": "ИИС", "type": "ИИС", "opened": "2018-01-01T00:00:00Z"}]
+        ops = [buy("2024-01-10", 1000, 10000, acc="I"), sell("2024-02-10", 1000, 60000, acc="I"),
+               op("2024-03-01", "DIVIDEND", 100000, acc="I")]
+        st_b = M.tax_compute(ops, {}, None, sel, {"iis": {"I": {"type": "B", "opened": "2018-01-01"}}, "loss_carry": {}}, today=date(2025, 1, 10))
+        r_b = [g for g in st_b["groups"] if g["kind"] == "iis"][0]["rows"][0]
+        self.assertAlmostEqual(r_b["iis_exempt_used"], 50e6)
+        self.assertAlmostEqual(r_b["tax"], M.tx_ndfl(100000, 2024)[0])
+
+        st_3 = M.tax_compute(ops, {}, None, sel, {"iis": {"I": {"type": "3", "opened": "2018-01-01"}}, "loss_carry": {}}, today=date(2025, 1, 10))
+        r_3 = [g for g in st_3["groups"] if g["kind"] == "iis"][0]["rows"][0]
+        self.assertAlmostEqual(r_3["iis_exempt_used"], 30e6)
+        self.assertAlmostEqual(r_3["tax"], M.tx_ndfl(20e6 + 100000, 2024)[0])
 
     def test_iis_deduct_rate_15(self):
         sel = [{"id": "I", "name": "I", "type": "ИИС", "opened": "2019-01-01T00:00:00Z"}]
