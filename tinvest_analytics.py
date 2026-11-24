@@ -1253,7 +1253,7 @@ def period_bounds(period, now):
 
 def fifo(ops):
     """Позиции по сделкам методом FIFO: {uid: {qty, cost, last_unit}}, заодно результат продаж (op['_yield'])."""
-    pos = defaultdict(lambda: {"lots": [], "last_unit": 0.0})
+    pos = defaultdict(lambda: {"lots": [], "shorts": [], "last_unit": 0.0})
     moved = {}
     for o in ops:
         k = classify(o.get("type"))
@@ -1274,14 +1274,14 @@ def fifo(ops):
             left = q
             for lq, lu in lots:
                 t = min(left, lq * r)
-                if t > 0:
+                if t > 1e-9:
                     pos[uid]["lots"].append([t, lu / r])
                     left -= t
             continue
         if k == "repayments" and uid and op_type(o) == "BOND_REPAYMENT":
             # частичное погашение (амортизация): стоимость открытых лотов уменьшается на выплаченный номинал на бумагу
             tq = sum(l[0] for l in pos[uid]["lots"]) if uid in pos else 0
-            red = abs(qf(o.get("payment"))) / tq if tq else 0.0
+            red = abs(qf(o.get("payment"))) / tq if tq > 1e-9 else 0.0
             if red:
                 for l in pos[uid]["lots"]:
                     l[1] = max(0.0, l[1] - red)
@@ -1289,6 +1289,7 @@ def fifo(ops):
         if not uid or k not in ("buy", "sell", "sec_in", "sec_out", "repayments") or not q:
             if k == "repayments" and uid and op_type(o) == "BOND_REPAYMENT_FULL":
                 pos[uid]["lots"] = []
+                pos[uid]["shorts"] = []
             continue
         pay = abs(qf(o.get("payment")))
         unit = pay / q if q else 0.0
@@ -1298,25 +1299,40 @@ def fifo(ops):
         if k in ("buy", "sec_in"):
             if k == "sec_in" and not unit:
                 unit = qf(o.get("price")) or p["last_unit"]
-            p["lots"].append([q, unit])
+            left_buy, short_yld = q, 0.0
+            while left_buy > 1e-9 and p["shorts"]:
+                s = p["shorts"][0]
+                take = min(left_buy, s[0])
+                short_yld += take * (s[1] - unit)
+                s[0] -= take
+                left_buy -= take
+                if s[0] <= 1e-9:
+                    p["shorts"].pop(0)
+            if k == "buy" and q - left_buy > 1e-9:
+                o["_yield"] = short_yld
+            if left_buy > 1e-9:
+                p["lots"].append([left_buy, unit])
         elif k in ("sell", "sec_out"):
             left, cost = q, 0.0
-            while left > 0 and p["lots"]:
+            while left > 1e-9 and p["lots"]:
                 lot = p["lots"][0]
                 take = min(left, lot[0])
                 cost += take * lot[1]
                 lot[0] -= take
                 left -= take
-                if lot[0] <= 0:
+                if lot[0] <= 1e-9:
                     p["lots"].pop(0)
             if k == "sell":
-                o["_yield"] = pay - cost
+                o["_yield"] = pay * ((q - left) / q) - cost if q - left > 1e-9 else 0.0
+            if left > 1e-9:
+                p["shorts"].append([left, unit])
         elif k == "repayments" and op_type(o) == "BOND_REPAYMENT_FULL":
             p["lots"] = []
+            p["shorts"] = []
     out = {}
     for uid, p in pos.items():
         qty = sum(l[0] for l in p["lots"])
-        if qty:
+        if qty > 1e-9:
             out[uid] = {"qty": qty, "cost": sum(l[0] * l[1] for l in p["lots"]), "last_unit": p["last_unit"]}
     return out
 
@@ -1348,6 +1364,8 @@ def analyze(ops, names, period, portfolio_value):
         entries = []
         if kind == "buy":
             entries.append(("buy_turnover", cur, abs(pay)))
+            if yld:
+                entries.append(("realized", ycur, yld))
         elif kind == "sell":
             entries += [("sell_turnover", cur, abs(pay)), ("realized", ycur, yld)]
         elif kind not in ("other", "sec_in", "sec_out", "conv_in", "conv_out"):
@@ -3472,7 +3490,7 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
     start = ops[0]["date"][:10]
     today = date.today().isoformat()
     by_day = defaultdict(list)
-    held, qty = {}, defaultdict(int)
+    held, qty = {}, defaultdict(float)
     members = {}                      # ключ позиции -> все instrumentUid/figi, под которыми она встречается
     for o in ops:
         d = o["date"][:10]
@@ -3490,13 +3508,15 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
         elif k in ("sell", "sec_out", "conv_out"):
             qty[uid] -= q
         elif k == "repayments" and op_type(o) == "BOND_REPAYMENT_FULL":
-            qty[uid] = 0
+            qty[uid] = 0.0
         else:
             continue
+        if abs(qty[uid]) <= 1e-9:
+            qty[uid] = 0.0
         rng = held.setdefault(uid, [d, d])
-        rng[1] = today if qty[uid] else d
+        rng[1] = today if abs(qty[uid]) > 1e-9 else d
     for uid in held:
-        if qty[uid]:
+        if abs(qty[uid]) > 1e-9:
             held[uid][1] = today
 
     def mnames(g):
@@ -3608,7 +3628,7 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
     # обменянная на другую бумагу уже списана конвертацией, и «обнуление» дало бы ложный скачок)
     dead_from = {}
     for g in real:
-        if zero_priced and qty.get(g) and types[g] not in ("bond", "currency") and closes.get(g) and any(i in zero_priced for i in [g] + (members.get(g) or [])):
+        if zero_priced and abs(qty.get(g, 0.0)) > 1e-9 and types[g] not in ("bond", "currency") and closes.get(g) and any(i in zero_priced for i in [g] + (members.get(g) or [])):
             dead_from[g] = (datetime.strptime(max(closes[g]), "%Y-%m-%d") + timedelta(days=30)).strftime("%Y-%m-%d")
 
     last_close, fallback, cash, scale = {}, {}, defaultdict(float), {}

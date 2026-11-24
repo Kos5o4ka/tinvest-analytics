@@ -83,7 +83,7 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
     start = ops[0]["date"][:10]
     today = date.today().isoformat()
     by_day = defaultdict(list)
-    held, qty = {}, defaultdict(int)
+    held, qty = {}, defaultdict(float)
     members = {}                      # ключ позиции -> все instrumentUid/figi, под которыми она встречается
     for o in ops:
         d = o["date"][:10]
@@ -101,13 +101,15 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
         elif k in ("sell", "sec_out", "conv_out"):
             qty[uid] -= q
         elif k == "repayments" and op_type(o) == "BOND_REPAYMENT_FULL":
-            qty[uid] = 0
+            qty[uid] = 0.0
         else:
             continue
+        if abs(qty[uid]) <= 1e-9:
+            qty[uid] = 0.0
         rng = held.setdefault(uid, [d, d])
-        rng[1] = today if qty[uid] else d
+        rng[1] = today if abs(qty[uid]) > 1e-9 else d
     for uid in held:
-        if qty[uid]:
+        if abs(qty[uid]) > 1e-9:
             held[uid][1] = today
 
     def mnames(g):
@@ -219,7 +221,7 @@ def build_history(client, ops, names, actual_total, held_qty=None, zero_priced=N
     # обменянная на другую бумагу уже списана конвертацией, и «обнуление» дало бы ложный скачок)
     dead_from = {}
     for g in real:
-        if zero_priced and qty.get(g) and types[g] not in ("bond", "currency") and closes.get(g) and any(i in zero_priced for i in [g] + (members.get(g) or [])):
+        if zero_priced and abs(qty.get(g, 0.0)) > 1e-9 and types[g] not in ("bond", "currency") and closes.get(g) and any(i in zero_priced for i in [g] + (members.get(g) or [])):
             dead_from[g] = (datetime.strptime(max(closes[g]), "%Y-%m-%d") + timedelta(days=30)).strftime("%Y-%m-%d")
 
     last_close, fallback, cash, scale = {}, {}, defaultdict(float), {}

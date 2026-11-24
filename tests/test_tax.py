@@ -505,3 +505,26 @@ class FeeKeyAllocation(unittest.TestCase):
         eng = M.tax_engine(finalized, None, None)
         self.assertEqual(len(eng["sales"]), 1)
         self.assertAlmostEqual(eng["sales"][0]["cost"], 1005.0, places=6)
+
+
+class FifoShortsAndEpsilon(unittest.TestCase):
+    def test_float_epsilon_closes_position(self):
+        ops = [buy("2025-01-10", 0.1, 100), buy("2025-01-11", 0.2, 100), sell("2025-01-12", 0.3, 100)]
+        self.assertEqual(M.fifo(ops), {})
+
+    def test_uncovered_short_sell_does_not_fabricate_100pct_yield(self):
+        s = sell("2025-01-10", 10, 1000)
+        res = M.fifo([s])
+        self.assertEqual(res, {})
+        self.assertAlmostEqual(s["_yield"], 0.0, places=9)
+
+    def test_short_then_cover_realizes_profit_in_fifo_and_analyze(self):
+        s = sell("2025-01-10", 10, 100)
+        b = buy("2025-02-10", 10, 90)
+        res = M.fifo([s, b])
+        self.assertEqual(res, {})
+        self.assertAlmostEqual(s["_yield"], 0.0, places=9)
+        self.assertAlmostEqual(b["_yield"], 100.0, places=9)
+        an = M.analyze([s, b], {}, "all", 0)
+        self.assertAlmostEqual(an["life"].get("realized", 0.0), 100.0, places=6)
+
