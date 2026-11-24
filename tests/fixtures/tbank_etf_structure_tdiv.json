@@ -1,0 +1,133 @@
+{
+ "netAssetValue": 973017093.53,
+ "currency": "RUB",
+ "structureCount": 14,
+ "snapshotId": "15f7996805d63f46",
+ "items": [
+  {
+   "name": "ДОМ.РФ",
+   "ticker": "DOMRF",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "RU000A0ZYAR5.png",
+   "value": 93972200,
+   "relativeValue": 9.66
+  },
+  {
+   "name": "Сбербанк",
+   "ticker": "SBER",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "sber3.png",
+   "value": 92226701.64,
+   "relativeValue": 9.48
+  },
+  {
+   "name": "Транснефть - привилегированные акции",
+   "ticker": "TRNFP",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "RU0009091573.png",
+   "value": 91455298,
+   "relativeValue": 9.4
+  },
+  {
+   "name": "Сургутнефтегаз - привилегированные акции",
+   "ticker": "SNGSP",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "RU0008926258.png",
+   "value": 89152856.55,
+   "relativeValue": 9.16
+  },
+  {
+   "name": "Т-Технологии",
+   "ticker": "T",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "tcs2.png",
+   "value": 84160824.24,
+   "relativeValue": 8.65
+  },
+  {
+   "name": "Татнефть",
+   "ticker": "TATN",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "RU0006944147.png",
+   "value": 84100576.5,
+   "relativeValue": 8.64
+  },
+  {
+   "name": "ЛУКОЙЛ",
+   "ticker": "LKOH",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "RU0009024277.png",
+   "value": 80633933,
+   "relativeValue": 8.29
+  },
+  {
+   "name": "НОВАТЭК",
+   "ticker": "NVTK",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "novatec.png",
+   "value": 73091984.8,
+   "relativeValue": 7.51
+  },
+  {
+   "name": "Совкомбанк",
+   "ticker": "SVCB",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "sovkombank.png",
+   "value": 57969142.5,
+   "relativeValue": 5.96
+  },
+  {
+   "name": "Озон",
+   "ticker": "OZON",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "ISSUANCEOZON.png",
+   "value": 57696256,
+   "relativeValue": 5.93
+  },
+  {
+   "name": "МТС",
+   "ticker": "MTSS",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "mtsnew.png",
+   "value": 53008363.8,
+   "relativeValue": 5.45
+  },
+  {
+   "name": "НМТП",
+   "ticker": "NMTP",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "RU0009084446.png",
+   "value": 52708974,
+   "relativeValue": 5.42
+  },
+  {
+   "name": "Хэдхантер",
+   "ticker": "HEAD",
+   "type": "Stock",
+   "typeRu": "Акция",
+   "logo": "US42207L1061.png",
+   "value": 51207096,
+   "relativeValue": 5.26
+  },
+  {
+   "name": "Денежные средства",
+   "type": "Currency",
+   "typeRu": "Валюта",
+   "logo": "money.png",
+   "value": 11714532.12,
+   "relativeValue": 1.2
+  }
+ ]
+}

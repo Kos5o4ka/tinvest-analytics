@@ -54,16 +54,36 @@ function calYearHtml(d,today){
   }
   return`<div class="cy">${h}</div>`;
 }
-function calKpis(evs,lbl){
+/* «Ключевая ставка 16,5% · следующее заседание ЦБ: 18 декабря 2026, через 24 дня» */
+const CAL_MONG=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+const calDays=n=>{const a=n%10,b=n%100;return n+' '+(a===1&&b!==11?'день':a>=2&&a<=4&&(b<12||b>14)?'дня':'дней')};
+function calNextCbr(d){
+  const n=d&&d.next_cbr;if(!n||!n.date)return'';
+  const [y,m,dd]=n.date.split('-'),when=n.days===0?'сегодня, решение в 13:30 мск':n.days===1?'завтра':'через '+calDays(n.days);
+  return`Следующее заседание ЦБ: <b>${+dd} ${CAL_MONG[+m-1]} ${y}</b>, ${when}`;
+}
+function calKrLine(d){
+  if(!d)return'';
+  const kr=d.key_rate!=null?`Ключевая ставка <b>${String(d.key_rate).replace('.',',')}%</b>${d.key_rate_since?' с '+dlabel(d.key_rate_since):''}`:'';
+  const nx=calNextCbr(d);
+  return kr||nx?`<div class="cal-kr">${[kr,nx].filter(Boolean).map(x=>`<span>${x}</span>`).join('<span class="cal-kr-sep">·</span>')}</div>`:'';
+}
+function calNotes(d){
+  const w=(d.warnings||[]).map(w=>`<div class="msg err" style="margin:8px 0">${esc(w)}</div>`).join('');
+  const n=(d.notes||[]).map(t=>`<p class="note cal-quiet">${esc(t)}</p>`).join('');
+  return w+n;
+}
+function calKpis(evs,lbl,d){
+  const noPri=d&&d.sources&&d.sources.primary===false;
   const sum={};evs.forEach(e=>{const k=calKind(e.kind);if(e.amount!=null&&['coupon','redemption','amort','dividend'].includes(k))sum[k]=(sum[k]||0)+e.amount});
   const total=Object.values(sum).reduce((a,b)=>a+b,0),n=k=>evs.filter(e=>calKind(e.kind)===k).length;
   return`<div class="g g4">${kpi('Событий '+(calYear()?'в году':'в месяце'),evs.length,lbl)}${kpi('Выплаты по портфелю',total?M(total,'rub',0):'—','купоны, погашения, амортизации, дивиденды')}
-    ${kpi('Заседаний ЦБ',n('cbr'),'по ключевой ставке')}${kpi('Размещений',n('primary'),'начало по объявлениям Мосбиржи')}</div>`;
+    ${kpi('Заседаний ЦБ',n('cbr'),'по ключевой ставке')}${kpi('Размещений',noPri?'—':n('primary'),noPri?'источник сейчас недоступен':'начало по объявлениям Мосбиржи')}</div>`;
 }
 function pCal(){
   loadCal();
   const key=calKey(),c=S.cal.cache[key]||{loading:true},yr=calYear();
-  const y=S.cal.y,m=S.cal.m,today=new Date().toISOString().slice(0,10);
+  const y=S.cal.y,m=S.cal.m,tn=new Date(),today=`${tn.getFullYear()}-${calP2(tn.getMonth()+1)}-${calP2(tn.getDate())}`;   /* местная дата, не UTC */
   const nav=`<div class="row cal-nav"><button class="btn ghost" id="cal-prev" title="${yr?'Предыдущий год':'Предыдущий месяц'}">‹</button><b class="cal-title">${yr?y:MONF[m]+' '+y}</b><button class="btn ghost" id="cal-next" title="${yr?'Следующий год':'Следующий месяц'}">›</button>
     <button class="btn ghost" id="cal-today">Сегодня</button><span class="cal-vw"><button id="cal-vm" class="${yr?'':'on'}">Месяц</button><button id="cal-vy" class="${yr?'on':''}">Год</button></span><a class="btn" id="cal-ics" href="/api/events.ics?${new URLSearchParams({account:S.account})}" download="tinvest_events.ics" style="margin-left:auto">Скачать .ics</a></div>`;
   const hasOther=c.data&&(c.data.events||[]).some(e=>calGroup(e.kind)==='other');
@@ -73,8 +93,7 @@ function pCal(){
   if(c.error)return`<div class="card">${nav}<div class="msg err">${esc(c.error)} <button class="btn ghost" id="cal-r">Повторить</button></div></div>`;
   const d=c.data,evs=(d.events||[]).filter(calVis);
   if(yr){
-    const warn=(d.warnings||[]).map(w=>`<div class="msg err" style="margin:8px 0">${esc(w)}</div>`).join('');
-    return`${calKpis(evs,'за '+y+' год')}<div class="card" style="margin-top:16px">${nav}${chips}${warn}${calYearHtml(d,today)}<p class="note" style="margin:10px 4px 0">Точки — типы событий в этот день (до трёх). Нажмите на день, чтобы открыть его в месячном виде, или на название месяца.</p></div>${help}`;
+    return`${calKpis(evs,'за '+y+' год',d)}<div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${calYearHtml(d,today)}<p class="note" style="margin:10px 4px 0">Точки — типы событий в этот день (до трёх). Нажмите на день, чтобы открыть его в месячном виде, или на название месяца.</p></div>${help}`;
   }
   const by={};evs.forEach(e=>(by[e.date]=by[e.date]||[]).push(e));
   const first=new Date(y,m,1),lead=(first.getDay()+6)%7,days=new Date(y,m+1,0).getDate();
@@ -89,11 +108,10 @@ function pCal(){
   const grid=`<div class="cal-grid"><div class="cal-h">Пн</div><div class="cal-h">Вт</div><div class="cal-h">Ср</div><div class="cal-h">Чт</div><div class="cal-h">Пт</div><div class="cal-h">Сб</div><div class="cal-h">Вс</div>${cells}</div>`;
   const ds=Object.keys(by).filter(x=>!S.cal.sel||x===S.cal.sel).sort();
   const list=ds.length?ds.map(dt=>`<div class="cal-day" id="cal-d-${dt}"><div class="cal-dh"><b>${dlabel(dt)}</b><span class="mu">${['вс','пн','вт','ср','чт','пт','сб'][new Date(dt+'T00:00:00').getDay()]}${dt===today?' · сегодня':''}</span></div>
-    ${by[dt].map(e=>`<div class="cal-ev"${e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:''}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}${calBadge(e)}</b><small class="mu">${esc(e.label||calName(e.kind))}${e.note&&!e.label?' · '+esc(e.note):''}</small>${e.label&&e.note?`<small class="mu">${esc(e.note)}</small>`:''}</div>
+    ${by[dt].map(e=>`<div class="cal-ev"${e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:e.kind==='dividend'&&e.ticker?stkAttr(e.ticker,'div'):''}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}${calBadge(e)}</b><small class="mu">${esc(e.label||calName(e.kind))}${e.note&&!e.label?' · '+esc(e.note):''}</small>${e.label&&e.note?`<small class="mu">${esc(e.note)}</small>`:''}</div>
       <span class="num cal-am">${calMoney(e)}</span></div>`).join('')}</div>`).join(''):'<div class="empty" style="padding:24px">В этом месяце событий нет'+(Object.keys(S.cal.off).some(k=>S.cal.off[k])?' (часть типов скрыта фильтрами)':'')+'</div>';
-  const warn=(d.warnings||[]).map(w=>`<div class="msg err" style="margin:8px 0">${esc(w)}</div>`).join('');
-  return`${calKpis(evs,MONF[m].toLowerCase()+' '+y)}
-  <div class="card" style="margin-top:16px">${nav}${chips}${warn}${grid}${S.cal.sel?`<div class="row" style="margin:10px 4px 0"><span class="mu">Показан день ${dlabel(S.cal.sel)}</span><button class="btn ghost" id="cal-all">Показать весь месяц</button></div>`:''}</div>
+  return`${calKpis(evs,MONF[m].toLowerCase()+' '+y,d)}
+  <div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${grid}${S.cal.sel?`<div class="row" style="margin:10px 4px 0"><span class="mu">Показан день ${dlabel(S.cal.sel)}</span><button class="btn ghost" id="cal-all">Показать весь месяц</button></div>`:''}</div>
   <div class="card" style="margin-top:16px"><h2>События ${S.cal.sel?'за день':'месяца'}</h2>${list}</div>${help}
   <p class="note">Источники: сайт Банка России (календарь заседаний), Московская биржа (купоны, оферты, размещения), ваш портфель${(d.sources||{}).watch!=null?', список наблюдения':''}. Даты выплат, размеры будущих купонов и оферт могут измениться — сверяйтесь с решением эмитента. Справочная информация, не инвестиционная рекомендация.</p>`;
 }

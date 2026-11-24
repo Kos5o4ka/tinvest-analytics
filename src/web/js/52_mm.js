@@ -21,7 +21,7 @@ function mmFundsTable(d){
   const cell=w=>!w||bad(w.ret)?'<td class="num"><span class="mu">—</span></td>'
     :`<td class="num"><b>${mmPc(w.ret)}</b><br><small class="${mmCls(w.gap)}" title="${w.bench_name?'Отставание от ставки ('+esc(w.bench_name)+') за то же окно':''}">${mmPp(w.gap)}</small></td>`;
   return`<div class="tbl"><table><thead><tr><th class="l">Фонд</th><th>Цена пая, ₽</th>${MM_WINS.map(([k,t])=>`<th>${t}</th>`).join('')}</tr></thead><tbody>${
-    d.funds.map(f=>`<tr data-mmf="${esc(f.secid)}" style="cursor:pointer" class="${f.secid===sel?'mm-sel':''}" title="Выбрать для сравнения ниже"><td class="l"><b>${esc(f.secid)}</b><br><small class="mu">${esc(f.name)}</small></td>
+    d.funds.map(f=>`<tr data-mmf="${esc(f.secid)}" style="cursor:pointer" class="${f.secid===sel?'mm-sel':''}" title="Выбрать для сравнения ниже"><td class="l"><b>${esc(f.secid)}</b> ${stkLink(f.secid)}<br><small class="mu">${esc(f.name)}</small></td>
       <td class="num">${mmNum(f.last,4)}<br><small class="mu">${esc(dlabel(f.last_date))}</small></td>${MM_WINS.map(([k])=>cell(f.wins[k])).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 function mmCompare(d){
@@ -86,7 +86,7 @@ function bindMm(){
   const t=$$('mm-tabs');if(t)t.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===m.tab)return;m.tab=b.dataset.t;render()};
   const r=$$('mm-r');if(r)r.onclick=()=>{m.f=null;loadMmF();render()};
   const br=$$('mm-br');if(br)br.onclick=()=>{m.b=null;m.bl=0;loadMmB(true);render()};
-  document.querySelectorAll('[data-mmf]').forEach(tr=>tr.onclick=()=>{m.q.fund=tr.dataset.mmf;loadMmF();renderSoon()});
+  document.querySelectorAll('[data-mmf]').forEach(tr=>tr.onclick=e=>{if(e.target.closest('.stk-lnk'))return;m.q.fund=tr.dataset.mmf;loadMmF();renderSoon()});
   const win=$$('mm-win');if(win)win.onclick=e=>{const b=e.target.closest('[data-w]');if(!b)return;m.q.win=b.dataset.w;loadMmF()};
   const fs=$$('mm-fund');if(fs)fs.onchange=()=>{m.q.fund=fs.value;loadMmF()};
   for(const[id,k]of[['mm-amount','amount'],['mm-days','days'],['mm-fee','fee'],['mm-save','save']]){const e=$$(id);if(e)e.onchange=()=>{m.q[k]=e.value;loadMmF()}}

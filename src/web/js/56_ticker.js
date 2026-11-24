@@ -27,7 +27,7 @@ function tkrBuild(){
   const g=TKR.items.map(tkrItemHtml).join('');
   el.innerHTML=`<div class="tk-vp"><div class="tk-track"><div class="tk-grp">${g}</div><div class="tk-grp" aria-hidden="true">${g}</div></div></div><button class="tk-x" id="tkrx" title="Скрыть строку котировок" aria-label="Скрыть">×</button>`;
   el.querySelector('#tkrx').onclick=()=>{lsSet('ta_ticker_off','1');tkrBuild()};
-  el.querySelector('.tk-vp').onclick=e=>{const b=e.target.closest('[data-stk]');if(b&&typeof openStock==='function')openStock(b.dataset.stk)};
+  /* клик по бумаге ([data-stk]) открывает карточку через общий обработчик в 45_stock.js */
   const w=el.querySelector('.tk-grp').scrollWidth||1000;
   el.querySelector('.tk-track').style.setProperty('--tk-dur',Math.max(40,Math.round(w/45))+'s'); /* ~45 px/с */
 }

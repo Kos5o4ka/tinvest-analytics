@@ -4,10 +4,10 @@
 #toasts{position:fixed;right:22px;bottom:44px;z-index:1300;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none}
 .toast-i{pointer-events:auto;cursor:pointer;display:flex;align-items:center;gap:10px;max-width:min(420px,calc(100vw - 44px));
   padding:10px 15px 10px 12px;border-radius:12px;font-size:13px;line-height:1.35;color:var(--tx);
-  background:var(--glass);border:1px solid var(--line2);box-shadow:var(--hl),0 10px 30px -10px #000000a0;
+  background:var(--glass-solid);border:1px solid var(--line2);box-shadow:var(--hl),0 10px 30px -10px #000000a0;
   backdrop-filter:saturate(1.5) blur(16px);-webkit-backdrop-filter:saturate(1.5) blur(16px);
   opacity:0;transform:translateY(10px) scale(.98);transition:opacity .22s ease,transform .26s cubic-bezier(.2,.8,.2,1)}
-.toast-i.in{opacity:1;transform:none}
+.toast-i.is-in{opacity:1;transform:none}
 .toast-i.out{opacity:0;transform:translateX(14px) scale(.98)}
 .toast-i svg{width:18px;height:18px;flex:none;padding:3px;border-radius:50%;box-sizing:content-box;background:color-mix(in srgb,currentColor 14%,transparent)}
 .toast-i.k-ok svg{color:var(--pos)}.toast-i.k-err svg{color:var(--neg)}.toast-i.k-info svg{color:var(--ac-tx)}
@@ -22,10 +22,10 @@
 
 /* подсказка цепочки g… */
 #dl-chord{position:fixed;left:50%;bottom:48px;z-index:1250;display:flex;gap:6px 14px;align-items:center;flex-wrap:wrap;justify-content:center;max-width:min(760px,calc(100vw - 40px));
-  padding:9px 16px;border-radius:12px;font-size:12.5px;color:var(--tx2);background:var(--glass);border:1px solid var(--line2);
+  padding:9px 16px;border-radius:12px;font-size:12.5px;color:var(--tx2);background:var(--glass-solid);border:1px solid var(--line2);
   box-shadow:var(--hl),0 10px 30px -10px #000000a0;backdrop-filter:saturate(1.5) blur(16px);-webkit-backdrop-filter:saturate(1.5) blur(16px);
   opacity:0;transform:translate(-50%,8px);transition:opacity .18s,transform .2s;pointer-events:none}
-#dl-chord.in{opacity:1;transform:translate(-50%,0)}
+#dl-chord.is-in{opacity:1;transform:translate(-50%,0)}
 #dl-chord span{display:inline-flex;gap:6px;align-items:center}
 
 /* клавиши с объёмом */
@@ -38,10 +38,10 @@
 /* шпаргалка */
 #ks-ov{position:fixed;inset:0;z-index:1200;display:grid;place-items:center;padding:16px;background:#00000099;
   backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);opacity:0;transition:opacity .18s}
-#ks-ov.in{opacity:1}
+#ks-ov.is-in{opacity:1}
 #ks{width:min(820px,100%);max-height:92vh;overflow:auto;padding:22px 26px 18px;border-radius:18px;background:var(--card);
   border:1px solid var(--line2);box-shadow:var(--hl),0 28px 70px #00000080;transform:translateY(8px) scale(.985);transition:transform .22s cubic-bezier(.2,.8,.2,1)}
-#ks-ov.in #ks{transform:none}
+#ks-ov.is-in #ks{transform:none}
 .ks-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 #ks .ks-hd h2{margin:0;font-size:17px;font-weight:650;letter-spacing:-.02em;text-transform:none;color:var(--tx)}
 .ks-x{border:0;background:transparent;color:var(--mu);font-size:15px;cursor:pointer;padding:4px 8px;border-radius:8px}

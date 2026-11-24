@@ -134,10 +134,11 @@ def imported_positions(client, ops, names):
                 nominal = (b or {}).get("nominal") or 1000.0
                 unit = unit / 100.0 * nominal
                 nkd = (b or {}).get("aci") or 0.0
-        if unit is None and uid.startswith("imp:") and (cur or "rub") == "rub":
+        if unit is None and uid.startswith("imp:"):
             q = mq.get(uid[4:].upper())
-            if q and q.get("price"):
-                unit, nkd = q["price"], q.get("nkd") or 0.0
+            k = 1.0 if (cur or "rub") == "rub" else fx.get(cur)     # котировка Мосбиржи в рублях -> в валюту позиции
+            if q and q.get("price") and k:
+                unit, nkd = q["price"] / k, (q.get("nkd") or 0.0) / k
                 if not itype and q.get("type"):
                     itype = {"etf": "etf"}.get(q["type"], q["type"])
         if unit is None:
@@ -326,11 +327,30 @@ def issuer_group_key(name):
     return "".join(sorted(name_tokens(_bond_query(n)))) or low
 
 
+def moex_coupon_schedule(isin):
+    """График купонов выпуска с Мосбиржи в формате bond_info: [[дата, выплата на 1 бумагу или 0.0, если не объявлена]]."""
+    try:
+        bz = moex_bondization(isin)
+    except Exception:  # noqa: BLE001
+        return []
+    out = {}
+    for c in (bz or {}).get("coupons") or []:
+        d = c.get("coupondate")
+        if d:
+            out[d] = float(c.get("value") or 0.0)
+    return sorted([d, v] for d, v in out.items())
+
+
 def bonds_report(client, rows, horizon_days=365):
     today = date.today().isoformat()
     horizon = (date.today() + timedelta(days=horizon_days)).isoformat()   # окно выплат; 365 — «Выплаты», больше — матрица потоков
     bonds = [r for r in rows if r["type"] == "bond" and r["uid"] and r["qty"] > 0]
     infos = dict(zip([r["uid"] for r in bonds], pool_map(lambda r: bond_info(client, r["uid"]), bonds)))
+    # без токена (импорт отчёта, демо) график купонов брокера недоступен — берём его с Мосбиржи, иначе нет ни выплат, ни календаря
+    need = [r for r in bonds if infos.get(r["uid"]) and not infos[r["uid"]].get("coupons")]
+    for r, cp in zip(need, pool_map(lambda r: moex_coupon_schedule(bond_isin(r)), need)):
+        if cp:
+            infos[r["uid"]] = dict(infos[r["uid"]], coupons=cp)
     out, pays = [], []
     tot_bonds = sum((r["value_rub"] or 0) for r in bonds) or 0.0
     rates = fx_now(client, {(infos.get(r["uid"]) or {}).get("cur", "rub") for r in bonds} | {r["cur"] for r in bonds})

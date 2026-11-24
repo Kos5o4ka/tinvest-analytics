@@ -13,36 +13,111 @@ _RU_MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апре
               "октября": 10, "ноября": 11, "декабря": 12}
 
 
+CBR_CAL_ERR_TTL = 3600      # после ошибки сайт ЦБ не дёргаем час: иначе каждый экран ждёт таймаут
+
+
+def _cbr_parse_meetings(s):
+    """Даты заседаний Совета директоров по ключевой ставке со страницы cbr.ru/dkp/cal_mp/ (все годы, включая скрытые вкладки)."""
+    s = s.replace("&nbsp;", " ").replace("\xa0", " ")
+    parts = re.split(r'<div class="date[^"]*">', s)
+    dates = set()
+    for p in parts[1:]:
+        m = re.match(r"\s*(\d{1,2})\s+([а-яё]+)\s+(\d{4})", p)
+        if not m or m.group(2) not in _RU_MONTHS:
+            continue
+        head = p[:1500]
+        nxt = head.find('class="date')
+        body = head if nxt < 0 else head[:nxt]
+        if re.search(r"Заседание Совета директоров", body):
+            try:
+                dates.add(date(int(m.group(3)), _RU_MONTHS[m.group(2)], int(m.group(1))).isoformat())
+            except ValueError:
+                continue
+    return sorted(dates)
+
+
 def cbr_meetings():
-    """Даты заседаний Совета директоров Банка России по ключевой ставке: {"dates": [...], "ok": bool, "error": str}. Кэш 1 день."""
+    """Даты заседаний Совета директоров Банка России по ключевой ставке: {"dates": [...], "ok": bool, "error": str, "stale": bool}.
+    Кэш 1 день; если сайт недоступен — последний сохранённый список (stale) и повтор не чаще раза в час."""
     st = store()
     hit = st.get(CBR_CAL_KEY, ttl=DAY)
     if hit and hit.get("dates"):
         return hit
-    try:
-        s = http_text(CBR_CAL_URL, timeout=30)
-        s = s.replace("&nbsp;", " ").replace("\xa0", " ")
-        parts = re.split(r'<div class="date[^"]*">', s)
-        dates = set()
-        for p in parts[1:]:
-            m = re.match(r"\s*(\d{1,2})\s+([а-яё]+)\s+(\d{4})", p)
-            if not m or m.group(2) not in _RU_MONTHS:
-                continue
-            head = p[:1500]
-            nxt = head.find('class="date')
-            body = head if nxt < 0 else head[:nxt]
-            if re.search(r"Заседание Совета директоров", body):
-                dates.add(date(int(m.group(3)), _RU_MONTHS[m.group(2)], int(m.group(1))).isoformat())
-        if not dates:
-            raise ValueError("на странице ЦБ не найдено заседаний")
-        out = {"dates": sorted(dates), "ok": True}
-        st.put(CBR_CAL_KEY, out)
-        return out
-    except Exception as e:  # noqa: BLE001
+    with key_lock(CBR_CAL_KEY):
+        hit = st.get(CBR_CAL_KEY, ttl=DAY)
+        if hit and hit.get("dates"):
+            return hit
         old = st.get(CBR_CAL_KEY)
+        err = st.get(CBR_CAL_KEY + ":err", ttl=CBR_CAL_ERR_TTL)
+        if err is None:
+            try:
+                dates = _cbr_parse_meetings(http_text(CBR_CAL_URL, timeout=30))
+                if not dates:
+                    raise ValueError("на странице ЦБ не найдено заседаний")
+                out = {"dates": dates, "ok": True}
+                st.put(CBR_CAL_KEY, out)
+                return out
+            except Exception as e:  # noqa: BLE001
+                err = str(e)[:160] or e.__class__.__name__
+                st.put(CBR_CAL_KEY + ":err", err)
         if old and old.get("dates"):
             return dict(old, stale=True)
-        return {"dates": [], "ok": False, "error": str(e)[:160]}
+        return {"dates": [], "ok": False, "error": str(err)}
+
+
+_cbr_bg = {"run": False}
+
+
+def cbr_meetings_cached():
+    """Даты заседаний без ожидания сети: что есть в кэше; устаревший или пустой кэш обновляется в фоне."""
+    st = store()
+    if st.get(CBR_CAL_KEY, ttl=DAY) is None and not _cbr_bg["run"]:
+        _cbr_bg["run"] = True
+
+        def job():
+            try:
+                cbr_meetings()
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                _cbr_bg["run"] = False
+        threading.Thread(target=job, daemon=True).start()
+    return (st.get(CBR_CAL_KEY) or {}).get("dates") or []
+
+
+def cbr_next_meeting(today=None, wait=True):
+    """Ближайшее заседание ЦБ по ключевой ставке начиная с сегодняшнего дня: {"date", "days"} или None.
+    В день заседания days = 0 (решение объявляют в 13:30 по Москве). wait=False — не ждать сайт ЦБ (только кэш)."""
+    today = today or date.today().isoformat()
+    try:
+        dates = (cbr_meetings().get("dates") or []) if wait else cbr_meetings_cached()
+    except Exception:  # noqa: BLE001
+        return None
+    fut = [d for d in dates if d >= today]
+    if not fut:
+        return None
+    return {"date": fut[0], "days": _day_diff(today, fut[0])}
+
+
+def key_rate_now():
+    """Текущая ключевая ставка, % годовых, и дата, с которой она действует: (ставка, дата) или (None, None)."""
+    try:
+        ser = key_rate_series()
+    except Exception:  # noqa: BLE001
+        ser = None
+    if not ser:
+        try:
+            ser = store().get(KEY_KEY) or []
+        except Exception:  # noqa: BLE001
+            ser = []
+    if not ser:
+        return None, None
+    v, since = ser[-1][1], ser[-1][0]
+    for d, x in reversed(ser):          # с какого дня действует текущее значение
+        if x != v:
+            break
+        since = d
+    return v, since
 
 
 def ev_kind(k):
@@ -154,12 +229,14 @@ def events_payload(cfg, acc, q):
     if bad:
         raise ApiError("Период для календаря должен быть не длиннее %d дней." % EV_MAX_DAYS, 400)
     kinds = [ev_kind(k) for k in (q.get("kinds") or "").split(",") if k]
-    events, warn, src = [], [], {}
+    events, warn, src, notes = [], [], {}, []
     # 1. заседания Банка России
     cb = cbr_meetings()
     src["cbr"] = bool(cb.get("ok"))
     if not cb.get("ok"):
         warn.append("Календарь заседаний Банка России не удалось получить с сайта cbr.ru (%s). Остальные события показаны." % cb.get("error", "нет связи"))
+    kr, kr_since = key_rate_now()
+    nxt = cbr_next_meeting(today)
     for d in cb.get("dates") or []:
         if frm <= d <= to:
             events.append(_ev(d, "cbr", "Заседание Банка России по ключевой ставке", None, None,
@@ -179,7 +256,8 @@ def events_payload(cfg, acc, q):
             note = EV_NOTE.get(pk) or EV_KINDS.get(pk, "выплата").lower()
             if p.get("est"):
                 note += " (оценка)"
-            events.append(_ev(p["date"], pk, p["name"], isin, round(p["amount"], 2), note))
+            events.append(_ev(p["date"], pk, p["name"], isin, round(p["amount"], 2), note,
+                              **({"ticker": p.get("ticker")} if pk == "dividend" and p.get("ticker") else {})))
         for r in rep["rows"]:
             if r.get("isin") and r.get("qty"):
                 held.add(r["isin"])
@@ -218,9 +296,9 @@ def events_payload(cfg, acc, q):
                 events.append(_ev(d, "primary", r.get("short") or r.get("issuer"), r.get("isin") or None, None,
                                   ((r.get("desc") or "") + ((" · книга заявок: " + r["book"]) if r.get("book") else "")).strip(" ·") or "начало размещения"))
         src["primary"] = True
-    except Exception as e:  # noqa: BLE001
-        src["primary"] = False
-        warn.append("Размещения не загружены: %s" % str(e)[:100])
+    except Exception:  # noqa: BLE001
+        src["primary"] = False          # источник размещений бывает недоступен — это не ошибка календаря, только пометка
+        notes.append("Объявленные размещения сейчас недоступны: источник не отвечает. Остальные события показаны.")
     # 4. список наблюдения
     fn = globals().get("watch_isins")
     if fn:
@@ -259,7 +337,8 @@ def events_payload(cfg, acc, q):
             continue
         seen[k] = e
         uniq.append(e)
-    return {"account": acc, "from": frm, "to": to, "events": uniq, "kinds": EV_KINDS, "warnings": warn, "sources": src, "today": today}
+    return {"account": acc, "from": frm, "to": to, "events": uniq, "kinds": EV_KINDS, "warnings": warn, "sources": src, "today": today,
+            "notes": notes, "key_rate": kr, "key_rate_since": kr_since, "next_cbr": nxt}
 
 
 # ── iCalendar (RFC 5545) ──

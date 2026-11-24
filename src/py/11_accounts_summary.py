@@ -96,9 +96,11 @@ def _list_accounts(cfg, key):
                 return 0.0, 0
         for a, (t, n) in zip(accs, pool_map(tot, accs)):
             a["total"], a["empty"] = t, (t < 0.01 and n == 0)
+            a["broker_id"], a["broker_name"] = "tinvest", BROKERS["tinvest"]
     for imp in imports_list():
         a = {"id": imp["id"], "name": imp["name"], "kind": "import", "type": imp.get("broker") or "",
              "closed": False, "opened": None}
+        a["broker_id"], a["broker_name"] = broker_of_account(imp)
         try:
             rows = imported_positions(client, store().ops(imp["id"]), instruments(client, []))
             a["total"] = sum((r["value_rub"] or 0) for r in rows)
@@ -149,6 +151,26 @@ def build_summary(cfg, acc, period, force=False):
     total = sum(qf((d["port"] or {}).get("totalAmountPortfolio")) for d in data if d["port"] is not None) + \
         sum(sum((r["value_rub"] or 0) for r in lst) for lst, d in zip(lists, data) if d["port"] is None)
     res = analyze(ops, names, period, total)
+    # оптимизатор тарифов Т-Инвестиций — только по счетам Т-Инвестиций; стоимость для порогов тарифов — все счета Т
+    t_ids = {a["id"] for a in sel if broker_of_account(a)[0] == "tinvest"}
+    if t_ids:
+        t_value = sum((a.get("total") or 0) for a in accs if broker_of_account(a)[0] == "tinvest" and not a.get("closed"))
+        res["fee_model"] = fee_model(ops, names, t_value, t_accs=t_ids)
+        res["fee_model"]["other_accounts"] = [a["name"] for a in sel if a["id"] not in t_ids]
+    else:
+        res["fee_model"] = None
+    bt = cfg.get("broker_tariffs") if isinstance(cfg.get("broker_tariffs"), dict) else {}
+    res["broker_fees"] = []
+    for a in sel:
+        bid, bname = broker_of_account(a)
+        if bid == "tinvest":
+            continue
+        tid = bt.get(a["id"]) or ""
+        tar = broker_tariff(bid, tid)
+        row = broker_account_fees(a["id"], ops, names, tar)
+        row.update(id=a["id"], name=a["name"], broker_id=bid, broker_name=bname, tariff_id=tid if tar else "",
+                   tariffs=[{"id": x["id"], "name": x["name"]} for x in BROKER_TARIFFS.get(bid, {}).get("tariffs") or []])
+        res["broker_fees"].append(row)
     cost = sum(r.get("cost_rub") or 0 for r in rows if r["type"] not in ("currency", "futures"))
     upnl = sum(r.get("pnl_rub") or 0 for r in rows if r["type"] not in ("currency",))
     res["portfolio"] = {"total": total, "shares": t["shares"], "bonds": t["bonds"], "etf": t["etf"],

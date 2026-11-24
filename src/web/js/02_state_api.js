@@ -86,4 +86,12 @@ function staleRefresh(path,first){
   setTimeout(tick,4000);
 }
 const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+/* «Показано один раз» (тур, подсказки, чек-лист): хранится в конфиге программы (ui_seen), localStorage — только запасной вариант:
+   в окне pywebview localStorage между запусками не сохраняется */
+function uiGet(k){const u=S.cfg&&S.cfg.ui_seen;if(u&&u[k]!=null)return u[k];const v=lsGet('ui_'+k);if(v==null)return null;try{return JSON.parse(v)}catch(e){return v}}
+function uiSet(k,v){
+  lsSet('ui_'+k,JSON.stringify(v));
+  if(S.cfg){S.cfg.ui_seen=Object.assign({},S.cfg.ui_seen);S.cfg.ui_seen[k]=v}
+  const b={};b[k]=v;post('/api/config',{ui_seen:b}).catch(()=>{});
+}
 

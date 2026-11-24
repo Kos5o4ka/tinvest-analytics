@@ -191,6 +191,114 @@ def dl_safety(fin):
     return {"score": score, "zone": z[2], "label": z[1], "available_weight": avail, "components": comps, "flags": flags, "note": None}
 
 
+def dl_cagr(a, b, years):
+    """Среднегодовой рост от a к b за years лет, % (None, если базы нет)."""
+    if not a or not b or a <= 0 or b <= 0 or years <= 0:
+        return None
+    return round(((b / a) ** (1.0 / years) - 1.0) * 100.0, 1)
+
+
+def dl_regularity(counts):
+    """Сколько выплат в год обычно (по последним полным годам с выплатами): {per_year, label}."""
+    c = [n for n in counts if n]
+    if not c:
+        return {"per_year": None, "label": "нет выплат"}
+    m = int(round(dl_median(c)))
+    same = sum(1 for n in c if n == m) / float(len(c))
+    lab = {1: "раз в год", 2: "два раза в год", 3: "три раза в год", 4: "раз в квартал"}.get(m, "%d раз в год" % m)
+    if len(c) >= 3 and same < 0.6:
+        lab = "нерегулярно (обычно %s)" % lab
+    return {"per_year": m, "label": lab}
+
+
+def dl_div_profile(divs, price, today=None, qty=None, tax=0.13):
+    """Сводный анализ дивидендов бумаги по полной истории (рублёвые выплаты, по году даты фиксации реестра).
+    divs: [{record, value, ...}]. Годовые суммы, рост за 5/10 лет (CAGR), доходности, серии лет с выплатами и с ростом,
+    регулярность, пропущенные годы, ближайшая выплата на позицию qty (до и после налога)."""
+    today = today or date.today().isoformat()
+    ty = int(today[:4])
+    rows = sorted((d for d in divs or [] if d.get("record") and _dl_num(d.get("value"))), key=lambda d: d["record"])
+    by = {}
+    for d in rows:
+        y = int(d["record"][:4])
+        b = by.setdefault(y, {"year": y, "sum": 0.0, "n": 0, "announced": 0.0})
+        if d["record"] >= today:
+            b["announced"] += float(d["value"])
+        else:
+            b["sum"] += float(d["value"])
+            b["n"] += 1
+    years = []
+    if by:
+        for y in range(min(by), max(max(by), ty) + 1):
+            b = by.get(y) or {"year": y, "sum": 0.0, "n": 0, "announced": 0.0}
+            years.append({"year": y, "sum": round(b["sum"], 4), "n": b["n"], "announced": round(b["announced"], 4),
+                          "yield_pct": round((b["sum"] + b["announced"]) / price * 100.0, 2) if price else None})
+    sums = {r["year"]: r["sum"] for r in years}
+    last_full = ty - 1
+    paid_years = {y for y, v in sums.items() if v > 0}
+    grow = 0
+    y = last_full
+    while sums.get(y, 0) > 0 and sums.get(y - 1, 0) > 0 and sums[y] > sums[y - 1] * 1.0001:
+        grow += 1
+        y -= 1
+    nodecl = 0
+    y = last_full
+    while sums.get(y, 0) > 0 and sums.get(y - 1, 0) > 0 and sums[y] >= sums[y - 1] * 0.9999:
+        nodecl += 1
+        y -= 1
+    first = min(paid_years) if paid_years else None
+    skipped = [y for y in range(first, last_full + 1) if y not in paid_years] if first else []
+    y1 = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
+    y1f = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=365)).strftime("%Y-%m-%d")
+    ttm = sum(float(d["value"]) for d in rows if y1 < d["record"] < today)
+    fwd = sum(float(d["value"]) for d in rows if today <= d["record"] <= y1f)
+    cnt = {r["year"]: r["n"] for r in years}
+    recent = [cnt.get(y, 0) for y in range(last_full - 4, last_full + 1)]
+    pct = lambda v: round(v / price * 100.0, 2) if price and v else None  # noqa: E731
+    nx = _dl_next(rows, today) if rows else None
+    nx_pos = None
+    if nx and nx.get("upcoming") and qty:
+        g = float(nx["value"]) * float(qty)
+        nx_pos = {"qty": qty, "gross": round(g, 2), "net": round(g * (1.0 - tax), 2), "tax_rate": tax}
+    return {"years": years, "first_year": first, "count": len([d for d in rows if d["record"] < today]),
+            "ttm": round(ttm, 4), "yield_ttm": pct(ttm), "last_year": round(sums.get(last_full, 0.0), 4), "yield_last_year": pct(sums.get(last_full, 0.0)),
+            "forward": round(fwd, 4) if fwd else None, "yield_forward": pct(fwd),
+            "cagr5": dl_cagr(sums.get(last_full - 5), sums.get(last_full), 5), "cagr10": dl_cagr(sums.get(last_full - 10), sums.get(last_full), 10),
+            "streak_paid": dl_streak(paid_years, ty) if paid_years else 0, "streak_growth": grow, "streak_nodecline": nodecl,
+            "skipped": skipped, "regularity": dl_regularity(recent), "last_full_year": last_full, "next": nx, "next_pos": nx_pos}
+
+
+def dl_received(ops, secid, alt=None, names=()):
+    """Полученные дивиденды по бумаге из операций сводки (строки [дата, тип, вид, имя, тикер, кол-во, цена, сумма, валюта, …]).
+    Налог с дивидендов вычитается; группировка по дате зачисления и по годам. Только рубли.
+    alt — второй идентификатор (ISIN); names — полные названия: для строк импорта без тикера сверяем название."""
+    ids = {x.upper() for x in (secid, alt) if x}
+    nms = {str(n).strip().lower() for n in names or () if n}
+    by = {}
+    for o in ops or []:
+        try:
+            dt, kind, tk, amt, cur = (o[0] or "")[:10], o[2], (o[4] or "").upper(), float(o[7] or 0), (o[8] or "rub").lower()
+        except (IndexError, TypeError, ValueError):
+            continue
+        if not (tk in ids or (not tk and str(o[3] or "").strip().lower() in nms)) or cur != "rub" or kind not in ("dividends", "tax_dividend") or not dt:
+            continue
+        b = by.setdefault(dt, {"date": dt, "gross": 0.0, "tax": 0.0})
+        if kind == "dividends":
+            b["gross"] += amt
+        else:
+            b["tax"] += -amt
+    items = sorted(by.values(), key=lambda b: b["date"], reverse=True)
+    yrs = {}
+    for b in items:
+        b["gross"], b["tax"] = round(b["gross"], 2), round(b["tax"], 2)
+        b["net"] = round(b["gross"] - b["tax"], 2)
+        y = yrs.setdefault(b["date"][:4], {"year": int(b["date"][:4]), "gross": 0.0, "net": 0.0})
+        y["gross"] = round(y["gross"] + b["gross"], 2)
+        y["net"] = round(y["net"] + b["net"], 2)
+    return {"items": items, "years": sorted(yrs.values(), key=lambda y: y["year"]), "gross": round(sum(b["gross"] for b in items), 2),
+            "tax": round(sum(b["tax"] for b in items), 2), "net": round(sum(b["net"] for b in items), 2)}
+
+
 # ── сеть: сбор данных по бумаге ──
 
 def _dl_rub_divs(items):
@@ -234,19 +342,21 @@ def _dl_fin_inputs(secid, q, dv, divs, cfg):
 def _dl_analyze(secid, cfg, q=None, force=False):
     """Тяжёлый расчёт по одной бумаге (кэш 12 ч): дивиденды, гэпы, надёжность. Ошибки сети — в поле error, не исключением."""
     secid = (secid or "").strip().upper()
-    key = "dl_v2_%s_%d" % (secid, 1 if (cfg or {}).get("token") else 0)
+    key = "dl_v6_%s_%d" % (secid, 1 if (cfg or {}).get("token") else 0)
     if not force:
         hit = store().get(key, DL_TTL)
         if hit:
             return hit
     err = []
+    kind = "share"
     if q is None:
         try:
-            q = next((r for r in stocks_universe(cfg=cfg) if r["secid"] == secid), None)
+            q, kind = stk_lookup(secid, cfg)                 # акции, затем биржевые фонды (у фонда дивиденды — с сервера данных и dohod.ru)
         except Exception as e:  # noqa: BLE001
             q = None
             err.append("список акций недоступен: %s" % str(e)[:80])
     q = q or {}
+    kind = kind or "share"
     candles = []
     try:
         candles = stock_candles(secid, 24, days=2400)
@@ -255,15 +365,15 @@ def _dl_analyze(secid, cfg, q=None, force=False):
     price = q.get("price") or (candles[-1]["c"] if candles else None)
     dv = {}
     try:
-        dv = stock_dividends(secid, price, q.get("uid"), cfg) or {}
+        dv = stock_dividends(secid, price, q.get("uid"), cfg, history=True) or {}
     except Exception as e:  # noqa: BLE001
         err.append("дивиденды недоступны: %s" % str(e)[:80])
     divs = sorted(_dl_rub_divs(dv.get("items")), key=lambda d: d["record"])
     gaps = dl_gaps(divs, candles)
-    safety = dl_safety(_dl_fin_inputs(secid, q, dv, divs, cfg))
-    res = {"secid": secid, "name": q.get("shortname") or q.get("name") or secid, "sector": q.get("sector"), "price": price,
-           "divs": [{k: d.get(k) for k in ("record", "payment", "last_buy", "value")} for d in divs], "gaps": gaps, "safety": safety,
-           "div_source": dv.get("source"), "candles_to": candles[-1]["t"][:10] if candles else None, "candles_n": len(candles), "error": "; ".join(err) or None}
+    safety = dl_safety(_dl_fin_inputs(secid, q, dv, divs, cfg)) if kind != "fund" else None   # у фонда нет отчётности эмитента
+    res = {"secid": secid, "kind": kind, "isin": q.get("isin"), "full_name": q.get("name"), "name": q.get("shortname") or q.get("name") or secid, "sector": q.get("sector"), "price": price,
+           "divs": [{k: d.get(k) for k in ("record", "payment", "last_buy", "declared", "value", "src")} for d in divs], "gaps": gaps, "safety": safety,
+           "div_source": dv.get("source"), "div_hist": dv.get("hist"), "candles_to": candles[-1]["t"][:10] if candles else None, "candles_n": len(candles), "error": "; ".join(err) or None}
     if candles and divs and not err:
         try:
             store().put(key, res)
@@ -288,12 +398,12 @@ def _dl_next(divs, today):
     return x
 
 
-def _dl_cost_map(cfg, acc):
-    """Позиции-акции счёта: {тикер: {qty, avg, name}}. Без токена/счёта — пусто."""
+def _dl_cost_map(cfg, acc, summ=None):
+    """Позиции-акции (и фонды) счёта: {тикер: {qty, avg, name}}. Без токена/счёта — пусто. summ — готовая сводка build_summary."""
     out = {}
     try:
-        for r in build_summary(cfg, acc, "all")["portfolio"]["positions"]:
-            if r.get("type") == "share" and (r.get("qty") or 0) > 0 and r.get("ticker"):
+        for r in (summ or build_summary(cfg, acc, "all"))["portfolio"]["positions"]:
+            if r.get("type") in ("share", "etf") and (r.get("qty") or 0) > 0 and r.get("ticker"):
                 o = out.setdefault(r["ticker"], {"qty": 0.0, "cost": 0.0, "name": r.get("name") or r["ticker"], "price": r.get("price")})
                 o["qty"] += r["qty"]
                 o["cost"] += (r.get("avg") or 0.0) * r["qty"]
@@ -313,7 +423,18 @@ def _dl_stock_view(secid, cfg, acc, tax, fee, force):
     st = dl_stats(gaps)
     today = date.today().isoformat()
     nx = _dl_next(a["divs"], today)
-    pos = (_dl_cost_map(cfg, acc) or {}).get(secid) if acc else None
+    summ = None
+    if acc:
+        try:
+            summ = build_summary(cfg, acc, "all")
+        except Exception:  # noqa: BLE001 — нет токена/счёта: анализ без позиции
+            summ = None
+    cmap = (_dl_cost_map(cfg, acc, summ) or {}) if summ else {}
+    pos = cmap.get(secid) or (cmap.get(a["isin"]) if a.get("isin") else None)    # импортированные отчёты: тикер бывает равен ISIN
+    received = dl_received(summ.get("ops"), secid, a.get("isin"), (a.get("full_name"),)) if summ else None
+    profile = dl_div_profile(a["divs"], a.get("price"), today, pos["qty"] if pos else None, tax)
+    px = a.get("price")
+    divs = [dict(d, future=d["record"] >= today, yield_pct=round(d["value"] / px * 100.0, 2) if px else None) for d in reversed(a["divs"])]
     payoff = None
     if nx and a.get("price"):
         k = st["median_k"] if st["median_k"] is not None else 1.0
@@ -321,8 +442,9 @@ def _dl_stock_view(secid, cfg, acc, tax, fee, force):
         payoff.update(record=nx["record"], upcoming=nx["upcoming"], k_used=round(k, 3), k_fallback=st["median_k"] is None,
                       qty=pos["qty"] if pos else None, held=bool(pos))
     return {"ok": True, "mode": "stock", "secid": secid, "name": a["name"], "sector": a["sector"], "price": a["price"], "gaps": list(reversed(gaps)),
-            "stats": st, "safety": a["safety"], "next": nx, "payoff": payoff, "tax": tax, "fee": fee, "div_source": a["div_source"],
-            "candles_to": a["candles_to"], "error": a["error"]}
+            "stats": st, "safety": a["safety"], "next": nx, "payoff": payoff, "tax": tax, "fee": fee, "div_source": a["div_source"], "div_hist": a.get("div_hist"),
+            "candles_to": a["candles_to"], "error": a["error"], "kind": a.get("kind") or "share", "divs": divs, "profile": profile,
+            "position": {"qty": pos["qty"], "avg": pos["avg"]} if pos else None, "received": received if received and received["items"] else None}
 
 
 def _dl_portfolio_view(cfg, acc, tax, force):
@@ -335,6 +457,17 @@ def _dl_portfolio_view(cfg, acc, tax, force):
         uni = {r["secid"]: r for r in stocks_universe(cfg=cfg)}
     except Exception:  # noqa: BLE001
         uni = {}
+    by_isin = {r.get("isin"): k for k, r in uni.items() if r.get("isin")}
+    for t in [t for t in pos if t not in uni and t in by_isin]:   # импортированные отчёты: вместо тикера ISIN
+        o = pos.pop(t)
+        k = by_isin[t]
+        if k in pos:
+            q0 = pos[k]
+            q0["cost"] = q0.get("cost", 0.0) + o.get("cost", 0.0)
+            q0["qty"] += o["qty"]
+            q0["avg"] = q0["cost"] / q0["qty"] if q0["qty"] else None
+        else:
+            pos[k] = o
     tickers = sorted(pos)
 
     def one(t):

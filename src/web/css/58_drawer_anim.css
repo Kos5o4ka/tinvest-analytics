@@ -1,0 +1,6 @@
+/* drawerClose(): панель уезжает вправо, фон гаснет (67_drawer_anim.js) */
+.closing{pointer-events:none;animation:drFade .18s ease forwards!important}
+.closing>:first-child{animation:drOut .18s cubic-bezier(.4,0,1,1) forwards!important;will-change:transform}
+@keyframes drFade{to{background-color:transparent;-webkit-backdrop-filter:none;backdrop-filter:none}}
+@keyframes drOut{from{transform:translateX(0)}to{transform:translateX(100%)}}
+@media(prefers-reduced-motion:reduce){.closing,.closing>:first-child{animation:none!important}}

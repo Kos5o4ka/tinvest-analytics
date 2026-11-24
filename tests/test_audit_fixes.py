@@ -92,5 +92,28 @@ class HostIPv6(unittest.TestCase):
             self.assertEqual(h.ok_host(), ok, host)
 
 
+class ShellStatus(unittest.TestCase):
+    def test_old_shell_outdated(self):
+        self.assertTrue(M.shell_status(env={}, frozen=True)["outdated"])
+
+    def test_rev2_shell_outdated(self):                      # ревизия 3: заставка на pywebview
+        self.assertTrue(M.shell_status(env={"TINVEST_SHELL_REV": "2"}, frozen=True)["outdated"])
+
+    def test_new_shell_ok(self):
+        self.assertFalse(M.shell_status(env={"TINVEST_SHELL_REV": "3"}, frozen=True)["outdated"])
+        self.assertFalse(M.shell_status(env={"TINVEST_SHELL_REV": "4"}, frozen=True)["outdated"])
+
+    def test_launcher_matches_latest(self):
+        import re
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tinvest.py"), encoding="utf-8").read()
+        self.assertEqual(int(re.search(r"^SHELL_REV = (\d+)", src, re.M).group(1)), M.SHELL_REV_LATEST)
+
+    def test_source_run_never_outdated(self):
+        self.assertFalse(M.shell_status(env={}, frozen=False)["outdated"])
+
+    def test_garbage_rev(self):
+        self.assertTrue(M.shell_status(env={"TINVEST_SHELL_REV": "x"}, frozen=True)["outdated"])
+
+
 if __name__ == "__main__":
     unittest.main()

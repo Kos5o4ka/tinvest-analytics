@@ -14,7 +14,7 @@ function flwSrcLine(d){
   return`<span class="flw-src ${d.source==='tinvest'?'live':'delay'}" title="Источник сделок">${FLW_SRC[d.source]||esc(d.source)}</span>`;
 }
 function flwOpen(secid,cls,isin){
-  if(cls==='share'&&typeof openStock==='function')openStock(secid);
+  if((cls==='share'||cls==='fund')&&typeof openStock==='function')openStock(secid);
   else if(cls==='bond'&&isin&&typeof openBond==='function')openBond(isin);
   else{S.flw.tab='book';S.flw.book.secid=secid;S.flw.book.data=null;render()}
 }

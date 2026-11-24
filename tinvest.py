@@ -3,6 +3,8 @@
 
 Запуск:  python3 tinvest.py          (--no-update — не проверять обновления,
                                        --no-gui — без окна, прогресс в консоли; то же TINVEST_NO_GUI=1)
+Просмотр заставки без сети и без записи файлов (нужен pywebview):  TINVEST_SPLASH_DEMO=1 python3 tinvest.py
+                                       (=net — ошибка сети с автозапуском, =checksum — неверная контрольная сумма)
 Токен лаунчер не читает и никуда не отправляет: он лежит только в папке данных на этом компьютере.
 """
 import hashlib, json, os, queue, re, socket, ssl, subprocess, sys, threading, time, urllib.request
@@ -16,6 +18,9 @@ HOME = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), "
 APP_DIR = os.path.join(HOME, "app")
 APP, VER = os.path.join(APP_DIR, FILE), os.path.join(APP_DIR, "version.txt")
 OK_HOSTS = ("api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com")
+SHELL_REV = 3                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
+                                         # 3 — заставка на pywebview и бесшовный переход в окно программы
+os.environ["TINVEST_SHELL_REV"] = str(SHELL_REV)
 FROZEN = bool(getattr(sys, "frozen", False))      # собрано PyInstaller: sys.executable — сам лаунчер, не Python
 
 
@@ -154,7 +159,7 @@ def ver(tag):
 
 
 def mb(n):
-    return "%.1f" % (n / 1e6)
+    return ("%.1f" % (n / 1e6)).replace(".", ",")
 
 
 def progress_text(done, total, speed):
@@ -704,10 +709,8 @@ def wait_ping(get_url, thread, timeout=90):
     return False
 
 
-def open_native(url, thread):
-    """Окно программы на pywebview (WKWebView / Edge WebView2). Возвращает управление после закрытия окна;
-    бросает исключение, если окно показать не удалось (тогда запускается запасное окно tk)."""
-    import webview
+def webview_setup(webview):
+    """Общие настройки pywebview и геометрия окна программы (по window.json)."""
     webview.settings["ALLOW_DOWNLOADS"] = True                  # выгрузки CSV/ICS по ссылкам
     webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True   # t.me, MOEX и прочие target=_blank — в обычный браузер
     screen = None
@@ -716,23 +719,485 @@ def open_native(url, thread):
         screen = (sc.width, sc.height)
     except Exception:
         pass
-    w, h, x, y = window_geometry(load_state(), screen)
-    win = webview.create_window(TITLE, url, width=w, height=h, x=x, y=y, min_size=(MIN_W, MIN_H),
-                                background_color=BG, text_select=True)
+    return window_geometry(load_state(), screen)
+
+
+def app_window(webview, url, thread, geom, hidden=False, html=None, remember_geometry=True):
+    """Окно программы. thread — поток программы: когда он завершается, окно закрывается."""
+    w, h, x, y = geom
+    win = webview.create_window(TITLE, url, html=html, width=w, height=h, x=x, y=y, min_size=(MIN_W, MIN_H),
+                                background_color=BG, text_select=True, hidden=hidden)
 
     def remember(*_):
         try:
             save_state(win.width, win.height, win.x, win.y)
         except Exception:
             pass
-    for ev in (win.events.closing, win.events.resized, win.events.moved):   # closing не вызывается при выходе по Cmd+Q
-        ev += remember
-    threading.Thread(target=lambda: (thread.join(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
+    if remember_geometry:
+        for ev in (win.events.closing, win.events.resized, win.events.moved):   # closing не вызывается при выходе по Cmd+Q
+            ev += remember
+    if thread is not None:
+        threading.Thread(target=lambda: (thread.join(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
+    return win
+
+
+def open_native(url, thread):
+    """Окно программы на pywebview (WKWebView / Edge WebView2). Возвращает управление после закрытия окна;
+    бросает исключение, если окно показать не удалось (тогда запускается запасное окно tk)."""
+    import webview
+    app_window(webview, url, thread, webview_setup(webview))
     webview.start()
 
 
-def run_inprocess(args, ui, native=False):
-    """Собранный лаунчер: Python-интерпретатора рядом нет, поэтому программа выполняется внутри него."""
+# ───────────────────────────── заставка на pywebview (оболочка ревизии 3) ─────────────────────────────
+# Одна безрамочная webview-заставка вместо окна tk: проверка → загрузка N% → запуск. Когда сервер программы
+# отвечает, рядом создаётся скрытое окно программы; оно показывается после загрузки страницы, а заставка
+# растворяется и закрывается. Переключить рамку у уже открытого окна pywebview 6 не умеет (нет такого API ни
+# в Cocoa-, ни в WinForms-бэкенде), поэтому «то же окно» — это два окна одного цикла GUI без пустого кадра.
+# Сетевая работа — в фоновом потоке; состояние уходит в страницу через evaluate_js, кнопки — через js_api.
+
+SPLASH_W, SPLASH_H = 520, 330
+SPLASH_STEPS = ("Проверка", "Загрузка", "Подпись", "Запуск")
+LOGO_SVG = ('<svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><defs>'
+            '<linearGradient id="lg" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3b82f6"/>'
+            '<stop offset=".5" stop-color="#2563eb"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient>'
+            '<linearGradient id="la" x1="12" y1="6" x2="26" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#60a5fa"/>'
+            '<stop offset="1" stop-color="#38bdf8"/></linearGradient></defs>'
+            '<rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.08)"/>'
+            '<path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="url(#lg)"/>'
+            '<path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="url(#lg)"/>'
+            '<path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="url(#la)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+SPLASH_HTML = r"""<!doctype html><html lang="ru" class="__PLAT__"><head><meta charset="utf-8"><title>TAnalytic</title>
+<style>
+:root{--bg:#07090d;--card:#0c1017;--card2:#131923;--line:#ffffff0f;--line2:#ffffff1c;--tx:#edf1f7;--tx2:#9aa5b6;--mu:#6b7688;
+  --ac:#3b82f6;--ac2:#2f6fe0;--ac-tx:#7aa8f8;--ac-glow:rgba(59,130,246,.22);--pos:#2bc48a;--neg:#f0626a}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;overflow:hidden;background:transparent;color:var(--tx);cursor:default;user-select:none;-webkit-user-select:none;
+  font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text","Segoe UI",Inter,Roboto,"Helvetica Neue",system-ui,sans-serif;
+  font-feature-settings:"cv11","ss01","ss03";letter-spacing:-.008em;-webkit-font-smoothing:antialiased}
+html.win,html.win body{background:var(--bg)}
+.card{position:absolute;inset:0;display:flex;flex-direction:column;padding:26px 30px 24px;border-radius:14px;overflow:hidden;
+  background:radial-gradient(120% 90% at 0% 0%,#3b82f61a,transparent 55%),radial-gradient(90% 80% at 100% 100%,#38bdf80d,transparent 60%),var(--card);
+  border:1px solid var(--line2);box-shadow:inset 0 1px 0 #ffffff0a;
+  animation:in .42s cubic-bezier(.16,1,.3,1) both;transition:opacity .2s ease,transform .2s ease}
+html.win .card{border-radius:0;border-color:transparent}
+body.bye .card{opacity:0;transform:scale(.985)}
+@keyframes in{from{opacity:0;transform:translateY(6px) scale(.985)}to{opacity:1;transform:none}}
+.hd{display:flex;align-items:center;gap:14px}
+.lg{width:44px;height:44px;flex:none;line-height:0;filter:drop-shadow(0 6px 18px var(--ac-glow))}
+.lg svg{width:44px;height:44px;display:block}
+body[data-stage=check] .lg,body[data-stage=launch] .lg{animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.045)}}
+.nm{font-size:19px;font-weight:700;letter-spacing:-.025em;line-height:1.2}
+.nm small{display:block;font-size:12px;font-weight:500;color:var(--mu);letter-spacing:0;margin-top:2px}
+.ver{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:6px;font-size:10.5px;font-weight:700;letter-spacing:.04em;
+  color:var(--ac-tx);background:#3b82f614;border:1px solid #3b82f626;vertical-align:3px}
+.ver:empty{display:none}
+.x{margin-left:auto;align-self:flex-start;width:28px;height:28px;border-radius:8px;border:0;background:transparent;color:var(--mu);
+  display:grid;place-items:center;cursor:pointer;transition:background .15s,color .15s}
+.x:hover{background:#ffffff0d;color:var(--tx)}
+.x svg{width:12px;height:12px}
+.steps{display:flex;gap:18px;margin:24px 0 0;font-size:12px;color:var(--mu)}
+.steps span{display:flex;align-items:center;gap:7px;transition:color .2s}
+.steps i{width:7px;height:7px;border-radius:50%;background:#ffffff1f;transition:background .2s,box-shadow .2s}
+.steps .done{color:var(--tx2)}.steps .done i{background:var(--pos)}
+.steps .on{color:var(--tx)}.steps .on i{background:var(--ac);box-shadow:0 0 0 4px #3b82f629}
+.steps .err{color:var(--tx)}.steps .err i{background:var(--neg);box-shadow:0 0 0 4px #f0626a29}
+.st{margin-top:18px;font-size:17px;font-weight:650;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+body[data-stage=error] .st{color:#ff8a90}
+.dt{margin-top:4px;min-height:20px;font-size:13px;color:var(--tx2);font-variant-numeric:tabular-nums;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;user-select:text;-webkit-user-select:text}
+.bar{position:relative;height:4px;margin-top:16px;border-radius:4px;background:#ffffff0d;overflow:hidden;transition:opacity .2s}
+.bar b{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:4px;background:linear-gradient(90deg,var(--ac2),var(--ac),#60a5fa);
+  box-shadow:0 0 12px var(--ac-glow);transition:width .25s ease}
+.bar.ind b{width:38%;background:linear-gradient(90deg,transparent,var(--ac),#60a5fa,transparent);animation:slide 1.25s ease-in-out infinite}
+.bar.off{opacity:0}
+@keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(265%)}}
+.ft{margin-top:auto;display:flex;align-items:center;gap:10px;min-height:34px}
+.ft .hint{font-size:12px;color:var(--mu);margin-right:auto;white-space:nowrap;font-variant-numeric:tabular-nums}
+.btn{height:34px;padding:0 15px;border-radius:9px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;
+  border:1px solid var(--line2);background:var(--card2);color:var(--tx);transition:background .15s,border-color .15s,transform .1s}
+.btn:hover{background:#1a2230;border-color:#ffffff2e}
+.btn:active{transform:translateY(1px)}
+.btn.pri{background:var(--ac);border-color:var(--ac);color:#fff;box-shadow:0 6px 18px -8px var(--ac-glow)}
+.btn.pri:hover{background:#4b8df7;border-color:#4b8df7}
+.btn:focus-visible,.x:focus-visible{outline:2px solid #3b82f680;outline-offset:2px}
+@media (prefers-reduced-motion:reduce){.card,.lg,.bar.ind b{animation:none}.bar.ind b{width:100%;opacity:.5}}
+</style></head>
+<body data-stage="check"><div class="card">
+  <div class="hd"><div class="lg">__LOGO__</div>
+    <div class="nm">TAnalytic<span class="ver" id="ver"></span><small>аналитика портфеля</small></div>
+    <button class="x" id="x" title="Закрыть" aria-label="Закрыть"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 2l8 8M10 2l-8 8"/></svg></button></div>
+  <div class="steps" id="steps"></div>
+  <div class="st" id="st">Проверяю обновления</div>
+  <div class="dt" id="dt"></div>
+  <div class="bar ind" id="bar"><b></b></div>
+  <div class="ft"><span class="hint" id="hint"></span><span id="btns" style="display:flex;gap:10px"></span></div>
+</div>
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id)};
+  var STEPS=__STEPS__, lastBtns='';
+  function call(n){try{if(window.pywebview&&pywebview.api&&pywebview.api[n])pywebview.api[n]()}catch(e){}}
+  $('steps').innerHTML=STEPS.map(function(s){return '<span><i></i>'+s+'</span>'}).join('');
+  $('x').onclick=function(){call('close')};
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')call('close')});
+  window.splash={set:function(s){
+    if(s.bye){document.body.classList.add('bye');return}
+    if('stage' in s)document.body.dataset.stage=s.stage;
+    if('title' in s)$('st').textContent=s.title;
+    if('detail' in s)$('dt').textContent=s.detail||'';
+    if('hint' in s)$('hint').textContent=s.hint||'';
+    if('ver' in s)$('ver').textContent=s.ver||'';
+    if('step' in s){var sp=$('steps').children;for(var i=0;i<sp.length;i++)
+      sp[i].className=i<s.step?'done':i===s.step?(document.body.dataset.stage==='error'?'err':'on'):'';}
+    var b=$('bar');
+    if(!('pct' in s)){}
+    else if(s.pct===false){b.className='bar off'}
+    else if(s.pct==null){b.className='bar ind';b.firstChild.style.width=''}
+    else{b.className='bar';b.firstChild.style.width=Math.max(2,Math.min(100,s.pct))+'%'}
+    var bs=JSON.stringify(s.buttons||[]);
+    if(('buttons' in s)&&bs!==lastBtns){lastBtns=bs;var box=$('btns');box.innerHTML='';
+      (s.buttons||[]).forEach(function(x){var el=document.createElement('button');el.className='btn'+(x[2]==='pri'?' pri':'');
+        el.textContent=x[1];el.onclick=function(){call(x[0])};box.appendChild(el)});
+      }
+  }};
+})();
+</script></body></html>"""
+
+
+def splash_html(platform=None):
+    """Страница заставки. На macOS окно прозрачное, скругление и обводка рисуются карточкой; на Windows окно
+    непрозрачное, а углы скругляет сама система (Windows 11)."""
+    plat = "win" if (platform or sys.platform) == "win32" else "mac"
+    return (SPLASH_HTML.replace("__PLAT__", plat).replace("__LOGO__", LOGO_SVG)
+            .replace("__STEPS__", json.dumps(list(SPLASH_STEPS), ensure_ascii=False)))
+
+
+def splash_state(ev, tag=""):
+    """Событие обновления (как в очереди worker) → состояние заставки для splash.set(). None — событие не меняет вид."""
+    k, v = ev[0], (ver(tag) if tag else "")
+    if k == "check":
+        return {"stage": "check", "step": 0, "title": "Проверяю обновления", "detail": "Сверяю версию с последним релизом на GitHub",
+                "pct": None, "buttons": [], "hint": ""}
+    if k == "current":
+        return {"stage": "launch", "step": 3, "title": "Установлена последняя версия", "detail": v, "pct": None}
+    if k == "download":
+        return {"stage": "download", "step": 1, "title": "Скачиваю обновление 0%", "detail": "Версия %s" % v, "pct": 0}
+    if k == "progress":
+        done, total, speed = ev[1:4]
+        pct = min(100, int(100 * done / total)) if total else None
+        return {"stage": "download", "step": 1, "pct": pct,
+                "title": "Скачиваю обновление %d%%" % pct if pct is not None else "Скачиваю обновление",
+                "detail": "%s · %s" % (v, progress_text(done, total, speed)) if v else progress_text(done, total, speed)}
+    if k == "verify":
+        return {"stage": "verify", "step": 2, "title": "Проверяю подпись", "detail": "Сверяю контрольную сумму SHA256", "pct": None}
+    return None
+
+
+class SplashApi:
+    """Методы для кнопок заставки (window.pywebview.api.*). Поля с «_» pywebview в страницу не отдаёт."""
+    def __init__(self, shell):
+        self._shell = shell
+
+    def retry(self):
+        self._shell.ui("retry")
+
+    def run(self):
+        self._shell.ui("run")
+
+    def close(self):
+        self._shell.ui("close")
+
+    def browser(self):
+        self._shell.ui("browser")
+
+
+def demo_worker(kind):
+    """TINVEST_SPLASH_DEMO: имитация обновления без сети и без записи файлов (для просмотра заставки)."""
+    def run(q, cancel):
+        try:
+            q.put(("check",))
+            time.sleep(1.2)
+            if kind == "net":
+                q.put(("error", "Не удалось связаться с GitHub: [Errno 8] nodename nor servname provided, or not known", True))
+                return
+            q.put(("download", "v9.9.9"))
+            total, t0 = 2_400_000, time.time()
+            for i in range(1, 41):
+                if cancel.is_set():
+                    raise Cancelled()
+                time.sleep(0.07)
+                q.put(("progress", total * i // 40, total, total * i / 40 / max(time.time() - t0, 1e-3)))
+            q.put(("verify", "v9.9.9"))
+            time.sleep(0.7)
+            if kind == "checksum":
+                q.put(("error", "не совпала контрольная сумма SHA256 — обновление отклонено", False))
+                return
+            q.put(("ok", "updated"))
+        except Cancelled:
+            q.put(("cancelled",))
+    return run
+
+
+DEMO_PAGE = ("<!doctype html><html><body style='margin:0;height:100vh;display:grid;place-items:center;background:#07090d;"
+             "color:#edf1f7;font:15px -apple-system,Segoe UI,sans-serif'><div style='text-align:center'><div style='width:72px;"
+             "margin:0 auto 14px'>%s</div>Демо: здесь откроется программа.<br><small style='color:#6b7688'>Окно программы "
+             "показано, заставка закрыта.</small></div></body></html>" % LOGO_SVG)
+
+
+class WebShell:
+    """Заставка обновления и запуск программы в одном цикле pywebview (главный поток занят GUI)."""
+
+    def __init__(self, webview, args, no_update=False, demo=""):
+        self.wv, self.args, self.no_update, self.demo = webview, args, no_update, demo
+        self.q = queue.Queue()
+        self.splash = self.main = None
+        self.flow_started = False
+        self.code, self.result = 0, {}
+        try:
+            with open(VER) as f:
+                self.tag = f.read().strip()
+        except OSError:
+            self.tag = ""
+
+    # --- связь со страницей ---
+    def ui(self, action):
+        self.q.put(("ui", action))
+
+    def push(self, **s):
+        if self.splash is None:
+            return
+        if "ver" not in s and not s.get("bye"):
+            s["ver"] = ver(self.tag) if self.tag else ""
+        try:
+            self.splash.evaluate_js("window.splash&&splash.set(%s)" % json.dumps(s))
+        except Exception:
+            pass
+
+    def have(self):
+        return bool(self.demo) or have_app()
+
+    # --- окно ---
+    def run(self):
+        """Возвращает код выхода; бросает исключение, если GUI не запустился (тогда — запасной путь tk)."""
+        wv = self.wv
+        self.geom = webview_setup(wv)
+        mac = sys.platform == "darwin"
+        self.splash = wv.create_window(TITLE, html=splash_html(), js_api=SplashApi(self), width=SPLASH_W, height=SPLASH_H,
+                                       resizable=False, frameless=True, easy_drag=True, transparent=mac,
+                                       background_color=BG, min_size=(SPLASH_W, SPLASH_H))
+        wv.start(self.flow)
+        return self.result.get("code") or self.code
+
+    def decorate(self):
+        """Тень у прозрачного окна (macOS) и скруглённые углы безрамочного окна (Windows 11)."""
+        nat = getattr(self.splash, "native", None)
+        if nat is None:
+            return
+        try:
+            if sys.platform == "darwin":
+                from PyObjCTools import AppHelper
+
+                def shadow():
+                    nat.setHasShadow_(True)
+                    nat.invalidateShadow()
+                AppHelper.callAfter(shadow)
+            elif sys.platform == "win32":
+                import ctypes
+                pref = ctypes.c_int(2)                           # DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(int(nat.Handle.ToInt64()), 33, ctypes.byref(pref), 4)
+        except Exception:
+            pass
+
+    def close_all(self):
+        for w in (self.splash, self.main):
+            try:
+                w and w.destroy()
+            except Exception:
+                pass
+
+    def flow(self):
+        self.flow_started = True
+        try:
+            self.splash.events.loaded.wait(15)
+            time.sleep(0.05)
+            self.decorate()
+            if self.updating() == "quit":
+                self.close_all()
+                return
+            self.launch()
+        except Exception as e:                                   # не оставляем пользователя с зависшей заставкой
+            try:
+                self.code = 1
+                self.fail("Ошибка оболочки", str(e) or e.__class__.__name__)
+            finally:
+                self.close_all()
+
+    # --- этап обновления ---
+    def updating(self):
+        if self.no_update and not self.demo:
+            return "run"
+        while True:
+            self.q = q = queue.Queue()
+            cancel, busy, cancel_t, deadline, last_step = threading.Event(), True, None, None, 0
+            work = demo_worker(self.demo) if self.demo else worker
+            threading.Thread(target=work, args=(q, cancel), daemon=True).start()
+            self.push(**splash_state(("check",)))
+            while True:
+                try:
+                    ev = q.get(timeout=0.25)
+                except queue.Empty:
+                    ev = None
+                now = time.time()
+                if cancel_t and now - cancel_t > 3:              # сеть повисла — не держим пользователя
+                    return "quit"
+                if deadline:
+                    left = int(deadline - now + 0.999)
+                    if left <= 0:
+                        return "run"
+                    if ev is None:
+                        self.push(stage="error", hint="Автозапуск через %d с" % left)
+                if ev is None:
+                    continue
+                k = ev[0]
+                if k == "ui":
+                    a = ev[1]
+                    if a == "close":
+                        if not busy:
+                            return "quit"
+                        cancel.set()
+                        cancel_t = now
+                        self.push(stage="check", title="Отмена…", detail="", buttons=[])
+                    elif a == "run" and not busy and self.have():
+                        return "run"
+                    elif a == "retry" and not busy:
+                        break
+                    continue
+                if k in ("current", "download"):
+                    self.tag = ev[1]
+                st = splash_state(ev, self.tag)
+                if st:
+                    last_step = st["step"]
+                    self.push(**st)
+                if k == "ok":
+                    self.push(stage="launch", step=3, title="Запускаю", detail="", pct=None, buttons=[])
+                    return "run"
+                if k == "cancelled":
+                    return "quit"
+                if k == "error":
+                    busy = False
+                    msg, net = ev[1], ev[2]
+                    btns = [["retry", "Повторить", "pri" if not self.have() else ""]]
+                    if self.have():
+                        btns.append(["run", "Запустить без обновления", "pri"])
+                    else:
+                        btns.insert(0, ["close", "Закрыть", ""])
+                    self.push(stage="error", step=last_step,
+                              title="Нет связи с GitHub" if net else "Обновление не установлено",
+                              detail=msg[:1].upper() + msg[1:], pct=False, buttons=btns,
+                              hint="" if not (net and self.have()) else "Автозапуск через 6 с")
+                    if not self.have():
+                        self.code = 1
+                    elif net:                                    # офлайн: через несколько секунд — установленная версия
+                        deadline = now + 6
+            deadline = None
+            self.code = 0
+
+    # --- этап запуска ---
+    def wait_choice(self, choices, ready=None):
+        """Ждёт кнопку заставки (или ready() → "ready")."""
+        while True:
+            try:
+                ev = self.q.get(timeout=0.2)
+            except queue.Empty:
+                if ready and ready():
+                    return "ready"
+                continue
+            if ev[0] == "ui" and ev[1] in choices:
+                return ev[1]
+
+    def fail(self, title, detail, buttons=None):
+        self.push(stage="error", step=3, title=title, detail=detail, pct=False, hint="",
+                  buttons=buttons or [["close", "Закрыть", "pri"]])
+        if not buttons:
+            self.wait_choice(("close",))
+
+    def launch(self):
+        self.push(stage="launch", step=3, title="Запускаю", detail="Запускаю сервер программы…", pct=None, buttons=[], hint="")
+        if not self.have():
+            self.code = 1
+            self.fail("Программа ещё не скачана", "Обновиться не удалось. Проверьте интернет и запустите снова.")
+            self.close_all()
+            return
+        if self.demo:
+            time.sleep(1.2)
+            url, html, t = None, DEMO_PAGE, None
+        else:
+            t, cap, self.result = start_app(self.args)
+            state = {}
+            threading.Thread(target=lambda: state.update(ok=wait_ping(lambda: cap.url, t, timeout=60)), daemon=True).start()
+            while "ok" not in state:
+                time.sleep(0.05)
+            while not state["ok"]:
+                if not t.is_alive():
+                    self.code = 1
+                    err = self.result.get("err") or "код выхода %s" % self.result.get("code")
+                    self.fail("Программа остановилась с ошибкой", err)
+                    self.close_all()
+                    return
+                btns = [["close", "Закрыть", ""]] + ([["browser", "Открыть в браузере", "pri"]] if cap.url else [])
+                self.fail("Программа долго не отвечает", "Сервер ещё запускается. Можно подождать или открыть программу в браузере.",
+                          btns)
+                state.clear()
+                threading.Thread(target=lambda: state.update(ok=wait_ping(lambda: cap.url, t, timeout=3600)), daemon=True).start()
+                a = self.wait_choice(("close", "browser"), ready=lambda: state.get("ok"))
+                if a == "close":
+                    self.close_all()
+                    return
+                if a == "browser":
+                    webbrowser_open(cap.url)
+                    self.push(hint="Открыто в браузере. Окно закроется вместе с программой.")
+                    a = self.wait_choice(("close",), ready=lambda: state.get("ok") or not t.is_alive())
+                    if a == "close" or not t.is_alive():
+                        self.close_all()
+                        return
+                self.push(stage="launch", step=3, title="Запускаю", detail="", pct=None, buttons=[], hint="")
+            url, html = cap.url, None
+        self.push(detail="Открываю окно программы…")
+        self.main = app_window(self.wv, url, t, self.geom, hidden=True, html=html, remember_geometry=not self.demo)
+        self.main.events.loaded.wait(10)                         # показываем уже отрисованную страницу, без белого кадра
+        time.sleep(0.05)
+        self.main.show()
+        self.push(bye=True)                                      # заставка растворяется под окном программы
+        time.sleep(0.22)
+        try:
+            self.splash.destroy()
+        except Exception:
+            pass
+        self.splash = None
+
+
+def run_webshell(args, no_update, demo=""):
+    """Заставка и окно на pywebview. None — pywebview недоступен или не запустился (тогда работает прежний путь с tk)."""
+    try:
+        import webview
+    except Exception:
+        return None
+    shell = WebShell(webview, args, no_update, demo)
+    try:
+        return shell.run()
+    except Exception as e:
+        if shell.flow_started:
+            raise
+        sys.stderr.write("Заставка pywebview недоступна (%s), открываю запасное окно.\n" % e)
+        os.environ["TINVEST_NO_WEBVIEW"] = "1"                  # и окно программы — запасное (tk / браузер)
+        return None
+
+
+def start_app(args):
+    """Запускает программу в фоновом потоке этого процесса. (поток, Capture, result)."""
     import runpy, traceback
     sys.argv = [APP] + args
     result = {}
@@ -744,12 +1209,26 @@ def run_inprocess(args, ui, native=False):
             result["code"] = e.code if isinstance(e.code, int) else 1
         except BaseException:
             result["err"] = traceback.format_exc().strip().splitlines()[-1]
-    if isinstance(ui, Console):
-        target()                                                # консоль: можно прямо в главном потоке
-        return result.get("code", 1 if result.get("err") else 0)
     cap = sys.stdout = sys.stderr = Capture(sys.stdout)
-    t = threading.Thread(target=target, daemon=True)           # tk занимает главный поток
+    t = threading.Thread(target=target, daemon=True)           # главный поток занят окном (tk или pywebview)
     t.start()
+    return t, cap, result
+
+
+def run_inprocess(args, ui, native=False):
+    """Собранный лаунчер: Python-интерпретатора рядом нет, поэтому программа выполняется внутри него."""
+    if isinstance(ui, Console):                                 # консоль: можно прямо в главном потоке
+        import runpy, traceback
+        sys.argv = [APP] + args
+        result = {}
+        try:
+            runpy.run_path(APP, run_name="__main__")
+        except SystemExit as e:
+            result["code"] = e.code if isinstance(e.code, int) else 1
+        except BaseException:
+            result["err"] = traceback.format_exc().strip().splitlines()[-1]
+        return result.get("code", 1 if result.get("err") else 0)
+    t, cap, result = start_app(args)
     if native:
         def ready():
             result["ready"] = wait_ping(lambda: cap.url, t)
@@ -788,6 +1267,13 @@ def main():
     no_update = "--no-update" in argv
     no_gui = "--no-gui" in argv or os.environ.get("TINVEST_NO_GUI") == "1"
     args = [a for a in argv if a not in ("--no-update", "--no-gui")]
+    demo = os.environ.get("TINVEST_SPLASH_DEMO", "")            # 1 / net / checksum: показать заставку без сети и файлов
+    demo = "ok" if demo == "1" else demo
+    if demo or (want_native(FROZEN, no_gui) and "--no-window" not in args):
+        code = run_webshell(args + ["--no-window"], no_update, demo)     # окно открывает оболочка, не браузер программы
+        if code is not None:
+            sys.stdout and sys.stdout.flush()
+            os._exit(code)                                      # не ждём фоновые потоки программы
     ui = None
     if FROZEN or not no_update:
         ui = (None if no_gui else make_window()) or Console()

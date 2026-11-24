@@ -20,11 +20,11 @@ function toast(msg,a,b){
   el.className='toast-i k-'+kind;el._msg=msg;
   el.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+TOAST_IC[kind]+'</svg><span></span>';
   el.lastChild.textContent=msg;
-  el._close=()=>{if(el._gone)return;el._gone=true;clearTimeout(el._t);el.classList.remove('in');el.classList.add('out');setTimeout(()=>el.remove(),260)};
+  el._close=()=>{if(el._gone)return;el._gone=true;clearTimeout(el._t);el.classList.remove('is-in');el.classList.add('out');setTimeout(()=>el.remove(),260)};
   el.onclick=el._close;
   box.appendChild(el);
   while(box.children.length>4)box.firstChild._close&&box.firstChild._close(),box.firstChild.remove();
-  requestAnimationFrame(()=>requestAnimationFrame(()=>el.classList.add('in')));
+  requestAnimationFrame(()=>requestAnimationFrame(()=>el.classList.add('is-in')));
   el._t=setTimeout(el._close,ms);
 }
 
@@ -85,14 +85,14 @@ const KS_GO=[['h','dash','Главная'],['p','pos','Портфель'],['v','
 const KS_CODE={KeyG:'g',KeyH:'h',KeyP:'p',KeyV:'v',KeyB:'b',KeyT:'t',KeyC:'c',KeyS:'s',KeyR:'r'};
 const DLK={chord:0,t:0};
 function dlKey(e){return KS_CODE[e.code]||(e.key&&e.key.length===1?e.key.toLowerCase():e.key)}
-function dlChordHide(){DLK.chord=0;clearTimeout(DLK.t);const c=document.getElementById('dl-chord');if(c){c.classList.remove('in');setTimeout(()=>{if(!DLK.chord)c.remove()},180)}}
+function dlChordHide(){DLK.chord=0;clearTimeout(DLK.t);const c=document.getElementById('dl-chord');if(c){c.classList.remove('is-in');setTimeout(()=>{if(!DLK.chord)c.remove()},180)}}
 function dlChordShow(){
   DLK.chord=1;clearTimeout(DLK.t);DLK.t=setTimeout(dlChordHide,1500);
   let c=document.getElementById('dl-chord');
   if(!c){
     c=document.createElement('div');c.id='dl-chord';
     c.innerHTML='<kbd>g</kbd>'+KS_GO.map(([k,,t])=>`<span><kbd>${k}</kbd>${t}</span>`).join('');
-    document.body.appendChild(c);requestAnimationFrame(()=>requestAnimationFrame(()=>c.classList.add('in')));
+    document.body.appendChild(c);requestAnimationFrame(()=>requestAnimationFrame(()=>c.classList.add('is-in')));
   }
 }
 function dlThemeToggle(){const t=document.getElementById('thm');if(t)t.click()}
@@ -136,9 +136,9 @@ function ksToggle(){
   el.addEventListener('mousedown',e=>{if(e.target===el)ksClose()});
   el.querySelector('.ks-x').onclick=ksClose;
   document.body.appendChild(el);
-  requestAnimationFrame(()=>requestAnimationFrame(()=>el.classList.add('in')));
+  requestAnimationFrame(()=>requestAnimationFrame(()=>el.classList.add('is-in')));
 }
-function ksClose(){const o=document.getElementById('ks-ov');if(!o||o._c)return;o._c=1;o.classList.remove('in');setTimeout(()=>o.remove(),180)}
+function ksClose(){const o=document.getElementById('ks-ov');if(!o||o._c)return;o._c=1;o.classList.remove('is-in');setTimeout(()=>o.remove(),180)}
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'&&document.getElementById('ks-ov')){e.preventDefault();e.stopPropagation();ksClose()}
 },true);

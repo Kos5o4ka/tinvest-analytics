@@ -19,3 +19,10 @@
 .stk-lv .tag.neg{background:#ff6b6b17;color:var(--neg)}.stk-lv .tag.pos{background:#3ecf8e17;color:var(--pos)}
 @media(max-width:860px){.stk-votes b{min-width:0}.stk-px{font-size:22px}}
 [data-theme=light] .stk-res{box-shadow:0 12px 32px #0002}[data-theme=light] .stk-res button:hover{background:#0000000a}[data-theme=light] .stk-sig{background:#0000000a}
+/* биржевой фонд в карточке: метка «Фонд» и таблица состава с полосами долей */
+.stk-kind{display:inline-block;font-size:12px;font-weight:600;letter-spacing:.02em;padding:3px 9px;border-radius:7px;background:#4f8ef726;color:var(--s1);vertical-align:4px;margin-right:4px}
+.fh-t tr.fh-lnk{cursor:pointer}.fh-t tr.fh-lnk:hover td{background:#ffffff08}.fh-t tr.fh-lnk:hover b{text-decoration:underline}
+.fh-w{white-space:nowrap}
+.fh-bar{display:inline-block;width:min(140px,18vw);height:6px;border-radius:3px;background:#ffffff12;margin-right:10px;vertical-align:middle;overflow:hidden}
+.fh-bar i{display:block;height:100%;background:var(--s1);border-radius:3px}
+[data-theme=light] .fh-bar{background:#0000000f}[data-theme=light] .fh-t tr.fh-lnk:hover td{background:#00000006}

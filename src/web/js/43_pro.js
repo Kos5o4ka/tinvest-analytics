@@ -60,7 +60,7 @@ function proPill(){
 function proBanner(){
   const s=AUTH&&AUTH.st,d=proDaysLeft();
   if(!s||s.plan!=='pro'||!s.pro_until||d==null||d<=0||d>3)return'';
-  if(lsGet('ta_pro_ban')===String(s.pro_until))return'';
+  if(String(uiGet('pro_ban')||lsGet('ta_pro_ban')||'')===String(s.pro_until))return'';
   return`<div class="msg info pro-ban"><span>Pro действует до ${proDm(s.pro_until)}${d<=1?' (остался день)':''}. Продлить: <a href="${esc(proUrl())}" target="_blank" rel="noopener noreferrer">@${esc(proBot())}</a>, команда /pro.</span><button data-pro-dismiss title="Скрыть">×</button></div>`;
 }
 function proAbout(){
@@ -81,7 +81,7 @@ document.addEventListener('click',e=>{
   if(t.closest('[data-pro-about]')){e.preventDefault();proAbout();return}
   if(t.closest('[data-pro-kb]')){proClose();kbOpen('pro');return}
   if(t.closest('[data-pro-close]')||t.id==='pro-ov'){proClose();return}
-  if(t.closest('[data-pro-dismiss]')){const s=AUTH.st;if(s&&s.pro_until)try{localStorage.setItem('ta_pro_ban',String(s.pro_until))}catch(x){}const b=t.closest('.pro-ban');if(b)b.remove()}
+  if(t.closest('[data-pro-dismiss]')){const s=AUTH.st;if(s&&s.pro_until)uiSet('pro_ban',String(s.pro_until));const b=t.closest('.pro-ban');if(b)b.remove()}
 });
 document.addEventListener('keydown',e=>{if(e.key==='Escape')proClose()});
 /* Тариф изменился (вход, выход, выдача Pro) — обновить меню, шапку и текущую страницу */

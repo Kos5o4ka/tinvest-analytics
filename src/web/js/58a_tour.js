@@ -1,10 +1,12 @@
 /* ── Spotlight-тур по интерфейсу (FE-13) + тихий «тик» (Web Audio) ── */
-const TOUR_KEY='ta_tour_v3_done';
+const TOUR_KEY='tour';   /* ключ в ui_seen: версия программы, на которой тур уже показан */
+function tourVer(){return String((S.cfg&&S.cfg.version)||'1')}
+function tourSeen(){return String(uiGet(TOUR_KEY)||'')===tourVer()}
 const TOUR_STEPS=[
   {sel:['#acc-dd'],title:'Все счета в одном месте',text:'Переключайте брокерские счета и смотрите сводку по всем сразу — прямо из верхней панели.'},
   {sel:['#ux-mode','aside'],title:'Режимы «Базовый» и «Профи»',text:'«Базовый» показывает основные разделы без лишнего. «Профи» открывает все инструменты аналитики.'},
   {sel:['#nav button[title="Облигации (рынок)"]','#nav [data-p="scr"]'],title:'Скринер: фиксы и флоатеры',text:'Подбор облигаций по доходности, сроку и надёжности. Нажмите, чтобы открыть скринер.',task:true},
-  {sel:['#nav [data-p="dgap"]','#nav button[title="Акции и фонды"]'],title:'Дивидендный радар и гэпы',text:'Как акция ведёт себя в день отсечки и за сколько дней цена возвращается. Раздел для режима «Профи».'},
+  {sel:['#nav [data-p="dgap"]','#nav button[title="Акции и фонды"]'],title:'Дивиденды',text:'Ближайшие дивиденды по акциям портфеля, их надёжность и поведение цены в день отсечки. Полный анализ любой акции — вкладка «Дивиденды» в её карточке. Раздел для режима «Профи».'},
   {sel:['#srch'],title:'Быстрый поиск ⌘K / Ctrl+K',text:'Находите бумаги, эмитентов и разделы программы с клавиатуры.'}
 ];
 const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0};
@@ -84,7 +86,7 @@ function tourShow(i,dir){
     <h3 class="tour-ti">${esc(st.title)}</h3><p class="tour-tx">${esc(st.text)}</p>
     <div class="tour-ft"><div class="tour-dots">${TOUR.list.map((_,k)=>`<i class="${k===i?'on':''}"></i>`).join('')}</div>
     <div class="tour-btns">${i>0?'<button class="btn ghost" type="button" data-tour="prev">← Назад</button>':''}<button class="btn" type="button" data-tour="next">${last?'Завершить':'Далее →'}</button></div></div>`;
-  pop.classList.remove('in');void pop.offsetWidth;pop.classList.add('in');
+  pop.classList.remove('tour-in');void pop.offsetWidth;pop.classList.add('tour-in');
   try{TOUR.tgt.scrollIntoView({block:'center',inline:'nearest'})}catch(e){}
   tourPlace();
   clearTimeout(TOUR.tm);TOUR.tm=setTimeout(tourPlace,320);
@@ -98,7 +100,7 @@ function tourNext(d){
 }
 function tourStop(){
   if(!TOUR.on)return;
-  TOUR.on=false;lsSet(TOUR_KEY,'1');
+  TOUR.on=false;uiSet(TOUR_KEY,tourVer());
   clearTimeout(TOUR.tm);clearTimeout(TOUR.tm2);
   if(TOUR.raf){cancelAnimationFrame(TOUR.raf);TOUR.raf=0}
   if(TOUR.ov)TOUR.ov.remove();if(TOUR.pop)TOUR.pop.remove();
@@ -150,11 +152,11 @@ window.tourStart=tourStart;
 /* автозапуск один раз: после первого рендера с данными портфеля и ушедшей заставки */
 let _tourAuto=false;
 function tourAutoCheck(tries){
-  if(_tourAuto||TOUR.on||lsGet(TOUR_KEY)==='1')return;
+  if(_tourAuto||TOUR.on||!S.cfg||tourSeen())return;
   if(!(S.data&&!S.data.empty))return;
   _tourAuto=true;
   const wait=n=>setTimeout(()=>{
-    if(TOUR.on||lsGet(TOUR_KEY)==='1')return;
+    if(TOUR.on||tourSeen())return;
     if(document.getElementById('boot-splash')&&n<20){wait(n+1);return}
     tourStart();
   },n?500:1200);

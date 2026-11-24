@@ -101,6 +101,37 @@ class Store:
     def snap(self, acc, total):
         self.write("INSERT OR REPLACE INTO snaps(acc, d, total) VALUES(?,?,?)", (acc, date.today().isoformat(), total))
 
+    def kv_gc(self, rules=None, now=None, vacuum=True):
+        """Удаляет устаревшие строки чистых кэшей kv (по явному списку префиксов и возрасту), затем сжимает журнал WAL.
+        Пользовательские данные (импорты, операции, настройки, наблюдение, журнал, рейтинги, исторические ряды) не трогает.
+        Возвращает {"deleted": n, "vacuum": bool}."""
+        now = time.time() if now is None else now
+        n = 0
+        with self.wlock:
+            c = self.conn()
+            for pre, age in (rules or KV_GC_RULES):
+                cur = c.execute("DELETE FROM kv WHERE substr(k, 1, ?) = ? AND t < ?", (len(pre), pre, now - age))
+                n += max(cur.rowcount or 0, 0)
+            c.commit()
+        try:
+            self.conn().execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except sqlite3.Error:
+            pass
+        vac = False
+        if vacuum and n:
+            try:      # VACUUM только если свободных страниц много, а база небольшая: он переписывает файл целиком
+                c = self.conn()
+                free = c.execute("PRAGMA freelist_count").fetchone()[0]
+                pages = c.execute("PRAGMA page_count").fetchone()[0]
+                size = pages * c.execute("PRAGMA page_size").fetchone()[0]
+                if pages and free / float(pages) > 0.3 and size < KV_GC_VACUUM_MAX:
+                    with self.wlock:
+                        c.execute("VACUUM")
+                    vac = True
+            except sqlite3.Error:
+                pass
+        return {"deleted": n, "vacuum": vac}
+
     def wipe_cache(self):
         with self.wlock:
             c = self.conn()
@@ -109,6 +140,37 @@ class Store:
             c.execute("DELETE FROM candles")
             c.commit()
 
+
+# Чистые кэши, которые без потерь перезапрашиваются из сети: (префикс ключа, максимальный возраст строки, с).
+# Сюда НЕ входят: imports*, операции, настройки, наблюдение, журнал, рейтинги, снимки размещений, исторические ряды
+# (stk_hist_v1_, fng_cl1:, kbdc1:, pv_*, prih1:, cbr: — курсы для налогов), inst:/bond:/cpn: (нужны без сети).
+KV_GC_RULES = (
+    ("stk_c_v1_", 3 * DAY),           # графики акций: ключ содержит дату, прошлые дни больше не читаются
+    ("mqquote:", 7 * DAY), ("mqmap:", 60 * DAY),
+    ("bondmiss:", 7 * DAY), ("bondmiss404:", 7 * DAY), ("instmiss:", 7 * DAY),
+    ("bondiz2:", 60 * DAY), ("bopt1:", 60 * DAY), ("bondhist_v1_", 60 * DAY), ("iss_card_v3_", 60 * DAY),
+    ("mon_desc_v1_", 60 * DAY), ("disc_desc2:", 60 * DAY), ("find:", 60 * DAY), ("div2:", 60 * DAY),
+    ("res:", 60 * DAY),               # результаты расчётов по счетам (в т.ч. старых токенов) — пересчитываются
+)
+KV_GC_KEY, KV_GC_DELAY, KV_GC_VACUUM_MAX = "kv_gc_v1", 90, 512 * 1024 * 1024
+
+
+def kv_gc_start(delay=KV_GC_DELAY):
+    """Не чаще раза в сутки, в фоне и с задержкой после запуска (чтобы не мешать прогреву): kv_gc()."""
+    def job():
+        try:
+            time.sleep(delay)
+            st = store()
+            if st.get(KV_GC_KEY, ttl=DAY) is not None:
+                return
+            st.put(KV_GC_KEY, {"at": time.time()})
+            st.put(KV_GC_KEY, dict(st.kv_gc(), at=time.time()))
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=job, daemon=True, name="kv-gc").start()
+
+
+STARTUP_HOOKS.append(kv_gc_start)
 
 STORE = None
 _klocks, _klocks_lock = {}, threading.Lock()

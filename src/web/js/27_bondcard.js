@@ -179,8 +179,9 @@ function bcBody(c){
   add('Госномер выпуска',esc(d.REGNUMBER||''));
   h+=`<div class="card bc-sec"><h2>Ключевые параметры</h2><div class="bc-par">${rows.join('')||'<span class="mu">Нет данных</span>'}</div></div>`;
   const rk=x=>{const i=RSC.indexOf(x.rating);return i<0?99:i},ra=(c.rating&&c.rating.all||[]).slice().sort((x,y)=>rk(x)-rk(y)||String(x.agency).localeCompare(String(y.agency)));
-  h+=`<div class="card bc-sec"><h2>Кредитные рейтинги эмитента</h2>`+(ra.length?`<div class="tbl bc-rt"><table><thead><tr><th>Агентство</th><th>Рейтинг</th><th>Прогноз</th><th>Дата</th><th>Совпадение</th></tr></thead><tbody>`
-    +ra.map(x=>`<tr><td>${esc(x.agency)}</td><td><span class="tag rt rt-${esc(rBucket(x.rating).split(' ')[0])}">${esc(x.rating)}</span></td><td>${x.outlook?esc(x.outlook):'<span class="mu">—</span>'}</td><td>${x.date?ddm(x.date):'<span class="mu">—</span>'}</td><td>${x.approx?'<span class="neg" title="'+esc(x.issuer||'')+'">по названию, приблизительно</span>':'точное'}</td></tr>`).join('')
+  h+=`<div class="card bc-sec"><h2>Кредитные рейтинги эмитента</h2>`+(ra.length?`<div class="tbl bc-rt"><table><thead><tr><th>Агентство</th><th>Рейтинг</th><th>Прогноз</th><th>Дата</th><th>Источник</th></tr></thead><tbody>`
+    +ra.map(x=>{const u=rtSafeUrl(x.url),tg=`<span class="tag rt rt-${esc(rBucket(x.rating).split(' ')[0])}${u?' rt-click':''}">${esc(x.rating)}</span>`;
+      return`<tr><td>${esc(x.agency)}${x.approx?`<div class="mu" style="font-size:11px" title="${esc(x.issuer||'')}">по названию, приблизительно</div>`:''}</td><td>${u?`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer" class="bc-rt-a" title="Открыть пресс-релиз">${tg}</a>`:tg}</td><td>${x.outlook?esc(x.outlook):'<span class="mu">—</span>'}</td><td>${x.date?ddm(x.date):'<span class="mu">—</span>'}</td><td>${u?`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">Пресс-релиз ↗</a>`:''}</td></tr>`}).join('')
     +`</tbody></table></div>`:'<div class="mu" style="font-size:13px">Рейтинги кредитных агентств не найдены</div>')+`</div>`;
   h+=`<div class="card bc-sec"><h2>Документы выпуска</h2>${bcDocLinks(c.isin,(c.docs||{}).inn||d.EMITTER_INN,(m&&m.id)||c.isin)}</div>`;
   h+=bcDisclosure(c.disclosure);
@@ -206,7 +207,7 @@ function bcBody(c){
   // кривая эмитента
   const ic=c.issuer_curve;
   if(ic&&ic.points&&ic.points.length>1)h+=`<div class="card bc-sec"><h2>Кривая эмитента<span class="sp">${ic.points.length} выпусков в обращении: доходность по сроку</span></h2><div class="bc-ic" id="bc-ic"></div>
-    <div class="mu" style="font-size:12px;margin-top:6px"><span style="color:var(--ac)">●</span> этот выпуск · <span style="color:#3987e5">●</span> другие выпуски эмитента · пунктир — кривая бескупонной доходности (КБД). Клик по точке открывает карточку выпуска.</div></div>`;
+    <div class="bc-ic-lg"><span><i class="lg-me"></i>этот выпуск</span><span><i class="lg-ot"></i>другие выпуски эмитента</span><span><i class="lg-fl"></i>флоатер (полая точка)</span><span><i class="lg-ln"></i>линия: выпуски с фиксированным купоном по сроку</span><span><i class="lg-kbd"></i>КБД (бескупонная доходность)</span><em>Клик по точке открывает карточку выпуска.</em></div></div>`;
   // аналоги
   const an=c.analogs||[];
   h+=`<div class="card bc-sec"><h2>Аналоги<span class="sp">похожий рейтинг, срок и тип</span></h2>`;
@@ -234,10 +235,11 @@ function bcIssuerCurve(el,ic){
   const nx=Math.max(2,Math.min(8,Math.round(pw/80))),st=x1/nx;
   for(let i=0;i<=nx;i++){const v=i*st;g+=`<text class="ax num" x="${X(v)}" y="${H-8}" text-anchor="middle">${bcN(v,1)} г.</text>`}
   if(K.length>1)g+=`<polyline class="ic-kbd" points="${K.map(k=>X(k[0]).toFixed(1)+','+Y(k[1]).toFixed(1)).join(' ')}"/>`;
-  const fl=P.filter(p=>!p.floating);
+  /* сплошная линия — выпуски с фиксированным купоном по возрастанию срока (флоатеры не соединяются: их доходность от срока не зависит) */
+  const fl=P.filter(p=>!p.floating).sort((a,b)=>a.dur-b.dur);
   if(fl.length>1)g+=`<polyline class="ic-ln" points="${fl.map(p=>X(p.dur).toFixed(1)+','+Y(p.yield).toFixed(1)).join(' ')}"/>`;
   P.slice().sort((a,b)=>a.me-b.me).forEach(p=>{
-    g+=`<circle class="ic-pt${p.me?' ic-me':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?7:5}" fill="${p.me?'var(--ac)':'var(--s1)'}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
+    g+=`<circle class="ic-pt${p.me?' ic-me':p.floating?' ic-fl':''}" data-isin="${esc(p.isin)}" cx="${X(p.dur)}" cy="${Y(p.yield)}" r="${p.me?8:5}"><title>${esc(p.name)} · дох. ${bcN(p.yield,2)} % · дюр. ${bcN(p.dur,2)} г.${p.spread==null?'':' · спред '+(p.spread>0?'+':'')+bcN(p.spread,2)}${p.rating?' · '+esc(p.rating):''}${p.floating?' · флоатер':''}</title></circle>`});
   el.innerHTML=`<svg width="${W}" height="${H}">${g}</svg>`;
 }
 function bcIssIfrs(j){

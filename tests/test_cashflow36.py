@@ -93,7 +93,7 @@ class Report(unittest.TestCase):
             {"date": (today + timedelta(days=5)).isoformat(), "kind": "coupon", "name": "X", "ticker": "X", "amount": 70.0, "est": False}]}
         M.TInvest = lambda cfg: object()
         rec = (today - timedelta(days=100))
-        M.stock_dividends = lambda secid, price, uid=None, cfg=None: {"items": [
+        M.stock_dividends = lambda secid, price, uid=None, cfg=None, **kw: {"items": [
             {"record": rec.isoformat(), "payment": rec.isoformat(), "value": 30.0, "cur": "RUB"}]}
         M.cf36_rates = lambda: {"lqdt": 13.0, "ofz1y": 14.0}
         try:

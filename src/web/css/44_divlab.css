@@ -19,3 +19,20 @@
 [data-theme=light] .dl-bar i{background:#1a1d24}
 @media(max-width:1180px){.dl-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:760px){.dl-f{width:calc(50% - 7px)}.dl-nx{text-align:left}.dl-big{font-size:32px}}
+/* вкладка «Дивиденды» в карточке акции (62a_stock_div.js) */
+.stk-tabs{margin:-4px 0 16px;width:max-content;max-width:100%}
+.stk-tabs button{min-width:110px}
+.sd-big{font-size:28px;font-weight:700;margin:2px 0 10px;font-variant-numeric:tabular-nums}.sd-big small{font-size:13px;font-weight:500}
+.sd-pos{margin-top:10px;padding:10px 12px;border-radius:10px;background:#3ecf8e14;font-size:13.5px;line-height:1.5}
+.sd-gk{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:12px}
+.sd-gk>div{display:flex;flex-direction:column;gap:2px}.sd-gk b{font-size:20px}.sd-gk small{font-size:12px}
+.sd-ws{display:grid;gap:7px;margin-bottom:8px}
+.sd-w{display:grid;grid-template-columns:62px 1fr 52px 70px;gap:10px;align-items:center;font-size:13px}
+.sd-w b{text-align:right}.sd-w small{font-size:11.5px}
+.sd-wb{height:6px;border-radius:4px;background:var(--line);overflow:hidden}.sd-wb i{display:block;height:100%;background:var(--s3)}
+.sd-in{display:flex;gap:12px;flex-wrap:wrap;margin:-2px 0 10px}
+.sd-det summary{cursor:pointer;padding:2px 0;list-style:revert}.sd-det[open] summary{margin-bottom:12px}
+.stk-lnk{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-left:4px;vertical-align:middle;border-radius:5px;color:var(--mu);cursor:pointer}
+.stk-lnk:hover,.stk-lnk:focus-visible{color:var(--ac);background:#4f8ef71a}.stk-lnk svg{width:13px;height:13px}
+.sd-gg{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.5fr);gap:24px;align-items:start}
+@media(max-width:980px){.sd-gg{grid-template-columns:1fr}}

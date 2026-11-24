@@ -46,13 +46,13 @@ function kpSecurities(q){
   const openB=isin=>()=>{if(typeof openBond==='function')openBond(isin)};
   if(S.bonds&&S.bonds.rows)S.bonds.rows.forEach(r=>add(r.name,r.ticker,r.isin,'в портфеле',r.isin?openB(r.isin):()=>go('bonds')));
   const ps=S.data&&S.data.portfolio&&S.data.portfolio.positions;
-  if(ps)ps.forEach(p=>{if(p.type==='currency')return;add(p.name,p.ticker,p.isin||'', 'в портфеле',p.type==='bond'&&p.isin?openB(p.isin):()=>go(p.type==='bond'?'bonds':'pos'))});
+  if(ps)ps.forEach(p=>{if(p.type==='currency')return;add(p.name,p.ticker,p.isin||'', 'в портфеле',p.type==='bond'&&p.isin?openB(p.isin):(p.type==='share'||p.type==='etf')&&p.ticker&&typeof openStock==='function'?()=>openStock(p.ticker):()=>go(p.type==='bond'?'bonds':'pos'))});
   if(q.length>=2&&S.scr&&S.scr.rows){
     let n=0;for(const r of S.scr.rows){if(n>=8)break;const i=r.isin||r.id;if(seen.has(i))continue;
       const before=out.length;add(r.name,r.id,i,'каталог',openB(i));if(out.length>before)n++}
   }
-  if(typeof stkSearch==='function'&&q.length>=1)stkSearch(q,6).forEach(r=>{const k='stk:'+r.secid;if(seen.has(k))return;seen.add(k);
-    out.push({g:'Бумаги',t:r.shortname||r.secid,s:[r.secid,'акция · '+r.sector].join(' · '),sc:Math.max(kpScore(r.secid,q),kpScore(r.shortname,q),kpScore(r.name,q))-0.01,run:()=>openStock(r.secid)})});
+  if(typeof stkSearch==='function'&&q.length>=1)stkSearch(q,6,true).forEach(r=>{const k='stk:'+r.secid;if(seen.has(k))return;seen.add(k);
+    out.push({g:'Бумаги',t:r.shortname||r.secid,s:[r.secid,(r.kind==='fund'?'фонд · ':'акция · ')+r.sector].join(' · '),sc:Math.max(kpScore(r.secid,q),kpScore(r.shortname,q),kpScore(r.name,q))-0.01,run:()=>openStock(r.secid)})});
   return out.sort((a,b)=>b.sc-a.sc).slice(0,12);
 }
 function kpBuild(raw){

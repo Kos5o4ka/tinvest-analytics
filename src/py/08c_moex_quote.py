@@ -47,6 +47,39 @@ def _mq_find(ident):
     return out if out.get("ok") else None
 
 
+_MQ_RUB = ("SUR", "RUB", "RUR")
+
+
+def _mq_cur(x):
+    c = str(x or "").strip().upper()
+    return "RUB" if not c or c in _MQ_RUB else c
+
+
+def _mq_quote(m, sec, px):
+    """Котировка в рублях: price — ₽ за штуку, nkd — ₽ на облигацию. Облигация: цена в % от номинала и НКД — в валюте номинала
+    (FACEUNIT; у замещающих выпусков он USD/CNY даже при торгах в рублях), акция/фонд — в валюте торгов (CURRENCYID).
+    Валюта переводится в рубли по курсу ЦБ на сегодня; нет курса — None (лучше без котировки, чем с ценой не в той валюте)."""
+    if not px:
+        return None
+    nkd = 0.0
+    if m["type"] == "bond":
+        cur = _mq_cur(sec.get("FACEUNIT") or sec.get("CURRENCYID"))
+        face = _mq_num(sec.get("FACEVALUE")) or 1000.0
+        px = px / 100.0 * face
+        nkd = _mq_num(sec.get("ACCRUEDINT")) or 0.0
+    else:
+        cur = _mq_cur(sec.get("CURRENCYID") or sec.get("FACEUNIT"))
+    k = 1.0
+    if cur != "RUB":
+        k = tax_cbr_rate(cur, date.today().isoformat())
+        if not k:
+            return None
+    res = {"ok": True, "secid": m["secid"], "type": m["type"], "price": px * k, "nkd": nkd * k, "isin": m["isin"]}
+    if cur != "RUB":
+        res.update(cur=cur, fx=k)
+    return res
+
+
 def _mq_one(ident):
     ident = (ident or "").strip().upper()
     if not ident:
@@ -67,14 +100,7 @@ def _mq_one(ident):
             md = (_bc_table(j, "marketdata") or [{}])[0]
             px = (_mq_num(md.get("LAST")) or _mq_num(md.get("LCURRENTPRICE")) or _mq_num(md.get("MARKETPRICE"))
                   or _mq_num(sec.get("PREVPRICE")) or _mq_num(sec.get("PREVLEGALCLOSEPRICE")))
-            cur = str(sec.get("CURRENCYID") or sec.get("FACEUNIT") or "SUR").upper()
-            if px and cur in ("SUR", "RUB", "RUR"):
-                nkd = 0.0
-                if m["type"] == "bond":
-                    face = _mq_num(sec.get("FACEVALUE")) or 1000.0
-                    px = px / 100.0 * face
-                    nkd = _mq_num(sec.get("ACCRUEDINT")) or 0.0
-                res = {"ok": True, "secid": m["secid"], "type": m["type"], "price": px, "nkd": nkd, "isin": m["isin"]}
+            res = _mq_quote(m, sec, px)
         except Exception:  # noqa: BLE001
             res = None
         st.put(key, res or {"ok": False, "ts": time.time()})

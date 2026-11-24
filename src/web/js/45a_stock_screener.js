@@ -28,11 +28,12 @@ function drawSst(){
   const cols=[['secid','Акция','l'],['sector','Сектор','l'],['price','Цена, ₽'],['chg_d','День'],['chg_w','Неделя'],['chg_m','Месяц'],['cap','Капитализация'],['pe','P/E'],['pb','P/B'],['ev_ebitda','EV/EBITDA'],['div_yield','Дивиденды'],['rev_growth','Рост выручки'],['roe','ROE']];
   $('#sst-head').innerHTML=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   const x=(v,dg=1)=>v==null?'<span class="mu">—</span>':stkN(v,dg),pc=(v)=>v==null?'<span class="mu">—</span>':stkPc(v,1);
-  $('#sst-body').innerHTML=rs.slice(0,n).map(r=>`<tr data-stk="${esc(r.secid)}" style="cursor:pointer" title="Открыть карточку"><td class="l"><b>${esc(r.shortname||r.secid)}</b><br><small class="mu">${esc(r.shortname?r.secid:'')}</small></td><td class="l"><small>${esc(r.sector)}</small></td>
+  const dv=S.ssf.preset==='high_div'||k==='div_yield'||!!S.ssf.dymin;   /* дивидендная подборка — сразу на вкладку «Дивиденды» */
+  $('#sst-body').innerHTML=rs.slice(0,n).map(r=>`<tr${stkAttr(r.secid,dv?'div':'')}><td class="l"><b>${esc(r.shortname||r.secid)}</b><br><small class="mu">${esc(r.shortname?r.secid:'')}</small></td><td class="l"><small>${esc(r.sector)}</small></td>
     <td class="num">${stkPrice(r.price)}</td><td class="num">${pc(r.chg_d)}</td><td class="num">${pc(r.chg_w)}</td><td class="num">${pc(r.chg_m)}</td><td class="num">${stkCap(r.cap)}</td>
     <td class="num ${r.pe!=null&&r.pe_sector&&r.pe>0&&r.pe<r.pe_sector?'pos':''}" title="${r.pe_sector?'медиана сектора: '+stkN(r.pe_sector,1):''}">${r.pe!=null&&r.pe>0?stkN(r.pe,1):'<span class="mu">—</span>'}</td>
     <td class="num">${r.pb!=null&&r.pb>0?stkN(r.pb,2):'<span class="mu">—</span>'}</td><td class="num">${r.ev_ebitda!=null&&r.ev_ebitda>0?stkN(r.ev_ebitda,1):'<span class="mu">—</span>'}</td>
-    <td class="num">${r.div_yield==null?'<span class="mu">—</span>':'<b>'+stkN(r.div_yield,1)+' %</b>'}</td><td class="num">${pc(r.rev_growth)}</td><td class="num">${r.roe==null?'<span class="mu">—</span>':stkN(r.roe,1)+' %'}</td></tr>`).join('')||`<tr><td colspan="13" class="empty">Ничего не найдено — ослабьте фильтры</td></tr>`;
+    <td class="num"${r.div_yield==null?'':stkAttr(r.secid,'div')}>${r.div_yield==null?'<span class="mu">—</span>':'<b>'+stkN(r.div_yield,1)+' %</b>'}</td><td class="num">${pc(r.rev_growth)}</td><td class="num">${r.roe==null?'<span class="mu">—</span>':stkN(r.roe,1)+' %'}</td></tr>`).join('')||`<tr><td colspan="13" class="empty">Ничего не найдено — ослабьте фильтры</td></tr>`;
   $('#sst-cnt').textContent=`Найдено: ${rs.length}${rs.length>n?' · показано '+n:''}`;
   $('#sst-more').style.display=rs.length>n?'':'none';
 }
@@ -66,7 +67,7 @@ function bindSst(){
   $('#sst-pre').onclick=e=>{const b=e.target.closest('[data-p]');if(!b)return;S.ssf.preset=b.dataset.p;S.ssn=200;$('#sst-pre').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));drawSst()};
   $('#ss-reset').onclick=()=>{S.ssf={q:'',preset:'',sector:'',pemax:'',pbmax:'',dymin:'',gmin:'',capmin:''};render()};
   $('#sst-head').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;S.sssort={k,d:S.sssort.k===k?-S.sssort.d:(['secid','sector'].includes(k)?1:-1)};drawSst()};
-  $('#sst-body').onclick=e=>{const t=e.target.closest('[data-stk]');if(t)openStock(t.dataset.stk)};
+  /* клик по строке ([data-stk]) — общий обработчик в 45_stock.js */
   $('#sst-more').onclick=()=>{S.ssn+=200;drawSst()};
   drawSst();
 }

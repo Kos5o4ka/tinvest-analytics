@@ -606,7 +606,13 @@ def key_rate_series():
         return hit
     frm = (date.today() - timedelta(days=900)).strftime("%d.%m.%Y")
     to = date.today().strftime("%d.%m.%Y")
-    s = http_text("https://www.cbr.ru/hd_base/KeyRate/?UniDbQuery.Posted=True&UniDbQuery.From=%s&UniDbQuery.To=%s" % (frm, to))
+    try:
+        s = http_text("https://www.cbr.ru/hd_base/KeyRate/?UniDbQuery.Posted=True&UniDbQuery.From=%s&UniDbQuery.To=%s" % (frm, to))
+    except Exception:  # noqa: BLE001
+        old = st.get(KEY_KEY)          # сайт ЦБ недоступен — последний сохранённый ряд лучше, чем ошибка на каждом экране
+        if old:
+            return old
+        raise
     rows = []
     for d, v in re.findall(r"<td>(\d\d\.\d\d\.\d{4})</td>\s*<td>([\d,]+)</td>", s):
         rows.append([datetime.strptime(d, "%d.%m.%Y").date().isoformat(), float(v.replace(",", "."))])
@@ -706,7 +712,16 @@ def rates_payload(days, terms=None):
         key.append(last)
     return {"iso": iso, "labels": [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y") for d in iso],
             "kbd": kbd, "terms": tl, "key": key, "loading": _rates_state["running"] or (miss > 0 and not _rates_state["ended"]),
-            "keys": [k for k in keys if k[0] >= first]}
+            "keys": [k for k in keys if k[0] >= first], "next_cbr": _next_cbr_safe()}
+
+
+def _next_cbr_safe():
+    """Ближайшее заседание ЦБ для экрана «Ставки»; без сети — None (экран не должен падать из-за календаря ЦБ)."""
+    fn = globals().get("cbr_next_meeting")
+    try:
+        return fn(wait=False) if fn else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 

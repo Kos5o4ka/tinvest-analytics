@@ -3,7 +3,8 @@
 # T-Invest API (сектор, дивиденды GetDividends, фундаментальные показатели GetAssetFundamentals, даты отчётности GetAssetReports).
 # Без токена мультипликаторы считаются по МСФО из smart-lab (13m_ifrs.ifrs_multiples), дата отчётности неизвестна.
 # Проценты везде — числами в процентных пунктах (12.5 = 12,5 %), как и chg_d/chg_w/chg_m.
-# Контракт для других модулей: stocks_universe, funds_universe, stock_candles, stock_history_closes.
+# Контракт для других модулей: stocks_universe, funds_universe, stk_lookup, stock_candles, stock_history_closes.
+# Карточка stock_card открывает и биржевые фонды (kind = "fund"); паспорт и состав фонда — в 13s2_funds.py.
 
 STK_ISS = "https://iss.moex.com/iss/"
 STK_SH = "engines/stock/markets/shares/boards/%s/securities.json?iss.meta=off&iss.only=securities,marketdata"
@@ -220,16 +221,21 @@ def funds_universe():
     Если на TQBR фондов нет — запасной вариант: доска TQTF."""
     rows = [dict(r) for r in _stk_tqbr_rows() if r.get("is_fund")]
     if not rows:
-        key = ("stk_funds",)
-        cached = mem_get(key, _stk_ttl())
-        if cached is None:
-            cached = stk_rows_from_iss(_stk_iss(STK_SH % "TQTF", 40), None, STK_FUND_OTHER)
-            _stk_changes(cached)
-            mem_put(key, cached)
-        rows = [dict(r, is_fund=True) for r in cached]
+        rows = _stk_tqtf_rows()
     for r in rows:
         r["sector"] = stk_fund_category(r["secid"], r.get("name") or r.get("shortname"))
     return rows
+
+
+def _stk_tqtf_rows():
+    """Бумаги доски TQTF (фонды до переезда на TQBR и те, что там остались), копии строк с is_fund=True. Кэш как у TQBR."""
+    key = ("stk_funds",)
+    cached = mem_get(key, _stk_ttl())
+    if cached is None:
+        cached = stk_rows_from_iss(_stk_iss(STK_SH % "TQTF", 40), None, STK_FUND_OTHER)
+        _stk_changes(cached)
+        mem_put(key, cached)
+    return [dict(r, is_fund=True) for r in cached]
 
 
 STK_IV = {"H": 60, "D": 24, "W": 7, "M": 31}
@@ -298,13 +304,14 @@ def stk_srv_dividends(items):
     return out
 
 
-def stk_dividends_build(items, price, today=None):
+def stk_dividends_build(items, price, today=None, limit=30):
     """Сводка по дивидендам: объединение источников по дате фиксации, доходность к текущей цене, годовая (TTM) и ближайшая будущая выплата."""
     today = today or date.today().isoformat()
     by = {}
     for it in items:
-        if it["record"] not in by or it.get("src") == "tinvest":
-            by[it["record"]] = it
+        k = (it["record"], round(float(it["value"]), 6))    # две выплаты в один день фиксации (обычная + special) — разные строки
+        if k not in by or it.get("src") == "tinvest":
+            by[k] = it
     rows = sorted(by.values(), key=lambda x: x["record"], reverse=True)
     y1 = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
     for r in rows:
@@ -312,11 +319,12 @@ def stk_dividends_build(items, price, today=None):
         r["future"] = r["record"] >= today
     ttm = sum(r["value"] for r in rows if y1 < r["record"] <= today and r["cur"] in ("RUB", "RUR"))
     fut = sorted((r for r in rows if r["future"]), key=lambda x: x["record"])
-    return {"items": rows[:30], "ttm_value": round(ttm, 4), "yield_ttm": round(ttm / price * 100, 2) if price and ttm else None,
+    return {"items": rows[:limit], "ttm_value": round(ttm, 4), "yield_ttm": round(ttm / price * 100, 2) if price and ttm else None,
             "next": fut[0] if fut else None}
 
 
-def stock_dividends(secid, price, uid=None, cfg=None):
+def stock_dividends(secid, price, uid=None, cfg=None, history=False):
+    """history=True — добрать длинную историю (dohod.ru, см. 13x9b_divhist): T-Invest отдаёт ~6 лет, у компаний 20+. Источник каждой строки — в поле src."""
     items = []
     source = "none"                                    # ISS dividends.json мёртв — только T-Invest / сервер данных
     if uid and cfg and (cfg.get("token") or "").strip():
@@ -332,8 +340,17 @@ def stock_dividends(secid, price, uid=None, cfg=None):
         if isinstance(srv, dict) and srv.get("items") is not None:
             items.extend(stk_srv_dividends(srv["items"]))
             source = "tinvest-server"
-    res = stk_dividends_build(items, price)
+    hist = None
+    if history:
+        had = bool(items)
+        items, hist = dh_enrich(items, secid)
+        if not had and hist.get("added"):
+            source = DH_SRC                                # токена и сервера нет: вся история — со стороннего источника
+    res = stk_dividends_build(items, price, limit=DH_LIMIT if history else 30)
     res["source"] = source
+    if hist is not None:
+        res["hist"] = {"src": DH_SRC_NAME, "status": hist.get("status"), "added": hist.get("added"), "url": hist.get("url"), "note": hist.get("note"),
+                       "from": hist.get("from"), "years": len({r["record"][:4] for r in res["items"]})}
     return res
 
 
@@ -404,15 +421,33 @@ def stock_next_report(uid, cfg, secid=None):
 
 # ── карточка ──
 
+def stk_lookup(secid, cfg=None):
+    """Бумага для карточки: (строка котировки, "share" | "fund"). Сначала акции TQBR, затем фонды (TQBR, потом TQTF); нет — (None, None)."""
+    q = next((r for r in stocks_universe(cfg=cfg) if r["secid"] == secid), None)
+    if q is not None:
+        return q, "share"
+    q = next((r for r in funds_universe() if r["secid"] == secid), None)
+    if q is None:
+        try:
+            q = next((r for r in _stk_tqtf_rows() if r["secid"] == secid), None)
+        except Exception:  # noqa: BLE001 — запасная доска недоступна: просто «не найдено»
+            q = None
+        if q is not None:
+            q["sector"] = stk_fund_category(secid, q.get("name") or q.get("shortname"))
+    return (q, "fund") if q is not None else (None, None)
+
+
 def stock_card(secid, interval="D", cfg=None):
-    """Карточка акции: котировка, свечи (D/W/H), индикаторы и сводный сигнал, уровни, мультипликаторы, дивиденды, дата отчётности."""
+    """Карточка акции или биржевого фонда: котировка, свечи (D/W/H), индикаторы и сводный сигнал, уровни.
+    Для акции ещё мультипликаторы, дивиденды, дата отчётности; для фонда — паспорт (fund) и дивиденды, если фонд их платит.
+    Состав фонда — отдельным запросом /api/fund/holdings (13s2_funds.py), карточка его не ждёт."""
     secid = (secid or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9._-]{1,16}", secid):
         raise ApiError("Некорректный тикер.", 400)
     iv = STK_IV.get(str(interval).upper(), STK_IV.get("D")) if not str(interval).isdigit() else int(interval)
-    q = next((r for r in stocks_universe(cfg=cfg) if r["secid"] == secid), None)
+    q, kind = stk_lookup(secid, cfg)
     if q is None:
-        raise ApiError("Акция %s не найдена среди торгуемых на Мосбирже (TQBR)." % secid, 404)
+        raise ApiError("Бумага %s не найдена среди акций и фондов, торгуемых на Мосбирже." % secid, 404)
     cs = stock_candles(secid, iv, STK_DAYS.get(iv, 650))
     ser = ta_series(cs) if cs else {}
     view = {"D": 220, "W": 200, "H": 260, "M": 120}.get({v: k for k, v in STK_IV.items()}.get(iv, "D"), 220)
@@ -420,10 +455,19 @@ def stock_card(secid, interval="D", cfg=None):
     r4 = lambda a: [None if v is None else round(v, 4) for v in a[k0:]]  # noqa: E731
     summ = ta_summary(cs) if cs else {"signal": None, "votes": [], "last": {}}
     uid, auid = q.get("uid"), q.get("asset_uid")
-    return {"secid": secid, "quote": q, "interval": iv, "candles": cs[k0:], "series": {k: r4(v) for k, v in ser.items()},
-            "levels": levels(cs) if cs else {"support": [], "resistance": []}, "ta": summ,
-            "multiples": stock_multiples(secid, q.get("cap"), auid, cfg), "dividends": stock_dividends(secid, q["price"], uid, cfg),
-            "report": stock_next_report(uid, cfg, secid), "token": bool(cfg and (cfg.get("token") or "").strip()), "updated": time.time()}
+    out = {"secid": secid, "kind": kind, "quote": q, "interval": iv, "candles": cs[k0:], "series": {k: r4(v) for k, v in ser.items()},
+           "levels": levels(cs) if cs else {"support": [], "resistance": []}, "ta": summ,
+           "token": bool(cfg and (cfg.get("token") or "").strip()), "updated": time.time()}
+    if kind == "fund":
+        try:
+            divs = stock_dividends(secid, q["price"], None, cfg, history=False)
+        except Exception:  # noqa: BLE001 — дивиденды фонда не обязательны
+            divs = {"items": [], "ttm_value": 0, "yield_ttm": None, "next": None, "source": "none"}
+        out.update(multiples=None, report=None, dividends=divs, fund=fund_meta(secid, q.get("sector")))
+        return out
+    out.update(multiples=stock_multiples(secid, q.get("cap"), auid, cfg), dividends=stock_dividends(secid, q["price"], uid, cfg, history=True),
+               report=stock_next_report(uid, cfg, secid))
+    return out
 
 
 # ── скринер ──

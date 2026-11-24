@@ -1,0 +1,6 @@
+#shell-bar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding:8px 28px;border-bottom:1px solid var(--line);
+  background:linear-gradient(90deg,#2bc48a1f,#2bc48a08 60%,transparent),var(--bg);font-size:12.5px;color:var(--tx2)}
+#shell-bar b{color:var(--tx)}
+#shell-bar .sb-b{display:flex;gap:8px}
+#shell-bar .btn{padding:4px 11px;font-size:12px;border-radius:8px}
+@media print{#shell-bar{display:none}}

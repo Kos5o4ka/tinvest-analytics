@@ -88,8 +88,8 @@ class Urls(unittest.TestCase):
 
 class Format(unittest.TestCase):
     def test_progress_text(self):
-        self.assertEqual(L.progress_text(12_300_000, 20_100_000, 2_400_000), "12.3 из 20.1 МБ · 2.4 МБ/с")
-        self.assertEqual(L.progress_text(1_000_000, 0, 0), "1.0 МБ")
+        self.assertEqual(L.progress_text(12_300_000, 20_100_000, 2_400_000), "12,3 из 20,1 МБ · 2,4 МБ/с")
+        self.assertEqual(L.progress_text(1_000_000, 0, 0), "1,0 МБ")
 
     def test_console_bar(self):
         s = L.console_bar(5, 10, 0, width=10)
@@ -222,6 +222,33 @@ class NativeWindow(unittest.TestCase):
         t.start()
         t.join()
         self.assertFalse(L.wait_ping(lambda: "", t, timeout=2))
+
+
+class Splash(unittest.TestCase):
+    def test_html_filled(self):
+        for plat in ("darwin", "win32"):
+            h = L.splash_html(plat)
+            self.assertNotIn("__", h.replace("__main__", ""))               # все подстановки сделаны
+            self.assertIn('class="%s"' % ("win" if plat == "win32" else "mac"), h)
+            self.assertIn("<svg", h)
+
+    def test_states(self):
+        self.assertEqual(L.splash_state(("check",))["title"], "Проверяю обновления")
+        s = L.splash_state(("progress", 500_000, 2_000_000, 1e6), "1.2")
+        self.assertEqual((s["pct"], s["title"], s["step"]), (25, "Скачиваю обновление 25%", 1))
+        self.assertTrue(s["detail"].startswith("v1.2 · "))
+        self.assertIsNone(L.splash_state(("progress", 10, 0, 0))["pct"])     # размер неизвестен — бегущая полоса
+        self.assertEqual(L.splash_state(("verify", "v1"))["step"], 2)
+        self.assertIsNone(L.splash_state(("ok", "current")))
+
+    def test_api_routes_to_queue(self):
+        class Sh:
+            got = []
+            def ui(self, a): self.got.append(a)
+        api = L.SplashApi(Sh())
+        api.retry(); api.run(); api.close(); api.browser()
+        self.assertEqual(Sh.got, ["retry", "run", "close", "browser"])
+        self.assertEqual([n for n in dir(api) if not n.startswith("_")], ["browser", "close", "retry", "run"])
 
 
 if __name__ == "__main__":

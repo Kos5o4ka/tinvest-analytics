@@ -14,7 +14,7 @@ const UX_TAB_SHORT={
   dash:'Главная',pos:'Позиции',bonds:'Облигации',ret:'Доходность',bench:'Бенчмарки',pm:'Разбор сделок',ops:'Операции',fees:'Комиссии',reb:'Ребалансировка',
   pay:'Выплаты',off:'Оферты',cal:'Календарь',
   scr:'Скринер',cmp:'Сравнение',arb:'Кривые и арбитраж',rot:'Флоатеры или фиксы',dbx:'Линкеры и валютные',lad:'Лесенка',pri:'Первичка',map:'Карта рынка',
-  sst:'Скринер акций',hm:'Тепловая карта',stk:'Карточка акции',dgap:'Дивидендные гэпы',mm:'Деньги и базис',
+  sst:'Скринер акций',hm:'Тепловая карта',stk:'Акция или фонд',dgap:'Дивиденды',mm:'Деньги и базис',
   mkt:'Ставки и КБД',fng:'Страх и жадность',flw:'Кто покупает',mic:'Стакан и ликвидность',sig:'Сигналы',
   risk:'Риски портфеля',mon:'Мониторинг',iss:'Эмитенты',crp:'Устойчивость',dfl:'Техдефолты',watch:'Наблюдение',
   tax:'Итоги года и ЛДВ',txo:'Оптимизация и ИИС-3',calc:'Калькулятор'
@@ -37,7 +37,7 @@ const UX_WHY={
   fng:'Сводный индекс настроений российского рынка на основе волатильности, ширины рынка и потоков.',
   dfl:'Лента технических и фактических дефолтов по облигациям с e-disclosure и флагами Мосбиржи.',
   arb:'Поиск перекосов доходности внутри одного эмитента, инверсий кривой (ранний сигнал риска) и безубыточной девальвации для валютных облигаций.',
-  dgap:'Как цена акции ведёт себя в день отсечки: насколько падает и за сколько дней возвращается, плюс оценка надёжности дивиденда.',
+  dgap:'Ближайшие дивиденды по акциям портфеля: даты отсечки, суммы к получению, надёжность и сроки закрытия гэпа. Полный анализ любой акции — вкладка «Дивиденды» в её карточке.',
   pm:'Честное сравнение ваших вложений с LQDT/TMOS в те же даты (призрачный портфель) и разбор закрытых сделок по FIFO (Win Rate, эффект диспозиции).',
   bench:'Честное сравнение доходности вашего портфеля с индексами акций, облигаций и денежного рынка.'
 };
@@ -51,6 +51,13 @@ const UX={
   checkOff:lsGet('ta_ux_chk_off')==='1',
   ddOpen:false
 };
+/* после загрузки конфига: подтягиваем «уже показано» из ui_seen (localStorage окна может быть пустым) */
+function uxSeenSync(){
+  const w=uiGet('ux_why_off'),c=uiGet('ux_checks'),o=uiGet('ux_chk_off');
+  if(w&&typeof w==='object')Object.assign(UX.whyOff,w);
+  if(c&&typeof c==='object')Object.assign(UX.checks,c);
+  if(o===true||o===1)UX.checkOff=true;
+}
 function uxSyncMode(){
   document.documentElement.dataset.uxMode=UX.mode;
   document.body.classList.toggle('side-mini',UX.mini);
@@ -65,7 +72,7 @@ function uxSetMode(m){
 }
 function uxMarkCheck(k){
   if(UX.checks[k])return;
-  UX.checks[k]=1;lsSet('ta_ux_checks',JSON.stringify(UX.checks));
+  UX.checks[k]=1;lsSet('ta_ux_checks',JSON.stringify(UX.checks));uiSet('ux_checks',UX.checks);
 }
 function uxSectionOf(page){
   return UX_SECTIONS.find(s=>s.tabs.includes(page))||null;
@@ -211,11 +218,11 @@ document.addEventListener('click',e=>{
   const um=t.closest('[data-um]');if(um){uxSetMode(um.dataset.um);return}
   if(t.closest('#side-tog')){UX.mini=!UX.mini;lsSet('ta_side_mini',UX.mini?'1':'0');uxSyncMode();return}
   const sub=t.closest('#ux-sub [data-p]');if(sub){go(sub.dataset.p);return}
-  const wh=t.closest('[data-why-off]');if(wh){UX.whyOff[wh.dataset.whyOff]=1;lsSet('ta_ux_why_off',JSON.stringify(UX.whyOff));const el=wh.closest('.ux-why');if(el)el.remove();return}
+  const wh=t.closest('[data-why-off]');if(wh){UX.whyOff[wh.dataset.whyOff]=1;lsSet('ta_ux_why_off',JSON.stringify(UX.whyOff));uiSet('ux_why_off',UX.whyOff);const el=wh.closest('.ux-why');if(el)el.remove();return}
   const kb=t.closest('[data-kb-jump]');if(kb){e.stopPropagation();S.kbArticle=kb.dataset.kbJump;go('kb');return}
   if(t.closest('#ux-g-demo')&&typeof demoEnter==='function'){demoEnter(t.closest('#ux-g-demo'));return}
   if(t.closest('#ux-tour-go')){uxTourStart();return}
-  if(t.closest('#ux-chk-hide')){UX.checkOff=true;lsSet('ta_ux_chk_off','1');const c=t.closest('.ux-chk');if(c)c.remove();return}
+  if(t.closest('#ux-chk-hide')){UX.checkOff=true;lsSet('ta_ux_chk_off','1');uiSet('ux_chk_off',true);const c=t.closest('.ux-chk');if(c)c.remove();return}
   const step=t.closest('[data-ux-step]');
   if(step){const a=step.dataset.uxStep;if(a==='__srch'){if(typeof kpOpen==='function')kpOpen();else $('#srch').click()}else go(a);return}
   const task=t.closest('[data-ux-task]');

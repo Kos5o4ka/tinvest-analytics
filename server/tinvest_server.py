@@ -41,8 +41,10 @@ ALLOWED_HOSTS = {
     "rosstat.gov.ru": None, "www.rosstat.gov.ru": None,
     "www.cbr.ru": None, "cbr.ru": None,
     "smart-lab.ru": None,
+    "www.dohod.ru": "/ik/analytics/dividend/",     # история дивидендов 20+ лет (клиент: 13x9b_divhist.py)
     "raexpert.ru": None, "ratings.ru": None, "investmint.ru": None,
     "invest-brands.cdn-tinkoff.ru": None,
+    "www.tbank.ru": "/api/invest-gw/fireg-advisory/api/web/v2/etf/assets/",   # состав фондов Т-Капитала (клиент: 13s2_funds.py)
     "api.coingecko.com": "/api/v3/simple/price", "api.binance.com": "/api/v3/ticker/24hr",   # курс BTC для бегущей строки
     "t.me": "/s/",                      # публичное зеркало канала с рейтингами (только страницы /s/...)
 }
@@ -453,11 +455,13 @@ RULES = [
     ("iss.moex.com",       r"/iss/securities/[^/]+/bondization",      3 * DAY,            None),    # график выплат
     ("iss.moex.com",       r"/iss/securities",                        3 * DAY,            None),    # описание/поиск
     ("iss.moex.com",       r"/iss/emitters",                          7 * DAY,            None),    # эмитенты
+    ("iss.moex.com",       r"/iss/statistics/engines/stock/markets/index/analytics", 12 * HOUR, None),   # веса бумаг в индексах
     ("www.moex.com",       r".*",                                     DAY,                None),
     ("bo.nalog.gov.ru",    r".*",                                     7 * DAY,            None),    # ФНС: отчётность годовая
     ("rosstat.gov.ru",     r".*",                                     12 * HOUR,          None),    # недельный ИПЦ
     ("www.rosstat.gov.ru", r".*",                                     12 * HOUR,          None),
     ("smart-lab.ru",       r".*",                                     5 * DAY,            None),    # МСФО: страницы обновляются редко
+    ("www.dohod.ru",       r".*",                                     3 * DAY,            None),    # история дивидендов: прошлые годы неизменны
     ("www.cbr.ru",         r"/dkp/|/statistics/|\.pdf",               12 * HOUR,          None),    # прогнозы, календарь, опросы
     ("www.cbr.ru",         r".*",                                     6 * HOUR,           None),    # курсы, ключевая ставка
     ("cbr.ru",             r".*",                                     12 * HOUR,          None),
@@ -467,6 +471,7 @@ RULES = [
     ("t.me",               r".*",                                     12 * HOUR,          None),    # канал рейтингов
     ("investmint.ru",      r".*",                                     6 * HOUR,           None),
     ("invest-brands.cdn-tinkoff.ru", r".*",                           30 * DAY,           None),    # логотипы
+    ("www.tbank.ru",       r".*",                                     12 * HOUR,          None),    # состав фондов: обновляется раз в день
     ("api.coingecko.com",  r".*",                                     MIN,                None),    # курс BTC (бегущая строка)
     ("api.binance.com",    r".*",                                     MIN,                None),
 ]
@@ -474,7 +479,7 @@ DEFAULT_TTL = HOUR
 NOT_FOUND_TTL = 10 * MIN
 
 # Вежливость к источникам: минимальный интервал между запросами к одному хосту (запросов в секунду).
-RATES = {"iss.moex.com": 8.0, "www.moex.com": 4.0, "bo.nalog.gov.ru": 2.0, "smart-lab.ru": 1.0}
+RATES = {"iss.moex.com": 8.0, "www.moex.com": 4.0, "bo.nalog.gov.ru": 2.0, "smart-lab.ru": 1.0, "www.dohod.ru": 1.0}
 DEFAULT_RATE = 2.0
 
 # Хосты, где cookie связаны с сессией (CSRF): GET с Set-Cookie не кэшируется, cookie передаются клиенту (X-Set-Cookie).

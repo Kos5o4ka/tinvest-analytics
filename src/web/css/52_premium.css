@@ -9,7 +9,7 @@
   --sk-1:#0c1017;--sk-2:#151b26;
   --hl:inset 0 1px 0 #ffffff08;
   --elev:0 1px 2px #00000066,0 8px 24px -12px #00000080;
-  --glass:rgba(7,9,13,.72);
+  --glass:rgba(7,9,13,.72);--glass-solid:rgba(11,14,20,.97);
   --lbl:#7d889a;
   --r:16px;
 }
@@ -20,7 +20,7 @@
   --ac:#2563eb;--ac2:#1d4fd7;--ac-tx:#1d4ed8;
   --hl:inset 0 1px 0 #ffffff;
   --elev:0 1px 2px #0f172a0d,0 8px 24px -14px #0f172a26;
-  --glass:rgba(245,246,248,.78);
+  --glass:rgba(245,246,248,.78);--glass-solid:rgba(250,251,252,.97);
   --lbl:#6b7486;
 }
 

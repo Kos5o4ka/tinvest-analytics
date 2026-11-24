@@ -55,7 +55,7 @@ function pMkt(){
     series:[{n:'Ключевая ставка',c:'var(--pos)',v:r.key,w:2.4,step:true},...tms.map(t=>({n:'КБД · '+rtLab(t),c:rtColor(t),v:K(t),w:2.2}))],
     hover:i=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i)},leave:()=>{const e=$('#rstrip');if(e)e.innerHTML=stripHtml(r,i0)}});
   const dk=lastK!=null&&lastC!=null?lastK-lastC:null;
-  return`<div class="g g4">${kpi('КБД · '+rtLab(bt),pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,rtColor(bt))}${kpi('Ключевая ставка',pc1(lastC),'Банк России',null,'var(--pos)')}
+  return`<div class="g g4">${kpi('КБД · '+rtLab(bt),pc1(lastK),'доходность гособлигаций, '+r.labels[i0],null,rtColor(bt))}${kpi('Ключевая ставка',pc1(lastC),r.next_cbr&&r.next_cbr.date?calNextCbr(r).replace(/<\/?b>/g,''):'Банк России',null,'var(--pos)')}
     ${kpi('КБД '+rtLab(bt)+' − ключевая',dk!=null?ppf(dk):'—',dk==null?'':'рынок закладывает '+(dk>0?'повышение / удержание':'снижение')+' ставки',dk==null?null:dk>0?'neg':'pos')}
     ${hasSl?kpi('Наклон: 10 лет − 1 год',ppf(sl),sl<0?'кривая инвертирована':'длинные ставки выше коротких',sl<0?'pos':null):
       kpi('КБД '+rtLab(bt)+' за период',lastK!=null&&first!=null?ppf(lastK-first):'—','с '+r.labels[Math.max(0,firstI)],lastK!=null&&first!=null?(lastK-first>0?'neg':'pos'):null)}</div>

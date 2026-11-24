@@ -82,7 +82,8 @@ class Handler(BaseHTTPRequestHandler):
                 pub = {k: v for k, v in cfg.items() if k not in SECRET_KEYS}
                 pub["secret_set"] = {k: bool(cfg.get(k)) for k in SECRET_KEYS if k != "token"}
                 pub.update(token_set=bool(cfg["token"]), token_hint=("…" + cfg["token"][-4:]) if cfg["token"] else "",
-                           imports=imports_list(), data_dir=APP_DIR, version=APP_VERSION)
+                           imports=[dict(x, broker_id=broker_of_account(x)[0]) for x in imports_list()],
+                           brokers=BROKERS, data_dir=APP_DIR, version=APP_VERSION)
                 return self.send(200, pub)
             if u.path == "/api/summary":
                 return self.send(200, build_summary(cfg, acc, q.get("period", "all"), f))
@@ -172,6 +173,26 @@ class Handler(BaseHTTPRequestHandler):
                         if 0 < x <= 100:
                             tg[str(k)[:24]] = round(x, 2)
                     cfg["targets"] = tg
+                if isinstance(body.get("ui_seen"), dict):
+                    seen = dict(cfg.get("ui_seen") if isinstance(cfg.get("ui_seen"), dict) else {})
+                    for k, v in body["ui_seen"].items():
+                        k = str(k)[:40]
+                        if isinstance(v, bool) or (isinstance(v, (int, float)) and abs(v) < 1e15):
+                            seen[k] = v
+                        elif isinstance(v, str):
+                            seen[k] = v[:64]
+                        elif isinstance(v, dict):
+                            seen[k] = {str(a)[:40]: (1 if b else 0) for a, b in list(v.items())[:80]}
+                    cfg["ui_seen"] = dict(list(seen.items())[:40])
+                if isinstance(body.get("broker_tariffs"), dict):
+                    bt = dict(cfg.get("broker_tariffs") if isinstance(cfg.get("broker_tariffs"), dict) else {})
+                    for k, v in list(body["broker_tariffs"].items())[:200]:
+                        k = str(k)[:64]
+                        if not v:
+                            bt.pop(k, None)
+                        elif isinstance(v, str) and re.fullmatch(r"[a-z0-9_]{1,40}", v):
+                            bt[k] = v
+                    cfg["broker_tariffs"] = bt
                 if body.get("keyrate_mode") in KR_MODES:
                     cfg["keyrate_mode"] = body["keyrate_mode"]
                 if "notify_days" in body:
@@ -224,7 +245,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"ok": True})
             if path == "/api/import/preview":
                 raw = base64.b64decode(body.get("data") or "")
-                return self.send(200, import_preview_any(body.get("filename") or "", raw))
+                pv = import_preview_any(body.get("filename") or "", raw)
+                bid = broker_detect_import(body.get("filename") or "", raw, pv.get("format") or "")
+                pv["broker_id"], pv["broker_name"] = bid, BROKERS[bid]
+                return self.send(200, pv)
             if path == "/api/import/parse":
                 raw = base64.b64decode(body.get("data") or "")
                 ops, skipped, _fmt, _meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
@@ -250,6 +274,7 @@ class Handler(BaseHTTPRequestHandler):
                           "broker": (body.get("broker") or "").strip(), "created": utc_now_str(), "files": []}
                     if fmt:
                         ex["format"] = fmt
+                    ex["broker_id"] = broker_detect_import(body.get("filename") or "", raw, fmt, ex["broker"], ex["name"])
                     lst.append(ex)
                 finfo = {"name": body.get("filename") or "", "count": len(ops), "at": utc_now_str()}
                 if meta:
@@ -268,6 +293,18 @@ class Handler(BaseHTTPRequestHandler):
                 found = sum(1 for v in ids.values() if v.get("uid"))
                 return self.send(200, {"ok": True, "id": acc_id, "count": finfo["count"], "total": len(ops), "skipped": skipped,
                                        "resolved": found, "idents": len(ids)})
+            if path == "/api/import/broker":
+                bid = str(body.get("broker_id") or "")
+                if bid not in BROKERS:
+                    raise ApiError("Неизвестный брокер.", 400)
+                lst = imports_list()
+                ex = next((x for x in lst if x["id"] == body.get("id")), None)
+                if ex is None:
+                    raise ApiError("Импортированный счёт не найден.", 404)
+                ex["broker_id"] = bid
+                store().put("imports", lst)
+                mem_clear()
+                return self.send(200, {"ok": True, "broker_id": bid})
             if path == "/api/import/delete":
                 lst = [x for x in imports_list() if x["id"] != body.get("id")]
                 store().put("imports", lst)

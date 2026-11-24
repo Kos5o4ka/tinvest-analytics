@@ -35,7 +35,7 @@ function pPm(){
       ?`<div class="msg err" style="margin-bottom:12px"><b>Обнаружен эффект диспозиции (×${f2(tr.disposition_ratio)}):</b> убыточные сделки вы держите в среднем <b>${f2(tr.avg_hold_loss)} дн.</b>, а прибыльные фиксируете через <b>${f2(tr.avg_hold_win)} дн.</b></div>`
       :(tr.disposition_ratio!=null?`<div class="bc-verdict" style="margin-bottom:12px">Дисциплина удержания: прибыльные сделки держатся в среднем <b>${f2(tr.avg_hold_win)} дн.</b>, убыточные — <b>${f2(tr.avg_hold_loss)} дн.</b> (коэффициент ${f2(tr.disposition_ratio)}).</div>`:'');
     const tTbl=(list,title)=>list&&list.length?`<div class="card"><h2>${title}</h2><div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Дата продажи</th><th>Срок, дн.</th><th>Результат, ₽</th><th>%</th></tr></thead><tbody>`+
-      list.map(x=>`<tr><td class="l"><b>${esc(x.name)}</b><br><small class="mu">${esc(x.ticker)}</small></td><td class="num">${ddm(x.sdate)}</td><td class="num">${x.hold_days!=null?Math.round(x.hold_days):'—'}</td>
+      list.map(x=>`<tr${stkAttrIf(x.ticker)}><td class="l"><b>${esc(x.name)}</b><br><small class="mu">${esc(x.ticker)}</small></td><td class="num">${ddm(x.sdate)}</td><td class="num">${x.hold_days!=null?Math.round(x.hold_days):'—'}</td>
         <td class="num ${cls(x.result)}"><b>${SM(x.result)}</b></td><td class="num ${cls(x.pct)}">${x.pct!=null?pct(x.pct,1):'—'}</td></tr>`).join('')+`</tbody></table></div></div>`:'';
     trHtml=`<div class="card"><h2>Разбор закрытых сделок (Trade Post-Mortem, FIFO)<span class="sp">всего закрытых продаж: ${tr.n}</span></h2>
       ${dispBanner}
