@@ -261,13 +261,29 @@ SIGN = {"BUY": -1, "SELL": 1, "COUPON": 1, "DIVIDEND": 1, "BOND_REPAYMENT": 1, "
         "BROKER_FEE": -1, "SERVICE_FEE": -1, "MARGIN_FEE": -1, "INPUT": 1, "OUTPUT": -1}
 
 
+def _imp_nkd_included(amount, qty, price, nkd):
+    """True, если сумма сделки уже включает НКД (amount ≈ qty*price*M + nkd при M для цены в % или руб.)."""
+    if not (amount and qty and price and nkd):
+        return False
+    a, base = abs(amount), abs(qty) * abs(price)
+    c = a - abs(nkd)
+    if c <= 0 or base <= 0:
+        return False
+    tol = max(0.5, 0.002 * a)
+    for m in (1.0, 10.0, 100.0, 0.1, 2.0, 5.0):
+        ec, ea = abs(c - base * m), abs(a - base * m)
+        if ec <= tol and ec * 3 < ea:
+            return True
+    return False
+
+
 def rows_to_ops(rows, mapping, header=None):
     extra_comm = [i for i, h in enumerate(header or []) if "комисс" in norm_head(h) and i != mapping.get("commission")]
     def cell(row, role):
         i = mapping.get(role)
         return row[i] if i is not None and i < len(row) else ""
 
-    ops, skipped = [], 0
+    ops, skipped, seen = [], 0, defaultdict(int)
     for row in rows:
         dt = parse_date(cell(row, "date"))
         if not dt:
@@ -302,7 +318,7 @@ def rows_to_ops(rows, mapping, header=None):
             continue
         if amount is None and qty and price is not None:
             amount = abs(qty) * price
-        if amount is not None and nkd and kind in ("BUY", "SELL"):
+        if amount is not None and nkd and kind in ("BUY", "SELL") and not _imp_nkd_included(amount, qty, price, nkd):
             amount = abs(amount) + abs(nkd)  # в отчётах НКД обычно указан отдельно от суммы сделки
         if not amount and kind not in ("BUY", "SELL"):
             skipped += 1
@@ -310,7 +326,12 @@ def rows_to_ops(rows, mapping, header=None):
         amount = abs(amount or 0.0) * SIGN.get(kind, 1)
         cur = norm_cur(cell(row, "currency"))
         ident = isin or ticker or (name if kind in ("BUY", "SELL", "COUPON", "DIVIDEND", "BOND_REPAYMENT", "BOND_REPAYMENT_FULL", "DIVIDEND_TAX", "BOND_TAX") else "")
-        o = {"id": "imp-" + uuid.uuid4().hex[:12], "date": dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "type": "OPERATION_TYPE_" + kind,
+        dt_iso = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        sig = (dt_iso, kind, ident, round(amount, 4), round(abs(qty or 0.0), 6), cur)
+        occ = seen[sig]
+        seen[sig] = occ + 1
+        op_id = "imp-" + hashlib.sha1(("%s|%d" % (sig, occ)).encode("utf-8")).hexdigest()[:12]
+        o = {"id": op_id, "date": dt_iso, "type": "OPERATION_TYPE_" + kind,
              "payment": to_money(round(amount, 9), cur), "name": name or ticker or isin, "_ident": ident}
         if qty:
             q = abs(qty)
@@ -319,7 +340,7 @@ def rows_to_ops(rows, mapping, header=None):
             o["price"] = to_money(abs(price), cur)
         ops.append(o)
         if comm:
-            ops.append({"id": "imp-" + uuid.uuid4().hex[:12], "date": o["date"], "type": "OPERATION_TYPE_BROKER_FEE",
+            ops.append({"id": op_id + "-f", "date": o["date"], "type": "OPERATION_TYPE_BROKER_FEE",
                         "payment": to_money(-abs(comm), cur), "name": "Комиссия: " + (o["name"] or ""), "_ident": ident})
     ops.sort(key=lambda o: o["date"])
     return ops, skipped
