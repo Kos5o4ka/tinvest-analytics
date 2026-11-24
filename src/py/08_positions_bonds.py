@@ -235,7 +235,7 @@ def portfolio_irr(items, today):
         for d, c, p in ex["flows"]:
             if d > today:
                 gross[d] += (c + p) * k
-        for d, a in net_flows(ex["flows"], today, ex["basis"]):
+        for d, a in net_flows(ex["flows"], today, ex["basis"], ex.get("aci", 0.0)):
             net[d] += a * k
     res = {"irr": None, "irr_tax": None, "value": dirty, "count": len(items)}
     if dirty > 0 and gross:
@@ -286,7 +286,7 @@ def bond_exact(client, r, b, today, rates):
         return None                      # график MOEX не сходится с данными брокера
     if y is None:
         return None
-    yt = cf_ytm(dirty, flows, today, tax=True, basis=price)
+    yt = cf_ytm(dirty, flows, today, tax=True, basis=price, aci=aci)
     mac, mod, conv = cf_risk(flows, today, y)
     st = stress(price / face * 100.0, flows, today, face, aci, STRESS_DY, y)
     live = [o for o in offs if o["status"] != "cancelled" and today < o["date"] < yk["maturity"]]
@@ -300,7 +300,7 @@ def bond_exact(client, r, b, today, rates):
             "call_dates": sorted({o["date"] for o in live if o["kind"] == "call"}),
             "unk_date": min([o["date"] for o in live if o["kind"] == "unknown"] or [None], key=lambda x: x or "9"),
             "stress_pct": {dy: (p / 100.0 * face + aci) / dirty * 100 - 100 for dy, p in st.items()},
-            "cf_source": "moex", "est_coupons": len(est), "est_detail": est, "bz": bz, "flows": flows, "basis": price, "dirty": dirty}
+            "cf_source": "moex", "est_coupons": len(est), "est_detail": est, "bz": bz, "flows": flows, "basis": price, "dirty": dirty, "aci": aci}
 
 
 def bond_price_face(r, b, rates):

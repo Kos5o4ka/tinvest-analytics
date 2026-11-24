@@ -42,6 +42,17 @@ class Ytm(unittest.TestCase):
         self.assertAlmostEqual(yt, 0.087, places=5)       # купоны 100 -> 87, налога на погашении нет
         self.assertLess(yt, y)
 
+    def test_tax_respects_aci(self):
+        fl = [("2026-12-24", 50.0, 1000.0)]
+        y = M.cf_ytm(1045.0, fl, "2026-11-24")
+        yt = M.cf_ytm(1045.0, fl, "2026-11-24", tax=True, basis=1000.0, aci=45.0)
+        self.assertIsNotNone(yt)
+        self.assertGreater(yt, 0.04)
+        self.assertLess(yt, y)
+        self.assertAlmostEqual(yt, (1049.35 / 1045.0) ** (365.0 / 30.0) - 1, places=5)
+        nf = M.net_flows(fl, "2026-11-24", basis=1000.0, aci=45.0)
+        self.assertAlmostEqual(nf[0][1], 1049.35, places=6)
+
 
 class Risk(unittest.TestCase):
     def test_duration_formula(self):
