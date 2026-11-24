@@ -75,9 +75,10 @@ def _ld_empty_dir(path):
 
 def _ld_protected_keys():
     """Ключи таблицы kv с вашими данными или накопленной историей: очистка кэша их не трогает."""
-    names = ("WATCH_KEY", "NOTES_KEY", "TG_SENT_KEY", "TG_STATE_KEY", "TAX_SETTINGS_KEY", "SIG_HIST_KEY", "RT_LOG_KEY",
-             "MKT_HIST_KEY", "MKT_HIST2_KEY", "MON_SNAP_KEY")
-    keys = {"backup_status"}
+    names = ("WATCH_KEY", "NOTES_KEY", "TG_SENT_KEY", "TG_STATE_KEY", "TG_SRV_KEY", "TAX_SETTINGS_KEY",
+             "SIG_HIST_KEY", "RT_LOG_KEY", "MKT_HIST_KEY", "MKT_HIST2_KEY", "MON_SNAP_KEY",
+             "PRI_SNAP_KEY", "BF_KEY", "FNG_SP_KEY", "FNG_FL_KEY", "_WI_KEY")
+    keys = {"backup_status", "weekly_cpi_notes_v1"}
     for n in names:
         v = globals().get(n)
         if isinstance(v, str):

@@ -1,7 +1,10 @@
 """Тесты раздела «Данные на компьютере»: размер и состав папки, очистка кэша, полное удаление. Без сети."""
+import http.client
+import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -72,6 +75,43 @@ class LocalData(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(M.APP_DIR, "cache")), [])
         self.assertTrue(os.path.exists(os.path.join(M.APP_DIR, "app", "keep.py")))
         self.assertTrue(os.path.exists(M.CONFIG_PATH))
+
+    def test_api_cache_clear_preserves_user_data(self):
+        st = M.store()
+        st.put("imports", [{"id": "imp-1"}])
+        st.put(M.WATCH_KEY, [{"isin": "RU000A107HG1", "added": "2026-11-24"}])
+        st.put(M.NOTES_KEY, [{"id": "n1", "isin": "RU000A107HG1", "date": "2026-11-24", "text": "keep"}])
+        st.put(M.TAX_SETTINGS_KEY, {"ndfl_rate": 15, "iis": {}, "loss_carry": {}})
+        st.put(M._WI_KEY, {"points": []})
+        st.put("some_ephemeral_cache", {"x": 1})
+        st.write("INSERT OR REPLACE INTO ops(acc, k, d, v) VALUES('imp-1','k1','2024-01-01','{}')")
+        st.write("INSERT OR REPLACE INTO ops(acc, k, d, v) VALUES('real-acc','k2','2024-01-01','{}')")
+
+        srv = M.LocalHTTPServer(("127.0.0.1", 0), M.Handler)
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+        try:
+            port = srv.server_address[1]
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("POST", "/api/cache/clear", body=b"{}",
+                      headers={"Host": "127.0.0.1:%d" % port, "Content-Type": "application/json"})
+            r = c.getresponse()
+            body = json.loads(r.read() or b"{}")
+            c.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        self.assertEqual(r.status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertIsNone(st.get("some_ephemeral_cache"))
+        self.assertEqual(st.get("imports"), [{"id": "imp-1"}])
+        self.assertEqual(st.get(M.WATCH_KEY), [{"isin": "RU000A107HG1", "added": "2026-11-24"}])
+        self.assertEqual(st.get(M.NOTES_KEY), [{"id": "n1", "isin": "RU000A107HG1", "date": "2026-11-24", "text": "keep"}])
+        self.assertEqual(st.get(M.TAX_SETTINGS_KEY), {"ndfl_rate": 15, "iis": {}, "loss_carry": {}})
+        self.assertEqual(st.get(M._WI_KEY), {"points": []})
+        # операции Т-Инвестиций сброшены для перезагрузки из API, импортированные сохранены
+        accs = [x[0] for x in st.conn().execute("SELECT acc FROM ops").fetchall()]
+        self.assertEqual(accs, ["imp-1"])
 
     def test_delete_all_keeps_app(self):
         base = tempfile.mkdtemp(prefix="ld_wipe_")

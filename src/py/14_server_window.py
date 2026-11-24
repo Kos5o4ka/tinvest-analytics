@@ -251,8 +251,12 @@ class Handler(BaseHTTPRequestHandler):
                     tcli = TInvest(tcfg)
                 return self.send(200, {"ok": True, "accounts": len(tcli.accounts())})
             if path == "/api/cache/clear":
-                store().wipe_cache()
-                shutil.rmtree(LOGO_DIR, ignore_errors=True)
+                clear_local_cache()
+                st = store()
+                with st.wlock:
+                    c = st.conn()
+                    c.execute("DELETE FROM ops WHERE acc NOT LIKE 'imp-%'")
+                    c.commit()
                 mem_clear()
                 return self.send(200, {"ok": True})
             if path == "/api/import/preview":

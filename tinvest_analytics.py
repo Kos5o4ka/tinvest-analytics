@@ -521,10 +521,15 @@ class Store:
                 pass
         return {"deleted": n, "vacuum": vac}
 
-    def wipe_cache(self):
+    def wipe_cache(self, keep_keys=None):
+        fn = globals().get("_ld_protected_keys")
+        keys = sorted(keep_keys if keep_keys is not None else (fn() if fn else ()))
         with self.wlock:
             c = self.conn()
-            c.execute("DELETE FROM kv WHERE k NOT LIKE 'imports%'")
+            if keys:
+                c.execute("DELETE FROM kv WHERE k NOT LIKE 'imports%%' AND k NOT IN (%s)" % ",".join("?" * len(keys)), keys)
+            else:
+                c.execute("DELETE FROM kv WHERE k NOT LIKE 'imports%'")
             c.execute("DELETE FROM ops WHERE acc NOT LIKE 'imp-%'")
             c.execute("DELETE FROM candles")
             c.commit()
@@ -17719,9 +17724,10 @@ def _ld_empty_dir(path):
 
 def _ld_protected_keys():
     """Ключи таблицы kv с вашими данными или накопленной историей: очистка кэша их не трогает."""
-    names = ("WATCH_KEY", "NOTES_KEY", "TG_SENT_KEY", "TG_STATE_KEY", "TAX_SETTINGS_KEY", "SIG_HIST_KEY", "RT_LOG_KEY",
-             "MKT_HIST_KEY", "MKT_HIST2_KEY", "MON_SNAP_KEY")
-    keys = {"backup_status"}
+    names = ("WATCH_KEY", "NOTES_KEY", "TG_SENT_KEY", "TG_STATE_KEY", "TG_SRV_KEY", "TAX_SETTINGS_KEY",
+             "SIG_HIST_KEY", "RT_LOG_KEY", "MKT_HIST_KEY", "MKT_HIST2_KEY", "MON_SNAP_KEY",
+             "PRI_SNAP_KEY", "BF_KEY", "FNG_SP_KEY", "FNG_FL_KEY", "_WI_KEY")
+    keys = {"backup_status", "weekly_cpi_notes_v1"}
     for n in names:
         v = globals().get(n)
         if isinstance(v, str):
@@ -25767,8 +25773,12 @@ class Handler(BaseHTTPRequestHandler):
                     tcli = TInvest(tcfg)
                 return self.send(200, {"ok": True, "accounts": len(tcli.accounts())})
             if path == "/api/cache/clear":
-                store().wipe_cache()
-                shutil.rmtree(LOGO_DIR, ignore_errors=True)
+                clear_local_cache()
+                st = store()
+                with st.wlock:
+                    c = st.conn()
+                    c.execute("DELETE FROM ops WHERE acc NOT LIKE 'imp-%'")
+                    c.commit()
                 mem_clear()
                 return self.send(200, {"ok": True})
             if path == "/api/import/preview":

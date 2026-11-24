@@ -132,10 +132,15 @@ class Store:
                 pass
         return {"deleted": n, "vacuum": vac}
 
-    def wipe_cache(self):
+    def wipe_cache(self, keep_keys=None):
+        fn = globals().get("_ld_protected_keys")
+        keys = sorted(keep_keys if keep_keys is not None else (fn() if fn else ()))
         with self.wlock:
             c = self.conn()
-            c.execute("DELETE FROM kv WHERE k NOT LIKE 'imports%'")
+            if keys:
+                c.execute("DELETE FROM kv WHERE k NOT LIKE 'imports%%' AND k NOT IN (%s)" % ",".join("?" * len(keys)), keys)
+            else:
+                c.execute("DELETE FROM kv WHERE k NOT LIKE 'imports%'")
             c.execute("DELETE FROM ops WHERE acc NOT LIKE 'imp-%'")
             c.execute("DELETE FROM candles")
             c.commit()
