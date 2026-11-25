@@ -1,8 +1,59 @@
 /* ── Выплаты ── */
+const PAY_UI={tab:'plan'};
+const PAY_J={st:'idle',data:null,err:'',acc:null,tries:0};
+
+function pjLoad(){
+  if(PAY_J.st==='load')return;
+  const acc=S.account;PAY_J.st='load';PAY_J.acc=acc;PAY_J.err='';
+  api('/api/pay/journal?'+new URLSearchParams({account:acc})).then(j=>{
+    if(S.account!==acc)return;
+    if(j&&j.stale&&PAY_J.tries<10){PAY_J.tries++;PAY_J.data=j;PAY_J.st='ok';setTimeout(()=>{if(S.account===acc&&PAY_UI.tab==='journal'){PAY_J.st='idle';pjLoad()}},4000)}
+    else{PAY_J.data=j;PAY_J.st='ok';PAY_J.tries=0}
+    if(S.page==='pay')renderSoon();
+  }).catch(e=>{if(S.account!==acc)return;PAY_J.st='err';PAY_J.err=e.message||'Не удалось загрузить журнал выплат';if(S.page==='pay')renderSoon()});
+}
+
+function pjRender(){
+  if(PAY_J.acc!==null&&PAY_J.acc!==S.account&&PAY_J.st!=='load'){PAY_J.st='idle';PAY_J.data=null}
+  if(PAY_J.st==='idle')pjLoad();
+  if(PAY_J.st==='load'||PAY_J.st==='idle')return`<div class="card">${waitBox('Собираю фактические выплаты и считаю YOC…')}</div>`;
+  if(PAY_J.st==='err')return`<div class="msg err">${esc(PAY_J.err)} <button class="btn ghost pj-retry">Повторить</button></div>`;
+  const d=PAY_J.data;
+  if(!d||d.error)return`<div class="msg err">${esc((d&&d.error)||'Нет данных')} <button class="btn ghost pj-retry">Повторить</button></div>`;
+  const ms=(d.months||[]).slice(-36),secs=d.securities||[],ys=d.years||[];
+  if(ms.length){
+    const labels=ms.map(m=>mlabel(m.ym));
+    const tips=ms.map(m=>{const[y,mm]=m.ym.split('-');return MONF[+mm-1]+' '+y});
+    chart('c-pj-m',bars,{h:250,labels,tipLabels:tips,stack:true,total:true,skipZero:true,series:[
+      {n:'Купоны',c:S1,v:ms.map(m=>m.coupons_rub)},
+      {n:'Дивиденды',c:S3,v:ms.map(m=>m.dividends_rub)}
+    ],empty:'Фактических выплат не найдено'});
+  }
+  const yocStr=v=>v==null||isNaN(v)?'—':(+v).toFixed(2).replace('.',',')+' %';
+  const yrsHtml=ys.length?`<div class="card"><h2>Итоги по годам</h2><div class="tbl"><table><thead><tr><th class="l">Год</th><th>Выплат</th><th>Купоны, ₽</th><th>Дивиденды, ₽</th><th>Всего, ₽</th></tr></thead><tbody>${ys.map(y=>`<tr><td class="l"><b>${esc(y.year)}</b></td><td class="num">${y.count}</td><td class="num">${M(y.coupons_rub)}</td><td class="num">${M(y.dividends_rub)}</td><td class="num pos"><b>${M(y.total_rub)}</b></td></tr>`).join('')}</tbody></table></div></div>`:'';
+  const secRows=secs.map(s=>`<tr><td class="l">${logo(s,26)} <b>${esc(s.name)}</b>${s.ticker?` <small class="mu">${esc(s.ticker)}</small>`:''}</td><td class="l">${esc(s.type_ru||s.type)}</td><td class="num">${s.qty?s.qty:'—'}</td><td class="num">${M(s.coupons_rub)}</td><td class="num">${M(s.dividends_rub)}</td><td class="num"><b>${M(s.total_rub)}</b></td><td class="num">${s.cost_rub>0?M(s.cost_rub):'—'}</td><td class="num ${s.yoc_pct!=null&&s.yoc_pct>0?'pos':''}">${yocStr(s.yoc_pct)}</td><td class="num">${yocStr(s.yoc_total_pct)}</td></tr>`).join('');
+  return`<div class="g g4">${kpi('Всего получено',M(d.total_rub),'купоны и дивиденды за всё время','pos',S3)}${kpi('За последние 12 мес.',M(d.total_12m_rub),'фактические выплаты',null,S1)}
+    ${kpi('Купоны (факт)',M(d.coupons_rub),'по всем операциям',null,S1)}${kpi('YOC портфеля (12 мес.)',yocStr(d.portfolio_yoc_pct),'к FIFO-стоимости '+M(d.cost_rub),d.portfolio_yoc_pct?'pos':null,S3)}</div>
+    <div class="card"><h2>Фактические выплаты по месяцам, ₽<span class="sp">${ms.length?'последние '+ms.length+' мес.':''}</span></h2>${ms.length?'<div id="c-pj-m" class="chart"></div>':'<p class="note" style="margin:0">Операций по купонам и дивидендам пока нет.</p>'}</div>
+    ${yrsHtml}
+    <div class="card"><h2>Доходность на цену покупки (YOC) по бумагам<span class="sp">FIFO-база · 12 мес. и накопленно</span></h2>
+      ${secs.length?`<div class="tbl"><table><thead><tr><th class="l">Бумага</th><th class="l">Тип</th><th>Кол-во</th><th>Купоны</th><th>Дивиденды</th><th>Всего</th><th>FIFO-стоимость</th><th>YOC 12 мес.</th><th>Накопл. YOC</th></tr></thead><tbody>${secRows}</tbody></table></div>`:'<p class="note" style="margin:0">Нет данных по бумагам с выплатами или открытыми позициями.</p>'}
+    </div>
+    <p class="note">${(d.notes||[]).map(esc).join(' ')}</p>`;
+}
+
+function payTabs(){
+  const tabs=[['plan','План выплат'],['journal','Факт и YOC'],['cf36','Прогноз 36 мес.']];
+  return`<div class="row" style="margin-bottom:12px"><div class="seg" id="pay-tabs">${tabs.map(([k,t])=>`<button data-ptab="${k}" class="${PAY_UI.tab===k?'on':''}">${t}</button>`).join('')}</div></div>`;
+}
+
 function pPay(){
+  const tab=PAY_UI.tab;
+  if(tab==='journal')return payTabs()+pjRender();
+  if(tab==='cf36'){CF36.open=true;return payTabs()+cf36Section()}
   const b=S.bonds;
-  if(!b)return`<div class="card">${waitBox('Собираю графики купонов и объявленные дивиденды…')}</div>`;
-  if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
+  if(!b)return payTabs()+`<div class="card">${waitBox('Собираю графики купонов и объявленные дивиденды…')}</div>`;
+  if(b.error)return payTabs()+`<div class="msg err">${esc(b.error)}</div>`;
   const ps=b.payments,now=new Date(),in30=localIso(new Date(now.getTime()+30*864e5));
   const sum=f=>ps.filter(f).reduce((a,x)=>a+x.amount,0);
   const pm=payMonths(ps,12);
@@ -13,12 +64,11 @@ function pPay(){
   const list=Object.keys(byM).sort().map(m=>{const[y,mm]=m.split('-');const t=byM[m].reduce((a,x)=>a+x.amount,0);
     return`<div class="card"><h2>${MONF[+mm-1]} ${y}<span class="sp num" style="color:var(--pos);font-size:13px;font-weight:600">${M(t)}</span></h2><div class="li">`+
     byM[m].map(p=>`<div class="it"${p.kind==='dividend'&&p.ticker?stkAttr(p.ticker,'div'):''}>${logo(p,34)}<div><b>${esc(p.name)}</b><small>${ddm(p.date)} · <span style="color:${KIND[p.kind][1]}">${KIND[p.kind][0]}</span>${p.est==='forecast'?' · прогноз по ключевой ставке':p.est?' · оценка':''}</small></div><div class="rv num">${M(p.amount)}</div></div>`).join('')+`</div></div>`}).join('');
-  return`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(sum(()=>1)),'купоны, дивиденды, амортизации и погашения','pos',S3)}
+  return payTabs()+`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(sum(()=>1)),'купоны, дивиденды, амортизации и погашения','pos',S3)}
     ${kpi('Купоны',M(sum(p=>p.kind==='coupon')),ps.filter(p=>p.kind==='coupon').length+' выплат',null,S1)}${kpi('Дивиденды',M(sum(p=>p.kind==='dividend')),'только объявленные, до налога',null,S3)}</div>
     <div class="card"><h2>Календарь выплат по месяцам, ₽</h2><div id="c-pay" class="chart"></div></div>
     <div class="card"><h2>Выплаты по дням<span class="sp"><span class="seg" id="pdays">${[[30,'30 дней'],[90,'90 дней'],[365,'Год']].map(([d,t])=>`<button data-d="${d}" class="${d===S.payDays?'on':''}">${t}</button>`).join('')}</span></span></h2><div id="c-days" class="chart"></div></div>
     ${list?`<div class="g g2">${list}</div>`:emptyHint('В ближайший год выплат не ожидается: в портфеле нет облигаций с купонами и акций с объявленными дивидендами. Подобрать облигации с купоном можно в скринере.',[['scr','Подобрать облигации',1],['bonds','Мои облигации']])}
-    ${cf36Section()}
     <p class="note">Купоны — по графику эмитента и текущему количеству бумаг (до НДФЛ). Для флоатеров ещё не объявленные купоны — прогноз по ключевой ставке ЦБ плюс спред эмитента (пометка «прогноз по ключевой ставке»). Амортизации — частичное погашение номинала по графику Мосбиржи. Дивиденды — только уже объявленные, сумма до налога.</p>`;
 }
 
@@ -127,6 +177,8 @@ function cf36Section(){
 }
 document.addEventListener('click',e=>{
   const t=e.target;if(!t.closest)return;
+  const pt=t.closest('#pay-tabs [data-ptab]');if(pt){PAY_UI.tab=pt.dataset.ptab;render();return}
+  if(t.closest('.pj-retry')){PAY_J.st='idle';PAY_J.tries=0;render();return}
   if(t.closest('.cf36-tgl')){CF36.open=!CF36.open;render();return}
   if(t.closest('.cf36-retry')){CF36.st='idle';CF36.tries=0;render();return}
   const b=t.closest('.cf36-rate [data-r]');if(b&&!b.disabled){CF36.rate=b.dataset.r;render()}

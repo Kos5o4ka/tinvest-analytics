@@ -120,5 +120,74 @@ class Report(unittest.TestCase):
             M.stock_dividends = saved
 
 
+class PayJournal(unittest.TestCase):
+    def test_build_pay_journal_fifo_yoc_and_fx(self):
+        today = date(2026, 11, 25)
+        d_old = "2024-06-15T10:00:00Z"
+        d_buy = "2025-01-10T10:00:00Z"
+        d_rec1 = "2026-06-15T10:00:00Z"
+        d_rec2 = "2026-10-20T10:00:00Z"
+        ops = [
+            {"id": "1", "date": d_buy, "type": "OPERATION_TYPE_BUY", "instrumentUid": "b1",
+             "quantityDone": 10, "payment": {"currency": "rub", "units": -10000, "nano": 0}},
+            {"id": "2", "date": d_old, "type": "OPERATION_TYPE_COUPON", "instrumentUid": "b1",
+             "payment": {"currency": "rub", "units": 500, "nano": 0}},
+            {"id": "3", "date": d_rec1, "type": "OPERATION_TYPE_COUPON", "instrumentUid": "b1",
+             "payment": {"currency": "rub", "units": 1200, "nano": 0}},
+            {"id": "4", "date": d_buy, "type": "OPERATION_TYPE_BUY", "instrumentUid": "s1",
+             "quantityDone": 5, "payment": {"currency": "usd", "units": -100, "nano": 0}},
+            {"id": "5", "date": d_rec2, "type": "OPERATION_TYPE_DIVIDEND", "instrumentUid": "s1",
+             "payment": {"currency": "usd", "units": 10, "nano": 0}},
+        ]
+        names = {
+            "b1": {"uid": "b1", "name": "ОФЗ 26238", "ticker": "SU26238RMFS4", "type": "bond", "cur": "rub"},
+            "s1": {"uid": "s1", "name": "Тест USD", "ticker": "TUSD", "type": "share", "cur": "usd"},
+        }
+        saved = M.tax_cbr_rate
+        M.tax_cbr_rate = lambda cur, iso: 90.0 if (cur or "").lower() == "usd" else 1.0
+        try:
+            res = M.build_pay_journal(ops, names, today=today)
+        finally:
+            M.tax_cbr_rate = saved
+
+        self.assertTrue(res["ok"])
+        # b1: 500 + 1200 = 1700 RUB; s1: 10 * 90 = 900 RUB => 2600 RUB
+        self.assertAlmostEqual(res["coupons_rub"], 1700.0, places=2)
+        self.assertAlmostEqual(res["dividends_rub"], 900.0, places=2)
+        self.assertAlmostEqual(res["total_rub"], 2600.0, places=2)
+        self.assertAlmostEqual(res["total_12m_rub"], 2100.0, places=2)
+        # FIFO cost: b1 = 10000 RUB, s1 = 100 * 90 = 9000 RUB => 19000 RUB
+        self.assertAlmostEqual(res["cost_rub"], 19000.0, places=2)
+        self.assertAlmostEqual(res["portfolio_yoc_pct"], round(2100.0 / 19000.0 * 100.0, 2), places=2)
+        secs = {s["uid"]: s for s in res["securities"]}
+        self.assertAlmostEqual(secs["b1"]["yoc_pct"], 12.0, places=2)
+        self.assertAlmostEqual(secs["b1"]["yoc_total_pct"], 17.0, places=2)
+        self.assertAlmostEqual(secs["s1"]["yoc_pct"], 10.0, places=2)
+        self.assertEqual([y["year"] for y in res["years"]], ["2024", "2026"])
+        self.assertEqual(len(res["months"]), 3)
+
+    def test_pay_journal_payload_offline(self):
+        names_to_save = ("selection", "instruments", "TInvest", "tax_cbr_rate")
+        saved = {k: getattr(M, k) for k in names_to_save}
+        ops = [
+            {"id": "b1", "date": "2026-01-15T10:00:00Z", "type": "OPERATION_TYPE_BUY", "instrumentUid": "u1",
+             "quantityDone": 2, "payment": {"currency": "rub", "units": -2000, "nano": 0}},
+            {"id": "c1", "date": date.today().isoformat() + "T10:00:00Z", "type": "OPERATION_TYPE_COUPON",
+             "instrumentUid": "u1", "payment": {"currency": "rub", "units": 200, "nano": 0}},
+        ]
+        M.selection = lambda cfg, acc, force=False: ([], [], [{"port": None, "ops": ops}])
+        M.instruments = lambda client, keys: {"u1": {"uid": "u1", "name": "Бонд 1", "ticker": "B1", "type": "bond"}}
+        M.TInvest = lambda cfg: object()
+        M.tax_cbr_rate = lambda cur, iso: 1.0
+        try:
+            res = M.pay_journal_payload({"token": "t", "sandbox": False}, "all", True)
+        finally:
+            for k, v in saved.items():
+                setattr(M, k, v)
+        self.assertTrue(res["ok"])
+        self.assertAlmostEqual(res["coupons_rub"], 200.0, places=2)
+        self.assertAlmostEqual(res["securities"][0]["yoc_pct"], 10.0, places=2)
+
+
 if __name__ == "__main__":
     unittest.main()
