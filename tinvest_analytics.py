@@ -22202,22 +22202,201 @@ def cf36_rates():
             "key": kr, "src": src_kr}
 
 
+def cf36_keyrate_trajectories(base_rate=None, n=CF36_MONTHS):
+    """Три траектории ключевой ставки ЦБ на n месяцев (% годовых): стабильная, снижение, повышение."""
+    fallback = False
+    if base_rate is None:
+        try:
+            i = keyrate_brief()
+            if i and i.get("key_rate") is not None:
+                base_rate = float(i["key_rate"])
+        except Exception:  # noqa: BLE001
+            base_rate = None
+    if base_rate is None:
+        try:
+            ser = key_rate_series()
+            if ser:
+                base_rate = float(ser[-1][1])
+        except Exception:  # noqa: BLE001
+            base_rate = None
+    if base_rate is None:
+        base_rate = 16.0
+        fallback = True
+    base = float(base_rate)
+    low = max(4.0, base - 6.0)
+    high = min(30.0, base + 4.0)
+    denom = max(1, n - 1)
+    hike_m = max(1, min(18, denom))
+    flat = [round(base, 2) for _ in range(n)]
+    cut = [round(base + (low - base) * (i / denom), 2) for i in range(n)]
+    hike = [round(base + (high - base) * min(1.0, i / hike_m), 2) for i in range(n)]
+    return {
+        "base": round(base, 2),
+        "fallback": fallback,
+        "items": {
+            "flat": {"id": "flat", "name": "Стабильная КС", "desc": "%.2f %% весь срок" % base, "rates": flat},
+            "cut": {"id": "cut", "name": "Снижение КС", "desc": "плавно до %.2f %%" % low, "rates": cut},
+            "hike": {"id": "hike", "name": "Повышение КС", "desc": "рост до %.2f %%" % high, "rates": hike},
+        },
+    }
+
+
+def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
+    """Реальные пут- и колл-оферты по облигациям портфеля в окне 36 месяцев (MOEX bondization/options + отчёт брокера)."""
+    t = today or date.today()
+    ti = t.isoformat()
+    horizon = (t + timedelta(days=cf36_horizon_days(t, n))).isoformat()
+    fx_rates = fx_rates or {}
+    out = []
+    for b in rep_bonds or []:
+        qty = float(b.get("qty") or 0.0)
+        if qty <= 0:
+            continue
+        isin = (b.get("isin") or "").strip().upper()
+        nominal = float(b.get("nominal") or 1000.0)
+        fc = (b.get("face_cur") or "rub").lower()
+        k_fx = 1.0 if fc == "rub" else float(fx_rates.get(fc) or 1.0)
+        mat = (b.get("maturity") or "")[:10]
+
+        bz = None
+        opt = None
+        if isin:
+            try:
+                bz = moex_bondization(isin)
+            except Exception:  # noqa: BLE001
+                bz = None
+            try:
+                opt = moex_bond_options(isin)
+            except Exception:  # noqa: BLE001
+                opt = None
+
+        dates_kind = {}
+        if b.get("put_date") and ti <= b["put_date"][:10] <= horizon:
+            dates_kind[b["put_date"][:10]] = ("offer_put", 100.0)
+        for cd in b.get("call_dates") or []:
+            cd10 = (cd or "")[:10]
+            if cd10 and ti <= cd10 <= horizon and cd10 not in dates_kind:
+                dates_kind[cd10] = ("offer_call", 100.0)
+
+        if opt:
+            prices = opt.get("prices") or {}
+            for d in opt.get("put") or []:
+                if ti <= d <= horizon:
+                    dates_kind[d] = ("offer_put", float(prices.get(d) or 100.0))
+            for d in opt.get("call") or []:
+                if ti <= d <= horizon and d not in dates_kind:
+                    dates_kind[d] = ("offer_call", float(prices.get(d) or 100.0))
+
+        if bz and bz.get("offers"):
+            for of in bz["offers"]:
+                od = (of.get("offerdate") or "")[:10]
+                if not od or od < ti or od > horizon or od in dates_kind:
+                    continue
+                otype = (of.get("offertype") or "").lower()
+                if "пут" in otype or "put" in otype or "выкуп" in otype:
+                    kind = "offer_put"
+                elif "колл" in otype or "call" in otype or "досроч" in otype:
+                    kind = "offer_call"
+                else:
+                    continue
+                dates_kind[od] = (kind, float(of.get("price") or 100.0))
+
+        if not dates_kind:
+            continue
+
+        amorts = []
+        if bz and bz.get("amort"):
+            for a in bz["amort"]:
+                ad = (a.get("amortdate") or "")[:10]
+                av = float(a.get("value") or 0.0)
+                if ad and av > 0 and ti <= ad and (not mat or ad < mat):
+                    amorts.append((ad, av))
+
+        rem_mat = max(0.0, nominal - sum(av for _, av in amorts)) * qty * k_fx
+        for od, (kind, price_pct) in sorted(dates_kind.items()):
+            if mat and od >= mat:
+                continue
+            rem_nom = max(0.0, nominal - sum(av for ad, av in amorts if ad < od))
+            amt = rem_nom * (price_pct / 100.0) * qty * k_fx
+            if amt <= 0:
+                continue
+            out.append({
+                "uid": b.get("uid") or "",
+                "isin": isin,
+                "ticker": b.get("ticker") or "",
+                "name": b.get("name") or b.get("ticker") or "",
+                "date": od,
+                "ym": od[:7],
+                "kind": kind,
+                "kind_ru": "Пут-оферта" if kind == "offer_put" else "Колл-оферта",
+                "amount": round(amt, 2),
+                "price_pct": round(price_pct, 2),
+                "maturity": mat,
+                "maturity_ym": mat[:7] if (mat and ti <= mat <= horizon) else "",
+                "maturity_amount": round(rem_mat, 2),
+            })
+    out.sort(key=lambda x: (x["date"], x["name"]))
+    return out
+
+
 def cf36_simulate(months, rate_pct, start=0.0, reinvest=True):
-    """K(m) = K(m-1)*(1 + r/12) + CF(m) при реинвесте, иначе K(m) = K(m-1) + CF(m). months — суммы или строки с полем total.
-    Возвращает капитал по месяцам с реинвестом и без, итоги и разницу (процент, заработанный на реинвестировании)."""
+    """K(m) = K(m-1)*(1 + r(m)/12) + CF(m) при реинвесте, иначе K(m) = K(m-1) + CF(m).
+    rate_pct — годовая ставка (%) или последовательность помесячных ставок. months — суммы или строки с полем total."""
     cfs = [float(m["total"] if isinstance(m, dict) else (m or 0.0)) for m in months]
-    k = float(rate_pct or 0.0) / 100.0 / 12.0
+    is_seq = isinstance(rate_pct, (list, tuple))
     plain, comp = [], []
     kp = kc = float(start or 0.0)
-    for c in cfs:
+    for i, c in enumerate(cfs):
+        r_i = float(rate_pct[i] if is_seq and i < len(rate_pct) else (rate_pct[-1] if is_seq and rate_pct else (rate_pct or 0.0)))
+        k = max(0.0, r_i) / 100.0 / 12.0
         kp += c
         kc = kc * (1.0 + k) + c
         plain.append(kp)
         comp.append(kc)
     cap = comp if reinvest else plain
     fin, fin_no = (cap[-1] if cap else float(start or 0.0)), (plain[-1] if plain else float(start or 0.0))
+    avg_r = (sum(float(x) for x in rate_pct[:len(cfs)]) / len(cfs)) if (is_seq and cfs) else float(rate_pct or 0.0)
     return {"capital": cap, "capital_no": plain, "final": fin, "final_no": fin_no, "interest": fin - fin_no if reinvest else 0.0,
-            "diff": fin - fin_no, "reinvest": bool(reinvest), "rate": float(rate_pct or 0.0)}
+            "diff": fin - fin_no, "reinvest": bool(reinvest), "rate": round(avg_r, 2)}
+
+
+def cf36_simulate_offers(months, rate_pct, start=0.0, reinvest=True, offers=None, offer_kinds=("offer_put",)):
+    """Реинвестирование купонов и погашений с учётом досрочного выхода по выбранным офертам (без двойного счёта номинала)."""
+    adj = [dict(m, by=dict(m.get("by") or {})) if isinstance(m, dict) else {"total": float(m or 0.0), "by": {}} for m in months]
+    by_ym = {m["ym"]: m for m in adj if m.get("ym")}
+    seen_bonds = set()
+    offer_added = 0.0
+    maturity_shifted = 0.0
+    offer_count = 0
+    for of in sorted(offers or [], key=lambda x: x.get("date") or ""):
+        if of.get("kind") not in (offer_kinds or ()):
+            continue
+        bkey = of.get("uid") or of.get("isin") or of.get("name")
+        if bkey in seen_bonds:
+            continue
+        row = by_ym.get(of.get("ym") or "")
+        if row is None:
+            continue
+        seen_bonds.add(bkey)
+        amt = float(of.get("amount") or 0.0)
+        row["total"] = round(float(row.get("total") or 0.0) + amt, 2)
+        offer_added += amt
+        offer_count += 1
+        mym = of.get("maturity_ym") or ""
+        mamt = float(of.get("maturity_amount") or 0.0)
+        if mym and mamt > 0 and mym in by_ym:
+            mrow = by_ym[mym]
+            red = float((mrow.get("by") or {}).get("redemption") or mrow.get("total") or 0.0)
+            sub = min(mamt, red, float(mrow.get("total") or 0.0))
+            mrow["total"] = round(max(0.0, float(mrow.get("total") or 0.0) - sub), 2)
+            maturity_shifted += sub
+    sim = cf36_simulate(adj, rate_pct, start=start, reinvest=reinvest)
+    sim.update({
+        "offer_added": round(offer_added, 2),
+        "maturity_shifted": round(maturity_shifted, 2),
+        "offer_count": offer_count,
+    })
+    return sim
 
 
 def cashflow36_payload(cfg, acc, f=False):
@@ -22225,18 +22404,33 @@ def cashflow36_payload(cfg, acc, f=False):
         s = build_summary(cfg, acc, "all")
         pos = s["portfolio"]["positions"]
         today = date.today()
-        rep = bonds_report(TInvest(cfg), pos, horizon_days=cf36_horizon_days(today))
+        client = TInvest(cfg)
+        rep = bonds_report(client, pos, horizon_days=cf36_horizon_days(today))
         pays = list(rep.get("payments") or [])
         shares = [r for r in pos if r.get("type") == "share" and r.get("uid") and (r.get("qty") or 0) > 0]
         est_d = cf36_est_dividends(shares, pays, cfg, today)
         months = cf36_bucket(pays + est_d, today)
         empty = [m["ym"] for m in months if m["total"] <= 0]
+        rates = cf36_rates()
+        fx_curs = {b.get("face_cur") or "rub" for b in (rep.get("bonds") or [])}
+        fx_rates = fx_now(client, fx_curs) if (fx_curs - {"rub"}) else {"rub": 1.0}
+        offers = cf36_offer_events(rep.get("bonds") or [], fx_rates, today)
+        trajectories = cf36_keyrate_trajectories(rates.get("key"))
+        put_offers = [o for o in offers if o["kind"] == "offer_put"]
+        call_offers = [o for o in offers if o["kind"] == "offer_call"]
         notes = ["Купоны и амортизации — по графикам эмитентов; погашения — остаток номинала. Все суммы до НДФЛ с купонов.",
                  "Купон флоатера, ещё не объявленный, — по прогнозу ключевой ставки ЦБ плюс спред; купон без объявленной суммы — как последний известный (помечено «оценка»).",
-                 "Дивиденды сверх объявленных — оценка по истории выплат: те же месяцы и сумма на акцию, что за последние 12 месяцев, за вычетом НДФЛ %d %%. Не гарантированы." % round(CF36_DIV_TAX * 100)]
+                 "Дивиденды сверх объявленных — оценка по истории выплат: те же месяцы и сумма на акцию, что за последние 12 месяцев, за вычетом НДФЛ %d %%. Не гарантированы." % round(CF36_DIV_TAX * 100),
+                 "Калькулятор реинвеста учитывает реальные пут- и колл-оферты (MOEX) и три траектории ключевой ставки ЦБ."]
         if not pos:
             notes.insert(0, "В выбранном счёте нет позиций.")
-        return {"ok": True, "months": months, "empty_months": empty, "notes": notes, "rates": cf36_rates(),
+        return {"ok": True, "months": months, "empty_months": empty, "notes": notes, "rates": rates,
+                "offers": offers,
+                "offer_summary": {
+                    "put_count": len(put_offers), "put_total": round(sum(o["amount"] for o in put_offers), 2),
+                    "call_count": len(call_offers), "call_total": round(sum(o["amount"] for o in call_offers), 2),
+                },
+                "trajectories": trajectories,
                 "total": round(sum(m["total"] for m in months), 2), "est_total": round(sum(m["est"] for m in months), 2),
                 "est_dividends": len(est_d), "start": cf36_month_keys(today, 1)[0]}
     return cached_result("cf36", cfg, acc, BONDS_TTL, compute, f)
@@ -30364,13 +30558,19 @@ function pPay(){
 
 
 /* ── Матрица потоков на 3 года + «Снежный ком 2.0» (грузится лениво, при открытии раздела) ── */
-const CF36={open:false,st:'idle',data:null,err:'',acc:null,rate:'lqdt',own:'12',reinv:true,tries:0};
+const CF36={open:false,st:'idle',data:null,err:'',acc:null,rate:'lqdt',traj:'flat',own:'12',reinv:true,usePut:true,useCall:false,tries:0};
 const CF36_K=[['coupon','Купоны',S1],['dividend','Дивиденды',S3],['amortization','Амортизации',S5],['redemption','Погашения',S4]];
 const cf36Pct=v=>v==null||isNaN(v)?'—':(+v).toFixed(2).replace('.',',')+' %';
-/* K(m) = K(m−1)·(1 + r/12) + CF(m) — та же формула, что cf36_simulate на сервере */
-function cf36Sim(ms,rate,start){
-  const k=(rate||0)/1200;let kp=start||0,kc=start||0;const p=[],c=[];
-  ms.forEach(m=>{const cf=+(m.total||0);kp+=cf;kc=kc*(1+k)+cf;p.push(kp);c.push(kc)});
+/* K(m) = K(m−1)·(1 + r(m)/12) + CF(m) — та же формула, что cf36_simulate на сервере */
+function cf36Sim(ms,rateOrSeq,start){
+  const isSeq=Array.isArray(rateOrSeq);
+  let kp=start||0,kc=start||0;const p=[],c=[];
+  ms.forEach((m,i)=>{
+    const cf=+(m.total||0);
+    const ri=isSeq?(rateOrSeq[i]!=null?rateOrSeq[i]:rateOrSeq[rateOrSeq.length-1]||0):(rateOrSeq||0);
+    const k=Math.max(0,ri)/1200;
+    kp+=cf;kc=kc*(1+k)+cf;p.push(kp);c.push(kc);
+  });
   return{plain:p,comp:c};
 }
 function cf36Rate(){
@@ -30378,6 +30578,47 @@ function cf36Rate(){
   if(CF36.rate==='lqdt')return r.lqdt;
   if(CF36.rate==='ofz')return r.ofz1y;
   const v=parseFloat(String(CF36.own).replace(',','.'));return isNaN(v)?null:Math.max(0,Math.min(100,v));
+}
+function cf36RateSeq(){
+  const base=cf36Rate();
+  if(base==null)return null;
+  const d=CF36.data||{},tr=d.trajectories&&d.trajectories.items&&d.trajectories.items[CF36.traj];
+  const n=(d.months||[]).length||36;
+  if(CF36.rate==='own'||!tr||!tr.rates||!tr.rates.length)return Array(n).fill(base);
+  const b0=tr.rates[0];
+  return tr.rates.slice(0,n).map(kr=>Math.max(0,base+(kr-b0)));
+}
+function cf36SimMonths(){
+  const d=CF36.data||{};
+  const ms=(d.months||[]).map(m=>({ym:m.ym,total:+(m.total||0),by:Object.assign({},m.by||{})}));
+  const byYm={};ms.forEach(m=>{byYm[m.ym]=m});
+  const kinds=[];if(CF36.usePut)kinds.push('offer_put');if(CF36.useCall)kinds.push('offer_call');
+  let offerAdded=0,maturityShifted=0,offerCount=0;
+  if(kinds.length&&d.offers&&d.offers.length){
+    const seen={};
+    d.offers.slice().sort((a,b)=>(a.date||'').localeCompare(b.date||'')).forEach(of=>{
+      if(kinds.indexOf(of.kind)<0)return;
+      const bkey=of.uid||of.isin||of.name;if(seen[bkey])return;
+      const row=byYm[of.ym];if(!row)return;
+      seen[bkey]=1;
+      const amt=+(of.amount||0);
+      row.total+=amt;offerAdded+=amt;offerCount++;
+      if(of.maturity_ym&&of.maturity_amount>0&&byYm[of.maturity_ym]){
+        const mr=byYm[of.maturity_ym];
+        const red=+(mr.by&&mr.by.redemption||mr.total||0);
+        const sub=Math.min(+of.maturity_amount,red,mr.total);
+        mr.total=Math.max(0,mr.total-sub);
+        maturityShifted+=sub;
+      }
+    });
+  }
+  let coupDiv=0,amortRed=0;
+  ms.forEach(m=>{
+    coupDiv+=(+(m.by.coupon||0))+(+(m.by.dividend||0));
+    amortRed+=(+(m.by.amortization||0))+(+(m.by.redemption||0));
+  });
+  amortRed=Math.max(0,amortRed-maturityShifted);
+  return{months:ms,offerAdded,maturityShifted,offerCount,coupDiv,amortRed};
 }
 function cf36Load(){
   if(CF36.st==='load')return;
@@ -30412,17 +30653,22 @@ function cf36Tip(i){
   return h;
 }
 function cf36Calc(){
-  const d=CF36.data,r=cf36Rate();
-  if(!d||r==null)return null;
-  const sim=cf36Sim(d.months,r,0),n=sim.plain.length;
-  return{r,sim,fin:sim.comp[n-1],fin0:sim.plain[n-1]};
+  const d=CF36.data,seq=cf36RateSeq();
+  if(!d||!seq)return null;
+  const sm=cf36SimMonths();
+  const sim=cf36Sim(sm.months,seq,0),n=sim.plain.length;
+  const avgR=seq.reduce((a,x)=>a+x,0)/(seq.length||1);
+  return{r:avgR,seq,sm,sim,fin:sim.comp[n-1],fin0:sim.plain[n-1]};
 }
 function cf36Kpis(){
   const c=cf36Calc();if(!c)return'<div class="msg">Укажите ставку, чтобы рассчитать реинвестирование.</div>';
-  const on=CF36.reinv,fin=on?c.fin:c.fin0;
-  return`<div class="g g3"><div class="card kpi"><div class="k"><i style="background:${S1}"></i>${on?'Итог с реинвестом':'Итог (реинвест выключен)'}</div><div class="v num pos">${M(fin)}</div><div class="s">под ${cf36Pct(c.r)} годовых</div></div>
-  <div class="card kpi"><div class="k"><i style="background:${S4}"></i>Итог без реинвеста</div><div class="v num">${M(c.fin0)}</div><div class="s">выплаты просто копятся</div></div>
-  <div class="card kpi"><div class="k">Разница</div><div class="v num ${on?'pos':''}">${on?'+'+M(c.fin-c.fin0):M(0)}</div><div class="s">${on?'проценты на реинвестирование':'включите реинвест'}</div></div></div>`;
+  const on=CF36.reinv,fin=on?c.fin:c.fin0,sm=c.sm;
+  const tr=(CF36.data&&CF36.data.trajectories&&CF36.data.trajectories.items&&CF36.data.trajectories.items[CF36.traj]);
+  const rSub=CF36.rate!=='own'&&tr?`${tr.name}: в среднем ${cf36Pct(c.r)}`:`под ${cf36Pct(c.r)} годовых`;
+  return`<div class="g g4"><div class="card kpi"><div class="k"><i style="background:${S1}"></i>${on?'Итог с реинвестом':'Итог (реинвест выключен)'}</div><div class="v num pos">${M(fin)}</div><div class="s">${esc(rSub)}</div></div>
+  <div class="card kpi"><div class="k"><i style="background:${S4}"></i>Итог без реинвеста</div><div class="v num">${M(c.fin0)}</div><div class="s">купоны/див. ${M(sm.coupDiv)} · тела ${M(sm.amortRed+(sm.offerAdded||0))}</div></div>
+  <div class="card kpi"><div class="k">Доход от реинвеста</div><div class="v num ${on?'pos':''}">${on?'+'+M(c.fin-c.fin0):M(0)}</div><div class="s">${on?'сложный процент по траектории':'включите реинвест'}</div></div>
+  <div class="card kpi"><div class="k"><i style="background:${S5}"></i>Оферты в расчёте</div><div class="v num">${M(sm.offerAdded||0)}</div><div class="s">${sm.offerCount?sm.offerCount+' оферт(ы) реинвестировано':'оферты не выбраны / отсутствуют'}</div></div></div>`;
 }
 function cf36Line(el){
   const c=cf36Calc(),d=CF36.data;if(!c||!d)return;
@@ -30443,18 +30689,28 @@ function cf36Body(){
   const ms=d.months||[],n=ms.length||36,emp=ms.filter(m=>m.total<=0).length,tot=ms.reduce((a,m)=>a+m.total,0),r=d.rates||{};
   const rb=(k,t,v)=>`<button data-r="${k}" class="${CF36.rate===k?'on':''}" ${k!=='own'&&v==null?'disabled title="нет данных"':''}>${t}${k!=='own'&&v!=null?' · '+cf36Pct(v):''}</button>`;
   const src=CF36.rate==='lqdt'?r.lqdt_src:CF36.rate==='ofz'?r.ofz1y_src:'введена вручную';
+  const trs=(d.trajectories&&d.trajectories.items)||{};
+  const trSeg=CF36.rate!=='own'&&trs.flat?`<span class="seg cf36-traj">${['flat','cut','hike'].map(k=>trs[k]?`<button data-tr="${k}" class="${CF36.traj===k?'on':''}" title="${esc(trs[k].desc)}">${esc(trs[k].name)}</button>`:'').join('')}</span>`:'';
+  const os=d.offer_summary||{},ofs=d.offers||[];
+  const ofRows=ofs.map(o=>`<tr><td class="l">${ddm(o.date)}</td><td class="l"><b>${esc(o.name)}</b>${o.ticker?` <small class="mu">${esc(o.ticker)}</small>`:''}</td><td class="l">${esc(o.kind_ru)}</td><td class="num">${(+o.price_pct||100).toFixed(2).replace('.',',')} %</td><td class="num"><b>${M(o.amount)}</b></td></tr>`).join('');
+  const ofBox=ofs.length?`<div style="margin-top:16px"><h3 class="cf36-h3">Ближайшие оферты (окно 36 мес.)<span class="sp">пут: ${os.put_count||0} (${M(os.put_total||0)}) · колл: ${os.call_count||0} (${M(os.call_total||0)})</span></h3>
+    <div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Облигация</th><th class="l">Тип оферты</th><th>Цена выкупа</th><th>Сумма номинала</th></tr></thead><tbody>${ofRows}</tbody></table></div></div>`:'';
   return`<div class="g g4">${kpi('За 3 года',M(tot),'в среднем '+M(tot/n)+' в месяц','pos',S3)}${kpi('Пустых месяцев',emp+' из '+n,emp?'нет ни одной выплаты':'выплаты каждый месяц',emp?'neg':'pos')}
     ${kpi('Оценочная часть',M(d.est_total||0),tot?Math.round((d.est_total||0)/tot*100)+' % от суммы':'',null,S5)}${kpi('Макс. месяц',M(Math.max(0,...ms.map(m=>m.total))),'пик выплат')}</div>
     ${cf36Grid(d)}
     <div class="cf36-leg"><span><i class="cf36-sw" style="background:color-mix(in srgb,var(--ac) 45%,transparent)"></i>чем темнее, тем больше выплат</span><span><i class="cf36-sw cf36-hs"></i>штриховка — оценочная часть</span><span><i class="cf36-sw cf36-ee"></i>пустой месяц</span></div>
-    <h3 class="cf36-h3">Снежный ком 2.0<span class="sp">что будет, если выплаты реинвестировать</span></h3>
+    <h3 class="cf36-h3">Снежный ком 2.0<span class="sp">реинвест купонов, амортизаций и оферт по траектории КС</span></h3>
     <div class="cf36-ctl"><span class="seg cf36-rate">${rb('lqdt','LQDT',r.lqdt)}${rb('ofz','Короткие ОФЗ',r.ofz1y)}${rb('own','Своя ставка')}</span>
+      ${trSeg}
       ${CF36.rate==='own'?`<label class="cf36-own">ставка, % годовых <input class="cf36-in" inputmode="decimal" value="${esc(CF36.own)}" size="5"></label>`:''}
-      <label class="cf36-chk"><input type="checkbox" class="cf36-reinv" ${CF36.reinv?'checked':''}> реинвестировать выплаты</label></div>
+      <label class="cf36-chk"><input type="checkbox" class="cf36-reinv" ${CF36.reinv?'checked':''}> реинвестировать выплаты</label>
+      <label class="cf36-chk"><input type="checkbox" class="cf36-put" ${CF36.usePut?'checked':''}> учитывать пут-оферты</label>
+      <label class="cf36-chk"><input type="checkbox" class="cf36-call" ${CF36.useCall?'checked':''}> учитывать колл-оферты</label></div>
     <div class="cf36-src">Ставка: ${esc(src||'—')}. LQDT — фонд ликвидности, сам не гарантирует доходность.</div>
     <div id="cf36-kpi">${cf36Kpis()}</div>
     <div id="cf36-chart" class="chart"></div>
-    <p class="note">Формула: K(m) = K(m−1)·(1 + r/12) + CF(m), где CF(m) — выплаты месяца m, r — годовая ставка реинвестирования, K(0) = 0. Налоги на проценты от реинвестирования не учтены.</p>
+    ${ofBox}
+    <p class="note">Формула: K(m) = K(m−1)·(1 + r(m)/12) + CF(m), где CF(m) — выплаты месяца m (с учётом досрочного выхода по выбранным офертам без двойного счёта погашения), r(m) — годовая ставка реинвестирования по выбранной траектории ключевой ставки, K(0) = 0. Налоги на проценты от реинвестирования не учтены.</p>
     <p class="note">${(d.notes||[]).map(esc).join(' ')} Оценки помечены штриховкой; дивиденды не гарантированы и могут быть отменены или изменены, а будущие ставки — отличаться от прогноза. Это не инвестиционная рекомендация.</p>`;
 }
 function cf36Section(){
@@ -30470,12 +30726,15 @@ document.addEventListener('click',e=>{
   if(t.closest('.pj-retry')){PAY_J.st='idle';PAY_J.tries=0;render();return}
   if(t.closest('.cf36-tgl')){CF36.open=!CF36.open;render();return}
   if(t.closest('.cf36-retry')){CF36.st='idle';CF36.tries=0;render();return}
-  const b=t.closest('.cf36-rate [data-r]');if(b&&!b.disabled){CF36.rate=b.dataset.r;render()}
+  const b=t.closest('.cf36-rate [data-r]');if(b&&!b.disabled){CF36.rate=b.dataset.r;render();return}
+  const tr=t.closest('.cf36-traj [data-tr]');if(tr){CF36.traj=tr.dataset.tr;render()}
 });
 document.addEventListener('input',e=>{
   const t=e.target;if(!t.classList)return;
   if(t.classList.contains('cf36-in')){CF36.own=t.value;cf36Update()}
   else if(t.classList.contains('cf36-reinv')){CF36.reinv=t.checked;cf36Update()}
+  else if(t.classList.contains('cf36-put')){CF36.usePut=t.checked;cf36Update()}
+  else if(t.classList.contains('cf36-call')){CF36.useCall=t.checked;cf36Update()}
 });
 document.addEventListener('mouseover',e=>{
   const g=e.target.closest&&e.target.closest('#cf36-grid');

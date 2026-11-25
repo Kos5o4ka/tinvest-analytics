@@ -189,5 +189,65 @@ class PayJournal(unittest.TestCase):
         self.assertAlmostEqual(res["securities"][0]["yoc_pct"], 10.0, places=2)
 
 
+class OfferReinvest(unittest.TestCase):
+    def test_keyrate_trajectories(self):
+        tr = M.cf36_keyrate_trajectories(18.0, n=36)
+        self.assertEqual(tr["base"], 18.0)
+        self.assertFalse(tr["fallback"])
+        self.assertEqual(len(tr["items"]["flat"]["rates"]), 36)
+        self.assertEqual(tr["items"]["flat"]["rates"][0], 18.0)
+        self.assertEqual(tr["items"]["cut"]["rates"][0], 18.0)
+        self.assertEqual(tr["items"]["cut"]["rates"][-1], 12.0)
+        self.assertEqual(tr["items"]["hike"]["rates"][0], 18.0)
+        self.assertEqual(tr["items"]["hike"]["rates"][-1], 22.0)
+
+    def test_offer_events_offline(self):
+        today = date(2026, 11, 25)
+        rep_bonds = [{
+            "uid": "u_put", "isin": "RU000A100001", "ticker": "BPUT", "name": "Бонд Пут",
+            "qty": 10.0, "nominal": 1000.0, "face_cur": "rub", "maturity": "2029-05-01",
+            "put_date": "2027-06-01", "call_dates": ["2028-06-01"],
+        }]
+        saved = (M.moex_bondization, M.moex_bond_options)
+        M.moex_bondization = lambda isin: {"ok": True, "amort": [{"amortdate": "2027-03-01", "value": 200.0}], "offers": []}
+        M.moex_bond_options = lambda isin: {"ok": True, "put": ["2027-06-01"], "call": ["2028-06-01"], "prices": {"2027-06-01": 100.0}}
+        try:
+            ofs = M.cf36_offer_events(rep_bonds, {"rub": 1.0}, today=today)
+        finally:
+            M.moex_bondization, M.moex_bond_options = saved
+        self.assertEqual(len(ofs), 2)
+        self.assertEqual(ofs[0]["kind"], "offer_put")
+        self.assertEqual(ofs[0]["ym"], "2027-06")
+        # 1000 - 200 amort = 800 * 10 = 8000
+        self.assertAlmostEqual(ofs[0]["amount"], 8000.0, places=2)
+        self.assertEqual(ofs[0]["maturity_ym"], "2029-05")
+        self.assertEqual(ofs[1]["kind"], "offer_call")
+
+    def test_simulate_offers_no_double_count_and_seq(self):
+        today = date(2026, 11, 25)
+        keys = M.cf36_month_keys(today)
+        months = [{"ym": k, "total": 100.0, "by": {"coupon": 100.0, "redemption": 0.0}} for k in keys]
+        # Погашение на последнем месяце 10000
+        months[-1]["total"] += 10000.0
+        months[-1]["by"]["redemption"] = 10000.0
+        offers = [{
+            "uid": "u1", "isin": "RU1", "name": "B1", "date": keys[5] + "-15", "ym": keys[5],
+            "kind": "offer_put", "amount": 10000.0, "maturity_ym": keys[-1], "maturity_amount": 10000.0,
+        }]
+        tr = M.cf36_keyrate_trajectories(12.0, n=36)
+        sim_put = M.cf36_simulate_offers(months, tr["items"]["flat"]["rates"], offers=offers, offer_kinds=("offer_put",))
+        sim_mat = M.cf36_simulate_offers(months, tr["items"]["flat"]["rates"], offers=offers, offer_kinds=())
+        # Без двойного счёта: сумма без реинвеста одинакова (36*100 + 10000 = 13600)
+        self.assertAlmostEqual(sim_put["final_no"], 13600.0, places=2)
+        self.assertAlmostEqual(sim_mat["final_no"], 13600.0, places=2)
+        # При ранней пут-оферте доход от реинвеста выше
+        self.assertGreater(sim_put["final"], sim_mat["final"])
+        self.assertEqual(sim_put["offer_count"], 1)
+        # При росте ставки итоговый капитал выше, чем при снижении
+        sim_cut = M.cf36_simulate_offers(months, tr["items"]["cut"]["rates"], offers=offers, offer_kinds=("offer_put",))
+        sim_hike = M.cf36_simulate_offers(months, tr["items"]["hike"]["rates"], offers=offers, offer_kinds=("offer_put",))
+        self.assertGreater(sim_hike["final"], sim_cut["final"])
+
+
 if __name__ == "__main__":
     unittest.main()

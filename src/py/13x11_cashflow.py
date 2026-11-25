@@ -116,22 +116,201 @@ def cf36_rates():
             "key": kr, "src": src_kr}
 
 
+def cf36_keyrate_trajectories(base_rate=None, n=CF36_MONTHS):
+    """Три траектории ключевой ставки ЦБ на n месяцев (% годовых): стабильная, снижение, повышение."""
+    fallback = False
+    if base_rate is None:
+        try:
+            i = keyrate_brief()
+            if i and i.get("key_rate") is not None:
+                base_rate = float(i["key_rate"])
+        except Exception:  # noqa: BLE001
+            base_rate = None
+    if base_rate is None:
+        try:
+            ser = key_rate_series()
+            if ser:
+                base_rate = float(ser[-1][1])
+        except Exception:  # noqa: BLE001
+            base_rate = None
+    if base_rate is None:
+        base_rate = 16.0
+        fallback = True
+    base = float(base_rate)
+    low = max(4.0, base - 6.0)
+    high = min(30.0, base + 4.0)
+    denom = max(1, n - 1)
+    hike_m = max(1, min(18, denom))
+    flat = [round(base, 2) for _ in range(n)]
+    cut = [round(base + (low - base) * (i / denom), 2) for i in range(n)]
+    hike = [round(base + (high - base) * min(1.0, i / hike_m), 2) for i in range(n)]
+    return {
+        "base": round(base, 2),
+        "fallback": fallback,
+        "items": {
+            "flat": {"id": "flat", "name": "Стабильная КС", "desc": "%.2f %% весь срок" % base, "rates": flat},
+            "cut": {"id": "cut", "name": "Снижение КС", "desc": "плавно до %.2f %%" % low, "rates": cut},
+            "hike": {"id": "hike", "name": "Повышение КС", "desc": "рост до %.2f %%" % high, "rates": hike},
+        },
+    }
+
+
+def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
+    """Реальные пут- и колл-оферты по облигациям портфеля в окне 36 месяцев (MOEX bondization/options + отчёт брокера)."""
+    t = today or date.today()
+    ti = t.isoformat()
+    horizon = (t + timedelta(days=cf36_horizon_days(t, n))).isoformat()
+    fx_rates = fx_rates or {}
+    out = []
+    for b in rep_bonds or []:
+        qty = float(b.get("qty") or 0.0)
+        if qty <= 0:
+            continue
+        isin = (b.get("isin") or "").strip().upper()
+        nominal = float(b.get("nominal") or 1000.0)
+        fc = (b.get("face_cur") or "rub").lower()
+        k_fx = 1.0 if fc == "rub" else float(fx_rates.get(fc) or 1.0)
+        mat = (b.get("maturity") or "")[:10]
+
+        bz = None
+        opt = None
+        if isin:
+            try:
+                bz = moex_bondization(isin)
+            except Exception:  # noqa: BLE001
+                bz = None
+            try:
+                opt = moex_bond_options(isin)
+            except Exception:  # noqa: BLE001
+                opt = None
+
+        dates_kind = {}
+        if b.get("put_date") and ti <= b["put_date"][:10] <= horizon:
+            dates_kind[b["put_date"][:10]] = ("offer_put", 100.0)
+        for cd in b.get("call_dates") or []:
+            cd10 = (cd or "")[:10]
+            if cd10 and ti <= cd10 <= horizon and cd10 not in dates_kind:
+                dates_kind[cd10] = ("offer_call", 100.0)
+
+        if opt:
+            prices = opt.get("prices") or {}
+            for d in opt.get("put") or []:
+                if ti <= d <= horizon:
+                    dates_kind[d] = ("offer_put", float(prices.get(d) or 100.0))
+            for d in opt.get("call") or []:
+                if ti <= d <= horizon and d not in dates_kind:
+                    dates_kind[d] = ("offer_call", float(prices.get(d) or 100.0))
+
+        if bz and bz.get("offers"):
+            for of in bz["offers"]:
+                od = (of.get("offerdate") or "")[:10]
+                if not od or od < ti or od > horizon or od in dates_kind:
+                    continue
+                otype = (of.get("offertype") or "").lower()
+                if "пут" in otype or "put" in otype or "выкуп" in otype:
+                    kind = "offer_put"
+                elif "колл" in otype or "call" in otype or "досроч" in otype:
+                    kind = "offer_call"
+                else:
+                    continue
+                dates_kind[od] = (kind, float(of.get("price") or 100.0))
+
+        if not dates_kind:
+            continue
+
+        amorts = []
+        if bz and bz.get("amort"):
+            for a in bz["amort"]:
+                ad = (a.get("amortdate") or "")[:10]
+                av = float(a.get("value") or 0.0)
+                if ad and av > 0 and ti <= ad and (not mat or ad < mat):
+                    amorts.append((ad, av))
+
+        rem_mat = max(0.0, nominal - sum(av for _, av in amorts)) * qty * k_fx
+        for od, (kind, price_pct) in sorted(dates_kind.items()):
+            if mat and od >= mat:
+                continue
+            rem_nom = max(0.0, nominal - sum(av for ad, av in amorts if ad < od))
+            amt = rem_nom * (price_pct / 100.0) * qty * k_fx
+            if amt <= 0:
+                continue
+            out.append({
+                "uid": b.get("uid") or "",
+                "isin": isin,
+                "ticker": b.get("ticker") or "",
+                "name": b.get("name") or b.get("ticker") or "",
+                "date": od,
+                "ym": od[:7],
+                "kind": kind,
+                "kind_ru": "Пут-оферта" if kind == "offer_put" else "Колл-оферта",
+                "amount": round(amt, 2),
+                "price_pct": round(price_pct, 2),
+                "maturity": mat,
+                "maturity_ym": mat[:7] if (mat and ti <= mat <= horizon) else "",
+                "maturity_amount": round(rem_mat, 2),
+            })
+    out.sort(key=lambda x: (x["date"], x["name"]))
+    return out
+
+
 def cf36_simulate(months, rate_pct, start=0.0, reinvest=True):
-    """K(m) = K(m-1)*(1 + r/12) + CF(m) при реинвесте, иначе K(m) = K(m-1) + CF(m). months — суммы или строки с полем total.
-    Возвращает капитал по месяцам с реинвестом и без, итоги и разницу (процент, заработанный на реинвестировании)."""
+    """K(m) = K(m-1)*(1 + r(m)/12) + CF(m) при реинвесте, иначе K(m) = K(m-1) + CF(m).
+    rate_pct — годовая ставка (%) или последовательность помесячных ставок. months — суммы или строки с полем total."""
     cfs = [float(m["total"] if isinstance(m, dict) else (m or 0.0)) for m in months]
-    k = float(rate_pct or 0.0) / 100.0 / 12.0
+    is_seq = isinstance(rate_pct, (list, tuple))
     plain, comp = [], []
     kp = kc = float(start or 0.0)
-    for c in cfs:
+    for i, c in enumerate(cfs):
+        r_i = float(rate_pct[i] if is_seq and i < len(rate_pct) else (rate_pct[-1] if is_seq and rate_pct else (rate_pct or 0.0)))
+        k = max(0.0, r_i) / 100.0 / 12.0
         kp += c
         kc = kc * (1.0 + k) + c
         plain.append(kp)
         comp.append(kc)
     cap = comp if reinvest else plain
     fin, fin_no = (cap[-1] if cap else float(start or 0.0)), (plain[-1] if plain else float(start or 0.0))
+    avg_r = (sum(float(x) for x in rate_pct[:len(cfs)]) / len(cfs)) if (is_seq and cfs) else float(rate_pct or 0.0)
     return {"capital": cap, "capital_no": plain, "final": fin, "final_no": fin_no, "interest": fin - fin_no if reinvest else 0.0,
-            "diff": fin - fin_no, "reinvest": bool(reinvest), "rate": float(rate_pct or 0.0)}
+            "diff": fin - fin_no, "reinvest": bool(reinvest), "rate": round(avg_r, 2)}
+
+
+def cf36_simulate_offers(months, rate_pct, start=0.0, reinvest=True, offers=None, offer_kinds=("offer_put",)):
+    """Реинвестирование купонов и погашений с учётом досрочного выхода по выбранным офертам (без двойного счёта номинала)."""
+    adj = [dict(m, by=dict(m.get("by") or {})) if isinstance(m, dict) else {"total": float(m or 0.0), "by": {}} for m in months]
+    by_ym = {m["ym"]: m for m in adj if m.get("ym")}
+    seen_bonds = set()
+    offer_added = 0.0
+    maturity_shifted = 0.0
+    offer_count = 0
+    for of in sorted(offers or [], key=lambda x: x.get("date") or ""):
+        if of.get("kind") not in (offer_kinds or ()):
+            continue
+        bkey = of.get("uid") or of.get("isin") or of.get("name")
+        if bkey in seen_bonds:
+            continue
+        row = by_ym.get(of.get("ym") or "")
+        if row is None:
+            continue
+        seen_bonds.add(bkey)
+        amt = float(of.get("amount") or 0.0)
+        row["total"] = round(float(row.get("total") or 0.0) + amt, 2)
+        offer_added += amt
+        offer_count += 1
+        mym = of.get("maturity_ym") or ""
+        mamt = float(of.get("maturity_amount") or 0.0)
+        if mym and mamt > 0 and mym in by_ym:
+            mrow = by_ym[mym]
+            red = float((mrow.get("by") or {}).get("redemption") or mrow.get("total") or 0.0)
+            sub = min(mamt, red, float(mrow.get("total") or 0.0))
+            mrow["total"] = round(max(0.0, float(mrow.get("total") or 0.0) - sub), 2)
+            maturity_shifted += sub
+    sim = cf36_simulate(adj, rate_pct, start=start, reinvest=reinvest)
+    sim.update({
+        "offer_added": round(offer_added, 2),
+        "maturity_shifted": round(maturity_shifted, 2),
+        "offer_count": offer_count,
+    })
+    return sim
 
 
 def cashflow36_payload(cfg, acc, f=False):
@@ -139,18 +318,33 @@ def cashflow36_payload(cfg, acc, f=False):
         s = build_summary(cfg, acc, "all")
         pos = s["portfolio"]["positions"]
         today = date.today()
-        rep = bonds_report(TInvest(cfg), pos, horizon_days=cf36_horizon_days(today))
+        client = TInvest(cfg)
+        rep = bonds_report(client, pos, horizon_days=cf36_horizon_days(today))
         pays = list(rep.get("payments") or [])
         shares = [r for r in pos if r.get("type") == "share" and r.get("uid") and (r.get("qty") or 0) > 0]
         est_d = cf36_est_dividends(shares, pays, cfg, today)
         months = cf36_bucket(pays + est_d, today)
         empty = [m["ym"] for m in months if m["total"] <= 0]
+        rates = cf36_rates()
+        fx_curs = {b.get("face_cur") or "rub" for b in (rep.get("bonds") or [])}
+        fx_rates = fx_now(client, fx_curs) if (fx_curs - {"rub"}) else {"rub": 1.0}
+        offers = cf36_offer_events(rep.get("bonds") or [], fx_rates, today)
+        trajectories = cf36_keyrate_trajectories(rates.get("key"))
+        put_offers = [o for o in offers if o["kind"] == "offer_put"]
+        call_offers = [o for o in offers if o["kind"] == "offer_call"]
         notes = ["Купоны и амортизации — по графикам эмитентов; погашения — остаток номинала. Все суммы до НДФЛ с купонов.",
                  "Купон флоатера, ещё не объявленный, — по прогнозу ключевой ставки ЦБ плюс спред; купон без объявленной суммы — как последний известный (помечено «оценка»).",
-                 "Дивиденды сверх объявленных — оценка по истории выплат: те же месяцы и сумма на акцию, что за последние 12 месяцев, за вычетом НДФЛ %d %%. Не гарантированы." % round(CF36_DIV_TAX * 100)]
+                 "Дивиденды сверх объявленных — оценка по истории выплат: те же месяцы и сумма на акцию, что за последние 12 месяцев, за вычетом НДФЛ %d %%. Не гарантированы." % round(CF36_DIV_TAX * 100),
+                 "Калькулятор реинвеста учитывает реальные пут- и колл-оферты (MOEX) и три траектории ключевой ставки ЦБ."]
         if not pos:
             notes.insert(0, "В выбранном счёте нет позиций.")
-        return {"ok": True, "months": months, "empty_months": empty, "notes": notes, "rates": cf36_rates(),
+        return {"ok": True, "months": months, "empty_months": empty, "notes": notes, "rates": rates,
+                "offers": offers,
+                "offer_summary": {
+                    "put_count": len(put_offers), "put_total": round(sum(o["amount"] for o in put_offers), 2),
+                    "call_count": len(call_offers), "call_total": round(sum(o["amount"] for o in call_offers), 2),
+                },
+                "trajectories": trajectories,
                 "total": round(sum(m["total"] for m in months), 2), "est_total": round(sum(m["est"] for m in months), 2),
                 "est_dividends": len(est_d), "start": cf36_month_keys(today, 1)[0]}
     return cached_result("cf36", cfg, acc, BONDS_TTL, compute, f)
