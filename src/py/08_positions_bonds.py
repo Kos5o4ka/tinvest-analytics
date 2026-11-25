@@ -535,7 +535,8 @@ def bonds_report(client, rows, horizon_days=365):
             x["call_kind"] = ckind.get(x.get("uid"))
     return {"rows": out, "metrics": metrics, "ladder": sorted(ladder.items()), "risk": sorted(risk.items(), key=lambda x: -x[1]),
             "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays,
-            "ratings": apply_ratings(out), "ratings_info": ratings_status()}
+            "ratings": apply_ratings(out), "ratings_info": ratings_status(),
+            "radar": offer_amort_radar(client, bonds, today, horizon_days=60, infos=infos, exacts=exacts, rates=rates)}
 
 
 CONC_THRESHOLDS = {"issuer": 15.0, "sector": 35.0, "below_a_minus": 30.0}
@@ -646,6 +647,144 @@ def portfolio_concentration(rows):
             "below_a_minus": {"value_rub": below_rub, "share": below_pct, "count": below_cnt},
             "unrated_bonds": {"value_rub": unrated_rub, "share": unrated_pct, "count": unrated_cnt},
             "thresholds": dict(CONC_THRESHOLDS), "warnings": warnings}
+
+
+def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exacts=None, rates=None):
+    """Радар ближайших пут-оферт (без объявленного купона или со снижением ставки) и частичных амортизаций."""
+    today = (today or date.today().isoformat())[:10]
+    t_dt = datetime.strptime(today, "%Y-%m-%d").date()
+    end_date = (t_dt + timedelta(days=horizon_days)).isoformat()
+    items = []
+
+    for r in (rows or []):
+        if r.get("type") != "bond" or (r.get("qty") or 0) <= 0:
+            continue
+        uid = r.get("uid") or ""
+        isin = (r.get("isin") or "").upper()
+        if not isin:
+            try:
+                isin = bond_isin(r)
+            except Exception:  # noqa: BLE001
+                isin = ""
+        b = (infos or {}).get(uid)
+        if b is None and client and uid:
+            try:
+                b = bond_info(client, uid)
+            except Exception:  # noqa: BLE001
+                b = None
+        ex = (exacts or {}).get(uid)
+        bz = (ex or {}).get("bz")
+        if bz is None and isin:
+            try:
+                bz = moex_bondization(isin)
+            except Exception:  # noqa: BLE001
+                bz = None
+        opt = None
+        if isin:
+            try:
+                opt = moex_bond_options(isin)
+            except Exception:  # noqa: BLE001
+                opt = None
+
+        mat = ((b or {}).get("maturity") or "")[:10]
+        name = r.get("name") or (b or {}).get("name") or r.get("ticker") or isin
+        ticker = r.get("ticker") or ""
+
+        try:
+            offs = offer_kinds(bz, opt, (b or {}).get("call"), today)
+        except Exception:  # noqa: BLE001
+            offs = []
+
+        raw_coupons = list((bz or {}).get("coupons") or [])
+        if not raw_coupons and isin:
+            try:
+                sched = moex_coupon_schedule(isin)
+            except Exception:  # noqa: BLE001
+                sched = []
+            raw_coupons = [{"coupondate": d, "value": v, "valueprc": None} for d, v in sched]
+        if not raw_coupons and (b or {}).get("coupons"):
+            raw_coupons = [{"coupondate": d, "value": v, "valueprc": None} for d, v in b["coupons"]]
+
+        coupons = sorted(
+            [c for c in raw_coupons if c.get("coupondate")],
+            key=lambda c: c["coupondate"]
+        )
+
+        for o in offs:
+            if o.get("kind") != "put" or o.get("status") == "cancelled":
+                continue
+            od = (o.get("date") or "")[:10]
+            if not od or not (today <= od <= end_date):
+                continue
+            if mat and od >= mat:
+                continue
+
+            cur_c = None
+            for c in coupons:
+                cd = c["coupondate"][:10]
+                if cd <= od and ((c.get("valueprc") or 0) > 0 or (c.get("value") or 0) > 0):
+                    cur_c = c
+            post_c = [c for c in coupons if c["coupondate"][:10] > od and (not mat or c["coupondate"][:10] <= mat)]
+            nxt = post_c[0] if post_c else None
+
+            kind = None
+            cur_rate = float(cur_c["valueprc"]) if cur_c and cur_c.get("valueprc") is not None else None
+            nxt_rate = float(nxt["valueprc"]) if nxt and nxt.get("valueprc") is not None else None
+            cur_val = float(cur_c["value"]) if cur_c and cur_c.get("value") is not None else None
+            nxt_val = float(nxt["value"]) if nxt and nxt.get("value") is not None else None
+
+            if nxt is None:
+                kind = "blind_put"
+            else:
+                declared = (nxt_rate is not None and nxt_rate > 0) or (nxt_val is not None and nxt_val > 0)
+                if not declared:
+                    kind = "blind_put"
+                elif cur_c is not None:
+                    if nxt_rate is not None and cur_rate is not None and nxt_rate > 0 and cur_rate > 0:
+                        if nxt_rate < cur_rate - 1e-6:
+                            kind = "coupon_cut"
+                    elif nxt_val is not None and cur_val is not None and nxt_val > 0 and cur_val > 0:
+                        if nxt_val < cur_val - 1e-6:
+                            kind = "coupon_cut"
+
+            if kind:
+                days_left = (datetime.strptime(od, "%Y-%m-%d").date() - t_dt).days
+                items.append({
+                    "kind": kind, "date": od, "days_left": days_left,
+                    "isin": isin, "ticker": ticker, "name": name,
+                    "value_rub": r.get("value_rub"),
+                    "cur_rate": cur_rate, "next_rate": nxt_rate,
+                    "cur_val": cur_val, "next_val": nxt_val,
+                })
+
+        fc = ((b or {}).get("cur") or r.get("cur") or "rub").lower()
+        k_ = 1.0 if fc == "rub" else ((rates or {}).get(fc) or 1.0)
+        for a in (bz or {}).get("amort") or []:
+            ad = (a.get("amortdate") or "")[:10]
+            av = float(a.get("value") or 0.0)
+            aprc = a.get("valueprc")
+            if not ad or av <= 0 or not (today <= ad <= end_date):
+                continue
+            if mat and ad >= mat:
+                continue
+            if not mat and aprc is not None and float(aprc) >= 100.0 - 1e-6:
+                continue
+            days_left = (datetime.strptime(ad, "%Y-%m-%d").date() - t_dt).days
+            items.append({
+                "kind": "amort", "date": ad, "days_left": days_left,
+                "isin": isin, "ticker": ticker, "name": name,
+                "value": av, "valueprc": float(aprc) if aprc is not None else None,
+                "amount_rub": av * float(r.get("qty") or 0) * k_,
+                "value_rub": r.get("value_rub"),
+            })
+
+    items.sort(key=lambda x: (x["date"], x["kind"], x["name"]))
+    counts = {"blind_put": 0, "coupon_cut": 0, "amort": 0}
+    for it in items:
+        counts[it["kind"]] = counts.get(it["kind"], 0) + 1
+    counts["total"] = len(items)
+    return {"today": today, "horizon_days": horizon_days, "items": items, "counts": counts}
+
 
 
 

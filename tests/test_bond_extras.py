@@ -199,5 +199,85 @@ class PortfolioConcentration(Patch):
         self.assertEqual(c["warnings"], [])
 
 
+class OfferAmortRadar(Patch):
+    TODAY = "2026-11-01"
+
+    def test_blind_put_coupon_cut_and_partial_amort(self):
+        bz_map = {
+            "RU000BLIND01": {
+                "coupons": [
+                    {"coupondate": "2026-11-20", "value": 45.0, "valueprc": 18.0},
+                    {"coupondate": "2027-02-20", "value": 0.0, "valueprc": None},
+                ],
+                "amort": [],
+                "offers": [{"offerdate": "2026-11-20", "offertype": "Оферта put"}],
+            },
+            "RU000CUT0002": {
+                "coupons": [
+                    {"coupondate": "2026-12-01", "value": 45.0, "valueprc": 18.0},
+                    {"coupondate": "2027-03-01", "value": 30.0, "valueprc": 12.0},
+                ],
+                "amort": [],
+                "offers": [{"offerdate": "2026-12-01", "offertype": "Оферта put"}],
+            },
+            "RU000AMORT03": {
+                "coupons": [{"coupondate": "2026-12-15", "value": 35.0, "valueprc": 14.0}],
+                "amort": [
+                    {"amortdate": "2026-12-15", "value": 250.0, "valueprc": 25.0},
+                    {"amortdate": "2027-12-15", "value": 750.0, "valueprc": 75.0},
+                ],
+                "offers": [],
+            },
+            "RU000SAFE004": {
+                "coupons": [
+                    {"coupondate": "2026-11-25", "value": 35.0, "valueprc": 14.0},
+                    {"coupondate": "2027-02-25", "value": 40.0, "valueprc": 16.0},
+                ],
+                "amort": [{"amortdate": "2026-11-25", "value": 1000.0, "valueprc": 100.0}],
+                "offers": [
+                    {"offerdate": "2026-11-25", "offertype": "Оферта put"},
+                    {"offerdate": "2027-06-01", "offertype": "Оферта put"},
+                ],
+            },
+        }
+        infos = {
+            "u1": {"maturity": "2028-01-01", "cur": "rub"},
+            "u2": {"maturity": "2028-01-01", "cur": "rub"},
+            "u3": {"maturity": "2027-12-15", "cur": "rub"},
+            "u4": {"maturity": "2026-11-25", "cur": "rub"},
+        }
+        self.patch(
+            moex_bondization=lambda isin: bz_map.get(isin),
+            moex_bond_options=lambda isin: None,
+            moex_coupon_schedule=lambda isin: [],
+        )
+        rows = [
+            {"type": "bond", "uid": "u1", "isin": "RU000BLIND01", "name": "Слепой Пут", "qty": 10, "cur": "rub", "value_rub": 10000.0},
+            {"type": "bond", "uid": "u2", "isin": "RU000CUT0002", "name": "Снижение Купона", "qty": 5, "cur": "rub", "value_rub": 5000.0},
+            {"type": "bond", "uid": "u3", "isin": "RU000AMORT03", "name": "Амортизация", "qty": 4, "cur": "rub", "value_rub": 4000.0},
+            {"type": "bond", "uid": "u4", "isin": "RU000SAFE004", "name": "Погашение", "qty": 2, "cur": "rub", "value_rub": 2000.0},
+        ]
+        rad = T.offer_amort_radar(None, rows, today=self.TODAY, horizon_days=60, infos=infos)
+        self.assertEqual(rad["counts"], {"blind_put": 1, "coupon_cut": 1, "amort": 1, "total": 3})
+        by_isin = {x["isin"]: x for x in rad["items"]}
+        self.assertEqual(by_isin["RU000BLIND01"]["kind"], "blind_put")
+        self.assertEqual(by_isin["RU000BLIND01"]["days_left"], 19)
+        self.assertEqual(by_isin["RU000CUT0002"]["kind"], "coupon_cut")
+        self.assertEqual(by_isin["RU000CUT0002"]["cur_rate"], 18.0)
+        self.assertEqual(by_isin["RU000CUT0002"]["next_rate"], 12.0)
+        self.assertEqual(by_isin["RU000AMORT03"]["kind"], "amort")
+        self.assertAlmostEqual(by_isin["RU000AMORT03"]["amount_rub"], 1000.0)
+        self.assertNotIn("RU000SAFE004", by_isin)
+
+    def test_offline_missing_data_safe(self):
+        def boom(_):
+            raise RuntimeError("offline")
+        self.patch(moex_bondization=boom, moex_bond_options=boom, moex_coupon_schedule=boom)
+        rows = [{"type": "bond", "uid": "u1", "isin": "RU000OFFLINE", "name": "Офлайн", "qty": 1, "cur": "rub", "value_rub": 1000.0}]
+        rad = T.offer_amort_radar(None, rows, today=self.TODAY, horizon_days=60, infos={"u1": {"maturity": "2028-01-01"}})
+        self.assertEqual(rad["items"], [])
+        self.assertEqual(rad["counts"]["total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

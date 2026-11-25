@@ -79,8 +79,34 @@ function pBonds(){
       <p class="note">Параллельный сдвиг доходностей всех выпусков с полной переоценкой по графику выплат (для выпусков без данных MOEX, помечены ≈, — по модиф. дюрации). Не учитывает изменения кредитных спредов.</p></div>
     ${ratingsCard(b)}
     ${typeof concCard==='function'?concCard((S.data&&S.data.concentration)||b.concentration):''}
+    ${radarCard(b.radar,false)}
     ${insightsCard(b)}
     <p class="note">Доходность — эффективная годовая по текущей цене с НКД. Если у выпуска есть пут-оферта, это доходность к ней (пометка «к пут»: держатель сам решает, предъявлять ли бумагу). Если есть колл эмитента, показана доходность к худшему (YTW) — меньшая из доходности к погашению и к колл-датам («к погаш.» или «к колл»): эмитент может погасить выпуск досрочно, рассчитывать на дату колла нельзя, подробности — во всплывающей подсказке. Если тип оферты не указан, показана доходность к её дате («оф.?»). Для флоатеров ещё не объявленные купоны оценены как ключевая ставка по прогнозу + спред эмитента (спред взят по последним известным купонам); MOEX считает по неизменному купону, поэтому доходности флоатеров здесь могут отличаться от биржевых. Дюрация — по Маколею, в годах. «После НДФЛ» — упрощённо: 13% с купонов и с положительной разницы между погашением и ценой покупки (без прогрессивной ставки 15% и ЛДВ). Пометка ≈ — график выплат MOEX недоступен, расчёт приблизительный.<br>IRR портфеля — единая ставка дисконтирования всех будущих выплат (купоны, амортизации, погашения и оферты, валютные выпуски по текущему курсу) к стоимости портфеля с НКД; по нему видно, сколько в итоге заработает вся «корзина». Средневзвешенная — просто среднее по выпускам. В обе цифры входят все выпуски без исключений.${hy.length?` Высокий риск дефолта (доходность выше 100%, ${M(m.high_yield_value,'rub',0)}): ${hy.map(o=>esc(o.name)+' '+pctp(o.ytm,0)).join(', ')} — такая ставка показывает цену риска, а не обещанный доход.`:''}${kr&&kr.source!=='none'?`<br>Прогноз ключевой ставки для флоатеров: ${esc(kr.name)}${kr.as_of?`, на ${esc(kr.as_of)}`:''}; сейчас ${kr.key_rate!=null?pctp(kr.key_rate,2):'—'}${(kr.yearly||[]).length?`, средняя по годам: ${kr.yearly.slice(0,4).map(y=>y.year+' — '+pctp(y.mid,1)).join(', ')}`:''}. Источник меняется в «Настройках».`:''}</p>`;
+}
+
+function radarCard(rad,compact){
+  const items=(rad&&rad.items)||[];
+  if(!items.length)return'';
+  const KIND={
+    blind_put:{l:'Пут-оферта без купона',c:'var(--neg)'},
+    coupon_cut:{l:'Снижение купона после оферты',c:'var(--warn)'},
+    amort:{l:'Частичная амортизация',c:'var(--s1)'}
+  };
+  const show=compact?items.slice(0,5):items;
+  const rows=show.map(x=>{
+    const k=KIND[x.kind]||{l:x.kind,c:'var(--mu)'};
+    let det='';
+    if(x.kind==='blind_put')det='купон после оферты не объявлен';
+    else if(x.kind==='coupon_cut'){
+      det=x.cur_rate!=null&&x.next_rate!=null?`ставка ${pctp(x.cur_rate,2)} -> ${pctp(x.next_rate,2)}`:(x.cur_val!=null&&x.next_val!=null?`купон ${M(x.cur_val)} -> ${M(x.next_val)}`:'купон снижен');
+    }else if(x.kind==='amort'){
+      det=`выплата ${M(x.amount_rub,'rub',0)}${x.valueprc!=null?' ('+pctp(x.valueprc,1)+' номинала)':''}`;
+    }
+    const attr=x.isin?` data-isin="${esc(x.isin)}" style="cursor:pointer;border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"`:` style="border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"`;
+    return`<div${attr}><div class="row" style="justify-content:space-between;gap:8px;flex-wrap:wrap"><span><b>${esc(x.name)}</b> <span class="tag" style="color:${k.c}">${k.l}</span></span><span class="num mu">${ddm(x.date)} (через ${x.days_left} дн.)</span></div><div class="t2" style="margin-top:3px;font-size:12.5px">${det}</div></div>`;
+  }).join('');
+  const more=compact&&items.length>5?`<div class="mu" style="font-size:12px;margin-top:4px">И ещё ${items.length-5} во вкладке «Облигации».</div>`:'';
+  return`<div class="card"><h2>Радар оферт и амортизаций<span class="sp">ближайшие ${rad.horizon_days||60} дней · событий: ${items.length}</span></h2>${rows}${more}</div>`;
 }
 
 
