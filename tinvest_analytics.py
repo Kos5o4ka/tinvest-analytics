@@ -4875,7 +4875,7 @@ def tbank_parse(table, splits=None):
     for key, p in sorted(meta_pos.items()):
         nm = p["name"] or name_of.get(key) or key
         unit = first_unit.get(key, 0.0)
-        if p["econ_open"] > 0.5:
+        if p["econ_open"] > 1e-6:
             q = p["econ_open"]
             ops.append(dict({"id": "tb-open-sec-%s-%s" % (key, period["from"]), "date": open_iso,
                              "type": "OPERATION_TYPE_INPUT_SECURITIES", "payment": to_money(0, "rub"),   # деньги не двигаются: оценка — в price
@@ -4886,7 +4886,7 @@ def tbank_parse(table, splits=None):
         r = p["resid"]
         if key in redeemed and p["econ_close"] < 0.5 and r < -0.5:
             r = 0.0  # списание бумаг — это погашение, его уже учтёл денежный раздел
-        if abs(r) <= 0.5:
+        if abs(r) <= 1e-6:
             r = 0.0
         # FIFO не знает коротких позиций: если продаж больше, чем бумаг на руках (продажа «с плеча» с покрытием через
         # секунды), недостающее довносим входящей операцией перед продажей и снимаем после покупки-покрытия
@@ -4899,16 +4899,16 @@ def tbank_parse(table, splits=None):
             if dq < 0:
                 take = min(run, -dq)
                 run -= take
-                if -dq - take > 0.5:
+                if -dq - take > 1e-6:
                     extra.append((True, -dq - take, t - timedelta(seconds=1), u))
                     short += -dq - take
             else:
                 c = min(short, dq)
-                if c > 0.5:
+                if c > 1e-6:
                     extra.append((False, c, t + timedelta(seconds=1), u))
                     short -= c
                 run += dq - c
-        if short > 0.5:
+        if short > 1e-6:
             extra.append((False, short, end_dt, unit))
         if r > 0:
             extra.append((True, r, start.replace(second=1), unit))
@@ -5309,9 +5309,9 @@ def vtb_parse(table, splits=None):
         r = p["resid"]
         if isin in redeemed and p["econ_close"] < 0.5 and r < -0.5:
             r = 0.0  # погашение: бумаги списаны, это учёл денежный раздел
-        if abs(r) <= 0.5:
+        if abs(r) <= 1e-6:
             r = 0.0
-        if p["econ_open"] > 0.5:
+        if p["econ_open"] > 1e-6:
             ops.append(dict({"id": "vtb-open-sec-%s-%s" % (isin, period["from"]), "date": open_iso,
                              "type": "OPERATION_TYPE_INPUT_SECURITIES", "payment": to_money(0, "rub"),
                              "name": nm, "_ident": isin, "quantity": tb_qty_str(p["econ_open"]),
@@ -5328,16 +5328,16 @@ def vtb_parse(table, splits=None):
             if q < 0:
                 take = min(run, -q)
                 run -= take
-                if -q - take > 0.5:
+                if -q - take > 1e-6:
                     extra.append((True, -q - take, t - timedelta(seconds=1), u))
                     short += -q - take
             else:
                 c = min(short, q)
-                if c > 0.5:
+                if c > 1e-6:
                     extra.append((False, c, t + timedelta(seconds=1), u))
                     short -= c
                 run += q - c
-        if short > 0.5:
+        if short > 1e-6:
             extra.append((False, short, end_dt, unit))
         # движение без сделки с известной датой — отдельными операциями, остаток нерасшифрованного — на границе периода
         for x, sign in xfer:
@@ -5496,7 +5496,7 @@ def import_apply_splits(ops, until=None):
             while ei < idx:
                 qty *= evs[ei][1]
                 ei += 1
-            if qty <= 0.5:
+            if qty <= 1e-6:
                 continue
             new_q = qty * ratio
             new_q = int(round(new_q)) if abs(new_q - round(new_q)) < 1e-6 else round(new_q, 6)

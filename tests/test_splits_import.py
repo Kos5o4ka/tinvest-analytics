@@ -126,6 +126,19 @@ class SplitTest(unittest.TestCase):
         ops, _ = parse(f)
         self.assertFalse([o for o in fin(ops) if o["id"].startswith("split:")])
 
+    def test_fractional_position_split(self):
+        deals = [deal("F1", "01.03.2025", "11:00:00", "Покупка", CODE, 0.25, 250.0)]
+        f = rep("01.01.2025", "30.06.2025", deals, [cash("01.02.2025", "10:00:00", "02.02.2025", "Пополнение счета", cr=250.0)],
+                (0.0, 0.0), [(CODE, ISIN, 0, 0.25, 0, 2.5, 2.5)])
+        ops, meta = parse(f)
+        self.assertEqual(meta["pos"][ISIN]["resid"], 0.0)
+        out = fin(ops)
+        pair = {o["id"]: o for o in out if o["id"].startswith("split:")}
+        self.assertEqual(sorted(pair), ["split:%s:2025-04-17:in" % ISIN, "split:%s:2025-04-17:out" % ISIN])
+        self.assertEqual(pair["split:%s:2025-04-17:out" % ISIN]["quantity"], "0.25")
+        self.assertEqual(pair["split:%s:2025-04-17:in" % ISIN]["quantity"], "2.5")
+        self.assertAlmostEqual(M.fifo(out)["imp:" + ISIN]["qty"], 2.5, places=6)
+
 
 class SplitSource(unittest.TestCase):
     def test_no_network_means_no_splits(self):

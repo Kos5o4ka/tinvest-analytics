@@ -411,7 +411,7 @@ def tbank_parse(table, splits=None):
     for key, p in sorted(meta_pos.items()):
         nm = p["name"] or name_of.get(key) or key
         unit = first_unit.get(key, 0.0)
-        if p["econ_open"] > 0.5:
+        if p["econ_open"] > 1e-6:
             q = p["econ_open"]
             ops.append(dict({"id": "tb-open-sec-%s-%s" % (key, period["from"]), "date": open_iso,
                              "type": "OPERATION_TYPE_INPUT_SECURITIES", "payment": to_money(0, "rub"),   # деньги не двигаются: оценка — в price
@@ -422,7 +422,7 @@ def tbank_parse(table, splits=None):
         r = p["resid"]
         if key in redeemed and p["econ_close"] < 0.5 and r < -0.5:
             r = 0.0  # списание бумаг — это погашение, его уже учтёл денежный раздел
-        if abs(r) <= 0.5:
+        if abs(r) <= 1e-6:
             r = 0.0
         # FIFO не знает коротких позиций: если продаж больше, чем бумаг на руках (продажа «с плеча» с покрытием через
         # секунды), недостающее довносим входящей операцией перед продажей и снимаем после покупки-покрытия
@@ -435,16 +435,16 @@ def tbank_parse(table, splits=None):
             if dq < 0:
                 take = min(run, -dq)
                 run -= take
-                if -dq - take > 0.5:
+                if -dq - take > 1e-6:
                     extra.append((True, -dq - take, t - timedelta(seconds=1), u))
                     short += -dq - take
             else:
                 c = min(short, dq)
-                if c > 0.5:
+                if c > 1e-6:
                     extra.append((False, c, t + timedelta(seconds=1), u))
                     short -= c
                 run += dq - c
-        if short > 0.5:
+        if short > 1e-6:
             extra.append((False, short, end_dt, unit))
         if r > 0:
             extra.append((True, r, start.replace(second=1), unit))

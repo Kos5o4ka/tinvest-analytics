@@ -307,6 +307,19 @@ class TBankEntry(unittest.TestCase):
         self.assertIsNone(M.tbank_try("g.xlsx", generic))
         self.assertIn("mapping", M.import_preview_any("g.xlsx", generic))
 
+    def test_fractional_opening_and_short_cover(self):
+        # входящий остаток 0.25 шт. и внутридневной шорт 0.4 шт. не должны отбрасываться порогом 0.5
+        deals = [deal("SH1", "03.02.2025", "11:00:00", "Продажа", ISIN2, 0.4, 400.0),
+                 deal("SH2", "03.02.2025", "11:05:00", "Покупка", ISIN2, 0.4, 400.0)]
+        t = report("01.01.2025", "30.06.2025", deals, [], 0.0, 0.0,
+                   [(ISIN, ISIN, 0.25, 0, 0, 0.25, 0.25), (ISIN2, ISIN2, 0, 0.4, 0.4, 0, 0)])
+        ops, _meta = parse(t)
+        opening = [o for o in ops if o["id"].startswith("tb-open-sec-%s" % ISIN)]
+        self.assertEqual(len(opening), 1)
+        self.assertEqual(opening[0]["quantity"], "0.25")
+        xfers = [o for o in ops if o["id"].startswith("tb-xfer-") and o.get("_ident") == ISIN2]
+        self.assertEqual(len(xfers), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

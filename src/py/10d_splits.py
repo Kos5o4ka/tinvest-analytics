@@ -112,7 +112,7 @@ def import_apply_splits(ops, until=None):
             while ei < idx:
                 qty *= evs[ei][1]
                 ei += 1
-            if qty <= 0.5:
+            if qty <= 1e-6:
                 continue
             new_q = qty * ratio
             new_q = int(round(new_q)) if abs(new_q - round(new_q)) < 1e-6 else round(new_q, 6)
