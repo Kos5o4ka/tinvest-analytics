@@ -59,7 +59,31 @@ function pDash(){
     <div class="g g2"><div class="card"><h2>Доходность по месяцам<span class="sp">последние 12 мес</span></h2>${mret}</div>
     <div class="card"><h2>Ближайшие выплаты<span class="sp">купоны · дивиденды · погашения</span></h2>${pays}</div></div>
     <div class="g g2"><div class="card"><h2>Крупнейшие позиции<span class="sp">стоимость · P&amp;L</span></h2>${topHtml}</div>
-    <div class="card"><h2>Кто платит дивиденды и купоны<span class="sp">${periodName()}</span></h2>${incHtml}</div></div>`+marg;
+    <div class="card"><h2>Кто платит дивиденды и купоны<span class="sp">${periodName()}</span></h2>${incHtml}</div></div>`+concCard(d.concentration)+marg;
+}
+
+function concCard(c){
+  if(!c||!c.total)return'';
+  const b=c.below_a_minus||{},u=c.unrated_bonds||{},ws=c.warnings||[];
+  const wHtml=ws.length?`<div style="margin-bottom:12px">${ws.map(w=>{
+    const txt=w.kind==='sector'&&w.sector?`${esc(SECT[w.sector]||w.sector)} — ${pctp(w.value,1)} портфеля (порог ${f0(w.threshold)}%)`:esc(w.detail);
+    return`<div style="border-left:3px solid var(--${w.severity==='high'?'neg':'warn'});padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"><b>${esc(w.title)}:</b> ${txt}</div>`;
+  }).join('')}</div>`:'';
+  const iss=(c.issuers||[]).slice(0,5).map((x,i)=>({n:x.name,v:x.share,c:x.share>15?S8:PAL[i%PAL.length]}));
+  const sec=(c.sectors||[]).slice(0,5).map((x,i)=>({n:x.key?(SECT[x.key]||(x.key==='etf'?'Фонды':x.key)):'Без сектора',v:x.share,c:x.key&&x.key!=='etf'&&x.share>35?S8:PAL[i%PAL.length]}));
+  const cur=(c.currencies||[]).slice(0,5).map((x,i)=>({n:(x.cur||'rub').toUpperCase(),v:x.share,c:PAL[i%PAL.length]}));
+  return`<div class="card"><h2>Концентрация и риски портфеля<span class="sp">${c.issuers_count||0} эмитентов · топ-3 ${pctp(c.top3_share,1)}</span></h2>${wHtml}
+    <div class="g g4" style="gap:10px;margin-bottom:12px">
+      <div><div class="mu" style="font-size:12px">Макс. на эмитента</div><div class="num ${c.max_issuer_share>15?'neg':''}" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(c.max_issuer_share,1)}</div></div>
+      <div><div class="mu" style="font-size:12px">Топ-3 эмитента</div><div class="num" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(c.top3_share,1)}</div></div>
+      <div><div class="mu" style="font-size:12px">Рейтинг ниже A−</div><div class="num ${(b.share||0)>30?'neg':''}" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(b.share||0,1)}</div></div>
+      <div><div class="mu" style="font-size:12px">Облигации без рейтинга</div><div class="num" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(u.share||0,1)}</div></div>
+    </div>
+    <div class="g g3">
+      <div><div class="mu" style="font-size:12px;margin-bottom:6px">Эмитенты (топ-5)</div>${iss.length?hbars(iss,S1,x=>pctp(x.v,1),1):'<div class="mu">Нет данных</div>'}</div>
+      <div><div class="mu" style="font-size:12px;margin-bottom:6px">Секторы</div>${sec.length?hbars(sec,S3,x=>pctp(x.v,1),1):'<div class="mu">Нет данных</div>'}</div>
+      <div><div class="mu" style="font-size:12px;margin-bottom:6px">Валюты</div>${cur.length?hbars(cur,S4,x=>pctp(x.v,1),1):'<div class="mu">Нет данных</div>'}</div>
+    </div></div>`;
 }
 
 function payMonths(pays,n){

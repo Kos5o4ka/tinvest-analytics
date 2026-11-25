@@ -538,3 +538,114 @@ def bonds_report(client, rows, horizon_days=365):
             "ratings": apply_ratings(out), "ratings_info": ratings_status()}
 
 
+CONC_THRESHOLDS = {"issuer": 15.0, "sector": 35.0, "below_a_minus": 30.0}
+
+
+def portfolio_concentration(rows):
+    """Анализ концентрации портфеля по эмитентам, секторам, валютам и кредитному качеству (без сети)."""
+    active = [r for r in (rows or []) if r.get("type") != "futures" and (r.get("value_rub") or 0.0) > 0]
+    total = sum(r["value_rub"] for r in active)
+    if total <= 0:
+        return {"total": 0.0, "issuers": [], "issuers_count": 0, "max_issuer_share": 0.0, "top3_share": 0.0,
+                "sectors": [], "currencies": [],
+                "below_a_minus": {"value_rub": 0.0, "share": 0.0, "count": 0},
+                "unrated_bonds": {"value_rub": 0.0, "share": 0.0, "count": 0},
+                "thresholds": dict(CONC_THRESHOLDS), "warnings": []}
+
+    issuers = {}
+    sectors = defaultdict(float)
+    currencies = defaultdict(float)
+    below_rub, below_cnt = 0.0, 0
+    unrated_rub, unrated_cnt = 0.0, 0
+    a_minus_idx = RATING_SCALE.index("A-")
+
+    for r in active:
+        v = float(r["value_rub"])
+        rtype = r.get("type") or ""
+        cur = (r.get("ticker") or r.get("cur") or "rub")[:3].lower() if rtype == "currency" else (r.get("cur") or "rub").lower()
+        currencies[cur] += v
+        if rtype == "currency":
+            continue
+
+        isin = (r.get("isin") or "").upper()
+        if not isin and rtype == "bond":
+            try:
+                isin = bond_isin(r)
+            except Exception:  # noqa: BLE001
+                isin = ""
+        cat = None
+        if isin:
+            try:
+                cat = tcat_info(isin)
+            except Exception:  # noqa: BLE001
+                cat = None
+
+        name = (r.get("name") or (cat or {}).get("name") or r.get("ticker") or r.get("uid") or "").strip()
+        ikey = issuer_group_key(name) or name.lower()
+        if ikey not in issuers:
+            disp = "Минфин (ОФЗ)" if ikey == "минфин" else name
+            issuers[ikey] = {"key": ikey, "name": disp, "value_rub": 0.0, "count": 0}
+        issuers[ikey]["value_rub"] += v
+        issuers[ikey]["count"] += 1
+
+        sec = r.get("sector") or (cat or {}).get("sector") or ("etf" if rtype == "etf" else "")
+        sectors[sec] += v
+
+        rt = r.get("rating")
+        if rt is None and rtype == "bond":
+            try:
+                rt = best_rating(isin or r.get("ticker"), name)
+            except Exception:  # noqa: BLE001
+                rt = None
+        rv = rt.get("v") if isinstance(rt, dict) else (rt if isinstance(rt, str) else None)
+        if rv and rv in RATING_SCALE:
+            if RATING_SCALE.index(rv) > a_minus_idx:
+                below_rub += v
+                below_cnt += 1
+        elif rtype == "bond":
+            unrated_rub += v
+            unrated_cnt += 1
+
+    iss_list = sorted(issuers.values(), key=lambda x: -x["value_rub"])
+    for x in iss_list:
+        x["share"] = x["value_rub"] / total * 100.0
+    max_iss = iss_list[0]["share"] if iss_list else 0.0
+    top3 = sum(x["share"] for x in iss_list[:3])
+
+    sec_list = [{"key": k, "value_rub": val, "share": val / total * 100.0}
+                for k, val in sorted(sectors.items(), key=lambda kv: -kv[1])]
+    cur_list = [{"cur": k, "value_rub": val, "share": val / total * 100.0}
+                for k, val in sorted(currencies.items(), key=lambda kv: -kv[1])]
+
+    below_pct = below_rub / total * 100.0
+    unrated_pct = unrated_rub / total * 100.0
+
+    warnings = []
+    if max_iss > CONC_THRESHOLDS["issuer"] and iss_list:
+        top_i = iss_list[0]
+        warnings.append({"kind": "issuer", "severity": "high" if max_iss > 25.0 else "warn",
+                         "title": "Концентрация на эмитенте",
+                         "detail": "%s — %.1f%% портфеля (порог %.0f%%)" % (top_i["name"], max_iss, CONC_THRESHOLDS["issuer"]),
+                         "value": max_iss, "threshold": CONC_THRESHOLDS["issuer"]})
+    known_secs = [s for s in sec_list if s["key"] and s["key"] != "etf"]
+    if known_secs and known_secs[0]["share"] > CONC_THRESHOLDS["sector"]:
+        top_s = known_secs[0]
+        warnings.append({"kind": "sector", "severity": "warn",
+                         "title": "Перекос по сектору",
+                         "detail": "%s — %.1f%% портфеля (порог %.0f%%)" % (top_s["key"], top_s["share"], CONC_THRESHOLDS["sector"]),
+                         "value": top_s["share"], "threshold": CONC_THRESHOLDS["sector"], "sector": top_s["key"]})
+    if below_pct > CONC_THRESHOLDS["below_a_minus"]:
+        warnings.append({"kind": "rating", "severity": "high" if below_pct > 50.0 else "warn",
+                         "title": "Высокая доля бумаг ниже A-",
+                         "detail": "%.1f%% портфеля с рейтингом ниже A- (порог %.0f%%)" % (below_pct, CONC_THRESHOLDS["below_a_minus"]),
+                         "value": below_pct, "threshold": CONC_THRESHOLDS["below_a_minus"]})
+
+    return {"total": total, "issuers": iss_list[:10], "issuers_count": len(iss_list),
+            "max_issuer_share": max_iss, "top3_share": top3,
+            "sectors": sec_list, "currencies": cur_list,
+            "below_a_minus": {"value_rub": below_rub, "share": below_pct, "count": below_cnt},
+            "unrated_bonds": {"value_rub": unrated_rub, "share": unrated_pct, "count": unrated_cnt},
+            "thresholds": dict(CONC_THRESHOLDS), "warnings": warnings}
+
+
+

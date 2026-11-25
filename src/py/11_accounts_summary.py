@@ -185,6 +185,7 @@ def build_summary(cfg, acc, period, force=False):
                         "daily": extra["daily"] if extra["has_daily"] else None,
                         "daily_pct": extra["daily"] / (total - extra["daily"]) * 100 if extra["has_daily"] and total - extra["daily"] else None,
                         "positions": rows}
+    res["concentration"] = portfolio_concentration(rows)
     if len(sel) == 1 and data[0]["margin"]:
         m = data[0]["margin"]
         res["margin"] = {k: qf(m.get(k)) for k in ("liquidPortfolio", "startingMargin", "minimalMargin",

@@ -2491,6 +2491,117 @@ def bonds_report(client, rows, horizon_days=365):
             "ratings": apply_ratings(out), "ratings_info": ratings_status()}
 
 
+CONC_THRESHOLDS = {"issuer": 15.0, "sector": 35.0, "below_a_minus": 30.0}
+
+
+def portfolio_concentration(rows):
+    """Анализ концентрации портфеля по эмитентам, секторам, валютам и кредитному качеству (без сети)."""
+    active = [r for r in (rows or []) if r.get("type") != "futures" and (r.get("value_rub") or 0.0) > 0]
+    total = sum(r["value_rub"] for r in active)
+    if total <= 0:
+        return {"total": 0.0, "issuers": [], "issuers_count": 0, "max_issuer_share": 0.0, "top3_share": 0.0,
+                "sectors": [], "currencies": [],
+                "below_a_minus": {"value_rub": 0.0, "share": 0.0, "count": 0},
+                "unrated_bonds": {"value_rub": 0.0, "share": 0.0, "count": 0},
+                "thresholds": dict(CONC_THRESHOLDS), "warnings": []}
+
+    issuers = {}
+    sectors = defaultdict(float)
+    currencies = defaultdict(float)
+    below_rub, below_cnt = 0.0, 0
+    unrated_rub, unrated_cnt = 0.0, 0
+    a_minus_idx = RATING_SCALE.index("A-")
+
+    for r in active:
+        v = float(r["value_rub"])
+        rtype = r.get("type") or ""
+        cur = (r.get("ticker") or r.get("cur") or "rub")[:3].lower() if rtype == "currency" else (r.get("cur") or "rub").lower()
+        currencies[cur] += v
+        if rtype == "currency":
+            continue
+
+        isin = (r.get("isin") or "").upper()
+        if not isin and rtype == "bond":
+            try:
+                isin = bond_isin(r)
+            except Exception:  # noqa: BLE001
+                isin = ""
+        cat = None
+        if isin:
+            try:
+                cat = tcat_info(isin)
+            except Exception:  # noqa: BLE001
+                cat = None
+
+        name = (r.get("name") or (cat or {}).get("name") or r.get("ticker") or r.get("uid") or "").strip()
+        ikey = issuer_group_key(name) or name.lower()
+        if ikey not in issuers:
+            disp = "Минфин (ОФЗ)" if ikey == "минфин" else name
+            issuers[ikey] = {"key": ikey, "name": disp, "value_rub": 0.0, "count": 0}
+        issuers[ikey]["value_rub"] += v
+        issuers[ikey]["count"] += 1
+
+        sec = r.get("sector") or (cat or {}).get("sector") or ("etf" if rtype == "etf" else "")
+        sectors[sec] += v
+
+        rt = r.get("rating")
+        if rt is None and rtype == "bond":
+            try:
+                rt = best_rating(isin or r.get("ticker"), name)
+            except Exception:  # noqa: BLE001
+                rt = None
+        rv = rt.get("v") if isinstance(rt, dict) else (rt if isinstance(rt, str) else None)
+        if rv and rv in RATING_SCALE:
+            if RATING_SCALE.index(rv) > a_minus_idx:
+                below_rub += v
+                below_cnt += 1
+        elif rtype == "bond":
+            unrated_rub += v
+            unrated_cnt += 1
+
+    iss_list = sorted(issuers.values(), key=lambda x: -x["value_rub"])
+    for x in iss_list:
+        x["share"] = x["value_rub"] / total * 100.0
+    max_iss = iss_list[0]["share"] if iss_list else 0.0
+    top3 = sum(x["share"] for x in iss_list[:3])
+
+    sec_list = [{"key": k, "value_rub": val, "share": val / total * 100.0}
+                for k, val in sorted(sectors.items(), key=lambda kv: -kv[1])]
+    cur_list = [{"cur": k, "value_rub": val, "share": val / total * 100.0}
+                for k, val in sorted(currencies.items(), key=lambda kv: -kv[1])]
+
+    below_pct = below_rub / total * 100.0
+    unrated_pct = unrated_rub / total * 100.0
+
+    warnings = []
+    if max_iss > CONC_THRESHOLDS["issuer"] and iss_list:
+        top_i = iss_list[0]
+        warnings.append({"kind": "issuer", "severity": "high" if max_iss > 25.0 else "warn",
+                         "title": "Концентрация на эмитенте",
+                         "detail": "%s — %.1f%% портфеля (порог %.0f%%)" % (top_i["name"], max_iss, CONC_THRESHOLDS["issuer"]),
+                         "value": max_iss, "threshold": CONC_THRESHOLDS["issuer"]})
+    known_secs = [s for s in sec_list if s["key"] and s["key"] != "etf"]
+    if known_secs and known_secs[0]["share"] > CONC_THRESHOLDS["sector"]:
+        top_s = known_secs[0]
+        warnings.append({"kind": "sector", "severity": "warn",
+                         "title": "Перекос по сектору",
+                         "detail": "%s — %.1f%% портфеля (порог %.0f%%)" % (top_s["key"], top_s["share"], CONC_THRESHOLDS["sector"]),
+                         "value": top_s["share"], "threshold": CONC_THRESHOLDS["sector"], "sector": top_s["key"]})
+    if below_pct > CONC_THRESHOLDS["below_a_minus"]:
+        warnings.append({"kind": "rating", "severity": "high" if below_pct > 50.0 else "warn",
+                         "title": "Высокая доля бумаг ниже A-",
+                         "detail": "%.1f%% портфеля с рейтингом ниже A- (порог %.0f%%)" % (below_pct, CONC_THRESHOLDS["below_a_minus"]),
+                         "value": below_pct, "threshold": CONC_THRESHOLDS["below_a_minus"]})
+
+    return {"total": total, "issuers": iss_list[:10], "issuers_count": len(iss_list),
+            "max_issuer_share": max_iss, "top3_share": top3,
+            "sectors": sec_list, "currencies": cur_list,
+            "below_a_minus": {"value_rub": below_rub, "share": below_pct, "count": below_cnt},
+            "unrated_bonds": {"value_rub": unrated_rub, "share": unrated_pct, "count": unrated_cnt},
+            "thresholds": dict(CONC_THRESHOLDS), "warnings": warnings}
+
+
+
 
 # ═══════════════════════════════ точная математика облигаций (потоки MOEX) ═══════════════════════════════
 # Потоки считаются на одну облигацию в валюте номинала: список (дата ISO, купон, погашение номинала).
@@ -5730,6 +5841,7 @@ def build_summary(cfg, acc, period, force=False):
                         "daily": extra["daily"] if extra["has_daily"] else None,
                         "daily_pct": extra["daily"] / (total - extra["daily"]) * 100 if extra["has_daily"] and total - extra["daily"] else None,
                         "positions": rows}
+    res["concentration"] = portfolio_concentration(rows)
     if len(sel) == 1 and data[0]["margin"]:
         m = data[0]["margin"]
         res["margin"] = {k: qf(m.get(k)) for k in ("liquidPortfolio", "startingMargin", "minimalMargin",
@@ -28730,7 +28842,31 @@ function pDash(){
     <div class="g g2"><div class="card"><h2>Доходность по месяцам<span class="sp">последние 12 мес</span></h2>${mret}</div>
     <div class="card"><h2>Ближайшие выплаты<span class="sp">купоны · дивиденды · погашения</span></h2>${pays}</div></div>
     <div class="g g2"><div class="card"><h2>Крупнейшие позиции<span class="sp">стоимость · P&amp;L</span></h2>${topHtml}</div>
-    <div class="card"><h2>Кто платит дивиденды и купоны<span class="sp">${periodName()}</span></h2>${incHtml}</div></div>`+marg;
+    <div class="card"><h2>Кто платит дивиденды и купоны<span class="sp">${periodName()}</span></h2>${incHtml}</div></div>`+concCard(d.concentration)+marg;
+}
+
+function concCard(c){
+  if(!c||!c.total)return'';
+  const b=c.below_a_minus||{},u=c.unrated_bonds||{},ws=c.warnings||[];
+  const wHtml=ws.length?`<div style="margin-bottom:12px">${ws.map(w=>{
+    const txt=w.kind==='sector'&&w.sector?`${esc(SECT[w.sector]||w.sector)} — ${pctp(w.value,1)} портфеля (порог ${f0(w.threshold)}%)`:esc(w.detail);
+    return`<div style="border-left:3px solid var(--${w.severity==='high'?'neg':'warn'});padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"><b>${esc(w.title)}:</b> ${txt}</div>`;
+  }).join('')}</div>`:'';
+  const iss=(c.issuers||[]).slice(0,5).map((x,i)=>({n:x.name,v:x.share,c:x.share>15?S8:PAL[i%PAL.length]}));
+  const sec=(c.sectors||[]).slice(0,5).map((x,i)=>({n:x.key?(SECT[x.key]||(x.key==='etf'?'Фонды':x.key)):'Без сектора',v:x.share,c:x.key&&x.key!=='etf'&&x.share>35?S8:PAL[i%PAL.length]}));
+  const cur=(c.currencies||[]).slice(0,5).map((x,i)=>({n:(x.cur||'rub').toUpperCase(),v:x.share,c:PAL[i%PAL.length]}));
+  return`<div class="card"><h2>Концентрация и риски портфеля<span class="sp">${c.issuers_count||0} эмитентов · топ-3 ${pctp(c.top3_share,1)}</span></h2>${wHtml}
+    <div class="g g4" style="gap:10px;margin-bottom:12px">
+      <div><div class="mu" style="font-size:12px">Макс. на эмитента</div><div class="num ${c.max_issuer_share>15?'neg':''}" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(c.max_issuer_share,1)}</div></div>
+      <div><div class="mu" style="font-size:12px">Топ-3 эмитента</div><div class="num" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(c.top3_share,1)}</div></div>
+      <div><div class="mu" style="font-size:12px">Рейтинг ниже A−</div><div class="num ${(b.share||0)>30?'neg':''}" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(b.share||0,1)}</div></div>
+      <div><div class="mu" style="font-size:12px">Облигации без рейтинга</div><div class="num" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(u.share||0,1)}</div></div>
+    </div>
+    <div class="g g3">
+      <div><div class="mu" style="font-size:12px;margin-bottom:6px">Эмитенты (топ-5)</div>${iss.length?hbars(iss,S1,x=>pctp(x.v,1),1):'<div class="mu">Нет данных</div>'}</div>
+      <div><div class="mu" style="font-size:12px;margin-bottom:6px">Секторы</div>${sec.length?hbars(sec,S3,x=>pctp(x.v,1),1):'<div class="mu">Нет данных</div>'}</div>
+      <div><div class="mu" style="font-size:12px;margin-bottom:6px">Валюты</div>${cur.length?hbars(cur,S4,x=>pctp(x.v,1),1):'<div class="mu">Нет данных</div>'}</div>
+    </div></div>`;
 }
 
 function payMonths(pays,n){
@@ -29005,6 +29141,7 @@ function pBonds(){
       <tr><td class="l">Изменение, %</td>${sk.map(x=>`<td class="num ${cls((st[x]||{}).pct)}">${(st[x]||{}).pct!=null?pct((st[x]||{}).pct,2):'—'}</td>`).join('')}</tr></tbody></table></div>
       <p class="note">Параллельный сдвиг доходностей всех выпусков с полной переоценкой по графику выплат (для выпусков без данных MOEX, помечены ≈, — по модиф. дюрации). Не учитывает изменения кредитных спредов.</p></div>
     ${ratingsCard(b)}
+    ${typeof concCard==='function'?concCard((S.data&&S.data.concentration)||b.concentration):''}
     ${insightsCard(b)}
     <p class="note">Доходность — эффективная годовая по текущей цене с НКД. Если у выпуска есть пут-оферта, это доходность к ней (пометка «к пут»: держатель сам решает, предъявлять ли бумагу). Если есть колл эмитента, показана доходность к худшему (YTW) — меньшая из доходности к погашению и к колл-датам («к погаш.» или «к колл»): эмитент может погасить выпуск досрочно, рассчитывать на дату колла нельзя, подробности — во всплывающей подсказке. Если тип оферты не указан, показана доходность к её дате («оф.?»). Для флоатеров ещё не объявленные купоны оценены как ключевая ставка по прогнозу + спред эмитента (спред взят по последним известным купонам); MOEX считает по неизменному купону, поэтому доходности флоатеров здесь могут отличаться от биржевых. Дюрация — по Маколею, в годах. «После НДФЛ» — упрощённо: 13% с купонов и с положительной разницы между погашением и ценой покупки (без прогрессивной ставки 15% и ЛДВ). Пометка ≈ — график выплат MOEX недоступен, расчёт приблизительный.<br>IRR портфеля — единая ставка дисконтирования всех будущих выплат (купоны, амортизации, погашения и оферты, валютные выпуски по текущему курсу) к стоимости портфеля с НКД; по нему видно, сколько в итоге заработает вся «корзина». Средневзвешенная — просто среднее по выпускам. В обе цифры входят все выпуски без исключений.${hy.length?` Высокий риск дефолта (доходность выше 100%, ${M(m.high_yield_value,'rub',0)}): ${hy.map(o=>esc(o.name)+' '+pctp(o.ytm,0)).join(', ')} — такая ставка показывает цену риска, а не обещанный доход.`:''}${kr&&kr.source!=='none'?`<br>Прогноз ключевой ставки для флоатеров: ${esc(kr.name)}${kr.as_of?`, на ${esc(kr.as_of)}`:''}; сейчас ${kr.key_rate!=null?pctp(kr.key_rate,2):'—'}${(kr.yearly||[]).length?`, средняя по годам: ${kr.yearly.slice(0,4).map(y=>y.year+' — '+pctp(y.mid,1)).join(', ')}`:''}. Источник меняется в «Настройках».`:''}</p>`;
 }

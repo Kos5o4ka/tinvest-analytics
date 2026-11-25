@@ -138,5 +138,66 @@ class DefaultAlerts(Patch):
         self.assertEqual(T.defaults_alerts({}, {}, rows=[self.ROW], isins=[]), [])
 
 
+class PortfolioConcentration(Patch):
+    def test_empty_and_futures_only(self):
+        c = T.portfolio_concentration([])
+        self.assertEqual(c["total"], 0.0)
+        self.assertEqual(c["warnings"], [])
+        c2 = T.portfolio_concentration([{"type": "futures", "value_rub": 50000.0, "cur": "rub"}])
+        self.assertEqual(c2["total"], 0.0)
+
+    def test_issuers_sectors_currencies_ratings_and_warnings(self):
+        self.patch(tcat_info=lambda isin: None, best_rating=lambda isin, name: None)
+        rows = [
+            {"type": "bond", "uid": "u1", "isin": "SU26238RMFS4", "name": "ОФЗ 26238", "sector": "gov",
+             "cur": "rub", "value_rub": 20000.0, "rating": {"v": "AAA"}},
+            {"type": "bond", "uid": "u2", "isin": "SU26240RMFS0", "name": "ОФЗ 26240", "sector": "gov",
+             "cur": "rub", "value_rub": 10000.0, "rating": {"v": "AAA"}},
+            {"type": "bond", "uid": "u3", "isin": "RU000A100001", "name": "Альфа БО-П01", "sector": "financial",
+             "cur": "usd", "value_rub": 40000.0, "rating": {"v": "BBB+"}},
+            {"type": "bond", "uid": "u4", "isin": "RU000A100002", "name": "Бета БО-01", "sector": "financial",
+             "cur": "rub", "value_rub": 15000.0, "rating": None},
+            {"type": "bond", "uid": "u5", "isin": "RU000A100003", "name": "Гамма БО-01", "sector": "energy",
+             "cur": "rub", "value_rub": 5000.0, "rating": {"v": "A-"}},
+            {"type": "currency", "uid": "cash:rub", "ticker": "RUB", "name": "Рубли", "cur": "rub", "value_rub": 10000.0},
+        ]
+        c = T.portfolio_concentration(rows)
+        self.assertAlmostEqual(c["total"], 100000.0)
+        self.assertEqual(c["issuers_count"], 4)
+        self.assertAlmostEqual(c["max_issuer_share"], 40.0)
+        # top-3: Альфа (40%) + Минфин (30%) + Бета (15%) = 85%
+        self.assertAlmostEqual(c["top3_share"], 85.0)
+        self.assertEqual(c["issuers"][0]["share"], 40.0)
+        self.assertEqual(c["issuers"][1]["key"], "минфин")
+        self.assertAlmostEqual(c["issuers"][1]["share"], 30.0)
+        # sectors: financial = 55%, gov = 30%, energy = 5%
+        sec_map = {s["key"]: s["share"] for s in c["sectors"]}
+        self.assertAlmostEqual(sec_map["financial"], 55.0)
+        self.assertAlmostEqual(sec_map["gov"], 30.0)
+        # currencies: rub = 60%, usd = 40%
+        cur_map = {x["cur"]: x["share"] for x in c["currencies"]}
+        self.assertAlmostEqual(cur_map["rub"], 60.0)
+        self.assertAlmostEqual(cur_map["usd"], 40.0)
+        # ratings: BBB+ (40%) is below A-; A- (5%) is not; Бета (15%) is unrated bond
+        self.assertAlmostEqual(c["below_a_minus"]["share"], 40.0)
+        self.assertEqual(c["below_a_minus"]["count"], 1)
+        self.assertAlmostEqual(c["unrated_bonds"]["share"], 15.0)
+        self.assertEqual(c["unrated_bonds"]["count"], 1)
+        # all 3 warnings triggered: issuer 40%>15%, sector 55%>35%, rating 40%>30%
+        self.assertEqual({w["kind"] for w in c["warnings"]}, {"issuer", "sector", "rating"})
+
+    def test_no_warnings_when_diversified(self):
+        self.patch(tcat_info=lambda isin: None, best_rating=lambda isin, name: None)
+        names = ["Газпром", "Лукойл", "Сбербанк", "Яндекс", "Магнит", "Новатэк", "Полюс", "Роснефть", "Татнефть", "МТС"]
+        rows = [
+            {"type": "share", "uid": f"s{i}", "name": nm, "sector": f"sec{i % 4}",
+             "cur": "rub", "value_rub": 10000.0}
+            for i, nm in enumerate(names)
+        ]
+        c = T.portfolio_concentration(rows)
+        self.assertAlmostEqual(c["max_issuer_share"], 10.0)
+        self.assertEqual(c["warnings"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
