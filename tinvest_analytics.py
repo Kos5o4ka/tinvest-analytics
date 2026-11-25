@@ -4416,6 +4416,36 @@ def resolve_idents(client, idents):
     return out
 
 
+def _op_sem_sig(o):
+    return (
+        (o.get("date") or "")[:19],
+        classify(o.get("type")),
+        o.get("instrumentUid") or o.get("figi") or o.get("_sec") or o.get("_ident") or "",
+        round(op_qty(o), 6),
+        round(qf(o.get("payment")), 2),
+        cur_of(o.get("payment")),
+    )
+
+
+def _imp_file_sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _imp_op_ids(ops):
+    return [op_key(o) for o in ops or [] if not o.get("_opening") and not o.get("_synthetic")]
+
+
+def _imp_ops_hash(ops):
+    return hashlib.sha1("\n".join(sorted(_imp_op_ids(ops))).encode("utf-8")).hexdigest()
+
+
+def _imp_date_span(ops, meta=None):
+    if meta and meta.get("period"):
+        return meta["period"].get("from"), meta["period"].get("to")
+    ds = [(o.get("date") or "")[:10] for o in ops or [] if not o.get("_opening") and not o.get("_synthetic") and (o.get("date") or "")[:10]]
+    return (min(ds), max(ds)) if ds else (None, None)
+
+
 def _period_covered(o, periods):
     """Синтетическая «входящая» операция отчёта (_opening) не нужна, если другой, более ранний файл счёта
     покрывает начало её периода: остатки на эту дату там уже получились из самих операций."""
@@ -4432,18 +4462,44 @@ def _period_covered(o, periods):
     return False
 
 
-def import_merge_ops(old, new, periods=None):
-    """Склейка операций счёта: новые заменяют старые с тем же id, служебные «досчитанные» пополнения и
-    входящие остатки, закрытые более ранним файлом, снимаются. Порядок — по дате."""
+def import_merge_ops(old, new, periods=None, old_periods=None):
+    """Склейка операций счёта: новые заменяют старые с тем же id, дубли из пересекающегося периода
+    отсеиваются по смысловой сигнатуре, а входящие остатки закрытые ранним файлом снимаются."""
+    old_list = [o for o in (old or []) if not o.get("_synthetic")]
+    new_list = [o for o in (new or []) if not o.get("_synthetic")]
+    new_keys = {op_key(o) for o in new_list}
+    old_keys = {op_key(o) for o in old_list}
+    old_ranges = [(f, t) for f, t in (old_periods or []) if f and t]
+    if not old_ranges:
+        for o in old_list:
+            per = o.get("_period")
+            if per and len(per) == 2 and per[0] and per[1]:
+                old_ranges.append((per[0], per[1]))
+        ds = [(o.get("date") or "")[:10] for o in old_list if not o.get("_opening") and (o.get("date") or "")[:10]]
+        if ds:
+            old_ranges.append((min(ds), max(ds)))
+    avail = defaultdict(int)
+    for o in old_list:
+        if not o.get("_opening") and op_key(o) not in new_keys:
+            avail[_op_sem_sig(o)] += 1
     by_id = {}
-    for o in list(old or []) + list(new or []):
+    for o in old_list:
         by_id[op_key(o)] = o
-    ops = [o for o in by_id.values() if not o.get("_synthetic") and not _period_covered(o, periods)]
+    for o in new_list:
+        k = op_key(o)
+        if k not in old_keys and not o.get("_opening"):
+            day = (o.get("date") or "")[:10]
+            sig = _op_sem_sig(o)
+            if day and any(f <= day <= t for f, t in old_ranges) and avail.get(sig, 0) > 0:
+                avail[sig] -= 1
+                continue
+        by_id[k] = o
+    ops = [o for o in by_id.values() if not _period_covered(o, periods)]
     ops.sort(key=lambda o: (o.get("date") or "", 0 if o.get("_opening") else 1))
     return ops
 
 
-def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, synth=True):
+def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, synth=True, old_periods=None):
     """Находит бумаги, склеивает с уже сохранёнными операциями счёта (existing) и пересчитывает по всему набору:
     досчитанные пополнения (synth) и FIFO идут по всей истории, а не только по новому файлу."""
     if not keep_demo:
@@ -4471,7 +4527,8 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
         elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out",
                                                "fee_broker", "tax_trade", "tax_dividend", "tax_coupon"):
             o["instrumentUid"] = "imp:" + ident
-    ops = import_merge_ops(existing, ops, periods) if existing else sorted(ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
+    ops = import_merge_ops(existing, ops, periods, old_periods=old_periods) if existing else sorted(
+        ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
     ops = import_apply_splits(ops)   # пары обмена на дни сплитов по всей истории счёта
     # если в отчёте нет пополнений — досоздаём их, чтобы деньги на счёте не уходили в минус
     if synth and not any(classify(o["type"]) == "deposits" for o in ops):
@@ -4511,6 +4568,127 @@ def import_ops(filename, raw, table, header_row, mapping):
         raise ApiError("Таблица не найдена.", 400)
     body = [r for r in tables[table][header_row + 1:] if any(str(c).strip() for c in r)]
     return rows_to_ops(body, {k: int(v) for k, v in mapping.items() if v is not None and str(v) != ""}, tables[table][header_row])
+
+
+def find_duplicate_import(raw, ops=None, lst=None):
+    """Проверяет, не загружен ли уже этот файл (по SHA-256 или полному набору операций) в любой импортированный счёт."""
+    lst = imports_list() if lst is None else lst
+    file_sha = _imp_file_sha(raw)
+    new_ids = set(_imp_op_ids(ops)) if ops is not None else set()
+    ops_hash = _imp_ops_hash(ops) if ops is not None else None
+    for acc in lst:
+        for f in acc.get("files") or []:
+            if f.get("sha256") == file_sha:
+                return {"id": acc["id"], "name": acc.get("name") or acc["id"], "file": f.get("name") or ""}
+            if ops_hash and new_ids and f.get("ops_hash") == ops_hash:
+                return {"id": acc["id"], "name": acc.get("name") or acc["id"], "file": f.get("name") or ""}
+        if new_ids:
+            ex_ops = store().ops(acc["id"])
+            ex_ids = {op_key(o) for o in ex_ops if not o.get("_opening") and not o.get("_synthetic")}
+            if new_ids <= ex_ids:
+                return {"id": acc["id"], "name": acc.get("name") or acc["id"], "file": ""}
+    return None
+
+
+def _op_loose_sig(o):
+    return (
+        (o.get("date") or "")[:19],
+        classify(o.get("type")),
+        round(op_qty(o), 6),
+        round(qf(o.get("payment")), 2),
+        cur_of(o.get("payment")),
+    )
+
+
+def find_overlap_account(ops, lst=None):
+    """Находит существующий импортированный счёт, с которым пересекаются операции нового файла."""
+    lst = imports_list() if lst is None else lst
+    st = store()
+    new_ids = set(_imp_op_ids(ops))
+    new_sigs, new_loose = set(), set()
+    for o in ops:
+        if o.get("_opening") or o.get("_synthetic"):
+            continue
+        uid = o.get("instrumentUid") or ""
+        if not uid and o.get("_ident"):
+            uid = (st.get("find:" + o["_ident"], ttl=30 * DAY) or {}).get("uid") or ""
+        sig = ((o.get("date") or "")[:19], classify(o.get("type")), uid or o.get("_ident") or "",
+               round(op_qty(o), 6), round(qf(o.get("payment")), 2), cur_of(o.get("payment")))
+        new_sigs.add(sig)
+        if classify(o.get("type")) in ("buy", "sell", "coupons", "dividends", "repayments"):
+            new_loose.add(_op_loose_sig(o))
+    best = None
+    for acc in lst:
+        ex_ops = st.ops(acc["id"])
+        ex_ids = {op_key(o) for o in ex_ops if not o.get("_opening") and not o.get("_synthetic")}
+        hits = len(new_ids & ex_ids)
+        if not hits and new_sigs:
+            ex_sigs = {_op_sem_sig(o) for o in ex_ops if not o.get("_opening") and not o.get("_synthetic")}
+            hits = len(new_sigs & ex_sigs)
+        if not hits and new_loose:
+            ex_loose = {_op_loose_sig(o) for o in ex_ops if not o.get("_opening") and not o.get("_synthetic")}
+            hits = len(new_loose & ex_loose)
+        if hits > 0 and (best is None or hits > best["matches"]):
+            best = {"id": acc["id"], "name": acc.get("name") or acc["id"], "matches": hits}
+    return best
+
+
+def import_parse_info(body):
+    raw = base64.b64decode(body.get("data") or "")
+    ops, skipped, _fmt, _meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
+                                               int(body.get("header_row") or 0), body.get("mapping") or {})
+    kinds = defaultdict(int)
+    for o in ops:
+        kinds[classify(o["type"])] += 1
+    sample = [[o["date"][:10], op_type(o), o.get("name") or "", op_qty(o), qf(o["payment"]), cur_of(o["payment"])]
+              for o in ops[:15]]
+    lst = imports_list()
+    dup = find_duplicate_import(raw, ops, lst)
+    overlap = None if dup else find_overlap_account(ops, lst)
+    return {"count": len(ops), "skipped": skipped, "kinds": kinds, "sample": sample,
+            "from": ops[0]["date"][:10] if ops else None, "to": ops[-1]["date"][:10] if ops else None,
+            "duplicate_of": dup, "overlap_account": overlap}
+
+
+def import_commit(client, body):
+    raw = base64.b64decode(body.get("data") or "")
+    filename = body.get("filename") or ""
+    ops, skipped, fmt, meta = import_ops_any(filename, raw, int(body.get("table") or 0),
+                                             int(body.get("header_row") or 0), body.get("mapping") or {})
+    if not ops:
+        raise ApiError("В файле не нашлось операций с выбранными колонками.", 400)
+    lst = imports_list()
+    dup = find_duplicate_import(raw, ops, lst)
+    if dup:
+        raise ApiError("Этот отчёт уже загружен в счёт «%s»%s." % (
+            dup["name"], (" (файл «%s»)" % dup["file"]) if dup.get("file") else ""), 409)
+    acc_id = body.get("target") if str(body.get("target") or "").startswith("imp-") else "imp-" + uuid.uuid4().hex[:10]
+    ex = next((x for x in lst if x["id"] == acc_id), None)
+    if ex is None:
+        ex = {"id": acc_id, "name": (body.get("name") or "").strip() or "Импорт " + date.today().strftime("%d.%m.%Y"),
+              "broker": (body.get("broker") or "").strip(), "created": utc_now_str(), "files": []}
+        if fmt:
+            ex["format"] = fmt
+        ex["broker_id"] = broker_detect_import(filename, raw, fmt, ex["broker"], ex["name"])
+        lst.append(ex)
+    f_from, f_to = _imp_date_span(ops, meta)
+    finfo = {"name": filename, "count": len(ops), "at": utc_now_str(),
+             "sha256": _imp_file_sha(raw), "ops_hash": _imp_ops_hash(ops)}
+    if f_from and f_to:
+        finfo["from"], finfo["to"] = f_from, f_to
+    old_periods = [(f.get("from"), f.get("to")) for f in ex["files"] if f.get("from") and f.get("to")]
+    periods = old_periods + ([(f_from, f_to)] if f_from and f_to else [])
+    ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) if ex["files"] else None,
+                               periods=periods, synth=not fmt, old_periods=old_periods)
+    ex["files"].append(finfo)
+    ex["ops"] = len(ops)
+    store().ops_clear(acc_id)
+    store().ops_put(acc_id, ops)
+    store().put("imports", lst)
+    mem_clear()
+    found = sum(1 for v in ids.values() if v.get("uid"))
+    return {"ok": True, "id": acc_id, "count": finfo["count"], "total": len(ops), "skipped": skipped,
+            "resolved": found, "idents": len(ids)}
 
 
 TEMPLATE_CSV = ("Дата;Тип операции;ISIN;Тикер;Название;Количество;Цена;Сумма;Валюта;Комиссия;НКД\n"
@@ -5271,7 +5449,11 @@ def tbank_preview(ops, meta):
 
 def import_preview_any(filename, raw):
     hit = broker_try(filename, raw)
-    return tbank_preview(*hit) if hit else import_preview(filename, raw)
+    res = tbank_preview(*hit) if hit else import_preview(filename, raw)
+    dup = find_duplicate_import(raw, hit[0] if hit else None)
+    if dup:
+        res["duplicate_of"] = dup
+    return res
 
 
 def import_ops_any(filename, raw, table, header_row, mapping):
@@ -5828,6 +6010,10 @@ def mem_put(key, val):
 def mem_clear():
     with _mem_lock:
         _mem.clear()
+    try:
+        store().write("DELETE FROM kv WHERE k LIKE 'res:%'")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def imports_list():
@@ -26797,49 +26983,9 @@ class Handler(BaseHTTPRequestHandler):
                 pv["broker_id"], pv["broker_name"] = bid, BROKERS[bid]
                 return self.send(200, pv)
             if path == "/api/import/parse":
-                raw = base64.b64decode(body.get("data") or "")
-                ops, skipped, _fmt, _meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
-                                                           int(body.get("header_row") or 0), body.get("mapping") or {})
-                kinds = defaultdict(int)
-                for o in ops:
-                    kinds[classify(o["type"])] += 1
-                sample = [[o["date"][:10], op_type(o), o.get("name") or "", op_qty(o), qf(o["payment"]), cur_of(o["payment"])]
-                          for o in ops[:15]]
-                return self.send(200, {"count": len(ops), "skipped": skipped, "kinds": kinds, "sample": sample,
-                                       "from": ops[0]["date"][:10] if ops else None, "to": ops[-1]["date"][:10] if ops else None})
+                return self.send(200, import_parse_info(body))
             if path == "/api/import/commit":
-                raw = base64.b64decode(body.get("data") or "")
-                ops, skipped, fmt, meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
-                                                         int(body.get("header_row") or 0), body.get("mapping") or {})
-                if not ops:
-                    raise ApiError("В файле не нашлось операций с выбранными колонками.", 400)
-                acc_id = body.get("target") if str(body.get("target") or "").startswith("imp-") else "imp-" + uuid.uuid4().hex[:10]
-                lst = imports_list()
-                ex = next((x for x in lst if x["id"] == acc_id), None)
-                if ex is None:
-                    ex = {"id": acc_id, "name": (body.get("name") or "").strip() or "Импорт " + date.today().strftime("%d.%m.%Y"),
-                          "broker": (body.get("broker") or "").strip(), "created": utc_now_str(), "files": []}
-                    if fmt:
-                        ex["format"] = fmt
-                    ex["broker_id"] = broker_detect_import(body.get("filename") or "", raw, fmt, ex["broker"], ex["name"])
-                    lst.append(ex)
-                finfo = {"name": body.get("filename") or "", "count": len(ops), "at": utc_now_str()}
-                if meta:
-                    finfo["from"], finfo["to"] = meta["period"]["from"], meta["period"]["to"]
-                periods = [(f.get("from"), f.get("to")) for f in ex["files"] if f.get("from")] + \
-                          ([(finfo["from"], finfo["to"])] if meta else [])
-                # новый файл склеивается со всеми операциями счёта: FIFO и «досчитанные» пополнения считаются по всей истории
-                ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) if ex["files"] else None,
-                                           periods=periods, synth=not fmt)
-                ex["files"].append(finfo)
-                ex["ops"] = len(ops)
-                store().ops_clear(acc_id)
-                store().ops_put(acc_id, ops)
-                store().put("imports", lst)
-                mem_clear()
-                found = sum(1 for v in ids.values() if v.get("uid"))
-                return self.send(200, {"ok": True, "id": acc_id, "count": finfo["count"], "total": len(ops), "skipped": skipped,
-                                       "resolved": found, "idents": len(ids)})
+                return self.send(200, import_commit(client, body))
             if path == "/api/import/broker":
                 bid = str(body.get("broker_id") or "")
                 if bid not in BROKERS:
@@ -31186,9 +31332,9 @@ async function renderImport(){
         <label class="field"><span>Брокер</span><input class="in" id="ibroker" placeholder="Сбер, ВТБ, БКС…" value="${esc(im&&im.broker||'')}"></label></div>
       <p class="note" style="margin-top:12px">Лучше всего подходит выгрузка всех операций (сделки + движение денег) за всё время. Если формат не распознаётся — заполните <a href="/api/import/template.csv" style="color:var(--ac)">шаблон CSV</a>. Бумаги находятся по ISIN или тикеру через API Т-Инвестиций, чтобы подтянуть текущие цены, названия, логотипы и купоны. Данные сохраняются только в локальной базе.</p></div>
     ${step}
-    <div class="card"><h2>Импортированные счета</h2>${imps.length?`<div class="li">${imps.map(x=>`<div class="it">${logo({name:x.name,ticker:x.name},34)}<div><b>${esc(x.name)}</b><small>${esc(x.broker||'')}${x.broker?' · ':''}файлов: ${x.files.length} · операций: ${f0(x.ops||x.files.reduce((a,f)=>a+f.count,0))}</small></div>
-      <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div></div>`;
-  const msg=(t,k)=>{$('#imsg').innerHTML=t?`<div class="msg ${k||'err'}">${t}</div>`:''};
+    <div class="card"><h2>Импортированные счета</h2>${imps.length?`<div class="li">${imps.map(x=>{const ps=(x.files||[]).map(f=>f.from&&f.to?[f.from,f.to]:null).filter(Boolean);const span=ps.length?` · ${ddm(ps.map(p=>p[0]).sort()[0])} — ${ddm(ps.map(p=>p[1]).sort().slice(-1)[0])}`:'';return`<div class="it">${logo({name:x.name,ticker:x.name},34)}<div><b>${esc(x.name)}</b><small>${esc(x.broker||'')}${x.broker?' · ':''}файлов: ${x.files.length} · операций: ${f0(x.ops||x.files.reduce((a,f)=>a+f.count,0))}${span}</small></div>
+      <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`}).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div></div>`;
+  const msg=(t,k)=>{$('#imsg').innerHTML=t?`<div class="msg ${k||'err'}">${t}</div>`:'';if(t)$('#imsg').scrollIntoView({block:'nearest'})};
   const drop=$('#drop'),inp=$('#ifile');
   drop.onclick=()=>inp.click();
   drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};drop.ondragleave=()=>drop.classList.remove('over');
@@ -31201,7 +31347,10 @@ async function renderImport(){
     try{const pv=await post('/api/import/preview',{filename:f.name,data});
       const t=!!pv.format,bn=IMP_BROKER[pv.format]||(pv.broker_id&&pv.broker_id!=='other'?pv.broker_name:'')||'';
       S.imp={filename:f.name,data,preview:pv,mapping:pv.mapping,name:$('#iname').value||(t?bn||pv.title:f.name.replace(/\.[^.]+$/,'')),broker:$('#ibroker').value||bn,
-        target:t&&pv.targets&&pv.targets.length?pv.targets[0].id:$('#itarget').value};msg('');renderImport()}
+        target:t&&pv.targets&&pv.targets.length?pv.targets[0].id:$('#itarget').value};
+      await renderImport();
+      if(pv.duplicate_of)msg(`Этот отчёт уже загружен в счёт «${esc(pv.duplicate_of.name)}»${pv.duplicate_of.file?` (файл «${esc(pv.duplicate_of.file)}»)`:''}. Повторный импорт будет отклонён, чтобы не дублировать сделки.`);
+      else msg('')}
     catch(e){msg(esc(e.message))}
   }
   $('#itarget').onchange=e=>{if(S.imp)S.imp.target=e.target.value};
@@ -31218,13 +31367,16 @@ async function renderImport(){
     const req=()=>({filename:im.filename,data:im.data,table:im.preview.table,header_row:im.preview.header_row,mapping:im.mapping});
     $('#iparse').onclick=async e=>{const b=e.currentTarget;b.disabled=true;
       try{const r=await post('/api/import/parse',req());const K={buy:'покупок',sell:'продаж',coupons:'купонов',dividends:'дивидендов',deposits:'пополнений',withdrawals:'выводов',fee_broker:'комиссий',tax_trade:'налогов',repayments:'погашений',fee_service:'обслуживание',margin_fee:'маржа'};
-        $('#iresult').innerHTML=`<div class="msg ${r.count?'ok':'err'}">Распознано операций: <b>${r.count}</b>${r.skipped?`, пропущено строк: ${r.skipped}`:''}${r.from?` · с ${ddm(r.from)} по ${ddm(r.to)}`:''}<br>${Object.entries(r.kinds).map(([k,v])=>`${K[k]||k}: ${v}`).join(' · ')}</div>
+        let ovNote='';
+        if(!$('#itarget').value&&r.overlap_account){$('#itarget').value=r.overlap_account.id;S.imp.target=r.overlap_account.id;ovNote=`<div class="msg info" style="margin-top:10px">Найдены пересекающиеся операции со счётом «${esc(r.overlap_account.name)}» (${r.overlap_account.matches} шт.) — выбран этот счёт, чтобы сделки за общий период не продублировались.</div>`}
+        const dupMsg=r.duplicate_of?`<div class="msg err" style="margin-top:10px">Этот отчёт уже загружен в счёт «${esc(r.duplicate_of.name)}». Повторная загрузка запрещена, чтобы сделки не задвоились.</div>`:'';
+        $('#iresult').innerHTML=`<div class="msg ${r.count?'ok':'err'}">Распознано операций: <b>${r.count}</b>${r.skipped?`, пропущено строк: ${r.skipped}`:''}${r.from?` · с ${ddm(r.from)} по ${ddm(r.to)}`:''}<br>${Object.entries(r.kinds).map(([k,v])=>`${K[k]||k}: ${v}`).join(' · ')}</div>${dupMsg}${ovNote}
           <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${r.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>
-          ${r.count?'<div class="row" style="margin-top:14px"><button class="btn" id="icommit">Импортировать</button><span class="note">Бумаги будут найдены через API Т-Инвестиций — это займёт несколько секунд.</span></div>':''}`;
+          ${r.count&&!r.duplicate_of?'<div class="row" style="margin-top:14px"><button class="btn" id="icommit">Импортировать</button><span class="note">Бумаги будут найдены через API Т-Инвестиций — это займёт несколько секунд.</span></div>':''}`;
         const c=$('#icommit');if(c)c.onclick=async ev=>{const bb=ev.currentTarget;bb.disabled=true;bb.textContent='Импортирую…';
           try{const res=await post('/api/import/commit',{...req(),name:$('#iname').value||im.name,broker:$('#ibroker').value,target:$('#itarget').value});
             S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
-            await renderImport();msg(`Импортировано операций: ${res.count}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
+            await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
           catch(err){bb.disabled=false;bb.textContent='Импортировать';msg(esc(err.message))}}}
       catch(err){$('#iresult').innerHTML=`<div class="msg err">${esc(err.message)}</div>`}finally{b.disabled=false}};
   }

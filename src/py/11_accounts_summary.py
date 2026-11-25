@@ -18,6 +18,10 @@ def mem_put(key, val):
 def mem_clear():
     with _mem_lock:
         _mem.clear()
+    try:
+        store().write("DELETE FROM kv WHERE k LIKE 'res:%'")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def imports_list():

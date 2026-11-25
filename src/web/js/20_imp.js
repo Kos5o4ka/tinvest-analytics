@@ -39,9 +39,9 @@ async function renderImport(){
         <label class="field"><span>Брокер</span><input class="in" id="ibroker" placeholder="Сбер, ВТБ, БКС…" value="${esc(im&&im.broker||'')}"></label></div>
       <p class="note" style="margin-top:12px">Лучше всего подходит выгрузка всех операций (сделки + движение денег) за всё время. Если формат не распознаётся — заполните <a href="/api/import/template.csv" style="color:var(--ac)">шаблон CSV</a>. Бумаги находятся по ISIN или тикеру через API Т-Инвестиций, чтобы подтянуть текущие цены, названия, логотипы и купоны. Данные сохраняются только в локальной базе.</p></div>
     ${step}
-    <div class="card"><h2>Импортированные счета</h2>${imps.length?`<div class="li">${imps.map(x=>`<div class="it">${logo({name:x.name,ticker:x.name},34)}<div><b>${esc(x.name)}</b><small>${esc(x.broker||'')}${x.broker?' · ':''}файлов: ${x.files.length} · операций: ${f0(x.ops||x.files.reduce((a,f)=>a+f.count,0))}</small></div>
-      <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div></div>`;
-  const msg=(t,k)=>{$('#imsg').innerHTML=t?`<div class="msg ${k||'err'}">${t}</div>`:''};
+    <div class="card"><h2>Импортированные счета</h2>${imps.length?`<div class="li">${imps.map(x=>{const ps=(x.files||[]).map(f=>f.from&&f.to?[f.from,f.to]:null).filter(Boolean);const span=ps.length?` · ${ddm(ps.map(p=>p[0]).sort()[0])} — ${ddm(ps.map(p=>p[1]).sort().slice(-1)[0])}`:'';return`<div class="it">${logo({name:x.name,ticker:x.name},34)}<div><b>${esc(x.name)}</b><small>${esc(x.broker||'')}${x.broker?' · ':''}файлов: ${x.files.length} · операций: ${f0(x.ops||x.files.reduce((a,f)=>a+f.count,0))}${span}</small></div>
+      <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`}).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div></div>`;
+  const msg=(t,k)=>{$('#imsg').innerHTML=t?`<div class="msg ${k||'err'}">${t}</div>`:'';if(t)$('#imsg').scrollIntoView({block:'nearest'})};
   const drop=$('#drop'),inp=$('#ifile');
   drop.onclick=()=>inp.click();
   drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};drop.ondragleave=()=>drop.classList.remove('over');
@@ -54,7 +54,10 @@ async function renderImport(){
     try{const pv=await post('/api/import/preview',{filename:f.name,data});
       const t=!!pv.format,bn=IMP_BROKER[pv.format]||(pv.broker_id&&pv.broker_id!=='other'?pv.broker_name:'')||'';
       S.imp={filename:f.name,data,preview:pv,mapping:pv.mapping,name:$('#iname').value||(t?bn||pv.title:f.name.replace(/\.[^.]+$/,'')),broker:$('#ibroker').value||bn,
-        target:t&&pv.targets&&pv.targets.length?pv.targets[0].id:$('#itarget').value};msg('');renderImport()}
+        target:t&&pv.targets&&pv.targets.length?pv.targets[0].id:$('#itarget').value};
+      await renderImport();
+      if(pv.duplicate_of)msg(`Этот отчёт уже загружен в счёт «${esc(pv.duplicate_of.name)}»${pv.duplicate_of.file?` (файл «${esc(pv.duplicate_of.file)}»)`:''}. Повторный импорт будет отклонён, чтобы не дублировать сделки.`);
+      else msg('')}
     catch(e){msg(esc(e.message))}
   }
   $('#itarget').onchange=e=>{if(S.imp)S.imp.target=e.target.value};
@@ -71,13 +74,16 @@ async function renderImport(){
     const req=()=>({filename:im.filename,data:im.data,table:im.preview.table,header_row:im.preview.header_row,mapping:im.mapping});
     $('#iparse').onclick=async e=>{const b=e.currentTarget;b.disabled=true;
       try{const r=await post('/api/import/parse',req());const K={buy:'покупок',sell:'продаж',coupons:'купонов',dividends:'дивидендов',deposits:'пополнений',withdrawals:'выводов',fee_broker:'комиссий',tax_trade:'налогов',repayments:'погашений',fee_service:'обслуживание',margin_fee:'маржа'};
-        $('#iresult').innerHTML=`<div class="msg ${r.count?'ok':'err'}">Распознано операций: <b>${r.count}</b>${r.skipped?`, пропущено строк: ${r.skipped}`:''}${r.from?` · с ${ddm(r.from)} по ${ddm(r.to)}`:''}<br>${Object.entries(r.kinds).map(([k,v])=>`${K[k]||k}: ${v}`).join(' · ')}</div>
+        let ovNote='';
+        if(!$('#itarget').value&&r.overlap_account){$('#itarget').value=r.overlap_account.id;S.imp.target=r.overlap_account.id;ovNote=`<div class="msg info" style="margin-top:10px">Найдены пересекающиеся операции со счётом «${esc(r.overlap_account.name)}» (${r.overlap_account.matches} шт.) — выбран этот счёт, чтобы сделки за общий период не продублировались.</div>`}
+        const dupMsg=r.duplicate_of?`<div class="msg err" style="margin-top:10px">Этот отчёт уже загружен в счёт «${esc(r.duplicate_of.name)}». Повторная загрузка запрещена, чтобы сделки не задвоились.</div>`:'';
+        $('#iresult').innerHTML=`<div class="msg ${r.count?'ok':'err'}">Распознано операций: <b>${r.count}</b>${r.skipped?`, пропущено строк: ${r.skipped}`:''}${r.from?` · с ${ddm(r.from)} по ${ddm(r.to)}`:''}<br>${Object.entries(r.kinds).map(([k,v])=>`${K[k]||k}: ${v}`).join(' · ')}</div>${dupMsg}${ovNote}
           <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${r.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>
-          ${r.count?'<div class="row" style="margin-top:14px"><button class="btn" id="icommit">Импортировать</button><span class="note">Бумаги будут найдены через API Т-Инвестиций — это займёт несколько секунд.</span></div>':''}`;
+          ${r.count&&!r.duplicate_of?'<div class="row" style="margin-top:14px"><button class="btn" id="icommit">Импортировать</button><span class="note">Бумаги будут найдены через API Т-Инвестиций — это займёт несколько секунд.</span></div>':''}`;
         const c=$('#icommit');if(c)c.onclick=async ev=>{const bb=ev.currentTarget;bb.disabled=true;bb.textContent='Импортирую…';
           try{const res=await post('/api/import/commit',{...req(),name:$('#iname').value||im.name,broker:$('#ibroker').value,target:$('#itarget').value});
             S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
-            await renderImport();msg(`Импортировано операций: ${res.count}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
+            await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
           catch(err){bb.disabled=false;bb.textContent='Импортировать';msg(esc(err.message))}}}
       catch(err){$('#iresult').innerHTML=`<div class="msg err">${esc(err.message)}</div>`}finally{b.disabled=false}};
   }

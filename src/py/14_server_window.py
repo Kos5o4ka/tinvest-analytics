@@ -266,49 +266,9 @@ class Handler(BaseHTTPRequestHandler):
                 pv["broker_id"], pv["broker_name"] = bid, BROKERS[bid]
                 return self.send(200, pv)
             if path == "/api/import/parse":
-                raw = base64.b64decode(body.get("data") or "")
-                ops, skipped, _fmt, _meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
-                                                           int(body.get("header_row") or 0), body.get("mapping") or {})
-                kinds = defaultdict(int)
-                for o in ops:
-                    kinds[classify(o["type"])] += 1
-                sample = [[o["date"][:10], op_type(o), o.get("name") or "", op_qty(o), qf(o["payment"]), cur_of(o["payment"])]
-                          for o in ops[:15]]
-                return self.send(200, {"count": len(ops), "skipped": skipped, "kinds": kinds, "sample": sample,
-                                       "from": ops[0]["date"][:10] if ops else None, "to": ops[-1]["date"][:10] if ops else None})
+                return self.send(200, import_parse_info(body))
             if path == "/api/import/commit":
-                raw = base64.b64decode(body.get("data") or "")
-                ops, skipped, fmt, meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
-                                                         int(body.get("header_row") or 0), body.get("mapping") or {})
-                if not ops:
-                    raise ApiError("В файле не нашлось операций с выбранными колонками.", 400)
-                acc_id = body.get("target") if str(body.get("target") or "").startswith("imp-") else "imp-" + uuid.uuid4().hex[:10]
-                lst = imports_list()
-                ex = next((x for x in lst if x["id"] == acc_id), None)
-                if ex is None:
-                    ex = {"id": acc_id, "name": (body.get("name") or "").strip() or "Импорт " + date.today().strftime("%d.%m.%Y"),
-                          "broker": (body.get("broker") or "").strip(), "created": utc_now_str(), "files": []}
-                    if fmt:
-                        ex["format"] = fmt
-                    ex["broker_id"] = broker_detect_import(body.get("filename") or "", raw, fmt, ex["broker"], ex["name"])
-                    lst.append(ex)
-                finfo = {"name": body.get("filename") or "", "count": len(ops), "at": utc_now_str()}
-                if meta:
-                    finfo["from"], finfo["to"] = meta["period"]["from"], meta["period"]["to"]
-                periods = [(f.get("from"), f.get("to")) for f in ex["files"] if f.get("from")] + \
-                          ([(finfo["from"], finfo["to"])] if meta else [])
-                # новый файл склеивается со всеми операциями счёта: FIFO и «досчитанные» пополнения считаются по всей истории
-                ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) if ex["files"] else None,
-                                           periods=periods, synth=not fmt)
-                ex["files"].append(finfo)
-                ex["ops"] = len(ops)
-                store().ops_clear(acc_id)
-                store().ops_put(acc_id, ops)
-                store().put("imports", lst)
-                mem_clear()
-                found = sum(1 for v in ids.values() if v.get("uid"))
-                return self.send(200, {"ok": True, "id": acc_id, "count": finfo["count"], "total": len(ops), "skipped": skipped,
-                                       "resolved": found, "idents": len(ids)})
+                return self.send(200, import_commit(client, body))
             if path == "/api/import/broker":
                 bid = str(body.get("broker_id") or "")
                 if bid not in BROKERS:

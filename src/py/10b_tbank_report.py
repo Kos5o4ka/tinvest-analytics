@@ -530,7 +530,11 @@ def tbank_preview(ops, meta):
 
 def import_preview_any(filename, raw):
     hit = broker_try(filename, raw)
-    return tbank_preview(*hit) if hit else import_preview(filename, raw)
+    res = tbank_preview(*hit) if hit else import_preview(filename, raw)
+    dup = find_duplicate_import(raw, hit[0] if hit else None)
+    if dup:
+        res["duplicate_of"] = dup
+    return res
 
 
 def import_ops_any(filename, raw, table, header_row, mapping):
