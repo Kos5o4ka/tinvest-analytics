@@ -8996,162 +8996,6 @@ def primary_payload():
 
 # v2: на каждую дату вся сетка {срок: доходность}; v1 хранил только 2 года (используем как запас, пока v2 докачивается)
 KBD_KEY, KBD_OLD_KEY, KEY_KEY = "kbd_grid_v2", "kbd2y_v1", "keyrate_v1"
-RATE_TERM_MIN, RATE_TERM_MAX, RATE_TERMS_MAX = 0.25, 30.0, 6
-_rates_state = {"running": False, "ended": 0.0}
-
-
-def kbd_interp(grid, term):
-    """Доходность КБД на срок term (лет): линейная интерполяция между соседними точками сетки {срок: доходность}.
-    Вне диапазона сетки возвращает None (не экстраполируем и не тянем крайнее значение)."""
-    pts = sorted((float(k), v) for k, v in (grid or {}).items() if v is not None)
-    if not pts or term is None or term < pts[0][0] - 1e-9 or term > pts[-1][0] + 1e-9:
-        return None
-    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
-        if term <= x1 + 1e-9:
-            return y0 if x1 == x0 else y0 + (y1 - y0) * (term - x0) / (x1 - x0)
-    return pts[-1][1]
-
-
-def parse_rate_terms(raw):
-    """'1,2,5.5' -> [1.0, 2.0, 5.5]: только числа в 0.25..30, без повторов, по возрастанию, не больше 6; по умолчанию [2.0]."""
-    out = set()
-    for x in str(raw or "").replace(";", ",").split(","):
-        try:
-            t = round(float(x.strip().replace(",", ".")), 2)
-        except ValueError:
-            continue
-        if RATE_TERM_MIN <= t <= RATE_TERM_MAX:
-            out.add(t)
-    return sorted(out)[:RATE_TERMS_MAX] or [2.0]
-
-
-def key_rate_series():
-    st = store()
-    hit = st.get(KEY_KEY, ttl=6 * 3600)
-    if hit:
-        return hit
-    frm = (date.today() - timedelta(days=900)).strftime("%d.%m.%Y")
-    to = date.today().strftime("%d.%m.%Y")
-    try:
-        s = http_text("https://www.cbr.ru/hd_base/KeyRate/?UniDbQuery.Posted=True&UniDbQuery.From=%s&UniDbQuery.To=%s" % (frm, to))
-    except Exception:  # noqa: BLE001
-        old = st.get(KEY_KEY)          # сайт ЦБ недоступен — последний сохранённый ряд лучше, чем ошибка на каждом экране
-        if old:
-            return old
-        raise
-    rows = []
-    for d, v in re.findall(r"<td>(\d\d\.\d\d\.\d{4})</td>\s*<td>([\d,]+)</td>", s):
-        rows.append([datetime.strptime(d, "%d.%m.%Y").date().isoformat(), float(v.replace(",", "."))])
-    rows.sort()
-    if rows:
-        st.put(KEY_KEY, rows)
-    return rows
-
-
-def _kbd_one(d):
-    j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/zcyc.json?iss.meta=off&iss.only=yearyields&date=" + d))
-    g = {str(float(r[2])): r[3] for r in j["yearyields"]["data"] if r[3] is not None}
-    return d, (g or None)
-
-
-def _rates_run(days):
-    try:
-        st = store()
-        cache = st.get(KBD_KEY) or {}
-        today = date.today()
-        need = []
-        for i in range(days + 1):
-            d = today - timedelta(days=i)
-            if d.weekday() < 5 and d.isoformat() not in cache:
-                need.append(d.isoformat())
-        try:
-            key_rate_series()
-        except Exception:  # noqa: BLE001
-            pass
-        for k in range(0, len(need), 40):
-            part = need[k:k + 40]
-            for d, v in pool_map(lambda x: _safe(_kbd_one, x), part, workers=8):
-                if d is None:
-                    continue
-                if v is not None or d < today.isoformat():
-                    cache[d] = v
-            st.put(KBD_KEY, cache)
-    finally:
-        _rates_state["ended"] = time.time()
-        _rates_state["running"] = False
-
-
-def _safe(fn, x):
-    try:
-        return fn(x)
-    except Exception:  # noqa: BLE001
-        return None, None
-
-
-def rates_start(days):
-    with _rt_lock:
-        # недокачанные дни (сбой ISS, праздники) повторяем не чаще раза в 10 минут — иначе экран вечно «загружается»
-        if _rates_state["running"] or time.time() - _rates_state["ended"] < 600:
-            return
-        _rates_state["running"] = True
-    threading.Thread(target=_rates_run, args=(days,), daemon=True).start()
-
-
-def rates_payload(days, terms=None):
-    days = max(30, min(int(days or 365), 900))
-    tl = terms if isinstance(terms, list) else parse_rate_terms(terms)
-    st = store()
-    cache = st.get(KBD_KEY) or {}
-    old = st.get(KBD_OLD_KEY) or {}
-    today = date.today()
-    first = (today - timedelta(days=days)).isoformat()
-    # сегодняшняя КБД появляется только после расчёта биржей — её отсутствие не считаем недокачкой
-    miss = sum(1 for i in range(1, days + 1) if (today - timedelta(days=i)).weekday() < 5
-               and (today - timedelta(days=i)).isoformat() not in cache)
-    if today.weekday() < 5 and today.isoformat() not in cache:
-        rates_start(days)
-    if miss > 0:
-        rates_start(days)
-    try:
-        keys = key_rate_series()
-    except Exception:  # noqa: BLE001
-        keys = st.get(KEY_KEY) or []
-    grids = {}
-    for d in set(cache) | set(old):
-        if d < first:
-            continue
-        g = cache.get(d)
-        if g:
-            grids[d] = g
-        elif d not in cache and old.get(d) is not None:
-            grids[d] = {"2.0": old[d]}      # запас до докачки v2: только срок 2 года
-    iso = sorted(grids)
-    kbd = {("%g" % t): [] for t in tl}
-    key, ki, last = [], 0, None
-    for d in iso:
-        while ki < len(keys) and keys[ki][0] <= d:
-            last = keys[ki][1]
-            ki += 1
-        for t in tl:
-            v = kbd_interp(grids[d], t)
-            kbd["%g" % t].append(round(v, 2) if v is not None else None)
-        key.append(last)
-    return {"iso": iso, "labels": [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y") for d in iso],
-            "kbd": kbd, "terms": tl, "key": key, "loading": _rates_state["running"] or (miss > 0 and not _rates_state["ended"]),
-            "keys": [k for k in keys if k[0] >= first], "next_cbr": _next_cbr_safe()}
-
-
-def _next_cbr_safe():
-    """Ближайшее заседание ЦБ для экрана «Ставки»; без сети — None (экран не должен падать из-за календаря ЦБ)."""
-    fn = globals().get("cbr_next_meeting")
-    try:
-        return fn(wait=False) if fn else None
-    except Exception:  # noqa: BLE001
-        return None
-
-
-
-
 # ── снимки объявленных размещений (накопление: позже можно сравнить ориентир и итог) ──
 
 PRI_SNAP_KEY = "pri_snap_v1"
@@ -9388,6 +9232,162 @@ def _api_primary_stats(cfg, acc, q, force):
 
 
 API_GET["/api/primary/stats"] = _api_primary_stats
+
+
+RATE_TERM_MIN, RATE_TERM_MAX, RATE_TERMS_MAX = 0.25, 30.0, 6
+_rates_state = {"running": False, "ended": 0.0}
+
+
+def kbd_interp(grid, term):
+    """Доходность КБД на срок term (лет): линейная интерполяция между соседними точками сетки {срок: доходность}.
+    Вне диапазона сетки возвращает None (не экстраполируем и не тянем крайнее значение)."""
+    pts = sorted((float(k), v) for k, v in (grid or {}).items() if v is not None)
+    if not pts or term is None or term < pts[0][0] - 1e-9 or term > pts[-1][0] + 1e-9:
+        return None
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if term <= x1 + 1e-9:
+            return y0 if x1 == x0 else y0 + (y1 - y0) * (term - x0) / (x1 - x0)
+    return pts[-1][1]
+
+
+def parse_rate_terms(raw):
+    """'1,2,5.5' -> [1.0, 2.0, 5.5]: только числа в 0.25..30, без повторов, по возрастанию, не больше 6; по умолчанию [2.0]."""
+    out = set()
+    for x in str(raw or "").replace(";", ",").split(","):
+        try:
+            t = round(float(x.strip().replace(",", ".")), 2)
+        except ValueError:
+            continue
+        if RATE_TERM_MIN <= t <= RATE_TERM_MAX:
+            out.add(t)
+    return sorted(out)[:RATE_TERMS_MAX] or [2.0]
+
+
+def key_rate_series():
+    st = store()
+    hit = st.get(KEY_KEY, ttl=6 * 3600)
+    if hit:
+        return hit
+    frm = (date.today() - timedelta(days=900)).strftime("%d.%m.%Y")
+    to = date.today().strftime("%d.%m.%Y")
+    try:
+        s = http_text("https://www.cbr.ru/hd_base/KeyRate/?UniDbQuery.Posted=True&UniDbQuery.From=%s&UniDbQuery.To=%s" % (frm, to))
+    except Exception:  # noqa: BLE001
+        old = st.get(KEY_KEY)          # сайт ЦБ недоступен — последний сохранённый ряд лучше, чем ошибка на каждом экране
+        if old:
+            return old
+        raise
+    rows = []
+    for d, v in re.findall(r"<td>(\d\d\.\d\d\.\d{4})</td>\s*<td>([\d,]+)</td>", s):
+        rows.append([datetime.strptime(d, "%d.%m.%Y").date().isoformat(), float(v.replace(",", "."))])
+    rows.sort()
+    if rows:
+        st.put(KEY_KEY, rows)
+    return rows
+
+
+def _kbd_one(d):
+    j = json.loads(http_text("https://iss.moex.com/iss/engines/stock/zcyc.json?iss.meta=off&iss.only=yearyields&date=" + d))
+    g = {str(float(r[2])): r[3] for r in j["yearyields"]["data"] if r[3] is not None}
+    return d, (g or None)
+
+
+def _rates_run(days):
+    try:
+        st = store()
+        cache = st.get(KBD_KEY) or {}
+        today = date.today()
+        need = []
+        for i in range(days + 1):
+            d = today - timedelta(days=i)
+            if d.weekday() < 5 and d.isoformat() not in cache:
+                need.append(d.isoformat())
+        try:
+            key_rate_series()
+        except Exception:  # noqa: BLE001
+            pass
+        for k in range(0, len(need), 40):
+            part = need[k:k + 40]
+            for d, v in pool_map(lambda x: _safe(_kbd_one, x), part, workers=8):
+                if d is None:
+                    continue
+                if v is not None or d < today.isoformat():
+                    cache[d] = v
+            st.put(KBD_KEY, cache)
+    finally:
+        _rates_state["ended"] = time.time()
+        _rates_state["running"] = False
+
+
+def _safe(fn, x):
+    try:
+        return fn(x)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def rates_start(days):
+    with _rt_lock:
+        # недокачанные дни (сбой ISS, праздники) повторяем не чаще раза в 10 минут — иначе экран вечно «загружается»
+        if _rates_state["running"] or time.time() - _rates_state["ended"] < 600:
+            return
+        _rates_state["running"] = True
+    threading.Thread(target=_rates_run, args=(days,), daemon=True).start()
+
+
+def rates_payload(days, terms=None):
+    days = max(30, min(int(days or 365), 900))
+    tl = terms if isinstance(terms, list) else parse_rate_terms(terms)
+    st = store()
+    cache = st.get(KBD_KEY) or {}
+    old = st.get(KBD_OLD_KEY) or {}
+    today = date.today()
+    first = (today - timedelta(days=days)).isoformat()
+    # сегодняшняя КБД появляется только после расчёта биржей — её отсутствие не считаем недокачкой
+    miss = sum(1 for i in range(1, days + 1) if (today - timedelta(days=i)).weekday() < 5
+               and (today - timedelta(days=i)).isoformat() not in cache)
+    if today.weekday() < 5 and today.isoformat() not in cache:
+        rates_start(days)
+    if miss > 0:
+        rates_start(days)
+    try:
+        keys = key_rate_series()
+    except Exception:  # noqa: BLE001
+        keys = st.get(KEY_KEY) or []
+    grids = {}
+    for d in set(cache) | set(old):
+        if d < first:
+            continue
+        g = cache.get(d)
+        if g:
+            grids[d] = g
+        elif d not in cache and old.get(d) is not None:
+            grids[d] = {"2.0": old[d]}      # запас до докачки v2: только срок 2 года
+    iso = sorted(grids)
+    kbd = {("%g" % t): [] for t in tl}
+    key, ki, last = [], 0, None
+    for d in iso:
+        while ki < len(keys) and keys[ki][0] <= d:
+            last = keys[ki][1]
+            ki += 1
+        for t in tl:
+            v = kbd_interp(grids[d], t)
+            kbd["%g" % t].append(round(v, 2) if v is not None else None)
+        key.append(last)
+    return {"iso": iso, "labels": [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y") for d in iso],
+            "kbd": kbd, "terms": tl, "key": key, "loading": _rates_state["running"] or (miss > 0 and not _rates_state["ended"]),
+            "keys": [k for k in keys if k[0] >= first], "next_cbr": _next_cbr_safe()}
+
+
+def _next_cbr_safe():
+    """Ближайшее заседание ЦБ для экрана «Ставки»; без сети — None (экран не должен падать из-за календаря ЦБ)."""
+    fn = globals().get("cbr_next_meeting")
+    try:
+        return fn(wait=False) if fn else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 
 
 # ── кривая КБД на прошлые даты ──
@@ -14940,7 +14940,7 @@ API_GET["/api/events.ics"] = _api_events_ics
 
 WATCH_KEY, NOTES_KEY, TG_SENT_KEY, TG_STATE_KEY = "watch_v1", "notes_v1", "tg_sent_v1", "tg_state_v1"
 TG_DEFAULTS = {"tg_enabled": False, "tg_on_mon": True, "tg_on_watch": True, "tg_pay_days": 0, "tg_digest": False, "tg_digest_time": "10:00",
-               "tg_server": False}
+               "tg_weekly_digest": False, "tg_server": False}
 TG_LEGACY_KEYS = ("tg_token", "tg_chat")
 _watch_lock = threading.Lock()
 _tg_lock = threading.Lock()
@@ -15313,7 +15313,7 @@ def tg_public(cfg):
 def tg_save(cfg, body):
     cfg = load_config()
     was = bool(cfg.get("tg_server") and cfg.get("tg_enabled"))
-    for k in ("tg_enabled", "tg_on_mon", "tg_on_watch", "tg_digest", "tg_server"):
+    for k in ("tg_enabled", "tg_on_mon", "tg_on_watch", "tg_digest", "tg_weekly_digest", "tg_server"):
         if k in body:
             cfg[k] = bool(body[k])
     if "tg_pay_days" in body:
@@ -15714,7 +15714,8 @@ _tg_srv_kick_on = [False]
 def tg_srv_payload(cfg, sent):
     """Подписка для сервера. Только ISIN, названия бумаг, пороги, даты и суммы ближайших выплат; ничего о счетах."""
     today = date.today().isoformat()
-    p = {"v": 1, "goals": [], "reminders": [], "offers": [], "pay_days": 0, "pays": [], "sent": []}
+    p = {"v": 1, "goals": [], "reminders": [], "offers": [], "pay_days": 0, "pays": [], "sent": [],
+         "weekly_digest": bool(cfg.get("tg_weekly_digest", False))}
     if cfg.get("tg_on_watch", True):
         items = watch_items()
         notes = [n for n in notes_all() if n.get("remind_on")]
@@ -15788,6 +15789,53 @@ def _tg_srv_merge(sent, keys, now):
             sent.setdefault(k, now)
 
 
+def _tg_srv_merge_goals(goals):
+    """Вливает цели, изменённые в боте, в локальный WATCH_KEY, не перезаписывая локальные поля (note, added и т. д.)."""
+    if not isinstance(goals, list):
+        return False
+    by_isin = {}
+    for g in goals:
+        if not isinstance(g, dict):
+            continue
+        isin = _isin_ok(g.get("isin"))
+        if isin:
+            by_isin[isin] = g
+    if not by_isin:
+        return False
+    changed = False
+    with _watch_lock:
+        items = watch_items()
+        cur_by = {x["isin"]: x for x in items}
+        today = date.today().isoformat()
+        for isin, g in by_isin.items():
+            cur = cur_by.get(isin)
+            if cur is None:
+                cur = {"isin": isin, "added": today}
+                items.append(cur)
+                cur_by[isin] = cur
+                changed = True
+            for k in ("target_yield", "target_price"):
+                if k not in g:
+                    continue
+                v = _num(g[k]) if g[k] is not None and str(g[k]).strip() != "" else None
+                if v is not None and v <= 0:
+                    v = None
+                if v is None:
+                    if k in cur:
+                        cur.pop(k, None)
+                        changed = True
+                else:
+                    rv = round(v, 4)
+                    if cur.get(k) != rv:
+                        cur[k] = rv
+                        changed = True
+        if changed:
+            store().put(WATCH_KEY, items)
+    if changed:
+        mem_clear_watch()
+    return changed
+
+
 def _tg_srv_sync(cfg, sent, force=False, resume=False):
     """Отправляет подписку, если она изменилась, устарела или force. Состояние — в TG_SRV_KEY. -> True, если подписка на сервере.
     resume=True — только по явному включению пользователем: снимает остановку, сделанную в боте (/alerts)."""
@@ -15810,7 +15858,14 @@ def _tg_srv_sync(cfg, sent, force=False, resume=False):
         return bool(st.get("active"))      # сервер недоступен: и программа отправить не сможет (уведомления идут через него)
     if code == 200 and j.get("ok"):
         _tg_srv_merge(sent, j.get("sent"), now)
+        rev, prev_rev = j.get("bot_goals_rev"), st.get("bot_goals_rev")
+        if isinstance(j.get("goals"), list) and (rev is None or rev != prev_rev):
+            _tg_srv_merge_goals(j["goals"])
         st = {"active": True, "ok": now, "hash": h, "err": "", "at": now, "counts": j.get("counts") or {}}
+        if rev is not None:
+            st["bot_goals_rev"] = rev
+        elif prev_rev is not None:
+            st["bot_goals_rev"] = prev_rev
     else:
         st.update(err=_TG_SRV_ERR.get(code) or "Сервер не принял подписку (код %s)." % code, at=now)
         if code in (400, 401, 402, 403, 404, 409, 413):     # подписки на сервере нет или она не действует: отправляет программа

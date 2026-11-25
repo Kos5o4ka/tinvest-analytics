@@ -122,5 +122,71 @@ class LocalData(unittest.TestCase):
         self.assertEqual(r["info"]["total"], 10)
 
 
+class WatchSyncTests(unittest.TestCase):
+    def setUp(self):
+        M.store().put(M.WATCH_KEY, [])
+        M.store().put(M.TG_SRV_KEY, {})
+
+    def test_weekly_digest_payload_and_save(self):
+        p0 = M.tg_srv_payload({}, {})
+        self.assertIs(p0["weekly_digest"], False)
+
+        res = M.tg_save({}, {"tg_weekly_digest": True})
+        self.assertTrue(res["settings"]["tg_weekly_digest"])
+        cfg = M.load_config()
+        self.assertTrue(cfg.get("tg_weekly_digest"))
+        p1 = M.tg_srv_payload(cfg, {})
+        self.assertIs(p1["weekly_digest"], True)
+
+    def test_bot_goals_back_sync_preserves_local_fields(self):
+        st = M.store()
+        st.put(M.WATCH_KEY, [
+            {"isin": "RU000A107HG1", "added": "2026-10-01", "note": "моя заметка", "target_yield": 18.0},
+        ])
+        calls = []
+
+        def fake_req(path, body=None, timeout=20):
+            calls.append((path, body))
+            return 200, {
+                "ok": True,
+                "bot_goals_rev": 1,
+                "goals": [
+                    {"isin": "RU000A107HG1", "target_yield": 21.5, "target_price": 97.25},
+                    {"isin": "RU000A108EF2", "target_price": 99.0},
+                ],
+                "counts": {"goals": 2},
+            }
+
+        orig_req = M.tg_srv_req
+        M.tg_srv_req = fake_req
+        try:
+            ok = M._tg_srv_sync({"tg_server": True, "tg_enabled": True}, {}, force=True)
+        finally:
+            M.tg_srv_req = orig_req
+
+        self.assertTrue(ok)
+        items = {x["isin"]: x for x in st.get(M.WATCH_KEY)}
+        self.assertEqual(items["RU000A107HG1"]["added"], "2026-10-01")
+        self.assertEqual(items["RU000A107HG1"]["note"], "моя заметка")
+        self.assertEqual(items["RU000A107HG1"]["target_yield"], 21.5)
+        self.assertEqual(items["RU000A107HG1"]["target_price"], 97.25)
+        self.assertEqual(items["RU000A108EF2"]["target_price"], 99.0)
+        self.assertTrue(items["RU000A108EF2"].get("added"))
+        self.assertEqual(st.get(M.TG_SRV_KEY).get("bot_goals_rev"), 1)
+
+        # Повторная синхронизация с тем же bot_goals_rev не должна перезаписывать локальную правку
+        st.put(M.WATCH_KEY, [
+            {"isin": "RU000A107HG1", "added": "2026-10-01", "note": "моя заметка", "target_yield": 22.0},
+        ])
+        M.tg_srv_req = fake_req
+        try:
+            M._tg_srv_sync({"tg_server": True, "tg_enabled": True}, {}, force=True)
+        finally:
+            M.tg_srv_req = orig_req
+        items2 = {x["isin"]: x for x in st.get(M.WATCH_KEY)}
+        self.assertEqual(items2["RU000A107HG1"]["target_yield"], 22.0)
+        self.assertNotIn("RU000A108EF2", items2)
+
+
 if __name__ == "__main__":
     unittest.main()
