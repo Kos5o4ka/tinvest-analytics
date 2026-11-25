@@ -304,6 +304,16 @@ class GeminiFixesTests(unittest.TestCase):
         self.assertIsNotNone(m_about)
         self.assertTrue(".filter(Boolean)" in m_about.group(1) or "if(!f)return''" in m_about.group(1))
 
+    def test_bug_ui02_ofz_no_portfolio(self):
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        shell_js = open(os.path.join(root, "src/web/js/06_shell.js"), encoding="utf-8").read()
+        m = re.search(r"NO_PORTFOLIO_PAGES=new Set\(\[([^\]]+)\]\)", shell_js)
+        self.assertIsNotNone(m)
+        pages = set(re.findall(r"'([^']+)'", m.group(1)))
+        for p in ("ofz", "arb", "dgap", "rot", "dbx", "mm", "crp", "mic"):
+            self.assertIn(p, pages)
+
 
 if __name__ == "__main__":
     unittest.main()
