@@ -343,8 +343,10 @@ def load_config():
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
-    if os.environ.get("TINVEST_TOKEN"):
-        cfg["token"] = os.environ["TINVEST_TOKEN"]
+    env_tok = os.environ.get("TINVEST_TOKEN")
+    if env_tok:
+        cfg["_env_token"] = env_tok
+        cfg["token"] = env_tok
     return cfg
 
 
@@ -358,7 +360,7 @@ def make_backup():
             src.backup(dst)
         dst.close()
         src.close()
-        cfg = {k: v for k, v in load_config().items() if k not in SECRET_KEYS}     # токен и прочие секреты не входят
+        cfg = {k: v for k, v in load_config().items() if k not in SECRET_KEYS and k != "_env_token"}     # токен и прочие секреты не входят
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(tmp, "data.db")
@@ -374,13 +376,23 @@ def make_backup():
 
 
 def save_config(cfg):
-    if (cfg.get("token") or "").strip():
-        try:
-            demo_remove()  # реальный токен заменяет демо-портфель
-        except Exception:  # noqa: BLE001
-            pass
+    out = dict(cfg)
+    env_tok = out.pop("_env_token", None)
     with _cfg_lock:
-        _private_write(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"))
+        if env_tok is not None and out.get("token") == env_tok:
+            disk_tok = ""
+            try:
+                with open(CONFIG_PATH, encoding="utf-8") as f:
+                    disk_tok = (json.load(f) or {}).get("token", "")
+            except (OSError, ValueError, AttributeError):
+                pass
+            out["token"] = disk_tok
+        if (out.get("token") or "").strip():
+            try:
+                demo_remove()  # реальный токен заменяет демо-портфель
+            except Exception:  # noqa: BLE001
+                pass
+        _private_write(CONFIG_PATH, json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
 def token_key(cfg):

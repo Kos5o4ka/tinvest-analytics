@@ -72,5 +72,55 @@ class ConfigSecret(unittest.TestCase):
         self.assertTrue(body["secret_set"]["data_key"])
 
 
+class EnvTokenNotSaved(unittest.TestCase):
+    """BUG-SEC-01: TINVEST_TOKEN из env не пишется в config.json и не вызывает demo_remove() при сохранении настроек."""
+
+    def test_post_config_does_not_leak_env_token_or_remove_demo(self):
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix="cfg_sec01_")
+        cfg_path = os.path.join(tmp_dir, "config.json")
+        old_cfg_path = M.CONFIG_PATH
+        old_demo_remove = M.demo_remove
+        old_env = os.environ.get("TINVEST_TOKEN")
+        demo_calls = []
+        M.CONFIG_PATH = cfg_path
+        M.demo_remove = lambda: demo_calls.append(1)
+        os.environ["TINVEST_TOKEN"] = "t.ENV_SECRET_XYZ"
+
+        def cleanup():
+            M.CONFIG_PATH = old_cfg_path
+            M.demo_remove = old_demo_remove
+            if old_env is None:
+                os.environ.pop("TINVEST_TOKEN", None)
+            else:
+                os.environ["TINVEST_TOKEN"] = old_env
+
+        self.addCleanup(cleanup)
+
+        srv = M.LocalHTTPServer(("127.0.0.1", 0), M.Handler)
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        port = srv.server_address[1]
+
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        payload = json.dumps({"theme": "dark"}).encode("utf-8")
+        c.request("POST", "/api/config", body=payload,
+                  headers={"Host": "127.0.0.1:%d" % port, "Content-Type": "application/json",
+                           "Content-Length": str(len(payload))})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.status, 200)
+
+        with open(cfg_path, encoding="utf-8") as f:
+            raw = f.read()
+        disk = json.loads(raw)
+        self.assertNotIn("t.ENV_SECRET_XYZ", raw)
+        self.assertNotIn("_env_token", raw)
+        self.assertEqual(disk.get("token"), "")
+        self.assertEqual(disk.get("theme"), "dark")
+        self.assertEqual(demo_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
