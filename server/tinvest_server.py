@@ -1165,9 +1165,17 @@ class Handler(BaseHTTPRequestHandler):
         if n:
             body = self.rfile.read(n)
         if u.path == "/v1/health":
-            return self._send(200, {"ok": True, "version": VERSION, "uptime": int(time.time() - app.started),
-                                    "cache_items": app.cache.count(), "auth": auth_mode(app), "bot": app.bot,
-                                    "alerts": bool(app.alerts)})
+            h = {"ok": True, "version": VERSION, "uptime": int(time.time() - app.started),
+                 "cache_items": app.cache.count(), "auth": auth_mode(app), "bot": app.bot,
+                 "alerts": bool(app.alerts)}
+            if app.alerts:
+                try:
+                    ast = app.alerts.stats()
+                    h["alerts_subs"] = ast["subs"]
+                    h["alerts_last_checked"] = ast["last_checked"]
+                except sqlite3.Error:
+                    pass
+            return self._send(200, h)
         client, reason, info = authorize_ex(app, self.headers)
         if client is None:
             return self._send(401, {"ok": False, "error": reason or "invalid", "bot": app.bot})
@@ -1297,7 +1305,15 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, UnicodeDecodeError):
                 return self._send(400, {"ok": False, "error": "bad_json"})
             keys = st.put(uid, sub)
-            return self._send(200, {"ok": True, "counts": alerts.summary(sub), "sent": keys})
+            cur = st.get(uid)
+            cur_sub = (cur or {}).get("sub") or sub
+            return self._send(200, {
+                "ok": True,
+                "counts": alerts.summary(cur_sub),
+                "sent": keys,
+                "bot_goals_rev": int(cur_sub.get("bot_goals_rev") or 0),
+                "goals": cur_sub.get("goals") or [],
+            })
         except alerts.AlertError as e:
             return self._send(e.code, {"ok": False, "error": e.error})
         except sqlite3.Error:

@@ -57,7 +57,7 @@ FIELDS = {
     "offers": {"isin", "name", "kind", "date", "period_start", "period_end", "coupon_status", "new_rate"},
     "pays": {"date", "kind", "name", "amount"},
 }
-TOP = {"v", "goals", "reminders", "offers", "pay_days", "pays", "sent", "resume"}
+TOP = {"v", "goals", "reminders", "offers", "pay_days", "pays", "sent", "resume", "bot_goals_rev", "weekly_digest"}
 
 
 def _bad(what):
@@ -102,7 +102,13 @@ def validate(p):
         _bad("field")
     if not isinstance(p.get("resume", False), bool):
         _bad("resume")
-    out = {"v": SUB_V, "resume": bool(p.get("resume"))}
+    if not isinstance(p.get("weekly_digest", False), bool):
+        _bad("weekly_digest")
+    bgr = p.get("bot_goals_rev")
+    if bgr is not None and (isinstance(bgr, bool) or not isinstance(bgr, int) or bgr < 0 or bgr > 10**9):
+        _bad("bot_goals_rev")
+    out = {"v": SUB_V, "resume": bool(p.get("resume")), "weekly_digest": bool(p.get("weekly_digest", False)),
+           "bot_goals_rev": bgr}
     for name in ("goals", "reminders", "offers", "pays"):
         lst = p.get(name) or []
         if not isinstance(lst, list) or len(lst) > LIMITS[name]:
@@ -435,10 +441,6 @@ class AlertStore:
     def put(self, tg_id, sub):
         """Сохраняет подписку (без sent) и добавляет присланные приложением ключи в отправленные. -> все отправленные ключи."""
         now = self.clock()
-        data = {k: v for k, v in sub.items() if k not in ("sent", "resume")}
-        raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        if len(raw.encode("utf-8")) > SUB_MAX_BYTES:
-            raise AlertError(413, "too_large")
         c = self.conn()
         c.execute("BEGIN IMMEDIATE")
         try:
@@ -451,6 +453,30 @@ class AlertStore:
                     raise AlertError(409, "stopped_in_bot")
             except sqlite3.OperationalError:
                 pass
+            row = c.execute("SELECT data FROM alert_subs WHERE tg_id=?", (tg_id,)).fetchone()
+            existing = json.loads(row[0]) if row else {}
+            existing_rev = int(existing.get("bot_goals_rev") or 0)
+            existing_bot_goals = [g for g in (existing.get("bot_goals") or []) if isinstance(g, dict) and g.get("isin")]
+            client_rev = sub.get("bot_goals_rev")
+            data = {k: v for k, v in sub.items() if k not in ("sent", "resume", "bot_goals_rev")}
+            if existing_rev > 0 and (client_rev is None or client_rev < existing_rev):
+                merged = list(data.get("goals") or [])
+                idx = {g["isin"]: i for i, g in enumerate(merged)}
+                for bg in existing_bot_goals:
+                    isin = bg["isin"]
+                    if isin in idx:
+                        merged[idx[isin]] = bg
+                    else:
+                        idx[isin] = len(merged)
+                        merged.append(bg)
+                data["goals"] = merged
+                data["bot_goals"] = existing_bot_goals
+                data["bot_goals_rev"] = existing_rev
+            elif existing_rev > 0:
+                data["bot_goals_rev"] = existing_rev
+            raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            if len(raw.encode("utf-8")) > SUB_MAX_BYTES:
+                raise AlertError(413, "too_large")
             c.execute("INSERT INTO alert_subs(tg_id, data, created, updated) VALUES(?,?,?,?) "
                       "ON CONFLICT(tg_id) DO UPDATE SET data=excluded.data, updated=excluded.updated", (tg_id, raw, now, now))
             c.executemany("INSERT OR IGNORE INTO alert_sent(tg_id, k, t) VALUES(?,?,?)", [(tg_id, k, now) for k in sub.get("sent") or []])
@@ -460,6 +486,53 @@ class AlertStore:
             c.execute("ROLLBACK")
             raise
         return self.sent_keys(tg_id)
+
+    def upsert_bot_goal(self, tg_id, goal):
+        """Добавляет или обновляет цель из бота, увеличивая bot_goals_rev. -> новый bot_goals_rev."""
+        if not isinstance(goal, dict):
+            _bad("goal")
+        g = {"isin": _isin(goal.get("isin")), "name": _s(goal.get("name"))}
+        for k in ("target_yield", "target_price"):
+            v = _numf(goal.get(k), hi=1e6)
+            if v is not None and v > 0:
+                g[k] = v
+        if "target_yield" not in g and "target_price" not in g:
+            _bad("goal")
+        now = self.clock()
+        c = self.conn()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            row = c.execute("SELECT data FROM alert_subs WHERE tg_id=?", (tg_id,)).fetchone()
+            if row:
+                data = json.loads(row[0])
+            else:
+                data = {"v": SUB_V, "goals": [], "reminders": [], "offers": [], "pay_days": 0, "pays": [], "weekly_digest": False}
+            for lst_key in ("goals", "bot_goals"):
+                lst = list(data.get(lst_key) or [])
+                for i, it in enumerate(lst):
+                    if it.get("isin") == g["isin"]:
+                        lst[i] = g
+                        break
+                else:
+                    lst.append(g)
+                data[lst_key] = lst
+            rev = int(data.get("bot_goals_rev") or 0) + 1
+            data["bot_goals_rev"] = rev
+            raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            if len(raw.encode("utf-8")) > SUB_MAX_BYTES:
+                raise AlertError(413, "too_large")
+            c.execute("INSERT INTO alert_subs(tg_id, data, created, updated) VALUES(?,?,?,?) "
+                      "ON CONFLICT(tg_id) DO UPDATE SET data=excluded.data, updated=excluded.updated", (tg_id, raw, now, now))
+            c.execute("COMMIT")
+        except BaseException:
+            c.execute("ROLLBACK")
+            raise
+        return rev
+
+    def stats(self):
+        """Количество активных подписок и время последней проверки: {subs, last_checked}."""
+        r = self.conn().execute("SELECT COUNT(*), MAX(checked) FROM alert_subs").fetchone()
+        return {"subs": int(r[0] or 0), "last_checked": r[1]}
 
     def get(self, tg_id):
         r = self.conn().execute("SELECT data, created, updated, checked, sent_n FROM alert_subs WHERE tg_id=?", (tg_id,)).fetchone()
