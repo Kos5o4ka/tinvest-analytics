@@ -182,6 +182,44 @@ class Parity(unittest.TestCase):
                             q["RU000A10FLT1"], TODAY)
         self.assertEqual([a["id"] for a in al], ["gp|RU000A10FLT1|100.0"])
 
+    def test_contract_boards_and_prefixes(self):
+        """Контракт между приложением и сервером: площадки ISS, префиксы тревог и пороги оферт."""
+        self.assertEqual(SA.BOARDS, ("TQCB", "TQOB", "TQOD", "TQOY"))
+        self.assertEqual(SA.SENT_PREFIXES, M.TG_SRV_PREFIX)
+        self.assertEqual(set(SA.SENT_PREFIXES), {"gy|", "gp|", "rm|", "ofr|", "pay|"})
+        self.assertEqual(SA.TG_OFR_CALL_DAYS, M.TG_OFR_CALL_DAYS)
+        self.assertEqual(SA.TG_OFR_CLOSE_DAYS, M.TG_OFR_CLOSE_DAYS)
+        self.assertEqual(SA.EV, M._TG_EV)
+        # validate сохраняет серверные префиксы и отбрасывает локальные (price|, mon|, offer|)
+        sent_in = ["gp|RU000A1|99.0", "gy|RU000A1|15.0", "rm|n1", "ofr|RU000A1|2026-12-01|put",
+                   "pay|2026-12-01|coupon|A", "mon|RU000A1", "offer|RU000A1", "price|RU000A1"]
+        v = SA.validate({"v": 1, "sent": sent_in})
+        self.assertEqual(v["sent"], ["gp|RU000A1|99.0", "gy|RU000A1|15.0", "rm|n1",
+                                      "ofr|RU000A1|2026-12-01|put", "pay|2026-12-01|coupon|A"])
+
+    def test_iss_quote_parity_currency_boards_and_floater(self):
+        """Паритет разбора ISS для валютных площадок (TQOD/TQOY) и флоатеров без YIELD."""
+        sec_cols = ["SECID", "ISIN", "SHORTNAME", "MATDATE", "PREVLEGALCLOSEPRICE", "YIELDATPREVWAPRICE"]
+        md_cols = ["SECID", "WAPRICE", "LAST", "YIELD", "YIELDATWAPRICE"]
+        tqod = {
+            "securities": {"columns": sec_cols, "data": [["USD1", "RU000A10USD1", "Замещ USD", d(700), 94.5, 7.2]]},
+            "marketdata": {"columns": md_cols, "data": [["USD1", 95.125, 95.2, 7.15, None]]},
+        }
+        tqoy = {
+            "securities": {"columns": sec_cols, "data": [["CNY1", "RU000A10CNY1", "Юань 1", d(500), 98.0, None]]},
+            "marketdata": {"columns": md_cols, "data": [["CNY1", None, 98.4, None, None]]},
+        }
+        q = {}
+        SA.quotes_from_iss(tqod, q)
+        SA.quotes_from_iss(tqoy, q)
+        self.assertEqual(q["RU000A10USD1"], {"price": 95.125, "yield": 7.15, "name": "Замещ USD"})
+        self.assertEqual(q["RU000A10CNY1"], {"price": 98.4, "yield": None, "name": "Юань 1"})
+        for isin, ty, tp in [("RU000A10USD1", 7.0, 96.0), ("RU000A10CNY1", 10.0, 99.0)]:
+            app_al = M.watch_goal_alerts(isin, q[isin]["name"], q[isin], ty, tp, TODAY)
+            srv_al = SA.goal_alerts({"isin": isin, "name": q[isin]["name"], "target_yield": ty, "target_price": tp},
+                                    q[isin], TODAY)
+            self.assertEqual([(x["id"], x["message"]) for x in app_al], [(x["id"], x["message"]) for x in srv_al])
+
 
 class Payload(unittest.TestCase):
     """Подписка из приложения: только разрешённые поля, без токена, счетов и текста заметок; сервер её принимает."""
@@ -276,6 +314,13 @@ class Validation(unittest.TestCase):
         v = SA.validate({"v": 1, "goals": [{"isin": "RU000A100001", "name": "a\x00b" + "я" * 500}], "sent": ["gy|x", "price|y", 5]})
         self.assertEqual(v["goals"], [])                                         # без порогов цель не хранится
         self.assertEqual(v["sent"], ["gy|x"])
+        self.assertFalse(v["weekly_digest"])
+        self.assertTrue(SA.validate({"v": 1, "weekly_digest": True})["weekly_digest"])
+        for bad_opt in ({"v": 1, "weekly_digest": "yes"}, {"v": 1, "weekly_digest": 1},
+                        {"v": 1, "bot_goals_rev": "1"}, {"v": 1, "bot_goals_rev": -1}, {"v": 1, "bot_goals_rev": True}):
+            with self.assertRaises(SA.AlertError) as cm:
+                SA.validate(bad_opt)
+            self.assertEqual(cm.exception.code, 400)
 
 
 class FakeNotifier:
@@ -415,6 +460,30 @@ class Server(unittest.TestCase):
         self.ck.run_once()
         self.assertEqual(self.fetches, [])
 
+    def test_bot_goals_rev_not_clobbered(self):
+        self.st.put(1, self.sub())
+        rev = self.st.upsert_bot_goal(1, {"isin": "RU000A10BOT1", "name": "Бот-цель", "target_price": 95.0})
+        self.assertEqual(rev, 1)
+        # Десктоп без bot_goals_rev (или со старой ревизией 0) не затирает цель из бота
+        self.st.put(1, self.sub(bot_goals_rev=0))
+        cur = self.st.get(1)["sub"]
+        self.assertEqual(cur["bot_goals_rev"], 1)
+        self.assertEqual({g["isin"] for g in cur["goals"]}, {"RU000A100001", "RU000A10BOT1"})
+        # После подтверждения ревизии bot_goals_rev=1 список десктопа становится авторитетным
+        self.st.put(1, self.sub(bot_goals_rev=1))
+        cur2 = self.st.get(1)["sub"]
+        self.assertEqual(cur2["bot_goals_rev"], 1)
+        self.assertEqual([g["isin"] for g in cur2["goals"]], ["RU000A100001"])
+
+    def test_stats_counts_and_max_checked(self):
+        self.assertEqual(self.st.stats(), {"subs": 0, "last_checked": None})
+        self.st.put(1, self.sub(weekly_digest=True))
+        self.assertTrue(self.st.get(1)["sub"]["weekly_digest"])
+        self.ck.run_once()
+        st = self.st.stats()
+        self.assertEqual(st["subs"], 1)
+        self.assertEqual(st["last_checked"], self.NOW)
+
 
 class EndToEnd(unittest.TestCase):
     """Приложение -> настоящий сервер данных (HTTP, база ключей во временной папке)."""
@@ -523,6 +592,22 @@ class EndToEnd(unittest.TestCase):
             for k, v in saved.items():
                 setattr(M, k, v)
             M.store().put(M.TG_SENT_KEY, {})
+
+    def test_health_and_sync_bot_goals(self):
+        import urllib.request
+        st = SA.AlertStore(self.dbp)
+        rev = st.upsert_bot_goal(1, {"isin": "RU000A10BOT2", "name": "Бот 2", "target_yield": 18.5})
+        self.assertEqual(rev, 1)
+        code, j = M.tg_srv_req("sync", {"v": 1, "goals": [{"isin": "RU000A100001", "name": "x", "target_price": 99.0}],
+                                        "weekly_digest": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(j["bot_goals_rev"], 1)
+        self.assertEqual({g["isin"] for g in j["goals"]}, {"RU000A100001", "RU000A10BOT2"})
+        st.checked(1)
+        with urllib.request.urlopen(self.url + "/v1/health", timeout=5) as r:
+            h = json.loads(r.read().decode("utf-8"))
+        self.assertEqual(h["alerts_subs"], 1)
+        self.assertIsNotNone(h["alerts_last_checked"])
 
 
 if __name__ == "__main__":
