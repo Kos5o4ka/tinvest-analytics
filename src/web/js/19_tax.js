@@ -176,10 +176,13 @@ function txDecl(d){
   const ys=Object.keys(d.decl).map(Number).sort((a,b)=>b-a);
   if(!ys.length)return`<div class="card empty">Нет данных для декларации</div>`;
   const y=ys.includes(+S.tx.year)?+S.tx.year:ys[0],dc=d.decl[y];
-  const sel=`<div class="row noprint" style="margin-bottom:12px;gap:12px"><label class="field" style="max-width:200px"><span>Налоговый год</span><select class="in" onchange="S.tx.year=this.value;render()">${ys.map(v=>`<option value="${v}" ${v===y?'selected':''}>${v}</option>`).join('')}</select></label>
-    <button class="btn ghost" onclick="window.print()">Печать</button></div>`;
+  const csvUrl='/api/tax/decl.csv?'+new URLSearchParams({account:S.account,year:String(y)});
+  const sel=`<div class="row noprint" style="margin-bottom:12px;gap:10px;align-items:flex-end;flex-wrap:wrap"><label class="field" style="max-width:200px"><span>Налоговый год</span><select class="in" onchange="S.tx.year=this.value;render()">${ys.map(v=>`<option value="${v}" ${v===y?'selected':''}>${v}</option>`).join('')}</select></label>
+    <a class="btn ghost" style="text-decoration:none" href="${csvUrl}">Скачать CSV для 3-НДФЛ</a>
+    <button class="btn ghost" onclick="window.print()">Печать / PDF</button></div>`;
   const wk=w=>Object.keys(w).filter(k=>Math.abs(w[k])>0.005).map(k=>`${esc(L[k]||k)}: ${tR(w[k])}`).join('; ');
   const ii=Object.fromEntries(d.iis.map(i=>[i.id,i]));
+  const kindLbl={repay:'погашение',amort:'амортизация',writeoff:'списание остатка',short:'шорт'};
   return sel+dc.groups.map(g=>{
     const rowsT=[
       ['Доходы от продажи ценных бумаг',tR(g.proceeds)],['Расходы (покупка, комиссии)',tR(g.cost+g.fees)],['Финансовый результат по сделкам',tS(g.trade)],
@@ -190,10 +193,24 @@ function txDecl(d){
       ['Убыток года к переносу на будущие годы',g.loss_new>0.5?tR(g.loss_new):'—']];
     const i=ii[g.key.replace('iis:','')];
     const iis=i&&(i.type==='A'||i.type==='3')?(i.years.find(v=>v.year===y)||null):null;
+    const pool=g.carry_pool||[];
+    const carryBox=(g.carry_used>0.005||g.loss_new>0.005||pool.length)?`<h3 style="margin:14px 0 6px;font-size:13px">Перенос убытков прошлых лет</h3>
+      <p class="note" style="margin:0 0 8px">Зачтено в ${y} г.: <b>${g.carry_used>0.005?tR(g.carry_used):'0 ₽'}</b> · Новый убыток ${y} г.: <b>${g.loss_new>0.005?tR(g.loss_new):'0 ₽'}</b></p>
+      ${pool.length?`<div class="tbl"><table><thead><tr><th class="l">Год возникновения убытка</th><th>Остаток к переносу на будущие годы</th></tr></thead><tbody>${pool.map(p=>`<tr><td class="l">${p.year}</td><td class="num">${tR(p.amount)}</td></tr>`).join('')}</tbody></table></div>`:''}`:'';
+    const fxp=g.fx_payouts||[];
+    const fxBox=fxp.length?`<h3 style="margin:14px 0 6px;font-size:13px">Валютные дивиденды и купоны (пересчёт по курсу ЦБ РФ)</h3>
+      <div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Бумага</th><th class="l">Тип</th><th>Валюта</th><th>Сумма в валюте</th><th>Курс ЦБ</th><th>Сумма, ₽</th><th>Удержано налога</th><th class="l">Источник</th></tr></thead><tbody>${
+        fxp.map(p=>`<tr${stkAttrIf(p.ticker)}><td class="l">${tDt(p.date)}</td><td class="l"><b>${esc(p.name)}</b>${p.ticker?`<br><small class="mu">${esc(p.ticker)}</small>`:''}</td><td class="l">${p.kind==='div'?'Дивиденд':'Купон'}</td><td class="num">${esc(p.cur)}</td><td class="num">${NF2.format(p.amount)}</td><td class="num">${Number(p.rate||0).toFixed(4)}</td><td class="num">${tR(p.amount_rub)}</td><td class="num">${p.tax_rub>0.005?tR(p.tax_rub)+(p.tax_orig>0.005?`<br><small class="mu">${NF2.format(p.tax_orig)} ${esc(p.cur)}</small>`:''):'—'}</td><td class="l"><small class="mu">${esc(p.source||'')}</small></td></tr>`).join('')
+      }</tbody></table></div>`:'';
+    const sls=g.sales||[];
+    const salesBox=sls.length?`<h3 style="margin:14px 0 6px;font-size:13px">Сделки по ценным бумагам (${sls.length}${sls.length>200?', показаны первые 200':''})</h3>
+      <div class="tbl"><table><thead><tr><th class="l">Дата продажи</th><th class="l">Дата покупки</th><th class="l">Бумага</th><th>Кол-во</th><th>Выручка</th><th>Расход</th><th>Комиссия</th><th>Результат</th><th>ЛДВ</th></tr></thead><tbody>${
+        sls.slice(0,200).map(s=>`<tr${stkAttrIf(s.ticker)}><td class="l">${tDt(s.sdate)}</td><td class="l">${tDt(s.bdate)}</td><td class="l">${esc(s.name)}<br><small class="mu">${esc(s.ticker)}${kindLbl[s.kind]?' · '+kindLbl[s.kind]:''}</small></td><td class="num">${NF0.format(s.qty)}</td><td class="num">${tR(s.proceeds)}</td><td class="num">${tR(s.cost)}</td><td class="num">${tR(s.fee)}</td><td class="num ${cls(s.result)}">${tS(s.result)}</td><td class="num">${s.ldv?`Да (${s.yrs} г.)`:'—'}</td></tr>`).join('')
+      }</tbody></table></div>`:(g.lines.length?`<h3 style="margin:14px 0 6px;font-size:13px">Сделки по бумагам (до 80 крупнейших по результату)</h3><div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Кол-во</th><th>Выручка</th><th>Расход</th><th>Комиссия продажи</th><th>Результат</th><th>из них ЛДВ</th></tr></thead><tbody>${
+        g.lines.map(l=>`<tr${stkAttrIf(l.ticker)}><td class="l">${esc(l.name)}<br><small class="mu">${esc(l.ticker)}${kindLbl[l.kind]?' · '+kindLbl[l.kind]:''}</small></td><td class="num">${NF0.format(l.qty)}</td><td class="num">${tR(l.proceeds)}</td><td class="num">${tR(l.cost)}</td><td class="num">${tR(l.fee)}</td><td class="num ${cls(l.result)}">${tS(l.result)}</td><td class="num">${Math.abs(l.ldv_result)>0.5?tS(l.ldv_result):'—'}</td></tr>`).join('')}</tbody></table></div>`:'');
     return`<div class="card"><h2>${esc(g.name)}<span class="sp">${y}</span></h2><div class="tbl"><table><tbody>${rowsT.map(r=>`<tr><td class="l">${r[0]}</td><td class="num">${r[1]}</td></tr>`).join('')}</tbody></table></div>
       ${iis?`<p class="note"><b>Вычет по ИИС (тип А):</b> взносы за год ${tR(iis.deposits)}, в вычет идёт ${tR(iis.deduct_base)}, к возврату до ${tR(iis.deduct)} (не больше уплаченного НДФЛ).</p>`:''}
-      ${g.lines.length?`<h3 style="margin:14px 0 6px;font-size:13px">Сделки по бумагам (до 80 крупнейших по результату)</h3><div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Кол-во</th><th>Выручка</th><th>Расход</th><th>Комиссия продажи</th><th>Результат</th><th>из них ЛДВ</th></tr></thead><tbody>${
-        g.lines.map(l=>`<tr${stkAttrIf(l.ticker)}><td class="l">${esc(l.name)}<br><small class="mu">${esc(l.ticker)}${l.kind==='repay'?' · погашение':l.kind==='amort'?' · амортизация':l.kind==='writeoff'?' · списание остатка':l.kind==='short'?' · шорт':''}</small></td><td class="num">${NF0.format(l.qty)}</td><td class="num">${tR(l.proceeds)}</td><td class="num">${tR(l.cost)}</td><td class="num">${tR(l.fee)}</td><td class="num ${cls(l.result)}">${tS(l.result)}</td><td class="num">${Math.abs(l.ldv_result)>0.5?tS(l.ldv_result):'—'}</td></tr>`).join('')}</tbody></table></div>`:''}</div>`}).join('')+
+      ${carryBox}${fxBox}${salesBox}</div>`}).join('')+
     `<p class="note">Данные для заполнения 3-НДФЛ — справочные. Если налог удержан брокером полностью, декларация нужна, чтобы заявить вычет по ИИС, ЛДВ или перенос убытка. Справку о доходах и удержанном налоге запросите у брокера.</p>`;
 }
 

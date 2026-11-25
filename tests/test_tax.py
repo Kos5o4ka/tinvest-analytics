@@ -528,3 +528,80 @@ class FifoShortsAndEpsilon(unittest.TestCase):
         an = M.analyze([s, b], {}, "all", 0)
         self.assertAlmostEqual(an["life"].get("realized", 0.0), 100.0, places=6)
 
+
+class NdflDeclarationPackage(unittest.TestCase):
+    def test_decl_fx_payouts_and_cbr_conversion(self):
+        rates = {"2024-03-15": 92.0, "2024-06-20": 12.5}
+        fx = lambda cur, day: rates.get(day) if cur in ("usd", "cny") else 1.0
+        div_usd = op("2024-03-15", "DIVIDEND", pay=100.0, uid="u_aapl", cur="usd", name="Apple")
+        tax_usd = op("2024-03-15", "DIVIDEND_TAX", pay=-10.0, uid="u_aapl", cur="usd", name="Apple")
+        tax_usd["parentOperationId"] = div_usd["id"]
+        cpn_cny = op("2024-06-20", "COUPON", pay=200.0, uid="u_cny", itype="bond", cur="cny", name="Юань Бонд")
+        div_rub = op("2024-07-01", "DIVIDEND", pay=500.0, uid="u_sber", cur="rub", name="Сбер")
+        sel = [{"id": "A", "name": "Основной", "type": ""}]
+        st = M.tax_compute([div_usd, tax_usd, cpn_cny, div_rub], {}, [], sel, {"iis": {}, "loss_carry": {}}, fx=fx)
+        decl = M.tx_decl(st)
+        self.assertIn(2024, decl)
+        fxp = decl[2024]["fx_payouts"]
+        self.assertEqual(len(fxp), 2)
+        self.assertEqual(fxp[0]["cur"], "USD")
+        self.assertAlmostEqual(fxp[0]["amount"], 100.0)
+        self.assertAlmostEqual(fxp[0]["rate"], 92.0)
+        self.assertAlmostEqual(fxp[0]["amount_rub"], 9200.0)
+        self.assertAlmostEqual(fxp[0]["tax_orig"], 10.0)
+        self.assertAlmostEqual(fxp[0]["tax_rub"], 920.0)
+        self.assertIn("ЦБ РФ", fxp[0]["source"])
+        self.assertEqual(fxp[1]["cur"], "CNY")
+        self.assertAlmostEqual(fxp[1]["amount_rub"], 2500.0)
+
+    def test_decl_sales_and_loss_carry_breakdown(self):
+        ops = [
+            buy("2023-01-10", 10, 100, uid="u1", name="Бумага 1"),
+            sell("2023-06-01", 10, 60, uid="u1", name="Бумага 1"),
+            buy("2024-01-10", 10, 100, uid="u2", name="Бумага 2"),
+            sell("2024-06-01", 10, 130, uid="u2", name="Бумага 2"),
+        ]
+        sel = [{"id": "A", "name": "Основной", "type": ""}]
+        st = M.tax_compute(ops, {}, [], sel, {"iis": {}, "loss_carry": {}})
+        decl = M.tx_decl(st)
+        g23 = decl[2023]["groups"][0]
+        self.assertAlmostEqual(g23["loss_new"], 400.0)
+        self.assertEqual(g23["carry_pool"], [{"year": 2023, "amount": 400.0}])
+        self.assertEqual(len(g23["sales"]), 1)
+        self.assertEqual(g23["sales"][0]["bdate"], "2023-01-10")
+        self.assertEqual(g23["sales"][0]["sdate"], "2023-06-01")
+        g24 = decl[2024]["groups"][0]
+        self.assertAlmostEqual(g24["carry_used"], 300.0)
+        self.assertAlmostEqual(g24["trade_base"], 0.0)
+        self.assertEqual(g24["carry_pool"], [{"year": 2023, "amount": 100.0}])
+        self.assertAlmostEqual(decl[2024]["loss_carry"]["carry_used"], 300.0)
+        self.assertEqual(decl[2024]["loss_carry"]["pool"], [{"year": 2023, "amount": 100.0}])
+
+    def test_decl_csv_endpoint_and_bom(self):
+        rates = {"2024-03-15": 90.0}
+        fx = lambda cur, day: rates.get(day) if cur == "usd" else 1.0
+        ops = [
+            buy("2024-01-10", 10, 100, uid="u1", name="Акция А"),
+            sell("2024-05-10", 10, 150, uid="u1", name="Акция А"),
+            op("2024-03-15", "DIVIDEND", pay=50.0, uid="u2", cur="usd", name="Microsoft"),
+        ]
+        sel = [{"id": "A", "name": "Основной", "type": ""}]
+        st = M.tax_compute(ops, {}, [], sel, {"iis": {}, "loss_carry": {"2022": 200.0}}, fx=fx)
+        old_state = M.tax_state
+        M.tax_state = lambda cfg, acc, force=False: (st, {"iis": {}, "loss_carry": {"2022": 200.0}})
+        try:
+            code, body, ctype, headers = M.API_GET["/api/tax/decl.csv"]({}, "all", {"year": "2024"}, False)
+        finally:
+            M.tax_state = old_state
+        self.assertEqual(code, 200)
+        self.assertIn("text/csv", ctype)
+        self.assertEqual(headers["Content-Disposition"], 'attachment; filename="3ndfl_2024.csv"')
+        self.assertTrue(body.startswith(b"\xef\xbb\xbf"))
+        text = body.decode("utf-8-sig")
+        self.assertIn(";", text)
+        self.assertIn("Сделка;Основной;2024-05-10;2024-01-10;Акция А", text)
+        self.assertIn("Валютная выплата;Основной;2024-03-15;;Microsoft", text)
+        self.assertIn(";USD;50,0;90,0;4500,0;", text)
+        with self.assertRaises(M.ApiError):
+            M.tax_decl_csv_get({}, "all", {"year": "bad"}, False)
+

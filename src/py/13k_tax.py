@@ -249,7 +249,26 @@ def tax_engine(ops, types=None, fx=None, held=None):
     books, sales, meta = {}, [], {}
     moved, convs = {}, []
     inc = defaultdict(tx_inc_new)
+    payouts = []
     turn = [0.0, 0.0]
+
+    pay_tax_parent = defaultdict(list)
+    pay_tax_key = defaultdict(list)
+    for o in ops:
+        tk = classify(o.get("type"))
+        if tk in ("tax_dividend", "tax_coupon"):
+            dt = parse_dt(o.get("date"))
+            td = dt.date()
+            tcur = cur_of(o.get("payment"))
+            tamt = abs(qf(o.get("payment")))
+            trub = tamt * rate(tcur, td)
+            pkind = "dividends" if tk == "tax_dividend" else "coupons"
+            if o.get("parentOperationId"):
+                pay_tax_parent[o["parentOperationId"]].append((tcur, tamt, trub))
+            else:
+                tuid = o.get("instrumentUid") or o.get("figi") or o.get("_ident") or ""
+                pay_tax_key[(o.get("_acc") or "", td.isoformat(), tuid, pkind)].append((tcur, tamt, trub))
+
     for idx, o in enumerate(ops):
         kind = classify(o.get("type"))
         acc = o.get("_acc") or ""
@@ -261,14 +280,32 @@ def tax_engine(ops, types=None, fx=None, held=None):
         itype = {"bonds": "bond", "shares": "share"}.get(itype, itype) or "share"
         pay = qf(o.get("payment"))
         cur = cur_of(o.get("payment"))
+        raw_fx = 1.0 if cur in ("", "rub") else fx(cur, d.isoformat())
         r = rate(cur, d)
         I = inc[(acc, d.year)]
         if uid and kind in ("buy", "sell", "sec_in", "repayments") and uid not in meta:
             meta[uid] = {"name": info.get("name") or o.get("name") or o.get("ticker") or uid, "ticker": info.get("ticker") or o.get("ticker") or "", "type": itype}
-        if kind == "dividends":
-            I["div"] += pay * r
-        elif kind == "coupons":
-            I["coupon"] += pay * r
+        if kind in ("dividends", "coupons"):
+            if kind == "dividends":
+                I["div"] += pay * r
+            else:
+                I["coupon"] += pay * r
+            matched = []
+            if o.get("id") and o["id"] in pay_tax_parent:
+                matched = pay_tax_parent.pop(o["id"])
+            elif pay_tax_key.get((acc, d.isoformat(), uid, kind)):
+                matched = [pay_tax_key[(acc, d.isoformat(), uid, kind)].pop(0)]
+            tax_orig = sum(a for tc, a, _ in matched if tc == cur)
+            tax_rub = sum(tr for _, _, tr in matched)
+            src_note = "Рублёвая выплата" if cur in ("", "rub") else ("ЦБ РФ на дату выплаты" if raw_fx else "Курс ЦБ не найден (взят 1.0)")
+            payouts.append({
+                "id": o.get("id") or "", "acc": acc, "date": d.isoformat(), "year": d.year, "uid": uid,
+                "name": info.get("name") or o.get("name") or o.get("ticker") or uid or "—",
+                "ticker": info.get("ticker") or o.get("ticker") or "",
+                "kind": "div" if kind == "dividends" else "coupon",
+                "cur": (cur or "rub").upper(), "amount": pay, "rate": r, "amount_rub": pay * r,
+                "tax_orig": tax_orig, "tax_rub": tax_rub, "source": src_note,
+            })
         elif kind == "overnight":
             I["over"] += pay * r
         elif kind in TAXES:
@@ -439,7 +476,7 @@ def tax_engine(ops, types=None, fx=None, held=None):
                 mt = meta.get(uid, {})
                 opens.append({"acc": acc, "uid": uid, "name": mt.get("name", ""), "ticker": mt.get("ticker", ""), "type": mt.get("type", "share"),
                               "qty": l["qty"], "unit": l["unit"], "date": l["date"], "blind": bool(l.get("blind")), "cur": l.get("cur", "rub")})
-    return {"sales": sales, "open": opens, "inc": dict(inc), "meta": meta, "warnings": sorted(warns.values()),
+    return {"sales": sales, "open": opens, "inc": dict(inc), "payouts": payouts, "meta": meta, "warnings": sorted(warns.values()),
             "fee_rate": (turn[1] / turn[0]) if turn[0] > 0 else 0.003}
 
 
@@ -521,7 +558,7 @@ def tax_group_years(sales, inc, carry_user=None, iis_exempt=False, extra=None, o
         rows.append({
             "year": y, "proceeds": sum(s["proceeds"] for s in sec), "cost": sum(s["cost"] for s in sec), "fees": sum(s["fee"] for s in sec),
             "trade": trade, "ldv_exempt": exempt, "ldv_limit": limit if elig else 0.0, "ldv_saved": saved, "ldv_n": len(elig),
-            "carry_used": used, "loss_new": new_loss, "trade_base": trade_base,
+            "carry_used": used, "loss_new": new_loss, "carry_pool": [{"year": p[0], "amount": round(p[1], 2)} for p in sorted(pool, key=lambda x: x[0]) if p[1] > 0.005], "trade_base": trade_base,
             "dividends": div, "coupons": coupon_net, "coupons_gross": i.get("coupon", 0.0), "nkd_adj": i.get("nkd_recv", 0.0) - un, "coupon_offset": coff,
             "overnight": over, "deriv": deriv, "base": base, "iis_exempt_used": iis_used, "tax": tax, "tax13": lo * 0.13, "tax15": hi * 0.15,
             "withheld": withheld, "w": {k[2:]: v for k, v in i.items() if k.startswith("w_")},
@@ -886,14 +923,51 @@ def tx_forecast(st, settings, pays=None, holidays=()):
     return out
 
 
+def tx_decl_sales(sales, year):
+    out = []
+    for s in sales:
+        if s["bucket"] != "sec" or s["sdate"].year != year:
+            continue
+        out.append({
+            "sdate": s["sdate"].isoformat(),
+            "bdate": s["bdate"].isoformat() if s.get("bdate") else "",
+            "uid": s["uid"],
+            "name": s["name"],
+            "ticker": s["ticker"],
+            "type": s["type"],
+            "kind": s["kind"],
+            "qty": s["qty"],
+            "proceeds": s["proceeds"],
+            "cost": s["cost"],
+            "fee": s["fee"],
+            "result": s["result"],
+            "ldv": bool(s.get("ldv")),
+            "yrs": s.get("yrs", 0),
+        })
+    return sorted(out, key=lambda x: (x["sdate"], x["name"]))
+
+
 def tx_decl(st):
     decl = {}
+    all_pays = st.get("eng", {}).get("payouts") or []
     for g in st["groups"]:
+        g_accs = set(g.get("accounts") or [])
         for r in g["rows"]:
-            d = decl.setdefault(r["year"], {"year": r["year"], "groups": []})
+            y = r["year"]
+            d = decl.setdefault(y, {"year": y, "groups": [], "fx_payouts": [], "loss_carry": {"carry_used": 0.0, "loss_new": 0.0, "pool": []}})
+            pays = sorted([dict(p) for p in all_pays if p["acc"] in g_accs and p["year"] == y], key=lambda p: (p["date"], p["name"]))
+            fx_pays = [p for p in pays if p["cur"] != "RUB"]
             e = dict(r)
-            e.update(key=g["key"], name=g["name"], kind=g["kind"], lines=tx_lines(g["sales"], r["year"]))
+            e.update(key=g["key"], name=g["name"], kind=g["kind"], lines=tx_lines(g["sales"], y),
+                     sales=tx_decl_sales(g["sales"], y), payouts=pays, fx_payouts=fx_pays)
             d["groups"].append(e)
+            d["fx_payouts"].extend(fx_pays)
+            d["loss_carry"]["carry_used"] += r.get("carry_used", 0.0)
+            d["loss_carry"]["loss_new"] += r.get("loss_new", 0.0)
+            if g["kind"] == "gen":
+                d["loss_carry"]["pool"] = list(r.get("carry_pool") or [])
+    for d in decl.values():
+        d["fx_payouts"].sort(key=lambda p: (p["date"], p["name"]))
     return decl
 
 
@@ -1074,6 +1148,60 @@ def tax_reb_get(cfg, acc, q, force):
     return {"items": tax_reb_plan(st, settings, sells), "warnings": st["eng"]["warnings"]}
 
 
+def tax_decl_csv(decl, year):
+    """Формирует UTF-8 BOM CSV (разделитель ';') для 3-НДФЛ по выбранному году."""
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["Раздел", "Группа", "Дата", "Дата покупки", "Бумага", "Тикер", "Операция", "Кол-во",
+                "Валюта", "Сумма в валюте", "Курс ЦБ", "Сумма / Выручка, ₽", "Расход, ₽", "Комиссия, ₽",
+                "Результат, ₽", "ЛДВ", "Налог удержан, ₽", "Примечание"])
+    n = lambda x, d=2: "" if x is None else str(round(float(x), d)).replace(".", ",")
+    kinds = {"sell": "Продажа", "repay": "Погашение", "amort": "Амортизация", "writeoff": "Списание", "short": "Шорт"}
+    d = decl.get(year) or {"year": year, "groups": []}
+    for g in d["groups"]:
+        gn = g["name"]
+        w.writerow(["Итог", gn, str(year), "", "Сделки с ценными бумагами", "", "Итог", "", "RUB", "", "",
+                    n(g["proceeds"]), n(g["cost"]), n(g["fees"]), n(g["trade"]),
+                    n(g["ldv_exempt"]) if g.get("ldv_exempt", 0) > 0.005 else "",
+                    n(g["withheld"]),
+                    "База: %s; Налог: %s; Зачёт убытков: %s; Убыток к переносу: %s" % (
+                        n(g["base"]), n(g["tax"]), n(g["carry_used"]), n(g["loss_new"]))])
+        for s in g.get("sales") or []:
+            w.writerow(["Сделка", gn, s["sdate"], s.get("bdate") or "", s["name"], s["ticker"],
+                        kinds.get(s["kind"], s["kind"]), n(s["qty"], 6), "RUB", "", "",
+                        n(s["proceeds"]), n(s["cost"]), n(s["fee"]), n(s["result"]),
+                        "Да (%d г.)" % s["yrs"] if s.get("ldv") else "Нет", "", ""])
+        for p in g.get("fx_payouts") or []:
+            note = p.get("source") or ""
+            if p.get("tax_orig", 0) > 0.005:
+                note = ("%s; налог в валюте: %s %s" % (note, n(p["tax_orig"]), p["cur"])).strip("; ")
+            w.writerow(["Валютная выплата", gn, p["date"], "", p["name"], p["ticker"],
+                        "Дивиденд" if p["kind"] == "div" else "Купон", "",
+                        p["cur"], n(p["amount"]), n(p["rate"], 4), n(p["amount_rub"]),
+                        "", "", "", "", n(p["tax_rub"]), note])
+        for lp in g.get("carry_pool") or []:
+            w.writerow(["Перенос убытков", gn, str(lp["year"]), "", "Остаток убытка к переносу", "", "", "",
+                        "RUB", "", "", "", "", "", n(lp["amount"]), "", "", "Год возникновения убытка: %s" % lp["year"]])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def tax_decl_csv_get(cfg, acc, q, force):
+    raw_y = (q.get("year") or "").strip()
+    year = None
+    if raw_y:
+        try:
+            year = int(raw_y)
+        except ValueError:
+            raise ApiError("Некорректный год", 400)
+    st, _ = tax_state(cfg, acc, force)
+    decl = tx_decl(st)
+    if year is None:
+        year = max(decl) if decl else st["today"].year
+    return (200, tax_decl_csv(decl, year), "text/csv; charset=utf-8",
+            {"Content-Disposition": 'attachment; filename="3ndfl_%d.csv"' % year})
+
+
 API_GET["/api/tax"] = tax_get
 API_GET["/api/tax/reb"] = tax_reb_get
+API_GET["/api/tax/decl.csv"] = tax_decl_csv_get
 API_POST["/api/tax/settings"] = tax_post_settings
