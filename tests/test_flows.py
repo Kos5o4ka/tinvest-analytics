@@ -230,6 +230,18 @@ class TestWorker(unittest.TestCase):
         self.eng.iss_trades("shares")
         self.assertEqual(self.db.execute("SELECT SUM(buy) FROM agg WHERE secid='SBER'").fetchone()[0], 6e6)
 
+    def test_tinvest_polling_fx_bond(self):
+        fmd = FakeMD()
+        self.eng.md = fmd
+        self.eng.fx_get = lambda: {"USD": 90.0}
+        self.db.execute("UPDATE instruments SET uid='u-usd', lot=1, face=1000 WHERE secid='RU000A0CORP1'")
+        self.eng.load_inst()
+        self.eng.inst["RU000A0CORP1"]["face_cur"] = "usd"
+        fmd.trades["u-usd"] = [{"ts": NOW - 60, "side": "buy", "price": 98.5, "qty": 10}]
+        self.eng.poll_tinvest(5)
+        val = self.db.execute("SELECT buy FROM agg WHERE secid='RU000A0CORP1'").fetchone()[0]
+        self.assertAlmostEqual(val, 98.5 / 100 * 1000 * 10 * 90.0)
+
     def test_spikes(self):
         for d in range(1, 8):
             self.db.execute("INSERT INTO slot VALUES('SBER',?,66,1000000)", ("2026-11-%02d" % (d + 5 if d + 5 < 17 else 5),))

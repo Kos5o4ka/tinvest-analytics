@@ -128,10 +128,23 @@ def iss_rows(text, block):
     return [dict(zip(cols, r)) for r in b.get("data") or []]
 
 
+def _parse_cbr_xml(xml):
+    """XML_daily ЦБ -> {'USD': 90.5, ...} (курс за единицу)."""
+    out = {}
+    for m in re.finditer(r"<Valute[^>]*>(.*?)</Valute>", xml or "", re.S):
+        b = m.group(1)
+        code = re.search(r"<CharCode>(\w+)</CharCode>", b)
+        nom = re.search(r"<Nominal>(\d+)</Nominal>", b)
+        val = re.search(r"<Value>([\d.,]+)</Value>", b)
+        if code and nom and val:
+            out[code.group(1).upper()] = float(val.group(1).replace(",", ".")) / float(nom.group(1))
+    return out
+
+
 # ───────────────────────── база ─────────────────────────
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS instruments(secid TEXT PRIMARY KEY, isin TEXT, uid TEXT, cls TEXT, board TEXT, sector TEXT, name TEXT,
-  lot INTEGER DEFAULT 1, face REAL DEFAULT 0, turnover REAL DEFAULT 0, active INTEGER DEFAULT 1, cdl_day TEXT, updated REAL);
+  lot INTEGER DEFAULT 1, face REAL DEFAULT 0, face_cur TEXT DEFAULT 'rub', turnover REAL DEFAULT 0, active INTEGER DEFAULT 1, cdl_day TEXT, updated REAL);
 CREATE INDEX IF NOT EXISTS ix_inst_isin ON instruments(isin);
 CREATE TABLE IF NOT EXISTS agg(secid TEXT, bucket INTEGER, buy REAL DEFAULT 0, sell REAL DEFAULT 0, n INTEGER DEFAULT 0,
   nl INTEGER DEFAULT 0, ti REAL DEFAULT 0, PRIMARY KEY(secid, bucket));
@@ -153,6 +166,8 @@ def open_db(path):
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.executescript(SCHEMA)
+    if "face_cur" not in {r[1] for r in db.execute("PRAGMA table_info(instruments)")}:
+        db.execute("ALTER TABLE instruments ADD COLUMN face_cur TEXT DEFAULT 'rub'")
     db.commit()
     return db
 
@@ -169,11 +184,13 @@ def meta_set(db, k, v):
 # ───────────────────────── движок ─────────────────────────
 class Engine:
     def __init__(self, db, iss_get, md=None, now=time.time, stop=None, md_poll_secs=90, candle_batch=40,
-                 iss_pages=8, iss_backfill=20000, universe=None):
+                 iss_pages=8, iss_backfill=20000, universe=None, fx_get=None):
         self.db, self.iss_get, self.md, self.now = db, iss_get, md, now
         self.stop = stop or threading.Event()
         self.md_poll_secs, self.candle_batch, self.iss_pages, self.iss_backfill = md_poll_secs, candle_batch, iss_pages, iss_backfill
         self.universe = dict(UNIVERSE, **(universe or {}))
+        self.fx_get = fx_get
+        self.fx_rates, self.fx_ts = {}, 0.0
         self.inst = {}                    # secid -> dict (активные)
         self.hist = {}                    # secid -> {day: {bin: n}}
         self.hist_dirty = set()
@@ -190,8 +207,8 @@ class Engine:
     # --- универсум ---
     def load_inst(self):
         self.inst = {}
-        for r in self.db.execute("SELECT secid,isin,uid,cls,board,sector,name,lot,face,turnover FROM instruments WHERE active=1"):
-            self.inst[r[0]] = dict(zip(("secid", "isin", "uid", "cls", "board", "sector", "name", "lot", "face", "turnover"), r))
+        for r in self.db.execute("SELECT secid,isin,uid,cls,board,sector,name,lot,face,turnover,COALESCE(face_cur,'rub') FROM instruments WHERE active=1"):
+            self.inst[r[0]] = dict(zip(("secid", "isin", "uid", "cls", "board", "sector", "name", "lot", "face", "turnover", "face_cur"), r))
         for secid, src, ts in self.db.execute("SELECT secid,src,ts FROM cur"):
             self.cur[(secid, src)] = ts
 
@@ -201,7 +218,7 @@ class Engine:
 
         def board(market, brd):
             url = ("%sengines/stock/markets/%s/boards/%s/securities.json?iss.meta=off&iss.only=securities,marketdata"
-                   "&securities.columns=SECID,ISIN,SHORTNAME,LOTSIZE,FACEVALUE&marketdata.columns=SECID,VALTODAY" %
+                   "&securities.columns=SECID,ISIN,SHORTNAME,LOTSIZE,FACEVALUE,FACEUNIT&marketdata.columns=SECID,VALTODAY" %
                    (ISS, market, brd))
             t = self.iss_get(url)
             sec, md = iss_rows(t, "securities"), {r["SECID"]: (r.get("VALTODAY") or 0) for r in iss_rows(t, "marketdata")}
@@ -228,15 +245,18 @@ class Engine:
                     continue
                 sector = SECTORS.get(s["SECID"], "Прочее") if cls == "share" else \
                     "Фонды" if cls == "fund" else ("ОФЗ" if brd == "TQOB" else "Корпоративные облигации")
+                fcur = (s.get("FACEUNIT") or "RUB").strip().lower()
+                if fcur in ("", "sur"):
+                    fcur = "rub"
                 found[s["SECID"]] = (s.get("ISIN") or "", cls, brd, sector, s.get("SHORTNAME") or s["SECID"],
-                                     int(s.get("LOTSIZE") or 1), float(s.get("FACEVALUE") or 0), v)
+                                     int(s.get("LOTSIZE") or 1), float(s.get("FACEVALUE") or 0), fcur, v)
         t = self.now()
         self.db.execute("UPDATE instruments SET active=0")
-        for secid, (isin, cls, brd, sector, name, lot, face, v) in found.items():
-            if self.db.execute("UPDATE instruments SET isin=?,cls=?,board=?,sector=?,name=?,lot=?,face=?,turnover=?,active=1,updated=? "
-                               "WHERE secid=?", (isin, cls, brd, sector, name, lot, face, v, t, secid)).rowcount == 0:
-                self.db.execute("INSERT INTO instruments(secid,isin,cls,board,sector,name,lot,face,turnover,active,updated) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,1,?)", (secid, isin, cls, brd, sector, name, lot, face, v, t))
+        for secid, (isin, cls, brd, sector, name, lot, face, fcur, v) in found.items():
+            if self.db.execute("UPDATE instruments SET isin=?,cls=?,board=?,sector=?,name=?,lot=?,face=?,face_cur=?,turnover=?,active=1,updated=? "
+                               "WHERE secid=?", (isin, cls, brd, sector, name, lot, face, fcur, v, t, secid)).rowcount == 0:
+                self.db.execute("INSERT INTO instruments(secid,isin,cls,board,sector,name,lot,face,face_cur,turnover,active,updated) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,1,?)", (secid, isin, cls, brd, sector, name, lot, face, fcur, v, t))
         meta_set(self.db, "universe_ts", t)
         self.db.commit()
         self.load_inst()
@@ -256,10 +276,14 @@ class Engine:
             i = by_isin.get(r["isin"])
             if not i:
                 continue
-            face = tinvest_md.quotation({"units": (i.get("nominal") or {}).get("units"), "nano": (i.get("nominal") or {}).get("nano")}) \
-                if r["cls"] == "bond" else None
+            nom = i.get("nominal") or {}
+            face = tinvest_md.quotation({"units": nom.get("units"), "nano": nom.get("nano")}) if r["cls"] == "bond" else None
+            fcur = (nom.get("currency") or "").strip().lower() or None if r["cls"] == "bond" else None
+            if fcur == "sur":
+                fcur = "rub"
             lot = int(i.get("lot") or r["lot"] or 1)
-            self.db.execute("UPDATE instruments SET uid=?, lot=?, face=COALESCE(?,face) WHERE secid=?", (i["uid"], lot, face or None, secid))
+            self.db.execute("UPDATE instruments SET uid=?, lot=?, face=COALESCE(?,face), face_cur=COALESCE(?,face_cur) WHERE secid=?",
+                            (i["uid"], lot, face or None, fcur, secid))
             n += 1
         meta_set(self.db, "uid_day", msk_day(self.now()))
         self.db.commit()
@@ -390,12 +414,39 @@ class Engine:
         self.db.commit()
         return calls
 
+    def fx_rate(self, cur):
+        """Курс валюты номинала к рублю (ЦБ XML_daily, кэш 6 часов)."""
+        c = (cur or "rub").strip().upper()
+        if c in ("", "RUB", "SUR"):
+            return 1.0
+        now = self.now()
+        if not self.fx_rates or now - self.fx_ts > 6 * 3600:
+            try:
+                if self.fx_get is not None:
+                    rates = self.fx_get()
+                else:
+                    req = urllib.request.Request("https://www.cbr.ru/scripts/XML_daily.asp", headers={"User-Agent": UA})
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        xml = resp.read().decode("windows-1251", "replace")
+                    rates = _parse_cbr_xml(xml)
+                if rates:
+                    self.fx_rates = {k.upper(): float(v) for k, v in rates.items() if v}
+                    self.fx_ts = now
+            except Exception as e:  # noqa: BLE001
+                log.warning("ЦБ курсы: %s", e)
+        return self.fx_rates.get(c)
+
     def ingest_ti(self, r, trades):
         secid = r["secid"]
         cur_ts = self.cur.get((secid, "tinvest"), 0)
         _t, sigs = self.sigs.get(secid, (0, set()))
         lot = r["lot"] or 1
-        k = (r["face"] or 1000.0) / 100.0 if r["cls"] == "bond" else 1.0       # цена облигации — % номинала
+        fx = 1.0
+        if r["cls"] == "bond":
+            fx = self.fx_rate(r.get("face_cur"))
+            if not fx:
+                return                               # нет курса для валютного номинала — не пишем искажённый объём
+        k = ((r["face"] or 1000.0) / 100.0) * fx if r["cls"] == "bond" else 1.0       # цена облигации — % номинала
         batch, take = [], []
         for t in trades:
             sg = (t["price"], t["qty"], t["side"])
