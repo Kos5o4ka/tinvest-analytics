@@ -278,6 +278,32 @@ class GeminiFixesTests(unittest.TestCase):
                     bad.append(f"{fname}:{idx}: {expr}")
         self.assertEqual(bad, [], f"Найдены непроверенные внешние href: {bad}")
 
+    def test_bug_ui01_pro_features(self):
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        pro_js = open(os.path.join(root, "src/web/js/43_pro.js"), encoding="utf-8").read()
+        # Собираем все страницы из PRO_PAGES и regPage(..., {..., pro:true})
+        m_pages = re.search(r"const PRO_PAGES=\[([^\]]+)\]", pro_js)
+        self.assertIsNotNone(m_pages)
+        pro_pages = set(re.findall(r"'([^']+)'", m_pages.group(1)))
+        feat_keys = set()
+        # Ключи из PRO_FEATURES={...}
+        m_feat = re.search(r"const PRO_FEATURES=\{([\s\S]*?)\n\};", pro_js)
+        self.assertIsNotNone(m_feat)
+        feat_keys.update(re.findall(r"^\s*([a-z0-9_]+):\{", m_feat.group(1), re.M))
+        for path in sorted(glob.glob(os.path.join(root, "src/web/js/*.js"))):
+            txt = open(path, encoding="utf-8").read()
+            for m in re.finditer(r"regPage\('([^']+)',\{[^}]*\bpro:true\b", txt):
+                pro_pages.add(m.group(1))
+            feat_keys.update(re.findall(r"PRO_FEATURES\.([a-z0-9_]+)\s*=", txt))
+        missing = sorted(pro_pages - feat_keys)
+        self.assertEqual(missing, [], f"Отсутствуют в PRO_FEATURES: {missing}")
+        # В proAbout() должна быть защита от undefined
+        m_about = re.search(r"function proAbout\(\)\{([\s\S]*?)\n\}", pro_js)
+        self.assertIsNotNone(m_about)
+        self.assertTrue(".filter(Boolean)" in m_about.group(1) or "if(!f)return''" in m_about.group(1))
+
 
 if __name__ == "__main__":
     unittest.main()
