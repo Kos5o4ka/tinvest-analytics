@@ -159,11 +159,28 @@ class Parity(unittest.TestCase):
             M.http_text, M.kbd_at = orig
             M._scr.update(t=0, rows=[])
         srv = {}
-        for b in SA.BOARDS:
+        for b in ("TQCB", "TQOB"):
             SA.quotes_from_iss(boards[b], srv)
         self.assertEqual(sorted(app), sorted(srv))
         for k in app:
             self.assertEqual((app[k]["price"], app[k]["yield"], app[k]["name"]), (srv[k]["price"], srv[k]["yield"], srv[k]["name"]))
+
+    def test_floater_and_currency_boards(self):
+        self.assertIn("TQOD", SA.BOARDS)
+        self.assertIn("TQOY", SA.BOARDS)
+        iss_floater = {
+            "securities": {"columns": ["SECID", "ISIN", "SHORTNAME", "MATDATE", "PREVLEGALCLOSEPRICE", "YIELDATPREVWAPRICE"],
+                           "data": [["FLT1", "RU000A10FLT1", "Флоатер 1", d(365), 99.0, None]]},
+            "marketdata": {"columns": ["SECID", "WAPRICE", "LAST", "YIELD", "YIELDATWAPRICE"],
+                           "data": [["FLT1", 99.2, 99.3, None, None]]},
+        }
+        q = SA.quotes_from_iss(iss_floater)
+        self.assertIn("RU000A10FLT1", q)
+        self.assertEqual(q["RU000A10FLT1"]["price"], 99.2)
+        self.assertIsNone(q["RU000A10FLT1"]["yield"])
+        al = SA.goal_alerts({"isin": "RU000A10FLT1", "name": "Флоатер 1", "target_price": 100.0, "target_yield": 20.0},
+                            q["RU000A10FLT1"], TODAY)
+        self.assertEqual([a["id"] for a in al], ["gp|RU000A10FLT1|100.0"])
 
 
 class Payload(unittest.TestCase):

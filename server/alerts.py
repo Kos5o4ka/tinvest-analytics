@@ -368,7 +368,7 @@ def pay_events(pays, today, days):
 ISS_URL = ("https://iss.moex.com/iss/engines/stock/markets/bonds/boards/%s/securities.json?iss.meta=off"
            "&iss.only=securities,marketdata&securities.columns=SECID,ISIN,SHORTNAME,MATDATE,PREVLEGALCLOSEPRICE,YIELDATPREVWAPRICE"
            "&marketdata.columns=SECID,WAPRICE,LAST,YIELD,YIELDATWAPRICE")
-BOARDS = ("TQCB", "TQOB")
+BOARDS = ("TQCB", "TQOB", "TQOD", "TQOY")
 
 
 def _table(j, name):
@@ -385,9 +385,13 @@ def quotes_from_iss(j, out=None):
         m = md.get(s["SECID"], {})
         price = m.get("WAPRICE") or m.get("LAST") or s.get("PREVLEGALCLOSEPRICE")
         yld = m.get("YIELD") or m.get("YIELDATWAPRICE") or s.get("YIELDATPREVWAPRICE")
-        if not price or not yld or not s.get("MATDATE") or str(s["MATDATE"]).startswith("0000"):
+        if not price or not s.get("MATDATE") or str(s["MATDATE"]).startswith("0000"):
             continue
-        out[s.get("ISIN") or s["SECID"]] = {"price": round(price, 3), "yield": round(float(yld), 2), "name": s.get("SHORTNAME")}
+        out[s.get("ISIN") or s["SECID"]] = {
+            "price": round(price, 3),
+            "yield": round(float(yld), 2) if yld else None,
+            "name": s.get("SHORTNAME"),
+        }
     return out
 
 
