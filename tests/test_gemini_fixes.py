@@ -372,5 +372,194 @@ class GeminiFixesTests(unittest.TestCase):
         self.assertNotIn('.get("NAME")', bc)
 
 
+class TestCurToRub(unittest.TestCase):
+    def test_cur_to_rub_variants(self):
+        self.assertIsNone(M.cur_to_rub(None, "usd", {"usd": 90.0}))
+        self.assertEqual(M.cur_to_rub(100, "rub", {"usd": 90.0}), 100.0)
+        self.assertEqual(M.cur_to_rub(100, "SUR", {"usd": 90.0}), 100.0)
+        self.assertEqual(M.cur_to_rub(100, None, {"usd": 90.0}), 100.0)
+        self.assertAlmostEqual(M.cur_to_rub(10, "USD", {"usd": 92.5}), 925.0)
+        self.assertAlmostEqual(M.cur_to_rub(10, "cny", {"CNY": 12.5}), 125.0)
+        self.assertEqual(M.cur_to_rub(50, "eur", {}), 50.0)
+        self.assertIsNone(M.cur_to_rub(50, "eur", {}, default=None))
+
+
+def _check_js_delimiters(code):
+    """Verify balanced (), [], {} across JS code, skipping strings, templates, comments, and regexes."""
+    stack, tpl_brace_stack = [], []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closing = {v: k for k, v in pairs.items()}
+    i, n, line, prev_tok = 0, len(code), 1, ""
+    regex_prev = frozenset((
+        "", "(", "[", "{", ",", ";", ":", "=", "!", "&", "|", "?", "+", "-", "*", "%", "^", "~", "<", ">",
+        "return", "case", "throw", "typeof", "void", "delete", "in", "of", "else",
+    ))
+
+    def skip_line_comment(pos):
+        while pos < n and code[pos] != "\n":
+            pos += 1
+        return pos
+
+    def skip_block_comment(pos):
+        nonlocal line
+        pos += 2
+        while pos < n - 1 and not (code[pos] == "*" and code[pos + 1] == "/"):
+            if code[pos] == "\n":
+                line += 1
+            pos += 1
+        return pos + 2
+
+    def skip_string(pos, quote):
+        nonlocal line
+        pos += 1
+        while pos < n:
+            ch = code[pos]
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == "\n":
+                line += 1
+            if ch == quote:
+                return pos + 1
+            pos += 1
+        raise AssertionError(f"Unclosed string {quote} at line {line}")
+
+    def scan_template(pos):
+        nonlocal line
+        pos += 1
+        while pos < n:
+            ch = code[pos]
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == "\n":
+                line += 1
+            if ch == "`":
+                return pos + 1
+            if ch == "$" and pos + 1 < n and code[pos + 1] == "{":
+                stack.append(("{", line))
+                tpl_brace_stack.append(len(stack))
+                return pos + 2
+            pos += 1
+        raise AssertionError(f"Unclosed template literal at line {line}")
+
+    def skip_regex(pos):
+        pos += 1
+        in_class = False
+        while pos < n:
+            ch = code[pos]
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == "[":
+                in_class = True
+            elif ch == "]":
+                in_class = False
+            elif ch == "/" and not in_class:
+                pos += 1
+                while pos < n and code[pos].isalpha():
+                    pos += 1
+                return pos
+            elif ch == "\n":
+                raise AssertionError(f"Unclosed regex at line {line}")
+            pos += 1
+        raise AssertionError(f"Unclosed regex at line {line}")
+
+    while i < n:
+        ch = code[i]
+        if ch == "\n":
+            line += 1
+            i += 1
+            continue
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            if code[i + 1] == "/":
+                i = skip_line_comment(i)
+                continue
+            if code[i + 1] == "*":
+                i = skip_block_comment(i)
+                continue
+            if prev_tok in regex_prev:
+                i = skip_regex(i)
+                prev_tok = "regex"
+                continue
+        if ch in ('"', "'"):
+            i = skip_string(i, ch)
+            prev_tok = "str"
+            continue
+        if ch == "`":
+            i = scan_template(i)
+            prev_tok = "`"
+            continue
+        if ch in pairs:
+            stack.append((ch, line))
+            prev_tok = ch
+            i += 1
+            continue
+        if ch in closing:
+            if not stack or stack[-1][0] != closing[ch]:
+                raise AssertionError(f"Mismatched {ch} at line {line}, stack={stack[-3:]}")
+            stack.pop()
+            if ch == "}" and tpl_brace_stack and len(stack) == tpl_brace_stack[-1] - 1:
+                tpl_brace_stack.pop()
+                i = scan_template(i)
+                prev_tok = "`"
+                continue
+            prev_tok = ch
+            i += 1
+            continue
+        if ch.isalpha() or ch in "_$":
+            j = i + 1
+            while j < n and (code[j].isalnum() or code[j] in "_$"):
+                j += 1
+            prev_tok = code[i:j]
+            i = j
+            continue
+        if ch.isdigit():
+            j = i + 1
+            while j < n and (code[j].isalnum() or code[j] in "._"):
+                j += 1
+            prev_tok = "num"
+            i = j
+            continue
+        prev_tok = ch
+        i += 1
+    if stack:
+        raise AssertionError(f"Unclosed delimiters: {stack[-5:]}")
+
+
+class TestJsSmoke(unittest.TestCase):
+    def test_js_concat_delimiters_and_symbols(self):
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        js_files = sorted(glob.glob(os.path.join(root, "src/web/js/*.js")))
+        self.assertGreater(len(js_files), 60)
+        names = [os.path.basename(p) for p in js_files]
+        for expected in ("21_set.js", "21a_set_parts.js", "21b_set_ui.js", "33_calc.js", "33a_calc_ui.js"):
+            self.assertIn(expected, names)
+        self.assertLess(names.index("21_set.js"), names.index("21a_set_parts.js"))
+        self.assertLess(names.index("21a_set_parts.js"), names.index("21b_set_ui.js"))
+        self.assertLess(names.index("33_calc.js"), names.index("33a_calc_ui.js"))
+
+        joined = "\n".join(open(p, encoding="utf-8").read() for p in js_files)
+        _check_js_delimiters(joined)
+
+        for sym in ("function renderSettings", "function pCalc", "function bindCalc", "function clNdfl", "function clSim",
+                    "PRO_FEATURES", "PRO_PAGES", "function crowdInviteHtml"):
+            self.assertIn(sym, joined, f"Missing JS symbol: {sym}")
+
+        for route in ("/api/calc/goal", "/api/config", "/api/crowd/status", "/api/flows_instruments"):
+            self.assertIn(route, joined, f"Missing JS API route reference: {route}")
+
+        for dead_route in ("/api/crp/batch/status", "/api/disclosure", "/api/flows_instrument'"):
+            self.assertNotIn(dead_route, joined, f"Dead route still referenced in JS: {dead_route}")
+
+        emoji_rx = re.compile(r"[\U0001F300-\U0001FAFF]")
+        self.assertEqual(emoji_rx.findall(joined), [], "Color emojis found in src/web/js/*.js")
+
+
 if __name__ == "__main__":
     unittest.main()

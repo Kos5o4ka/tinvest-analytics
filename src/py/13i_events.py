@@ -308,8 +308,7 @@ def events_payload(cfg, acc, q):
                     continue
                 have_cp.add(key)
             if e.get("amount") is not None:
-                k = 1.0 if not cur or cur == "rub" else (rates.get(cur) or 1.0)
-                e["amount"] = round(e["amount"] * k, 2)
+                e["amount"] = round(cur_to_rub(e["amount"], cur, rates), 2)
             events.append(e)
     except Exception as e:  # noqa: BLE001
         src["portfolio"] = False

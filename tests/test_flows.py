@@ -452,8 +452,9 @@ class TestClient(unittest.TestCase):
         self.assertEqual(T.large_trades_get({}, None, {}, False), {"configured": False, "rows": []})
         with self.assertRaises(T.ApiError):
             T.orderbook_get({}, None, {"secid": "bad secid!"}, False)
-        for p in ("/api/flows", "/api/flows_instrument", "/api/large_trades", "/api/spikes", "/api/orderbook"):
+        for p in ("/api/flows", "/api/flows_instruments", "/api/large_trades", "/api/spikes", "/api/orderbook"):
             self.assertIn(p, T.API_GET)
+        self.assertNotIn("/api/flows_instrument", T.API_GET)
 
     def test_watch_alerts(self):
         al = T.flows_alerts_from([{"secid": "SBER", "ts": 1700000000, "side": "buy", "value": 12e6, "price": 300, "isin": "RU0009029540", "name": "Сбер"}],

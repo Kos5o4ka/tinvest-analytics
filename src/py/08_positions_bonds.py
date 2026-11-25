@@ -57,6 +57,21 @@ def fx_now(client, curs):
     return out
 
 
+def cur_to_rub(amount, cur, rates, default=1.0):
+    """Перевести сумму из валюты cur в рубли по словарю курсов rates."""
+    if amount is None:
+        return None
+    c = (cur or "rub").strip().lower()
+    if c in ("", "rub", "sur"):
+        return float(amount)
+    r = (rates.get(c) or rates.get(c.upper())) if rates else None
+    if not r:
+        if default is None:
+            return None
+        r = default
+    return float(amount) * float(r)
+
+
 def tinvest_positions(port, names):
     raw = port.get("positions") or []
     fx = {"rub": 1.0}
@@ -436,7 +451,7 @@ def bonds_report(client, rows, horizon_days=365):
             kinds["С амортизацией"] += 1
         known = [p for _, p in b.get("coupons") or [] if p]
         fc_ = (b.get("cur") or "rub").lower()
-        k_ = 1.0 if fc_ == "rub" else (rates.get(fc_) or 1.0)       # выплаты считаем в рублях по текущему курсу номинала
+        k_ = cur_to_rub(1.0, fc_, rates)                            # выплаты считаем в рублях по текущему курсу номинала
         fest = (ex or {}).get("est_detail") or {}
         for d, p in b.get("coupons") or []:
             if today <= d <= horizon:
@@ -509,10 +524,10 @@ def bonds_report(client, rows, horizon_days=365):
         for x in ds:
             d, per = x[0], x[1]
             dc = (x[2] if len(x) > 2 else r.get("cur") or "rub").lower()
-            kk = 1.0 if dc == "rub" else rates.get(dc)
-            if d and today <= d <= horizon and per and kk:        # выплата в валюте — переводим в рубли по текущему курсу
+            amt = cur_to_rub(per * r["qty"], dc, rates, default=None) if per else None
+            if d and today <= d <= horizon and amt:               # выплата в валюте — переводим в рубли по текущему курсу
                 pays.append({"date": d, "kind": "dividend", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
-                             "amount": per * r["qty"] * kk, "est": False, "cur": dc})
+                             "amount": amt, "est": False, "cur": dc})
     pays.sort(key=lambda p: p["date"])
     irr = portfolio_irr(irr_items, today)
     metrics = {"count": len(bonds), "value": tot_bonds,

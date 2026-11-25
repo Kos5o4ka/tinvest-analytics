@@ -314,14 +314,5 @@ def crp_batch(cfg, acc, q, force):
     return {"pending": True, "done": 0, "total": 0}
 
 
-def crp_batch_status(cfg, acc, q, force):
-    with _crp_jobs_lock:
-        job = _crp_jobs.get((token_key(cfg), acc))
-    if not job:
-        return {"state": "none"}
-    return {"state": job["state"], "done": job["done"], "total": job["total"]}
-
-
 API_GET["/api/crp"] = crp_api
 API_GET["/api/crp/batch"] = crp_batch
-API_GET["/api/crp/batch/status"] = crp_batch_status

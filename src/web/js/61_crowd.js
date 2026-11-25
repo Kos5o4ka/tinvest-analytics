@@ -1,4 +1,4 @@
-/* ── Помощь в сборе раскрытий эмитентов (по желанию, по умолчанию выключено) ── */
+/* ── Помощь в сборе раскрытий эмитентов (включено по умолчанию, можно отключить в «Настройках») ── */
 const CROWD={st:null};
 function crowdLoad(){return api('/api/crowd/status').then(s=>{CROWD.st=s;return s}).catch(()=>null)}
 setTimeout(crowdLoad,3000);

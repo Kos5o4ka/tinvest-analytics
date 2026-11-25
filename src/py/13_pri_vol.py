@@ -322,7 +322,6 @@ def pv_build_row(secid, desc, agg, today_place, bm, today, rating, cum=None, fx=
     """Одна строка «простыни». today_place — строки marketdata площадки размещения, bm — marketdata рынка bonds."""
     face = desc.get("face") or desc.get("face0") or 1000.0
     cur = (desc.get("cur") or "SUR").replace("SUR", "RUB")
-    rate = 1.0 if cur == "RUB" else ((fx or {}).get(cur) or (fx or {}).get(cur.upper()) or 1.0)
     a = agg or {}
     live = None
     if bm:
@@ -352,8 +351,8 @@ def pv_build_row(secid, desc, agg, today_place, bm, today, rating, cum=None, fx=
     return {"secid": secid, "isin": desc.get("isin") or secid, "name": desc.get("name") or a.get("name") or secid, "full": desc.get("full") or "",
             "rating": rating, "coupon": cpn, "floating": flt, "mat": desc.get("mat") or (live or {}).get("mat") or "",
             "offer": (live or {}).get("offer") or "", "start": start, "first_place": (base.get("first") or (pl_days[0] if pl_days else "")) or (today if tp_val > 0 else ""), "days_on": days_on,
-            "face": face, "size_pcs": size_pcs, "size_rub": round(size_pcs * face * rate, 2) if size_pcs else None,
-            "placed_pcs": placed_pcs, "placed_rub": round(placed_pcs * face * rate, 2) if placed_pcs else None, "placed_src": src,
+            "face": face, "size_pcs": size_pcs, "size_rub": round(cur_to_rub(size_pcs * face, cur, fx), 2) if size_pcs else None,
+            "placed_pcs": placed_pcs, "placed_rub": round(cur_to_rub(placed_pcs * face, cur, fx), 2) if placed_pcs else None, "placed_src": src,
             "placed_pct": round(100.0 * placed_pcs / size_pcs, 1) if size_pcs and placed_pcs else None,
             "place_value": round((base.get("v") or 0) + tp_val, 2), "place_trades": (base.get("n") or 0) + tp_n,
             "today_place": round(tp_val, 2), "today_sec": round(sec_today, 2), "today": round(tp_val + sec_today, 2),
