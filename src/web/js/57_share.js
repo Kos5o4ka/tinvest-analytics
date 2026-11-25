@@ -41,7 +41,7 @@ function shareMount(){
     cv.toBlob(blob=>{
       if(!blob)return;
       const u=URL.createObjectURL(blob),a=document.createElement('a');
-      a.href=u;a.download='tanalytic-portfolio-'+new Date().toISOString().slice(0,10)+'.png';
+      a.href=u;a.download='tanalytic-portfolio-'+localIso()+'.png';
       document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);
       $('#shr-st').textContent='PNG-карточка сохранена.';
     },'image/png');

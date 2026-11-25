@@ -1,7 +1,7 @@
 /* ── напоминания о выплатах ── */
 function upcoming(){
   const n=S.cfg&&S.cfg.notify_days!=null?+S.cfg.notify_days:7,b=S.bonds;if(!n||!b||b.error)return[];
-  const from=new Date().toISOString().slice(0,10),to=new Date(Date.now()+n*864e5).toISOString().slice(0,10);
+  const from=localIso(),to=localIso(new Date(Date.now()+n*864e5));
   const ev=(b.payments||[]).filter(p=>p.date>=from&&p.date<=to).map(p=>({date:p.date,name:p.name,kind:p.kind,amount:p.amount,ticker:p.ticker}));
   (b.rows||[]).forEach(r=>{if(r.call&&r.call>=from&&r.call<=to)ev.push({date:r.call,name:r.name,kind:'offer',amount:null})});
   return ev.sort((a,c)=>a.date.localeCompare(c.date));

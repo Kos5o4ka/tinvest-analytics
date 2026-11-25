@@ -33,7 +33,7 @@ function fngCards(d){
     <p>${esc(c.note)}</p></div>`).join('')}</div>`;
 }
 function fngChart(el){
-  const d=S.fng.data,h=(d&&d.history||[]).filter(x=>x.d>=new Date(Date.now()-366*864e5).toISOString().slice(0,10));
+  const d=S.fng.data,h=(d&&d.history||[]).filter(x=>x.d>=localIso(new Date(Date.now()-366*864e5)));
   if(h.length<2){emptyChart(el,260,'История индекса пока накапливается');return}
   const W=el.clientWidth,H=260,pl=34,pr=10,pt=10,pb=26,n=h.length,pw=W-pl-pr,ph=H-pt-pb,X=i=>pl+i/(n-1)*pw,Y=v=>pt+ph-v/100*ph;
   let s=FNG_ZONES.map(z=>`<rect x="${pl}" y="${Y(z[1])}" width="${pw}" height="${Y(z[0])-Y(z[1])}" fill="${z[3]}" fill-opacity=".13"/>`).join('');

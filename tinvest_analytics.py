@@ -28118,6 +28118,7 @@ const MONF=['Январь','Февраль','Март','Апрель','Май','
 const mlabel=m=>{if(!m||typeof m!=='string'||!m.includes('-'))return'—';const[y,mm]=m.split('-');return(MON[+mm-1]||mm)+' '+y.slice(2)};
 const dlabel=d=>{if(!d||typeof d!=='string'||!d.includes('-'))return'—';const[y,m,dd]=d.split('-');return+dd+' '+(MON[+m-1]||m)+' '+y};
 const ddm=d=>{if(!d||typeof d!=='string'||!d.includes('-'))return'—';const[y,m,dd]=d.split('-');return dd+'.'+m+'.'+y.slice(2)};
+const localIso=(d=new Date())=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 const S1='var(--s1)',S2='var(--s2)',S3='var(--s3)',S4='var(--s4)',S5='var(--s5)',S6='var(--s6)',S7='var(--s7)',S8='var(--s8)';
 /* порядок серий в диаграммах: синий, бирюзовый, янтарный, фиолетовый, розовый, голубой, оливковый, коралловый */
 const PAL=[S1,S3,S4,S7,S5,S2,S6,S8];
@@ -28646,7 +28647,7 @@ function monthsSeries(n=36){
   let ms=S.data.months;if(ms.length>n)ms=ms.slice(-n);
   return{labels:ms.map(m=>mlabel(m[0])),tips:ms.map(m=>{const[y,mm]=m[0].split('-');return MONF[+mm-1]+' '+y}),rows:ms.map(m=>m[1])};
 }
-function periodStart(){const d=new Date();const iso=x=>x.toISOString().slice(0,10);
+function periodStart(){const d=new Date();const iso=localIso;
   switch(S.period){case'1m':d.setDate(d.getDate()-30);return iso(d);case'3m':d.setDate(d.getDate()-91);return iso(d);
   case'12m':d.setDate(d.getDate()-365);return iso(d);case'ytd':return d.getFullYear()+'-01-01';case'py':return(d.getFullYear()-1)+'-01-01';default:return null}}
 function periodEnd(){return S.period==='py'?(new Date().getFullYear()-1)+'-12-31':null}
@@ -28912,7 +28913,7 @@ function bondInsights(b){
   const hy=sp.filter(r=>r.spread>6);if(hy.length)out.push(['Очень высокая доходность',`Спред больше 6 п.п.: ${hy.map(r=>`${esc(r.name)} (+${r.spread.toFixed(1).replace('.',',')})`).join(', ')}. Рынок закладывает повышенный риск — перепроверьте эмитента.`]);
   const top=rows.slice().sort((a,c)=>c.value_rub-a.value_rub).slice(0,3);
   out.push(['Концентрация',`Три крупнейшие позиции — <b>${(top.reduce((a,r)=>a+r.value_rub,0)/tot*100).toFixed(0)}%</b> облигаций: ${top.map(r=>esc(r.name)).join(', ')}.`]);
-  const soon=new Date(Date.now()+90*864e5).toISOString().slice(0,10),today=new Date().toISOString().slice(0,10);
+  const soon=localIso(new Date(Date.now()+90*864e5)),today=localIso();
   const inW=d=>d&&d>=today&&d<=soon,KN={put:'пут-оферта',call:'колл',both:'пут и колл',unknown:'оферта, тип не указан'};
   const ev=rows.filter(r=>inW(r.call)||inW(r.maturity));
   if(ev.length)out.push(['Ближайшие 90 дней',`Оферта или погашение: ${ev.map(r=>inW(r.call)?`${esc(r.name)} — ${ddm(r.call)} (${KN[r.call_kind]||KN.unknown})`:`${esc(r.name)} — ${ddm(r.maturity)}`).join('; ')}. Это только ближайшие даты: все оферты и их тип — на странице «Оферты». <a href="#" class="kb-a" data-kb="offers">Что такое put и call</a>.`]);
@@ -29058,10 +29059,10 @@ function pPri(){
   const d=S.pri;
   if(!d){loadPri();return`<div class="card">${waitBox('Загружаю календарь первичных размещений…')}</div>`}
   if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="pri-r">Повторить</button></div>`;
-  const today=new Date().toISOString().slice(0,10),rows=d.rows;
+  const today=localIso(),rows=d.rows;
   // календарь будущих размещений недоступен (investmint закрыл доступ программам): остальное на экране работает по данным Мосбиржи
   const calNote=d.cal_error?`<div class="msg" style="margin-top:16px">Календарь будущих размещений сейчас недоступен: ${esc(d.cal_error)}. Размещения, которые уже идут на Мосбирже, показаны выше; калькулятор премии работает.</div>`:'';
-  const wk=new Date(Date.now()+7*864e5).toISOString().slice(0,10);
+  const wk=localIso(new Date(Date.now()+7*864e5));
   const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${isinTxt(r.isin)}</small>`:''}</td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
     <td class="l">${priNipCell(r.nip)}</td>
@@ -29194,7 +29195,7 @@ function priVolHtml(){
   const d=S.priV,head='<div class="card"><div class="row" style="padding:0 6px 8px"><h2 style="margin:0">Новые выпуски: объём и спрос</h2><button class="btn ghost" id="pv-r" style="margin-left:auto">Обновить</button></div>';
   if(!d)return head+waitBox('Загружаю размещения за последние 30 дней…')+'</div>';
   if(d.error)return head+`<div class="msg err">${esc(d.error)}</div></div>`;
-  const all=d.rows||[],today=d.today||new Date().toISOString().slice(0,10);
+  const all=d.rows||[],today=d.today||localIso();
   if(!all.length)return head+(d.loading?waitBox((d.phase||'Готовлю данные')+'. Первая загрузка занимает до минуты, потом данные хранятся на компьютере.'):'<div class="empty">Размещений за последние 30 дней не найдено</div>')+'</div>';
   const cnt=k=>all.filter(r=>r.status===k).length;
   const rows=pvSortRows(all.filter(r=>S.priVF==='all'||r.status===S.priVF));
@@ -29590,7 +29591,7 @@ function dayBars(el,o){
     `<div class="tot">Итого<span>${M(d.total)}</span></div>`});
 }
 function payDays(ps,limit){
-  const to=new Date(Date.now()+limit*864e5).toISOString().slice(0,10),from=new Date().toISOString().slice(0,10);
+  const to=localIso(new Date(Date.now()+limit*864e5)),from=localIso();
   const f=ps.filter(p=>p.date>=from&&p.date<=to);
   const tot={};f.forEach(p=>tot[p.name]=(tot[p.name]||0)+p.amount);
   const names=Object.keys(tot).sort((a,b)=>tot[b]-tot[a]),col={};names.forEach((n,i)=>col[n]=colAt(i));
@@ -29607,7 +29608,7 @@ function pPay(){
   const b=S.bonds;
   if(!b)return`<div class="card">${waitBox('Собираю графики купонов и объявленные дивиденды…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
-  const ps=b.payments,now=new Date(),in30=new Date(now.getTime()+30*864e5).toISOString().slice(0,10);
+  const ps=b.payments,now=new Date(),in30=localIso(new Date(now.getTime()+30*864e5));
   const sum=f=>ps.filter(f).reduce((a,x)=>a+x.amount,0);
   const pm=payMonths(ps,12);
   const pdd=payDays(ps,S.payDays);chart('c-days',dayBars,{days:pdd.days,legend:pdd.legend,h:340});
@@ -30739,7 +30740,7 @@ function prInfo(){const a=S.accounts.find(x=>x.id===S.account),pg=(PAGES.find(p=
 /* ── напоминания о выплатах ── */
 function upcoming(){
   const n=S.cfg&&S.cfg.notify_days!=null?+S.cfg.notify_days:7,b=S.bonds;if(!n||!b||b.error)return[];
-  const from=new Date().toISOString().slice(0,10),to=new Date(Date.now()+n*864e5).toISOString().slice(0,10);
+  const from=localIso(),to=localIso(new Date(Date.now()+n*864e5));
   const ev=(b.payments||[]).filter(p=>p.date>=from&&p.date<=to).map(p=>({date:p.date,name:p.name,kind:p.kind,amount:p.amount,ticker:p.ticker}));
   (b.rows||[]).forEach(r=>{if(r.call&&r.call>=from&&r.call<=to)ev.push({date:r.call,name:r.name,kind:'offer',amount:null})});
   return ev.sort((a,c)=>a.date.localeCompare(c.date));
@@ -31517,7 +31518,7 @@ function cmpFetch(){
   });
 }
 const cmpAvgTurn=c=>{const v=((c.history||{}).v||[]).slice(-30).filter(x=>x>0);return v.length?v.reduce((a,b)=>a+b,0)/v.length:(c.market&&c.market.turn)||null};
-const cmpOffer=c=>{const t=new Date().toISOString().slice(0,10);return(c.offers||[]).filter(o=>o.date>=t).sort((a,b)=>a.date<b.date?-1:1)[0]||null};
+const cmpOffer=c=>{const t=localIso();return(c.offers||[]).filter(o=>o.date>=t).sort((a,b)=>a.date<b.date?-1:1)[0]||null};
 const cmpKindTag=k=>k==='both'?'<span class="tag of-t-put">PUT</span> <span class="tag of-t-call">CALL</span>':k==='put'?'<span class="tag of-t-put" title="Право держателя продать выпуск эмитенту">PUT</span>':k==='call'?'<span class="tag of-t-call" title="Эмитент может погасить выпуск досрочно">CALL</span>':'<span class="tag of-t-unk" title="Тип оферты не указан в источниках">оферта</span>';
 /* доходность выше CMP_ODD % или цена ниже 70 % номинала — признак проблем эмитента, такую бумагу не отмечаем «лучшей» */
 const CMP_ODD=40,cmpOdd=c=>!!c.market&&((c.market.yield||0)>CMP_ODD||(c.market.price!=null&&c.market.price<70&&(c.market.yield||0)>25));
@@ -33292,7 +33293,7 @@ function wtRow(r){
     <td><button class="btn ghost wt-del" data-wdel="${esc(r.isin)}" title="Убрать из наблюдения">×</button></td></tr>`;
 }
 function wtNoteHtml(n){
-  const due=n.remind_on&&n.remind_on<=new Date().toISOString().slice(0,10);
+  const due=n.remind_on&&n.remind_on<=localIso();
   return`<div class="wt-note-i" data-isin="${esc(n.isin)}"><div class="wt-nh"><b>${esc(n.name||n.isin)}</b><small class="mu num">${ddm(n.date)}</small>
     ${n.remind_on?`<span class="tag ${due?'wt-due':''}" title="Напоминание">${due?'пора пересмотреть':'напомнить '+ddm(n.remind_on)}</span>`:''}
     <span style="margin-left:auto;display:flex;gap:6px">${n.remind_on?`<button class="btn ghost wt-sm" data-ndone="${esc(n.id)}">Пересмотрено</button>`:''}<button class="btn ghost wt-sm" data-ndel="${esc(n.id)}" title="Удалить заметку">Удалить</button></span></div>
@@ -34259,7 +34260,7 @@ function stkDivCard(c,p){
 }
 function stkRepCard(c){
   const r=c.report||{};let v;
-  if(r.date){const dd=Math.ceil((new Date(r.date)-new Date(new Date().toISOString().slice(0,10)))/864e5);
+  if(r.date){const dd=Math.ceil((new Date(r.date)-new Date(localIso()))/864e5);
     v=`<div class="v num" style="font-size:22px;font-weight:700">${ddm(r.date)}</div><div class="s mu">${dd>0?'через '+dd+' дн.':dd===0?'сегодня':''}${r.year?' · отчёт за '+(r.num?r.num+' кв. ':'')+r.year:''}</div>`}
   else v=`<div class="mu" style="padding:6px 0">${esc(r.note||'Дата неизвестна')}</div>`;
   return`<div class="card"><h2>Следующая отчётность</h2>${v}</div>`;
@@ -34851,7 +34852,7 @@ function fngCards(d){
     <p>${esc(c.note)}</p></div>`).join('')}</div>`;
 }
 function fngChart(el){
-  const d=S.fng.data,h=(d&&d.history||[]).filter(x=>x.d>=new Date(Date.now()-366*864e5).toISOString().slice(0,10));
+  const d=S.fng.data,h=(d&&d.history||[]).filter(x=>x.d>=localIso(new Date(Date.now()-366*864e5)));
   if(h.length<2){emptyChart(el,260,'История индекса пока накапливается');return}
   const W=el.clientWidth,H=260,pl=34,pr=10,pt=10,pb=26,n=h.length,pw=W-pl-pr,ph=H-pt-pb,X=i=>pl+i/(n-1)*pw,Y=v=>pt+ph-v/100*ph;
   let s=FNG_ZONES.map(z=>`<rect x="${pl}" y="${Y(z[1])}" width="${pw}" height="${Y(z[0])-Y(z[1])}" fill="${z[3]}" fill-opacity=".13"/>`).join('');
@@ -35620,7 +35621,7 @@ function shareMount(){
     cv.toBlob(blob=>{
       if(!blob)return;
       const u=URL.createObjectURL(blob),a=document.createElement('a');
-      a.href=u;a.download='tanalytic-portfolio-'+new Date().toISOString().slice(0,10)+'.png';
+      a.href=u;a.download='tanalytic-portfolio-'+localIso()+'.png';
       document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);
       $('#shr-st').textContent='PNG-карточка сохранена.';
     },'image/png');

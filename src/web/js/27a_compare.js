@@ -18,7 +18,7 @@ function cmpFetch(){
   });
 }
 const cmpAvgTurn=c=>{const v=((c.history||{}).v||[]).slice(-30).filter(x=>x>0);return v.length?v.reduce((a,b)=>a+b,0)/v.length:(c.market&&c.market.turn)||null};
-const cmpOffer=c=>{const t=new Date().toISOString().slice(0,10);return(c.offers||[]).filter(o=>o.date>=t).sort((a,b)=>a.date<b.date?-1:1)[0]||null};
+const cmpOffer=c=>{const t=localIso();return(c.offers||[]).filter(o=>o.date>=t).sort((a,b)=>a.date<b.date?-1:1)[0]||null};
 const cmpKindTag=k=>k==='both'?'<span class="tag of-t-put">PUT</span> <span class="tag of-t-call">CALL</span>':k==='put'?'<span class="tag of-t-put" title="Право держателя продать выпуск эмитенту">PUT</span>':k==='call'?'<span class="tag of-t-call" title="Эмитент может погасить выпуск досрочно">CALL</span>':'<span class="tag of-t-unk" title="Тип оферты не указан в источниках">оферта</span>';
 /* доходность выше CMP_ODD % или цена ниже 70 % номинала — признак проблем эмитента, такую бумагу не отмечаем «лучшей» */
 const CMP_ODD=40,cmpOdd=c=>!!c.market&&((c.market.yield||0)>CMP_ODD||(c.market.price!=null&&c.market.price<70&&(c.market.yield||0)>25));

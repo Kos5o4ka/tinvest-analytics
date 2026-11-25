@@ -3,7 +3,7 @@ function pPay(){
   const b=S.bonds;
   if(!b)return`<div class="card">${waitBox('Собираю графики купонов и объявленные дивиденды…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
-  const ps=b.payments,now=new Date(),in30=new Date(now.getTime()+30*864e5).toISOString().slice(0,10);
+  const ps=b.payments,now=new Date(),in30=localIso(new Date(now.getTime()+30*864e5));
   const sum=f=>ps.filter(f).reduce((a,x)=>a+x.amount,0);
   const pm=payMonths(ps,12);
   const pdd=payDays(ps,S.payDays);chart('c-days',dayBars,{days:pdd.days,legend:pdd.legend,h:340});

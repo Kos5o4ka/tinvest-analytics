@@ -23,7 +23,7 @@ function dayBars(el,o){
     `<div class="tot">Итого<span>${M(d.total)}</span></div>`});
 }
 function payDays(ps,limit){
-  const to=new Date(Date.now()+limit*864e5).toISOString().slice(0,10),from=new Date().toISOString().slice(0,10);
+  const to=localIso(new Date(Date.now()+limit*864e5)),from=localIso();
   const f=ps.filter(p=>p.date>=from&&p.date<=to);
   const tot={};f.forEach(p=>tot[p.name]=(tot[p.name]||0)+p.amount);
   const names=Object.keys(tot).sort((a,b)=>tot[b]-tot[a]),col={};names.forEach((n,i)=>col[n]=colAt(i));

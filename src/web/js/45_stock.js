@@ -158,7 +158,7 @@ function stkDivCard(c,p){
 }
 function stkRepCard(c){
   const r=c.report||{};let v;
-  if(r.date){const dd=Math.ceil((new Date(r.date)-new Date(new Date().toISOString().slice(0,10)))/864e5);
+  if(r.date){const dd=Math.ceil((new Date(r.date)-new Date(localIso()))/864e5);
     v=`<div class="v num" style="font-size:22px;font-weight:700">${ddm(r.date)}</div><div class="s mu">${dd>0?'через '+dd+' дн.':dd===0?'сегодня':''}${r.year?' · отчёт за '+(r.num?r.num+' кв. ':'')+r.year:''}</div>`}
   else v=`<div class="mu" style="padding:6px 0">${esc(r.note||'Дата неизвестна')}</div>`;
   return`<div class="card"><h2>Следующая отчётность</h2>${v}</div>`;

@@ -340,6 +340,19 @@ class GeminiFixesTests(unittest.TestCase):
             for term in bad_terms:
                 self.assertNotIn(term, txt, f"{term} найден в {rel}")
 
+    def test_bug_ui04_local_iso(self):
+        import glob
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        core_js = open(os.path.join(root, "src/web/js/01_core.js"), encoding="utf-8").read()
+        self.assertIn("localIso", core_js)
+        self.assertIn("getFullYear()", core_js)
+        bad = []
+        for p in sorted(glob.glob(os.path.join(root, "src/web/js/*.js"))):
+            txt = open(p, encoding="utf-8").read()
+            if "toISOString().slice(0,10)" in txt or "toISOString().slice(0, 10)" in txt:
+                bad.append(os.path.basename(p))
+        self.assertEqual(bad, [], f"Найдено UTC toISOString().slice(0,10) в: {bad}")
+
 
 if __name__ == "__main__":
     unittest.main()

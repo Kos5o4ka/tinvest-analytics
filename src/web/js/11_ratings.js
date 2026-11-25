@@ -84,7 +84,7 @@ function bondInsights(b){
   const hy=sp.filter(r=>r.spread>6);if(hy.length)out.push(['Очень высокая доходность',`Спред больше 6 п.п.: ${hy.map(r=>`${esc(r.name)} (+${r.spread.toFixed(1).replace('.',',')})`).join(', ')}. Рынок закладывает повышенный риск — перепроверьте эмитента.`]);
   const top=rows.slice().sort((a,c)=>c.value_rub-a.value_rub).slice(0,3);
   out.push(['Концентрация',`Три крупнейшие позиции — <b>${(top.reduce((a,r)=>a+r.value_rub,0)/tot*100).toFixed(0)}%</b> облигаций: ${top.map(r=>esc(r.name)).join(', ')}.`]);
-  const soon=new Date(Date.now()+90*864e5).toISOString().slice(0,10),today=new Date().toISOString().slice(0,10);
+  const soon=localIso(new Date(Date.now()+90*864e5)),today=localIso();
   const inW=d=>d&&d>=today&&d<=soon,KN={put:'пут-оферта',call:'колл',both:'пут и колл',unknown:'оферта, тип не указан'};
   const ev=rows.filter(r=>inW(r.call)||inW(r.maturity));
   if(ev.length)out.push(['Ближайшие 90 дней',`Оферта или погашение: ${ev.map(r=>inW(r.call)?`${esc(r.name)} — ${ddm(r.call)} (${KN[r.call_kind]||KN.unknown})`:`${esc(r.name)} — ${ddm(r.maturity)}`).join('; ')}. Это только ближайшие даты: все оферты и их тип — на странице «Оферты». <a href="#" class="kb-a" data-kb="offers">Что такое put и call</a>.`]);

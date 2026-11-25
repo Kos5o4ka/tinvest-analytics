@@ -75,7 +75,7 @@ function wtRow(r){
     <td><button class="btn ghost wt-del" data-wdel="${esc(r.isin)}" title="Убрать из наблюдения">×</button></td></tr>`;
 }
 function wtNoteHtml(n){
-  const due=n.remind_on&&n.remind_on<=new Date().toISOString().slice(0,10);
+  const due=n.remind_on&&n.remind_on<=localIso();
   return`<div class="wt-note-i" data-isin="${esc(n.isin)}"><div class="wt-nh"><b>${esc(n.name||n.isin)}</b><small class="mu num">${ddm(n.date)}</small>
     ${n.remind_on?`<span class="tag ${due?'wt-due':''}" title="Напоминание">${due?'пора пересмотреть':'напомнить '+ddm(n.remind_on)}</span>`:''}
     <span style="margin-left:auto;display:flex;gap:6px">${n.remind_on?`<button class="btn ghost wt-sm" data-ndone="${esc(n.id)}">Пересмотрено</button>`:''}<button class="btn ghost wt-sm" data-ndel="${esc(n.id)}" title="Удалить заметку">Удалить</button></span></div>
