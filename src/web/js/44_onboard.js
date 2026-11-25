@@ -19,7 +19,7 @@ function obRender(){
   const v=$('#view');if(!v)return;
   const tokDone=ob.done;
   v.innerHTML=`<div class="wrap fade" style="max-width:960px"><div class="card ob-card">
-    <div class="ob-hd"><div class="ob-t">Добро пожаловать в TAnalytic 👋</div>
+    <div class="ob-hd"><div class="ob-t">Добро пожаловать в TAnalytic</div>
       <p class="t2">Выберите удобный способ начать — это займёт меньше минуты. Все данные хранятся только на вашем компьютере.</p></div>
     <div class="ob-cards">
       <div class="ob-opt ob-opt-main">

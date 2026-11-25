@@ -23777,9 +23777,9 @@ def txo_ldv_class(rows, lots, today, rate):
     if worst:
         res["status"] = "critical" if worst == 2 else "warn"
         if worst == 2:
-            res["ldv_badge"] = "🛡 до ЛДВ осталось %d дн. — продажа почти наверняка невыгодна" % res["ldv_days_left"]
+            res["ldv_badge"] = "до ЛДВ осталось %d дн. — продажа почти наверняка невыгодна" % res["ldv_days_left"]
         else:
-            res["ldv_badge"] = "🛡 стаж %s: продажа сбросит срок владения для ЛДВ" % txo_hold_text(oldest_warn, today)
+            res["ldv_badge"] = "стаж %s: продажа сбросит срок владения для ЛДВ" % txo_hold_text(oldest_warn, today)
     elif "young" in seen:
         res["status"] = "young"
     elif "reached" in seen:
@@ -29240,7 +29240,7 @@ const SCR_PRESETS=[
   ['fx','Валютные',{cur:'all',kind:'corp',fl:'all',q:''}]
 ];
 S.scr=null;S.sf=Object.assign({},SCR_DEF);S.scrOpen=false;S.scrPreset='';S.ssort={k:'yield',d:-1};S.sn=150;
-const SCR_DENS=[['comfort','Комфорт'],['compact','Компакт'],['scatter','Scatter']];
+const SCR_DENS=[['comfort','Комфорт'],['compact','Компакт'],['scatter','Точечная']];
 S.scrDens=(d=>SCR_DENS.some(x=>x[0]===d)?d:'comfort')(lsGet('scr_dens'));      /* плотность таблицы: сохраняется в localStorage */
 S.scrReal=lsGet('scr_real')==='1';S.scrBox=null;S.scrScCol=false;
 const SCR_TAX_TIP='Купоны зачисляются брутто (100%): налог брокер удерживает при выводе денег или по итогам года, его можно уменьшить сальдированием с убытками. Дивиденды приходят уже за вычетом налога.';
@@ -29305,7 +29305,7 @@ function scrCpn(r){
   let cap,sub,tt;
   if(r.linker){cap='<span class="cap cap-lnk">ЛИНКЕР</span>';sub=`ИПЦ + ${q!=null?q+'%':'?'}`;tt='Купон привязан к индексу потребительских цен: номинал растёт с инфляцией'}
   else if(r.floating){const fm=r.fl_label&&r.fl_label!=='ФЛОАТЕР'?r.fl_label:null;cap='<span class="cap cap-fl">ФЛОАТЕР</span>';sub=`${fm?esc(fm):'формула н/д'}${q!=null?` (${q}%)`:''}`;tt=fm?'Плавающий купон: '+fm+' (спред эмитента по последним купонам), в скобках — текущий купон':'Плавающий купон (привязан к ключевой ставке или RUONIA); формула пока не определена'}
-  else{const t=r.perp&&r.yoff==null?'бессрочный':n!=null?'фикс на '+(n<1?Math.max(1,Math.round(n*12))+' мес.':n.toFixed(1).replace('.',',')+' г.'):'';cap='<span class="cap cap-fix">ФИКС</span>';sub=`${q!=null?q+'%':'—'}${t?' · 🔒 '+t:''}`;tt='Фиксированный купон'+(r.yoff!=null?' (до ближайшей оферты)':'')}
+  else{const t=r.perp&&r.yoff==null?'бессрочный':n!=null?'фикс на '+(n<1?Math.max(1,Math.round(n*12))+' мес.':n.toFixed(1).replace('.',',')+' г.'):'';cap='<span class="cap cap-fix">ФИКС</span>';sub=`${q!=null?q+'%':'—'}${t?' · '+t:''}`;tt='Фиксированный купон'+(r.yoff!=null?' (до ближайшей оферты)':'')}
   const ex=(/суборд/i.test(r.sub||'')?'<span class="cap cap-w" title="Субординированная облигация: при проблемах эмитента требования погашаются в последнюю очередь, купон могут не выплатить">⚠ СУБОРД</span>':'')+(r.perp?'<span class="cap cap-w" title="Бессрочная облигация: срока погашения нет">∞ ВЕЧНЫЙ</span>':'');
   return`<div class="cell-stack" title="${esc(tt)}"><span class="cap-row">${cap}${ex}<span class="cmp-only mu">${r.linker?sub:q!=null?q+'%':''}</span></span><span class="cell-sub">${sub}</span></div>`;
 }
@@ -29330,7 +29330,7 @@ function scrRowHtml(r,fl){
 }
 function drawScr(){
   const rs=scrRows(),n=Math.min(rs.length,S.sn),fl=S.scr.floor&&S.scr.floor.lqdt;
-  const cols=[['_w','★','l'],['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield',S.scrReal?'Реальная доходность':'Доходность'],['cy','CY, %'],['spread','Спред к КБД'],['coupon','Купон & формула','l'],['years','До погашения'],['macdur','MacDur, лет'],['liq','Ликвидность']];
+  const cols=[['_w','★','l'],['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield',S.scrReal?'Реальная доходность':'Доходность'],['cy','Тек. доходн., %'],['spread','Спред к КБД'],['coupon','Купон & формула','l'],['years','До погашения'],['macdur','Дюрация, лет'],['liq','Ликвидность']];
   const {k,d}=S.ssort;
   $('#scr-head').innerHTML=cols.map(([kk,t,c])=>kk==='_w'?`<th class="wt-sth" title="Список наблюдения">${t}</th>`:`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   $('#scr-body').innerHTML=rs.slice(0,n).map(r=>scrRowHtml(r,fl)).join('');
@@ -33926,7 +33926,7 @@ function obRender(){
   const v=$('#view');if(!v)return;
   const tokDone=ob.done;
   v.innerHTML=`<div class="wrap fade" style="max-width:960px"><div class="card ob-card">
-    <div class="ob-hd"><div class="ob-t">Добро пожаловать в TAnalytic 👋</div>
+    <div class="ob-hd"><div class="ob-t">Добро пожаловать в TAnalytic</div>
       <p class="t2">Выберите удобный способ начать — это займёт меньше минуты. Все данные хранятся только на вашем компьютере.</p></div>
     <div class="ob-cards">
       <div class="ob-opt ob-opt-main">
@@ -36387,7 +36387,7 @@ function bindArb(){
   const f=$('#arb-fee');if(f)f.onchange=()=>{S.arb.fee=f.value;S.arb.data=null;arbLoad(true);render()};
 }
 regPage('arb',{title:'Кривые и арбитраж',group:'Рынок',icon:'<path d="M3 17l5-5 4 4 9-10"/><circle cx="8" cy="12" r="2"/><circle cx="16" cy="10" r="2"/>',render:pArb,bind:bindArb});
-/* ── Разбор сделок (Trade Post-Mortem, FIFO) и Призрачный портфель (Cashflow-Matched LQDT / TMOS) (#8) ── */
+/* ── Разбор сделок (FIFO) и Призрачный портфель (с теми же пополнениями LQDT / TMOS) (#8) ── */
 S.pm={acc:null,data:null,loading:false,err:''};
 function pmLoad(force){
   const D=S.pm,acc=S.account;
@@ -36411,14 +36411,14 @@ function pPm(){
     if(gh.series.LQDT)ser.push({n:'Призрак LQDT',c:S3,v:gh.series.LQDT,w:1.8,dash:1});
     if(gh.series.TMOS)ser.push({n:'Призрак TMOS',c:S2,v:gh.series.TMOS,w:1.8,dash:1});
     chart('c-pm-gh',line,{h:270,zero:false,labels:labs,tipLabels:tips,series:ser});
-    ghostHtml=`<div class="card"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Призрачный портфель<span class="sp">cashflow-matched · те же пополнения и выводы в те же даты</span></h2><button class="btn ghost" id="pm-r" style="margin-left:auto">Обновить</button></div>
+    ghostHtml=`<div class="card"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Призрачный портфель<span class="sp">с теми же пополнениями и выводами в те же даты</span></h2><button class="btn ghost" id="pm-r" style="margin-left:auto">Обновить</button></div>
       <div class="g g3" style="margin-bottom:12px">${kpi('Мой портфель сейчас',M(gh.real_val,'rub',0),'вложено '+M(gh.invested,'rub',0),null,S1)}
         ${gh.items.map(it=>kpi('Если бы всё в '+it.code,M(it.ghost_val,'rub',0),`мой результат: ${SM(it.diff_rub)}${it.diff_pct!=null?' ('+pct(it.diff_pct,1)+')':''}`,cls(it.diff_rub),it.code==='LQDT'?S3:S2)).join('')}</div>
       <div id="c-pm-gh" class="chart"></div></div>`;
   }
   let trHtml='';
   if(!tr.n){
-    trHtml=`<div class="card"><h2>Разбор закрытых сделок (Trade Post-Mortem, FIFO)</h2><div class="empty">Закрытых продаж бумаг по этому счёту пока нет.</div></div>`;
+    trHtml=`<div class="card"><h2>Разбор закрытых сделок (FIFO)</h2><div class="empty">Закрытых продаж бумаг по этому счёту пока нет.</div></div>`;
   }else{
     const dispBanner=tr.disposition_flag
       ?`<div class="msg err" style="margin-bottom:12px"><b>Обнаружен эффект диспозиции (×${f2(tr.disposition_ratio)}):</b> убыточные сделки вы держите в среднем <b>${f2(tr.avg_hold_loss)} дн.</b>, а прибыльные фиксируете через <b>${f2(tr.avg_hold_win)} дн.</b></div>`
@@ -36426,14 +36426,14 @@ function pPm(){
     const tTbl=(list,title)=>list&&list.length?`<div class="card"><h2>${title}</h2><div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Дата продажи</th><th>Срок, дн.</th><th>Результат, ₽</th><th>%</th></tr></thead><tbody>`+
       list.map(x=>`<tr${stkAttrIf(x.ticker)}><td class="l"><b>${esc(x.name)}</b><br><small class="mu">${esc(x.ticker)}</small></td><td class="num">${ddm(x.sdate)}</td><td class="num">${x.hold_days!=null?Math.round(x.hold_days):'—'}</td>
         <td class="num ${cls(x.result)}"><b>${SM(x.result)}</b></td><td class="num ${cls(x.pct)}">${x.pct!=null?pct(x.pct,1):'—'}</td></tr>`).join('')+`</tbody></table></div></div>`:'';
-    trHtml=`<div class="card"><h2>Разбор закрытых сделок (Trade Post-Mortem, FIFO)<span class="sp">всего закрытых продаж: ${tr.n}</span></h2>
+    trHtml=`<div class="card"><h2>Разбор закрытых сделок (FIFO)<span class="sp">всего закрытых продаж: ${tr.n}</span></h2>
       ${dispBanner}
       <div class="g g4" style="margin-bottom:12px">
-        ${kpi('Win Rate (доля прибыльных)',tr.win_rate!=null?pctp(tr.win_rate,1):'—',`${tr.wins} в плюс · ${tr.losses} в минус`,tr.win_rate>=50?'pos':'neg')}
-        ${kpi('Profit Factor',tr.profit_factor!=null?f2(tr.profit_factor):'—','валовая прибыль / валовой убыток',tr.profit_factor>=1.2?'pos':tr.profit_factor!=null&&tr.profit_factor<1?'neg':'')}
+        ${kpi('Доля прибыльных',tr.win_rate!=null?pctp(tr.win_rate,1):'—',`${tr.wins} в плюс · ${tr.losses} в минус`,tr.win_rate>=50?'pos':'neg')}
+        ${kpi('Фактор прибыли',tr.profit_factor!=null?f2(tr.profit_factor):'—','валовая прибыль / валовой убыток',tr.profit_factor>=1.2?'pos':tr.profit_factor!=null&&tr.profit_factor<1?'neg':'')}
         ${kpi('Средняя прибыль / убыток',tr.avg_win!=null?M(tr.avg_win,'rub',0):'—','ср. убыток: '+(tr.avg_loss!=null?M(tr.avg_loss,'rub',0):'—'))}
         ${kpi('Итого реализовано (FIFO)',SM(tr.net_pnl),'валовая прибыль '+M(tr.gross_profit,'rub',0),cls(tr.net_pnl))}</div>
-      ${(tr.by_type||[]).length?`<div class="tbl"><table><thead><tr><th class="l">Класс активов</th><th>Сделок</th><th>Win Rate</th><th>Итоговый результат, ₽</th></tr></thead><tbody>`+
+      ${(tr.by_type||[]).length?`<div class="tbl"><table><thead><tr><th class="l">Класс активов</th><th>Сделок</th><th>Доля прибыльных</th><th>Итоговый результат, ₽</th></tr></thead><tbody>`+
         tr.by_type.map(b=>`<tr><td class="l"><b>${esc(TYPES[b.type]||b.type)}</b></td><td class="num">${b.n}</td><td class="num">${pctp(b.win_rate,1)}</td><td class="num ${cls(b.result)}"><b>${SM(b.result)}</b></td></tr>`).join('')+`</tbody></table></div>`:''}</div>
       <div class="g g2">${tTbl(tr.best,'Лучшие закрытые сделки')}${tTbl(tr.worst,'Худшие закрытые сделки')}</div>`;
   }
@@ -36914,7 +36914,7 @@ const KS_GROUPS=[
   ['Навигация',[[['g','h'],'Главная'],[['g','p'],'Портфель'],[['g','v'],'Выплаты'],[['g','b'],'Облигации'],[['g','t'],'Налоги'],[['g','c'],'Калькулятор'],[['g','s'],'Настройки']]],
   ['Действия',[[['/'],'Поиск'],[['Ctrl','K'],'Палитра команд и калькулятор'],[['r'],'Обновить данные'],[['h'],'Скрыть / показать суммы'],[['t'],'Тёмная / светлая тема'],[['?'],'Эта шпаргалка'],[['Esc'],'Закрыть окно']]],
   ['Таблицы',[[['j','k'],'Строка вниз / вверх'],[['↓','↑'],'То же, когда строка выбрана'],[['Пробел'],'★ в список наблюдения'],[['Enter'],'Открыть карточку строки']]],
-  ['Скринер',[[['f'],'Тип: Все → Флоатеры → Фиксы → ОФЗ'],[['v'],'Плотность: Комфорт → Компакт → Scatter']]]
+  ['Скринер',[[['f'],'Тип: Все → Флоатеры → Фиксы → ОФЗ'],[['v'],'Плотность: Комфорт → Компакт → Точечная']]]
 ];
 function ksToggle(){
   const o=document.getElementById('ks-ov');

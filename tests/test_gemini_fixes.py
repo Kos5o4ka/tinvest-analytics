@@ -314,6 +314,32 @@ class GeminiFixesTests(unittest.TestCase):
         for p in ("ofz", "arb", "dgap", "rot", "dbx", "mm", "crp", "mic"):
             self.assertIn(p, pages)
 
+    def test_bug_ui03_no_emoji_and_ru_terms(self):
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        em_pat = re.compile(r"[\U0001F300-\U0001FAFF]")
+        hits = []
+        for p in sorted(glob.glob(os.path.join(root, "src/web/**/*"), recursive=True)):
+            if not p.endswith((".js", ".html", ".css")):
+                continue
+            txt = open(p, encoding="utf-8").read()
+            if em_pat.search(txt):
+                hits.append(os.path.relpath(p, root))
+        taxopt = open(os.path.join(root, "src/py/13x5_taxopt.py"), encoding="utf-8").read()
+        if em_pat.search(taxopt) or "\U0001f6e1" in taxopt:
+            hits.append("src/py/13x5_taxopt.py")
+        self.assertEqual(hits, [], f"Найдены эмодзи в UI: {hits}")
+
+        for rel, bad_terms in (
+            ("src/web/js/14_scr.js", ["'Scatter'", "'CY, %'", "'MacDur, лет'"]),
+            ("src/web/js/65_delight.js", ["Scatter"]),
+            ("src/web/js/60_pm.js", ["Trade Post-Mortem", "Win Rate", "Profit Factor", "cashflow-matched"]),
+        ):
+            txt = open(os.path.join(root, rel), encoding="utf-8").read()
+            for term in bad_terms:
+                self.assertNotIn(term, txt, f"{term} найден в {rel}")
+
 
 if __name__ == "__main__":
     unittest.main()

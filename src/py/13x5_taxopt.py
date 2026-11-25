@@ -104,9 +104,9 @@ def txo_ldv_class(rows, lots, today, rate):
     if worst:
         res["status"] = "critical" if worst == 2 else "warn"
         if worst == 2:
-            res["ldv_badge"] = "🛡 до ЛДВ осталось %d дн. — продажа почти наверняка невыгодна" % res["ldv_days_left"]
+            res["ldv_badge"] = "до ЛДВ осталось %d дн. — продажа почти наверняка невыгодна" % res["ldv_days_left"]
         else:
-            res["ldv_badge"] = "🛡 стаж %s: продажа сбросит срок владения для ЛДВ" % txo_hold_text(oldest_warn, today)
+            res["ldv_badge"] = "стаж %s: продажа сбросит срок владения для ЛДВ" % txo_hold_text(oldest_warn, today)
     elif "young" in seen:
         res["status"] = "young"
     elif "reached" in seen:

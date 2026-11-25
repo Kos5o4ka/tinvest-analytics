@@ -7,7 +7,7 @@ const SCR_PRESETS=[
   ['fx','Валютные',{cur:'all',kind:'corp',fl:'all',q:''}]
 ];
 S.scr=null;S.sf=Object.assign({},SCR_DEF);S.scrOpen=false;S.scrPreset='';S.ssort={k:'yield',d:-1};S.sn=150;
-const SCR_DENS=[['comfort','Комфорт'],['compact','Компакт'],['scatter','Scatter']];
+const SCR_DENS=[['comfort','Комфорт'],['compact','Компакт'],['scatter','Точечная']];
 S.scrDens=(d=>SCR_DENS.some(x=>x[0]===d)?d:'comfort')(lsGet('scr_dens'));      /* плотность таблицы: сохраняется в localStorage */
 S.scrReal=lsGet('scr_real')==='1';S.scrBox=null;S.scrScCol=false;
 const SCR_TAX_TIP='Купоны зачисляются брутто (100%): налог брокер удерживает при выводе денег или по итогам года, его можно уменьшить сальдированием с убытками. Дивиденды приходят уже за вычетом налога.';
@@ -72,7 +72,7 @@ function scrCpn(r){
   let cap,sub,tt;
   if(r.linker){cap='<span class="cap cap-lnk">ЛИНКЕР</span>';sub=`ИПЦ + ${q!=null?q+'%':'?'}`;tt='Купон привязан к индексу потребительских цен: номинал растёт с инфляцией'}
   else if(r.floating){const fm=r.fl_label&&r.fl_label!=='ФЛОАТЕР'?r.fl_label:null;cap='<span class="cap cap-fl">ФЛОАТЕР</span>';sub=`${fm?esc(fm):'формула н/д'}${q!=null?` (${q}%)`:''}`;tt=fm?'Плавающий купон: '+fm+' (спред эмитента по последним купонам), в скобках — текущий купон':'Плавающий купон (привязан к ключевой ставке или RUONIA); формула пока не определена'}
-  else{const t=r.perp&&r.yoff==null?'бессрочный':n!=null?'фикс на '+(n<1?Math.max(1,Math.round(n*12))+' мес.':n.toFixed(1).replace('.',',')+' г.'):'';cap='<span class="cap cap-fix">ФИКС</span>';sub=`${q!=null?q+'%':'—'}${t?' · 🔒 '+t:''}`;tt='Фиксированный купон'+(r.yoff!=null?' (до ближайшей оферты)':'')}
+  else{const t=r.perp&&r.yoff==null?'бессрочный':n!=null?'фикс на '+(n<1?Math.max(1,Math.round(n*12))+' мес.':n.toFixed(1).replace('.',',')+' г.'):'';cap='<span class="cap cap-fix">ФИКС</span>';sub=`${q!=null?q+'%':'—'}${t?' · '+t:''}`;tt='Фиксированный купон'+(r.yoff!=null?' (до ближайшей оферты)':'')}
   const ex=(/суборд/i.test(r.sub||'')?'<span class="cap cap-w" title="Субординированная облигация: при проблемах эмитента требования погашаются в последнюю очередь, купон могут не выплатить">⚠ СУБОРД</span>':'')+(r.perp?'<span class="cap cap-w" title="Бессрочная облигация: срока погашения нет">∞ ВЕЧНЫЙ</span>':'');
   return`<div class="cell-stack" title="${esc(tt)}"><span class="cap-row">${cap}${ex}<span class="cmp-only mu">${r.linker?sub:q!=null?q+'%':''}</span></span><span class="cell-sub">${sub}</span></div>`;
 }
@@ -97,7 +97,7 @@ function scrRowHtml(r,fl){
 }
 function drawScr(){
   const rs=scrRows(),n=Math.min(rs.length,S.sn),fl=S.scr.floor&&S.scr.floor.lqdt;
-  const cols=[['_w','★','l'],['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield',S.scrReal?'Реальная доходность':'Доходность'],['cy','CY, %'],['spread','Спред к КБД'],['coupon','Купон & формула','l'],['years','До погашения'],['macdur','MacDur, лет'],['liq','Ликвидность']];
+  const cols=[['_w','★','l'],['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield',S.scrReal?'Реальная доходность':'Доходность'],['cy','Тек. доходн., %'],['spread','Спред к КБД'],['coupon','Купон & формула','l'],['years','До погашения'],['macdur','Дюрация, лет'],['liq','Ликвидность']];
   const {k,d}=S.ssort;
   $('#scr-head').innerHTML=cols.map(([kk,t,c])=>kk==='_w'?`<th class="wt-sth" title="Список наблюдения">${t}</th>`:`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   $('#scr-body').innerHTML=rs.slice(0,n).map(r=>scrRowHtml(r,fl)).join('');
