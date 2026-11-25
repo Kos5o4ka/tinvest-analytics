@@ -9690,9 +9690,11 @@ def pv_coupon_text(live, desc):
     return "", False
 
 
-def pv_build_row(secid, desc, agg, today_place, bm, today, rating, cum=None):
+def pv_build_row(secid, desc, agg, today_place, bm, today, rating, cum=None, fx=None):
     """Одна строка «простыни». today_place — строки marketdata площадки размещения, bm — marketdata рынка bonds."""
     face = desc.get("face") or desc.get("face0") or 1000.0
+    cur = (desc.get("cur") or "SUR").replace("SUR", "RUB")
+    rate = 1.0 if cur == "RUB" else ((fx or {}).get(cur) or (fx or {}).get(cur.upper()) or 1.0)
     a = agg or {}
     live = None
     if bm:
@@ -9722,14 +9724,14 @@ def pv_build_row(secid, desc, agg, today_place, bm, today, rating, cum=None):
     return {"secid": secid, "isin": desc.get("isin") or secid, "name": desc.get("name") or a.get("name") or secid, "full": desc.get("full") or "",
             "rating": rating, "coupon": cpn, "floating": flt, "mat": desc.get("mat") or (live or {}).get("mat") or "",
             "offer": (live or {}).get("offer") or "", "start": start, "first_place": (base.get("first") or (pl_days[0] if pl_days else "")) or (today if tp_val > 0 else ""), "days_on": days_on,
-            "face": face, "size_pcs": size_pcs, "size_rub": size_pcs * face if size_pcs else None,
-            "placed_pcs": placed_pcs, "placed_rub": placed_pcs * face if placed_pcs else None, "placed_src": src,
+            "face": face, "size_pcs": size_pcs, "size_rub": round(size_pcs * face * rate, 2) if size_pcs else None,
+            "placed_pcs": placed_pcs, "placed_rub": round(placed_pcs * face * rate, 2) if placed_pcs else None, "placed_src": src,
             "placed_pct": round(100.0 * placed_pcs / size_pcs, 1) if size_pcs and placed_pcs else None,
             "place_value": round((base.get("v") or 0) + tp_val, 2), "place_trades": (base.get("n") or 0) + tp_n,
             "today_place": round(tp_val, 2), "today_sec": round(sec_today, 2), "today": round(tp_val + sec_today, 2),
             "today_trades": tp_n + sum(x.get("n") or 0 for x in bm or []),
             "price": (live or {}).get("wap") or (live or {}).get("last"), "yield": (live or {}).get("yield"),
-            "status": status, "cur": (desc.get("cur") or "SUR").replace("SUR", "RUB")}
+            "status": status, "cur": cur}
 
 
 def pv_upcoming(cal, known_isins, today):
@@ -9794,7 +9796,7 @@ def pv_compute():
     dates = [_day_add(today, -i) for i in range(1, PV_DAYS + 1)]
     dates = [d for d in dates if datetime.strptime(d, "%Y-%m-%d").weekday() < 5]
     byday = pv_days_cached(dates, errs)
-    day_rows = [r for d in sorted(byday) for r in byday[d]] + pv_other_boards(cut, today, errs)
+    day_rows = [r for d in sorted(byday) for r in byday[d]] + [r for r in pv_other_boards(cut, _day_add(today, -1), errs) if (r.get("d") or "") < today]
     agg = pv_aggregate(day_rows)
     lap("history")
     descs = {}
@@ -9895,12 +9897,20 @@ def pv_compute():
             else:
                 errs.append("торги %s: %s" % (s, v))
     lap("secondary")
+    fx = {"RUB": 1.0}
+    for s in new:
+        c = ((descs[s] or {}).get("cur") or "SUR").replace("SUR", "RUB").upper()
+        if c not in fx:
+            try:
+                fx[c] = tax_cbr_rate(c, today) or 1.0
+            except Exception:  # noqa: BLE001
+                fx[c] = 1.0
     rows = []
     for s in new:
         d = descs[s]
         tp = [m for m in live.get(s, []) if m["b"] in PV_PLACE]
         rt = _pv_rating(d.get("isin") or s, pv_issuer_name(d.get("full") or d.get("name")))
-        row = pv_build_row(s, d, agg.get(s), tp, bms.get(s), today, rt, cums.get(s))
+        row = pv_build_row(s, d, agg.get(s), tp, bms.get(s), today, rt, cums.get(s), fx=fx)
         if row["status"] == "upcoming" and (row["start"] or "") < today:
             continue                                    # открыт на площадке, но сделок не было и даты размещения в будущем нет
         rows.append(row)
@@ -9908,7 +9918,6 @@ def pv_compute():
     for r in pv_upcoming(cal, known, today):
         r["rating"] = r["rating"] if r.get("rating") else None
         rows.append(r)
-    rows.sort(key=lambda r: (r["status"] != "placing", r["status"] == "upcoming", ""), reverse=False)
     rows.sort(key=lambda r: r.get("start") or "", reverse=True)
     rows.sort(key=lambda r: {"placing": 0, "upcoming": 1}.get(r["status"], 2))
     return {"rows": rows, "today": today, "window": PV_DAYS, "errors": errs[:10], "updated": time.time(), "timing": tm,
