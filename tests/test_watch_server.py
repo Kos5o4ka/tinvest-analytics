@@ -187,7 +187,8 @@ class Payload(unittest.TestCase):
     """Подписка из приложения: только разрешённые поля, без токена, счетов и текста заметок; сервер её принимает."""
 
     def setUp(self):
-        self.saved = {k: getattr(M, k) for k in ("load_config", "_tg_offer_items", "_tg_payments", "_scr_by_isin", "tcat_info", "watch_items", "notes_all")}
+        self.saved = {k: getattr(M, k) for k in ("load_config", "imports_list", "_tg_offer_items", "_tg_payments", "_scr_by_isin", "tcat_info", "watch_items", "notes_all")}
+        M.imports_list = lambda: []
         M._tg_offer_items = lambda cfg, today: [dict(o) for o in OFFERS]
         M._tg_payments = lambda cfg, days: list(PAYS)
         M._scr_by_isin = lambda: {"RU000A100001": {"name": "Выпуск 1"}}
