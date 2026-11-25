@@ -439,7 +439,7 @@ def bonds_report(client, rows, horizon_days=365):
         k_ = 1.0 if fc_ == "rub" else (rates.get(fc_) or 1.0)       # выплаты считаем в рублях по текущему курсу номинала
         fest = (ex or {}).get("est_detail") or {}
         for d, p in b.get("coupons") or []:
-            if today < d <= horizon:
+            if today <= d <= horizon:
                 if not p and b.get("floating") and d in fest:
                     amt, est = fest[d]["amt"] * r["qty"] * k_, "forecast"      # прогноз ключевой ставки ЦБ + спред эмитента
                 else:
@@ -450,7 +450,7 @@ def bonds_report(client, rows, horizon_days=365):
         # прогнозные купоны флоатера, которых ещё нет в графике брокера
         have = {d for d, _ in b.get("coupons") or []}
         for d, e in sorted(fest.items()):
-            if d not in have and today < d <= horizon and e["amt"]:
+            if d not in have and today <= d <= horizon and e["amt"]:
                 pays.append({"date": d, "kind": "coupon", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
                              "amount": e["amt"] * r["qty"] * k_, "est": "forecast"})
         # амортизации (частичное погашение номинала) из графика MOEX; погашение в последний день — остаток номинала
@@ -458,20 +458,20 @@ def bonds_report(client, rows, horizon_days=365):
         if ex and b.get("maturity"):
             for a in sorted((ex.get("bz") or {}).get("amort") or [], key=lambda x: x.get("amortdate") or ""):
                 ad, av = a.get("amortdate"), a.get("value")
-                if not ad or not av or ad <= today or ad >= b["maturity"]:
+                if not ad or not av or ad < today or ad >= b["maturity"]:
                     continue
                 am_total += av
                 if ad <= horizon:
                     pays.append({"date": ad, "kind": "amortization", "name": r["name"], "ticker": r["ticker"],
                                  "logo": r["logo"], "amount": av * r["qty"] * k_, "est": False})
-        if b.get("maturity") and today < b["maturity"] <= horizon:
+        if b.get("maturity") and today <= b["maturity"] <= horizon:
             pays.append({"date": b["maturity"], "kind": "redemption", "name": r["name"], "ticker": r["ticker"],
                          "logo": r["logo"], "amount": max(nominal - am_total, 0.0) * r["qty"] * k_, "est": False})
     # дивиденды по акциям (объявленные)
     shares = [r for r in rows if r["type"] in ("share",) and r["uid"] and r["qty"] > 0]
 
     def srv_divs(secid):
-        """Дивиденды с сервера данных (md/dividends) -> [[дата, на акцию, валюта]] в окне (today, horizon]."""
+        """Дивиденды с сервера данных (md/dividends) -> [[дата, на акцию, валюта]] в окне [today, horizon]."""
         d = ds_parsed("md/dividends", {"secid": secid}) if secid else None
         if not isinstance(d, dict) or d.get("items") is None:
             return None
@@ -479,7 +479,7 @@ def bonds_report(client, rows, horizon_days=365):
         for x in d["items"]:
             dt = iso_date(x.get("payment")) or iso_date(x.get("record"))
             v_ = qf(x.get("value")) if not isinstance(x.get("value"), (int, float)) else float(x["value"])
-            if dt and v_ and today < dt <= horizon:
+            if dt and v_ and today <= dt <= horizon:
                 out_.append([dt, v_, str(x.get("currency") or "rub").lower()])
         return out_
 
@@ -510,7 +510,7 @@ def bonds_report(client, rows, horizon_days=365):
             d, per = x[0], x[1]
             dc = (x[2] if len(x) > 2 else r.get("cur") or "rub").lower()
             kk = 1.0 if dc == "rub" else rates.get(dc)
-            if d and today < d <= horizon and per and kk:        # выплата в валюте — переводим в рубли по текущему курсу
+            if d and today <= d <= horizon and per and kk:        # выплата в валюте — переводим в рубли по текущему курсу
                 pays.append({"date": d, "kind": "dividend", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
                              "amount": per * r["qty"] * kk, "est": False, "cur": dc})
     pays.sort(key=lambda p: p["date"])

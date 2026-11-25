@@ -263,6 +263,10 @@ def events_payload(cfg, acc, q):
                 held.add(r["isin"])
         rows = [r for r in rep["rows"] if r.get("isin") and r.get("qty")]
 
+        def _ev_cur(x):
+            c = (x or "rub").lower()
+            return "rub" if c == "sur" else c
+
         def one(r):
             try:
                 bz = moex_bondization(r["isin"])
@@ -271,20 +275,42 @@ def events_payload(cfg, acc, q):
                 except Exception:  # noqa: BLE001
                     opt = None
                 offs = offer_kinds(bz or {}, opt, r.get("call"), _day_add(frm, -1), with_done=True)
-                out = offer_events(offs, r["name"], r["isin"], frm, to)
+                out = [(e, None) for e in offer_events(offs, r["name"], r["isin"], frm, to)]
+                max_am = max([x.get("amortdate") or "" for x in (bz or {}).get("amort") or []] + [""])
                 for a in (bz or {}).get("amort") or []:
                     d = a.get("amortdate")
-                    if d and frm <= d <= to and a.get("value") and d != max([x.get("amortdate") or "" for x in bz["amort"]] + [""]):
-                        out.append(_ev(d, "amort", r["name"], r["isin"], round(a["value"] * r["qty"], 2), "частичное погашение номинала"))
+                    if d and frm <= d <= to and a.get("value") and d != max_am:
+                        cur = _ev_cur(a.get("faceunit") or r.get("cur"))
+                        out.append((_ev(d, "amort", r["name"], r["isin"], a["value"] * r["qty"], "частичное погашение номинала"), cur))
+                for c in (bz or {}).get("coupons") or []:
+                    d = c.get("coupondate")
+                    if d and frm <= d <= to:
+                        v = c.get("value")
+                        cur = _ev_cur(c.get("faceunit") or r.get("cur"))
+                        note = EV_NOTE["coupon"] if v else "размер купона ещё не объявлен"
+                        out.append((_ev(d, "coupon", r["name"], r["isin"], (v * r["qty"]) if v else None, note), cur if v else None))
                 return out
             except Exception:  # noqa: BLE001
                 return []
         have_am = {(e["isin"], e["date"]) for e in events if e["kind"] == "amort"}
-        for lst in pool_map(one, rows, workers=8):
-            for e in lst:
-                if e["kind"] == "amort" and (e["isin"], e["date"]) in have_am:
+        have_cp = {(e["isin"], e["date"]) for e in events if e["kind"] == "coupon"}
+        extra = [item for lst in pool_map(one, rows, workers=8) for item in lst]
+        need_fx = {cur for _, cur in extra if cur and cur != "rub"}
+        rates = fx_now(TInvest(cfg) if cfg.get("hosts_prod") else type("_C", (), {"ready": False})(), need_fx) if need_fx else {}
+        for e, cur in extra:
+            key = (e["isin"], e["date"])
+            if e["kind"] == "amort":
+                if key in have_am:
                     continue
-                events.append(e)
+                have_am.add(key)
+            elif e["kind"] == "coupon":
+                if key in have_cp:
+                    continue
+                have_cp.add(key)
+            if e.get("amount") is not None:
+                k = 1.0 if not cur or cur == "rub" else (rates.get(cur) or 1.0)
+                e["amount"] = round(e["amount"] * k, 2)
+            events.append(e)
     except Exception as e:  # noqa: BLE001
         src["portfolio"] = False
         warn.append("Выплаты и оферты по портфелю не загружены: %s" % str(e)[:140])
