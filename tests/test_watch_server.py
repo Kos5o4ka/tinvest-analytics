@@ -216,6 +216,25 @@ class Payload(unittest.TestCase):
         self.assertEqual((p["offers"], p["pays"]), ([], []))                         # без токена портфеля нет
         self.assertEqual(len(p["goals"]), 1)
 
+    def test_imported_portfolio_without_token(self):
+        extra = ("imports_list", "build_summary", "build_monitor", "watch_payload")
+        saved_extra = {k: getattr(M, k) for k in extra}
+        try:
+            M.imports_list = lambda: [{"id": "imp-demo", "name": "Демо"}]
+            M.build_summary = lambda cfg, a, b: {"portfolio": {"total": 123456.0, "daily": 100.0}}
+            M.build_monitor = lambda cfg, a: {"summary": {"high": 1, "medium": 0}, "alerts": []}
+            M.watch_payload = lambda cfg: {"items": [], "alerts": []}
+            p = M.tg_srv_payload(self.cfg(token=""), {})
+            self.assertEqual(len(p["offers"]), len(OFFERS))
+            self.assertEqual(len(p["pays"]), len(PAYS))
+            txt = M.tg_digest_text(self.cfg(token=""))
+            self.assertIn("Портфель", txt)
+            self.assertIn("Ближайшие 7 дней", txt)
+            self.assertIn("Мониторинг", txt)
+        finally:
+            for k, v in saved_extra.items():
+                setattr(M, k, v)
+
 
 class Validation(unittest.TestCase):
     def test_rejects(self):

@@ -15320,7 +15320,7 @@ def tg_pay_text(days, fresh):
 
 def tg_digest_text(cfg):
     parts = [_tg_head("📈", "Сводка TAnalytic", _tg_date(date.today().isoformat()))]
-    if cfg.get("token"):
+    if cfg.get("token") or imports_list():
         try:
             s = build_summary(cfg, "all", "all")
             p = s.get("portfolio") or {}
@@ -15376,14 +15376,15 @@ def tg_tick(force_digest=False, manual=False):
             srv = tg_srv_active(cfg)
         except Exception:  # noqa: BLE001
             srv = tg_srv_active(cfg)
+        has_port = bool(cfg.get("token") or imports_list())
         try:
-            if cfg.get("tg_on_mon", True) and cfg.get("token"):
+            if cfg.get("tg_on_mon", True) and has_port:
                 al = [a for a in build_monitor(cfg, "all")["alerts"] if a["severity"] == "high"]
                 n += _tg_dispatch(cfg, "Тревоги по портфелю", al, sent, now)
         except Exception:  # noqa: BLE001
             pass
         try:
-            if cfg.get("tg_on_mon", True) and cfg.get("token") and not srv:
+            if cfg.get("tg_on_mon", True) and has_port and not srv:
                 today_ = date.today().isoformat()
                 due = [(k, t) for k, t in tg_offer_due(_tg_offer_items(cfg, today_), today_) if k not in sent][:10]
                 if due:
@@ -15412,7 +15413,7 @@ def tg_tick(force_digest=False, manual=False):
             pass
         try:
             days = int(cfg.get("tg_pay_days") or 0)
-            if days > 0 and cfg.get("token") and not srv:
+            if days > 0 and has_port and not srv:
                 fresh = tg_pay_fresh(_tg_payments(cfg, days), sent)
                 if fresh:
                     tg_send(cfg, tg_pay_text(days, fresh))
@@ -15474,14 +15475,15 @@ def tg_srv_payload(cfg, sent):
         for n in notes:
             p["reminders"].append({"id": n["id"], "isin": n["isin"], "name": str(_bond_name(n["isin"], sec))[:120],
                                    "date": n["date"], "remind_on": n["remind_on"]})
-    if cfg.get("tg_on_mon", True) and cfg.get("token"):
+    has_port = bool(cfg.get("token") or imports_list())
+    if cfg.get("tg_on_mon", True) and has_port:
         try:
             p["offers"] = [{k: o.get(k) for k in ("isin", "name", "kind", "date", "period_start", "period_end", "coupon_status", "new_rate")}
                            for o in _tg_offer_items(cfg, today)]
         except Exception:  # noqa: BLE001
             pass
     days = int(cfg.get("tg_pay_days") or 0)
-    if days > 0 and cfg.get("token"):
+    if days > 0 and has_port:
         try:
             p["pays"] = [{"date": e[0], "kind": e[1], "name": str(e[2] or "")[:120], "amount": round(e[3], 2) if e[3] else None}
                          for e in _tg_payments(cfg, days + TG_SRV_PAY_EXTRA)][:1000]
