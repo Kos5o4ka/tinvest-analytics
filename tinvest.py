@@ -129,12 +129,22 @@ def update(report=lambda *a: None, cancel=None, fetch=fetch):
     if cancel is not None and cancel.is_set():
         raise Cancelled()                                      # до этой точки APP не тронут
     os.makedirs(APP_DIR, mode=0o700, exist_ok=True)
-    if os.path.exists(APP):
-        os.replace(APP, APP + ".bak")                          # предыдущая версия остаётся как запасная
-    tmp = APP + ".tmp"
+    tmp, bak = APP + ".tmp", APP + ".bak"
     with open(tmp, "wb") as f:
         f.write(code)
-    os.replace(tmp, APP)                                       # атомарная подмена
+    moved = False
+    try:
+        if os.path.exists(APP):
+            os.replace(APP, bak)                              # предыдущая версия остаётся как запасная
+            moved = True
+        os.replace(tmp, APP)                                   # атомарная подмена
+    except Exception:
+        if moved and not os.path.exists(APP) and os.path.exists(bak):
+            try:
+                os.replace(bak, APP)                           # откат рабочей версии при сбое замены
+            except OSError:
+                pass
+        raise
     with open(VER, "w") as f:
         f.write(tag)
     return "updated"
@@ -175,7 +185,7 @@ def console_bar(done, total, speed, width=28):
 
 
 def have_app():
-    return os.path.exists(APP)
+    return os.path.exists(APP) or os.path.exists(APP + ".bak")
 
 
 # ───────────────────────────── интерфейс: консоль ─────────────────────────────
@@ -1196,19 +1206,35 @@ def run_webshell(args, no_update, demo=""):
         return None
 
 
+def _exec_app(args, result):
+    import runpy, traceback
+    bak = APP + ".bak"
+    path = APP if os.path.exists(APP) else bak
+    sys.argv = [path] + args
+    try:
+        runpy.run_path(path, run_name="__main__")
+    except SystemExit as e:
+        result["code"] = e.code if isinstance(e.code, int) else 1
+    except BaseException:
+        if path == APP and os.path.exists(bak):
+            try:
+                sys.argv = [bak] + args
+                runpy.run_path(bak, run_name="__main__")
+                return
+            except SystemExit as e:
+                result["code"] = e.code if isinstance(e.code, int) else 1
+                return
+            except BaseException:
+                pass
+        result["err"] = traceback.format_exc().strip().splitlines()[-1]
+
+
 def start_app(args):
     """Запускает программу в фоновом потоке этого процесса. (поток, Capture, result)."""
-    import runpy, traceback
-    sys.argv = [APP] + args
     result = {}
 
     def target():
-        try:
-            runpy.run_path(APP, run_name="__main__")
-        except SystemExit as e:
-            result["code"] = e.code if isinstance(e.code, int) else 1
-        except BaseException:
-            result["err"] = traceback.format_exc().strip().splitlines()[-1]
+        _exec_app(args, result)
     cap = sys.stdout = sys.stderr = Capture(sys.stdout)
     t = threading.Thread(target=target, daemon=True)           # главный поток занят окном (tk или pywebview)
     t.start()
@@ -1218,15 +1244,8 @@ def start_app(args):
 def run_inprocess(args, ui, native=False):
     """Собранный лаунчер: Python-интерпретатора рядом нет, поэтому программа выполняется внутри него."""
     if isinstance(ui, Console):                                 # консоль: можно прямо в главном потоке
-        import runpy, traceback
-        sys.argv = [APP] + args
         result = {}
-        try:
-            runpy.run_path(APP, run_name="__main__")
-        except SystemExit as e:
-            result["code"] = e.code if isinstance(e.code, int) else 1
-        except BaseException:
-            result["err"] = traceback.format_exc().strip().splitlines()[-1]
+        _exec_app(args, result)
         return result.get("code", 1 if result.get("err") else 0)
     t, cap, result = start_app(args)
     if native:
@@ -1296,7 +1315,8 @@ def main():
         os._exit(code)                                          # не ждём фоновые потоки программы
     if ui:
         ui.close()                                              # окно закрыто полностью до запуска программы
-    sys.exit(subprocess.call([sys.executable, APP] + args))
+    path = APP if os.path.exists(APP) else APP + ".bak"
+    sys.exit(subprocess.call([sys.executable, path] + args))
 
 
 if __name__ == "__main__":

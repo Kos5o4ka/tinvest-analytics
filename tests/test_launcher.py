@@ -178,6 +178,45 @@ class Update(unittest.TestCase):
         self.assertEqual(ev[0], "error")
         self.assertTrue(ev[2])
 
+    def test_write_tmp_failure_keeps_app(self):
+        os.makedirs(L.APP_DIR)
+        open(L.APP, "wb").write(b"old = 1\n")
+        orig_open = open
+
+        def fail_tmp(p, mode="r", *a, **k):
+            if str(p).endswith(".tmp") and "w" in mode:
+                raise OSError("disk full")
+            return orig_open(p, mode, *a, **k)
+        import unittest.mock as mock
+        with mock.patch("builtins.open", side_effect=fail_tmp):
+            with self.assertRaises(OSError):
+                L.update(lambda *e: None, None, self.fake())
+        self.assertEqual(open(L.APP, "rb").read(), b"old = 1\n")
+        self.assertFalse(os.path.exists(L.APP + ".bak"))
+
+    def test_replace_failure_rolls_back_bak(self):
+        os.makedirs(L.APP_DIR)
+        open(L.APP, "wb").write(b"old = 1\n")
+        orig_replace = os.replace
+
+        def fail_second_replace(src, dst):
+            if str(src).endswith(".tmp"):
+                raise OSError("locked")
+            return orig_replace(src, dst)
+        import unittest.mock as mock
+        with mock.patch.object(L.os, "replace", side_effect=fail_second_replace):
+            with self.assertRaises(OSError):
+                L.update(lambda *e: None, None, self.fake())
+        self.assertEqual(open(L.APP, "rb").read(), b"old = 1\n")
+
+    def test_have_app_and_exec_fallback_to_bak(self):
+        os.makedirs(L.APP_DIR)
+        open(L.APP + ".bak", "wb").write(b"import sys\nsys.exit(0)\n")
+        self.assertTrue(L.have_app())
+        self.assertEqual(L.run_inprocess([], L.Console()), 0)
+        open(L.APP, "wb").write(b"raise RuntimeError('broken')\n")
+        self.assertEqual(L.run_inprocess([], L.Console()), 0)
+
 
 class NativeWindow(unittest.TestCase):
     def test_want_native(self):
