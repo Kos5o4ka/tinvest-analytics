@@ -252,6 +252,32 @@ class GeminiFixesTests(unittest.TestCase):
         self.assertAlmostEqual(by_c["LQDT"]["ghost_val"], 202000.0, places=1)
         self.assertAlmostEqual(by_c["LQDT"]["diff_rub"], 18000.0, places=1)
 
+    def test_bug_sec02_safe_url(self):
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        core_js = open(os.path.join(root, "src/web/js/01_core.js"), encoding="utf-8").read()
+        self.assertIn("function safeUrl(", core_js)
+        self.assertIn("https:", core_js)
+        self.assertIn("http:", core_js)
+
+        # Все внешние динамические href в JS должны проходить через safeUrl / rtSafeUrl
+        bad = []
+        pat = re.compile(r"""href=(?:"\$\{esc\(([^)]+)\)\}"|'\+esc\(([^)]+)\)\+')""")
+        for path in sorted(glob.glob(os.path.join(root, "src/web/js/*.js"))):
+            fname = os.path.basename(path)
+            txt = open(path, encoding="utf-8").read()
+            for idx, line in enumerate(txt.splitlines(), 1):
+                for m in pat.finditer(line):
+                    expr = m.group(1) or m.group(2)
+                    # Константные/внутренние URL и уже отфильтрованные переменные (rtSafeUrl/safeUrl) допустимы
+                    if expr in ("u", "su", "eu", "fu", "bu", "iu", "au", "ru", "xu", "lu", "s", "href", "proUrl()"):
+                        continue
+                    if "safeUrl(" in expr or "rtSafeUrl(" in expr:
+                        continue
+                    bad.append(f"{fname}:{idx}: {expr}")
+        self.assertEqual(bad, [], f"Найдены непроверенные внешние href: {bad}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28093,6 +28093,7 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 "use strict";
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function safeUrl(u){try{const x=new URL(String(u||''));return(x.protocol==='https:'||x.protocol==='http:')?x.href:''}catch(e){return''}}
 const NF2=new Intl.NumberFormat('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2});
 const NF0=new Intl.NumberFormat('ru-RU',{maximumFractionDigits:0});
 const NFQ=new Intl.NumberFormat('ru-RU',{maximumFractionDigits:6});
@@ -28864,7 +28865,7 @@ function rtPopOpen(el){
   if(!withUrl.length)return;
   if(L.length===1){rtOpenUrl(withUrl[0].u);return}
   const pop=document.createElement('div');pop.id='rt-pop';pop.setAttribute('role','dialog');
-  pop.innerHTML=L.map(x=>`<div class="rt-pop-r"><b>${esc(x.a)}</b><span>${esc(x.r)}${x.o?' · '+esc(x.o):''}${x.d?' · '+esc(typeof ddm==='function'&&/^\d{4}-/.test(x.d)?ddm(x.d):x.d):''}</span>${x.u?`<a href="${esc(x.u)}" target="_blank" rel="noopener noreferrer">Пресс-релиз ↗</a>`:'<span class="mu">нет ссылки</span>'}</div>`).join('');
+  pop.innerHTML=L.map(x=>{const xu=rtSafeUrl(x.u);return`<div class="rt-pop-r"><b>${esc(x.a)}</b><span>${esc(x.r)}${x.o?' · '+esc(x.o):''}${x.d?' · '+esc(typeof ddm==='function'&&/^\d{4}-/.test(x.d)?ddm(x.d):x.d):''}</span>${xu?`<a href="${esc(xu)}" target="_blank" rel="noopener noreferrer">Пресс-релиз ↗</a>`:'<span class="mu">нет ссылки</span>'}</div>`}).join('');
   document.body.appendChild(pop);
   const b=el.getBoundingClientRect(),w=pop.offsetWidth,h=pop.offsetHeight;
   pop.style.left=Math.max(8,Math.min(b.left,innerWidth-w-8))+'px';
@@ -29065,7 +29066,7 @@ function pPri(){
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
     <td class="l">${priNipCell(r.nip)}</td>
     <td class="num">${ddm(r.start)}${r.start===today?'<br><small class="pos">сегодня</small>':''}</td><td class="num">${esc(r.end.replace(' г.',''))}</td>
-    <td class="l">${esc(r.book)}</td><td class="l">${r.link?`<a class="blue-link" href="${esc(r.link)}" target="_blank" rel="noopener">объявление Мосбиржи ↗</a>`:''}</td></tr>`).join('');
+    <td class="l">${esc(r.book)}</td><td class="l">${safeUrl(r.link)?`<a class="blue-link" href="${esc(safeUrl(r.link))}" target="_blank" rel="noopener">объявление Мосбиржи ↗</a>`:''}</td></tr>`).join('');
   return priVolHtml()+calNote+`<div class="g g4" style="margin-top:16px">${kpi('Размещений в списке',rows.length,'объявлено Мосбиржей')}${kpi('Сегодня',rows.filter(r=>r.start===today).length,'плановое начало размещения')}
     ${kpi('На этой неделе',rows.filter(r=>r.start>=today&&r.start<=wk).length,'начало в ближайшие 7 дней')}${kpi('С рейтингом',rows.filter(r=>r.rating).length,'эмитент найден в базе рейтингов')}</div>
   ${priNipCalcHtml(d)}
@@ -31289,7 +31290,7 @@ function bcOutLine(o){
   if(!o||o.qty==null)return'';
   const fmt=n=>Number(n).toLocaleString('ru-RU');
   const sh=o.share!=null?` (${Math.round(o.share*100)} % выпуска)`:'';
-  const src=o.doc_url?`<a href="${esc(o.doc_url)}" target="_blank" rel="noopener">источник ↗</a>`:'';
+  const su=safeUrl(o.doc_url),src=su?`<a href="${esc(su)}" target="_blank" rel="noopener">источник ↗</a>`:'';
   const M={coupon_explicit:'купону',coupon_derived:'купону (выведено из суммы выплаты)',declared_derived:'объявлению о купоне (выведено из суммы)'};
   let how;
   if(M[o.method])how=`по ${M[o.method]}${o.coupon_no?' №'+esc(String(o.coupon_no)):''}${o.as_of?' от '+ddm(o.as_of):''}`;
@@ -31310,7 +31311,8 @@ function bcOutLine(o){
   if(evs.length>1||(evs.length===1&&evs[0].kind!=='issue')){
     const rows=evs.map(e=>{
       const dlt=e.delta==null?'—':(e.kind==='issue'?fmt(e.delta)+' шт.':(e.delta>0?`<span class="pos">+${fmt(e.delta)} шт.</span>`:`<span class="neg">−${fmt(Math.abs(e.delta))} шт.</span>`));
-      return`<tr><td class="l">${e.date?ddm(e.date):'—'}</td><td class="l">${esc(e.label||e.kind)}</td><td class="num">${dlt}</td><td>${e.url?`<a href="${esc(e.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`;
+      const eu=safeUrl(e.url);
+      return`<tr><td class="l">${e.date?ddm(e.date):'—'}</td><td class="l">${esc(e.label||e.kind)}</td><td class="num">${dlt}</td><td>${eu?`<a href="${esc(eu)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`;
     }).join('');
     tl=`<details class="bc-out-det"><summary>История изменения объёма (${evs.length})</summary><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Событие</th><th>Объём / изменение</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
   }
@@ -31325,7 +31327,7 @@ function bcDisclosure(dc){
   if(!o&&!fs.length&&!inv)return'';
   let h=`<div class="card bc-sec"><h2>Раскрытие эмитента<span class="sp">сообщения на e-disclosure, разбор сервера данных</span></h2>${inv}${o}`;
   if(fs.length)h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Данные</th><th></th></tr></thead><tbody>`
-    +fs.map(f=>`<tr><td class="l">${f.date?ddm(f.date):'—'}</td><td class="l">${esc(BC_DISC_KIND[f.kind]||f.label||f.kind)}</td><td class="l">${esc(f.text||'')}</td><td>${f.url?`<a href="${esc(f.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`).join('')+`</tbody></table></div>`;
+    +fs.map(f=>{const fu=safeUrl(f.url);return`<tr><td class="l">${f.date?ddm(f.date):'—'}</td><td class="l">${esc(BC_DISC_KIND[f.kind]||f.label||f.kind)}</td><td class="l">${esc(f.text||'')}</td><td>${fu?`<a href="${esc(fu)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`}).join('')+`</tbody></table></div>`;
   else h+=`<div class="mu" style="font-size:13px">Раскрытий по выпуску пока нет (сервер данных не подключён или сообщений не найдено).</div>`;
   return h+`</div>`;
 }
@@ -31453,7 +31455,8 @@ function bcIssIfrs(j){
     ${bcKpi('Капитал / активы',c.eq_ratio==null?'—':bcN(c.eq_ratio*100,0)+' %','норма от 25–40 %')}${bcKpi('Рентабельность EBITDA',Pc(c.margin_ebitda),'доля EBITDA в выручке')}</div>`;
   if(m.key)h+=`<div class="bc-rel"><b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b></div>`;
   if(j.history&&(j.history.defaults||j.history.tech))h+=`<div class="bc-warn">${esc(j.history.verdict)}</div>`;
-  h+=`<div class="mu" style="font-size:12.5px;margin-top:6px">${rs?'Для сравнения, РСБУ отдельной компании: '+rs.score+' ('+esc(rs.label)+'). ':''}<a href="${esc(b.url)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a></div>
+  const bu=safeUrl(b.url);
+  h+=`<div class="mu" style="font-size:12.5px;margin-top:6px">${rs?'Для сравнения, РСБУ отдельной компании: '+rs.score+' ('+esc(rs.label)+'). ':''}${bu?`<a href="${esc(bu)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a>`:'Источник: smart-lab'}</div>
     <button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button><p class="note" style="margin-top:8px">Скоринг от 0 до 100 по консолидированной отчётности группы (МСФО). Данные агрегатора smart-lab, могут отличаться от официальной отчётности. Не инвестиционная рекомендация.</p>`;
   return h;
 }
@@ -31934,8 +31937,9 @@ function monSpark(sp,w=96,h=26){
 function monAlertHtml(a){
   const[s,c]=MON_SEV[a.severity]||MON_SEV.info,n=(a.isins||[]).length;
   const nm=a.kind==='rating'?`${esc(a.name)}${n?` <small class="mu">· ${esc((a.bonds||[]).slice(0,2).join(', '))}${n>2?' и ещё '+(n-2):''}</small>`:''}`:esc(a.name||'');
+  const au=safeUrl(a.url);
   return`<div class="mon-al ${c}" ${a.isin?`data-isin="${esc(a.isin)}"`:''}><span class="mon-sev">${s}</span><span class="mon-d num"${a.asof?' title="Состояние на сегодня: дата события не публикуется"':''}>${a.asof?'сейчас':a.date?ddm(a.date):''}</span>
-    <div class="mon-b"><b>${nm}</b><span>${esc(a.message)}</span></div>${a.url?`<a href="${esc(a.url)}" target="_blank" rel="noopener" title="Источник">↗</a>`:''}</div>`;
+    <div class="mon-b"><b>${nm}</b><span>${esc(a.message)}</span></div>${au?`<a href="${esc(au)}" target="_blank" rel="noopener" title="Источник">↗</a>`:''}</div>`;
 }
 function monCard(){
   if(!(S.bonds&&S.bonds.rows&&S.bonds.rows.length))return'';
@@ -32967,8 +32971,8 @@ function issIfrsBlock(ib){
     if(s.year<new Date().getFullYear()-2)h+=`<div class="bc-warn">Последний годовой отчёт — за ${s.year} г.: оценка устарела.</div>`;
     h+=`<h3 class="iss-h">За что баллы</h3>${issPartsHtml(s,ISS_HINT_I)}`;
   }else h+=`<div class="msg" style="margin:6px 0 12px">${esc(s.reason||f.note||'Нет данных МСФО.')}</div>`;
-  if(f.years&&f.years.length)h+=`<h3 class="iss-h">Динамика по годам</h3><div id="iss-ch" class="bc-ch"></div>${issIfrsTable(f)}
-    <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. LTM — последние 12 месяцев по квартальной отчётности (если новее годовой). Рост выручки считается по годовым данным. <a href="${esc(ib.url)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a> — данные агрегатора, могут отличаться от официальной отчётности.</p>`;
+  if(f.years&&f.years.length){const iu=safeUrl(ib.url);h+=`<h3 class="iss-h">Динамика по годам</h3><div id="iss-ch" class="bc-ch"></div>${issIfrsTable(f)}
+    <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. LTM — последние 12 месяцев по квартальной отчётности (если новее годовой). Рост выручки считается по годовым данным. ${iu?`<a href="${esc(iu)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a>`:'Источник: smart-lab'} — данные агрегатора, могут отличаться от официальной отчётности.</p>`;}
   return h;
 }
 /* ── Выплаты эмитента по месяцам: «Рублёвый эквивалент» (число бумаг в рынке x выплата на бумагу, по всем торгуемым выпускам) ── */
@@ -34235,7 +34239,7 @@ function stkDivHist(d){
   const ys=new Set(d.items.map(r=>String(r.record).slice(0,4)));
   const span=ys.size?Math.max(...ys)-Math.min(...ys)+1:0;
   const parts=[d.items.length+' '+(d.items.length===1?'выплата':'выплат')+(span>1?' за '+span+' '+(span%10===1&&span%100!==11?'год':span%10>=2&&span%10<=4&&(span%100<10||span%100>=20)?'года':'лет'):'')];
-  if(h.added)parts.push('до '+String(h.from).slice(0,4)+' г. — по данным <a href="'+esc(h.url||'https://www.dohod.ru')+'" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет)');
+  if(h.added)parts.push('до '+String(h.from).slice(0,4)+' г. — по данным <a href="'+esc(safeUrl(h.url)||'https://www.dohod.ru')+'" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет)');
   else if(h.status==='err')parts.push('длинная история с dohod.ru сейчас недоступна');
   return`<p class="note" style="margin-top:8px">${parts.join('. ')}. Доходность — к текущей цене.</p>`;
 }
@@ -34269,7 +34273,7 @@ function stkFundInfo(c){
   const f=c.fund||{},q=c.quote,h=(S.fh[c.secid]||{}).data,d=c.dividends||{items:[]},n=f.nav||{};
   const mgr=f.manager||n.manager,murl=f.manager_url||n.manager_url;
   const url=murl?(/^https?:/i.test(murl)?murl:'https://'+murl):'';
-  const lnk=(u,t)=>`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`;
+  const lnk=(u,t)=>{const s=safeUrl(u);return s?`<a href="${esc(s)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`:esc(t)};
   const start=fiDate(f.issue_date||n.issue_date);
   let nav;
   if(n.nav)nav=`${fhMoney(n.nav,n.nav_cur)}<small class="mu">${n.nav_date?'на '+fiDate(n.nav_date)+', ':''}${lnk(n.source_url,'Мосбиржа')}</small>`;
@@ -34308,7 +34312,7 @@ function stkFundHold(c,p){
     sp=it.length+' '+(it.length%10===1&&it.length%100!==11?'позиция':it.length%10>=2&&it.length%10<=4&&(it.length%100<10||it.length%100>=20)?'позиции':'позиций')+(it.length>10?' · первые 10 — '+stkN(top,1)+' %':'');
     const rows=it.slice(0,n).map(r=>`<tr${r.stock?` data-fh="${esc(r.ticker)}" class="fh-lnk" title="Открыть карточку ${esc(r.ticker)}"`:''}><td class="l"><b>${esc(r.name)}</b>${r.ticker?` <small class="mu">${esc(r.ticker)}</small>`:''}</td>
       <td class="l mu">${esc(r.type_ru||'')}</td><td class="num fh-w"><span class="fh-bar"><i style="width:${Math.max(.5,(r.weight||0)/mx*100).toFixed(1)}%"></i></span><b>${stkN(r.weight,2)} %</b></td></tr>`).join('');
-    const src=d.source||{},a=src.url?`<a href="${esc(src.url)}" target="_blank" rel="noopener noreferrer">${esc(src.name)}</a>`:esc(src.name||'');
+    const src=d.source||{},su=safeUrl(src.url),a=su?`<a href="${esc(su)}" target="_blank" rel="noopener noreferrer">${esc(src.name)}</a>`:esc(src.name||'');
     const line=d.basis==='index'?`Фонд следует за индексом «${esc((d.index||{}).name||'')}»; веса бумаг в индексе — по данным ${a} на ${ddm(d.as_of)}. Фактический портфель фонда может немного отличаться от индекса.`
       :`Источник: ${a}, данные получены ${ddm(d.as_of)}.${d.nav?' Стоимость чистых активов: '+fhMoney(d.nav,d.nav_cur)+'.':''}`;
     body=`<div class="tbl"><table class="fh-t"><thead><tr><th class="l">Бумага</th><th class="l">Тип</th><th>Доля</th></tr></thead><tbody id="${p}fh">${rows}</tbody></table></div>
@@ -34613,11 +34617,12 @@ function dflRows(rows,since){
   return`<div class="tbl dfl-wrap"><table class="dfl-tab"><thead><tr><th class="l">Дата</th><th class="l">Статус</th><th class="l">Эмитент · бумага</th><th class="l">Обязательство</th><th>Сумма</th><th class="l">Исполнение</th><th class="l">Основание</th></tr></thead><tbody>`
   +rows.map(r=>{const st=DFL_ST[r.status]||DFL_ST.technical;
     const dt=r.date?ddm(r.date)+(r.date_est?` <small class="mu dfl-est" title="Дата оценена по графику выплат Мосбиржи: последняя плановая выплата до сегодняшнего дня. Фактическую дату неисполнения эмитент мог раскрыть иначе.">по графику</small>`:''):'—';
+    const ru=safeUrl(r.url);
     return`<tr${r.isin?` data-isin="${esc(r.isin)}" title="Открыть карточку выпуска"`:''}><td class="l">${dt}</td><td class="l"><span class="dfl-b ${st[1]}">${st[0]}</span></td>
       <td class="l dfl-is"><b>${esc(r.issuer||'—')}</b>${r.mine?' <span class="tag">мой</span>':''}<br><small class="mu num">${r.isin?esc(r.isin):''}${r.isin&&r.inn?' · ':''}${r.inn?'ИНН '+esc(r.inn):''}</small></td>
       <td class="l">${esc(r.obligation||'—')}${r.due_date&&!r.date_est?`<br><small class="mu">срок ${ddm(r.due_date)}</small>`:''}</td><td class="num">${r.amount==null?'—':short(r.amount)+' ₽'}</td>
       <td class="l">${r.executed?`<span class="pos">исполнено ${ddm(r.executed)}</span>`:'<span class="mu">нет данных</span>'}</td>
-      <td class="l dfl-bs">${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
+      <td class="l dfl-bs">${ru?`<a href="${esc(ru)}" target="_blank" rel="noopener">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
 }
 function pDfl(){
   const D=S.dfl,key=dflKey();
@@ -35246,8 +35251,9 @@ function crpDilution(c){
   let h='';
   if(!d.n_scanned)h+=`<div class="mu">Данных для проверки нет: в приложении нет потока раскрытий по акциям этого эмитента (покрытие — только выпуски облигаций, и то не для всех).</div>`;
   else if(!m.length)h+=`<div class="mu">Проверено заголовков раскрытий: ${d.n_scanned}. Упоминаний допэмиссии, конвертируемых облигаций, опционных программ, выкупа акций и lock-up не найдено.</div>`;
-  else h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Признак</th><th class="l">Раскрытие</th></tr></thead><tbody>${m.map(x=>`<tr><td class="l">${crpFmtDate(x.date)}</td><td class="l"><span class="tag">${esc(x.label)}</span></td><td class="l">${x.url?`<a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.title)}</a>`:esc(x.title)}</td></tr>`).join('')}</tbody></table></div>`;
-  h+=`<p class="note">Поиск по ключевым словам в заголовках — это грубый признак, а не оценка вероятности размытия. `+((lk.skrin||lk.edisclosure)?`Первоисточник: <a href="${esc(lk.skrin||lk.edisclosure)}" target="_blank" rel="noopener">раскрытие информации эмитента</a>.`:'')+`</p>`;
+  else h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Признак</th><th class="l">Раскрытие</th></tr></thead><tbody>${m.map(x=>{const xu=safeUrl(x.url);return`<tr><td class="l">${crpFmtDate(x.date)}</td><td class="l"><span class="tag">${esc(x.label)}</span></td><td class="l">${xu?`<a href="${esc(xu)}" target="_blank" rel="noopener">${esc(x.title)}</a>`:esc(x.title)}</td></tr>`}).join('')}</tbody></table></div>`;
+  const lu=safeUrl(lk.skrin||lk.edisclosure);
+  h+=`<p class="note">Поиск по ключевым словам в заголовках — это грубый признак, а не оценка вероятности размытия. `+(lu?`Первоисточник: <a href="${esc(lu)}" target="_blank" rel="noopener">раскрытие информации эмитента</a>.`:'')+`</p>`;
   return h;
 }
 function crpCard(c){
@@ -36665,7 +36671,7 @@ function stkDvHist(d){
   const dh=d.div_hist||{};
   const body=it.map(r=>`<tr class="${r.future?'pnew':''}"><td class="l num">${ddm(r.record)}${r.future?' <small class="pos">будущая</small>':''}</td><td class="num">${r.last_buy?ddm(r.last_buy):'—'}</td><td class="num">${r.payment?ddm(r.payment):'—'}</td>
     <td class="num"><b>${stkDvRub(r.value)}</b></td><td class="num">${r.yield_pct==null?'—':stkN(r.yield_pct,2)+' %'}</td><td class="l">${stkDvSrc(r.src)}</td></tr>`).join('');
-  const note=dh.added?`Ранние годы — по данным <a href="${esc(dh.url||'https://www.dohod.ru')}" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет). `:dh.status==='err'?'Длинная история с dohod.ru сейчас недоступна. ':'';
+  const note=dh.added?`Ранние годы — по данным <a href="${esc(safeUrl(dh.url)||'https://www.dohod.ru')}" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет). `:dh.status==='err'?'Длинная история с dohod.ru сейчас недоступна. ':'';
   return`<div class="card"><h2>Все выплаты<span class="sp">${it.length} ${dlEv(it.length,'выплата','выплаты','выплат')}</span></h2>
     <div class="tbl" style="max-height:420px"><table><thead><tr><th class="l">Закрытие реестра</th><th title="Последний день, когда покупка давала право на дивиденд">Посл. день покупки</th><th>Выплата</th><th>На акцию</th><th title="Размер дивиденда к текущей цене акции">К текущей цене</th><th class="l">Источник</th></tr></thead><tbody>${body}</tbody></table></div>
     <p class="note" style="margin-top:8px">${note}Доходность каждой выплаты — к сегодняшней цене, а не к цене на дату выплаты.</p></div>`;
@@ -36986,9 +36992,9 @@ async function shellNotice(){
   try{if(sessionStorage.getItem('shell_later'))return}catch(e){}
   if(document.getElementById('shell-bar'))return;
   const bar=document.createElement('div');bar.id='shell-bar';bar.className='noprint';
-  const href=s.asset?`https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/${encodeURIComponent(s.asset)}`:s.url;
+  const href=safeUrl(s.asset?`https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/${encodeURIComponent(s.asset)}`:s.url),su=safeUrl(s.url);
   bar.innerHTML=`<span><b>Доступна новая версия приложения.</b> Программа обновилась сама, а новая иконка и экран запуска придут, когда вы скачаете приложение заново и замените старое.</span>
-    <span class="sb-b"><a class="btn" href="${esc(href)}" target="_blank" rel="noopener noreferrer">Скачать</a><a class="btn ghost" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">Что нового</a><button class="btn ghost" id="shell-later">Позже</button></span>`;
+    <span class="sb-b">${href?`<a class="btn" href="${esc(href)}" target="_blank" rel="noopener noreferrer">Скачать</a>`:''}${su?`<a class="btn ghost" href="${esc(su)}" target="_blank" rel="noopener noreferrer">Что нового</a>`:''}<button class="btn ghost" id="shell-later">Позже</button></span>`;
   const top=document.querySelector('main .top');if(!top)return;
   top.insertAdjacentElement('afterend',bar);
   bar.querySelector('#shell-later').onclick=()=>{try{sessionStorage.setItem('shell_later','1')}catch(e){}bar.remove()};

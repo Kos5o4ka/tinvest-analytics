@@ -1,6 +1,7 @@
 "use strict";
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function safeUrl(u){try{const x=new URL(String(u||''));return(x.protocol==='https:'||x.protocol==='http:')?x.href:''}catch(e){return''}}
 const NF2=new Intl.NumberFormat('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2});
 const NF0=new Intl.NumberFormat('ru-RU',{maximumFractionDigits:0});
 const NFQ=new Intl.NumberFormat('ru-RU',{maximumFractionDigits:6});

@@ -144,7 +144,7 @@ function stkDivHist(d){
   const ys=new Set(d.items.map(r=>String(r.record).slice(0,4)));
   const span=ys.size?Math.max(...ys)-Math.min(...ys)+1:0;
   const parts=[d.items.length+' '+(d.items.length===1?'выплата':'выплат')+(span>1?' за '+span+' '+(span%10===1&&span%100!==11?'год':span%10>=2&&span%10<=4&&(span%100<10||span%100>=20)?'года':'лет'):'')];
-  if(h.added)parts.push('до '+String(h.from).slice(0,4)+' г. — по данным <a href="'+esc(h.url||'https://www.dohod.ru')+'" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет)');
+  if(h.added)parts.push('до '+String(h.from).slice(0,4)+' г. — по данным <a href="'+esc(safeUrl(h.url)||'https://www.dohod.ru')+'" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет)');
   else if(h.status==='err')parts.push('длинная история с dohod.ru сейчас недоступна');
   return`<p class="note" style="margin-top:8px">${parts.join('. ')}. Доходность — к текущей цене.</p>`;
 }
@@ -178,7 +178,7 @@ function stkFundInfo(c){
   const f=c.fund||{},q=c.quote,h=(S.fh[c.secid]||{}).data,d=c.dividends||{items:[]},n=f.nav||{};
   const mgr=f.manager||n.manager,murl=f.manager_url||n.manager_url;
   const url=murl?(/^https?:/i.test(murl)?murl:'https://'+murl):'';
-  const lnk=(u,t)=>`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`;
+  const lnk=(u,t)=>{const s=safeUrl(u);return s?`<a href="${esc(s)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`:esc(t)};
   const start=fiDate(f.issue_date||n.issue_date);
   let nav;
   if(n.nav)nav=`${fhMoney(n.nav,n.nav_cur)}<small class="mu">${n.nav_date?'на '+fiDate(n.nav_date)+', ':''}${lnk(n.source_url,'Мосбиржа')}</small>`;
@@ -217,7 +217,7 @@ function stkFundHold(c,p){
     sp=it.length+' '+(it.length%10===1&&it.length%100!==11?'позиция':it.length%10>=2&&it.length%10<=4&&(it.length%100<10||it.length%100>=20)?'позиции':'позиций')+(it.length>10?' · первые 10 — '+stkN(top,1)+' %':'');
     const rows=it.slice(0,n).map(r=>`<tr${r.stock?` data-fh="${esc(r.ticker)}" class="fh-lnk" title="Открыть карточку ${esc(r.ticker)}"`:''}><td class="l"><b>${esc(r.name)}</b>${r.ticker?` <small class="mu">${esc(r.ticker)}</small>`:''}</td>
       <td class="l mu">${esc(r.type_ru||'')}</td><td class="num fh-w"><span class="fh-bar"><i style="width:${Math.max(.5,(r.weight||0)/mx*100).toFixed(1)}%"></i></span><b>${stkN(r.weight,2)} %</b></td></tr>`).join('');
-    const src=d.source||{},a=src.url?`<a href="${esc(src.url)}" target="_blank" rel="noopener noreferrer">${esc(src.name)}</a>`:esc(src.name||'');
+    const src=d.source||{},su=safeUrl(src.url),a=su?`<a href="${esc(su)}" target="_blank" rel="noopener noreferrer">${esc(src.name)}</a>`:esc(src.name||'');
     const line=d.basis==='index'?`Фонд следует за индексом «${esc((d.index||{}).name||'')}»; веса бумаг в индексе — по данным ${a} на ${ddm(d.as_of)}. Фактический портфель фонда может немного отличаться от индекса.`
       :`Источник: ${a}, данные получены ${ddm(d.as_of)}.${d.nav?' Стоимость чистых активов: '+fhMoney(d.nav,d.nav_cur)+'.':''}`;
     body=`<div class="tbl"><table class="fh-t"><thead><tr><th class="l">Бумага</th><th class="l">Тип</th><th>Доля</th></tr></thead><tbody id="${p}fh">${rows}</tbody></table></div>

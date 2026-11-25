@@ -37,7 +37,7 @@ function rtPopOpen(el){
   if(!withUrl.length)return;
   if(L.length===1){rtOpenUrl(withUrl[0].u);return}
   const pop=document.createElement('div');pop.id='rt-pop';pop.setAttribute('role','dialog');
-  pop.innerHTML=L.map(x=>`<div class="rt-pop-r"><b>${esc(x.a)}</b><span>${esc(x.r)}${x.o?' · '+esc(x.o):''}${x.d?' · '+esc(typeof ddm==='function'&&/^\d{4}-/.test(x.d)?ddm(x.d):x.d):''}</span>${x.u?`<a href="${esc(x.u)}" target="_blank" rel="noopener noreferrer">Пресс-релиз ↗</a>`:'<span class="mu">нет ссылки</span>'}</div>`).join('');
+  pop.innerHTML=L.map(x=>{const xu=rtSafeUrl(x.u);return`<div class="rt-pop-r"><b>${esc(x.a)}</b><span>${esc(x.r)}${x.o?' · '+esc(x.o):''}${x.d?' · '+esc(typeof ddm==='function'&&/^\d{4}-/.test(x.d)?ddm(x.d):x.d):''}</span>${xu?`<a href="${esc(xu)}" target="_blank" rel="noopener noreferrer">Пресс-релиз ↗</a>`:'<span class="mu">нет ссылки</span>'}</div>`}).join('');
   document.body.appendChild(pop);
   const b=el.getBoundingClientRect(),w=pop.offsetWidth,h=pop.offsetHeight;
   pop.style.left=Math.max(8,Math.min(b.left,innerWidth-w-8))+'px';

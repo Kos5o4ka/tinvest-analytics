@@ -18,8 +18,9 @@ function monSpark(sp,w=96,h=26){
 function monAlertHtml(a){
   const[s,c]=MON_SEV[a.severity]||MON_SEV.info,n=(a.isins||[]).length;
   const nm=a.kind==='rating'?`${esc(a.name)}${n?` <small class="mu">· ${esc((a.bonds||[]).slice(0,2).join(', '))}${n>2?' и ещё '+(n-2):''}</small>`:''}`:esc(a.name||'');
+  const au=safeUrl(a.url);
   return`<div class="mon-al ${c}" ${a.isin?`data-isin="${esc(a.isin)}"`:''}><span class="mon-sev">${s}</span><span class="mon-d num"${a.asof?' title="Состояние на сегодня: дата события не публикуется"':''}>${a.asof?'сейчас':a.date?ddm(a.date):''}</span>
-    <div class="mon-b"><b>${nm}</b><span>${esc(a.message)}</span></div>${a.url?`<a href="${esc(a.url)}" target="_blank" rel="noopener" title="Источник">↗</a>`:''}</div>`;
+    <div class="mon-b"><b>${nm}</b><span>${esc(a.message)}</span></div>${au?`<a href="${esc(au)}" target="_blank" rel="noopener" title="Источник">↗</a>`:''}</div>`;
 }
 function monCard(){
   if(!(S.bonds&&S.bonds.rows&&S.bonds.rows.length))return'';

@@ -19,11 +19,12 @@ function dflRows(rows,since){
   return`<div class="tbl dfl-wrap"><table class="dfl-tab"><thead><tr><th class="l">Дата</th><th class="l">Статус</th><th class="l">Эмитент · бумага</th><th class="l">Обязательство</th><th>Сумма</th><th class="l">Исполнение</th><th class="l">Основание</th></tr></thead><tbody>`
   +rows.map(r=>{const st=DFL_ST[r.status]||DFL_ST.technical;
     const dt=r.date?ddm(r.date)+(r.date_est?` <small class="mu dfl-est" title="Дата оценена по графику выплат Мосбиржи: последняя плановая выплата до сегодняшнего дня. Фактическую дату неисполнения эмитент мог раскрыть иначе.">по графику</small>`:''):'—';
+    const ru=safeUrl(r.url);
     return`<tr${r.isin?` data-isin="${esc(r.isin)}" title="Открыть карточку выпуска"`:''}><td class="l">${dt}</td><td class="l"><span class="dfl-b ${st[1]}">${st[0]}</span></td>
       <td class="l dfl-is"><b>${esc(r.issuer||'—')}</b>${r.mine?' <span class="tag">мой</span>':''}<br><small class="mu num">${r.isin?esc(r.isin):''}${r.isin&&r.inn?' · ':''}${r.inn?'ИНН '+esc(r.inn):''}</small></td>
       <td class="l">${esc(r.obligation||'—')}${r.due_date&&!r.date_est?`<br><small class="mu">срок ${ddm(r.due_date)}</small>`:''}</td><td class="num">${r.amount==null?'—':short(r.amount)+' ₽'}</td>
       <td class="l">${r.executed?`<span class="pos">исполнено ${ddm(r.executed)}</span>`:'<span class="mu">нет данных</span>'}</td>
-      <td class="l dfl-bs">${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
+      <td class="l dfl-bs">${ru?`<a href="${esc(ru)}" target="_blank" rel="noopener">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
 }
 function pDfl(){
   const D=S.dfl,key=dflKey();

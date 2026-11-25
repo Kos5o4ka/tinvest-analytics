@@ -88,7 +88,7 @@ function bcOutLine(o){
   if(!o||o.qty==null)return'';
   const fmt=n=>Number(n).toLocaleString('ru-RU');
   const sh=o.share!=null?` (${Math.round(o.share*100)} % выпуска)`:'';
-  const src=o.doc_url?`<a href="${esc(o.doc_url)}" target="_blank" rel="noopener">источник ↗</a>`:'';
+  const su=safeUrl(o.doc_url),src=su?`<a href="${esc(su)}" target="_blank" rel="noopener">источник ↗</a>`:'';
   const M={coupon_explicit:'купону',coupon_derived:'купону (выведено из суммы выплаты)',declared_derived:'объявлению о купоне (выведено из суммы)'};
   let how;
   if(M[o.method])how=`по ${M[o.method]}${o.coupon_no?' №'+esc(String(o.coupon_no)):''}${o.as_of?' от '+ddm(o.as_of):''}`;
@@ -109,7 +109,8 @@ function bcOutLine(o){
   if(evs.length>1||(evs.length===1&&evs[0].kind!=='issue')){
     const rows=evs.map(e=>{
       const dlt=e.delta==null?'—':(e.kind==='issue'?fmt(e.delta)+' шт.':(e.delta>0?`<span class="pos">+${fmt(e.delta)} шт.</span>`:`<span class="neg">−${fmt(Math.abs(e.delta))} шт.</span>`));
-      return`<tr><td class="l">${e.date?ddm(e.date):'—'}</td><td class="l">${esc(e.label||e.kind)}</td><td class="num">${dlt}</td><td>${e.url?`<a href="${esc(e.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`;
+      const eu=safeUrl(e.url);
+      return`<tr><td class="l">${e.date?ddm(e.date):'—'}</td><td class="l">${esc(e.label||e.kind)}</td><td class="num">${dlt}</td><td>${eu?`<a href="${esc(eu)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`;
     }).join('');
     tl=`<details class="bc-out-det"><summary>История изменения объёма (${evs.length})</summary><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Событие</th><th>Объём / изменение</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
   }
@@ -124,7 +125,7 @@ function bcDisclosure(dc){
   if(!o&&!fs.length&&!inv)return'';
   let h=`<div class="card bc-sec"><h2>Раскрытие эмитента<span class="sp">сообщения на e-disclosure, разбор сервера данных</span></h2>${inv}${o}`;
   if(fs.length)h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Данные</th><th></th></tr></thead><tbody>`
-    +fs.map(f=>`<tr><td class="l">${f.date?ddm(f.date):'—'}</td><td class="l">${esc(BC_DISC_KIND[f.kind]||f.label||f.kind)}</td><td class="l">${esc(f.text||'')}</td><td>${f.url?`<a href="${esc(f.url)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`).join('')+`</tbody></table></div>`;
+    +fs.map(f=>{const fu=safeUrl(f.url);return`<tr><td class="l">${f.date?ddm(f.date):'—'}</td><td class="l">${esc(BC_DISC_KIND[f.kind]||f.label||f.kind)}</td><td class="l">${esc(f.text||'')}</td><td>${fu?`<a href="${esc(fu)}" target="_blank" rel="noopener">↗</a>`:''}</td></tr>`}).join('')+`</tbody></table></div>`;
   else h+=`<div class="mu" style="font-size:13px">Раскрытий по выпуску пока нет (сервер данных не подключён или сообщений не найдено).</div>`;
   return h+`</div>`;
 }
@@ -252,7 +253,8 @@ function bcIssIfrs(j){
     ${bcKpi('Капитал / активы',c.eq_ratio==null?'—':bcN(c.eq_ratio*100,0)+' %','норма от 25–40 %')}${bcKpi('Рентабельность EBITDA',Pc(c.margin_ebitda),'доля EBITDA в выручке')}</div>`;
   if(m.key)h+=`<div class="bc-rel"><b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b></div>`;
   if(j.history&&(j.history.defaults||j.history.tech))h+=`<div class="bc-warn">${esc(j.history.verdict)}</div>`;
-  h+=`<div class="mu" style="font-size:12.5px;margin-top:6px">${rs?'Для сравнения, РСБУ отдельной компании: '+rs.score+' ('+esc(rs.label)+'). ':''}<a href="${esc(b.url)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a></div>
+  const bu=safeUrl(b.url);
+  h+=`<div class="mu" style="font-size:12.5px;margin-top:6px">${rs?'Для сравнения, РСБУ отдельной компании: '+rs.score+' ('+esc(rs.label)+'). ':''}${bu?`<a href="${esc(bu)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a>`:'Источник: smart-lab'}</div>
     <button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button><p class="note" style="margin-top:8px">Скоринг от 0 до 100 по консолидированной отчётности группы (МСФО). Данные агрегатора smart-lab, могут отличаться от официальной отчётности. Не инвестиционная рекомендация.</p>`;
   return h;
 }
