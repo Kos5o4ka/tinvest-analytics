@@ -69,6 +69,12 @@ def _account_data(cfg, a, key):
     return mem_put(key, res)
 
 
+def _op_inst_keys(ops):
+    """Собирает пары (instrumentUid, figi) из операций, исключая синтетические imp:-ключи."""
+    return {(o.get("instrumentUid"), o.get("figi")) for o in ops
+            if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
+
+
 def list_accounts(cfg, force=False):
     key = ("accounts", token_key(cfg))
     hit = None if force else mem_get(key, 60)
@@ -102,7 +108,8 @@ def _list_accounts(cfg, key):
              "closed": False, "opened": None}
         a["broker_id"], a["broker_name"] = broker_of_account(imp)
         try:
-            rows = imported_positions(client, store().ops(imp["id"]), instruments(client, []))
+            ops = store().ops(imp["id"])
+            rows = imported_positions(client, ops, instruments(client, _op_inst_keys(ops)))
             a["total"] = sum((r["value_rub"] or 0) for r in rows)
         except Exception:  # noqa: BLE001
             a["total"] = 0.0
@@ -131,8 +138,7 @@ def build_summary(cfg, acc, period, force=False):
     for d in data:
         for x in (d["port"] or {}).get("positions") or []:
             keys.add((x.get("instrumentUid"), x.get("figi")))
-    keys |= {(o.get("instrumentUid"), o.get("figi")) for o in ops
-             if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
+    keys |= _op_inst_keys(ops)
     names = instruments(client, keys)
     lists, extra = [], {"daily": 0.0, "has_daily": False, "yield_w": 0.0}
     for a, d in zip(sel, data):
@@ -274,8 +280,7 @@ def build_history_for(cfg, acc, force=False):
         client = TInvest(cfg)
         accs, sel, data = selection(cfg, acc)
         ops = sorted([o for d in data for o in d["ops"]], key=lambda o: o.get("date") or "")
-        keys = {(o.get("instrumentUid"), o.get("figi")) for o in ops
-                if (o.get("instrumentUid") or o.get("figi")) and not str(o.get("instrumentUid") or "").startswith("imp:")}
+        keys = _op_inst_keys(ops)
         names = instruments(client, keys)
         total = sum(qf((d["port"] or {}).get("totalAmountPortfolio")) for d in data if d["port"] is not None)
         if any(d["port"] is None for d in data):

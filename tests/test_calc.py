@@ -323,3 +323,39 @@ class IncomeGoal(unittest.TestCase):
         self.assertAlmostEqual(out["result"]["capital_today"], 80000 * 12 / (0.14 * 0.87), places=3)
         self.assertEqual(M.calc_goal_get({}, "all", {"monthly": "80000", "years": "8"})["result"], None)
         self.assertIn("доходность", M.calc_goal_get({}, "all", {"monthly": "80000", "years": "8"})["error"])
+
+
+class ListAccountsImportFx(unittest.TestCase):
+    """BUG-CALC-07: _list_accounts передаёт ключи инструментов импорта в instruments(), учитывая валюту."""
+
+    def test_import_usd_total_uses_fx(self):
+        ops = [{"operationType": "OPERATION_TYPE_INPUT", "payment": 200.0, "currency": "rub"},
+               {"instrumentUid": "uid-usd-1", "figi": None, "operationType": "OPERATION_TYPE_BUY",
+                "quantity": 2, "payment": -200.0}]
+        st = type("S", (), {"ops": lambda self, i: ops})()
+        inst = lambda c, keys: (
+            {"uid-usd-1": {"name": "Apple", "ticker": "AAPL", "type": "share", "cur": "usd"}}
+            if ("uid-usd-1", None) in set(keys) else {}
+        )
+        patches = {
+            "TInvest": lambda cfg: type("C", (), {"ready": False})(),
+            "imports_list": lambda: [{"id": "imp1", "name": "Импорт", "broker": "vtb"}],
+            "broker_of_account": lambda imp: ("vtb", "ВТБ"),
+            "store": lambda: st,
+            "instruments": inst,
+            "fifo": lambda o: {"uid-usd-1": {"qty": 2.0, "cost": 200.0, "last_unit": 100.0}},
+            "fx_now": lambda c, cs: {"rub": 1.0, "usd": 80.0},
+            "moex_quotes": lambda ids: {},
+            "mem_put": lambda k, v: v,
+        }
+        saved = {k: getattr(M, k) for k in patches}
+        for k, v in patches.items():
+            setattr(M, k, v)
+        try:
+            accs = M._list_accounts({}, ("accounts", "k"))
+        finally:
+            for k, v in saved.items():
+                setattr(M, k, v)
+        self.assertEqual(len(accs), 1)
+        self.assertAlmostEqual(accs[0]["total"], 16000.0)
+        self.assertFalse(accs[0]["empty"])
