@@ -10386,7 +10386,7 @@ def bond_card(isin):
             fsp = fl_spread_cached([isin]).get(isin)
             if fsp is None:
                 face2 = (desc or {}).get("FACEVALUE") or (me or {}).get("nominal")
-                fsp = fl_spread_put(isin, (me or {}).get("full") or (desc or {}).get("NAME") or card.get("name"),
+                fsp = fl_spread_put(isin, (me or {}).get("full") or (desc or {}).get("ISSUENAME") or card.get("name"),
                                     moex_bondization(isin), float(face2) if face2 else None, (me or {}).get("kind"))
             card["fl_spread"] = fsp
             card["fl_label"] = fl_label(fsp, True)
@@ -28829,7 +28829,7 @@ function pPos(){
 
 /* ── кредитные рейтинги ── */
 const RSC=['AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-','BB+','BB','BB-','B+','B','B-','CCC','CC','C','D'];
-const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
+const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i<0?'нет рейтинга':i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
 /* Пресс-релиз по клику на тег рейтинга: только https и хосты агентств/Telegram */
 const RT_HOSTS=['acra-ratings.ru','raexpert.ru','ratings.ru','ra-national.ru','t.me'];
 function rtSafeUrl(u){
@@ -32882,7 +32882,7 @@ function issOpen(isin){
   S.iss.sel=isin;S.iss.scroll=1;go('iss');
 }
 function issRows(d){
-  const k=S.iss.sort.k,g={name:r=>r.title,share:r=>r.share,rating:r=>r.rating?RSC.indexOf(r.rating):null,score:r=>r.score,nd_ebit:r=>r.nd_ebit,cover:r=>r.cover,eq_ratio:r=>r.eq_ratio,
+  const k=S.iss.sort.k,g={name:r=>r.title,share:r=>r.share,rating:r=>{const i=r.rating?RSC.indexOf(r.rating):-1;return i<0?null:i},score:r=>r.score,nd_ebit:r=>r.nd_ebit,cover:r=>r.cover,eq_ratio:r=>r.eq_ratio,
     signal:r=>r.market&&r.market.key?['mkt_lower','match','mkt_higher'].indexOf(r.market.key):null}[k]||(r=>r.share);
   return d.rows.slice().sort((a,b)=>{const x=g(a),y=g(b);if(typeof x==='string'||typeof y==='string')return S.iss.sort.d*String(x||'').localeCompare(String(y||''));
     if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;return S.iss.sort.d*(x-y)});
@@ -35306,7 +35306,7 @@ function bindCrp(){
   const b=document.getElementById('crp-go');if(b)b.onclick=go;
   const i=document.getElementById('crp-q');if(i){i.onkeydown=e=>{if(e.key==='Enter')go()};i.oninput=()=>{S.crp.q=i.value}}
   const m=document.getElementById('crp-my');if(m)m.onclick=()=>{loadCrpBatch(!!S.crp.batch);renderSoon()};
-  document.querySelectorAll('tr[data-crp]').forEach(tr=>{tr.style.cursor='pointer';tr.onclick=()=>{const q=tr.dataset.crp;if(q){loadCrp(q,false);renderSoon();window.scrollTo(0,0)}}});
+  document.querySelectorAll('tr[data-crp]').forEach(tr=>{tr.style.cursor='pointer';tr.onclick=()=>{const q=tr.dataset.crp;if(q){loadCrp(q,false);renderSoon();const v=$('#view');if(v)v.scrollTop=0}}});
 }
 regPage('crp',{title:'Устойчивость эмитентов',group:'Риски и контроль',icon:'<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/>',render:pCrp,bind:bindCrp,pro:true});
 /* ── Налоговая оптимизация: сбор убытков по лотам FIFO и планировщик ИИС-3 ── */
@@ -36405,7 +36405,7 @@ function pPm(){
   if(D.loading&&!D.data)return`<div class="card">${waitBox('Разбираю закрытые сделки по FIFO и моделирую призрачный портфель…')}</div>`;
   if(D.err)return`<div class="msg err">${esc(D.err)} <button class="btn ghost" id="pm-r">Повторить</button></div>`;
   const d=D.data||{},tr=d.trades||{},gh=d.ghost||{};
-  let ghostHtml='<div class="card"><h2>Призрачный портфель (те же пополнения в те же даты)</h2><div class="empty">Недостаточно истории операций или котировок бенчмарков (LQDT / TMOS).</div></div>';
+  let ghostHtml='<div class="card"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Призрачный портфель (те же пополнения в те же даты)</h2><button class="btn ghost" id="pm-r" style="margin-left:auto">Обновить</button></div><div class="empty">Недостаточно истории операций или котировок бенчмарков (LQDT / TMOS).</div></div>';
   if(gh.ok&&gh.items&&gh.items.length){
     const labs=gh.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tips=gh.days.map(dlabel);
     const ser=[{n:'Мой портфель',c:S1,v:gh.real,w:2.4}];

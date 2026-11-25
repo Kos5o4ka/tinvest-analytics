@@ -353,6 +353,24 @@ class GeminiFixesTests(unittest.TestCase):
                 bad.append(os.path.basename(p))
         self.assertEqual(bad, [], f"Найдено UTC toISOString().slice(0,10) в: {bad}")
 
+    def test_bug_ui05_misc_fixes(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        crp = open(os.path.join(root, "src/web/js/53_crp.js"), encoding="utf-8").read()
+        self.assertNotIn("window.scrollTo(0,0)", crp)
+        self.assertIn("scrollTop=0", crp)
+
+        pm = open(os.path.join(root, "src/web/js/60_pm.js"), encoding="utf-8").read()
+        self.assertGreaterEqual(pm.count('id="pm-r"'), 2)
+
+        rt = open(os.path.join(root, "src/web/js/11_ratings.js"), encoding="utf-8").read()
+        self.assertIn("i<0?'нет рейтинга'", rt)
+
+        iss = open(os.path.join(root, "src/web/js/36_issuers.js"), encoding="utf-8").read()
+        self.assertNotIn("r.rating?RSC.indexOf(r.rating):null", iss)
+
+        bc = open(os.path.join(root, "src/py/13a_bondcard.py"), encoding="utf-8").read()
+        self.assertNotIn('.get("NAME")', bc)
+
 
 if __name__ == "__main__":
     unittest.main()

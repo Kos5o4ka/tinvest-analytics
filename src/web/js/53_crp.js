@@ -107,6 +107,6 @@ function bindCrp(){
   const b=document.getElementById('crp-go');if(b)b.onclick=go;
   const i=document.getElementById('crp-q');if(i){i.onkeydown=e=>{if(e.key==='Enter')go()};i.oninput=()=>{S.crp.q=i.value}}
   const m=document.getElementById('crp-my');if(m)m.onclick=()=>{loadCrpBatch(!!S.crp.batch);renderSoon()};
-  document.querySelectorAll('tr[data-crp]').forEach(tr=>{tr.style.cursor='pointer';tr.onclick=()=>{const q=tr.dataset.crp;if(q){loadCrp(q,false);renderSoon();window.scrollTo(0,0)}}});
+  document.querySelectorAll('tr[data-crp]').forEach(tr=>{tr.style.cursor='pointer';tr.onclick=()=>{const q=tr.dataset.crp;if(q){loadCrp(q,false);renderSoon();const v=$('#view');if(v)v.scrollTop=0}}});
 }
 regPage('crp',{title:'Устойчивость эмитентов',group:'Риски и контроль',icon:'<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/>',render:pCrp,bind:bindCrp,pro:true});

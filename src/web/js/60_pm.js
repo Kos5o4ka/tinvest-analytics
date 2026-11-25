@@ -15,7 +15,7 @@ function pPm(){
   if(D.loading&&!D.data)return`<div class="card">${waitBox('Разбираю закрытые сделки по FIFO и моделирую призрачный портфель…')}</div>`;
   if(D.err)return`<div class="msg err">${esc(D.err)} <button class="btn ghost" id="pm-r">Повторить</button></div>`;
   const d=D.data||{},tr=d.trades||{},gh=d.ghost||{};
-  let ghostHtml='<div class="card"><h2>Призрачный портфель (те же пополнения в те же даты)</h2><div class="empty">Недостаточно истории операций или котировок бенчмарков (LQDT / TMOS).</div></div>';
+  let ghostHtml='<div class="card"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Призрачный портфель (те же пополнения в те же даты)</h2><button class="btn ghost" id="pm-r" style="margin-left:auto">Обновить</button></div><div class="empty">Недостаточно истории операций или котировок бенчмарков (LQDT / TMOS).</div></div>';
   if(gh.ok&&gh.items&&gh.items.length){
     const labs=gh.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tips=gh.days.map(dlabel);
     const ser=[{n:'Мой портфель',c:S1,v:gh.real,w:2.4}];

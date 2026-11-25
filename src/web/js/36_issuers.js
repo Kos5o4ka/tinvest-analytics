@@ -53,7 +53,7 @@ function issOpen(isin){
   S.iss.sel=isin;S.iss.scroll=1;go('iss');
 }
 function issRows(d){
-  const k=S.iss.sort.k,g={name:r=>r.title,share:r=>r.share,rating:r=>r.rating?RSC.indexOf(r.rating):null,score:r=>r.score,nd_ebit:r=>r.nd_ebit,cover:r=>r.cover,eq_ratio:r=>r.eq_ratio,
+  const k=S.iss.sort.k,g={name:r=>r.title,share:r=>r.share,rating:r=>{const i=r.rating?RSC.indexOf(r.rating):-1;return i<0?null:i},score:r=>r.score,nd_ebit:r=>r.nd_ebit,cover:r=>r.cover,eq_ratio:r=>r.eq_ratio,
     signal:r=>r.market&&r.market.key?['mkt_lower','match','mkt_higher'].indexOf(r.market.key):null}[k]||(r=>r.share);
   return d.rows.slice().sort((a,b)=>{const x=g(a),y=g(b);if(typeof x==='string'||typeof y==='string')return S.iss.sort.d*String(x||'').localeCompare(String(y||''));
     if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;return S.iss.sort.d*(x-y)});

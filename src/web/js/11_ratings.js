@@ -1,6 +1,6 @@
 /* ── кредитные рейтинги ── */
 const RSC=['AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-','BB+','BB','BB-','B+','B','B-','CCC','CC','C','D'];
-const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
+const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i<0?'нет рейтинга':i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
 /* Пресс-релиз по клику на тег рейтинга: только https и хосты агентств/Telegram */
 const RT_HOSTS=['acra-ratings.ru','raexpert.ru','ratings.ru','ra-national.ru','t.me'];
 function rtSafeUrl(u){
