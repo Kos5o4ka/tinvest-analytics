@@ -380,6 +380,24 @@ class Server(unittest.TestCase):
         self.assertIsNone(self.st.get(1))
         self.assertEqual(self.st.delete(1), (False, []))
 
+    def test_delete_during_quotes_race(self):
+        self.st.put(1, self.sub())
+        orig_fetch = self.ck.fetch_json
+        deleted = [False]
+
+        def racing_fetch(url):
+            if not deleted[0]:
+                deleted[0] = True
+                self.st.delete(1)
+            return orig_fetch(url)
+
+        self.ck.fetch_json = racing_fetch
+        self.ck.run_once()
+        self.assertEqual(self.nt.msgs, [])
+        self.assertEqual(self.st.sent_keys(1), [])
+        self.st.mark_sent(1, ["gy|RU000A100001|20.0"])
+        self.assertEqual(self.st.sent_keys(1), [])
+
     def test_stopped_in_bot(self):
         self.st.put(1, self.sub())
         self.db.execute("INSERT INTO meta(k, v) VALUES('alerts_stop:1', '1')")

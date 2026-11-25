@@ -476,7 +476,8 @@ class AlertStore:
     def mark_sent(self, tg_id, keys):
         now = self.clock()
         c = self.conn()
-        c.executemany("INSERT OR REPLACE INTO alert_sent(tg_id, k, t) VALUES(?,?,?)", [(tg_id, k, now) for k in keys])
+        c.executemany("INSERT OR REPLACE INTO alert_sent(tg_id, k, t) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM alert_subs WHERE tg_id=?)",
+                      [(tg_id, k, now, tg_id) for k in keys])
         c.execute("UPDATE alert_subs SET sent_n=sent_n+? WHERE tg_id=?", (len(keys), tg_id))
 
     def checked(self, tg_id):
@@ -580,9 +581,13 @@ class AlertChecker:
             need = {g["isin"] for s in subs.values() for g in s.get("goals") or []}
             q = self.quotes(need)
             for uid, sub in subs.items():
+                if not self.store.get(uid):
+                    continue
                 stats["users"] += 1
                 sent = set(self.store.sent_keys(uid))
                 for text, keys in build_messages(sub, q, today, sent):
+                    if not self.store.get(uid):
+                        break
                     try:
                         self.notifier.enqueue(uid, fit(text, TG_LIMIT - len(TG_DISCLAIMER)) + TG_DISCLAIMER)
                     except Exception as e:  # noqa: BLE001   NotifyError: лимит/notify_off/нет пользователя — попробуем в следующий раз
