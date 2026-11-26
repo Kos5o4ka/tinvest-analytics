@@ -178,7 +178,7 @@ function txDecl(d){
   const y=ys.includes(+S.tx.year)?+S.tx.year:ys[0],dc=d.decl[y];
   const csvUrl='/api/tax/decl.csv?'+new URLSearchParams({account:S.account,year:String(y)});
   const sel=`<div class="row noprint" style="margin-bottom:12px;gap:10px;align-items:flex-end;flex-wrap:wrap"><label class="field" style="max-width:200px"><span>Налоговый год</span><select class="in" onchange="S.tx.year=this.value;render()">${ys.map(v=>`<option value="${v}" ${v===y?'selected':''}>${v}</option>`).join('')}</select></label>
-    <a class="btn ghost" style="text-decoration:none" href="${csvUrl}">Скачать CSV для 3-НДФЛ</a>
+    <a class="btn ghost" style="text-decoration:none" href="${csvUrl}" download="3ndfl_${y}.csv">Скачать CSV для 3-НДФЛ</a>
     <button class="btn ghost" onclick="window.print()">Печать / PDF</button></div>`;
   const wk=w=>Object.keys(w).filter(k=>Math.abs(w[k])>0.005).map(k=>`${esc(L[k]||k)}: ${tR(w[k])}`).join('; ');
   const ii=Object.fromEntries(d.iis.map(i=>[i.id,i]));

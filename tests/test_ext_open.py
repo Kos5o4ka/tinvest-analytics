@@ -262,11 +262,10 @@ class ExtOpenTests(unittest.TestCase):
         self.assertIn("127.0.0.1", self.m._direct_block)
 
     def test_connection_test_endpoint(self):
-        r = self.m.ds_test({}, {"url": self.fk.base, "key": "z"})
+        self.set_cfg(self.fk.base, "")
+        r = self.m.ds_test({}, {"url": "http://evil.example", "key": "z"})   # адрес из формы игнорируется
         self.assertEqual((r["ok"], r["version"]), (True, "9.9"))
         self.assertEqual(self.fk.log[-1][1], "z")
-        with self.assertRaises(self.m.ApiError):
-            self.m.ds_test({}, {"url": "not a url"})
 
     def test_key_never_exposed(self):
         self.set_cfg(self.fk.base, "topsecret-key")

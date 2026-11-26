@@ -1,6 +1,6 @@
 /* ── Первичные размещения ── */
 S.pri=null;S.priNip={y:21,bucket:'AA',term:3,days:4};
-function loadPri(){api('/api/primary').then(j=>{S.pri=j;if(S.page==='pri')renderSoon()}).catch(e=>{S.pri={error:e.message,rows:[]};if(S.page==='pri')renderSoon()})}
+function loadPri(){api('/api/primary').then(j=>{S.pri=j;if(S.page==='pri')renderSoon();if(j&&j.scr_loading)setTimeout(()=>{if(S.page==='pri')loadPri()},4000)}).catch(e=>{S.pri={error:e.message,rows:[]};if(S.page==='pri')renderSoon()})}
 function priNipCell(n){
   if(!n)return'<span class="mu">—</span>';
   const bits=[];

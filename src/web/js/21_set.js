@@ -117,11 +117,10 @@ function navShowAll(){S.navHidden=[];lsSet('ta_nav_hidden','[]');renderNav();ren
 function setDsHtml(c){
   const keySet=c.secret_set&&c.secret_set.data_key;
   return stGroup('Сервер данных',
-    stRow('Адрес сервера','Пусто — сервер по умолчанию, <code>off</code> — напрямую к источникам',`<input class="in mono st-wide" id="ds-url" value="${esc(c.data_server||'')}" placeholder="сервер по умолчанию" autocomplete="off" spellcheck="false" aria-label="Адрес сервера данных">`)+
     stRow('Ключ доступа',`Выдаёт @${esc(AUTH.bot)}${keySet?' · <span class="pos">сохранён</span>, пустое поле ничего не меняет':''}`,stSecret('ds-key',keySet?'••••••••':'вставьте ключ','autocomplete="off"','Ключ доступа к серверу данных'))+
     stRow('Действия','',`<button class="btn" id="ds-save" disabled>Сохранить</button><button class="btn ghost" id="ds-test">Проверить</button>${keySet?'<button class="btn ghost danger" id="ds-clr">Удалить ключ</button>':''}`)+
     `<p class="st-line" id="ds-st">Загружаю…</p>`+
-    stMore('Что передаётся на сервер','Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через ваш сервер — быстрее и без лишних запросов к источникам. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.'),
+    stMore('Что передаётся на сервер','Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через сервер TAnalytic: он сам обновляет их раз в час, поэтому экраны открываются без ожидания источников. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.'),
     {id:'ds-card',hint:'данные рынка'});
 }
 async function dsStatus(){
@@ -136,12 +135,12 @@ async function dsStatus(){
 function bindSetDs(c,msg){
   const g=id=>document.getElementById(id);
   dsStatus();
-  const dirty=stDirty('ds-save',['ds-url','ds-key']);
-  stEnter(['ds-url','ds-key'],'ds-save');
-  const save=async()=>{const k=stSecVal('ds-key'),b={data_server:g('ds-url').value};if(k)b.data_key=k;await post('/api/config',b);
-    c.data_server=g('ds-url').value.trim();if(k)c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
-  g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Сохранено. Новые запросы пойдут '+(c.data_server.toLowerCase()==='off'?'напрямую.':'через сервер.'),1);authCheck(true);renderSettings()}catch(x){msg(x.message);dirty.upd()}};
-  g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{url:g('ds-url').value,key:g('ds-key').value});
+  const dirty=stDirty('ds-save',['ds-key']);
+  stEnter(['ds-key'],'ds-save');
+  const save=async()=>{const k=stSecVal('ds-key');if(!k)return;await post('/api/config',{data_key:k});
+    c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
+  g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Ключ сохранён.',1);authCheck(true);renderSettings()}catch(x){msg(x.message);dirty.upd()}};
+  g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{key:g('ds-key').value});
     msg(`Сервер работает: версия ${r.version}, записей в кэше ${r.cache_items}.`,1)}catch(x){msg(x.message)}finally{b.disabled=false}};
   if(g('ds-clr'))g('ds-clr').onclick=async()=>{try{if(!confirm('Удалить сохранённый ключ сервера данных?'))return;await post('/api/config',{clear_data_key:true});authCheck(true);c.secret_set=Object.assign({},c.secret_set,{data_key:false});renderSettings()}catch(x){msg(x.message)}};
 }

@@ -121,6 +121,21 @@ class EnvTokenNotSaved(unittest.TestCase):
         self.assertEqual(disk.get("theme"), "dark")
         self.assertEqual(demo_calls, [])
 
+    def test_env_token_only_in_secret_key(self):
+        """Токен из env живёт только под ключом token (SECRET_KEYS): GET /api/config и бэкап его не увидят."""
+        old_env = os.environ.get("TINVEST_TOKEN")
+        os.environ["TINVEST_TOKEN"] = "t.ENV_SECRET_XYZ"
+        try:
+            cfg = M.load_config()
+        finally:
+            if old_env is None:
+                os.environ.pop("TINVEST_TOKEN", None)
+            else:
+                os.environ["TINVEST_TOKEN"] = old_env
+        self.assertEqual(cfg["token"], "t.ENV_SECRET_XYZ")
+        pub = {k: v for k, v in cfg.items() if k not in M.SECRET_KEYS}
+        self.assertNotIn("t.ENV_SECRET_XYZ", json.dumps(pub, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     unittest.main()

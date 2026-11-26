@@ -232,11 +232,8 @@ class Handler(BaseHTTPRequestHandler):
                         hosts = [str(h).strip() for h in body[k] if str(h).strip()]
                         if hosts:
                             cfg[k] = hosts
-                if "data_server" in body:
-                    u = str(body["data_server"]).strip().rstrip("/")
-                    if u and u.lower() != "off" and not re.fullmatch(r"https?://[^/\s]+(/[^\s]*)?", u):
-                        raise ApiError("Адрес сервера данных должен начинаться с http:// или https://", 400)
-                    cfg["data_server"] = u
+                if str(cfg.get("data_server") or "").strip().lower() == "off":
+                    cfg["data_server"] = ""         # «off» из прежних версий: сервер данных теперь не отключается
                 if body.get("data_key"):
                     cfg["data_key"] = "".join(str(body["data_key"]).split())
                 if body.get("clear_data_key"):
@@ -245,7 +242,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError("Файл сертификата не найден: " + cfg["ca_file"], 400)
                 save_config(cfg)
                 ds_reset()
-                mem_clear()
+                mem_clear(persist=False)        # сохранённые отчёты привязаны к токену (token_key): настройки их не портят
                 return self.send(200, {"ok": True})
             if path == "/api/ratings/refresh":
                 return self.send(200, {"started": ratings_start(force=True), **ratings_status()})

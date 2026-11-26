@@ -78,11 +78,11 @@ class Upstream:
 class Fx:
     """Поднимает фейковый источник и сервер данных на случайных портах."""
 
-    def __init__(self, key="", clock=None, keys_db=""):
+    def __init__(self, key="", clock=None, keys_db="", ttl=100):
         self.up = Upstream()
         self.tmp = tempfile.mkdtemp(prefix="tsrv_")
         self.now = [1_000_000.0]
-        rules = [(self.up.host, ".*", 100, 100)]
+        rules = [(self.up.host, ".*", ttl, ttl)]
         self.app = ts.DataServer(self.tmp, key=key, clock=clock or (lambda: self.now[0]), extra_allow=[self.up.host],
                                  rates={"*": 1000}, rules=rules, keys_db=keys_db, bot="@testbot")
         self.http = ts.make_http_server(self.app, "127.0.0.1", 0)
@@ -250,6 +250,77 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(a.ttl_for("bo.nalog.gov.ru", "https://bo.nalog.gov.ru/nbo/x", "GET", mon), 7 * 86400)
         self.assertIsNone(a.ttl_for("iss.moex.com", "https://iss.moex.com/iss/x", "POST", mon))
         self.assertEqual(a.ttl_for("raexpert.ru", "https://raexpert.ru/search/", "POST", mon), 12 * 3600)
+
+
+class WarmTests(unittest.TestCase):
+    """Фоновое обновление кэша раз в час, отдача просроченной долгоживущей копии сразу и удаление устаревшего."""
+
+    def setUp(self):
+        self.f = Fx(ttl=6 * 3600)
+
+    def tearDown(self):
+        self.f.close()
+
+    def wait_hits(self, n):
+        for _ in range(200):
+            if self.f.up.hits >= n:
+                return
+            time.sleep(0.01)
+
+    def test_refresh_once_renews_recently_used_before_expiry(self):
+        u = self.f.up.url("/a")
+        self.f.call(u)                                       # hit1, истекает через 6 ч
+        self.f.now[0] += 5.5 * 3600                          # до истечения меньше часа
+        st = self.f.app.refresh_once()
+        self.assertEqual((st["candidates"], st["refreshed"]), (1, 1))
+        self.f.now[0] += 3600                                # старая копия уже истекла бы — отдаётся обновлённая без похода к источнику
+        st2, body, h = self.f.call(u)
+        self.assertEqual((body, h["X-Cache"], self.f.up.hits), (b"hit2", "hit", 2))
+
+    def test_refresh_keeps_access_time_so_unused_entries_die(self):
+        u = self.f.up.url("/a")
+        self.f.call(u)
+        for _ in range(4):                                   # клиент больше не приходит: обновляем, пока запрос «свежий»
+            self.f.now[0] += 6 * 3600
+            self.f.app.refresh_once()
+        self.assertEqual(self.f.app.cache.count(), 1)
+        self.f.now[0] += 3 * 86400                           # не запрашивали > WARM_SINCE: не обновляем, а просроченное > 2 суток удаляем
+        st = self.f.app.refresh_once()
+        self.assertEqual((st["candidates"], st["purged"]), (0, 1))
+        self.assertEqual(self.f.app.cache.count(), 0)
+
+    def test_expired_long_ttl_served_instantly_and_revalidated(self):
+        u = self.f.up.url("/a")
+        self.f.call(u)
+        self.f.up.delay = 0.3
+        self.f.now[0] += 7 * 3600                            # истекло час назад
+        t0 = time.time()
+        st, body, h = self.f.call(u)
+        self.assertLess(time.time() - t0, 0.25)              # клиент не ждёт источник
+        self.assertEqual((body, h["X-Cache"]), (b"hit1", "stale"))
+        self.wait_hits(2)
+        for _ in range(100):
+            if not self.f.app._bg_keys:
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.f.call(u)[1], b"hit2")
+
+    def test_short_ttl_not_served_stale_or_warmed(self):
+        f = Fx(ttl=100)
+        try:
+            u = f.up.url("/a")
+            f.call(u)
+            f.now[0] += 150
+            self.assertEqual(f.call(u)[2]["X-Cache"], "miss")  # котировки: только свежие
+            f.now[0] += 60
+            self.assertEqual(f.app.refresh_once()["refreshed"], 0)
+        finally:
+            f.close()
+
+    def test_post_and_cookie_requests_not_warmed(self):
+        self.f.call(self.f.up.url("/p"), data=b"x")
+        self.f.now[0] += 6 * 3600
+        self.assertEqual(self.f.app.refresh_once()["candidates"], 0)
 
 
 class BlockTests(unittest.TestCase):

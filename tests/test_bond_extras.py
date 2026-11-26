@@ -198,6 +198,24 @@ class PortfolioConcentration(Patch):
         self.assertAlmostEqual(c["max_issuer_share"], 10.0)
         self.assertEqual(c["warnings"], [])
 
+    def test_share_and_bond_of_one_issuer_merge_and_ofz_not_warned(self):
+        self.patch(tcat_info=lambda isin: None, best_rating=lambda isin, name: None)
+        rows = [
+            {"type": "bond", "uid": "b1", "isin": "SU26238RMFS4", "name": "ОФЗ 26238", "cur": "rub", "value_rub": 60000.0},
+            {"type": "bond", "uid": "b2", "isin": "RU000A10SB51", "name": "Сбербанк Sb51R", "cur": "rub", "value_rub": 10000.0},
+            {"type": "share", "uid": "s1", "name": "Сбербанк России ПАО ао", "cur": "rub", "value_rub": 8000.0},
+            {"type": "share", "uid": "s2", "name": "НК ЛУКОЙЛ (ПАО) - ао", "cur": "rub", "value_rub": 11000.0},
+            {"type": "bond", "uid": "b3", "isin": "RU000A10LK01", "name": "ЛУКОЙЛ БО-1", "cur": "rub", "value_rub": 11000.0},
+        ]
+        c = T.portfolio_concentration(rows)
+        names = {x["name"]: round(x["share"], 1) for x in c["issuers"]}
+        self.assertEqual(names, {"Минфин (ОФЗ)": 60.0, "ЛУКОЙЛ": 22.0, "Сбербанк": 18.0})
+        self.assertAlmostEqual(c["max_issuer_share"], 22.0)           # без ОФЗ
+        self.assertEqual(c["max_issuer"], "ЛУКОЙЛ")
+        iw = [w for w in c["warnings"] if w["kind"] == "issuer"]
+        self.assertEqual(len(iw), 1)
+        self.assertIn("ЛУКОЙЛ", iw[0]["detail"])
+
 
 class OfferAmortRadar(Patch):
     TODAY = "2026-11-01"

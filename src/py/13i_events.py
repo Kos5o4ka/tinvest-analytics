@@ -292,24 +292,33 @@ def events_payload(cfg, acc, q):
                 return out
             except Exception:  # noqa: BLE001
                 return []
-        have_am = {(e["isin"], e["date"]) for e in events if e["kind"] == "amort"}
-        have_cp = {(e["isin"], e["date"]) for e in events if e["kind"] == "coupon"}
+        # даты у брокера и на MOEX могут расходиться на пару дней (перенос с выходных): одна выплата — одно событие
+        have = defaultdict(list)
+        for e in events:
+            if e["kind"] in ("amort", "coupon") and e.get("isin"):
+                have[(e["kind"], e["isin"])].append(e["date"])
+
+        def _dup(kind, isin, d):
+            dd = datetime.strptime(d, "%Y-%m-%d")
+            return any(abs((datetime.strptime(x, "%Y-%m-%d") - dd).days) <= 3 for x in have[(kind, isin)])
         extra = [item for lst in pool_map(one, rows, workers=8) for item in lst]
         need_fx = {cur for _, cur in extra if cur and cur != "rub"}
         rates = fx_now(TInvest(cfg) if cfg.get("hosts_prod") else type("_C", (), {"ready": False})(), need_fx) if need_fx else {}
+        no_fx = set()
         for e, cur in extra:
-            key = (e["isin"], e["date"])
-            if e["kind"] == "amort":
-                if key in have_am:
+            if e["kind"] in ("amort", "coupon"):
+                if _dup(e["kind"], e["isin"], e["date"]):
                     continue
-                have_am.add(key)
-            elif e["kind"] == "coupon":
-                if key in have_cp:
-                    continue
-                have_cp.add(key)
+                have[(e["kind"], e["isin"])].append(e["date"])
             if e.get("amount") is not None:
-                e["amount"] = round(cur_to_rub(e["amount"], cur, rates), 2)
+                rub = cur_to_rub(e["amount"], cur, rates, default=None)
+                if rub is None:                     # без курса ЦБ сумму не показываем, чем считать валюту рублями
+                    no_fx.add((cur or "").upper())
+                    e["note"] = (e.get("note") or "") + " (нет курса %s)" % (cur or "").upper()
+                e["amount"] = round(rub, 2) if rub is not None else None
             events.append(e)
+        if no_fx:
+            warn.append("Нет курса ЦБ для %s: суммы валютных выплат не показаны." % ", ".join(sorted(no_fx)))
     except Exception as e:  # noqa: BLE001
         src["portfolio"] = False
         warn.append("Выплаты и оферты по портфелю не загружены: %s" % str(e)[:140])

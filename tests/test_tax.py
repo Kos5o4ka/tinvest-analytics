@@ -528,6 +528,14 @@ class FifoShortsAndEpsilon(unittest.TestCase):
         an = M.analyze([s, b], {}, "all", 0)
         self.assertAlmostEqual(an["life"].get("realized", 0.0), 100.0, places=6)
 
+    def test_short_covered_by_securities_input_realizes_result(self):
+        s = sell("2025-01-10", 10, 100)
+        si = op("2025-02-10", "INPUT_SECURITIES", 0.0, 10, price=90)
+        self.assertEqual(M.fifo([s, si]), {})
+        self.assertAlmostEqual(si["_yield"], 100.0, places=9)
+        an = M.analyze([s, si], {}, "all", 0)
+        self.assertAlmostEqual(an["life"].get("realized", 0.0), 100.0, places=6)
+
 
 class NdflDeclarationPackage(unittest.TestCase):
     def test_decl_fx_payouts_and_cbr_conversion(self):

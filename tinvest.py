@@ -1206,27 +1206,40 @@ def run_webshell(args, no_update, demo=""):
         return None
 
 
+APP_START_GRACE = 20        # сек: падение новой версии раньше этого срока считаем сбоем запуска и пробуем .bak
+
+
 def _exec_app(args, result):
+    """Выполняет APP; если новой версии нет или она упала при запуске (не Ctrl+C и не позже, после работы),
+    один раз запускает предыдущую из .bak."""
     import runpy, traceback
     bak = APP + ".bak"
     path = APP if os.path.exists(APP) else bak
+    t0 = time.time()
     sys.argv = [path] + args
     try:
         runpy.run_path(path, run_name="__main__")
+        return
     except SystemExit as e:
         result["code"] = e.code if isinstance(e.code, int) else 1
-    except BaseException:
-        if path == APP and os.path.exists(bak):
-            try:
-                sys.argv = [bak] + args
-                runpy.run_path(bak, run_name="__main__")
-                return
-            except SystemExit as e:
-                result["code"] = e.code if isinstance(e.code, int) else 1
-                return
-            except BaseException:
-                pass
-        result["err"] = traceback.format_exc().strip().splitlines()[-1]
+        return
+    except KeyboardInterrupt:
+        result["code"] = 130
+        return
+    except Exception:  # noqa: BLE001
+        err = traceback.format_exc().strip().splitlines()[-1]
+        if path != APP or not os.path.exists(bak) or time.time() - t0 > APP_START_GRACE:
+            result["err"] = err
+            return
+    sys.argv = [bak] + args
+    try:
+        runpy.run_path(bak, run_name="__main__")
+    except SystemExit as e:
+        result["code"] = e.code if isinstance(e.code, int) else 1
+    except KeyboardInterrupt:
+        result["code"] = 130
+    except Exception:  # noqa: BLE001
+        result["err"] = err
 
 
 def start_app(args):

@@ -15,9 +15,12 @@ def mem_put(key, val):
     return val
 
 
-def mem_clear():
+def mem_clear(persist=True):
+    """Сбрасывает кэш в памяти; persist=True — ещё и сохранённые результаты отчётов (после смены данных счетов)."""
     with _mem_lock:
         _mem.clear()
+    if not persist:
+        return
     try:
         store().write("DELETE FROM kv WHERE k LIKE 'res:%'")
     except Exception:  # noqa: BLE001

@@ -193,8 +193,12 @@ class AuthClientTests(unittest.TestCase):
         os.environ["TINVEST_DATA_SERVER"] = ""
         self.set_cfg("", "")
         self.assertEqual(self.m.ds_conf()[0], self.m.DS_DEFAULT)
-        self.set_cfg("off", "")
+        self.set_cfg("off", "")                         # «off» из старых настроек сервер больше не отключает
+        self.assertEqual(self.m.ds_conf()[0], self.m.DS_DEFAULT)
+        os.environ["TINVEST_DATA_SERVER"] = "off"         # отключить можно только переменной окружения (разработка, тесты)
+        self.m.ds_reset()
         self.assertEqual(self.m.ds_conf()[0], "")
+        os.environ["TINVEST_DATA_SERVER"] = ""
 
 
 if __name__ == "__main__":

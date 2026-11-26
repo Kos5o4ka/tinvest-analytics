@@ -196,8 +196,9 @@ class WatchSyncTests(unittest.TestCase):
         ])
         sent_revs = []
         responses = [
-            {"ok": True, "bot_goals_rev": 1, "goals": [{"isin": "RU000A107HG1", "target_price": 97.0}], "counts": {"goals": 1}},
-            {"ok": True, "bot_goals_rev": 2, "goals": [], "counts": {"goals": 0}},
+            {"ok": True, "bot_goals_rev": 1, "goals": [{"isin": "RU000A107HG1", "target_price": 97.0}],
+             "bot_deleted": ["RU000A108EF2"], "counts": {"goals": 1}},
+            {"ok": True, "bot_goals_rev": 2, "goals": [], "bot_deleted": ["RU000A107HG1"], "counts": {"goals": 0}},
         ]
 
         def fake_req(path, body=None, timeout=20):
@@ -225,6 +226,27 @@ class WatchSyncTests(unittest.TestCase):
             M.tg_srv_req = orig_req
 
         self.assertEqual(sent_revs, [0, 1])
+
+    def test_tg_srv_sync_keeps_goals_missing_in_reply(self):
+        """Бумага, которой нет в ответе сервера, но не удалённая в боте, сохраняет цели; при выключенном
+        наблюдении (программа не шлёт цели) ответ сервера целей не трогает."""
+        st = M.store()
+        base = [{"isin": "RU000A107HG1", "added": "2026-10-01", "target_yield": 18.0},
+                {"isin": "RU000A108EF2", "added": "2026-10-01", "target_price": 99.0}]
+        reply = {"ok": True, "bot_goals_rev": 1, "goals": [], "counts": {"goals": 0}}
+        orig_req = M.tg_srv_req
+        M.tg_srv_req = lambda path, body=None, timeout=20: (200, dict(reply))
+        try:
+            for cfg in ({"tg_server": True, "tg_enabled": True},
+                        {"tg_server": True, "tg_enabled": True, "tg_on_watch": False}):
+                st.put(M.WATCH_KEY, [dict(x) for x in base])
+                st.put(M.TG_SRV_KEY, {})
+                M._tg_srv_sync(cfg, {}, force=True)
+                items = {x["isin"]: x for x in st.get(M.WATCH_KEY)}
+                self.assertEqual(items["RU000A107HG1"]["target_yield"], 18.0)
+                self.assertEqual(items["RU000A108EF2"]["target_price"], 99.0)
+        finally:
+            M.tg_srv_req = orig_req
 
 
 if __name__ == "__main__":

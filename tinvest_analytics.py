@@ -343,10 +343,8 @@ def load_config():
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
-    env_tok = os.environ.get("TINVEST_TOKEN")
-    if env_tok:
-        cfg["_env_token"] = env_tok
-        cfg["token"] = env_tok
+    if os.environ.get("TINVEST_TOKEN"):
+        cfg["token"] = os.environ["TINVEST_TOKEN"]
     return cfg
 
 
@@ -360,7 +358,7 @@ def make_backup():
             src.backup(dst)
         dst.close()
         src.close()
-        cfg = {k: v for k, v in load_config().items() if k not in SECRET_KEYS and k != "_env_token"}     # токен и прочие секреты не входят
+        cfg = {k: v for k, v in load_config().items() if k not in SECRET_KEYS}     # токен и прочие секреты не входят
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(tmp, "data.db")
@@ -377,9 +375,9 @@ def make_backup():
 
 def save_config(cfg):
     out = dict(cfg)
-    env_tok = out.pop("_env_token", None)
+    env_tok = os.environ.get("TINVEST_TOKEN")      # токен из окружения на диск не пишем: оставляем сохранённый там
     with _cfg_lock:
-        if env_tok is not None and out.get("token") == env_tok:
+        if env_tok and out.get("token") == env_tok:
             disk_tok = ""
             try:
                 with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -1320,7 +1318,7 @@ def fifo(ops):
                 left_buy -= take
                 if s[0] <= 1e-9:
                     p["shorts"].pop(0)
-            if k == "buy" and q - left_buy > 1e-9:
+            if q - left_buy > 1e-9:                 # закрытие шорта покупкой или зачислением бумаг
                 o["_yield"] = short_yld
             if left_buy > 1e-9:
                 p["lots"].append([left_buy, unit])
@@ -1380,7 +1378,10 @@ def analyze(ops, names, period, portfolio_value):
                 entries.append(("realized", ycur, yld))
         elif kind == "sell":
             entries += [("sell_turnover", cur, abs(pay)), ("realized", ycur, yld)]
-        elif kind not in ("other", "sec_in", "sec_out", "conv_in", "conv_out"):
+        elif kind == "sec_in":
+            if yld:
+                entries.append(("realized", ycur, yld))
+        elif kind not in ("other", "sec_out", "conv_in", "conv_out"):
             entries.append((kind, cur, -pay if kind in FLIP else pay))
         if kind in ("buy", "sell") and comm and o.get("_acc") not in accs_with_broker_ops:
             entries.append(("fee_broker", ccur, -comm if comm < 0 else comm))
@@ -2319,7 +2320,7 @@ def bonds_report(client, rows, horizon_days=365):
     for r, cp in zip(need, pool_map(lambda r: moex_coupon_schedule(bond_isin(r)), need)):
         if cp:
             infos[r["uid"]] = dict(infos[r["uid"]], coupons=cp)
-    out, pays = [], []
+    out, pays, fx_miss = [], [], set()
     tot_bonds = sum((r["value_rub"] or 0) for r in bonds) or 0.0
     rates = fx_now(client, {(infos.get(r["uid"]) or {}).get("cur", "rub") for r in bonds} | {r["cur"] for r in bonds})
     exacts = dict(zip([r["uid"] for r in bonds], pool_map(
@@ -2404,7 +2405,10 @@ def bonds_report(client, rows, horizon_days=365):
             kinds["С амортизацией"] += 1
         known = [p for _, p in b.get("coupons") or [] if p]
         fc_ = (b.get("cur") or "rub").lower()
-        k_ = cur_to_rub(1.0, fc_, rates)                            # выплаты считаем в рублях по текущему курсу номинала
+        k_ = cur_to_rub(1.0, fc_, rates, default=None)              # выплаты считаем в рублях по текущему курсу номинала
+        if k_ is None:                                              # без курса ЦБ валютные выплаты не считаем рублями 1:1
+            fx_miss.add(fc_.upper())
+            k_ = 0.0
         fest = (ex or {}).get("est_detail") or {}
         for d, p in b.get("coupons") or []:
             if today <= d <= horizon:
@@ -2481,7 +2485,7 @@ def bonds_report(client, rows, horizon_days=365):
             if d and today <= d <= horizon and amt:               # выплата в валюте — переводим в рубли по текущему курсу
                 pays.append({"date": d, "kind": "dividend", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
                              "amount": amt, "est": False, "cur": dc})
-    pays.sort(key=lambda p: p["date"])
+    pays = sorted((p for p in pays if p["amount"]), key=lambda p: p["date"])
     irr = portfolio_irr(irr_items, today)
     metrics = {"count": len(bonds), "value": tot_bonds,
                "ytm": w["ytm"] / w["ytm_v"] if w["ytm_v"] else None,
@@ -2502,12 +2506,40 @@ def bonds_report(client, rows, horizon_days=365):
         if x.get("call") and x.get("call") > today and "call_kind" not in x:
             x["call_kind"] = ckind.get(x.get("uid"))
     return {"rows": out, "metrics": metrics, "ladder": sorted(ladder.items()), "risk": sorted(risk.items(), key=lambda x: -x[1]),
-            "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays,
+            "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays, "fx_missing": sorted(fx_miss),
             "ratings": apply_ratings(out), "ratings_info": ratings_status(),
-            "radar": offer_amort_radar(client, bonds, today, horizon_days=60, infos=infos, exacts=exacts, rates=rates)}
+            "radar": _radar_safe(client, bonds, today, infos, exacts, rates)}
+
+
+def _radar_safe(client, bonds, today, infos, exacts, rates):
+    try:
+        return offer_amort_radar(client, bonds, today, horizon_days=60, infos=infos, exacts=exacts, rates=rates)
+    except Exception:  # noqa: BLE001
+        return {"today": today, "horizon_days": 60, "items": [], "counts": {"blind_put": 0, "coupon_cut": 0, "amort": 0, "total": 0}}
 
 
 CONC_THRESHOLDS = {"issuer": 15.0, "sector": 35.0, "below_a_minus": 30.0}
+
+
+_CONC_FORM_RX = re.compile(r"\((?:ПАО|АО|ОАО|ЗАО)\)|(?<![\w-])(?:ПАО|МКПАО|ОАО|ЗАО|АО|НК|ГК|России|ао|ап|-)(?![\w-])")
+
+
+_CONC_SERIES_RX = re.compile(r"^(?:\d+[\w-]*[PРRСC-][\w-]*|[A-Za-z]{1,3}\d[\w-]*|БО-[\w-]+|\d{3,}[\w-]*)$")
+
+
+def _conc_issuer(name):
+    """(ключ, название) эмитента для концентрации: акции «Сбербанк России ПАО ао» и облигации «Сбербанк Sb51R»
+    сходятся к одному «Сбербанк»; серии выпусков и правовые формы в названии не показываем."""
+    clean = re.sub(r"\s+", " ", _CONC_FORM_RX.sub(" ", name or "")).strip(" -")
+    key = issuer_group_key(clean or name) or (name or "").lower()
+    if key == "минфин":
+        return key, "Минфин (ОФЗ)"
+    words = []
+    for w in clean.split():
+        if w.upper() in ("БО", "ПБО", "КО", "СО") or _CONC_SERIES_RX.match(w):
+            break                                   # дальше — номер выпуска: «2P-12», «Sb51R», «БО 001P-09»
+        words.append(w)
+    return key, " ".join(words) or clean or name
 
 
 def portfolio_concentration(rows):
@@ -2550,9 +2582,8 @@ def portfolio_concentration(rows):
                 cat = None
 
         name = (r.get("name") or (cat or {}).get("name") or r.get("ticker") or r.get("uid") or "").strip()
-        ikey = issuer_group_key(name) or name.lower()
+        ikey, disp = _conc_issuer(name)
         if ikey not in issuers:
-            disp = "Минфин (ОФЗ)" if ikey == "минфин" else name
             issuers[ikey] = {"key": ikey, "name": disp, "value_rub": 0.0, "count": 0}
         issuers[ikey]["value_rub"] += v
         issuers[ikey]["count"] += 1
@@ -2578,7 +2609,8 @@ def portfolio_concentration(rows):
     iss_list = sorted(issuers.values(), key=lambda x: -x["value_rub"])
     for x in iss_list:
         x["share"] = x["value_rub"] / total * 100.0
-    max_iss = iss_list[0]["share"] if iss_list else 0.0
+    corp = [x for x in iss_list if x["key"] != "минфин"]     # ОФЗ — госдолг: кредитным риском эмитента не считаем
+    max_iss = corp[0]["share"] if corp else 0.0
     top3 = sum(x["share"] for x in iss_list[:3])
 
     sec_list = [{"key": k, "value_rub": val, "share": val / total * 100.0}
@@ -2590,8 +2622,8 @@ def portfolio_concentration(rows):
     unrated_pct = unrated_rub / total * 100.0
 
     warnings = []
-    if max_iss > CONC_THRESHOLDS["issuer"] and iss_list:
-        top_i = iss_list[0]
+    if max_iss > CONC_THRESHOLDS["issuer"] and corp:
+        top_i = corp[0]
         warnings.append({"kind": "issuer", "severity": "high" if max_iss > 25.0 else "warn",
                          "title": "Концентрация на эмитенте",
                          "detail": "%s — %.1f%% портфеля (порог %.0f%%)" % (top_i["name"], max_iss, CONC_THRESHOLDS["issuer"]),
@@ -2610,7 +2642,7 @@ def portfolio_concentration(rows):
                          "value": below_pct, "threshold": CONC_THRESHOLDS["below_a_minus"]})
 
     return {"total": total, "issuers": iss_list[:10], "issuers_count": len(iss_list),
-            "max_issuer_share": max_iss, "top3_share": top3,
+            "max_issuer_share": max_iss, "max_issuer": corp[0]["name"] if corp else None, "top3_share": top3,
             "sectors": sec_list, "currencies": cur_list,
             "below_a_minus": {"value_rub": below_rub, "share": below_pct, "count": below_cnt},
             "unrated_bonds": {"value_rub": unrated_rub, "share": unrated_pct, "count": unrated_cnt},
@@ -2624,9 +2656,10 @@ def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exa
     end_date = (t_dt + timedelta(days=horizon_days)).isoformat()
     items = []
 
-    for r in (rows or []):
+    def one(r):
         if r.get("type") != "bond" or (r.get("qty") or 0) <= 0:
-            continue
+            return []
+        its = []
         uid = r.get("uid") or ""
         isin = (r.get("isin") or "").upper()
         if not isin:
@@ -2732,7 +2765,7 @@ def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exa
 
             if kind:
                 days_left = (datetime.strptime(od, "%Y-%m-%d").date() - t_dt).days
-                items.append({
+                its.append({
                     "kind": kind, "date": od, "days_left": days_left,
                     "isin": isin, "ticker": ticker, "name": name,
                     "value_rub": r.get("value_rub"),
@@ -2741,7 +2774,7 @@ def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exa
                 })
 
         fc = ((b or {}).get("cur") or r.get("cur") or "rub").lower()
-        k_ = 1.0 if fc == "rub" else ((rates or {}).get(fc) or 1.0)
+        k_ = cur_to_rub(1.0, fc, rates or {}, default=None)          # без курса сумму в рублях не показываем
         for a in (bz or {}).get("amort") or []:
             ad = (a.get("amortdate") or "")[:10]
             av = float(a.get("value") or 0.0)
@@ -2753,13 +2786,23 @@ def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exa
             if not mat and aprc is not None and float(aprc) >= 100.0 - 1e-6:
                 continue
             days_left = (datetime.strptime(ad, "%Y-%m-%d").date() - t_dt).days
-            items.append({
+            its.append({
                 "kind": "amort", "date": ad, "days_left": days_left,
                 "isin": isin, "ticker": ticker, "name": name,
                 "value": av, "valueprc": float(aprc) if aprc is not None else None,
-                "amount_rub": av * float(r.get("qty") or 0) * k_,
+                "amount_rub": av * float(r.get("qty") or 0) * k_ if k_ is not None else None,
                 "value_rub": r.get("value_rub"),
             })
+        return its
+
+    def safe(r):
+        try:
+            return one(r)
+        except Exception:  # noqa: BLE001   сбой данных одной бумаги не роняет весь отчёт
+            return []
+    # бумаги независимы, а без кэша по каждой идут запросы к MOEX — считаем параллельно
+    for its in pool_map(safe, list(rows or []), workers=8):
+        items.extend(its or [])
 
     items.sort(key=lambda x: (x["date"], x["kind"], x["name"]))
     counts = {"blind_put": 0, "coupon_cut": 0, "amort": 0}
@@ -6022,9 +6065,12 @@ def mem_put(key, val):
     return val
 
 
-def mem_clear():
+def mem_clear(persist=True):
+    """Сбрасывает кэш в памяти; persist=True — ещё и сохранённые результаты отчётов (после смены данных счетов)."""
     with _mem_lock:
         _mem.clear()
+    if not persist:
+        return
     try:
         store().write("DELETE FROM kv WHERE k LIKE 'res:%'")
     except Exception:  # noqa: BLE001
@@ -6372,11 +6418,11 @@ def warmup_start():
             pass
     threading.Thread(target=job, daemon=True, name="warmup").start()
 # ═══════════════ единая точка исходящих запросов за ПУБЛИЧНЫМИ данными (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО, логотипы) ═══════════════
-# Если задан «сервер данных» (настройки или TINVEST_DATA_SERVER / TINVEST_DATA_KEY), запрос идёт через него:
+# Публичные данные идут через сервер данных (DS_DEFAULT; для разработки и тестов — TINVEST_DATA_SERVER / TINVEST_DATA_KEY):
 # GET|POST {сервер}/v1/fetch?url=... Сервер кэширует ответы и сам ходит к источникам. При любой неудаче сервера
 # (нет связи, таймаут, 5xx, 401/403) запрос выполняется напрямую, а сервер на 5 минут считается недоступным.
 # Сервер по умолчанию — DS_DEFAULT; он требует личный ключ из Telegram-бота (7 дней), см. «вход по ключу» ниже
-# (/api/auth/*). «off» в настройках или в TINVEST_DATA_SERVER отключает сервер совсем (запросы идут напрямую).
+# (/api/auth/*). В интерфейсе адрес не меняется; «off» в TINVEST_DATA_SERVER (разработка) отключает сервер совсем.
 # API Т-Инвестиций сюда НЕ входит: он всегда идёт напрямую, токен на сервер данных не передаётся. Уведомления Telegram — отдельный вызов POST /v1/notify (13j_watch.py).
 
 EXT_UA = {"User-Agent": "Mozilla/5.0 (compatible; tinvest-analytics)"}
@@ -6407,7 +6453,11 @@ def ds_conf():
         cfg = load_config()
     except Exception:  # noqa: BLE001
         cfg = {}
-    url = str(cfg.get("data_server") or os.environ.get("TINVEST_DATA_SERVER") or DS_DEFAULT).strip().rstrip("/")
+    # адрес в config.json учитывается, только если это URL (ручная правка для своего сервера); старое «off» из прежних
+    # версий настроек больше не отключает сервер — данные рынка всегда берутся с сервера по умолчанию
+    own = str(cfg.get("data_server") or "").strip()
+    url = (own if re.match(r"https?://[^/\s]+", own) else
+           os.environ.get("TINVEST_DATA_SERVER") or DS_DEFAULT).strip().rstrip("/")
     key = str(cfg.get("data_key") or os.environ.get("TINVEST_DATA_KEY") or "").strip()
     if not re.match(r"https?://[^/\s]+", url):          # в т.ч. «off»: сервер отключён
         url = ""
@@ -6674,10 +6724,10 @@ def ds_get(cfg, acc, q, force):
 
 def ds_test(cfg, body):
     """Проверка сервера: GET /v1/health. Поля url/key из формы; пустой ключ = сохранённый."""
-    url = str(body.get("url") or "").strip().rstrip("/") or ds_conf()[0]
+    url = ds_conf()[0]
     key = str(body.get("key") or "").strip() or ds_conf()[1]
     if not re.match(r"https?://[^/\s]+", url):
-        raise ApiError("Укажите адрес сервера, например https://data.example.ru", 400)
+        raise ApiError("Сервер данных отключён (TINVEST_DATA_SERVER=off).", 400)
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key
@@ -9168,6 +9218,28 @@ def primary_nip_for(row, screener=None, rusfar=None, freeze_days=4):
             "freeze_cost_pct": freeze_pct, "freeze_drag_bp": freeze_drag_bp, "net_nip_bp": net_nip_bp}
 
 
+_pri_scr_state = {"th": None, "t": 0.0}
+
+
+def _pri_scr_kick():
+    """Запускает фоновую загрузку скринера (не чаще раза в 2 минуты). -> True, пока загрузка идёт."""
+    def run():
+        try:
+            screener_payload()
+        except Exception:  # noqa: BLE001
+            pass
+    with _rt_lock:
+        th = _pri_scr_state["th"]
+        if th is not None and th.is_alive():
+            return True
+        if time.time() - _pri_scr_state["t"] < 120:
+            return False
+        _pri_scr_state["t"] = time.time()
+        th = _pri_scr_state["th"] = threading.Thread(target=run, daemon=True)
+    th.start()
+    return True
+
+
 def primary_payload():
     cal_error = None
     try:
@@ -9175,12 +9247,9 @@ def primary_payload():
     except Exception as e:  # noqa: BLE001
         rows, cal_error = [], str(e)[:200]      # без календаря экран всё равно показывает размещения Мосбиржи и калькулятор
     scr = _scr.get("rows") or []
+    scr_loading = False
     if not scr:
-        try:
-            screener_payload()
-            scr = _scr.get("rows") or []
-        except Exception:  # noqa: BLE001
-            scr = []
+        scr_loading = _pri_scr_kick()       # скринер нужен для медиан по рейтингу: грузим в фоне, экран не ждёт
     rusfar = None
     try:
         kr = key_rate_series()
@@ -9210,7 +9279,8 @@ def primary_payload():
         primary_snapshot(out_rows)
     except Exception:  # noqa: BLE001
         pass
-    return {"rows": out_rows, "updated": _pri["t"], "rusfar": rusfar, "peer_medians": peer_med, "cal_error": cal_error}
+    return {"rows": out_rows, "updated": _pri["t"], "rusfar": rusfar, "peer_medians": peer_med, "cal_error": cal_error,
+            "scr_loading": scr_loading}
 
 
 
@@ -15051,24 +15121,33 @@ def events_payload(cfg, acc, q):
                 return out
             except Exception:  # noqa: BLE001
                 return []
-        have_am = {(e["isin"], e["date"]) for e in events if e["kind"] == "amort"}
-        have_cp = {(e["isin"], e["date"]) for e in events if e["kind"] == "coupon"}
+        # даты у брокера и на MOEX могут расходиться на пару дней (перенос с выходных): одна выплата — одно событие
+        have = defaultdict(list)
+        for e in events:
+            if e["kind"] in ("amort", "coupon") and e.get("isin"):
+                have[(e["kind"], e["isin"])].append(e["date"])
+
+        def _dup(kind, isin, d):
+            dd = datetime.strptime(d, "%Y-%m-%d")
+            return any(abs((datetime.strptime(x, "%Y-%m-%d") - dd).days) <= 3 for x in have[(kind, isin)])
         extra = [item for lst in pool_map(one, rows, workers=8) for item in lst]
         need_fx = {cur for _, cur in extra if cur and cur != "rub"}
         rates = fx_now(TInvest(cfg) if cfg.get("hosts_prod") else type("_C", (), {"ready": False})(), need_fx) if need_fx else {}
+        no_fx = set()
         for e, cur in extra:
-            key = (e["isin"], e["date"])
-            if e["kind"] == "amort":
-                if key in have_am:
+            if e["kind"] in ("amort", "coupon"):
+                if _dup(e["kind"], e["isin"], e["date"]):
                     continue
-                have_am.add(key)
-            elif e["kind"] == "coupon":
-                if key in have_cp:
-                    continue
-                have_cp.add(key)
+                have[(e["kind"], e["isin"])].append(e["date"])
             if e.get("amount") is not None:
-                e["amount"] = round(cur_to_rub(e["amount"], cur, rates), 2)
+                rub = cur_to_rub(e["amount"], cur, rates, default=None)
+                if rub is None:                     # без курса ЦБ сумму не показываем, чем считать валюту рублями
+                    no_fx.add((cur or "").upper())
+                    e["note"] = (e.get("note") or "") + " (нет курса %s)" % (cur or "").upper()
+                e["amount"] = round(rub, 2) if rub is not None else None
             events.append(e)
+        if no_fx:
+            warn.append("Нет курса ЦБ для %s: суммы валютных выплат не показаны." % ", ".join(sorted(no_fx)))
     except Exception as e:  # noqa: BLE001
         src["portfolio"] = False
         warn.append("Выплаты и оферты по портфелю не загружены: %s" % str(e)[:140])
@@ -16048,10 +16127,12 @@ def _tg_srv_merge(sent, keys, now):
             sent.setdefault(k, now)
 
 
-def _tg_srv_merge_goals(goals):
-    """Вливает цели, изменённые в боте, в локальный WATCH_KEY, не перезаписывая локальные поля (note, added и т. д.)."""
+def _tg_srv_merge_goals(goals, deleted=None):
+    """Вливает цели, изменённые в боте, в локальный WATCH_KEY, не перезаписывая локальные поля (note, added и т. д.).
+    Снимает цели только у ISIN, явно удалённых в боте (deleted): отсутствие бумаги в ответе сервера — не удаление."""
     if not isinstance(goals, list):
         return False
+    deleted = {i for i in (_isin_ok(x) for x in (deleted or []) if isinstance(x, str)) if i}
     by_isin = {}
     for g in goals:
         if not isinstance(g, dict):
@@ -16089,7 +16170,7 @@ def _tg_srv_merge_goals(goals):
                         changed = True
         kept = []
         for x in items:
-            if x["isin"] not in by_isin and ("target_yield" in x or "target_price" in x):
+            if x["isin"] in deleted and x["isin"] not in by_isin and ("target_yield" in x or "target_price" in x):
                 x.pop("target_yield", None)
                 x.pop("target_price", None)
                 changed = True
@@ -16128,8 +16209,9 @@ def _tg_srv_sync(cfg, sent, force=False, resume=False):
     if code == 200 and j.get("ok"):
         _tg_srv_merge(sent, j.get("sent"), now)
         rev, prev_rev = j.get("bot_goals_rev"), st.get("bot_goals_rev")
-        if isinstance(j.get("goals"), list) and (rev is None or rev != prev_rev):
-            _tg_srv_merge_goals(j["goals"])
+        # цели из бота вливаем, только если программа сама отправляет цели (иначе пустой список в ответе ничего не значит)
+        if cfg.get("tg_on_watch", True) and isinstance(j.get("goals"), list) and rev is not None and rev != (prev_rev or 0):
+            _tg_srv_merge_goals(j["goals"], j.get("bot_deleted"))
         st = {"active": True, "ok": now, "hash": h, "err": "", "at": now, "counts": j.get("counts") or {}}
         if rev is not None:
             st["bot_goals_rev"] = rev
@@ -27112,11 +27194,8 @@ class Handler(BaseHTTPRequestHandler):
                         hosts = [str(h).strip() for h in body[k] if str(h).strip()]
                         if hosts:
                             cfg[k] = hosts
-                if "data_server" in body:
-                    u = str(body["data_server"]).strip().rstrip("/")
-                    if u and u.lower() != "off" and not re.fullmatch(r"https?://[^/\s]+(/[^\s]*)?", u):
-                        raise ApiError("Адрес сервера данных должен начинаться с http:// или https://", 400)
-                    cfg["data_server"] = u
+                if str(cfg.get("data_server") or "").strip().lower() == "off":
+                    cfg["data_server"] = ""         # «off» из прежних версий: сервер данных теперь не отключается
                 if body.get("data_key"):
                     cfg["data_key"] = "".join(str(body["data_key"]).split())
                 if body.get("clear_data_key"):
@@ -27125,7 +27204,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError("Файл сертификата не найден: " + cfg["ca_file"], 400)
                 save_config(cfg)
                 ds_reset()
-                mem_clear()
+                mem_clear(persist=False)        # сохранённые отчёты привязаны к токену (token_key): настройки их не портят
                 return self.send(200, {"ok": True})
             if path == "/api/ratings/refresh":
                 return self.send(200, {"started": ratings_start(force=True), **ratings_status()})
@@ -29922,7 +30001,10 @@ function concCard(c){
   if(!c||!c.total)return'';
   const b=c.below_a_minus||{},u=c.unrated_bonds||{},ws=c.warnings||[];
   const wHtml=ws.length?`<div style="margin-bottom:12px">${ws.map(w=>{
-    const txt=w.kind==='sector'&&w.sector?`${esc(SECT[w.sector]||w.sector)} — ${pctp(w.value,1)} портфеля (порог ${f0(w.threshold)}%)`:esc(w.detail);
+    const lim=`(порог ${f0(w.threshold)} %)`;
+    const txt=w.kind==='sector'&&w.sector?`${esc(SECT[w.sector]||w.sector)} — ${pctp(w.value,1)} портфеля ${lim}`:
+      w.kind==='issuer'&&c.max_issuer?`${esc(c.max_issuer)} — ${pctp(w.value,1)} портфеля ${lim}`:
+      w.kind==='rating'?`${pctp(w.value,1)} портфеля с рейтингом ниже A− ${lim}`:esc(w.detail);
     return`<div style="border-left:3px solid var(--${w.severity==='high'?'neg':'warn'});padding:7px 12px;margin-bottom:6px;background:var(--card2);border-radius:6px;font-size:13px"><b>${esc(w.title)}:</b> ${txt}</div>`;
   }).join('')}</div>`:'';
   const iss=(c.issuers||[]).slice(0,5).map((x,i)=>({n:x.name,v:x.share,c:x.share>15?S8:PAL[i%PAL.length]}));
@@ -29930,14 +30012,14 @@ function concCard(c){
   const cur=(c.currencies||[]).slice(0,5).map((x,i)=>({n:(x.cur||'rub').toUpperCase(),v:x.share,c:PAL[i%PAL.length]}));
   return`<div class="card"><h2>Концентрация и риски портфеля<span class="sp">${c.issuers_count||0} эмитентов · топ-3 ${pctp(c.top3_share,1)}</span></h2>${wHtml}
     <div class="g g4" style="gap:10px;margin-bottom:12px">
-      <div><div class="mu" style="font-size:12px">Макс. на эмитента</div><div class="num ${c.max_issuer_share>15?'neg':''}" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(c.max_issuer_share,1)}</div></div>
+      <div><div class="mu" style="font-size:12px">Макс. на эмитента (без ОФЗ)</div><div class="num ${c.max_issuer_share>15?'neg':''}" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(c.max_issuer_share,1)}</div></div>
       <div><div class="mu" style="font-size:12px">Топ-3 эмитента</div><div class="num" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(c.top3_share,1)}</div></div>
       <div><div class="mu" style="font-size:12px">Рейтинг ниже A−</div><div class="num ${(b.share||0)>30?'neg':''}" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(b.share||0,1)}</div></div>
       <div><div class="mu" style="font-size:12px">Облигации без рейтинга</div><div class="num" style="font-weight:650;font-size:16px;margin-top:2px">${pctp(u.share||0,1)}</div></div>
     </div>
     <div class="g g3">
       <div><div class="mu" style="font-size:12px;margin-bottom:6px">Эмитенты (топ-5)</div>${iss.length?hbars(iss,S1,x=>pctp(x.v,1),1):'<div class="mu">Нет данных</div>'}</div>
-      <div><div class="mu" style="font-size:12px;margin-bottom:6px">Секторы</div>${sec.length?hbars(sec,S3,x=>pctp(x.v,1),1):'<div class="mu">Нет данных</div>'}</div>
+      <div><div class="mu" style="font-size:12px;margin-bottom:6px">Секторы</div>${sec.some(x=>x.n!=='Без сектора')?hbars(sec,S3,x=>pctp(x.v,1),1):'<div class="mu">Секторы бумаг пока неизвестны: они появятся после загрузки каталога T-Invest.</div>'}</div>
       <div><div class="mu" style="font-size:12px;margin-bottom:6px">Валюты</div>${cur.length?hbars(cur,S4,x=>pctp(x.v,1),1):'<div class="mu">Нет данных</div>'}</div>
     </div></div>`;
 }
@@ -30249,7 +30331,7 @@ function radarCard(rad,compact){
 
 /* ── Первичные размещения ── */
 S.pri=null;S.priNip={y:21,bucket:'AA',term:3,days:4};
-function loadPri(){api('/api/primary').then(j=>{S.pri=j;if(S.page==='pri')renderSoon()}).catch(e=>{S.pri={error:e.message,rows:[]};if(S.page==='pri')renderSoon()})}
+function loadPri(){api('/api/primary').then(j=>{S.pri=j;if(S.page==='pri')renderSoon();if(j&&j.scr_loading)setTimeout(()=>{if(S.page==='pri')loadPri()},4000)}).catch(e=>{S.pri={error:e.message,rows:[]};if(S.page==='pri')renderSoon()})}
 function priNipCell(n){
   if(!n)return'<span class="mu">—</span>';
   const bits=[];
@@ -30908,7 +30990,8 @@ function pPay(){
   const list=Object.keys(byM).sort().map(m=>{const[y,mm]=m.split('-');const t=byM[m].reduce((a,x)=>a+x.amount,0);
     return`<div class="card"><h2>${MONF[+mm-1]} ${y}<span class="sp num" style="color:var(--pos);font-size:13px;font-weight:600">${M(t)}</span></h2><div class="li">`+
     byM[m].map(p=>`<div class="it"${p.kind==='dividend'&&p.ticker?stkAttr(p.ticker,'div'):''}>${logo(p,34)}<div><b>${esc(p.name)}</b><small>${ddm(p.date)} · <span style="color:${KIND[p.kind][1]}">${KIND[p.kind][0]}</span>${p.est==='forecast'?' · прогноз по ключевой ставке':p.est?' · оценка':''}</small></div><div class="rv num">${M(p.amount)}</div></div>`).join('')+`</div></div>`}).join('');
-  return payTabs()+`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(sum(()=>1)),'купоны, дивиденды, амортизации и погашения','pos',S3)}
+  const fxw=(b.fx_missing||[]).length?`<div class="msg">Нет курса ЦБ для ${esc(b.fx_missing.join(', '))}: выплаты в этой валюте не учтены.</div>`:'';
+  return payTabs()+fxw+`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(sum(()=>1)),'купоны, дивиденды, амортизации и погашения','pos',S3)}
     ${kpi('Купоны',M(sum(p=>p.kind==='coupon')),ps.filter(p=>p.kind==='coupon').length+' выплат',null,S1)}${kpi('Дивиденды',M(sum(p=>p.kind==='dividend')),'только объявленные, до налога',null,S3)}</div>
     <div class="card"><h2>Календарь выплат по месяцам, ₽</h2><div id="c-pay" class="chart"></div></div>
     <div class="card"><h2>Выплаты по дням<span class="sp"><span class="seg" id="pdays">${[[30,'30 дней'],[90,'90 дней'],[365,'Год']].map(([d,t])=>`<button data-d="${d}" class="${d===S.payDays?'on':''}">${t}</button>`).join('')}</span></span></h2><div id="c-days" class="chart"></div></div>
@@ -31394,7 +31477,7 @@ function txDecl(d){
   const y=ys.includes(+S.tx.year)?+S.tx.year:ys[0],dc=d.decl[y];
   const csvUrl='/api/tax/decl.csv?'+new URLSearchParams({account:S.account,year:String(y)});
   const sel=`<div class="row noprint" style="margin-bottom:12px;gap:10px;align-items:flex-end;flex-wrap:wrap"><label class="field" style="max-width:200px"><span>Налоговый год</span><select class="in" onchange="S.tx.year=this.value;render()">${ys.map(v=>`<option value="${v}" ${v===y?'selected':''}>${v}</option>`).join('')}</select></label>
-    <a class="btn ghost" style="text-decoration:none" href="${csvUrl}">Скачать CSV для 3-НДФЛ</a>
+    <a class="btn ghost" style="text-decoration:none" href="${csvUrl}" download="3ndfl_${y}.csv">Скачать CSV для 3-НДФЛ</a>
     <button class="btn ghost" onclick="window.print()">Печать / PDF</button></div>`;
   const wk=w=>Object.keys(w).filter(k=>Math.abs(w[k])>0.005).map(k=>`${esc(L[k]||k)}: ${tR(w[k])}`).join('; ');
   const ii=Object.fromEntries(d.iis.map(i=>[i.id,i]));
@@ -31550,6 +31633,7 @@ async function renderImport(){
       try{const r=await post('/api/import/parse',req());const K={buy:'покупок',sell:'продаж',coupons:'купонов',dividends:'дивидендов',deposits:'пополнений',withdrawals:'выводов',fee_broker:'комиссий',tax_trade:'налогов',repayments:'погашений',fee_service:'обслуживание',margin_fee:'маржа'};
         let ovNote='';
         if(!$('#itarget').value&&r.overlap_account){$('#itarget').value=r.overlap_account.id;S.imp.target=r.overlap_account.id;ovNote=`<div class="msg info" style="margin-top:10px">Найдены пересекающиеся операции со счётом «${esc(r.overlap_account.name)}» (${r.overlap_account.matches} шт.) — выбран этот счёт, чтобы сделки за общий период не продублировались.</div>`}
+        if(r.duplicate_of)msg('');      // то же предупреждение уже есть ниже, рядом с результатом разбора
         const dupMsg=r.duplicate_of?`<div class="msg err" style="margin-top:10px">Этот отчёт уже загружен в счёт «${esc(r.duplicate_of.name)}». Повторная загрузка запрещена, чтобы сделки не задвоились.</div>`:'';
         $('#iresult').innerHTML=`<div class="msg ${r.count?'ok':'err'}">Распознано операций: <b>${r.count}</b>${r.skipped?`, пропущено строк: ${r.skipped}`:''}${r.from?` · с ${ddm(r.from)} по ${ddm(r.to)}`:''}<br>${Object.entries(r.kinds).map(([k,v])=>`${K[k]||k}: ${v}`).join(' · ')}</div>${dupMsg}${ovNote}
           <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${r.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>
@@ -31687,11 +31771,10 @@ function navShowAll(){S.navHidden=[];lsSet('ta_nav_hidden','[]');renderNav();ren
 function setDsHtml(c){
   const keySet=c.secret_set&&c.secret_set.data_key;
   return stGroup('Сервер данных',
-    stRow('Адрес сервера','Пусто — сервер по умолчанию, <code>off</code> — напрямую к источникам',`<input class="in mono st-wide" id="ds-url" value="${esc(c.data_server||'')}" placeholder="сервер по умолчанию" autocomplete="off" spellcheck="false" aria-label="Адрес сервера данных">`)+
     stRow('Ключ доступа',`Выдаёт @${esc(AUTH.bot)}${keySet?' · <span class="pos">сохранён</span>, пустое поле ничего не меняет':''}`,stSecret('ds-key',keySet?'••••••••':'вставьте ключ','autocomplete="off"','Ключ доступа к серверу данных'))+
     stRow('Действия','',`<button class="btn" id="ds-save" disabled>Сохранить</button><button class="btn ghost" id="ds-test">Проверить</button>${keySet?'<button class="btn ghost danger" id="ds-clr">Удалить ключ</button>':''}`)+
     `<p class="st-line" id="ds-st">Загружаю…</p>`+
-    stMore('Что передаётся на сервер','Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через ваш сервер — быстрее и без лишних запросов к источникам. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.'),
+    stMore('Что передаётся на сервер','Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через сервер TAnalytic: он сам обновляет их раз в час, поэтому экраны открываются без ожидания источников. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.'),
     {id:'ds-card',hint:'данные рынка'});
 }
 async function dsStatus(){
@@ -31706,12 +31789,12 @@ async function dsStatus(){
 function bindSetDs(c,msg){
   const g=id=>document.getElementById(id);
   dsStatus();
-  const dirty=stDirty('ds-save',['ds-url','ds-key']);
-  stEnter(['ds-url','ds-key'],'ds-save');
-  const save=async()=>{const k=stSecVal('ds-key'),b={data_server:g('ds-url').value};if(k)b.data_key=k;await post('/api/config',b);
-    c.data_server=g('ds-url').value.trim();if(k)c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
-  g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Сохранено. Новые запросы пойдут '+(c.data_server.toLowerCase()==='off'?'напрямую.':'через сервер.'),1);authCheck(true);renderSettings()}catch(x){msg(x.message);dirty.upd()}};
-  g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{url:g('ds-url').value,key:g('ds-key').value});
+  const dirty=stDirty('ds-save',['ds-key']);
+  stEnter(['ds-key'],'ds-save');
+  const save=async()=>{const k=stSecVal('ds-key');if(!k)return;await post('/api/config',{data_key:k});
+    c.secret_set=Object.assign({},c.secret_set,{data_key:true});g('ds-key').value=''};
+  g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Ключ сохранён.',1);authCheck(true);renderSettings()}catch(x){msg(x.message);dirty.upd()}};
+  g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{key:g('ds-key').value});
     msg(`Сервер работает: версия ${r.version}, записей в кэше ${r.cache_items}.`,1)}catch(x){msg(x.message)}finally{b.disabled=false}};
   if(g('ds-clr'))g('ds-clr').onclick=async()=>{try{if(!confirm('Удалить сохранённый ключ сервера данных?'))return;await post('/api/config',{clear_data_key:true});authCheck(true);c.secret_set=Object.assign({},c.secret_set,{data_key:false});renderSettings()}catch(x){msg(x.message)}};
 }
@@ -31790,6 +31873,7 @@ function setTgHtml(c){
     stRow('Наблюдение и цели','Тревоги по списку наблюдения, достигнутые цели, напоминания из дневника',stSw('tg-wat',on('tg_on_watch',true),'Наблюдение и цели'),{cls:'sub'})+
     stRow('Ближайшие выплаты','За сколько дней сообщать о выплатах (0 — выключить)',`<input class="in num st-num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}" aria-label="За сколько дней сообщать о выплатах"><span class="st-unit">дн.</span>`,{cls:'sub'})+
     stRow('Ежедневная сводка','Портфель, выплаты на неделю, тревоги',`<input class="in num st-time" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}" aria-label="Время сводки">${stSw('tg-dg',on('tg_digest',false),'Ежедневная сводка')}`,{cls:'sub'})+
+    stRow('Недельная сводка','По понедельникам утром от бота: итоги недели по целям и ближайшим событиям. Работает при включённой проверке на сервере',stSw('tg-wd',on('tg_weekly_digest',false),'Недельная сводка'),{cls:'sub'})+
     stRow('Проверять на сервере, когда программа закрыта','Цели по наблюдению, напоминания дневника, оферты и выплаты по портфелю проверяет сервер данных — раз в 15 минут, кроме ночи (22:00–08:00 МСК)',stSw('tg-srv',on('tg_server',false),'Проверять тревоги на сервере, когда программа закрыта'),{cls:'sub'})+
     `<p class="st-line" id="tg-srv-state"></p>`+
     stRow('Данные на сервере','Подписка удаляется и сама — когда истекает ключ из бота',`<button class="btn ghost danger" id="tg-srv-del">Удалить данные с сервера</button>`,{cls:'sub',id:'tg-srv-row',hidden:!on('tg_server',false)})+
@@ -31805,7 +31889,7 @@ function setTgHtml(c){
 function bindSetTg(c,msg){
   const g=id=>document.getElementById(id);if(!g('tg-card'))return;
   const body=()=>({tg_enabled:g('tg-en').checked,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
-    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00',tg_server:g('tg-srv').checked});
+    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00',tg_weekly_digest:g('tg-wd').checked,tg_server:g('tg-srv').checked});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
   const save=async()=>{const r=await post('/api/tg/save',body());Object.assign(c,r.settings);return r};
   const dim=()=>g('tg-card').classList.toggle('st-dis',!g('tg-en').checked);
@@ -31813,7 +31897,7 @@ function bindSetTg(c,msg){
     g('tg-srv-row').hidden=!(s.enabled||s.ok);const n=s.counts||{};
     g('tg-srv-state').textContent=!s.enabled?'':s.error?s.error:s.active?`Сервер проверяет: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}. Обновлено ${new Date(s.ok*1000).toLocaleString('ru-RU')}.`:'Подписка ещё не отправлена на сервер.';
   }).catch(()=>{});
-  ['tg-en','tg-mon','tg-wat','tg-pay','tg-time','tg-dg'].forEach(id=>g(id).addEventListener('change',async e=>{
+  ['tg-en','tg-mon','tg-wat','tg-pay','tg-time','tg-dg','tg-wd'].forEach(id=>g(id).addEventListener('change',async e=>{
     const el=e.currentTarget;dim();
     try{const r=await save();stOk(el);if(r.warning)msg(r.warning);setTimeout(srvShow,4500)}catch(x){msg(x.message)}}));
   g('tg-srv').addEventListener('change',async e=>{
@@ -31829,7 +31913,7 @@ function bindSetTg(c,msg){
   srvShow();
   api('/api/tg/info').then(i=>{
     g('tg-bot').textContent='@'+String(i.bot||'tanalyticbot').replace(/^@/,'');
-    g('tg-state').textContent=!i.server?'Сервер данных выключен («off»): уведомления работают через него. Включите сервер данных в разделе «Подключение».':
+    g('tg-state').textContent=!i.server?'Сервер данных недоступен: уведомления работают через него.':
       i.state==='need_login'?'Войдите по ключу из бота — иначе уведомления отправить нельзя.':i.state==='offline'?'Сервер недоступен.':'';
   }).catch(()=>{});
   g('tg-test').onclick=e=>busy(e.currentTarget,async()=>{await save();await post('/api/tg/test');msg('Тестовое сообщение отправлено — проверьте Telegram.',1)});
@@ -31934,7 +32018,7 @@ async function stTiles(c){
   /* сервер данных */
   if(!ds)stTileSet('st-t2','mu','Нет данных','Не удалось получить статус');
   else if(ds.mode==='server')stTileSet('st-t2','pos','Подключён',String(ds.url||'').replace(/^https?:\/\//,''));
-  else if(ds.mode==='direct')stTileSet('st-t2','mu','Напрямую',(c.data_server||'').toLowerCase()==='off'?'Сервер отключён вручную':'Прямые запросы к источникам');
+  else if(ds.mode==='direct')stTileSet('st-t2','mu','Напрямую','Прямые запросы к источникам');
   else stTileSet('st-t2','warn','Недоступен','Работаем напрямую, повтор через '+(ds.retry_in||'…')+' с');
   /* Telegram-бот */
   const loggedIn=au&&au.state==='ok'&&(au.username||au.expires);
@@ -36038,7 +36122,7 @@ function pDfl(){
   const since=d.since||'';
   const inP=r=>r.date&&r.date>=since,main=all.filter(inP),old=all.filter(r=>!inP(r));
   const sc=d.scan;
-  if(!d.configured)h+=`<div class="msg" style="margin:10px 0">Сервер данных не подключён: сообщения эмитентов недоступны. Ниже только флаги Мосбиржи.</div>`;
+  if(!d.configured)h+=`<div class="msg" style="margin:10px 0">Сервер данных недоступен: сообщения эмитентов не загружены. Ниже только флаги Мосбиржи.</div>`;
   if(sc&&sc.running)h+=`<div class="msg" style="margin:10px 0"><span class="dfl-spin"></span> <span id="dfl-prog">Проверяю выпуски Мосбиржи: ${sc.done} из ${sc.total}</span> — список дополняется по ходу проверки.</div>`;
   else if(sc&&sc.error)h+=`<div class="msg err" style="margin:10px 0">Обход рынка не завершён: ${esc(sc.error)}</div>`;
   const isn=new Set(all.map(r=>r.isin||r.issuer)),iss=new Set(all.map(r=>r.inn||r.issuer));
@@ -36076,7 +36160,7 @@ function flwOpen(secid,cls,isin){
   else{S.flw.tab='book';S.flw.book.secid=secid;S.flw.book.data=null;render()}
 }
 function flwEmpty(d){
-  return`<div class="empty" style="padding:28px 12px">${d&&d.configured===false?'Сервер данных не подключён: потоки денег считаются на сервере. Подключите сервер в «Настройках» (раздел «Сервер данных»).':'Данных пока нет: сборщик ещё накапливает сделки (в нерабочее время биржи данных нет).'}</div>`;
+  return`<div class="empty" style="padding:28px 12px">${d&&d.configured===false?'Сервер данных недоступен: потоки денег считаются на сервере. Попробуйте позже или проверьте ключ в «Настройках».':'Данных пока нет: сборщик ещё накапливает сделки (в нерабочее время биржи данных нет).'}</div>`;
 }
 /* ── потоки ── */
 function loadFlw(force){

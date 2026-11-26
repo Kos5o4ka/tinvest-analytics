@@ -94,10 +94,12 @@ def _tg_srv_merge(sent, keys, now):
             sent.setdefault(k, now)
 
 
-def _tg_srv_merge_goals(goals):
-    """Вливает цели, изменённые в боте, в локальный WATCH_KEY, не перезаписывая локальные поля (note, added и т. д.)."""
+def _tg_srv_merge_goals(goals, deleted=None):
+    """Вливает цели, изменённые в боте, в локальный WATCH_KEY, не перезаписывая локальные поля (note, added и т. д.).
+    Снимает цели только у ISIN, явно удалённых в боте (deleted): отсутствие бумаги в ответе сервера — не удаление."""
     if not isinstance(goals, list):
         return False
+    deleted = {i for i in (_isin_ok(x) for x in (deleted or []) if isinstance(x, str)) if i}
     by_isin = {}
     for g in goals:
         if not isinstance(g, dict):
@@ -135,7 +137,7 @@ def _tg_srv_merge_goals(goals):
                         changed = True
         kept = []
         for x in items:
-            if x["isin"] not in by_isin and ("target_yield" in x or "target_price" in x):
+            if x["isin"] in deleted and x["isin"] not in by_isin and ("target_yield" in x or "target_price" in x):
                 x.pop("target_yield", None)
                 x.pop("target_price", None)
                 changed = True
@@ -174,8 +176,9 @@ def _tg_srv_sync(cfg, sent, force=False, resume=False):
     if code == 200 and j.get("ok"):
         _tg_srv_merge(sent, j.get("sent"), now)
         rev, prev_rev = j.get("bot_goals_rev"), st.get("bot_goals_rev")
-        if isinstance(j.get("goals"), list) and (rev is None or rev != prev_rev):
-            _tg_srv_merge_goals(j["goals"])
+        # цели из бота вливаем, только если программа сама отправляет цели (иначе пустой список в ответе ничего не значит)
+        if cfg.get("tg_on_watch", True) and isinstance(j.get("goals"), list) and rev is not None and rev != (prev_rev or 0):
+            _tg_srv_merge_goals(j["goals"], j.get("bot_deleted"))
         st = {"active": True, "ok": now, "hash": h, "err": "", "at": now, "counts": j.get("counts") or {}}
         if rev is not None:
             st["bot_goals_rev"] = rev

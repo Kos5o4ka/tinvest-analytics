@@ -360,7 +360,12 @@ class PrimaryScreenerPopulate(unittest.TestCase):
             M.key_rate_series = lambda: []
             M.primary_snapshot = lambda rows: None
             M._scr["rows"] = []
+            M._pri_scr_state.update(th=None, t=0.0)
+            first = M.primary_payload()                 # скринер грузится в фоне, ответ не ждёт
+            self.assertTrue(first["scr_loading"])
+            M._pri_scr_state["th"].join(5)
             res = M.primary_payload()
+            self.assertFalse(res["scr_loading"])
         finally:
             M.primary_rows, M.screener_payload, M.key_rate_series, M.primary_snapshot = saved[:4]
             M._scr.clear()

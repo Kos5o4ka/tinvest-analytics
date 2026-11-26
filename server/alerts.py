@@ -408,6 +408,13 @@ def quotes_from_iss(j, out=None):
 
 
 # ───────────────────────── хранилище ─────────────────────────
+def fresh_bot_deleted(sub, seen_rev):
+    """ISIN, удалённые в боте после ревизии seen_rev, которую программа уже видела."""
+    rev = int(sub.get("bot_goals_rev") or 0)
+    rev_of = sub.get("bot_rev_of") if isinstance(sub.get("bot_rev_of"), dict) else {}
+    return [x for x in sub.get("bot_deleted") or [] if isinstance(x, str) and int(rev_of.get(x) or rev) > int(seen_rev or 0)]
+
+
 class AlertStore:
     """Подписки и отправленные ключи в общей базе бота. Своё соединение на поток (как KeyStore)."""
 
@@ -467,11 +474,18 @@ class AlertStore:
             client_rev = sub.get("bot_goals_rev")
             data = {k: v for k, v in sub.items() if k not in ("sent", "resume", "bot_goals_rev")}
             if existing_rev > 0 and (client_rev is None or client_rev < existing_rev):
-                deleted_set = set(existing_deleted)
+                # применяем только правки бота новее ревизии, которую программа уже видела: иначе удалённая
+                # в программе цель из бота воскресала бы при каждой синхронизации
+                rev_of = existing.get("bot_rev_of") if isinstance(existing.get("bot_rev_of"), dict) else {}
+                seen = client_rev or 0
+                fresh = lambda isin: int(rev_of.get(isin) or existing_rev) > seen
+                deleted_set = {x for x in existing_deleted if fresh(x)}
                 merged = [g for g in (data.get("goals") or []) if g.get("isin") not in deleted_set]
                 idx = {g["isin"]: i for i, g in enumerate(merged)}
                 for bg in existing_bot_goals:
                     isin = bg["isin"]
+                    if not fresh(isin):
+                        continue
                     if isin in idx:
                         merged[idx[isin]] = bg
                     else:
@@ -481,6 +495,8 @@ class AlertStore:
                 data["bot_goals"] = existing_bot_goals
                 if existing_deleted:
                     data["bot_deleted"] = existing_deleted
+                if rev_of:
+                    data["bot_rev_of"] = rev_of
                 data["bot_goals_rev"] = existing_rev
             elif existing_rev > 0:
                 data["bot_goals_rev"] = existing_rev
@@ -545,6 +561,10 @@ class AlertStore:
                 data.pop("bot_deleted", None)
             rev = int(data.get("bot_goals_rev") or 0) + 1
             data["bot_goals_rev"] = rev
+            rev_of = data.get("bot_rev_of") if isinstance(data.get("bot_rev_of"), dict) else {}
+            rev_of[isin] = rev
+            keep = {g.get("isin") for g in data.get("bot_goals") or []} | set(data.get("bot_deleted") or [])
+            data["bot_rev_of"] = {k: v for k, v in rev_of.items() if k in keep}
             raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             if len(raw.encode("utf-8")) > SUB_MAX_BYTES:
                 raise AlertError(413, "too_large")

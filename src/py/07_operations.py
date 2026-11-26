@@ -170,7 +170,7 @@ def fifo(ops):
                 left_buy -= take
                 if s[0] <= 1e-9:
                     p["shorts"].pop(0)
-            if k == "buy" and q - left_buy > 1e-9:
+            if q - left_buy > 1e-9:                 # закрытие шорта покупкой или зачислением бумаг
                 o["_yield"] = short_yld
             if left_buy > 1e-9:
                 p["lots"].append([left_buy, unit])
@@ -230,7 +230,10 @@ def analyze(ops, names, period, portfolio_value):
                 entries.append(("realized", ycur, yld))
         elif kind == "sell":
             entries += [("sell_turnover", cur, abs(pay)), ("realized", ycur, yld)]
-        elif kind not in ("other", "sec_in", "sec_out", "conv_in", "conv_out"):
+        elif kind == "sec_in":
+            if yld:
+                entries.append(("realized", ycur, yld))
+        elif kind not in ("other", "sec_out", "conv_in", "conv_out"):
             entries.append((kind, cur, -pay if kind in FLIP else pay))
         if kind in ("buy", "sell") and comm and o.get("_acc") not in accs_with_broker_ops:
             entries.append(("fee_broker", ccur, -comm if comm < 0 else comm))

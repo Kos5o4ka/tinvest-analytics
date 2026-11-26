@@ -10,6 +10,7 @@ function setTgHtml(c){
     stRow('Наблюдение и цели','Тревоги по списку наблюдения, достигнутые цели, напоминания из дневника',stSw('tg-wat',on('tg_on_watch',true),'Наблюдение и цели'),{cls:'sub'})+
     stRow('Ближайшие выплаты','За сколько дней сообщать о выплатах (0 — выключить)',`<input class="in num st-num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}" aria-label="За сколько дней сообщать о выплатах"><span class="st-unit">дн.</span>`,{cls:'sub'})+
     stRow('Ежедневная сводка','Портфель, выплаты на неделю, тревоги',`<input class="in num st-time" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}" aria-label="Время сводки">${stSw('tg-dg',on('tg_digest',false),'Ежедневная сводка')}`,{cls:'sub'})+
+    stRow('Недельная сводка','По понедельникам утром от бота: итоги недели по целям и ближайшим событиям. Работает при включённой проверке на сервере',stSw('tg-wd',on('tg_weekly_digest',false),'Недельная сводка'),{cls:'sub'})+
     stRow('Проверять на сервере, когда программа закрыта','Цели по наблюдению, напоминания дневника, оферты и выплаты по портфелю проверяет сервер данных — раз в 15 минут, кроме ночи (22:00–08:00 МСК)',stSw('tg-srv',on('tg_server',false),'Проверять тревоги на сервере, когда программа закрыта'),{cls:'sub'})+
     `<p class="st-line" id="tg-srv-state"></p>`+
     stRow('Данные на сервере','Подписка удаляется и сама — когда истекает ключ из бота',`<button class="btn ghost danger" id="tg-srv-del">Удалить данные с сервера</button>`,{cls:'sub',id:'tg-srv-row',hidden:!on('tg_server',false)})+
@@ -25,7 +26,7 @@ function setTgHtml(c){
 function bindSetTg(c,msg){
   const g=id=>document.getElementById(id);if(!g('tg-card'))return;
   const body=()=>({tg_enabled:g('tg-en').checked,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
-    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00',tg_server:g('tg-srv').checked});
+    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00',tg_weekly_digest:g('tg-wd').checked,tg_server:g('tg-srv').checked});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
   const save=async()=>{const r=await post('/api/tg/save',body());Object.assign(c,r.settings);return r};
   const dim=()=>g('tg-card').classList.toggle('st-dis',!g('tg-en').checked);
@@ -33,7 +34,7 @@ function bindSetTg(c,msg){
     g('tg-srv-row').hidden=!(s.enabled||s.ok);const n=s.counts||{};
     g('tg-srv-state').textContent=!s.enabled?'':s.error?s.error:s.active?`Сервер проверяет: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}. Обновлено ${new Date(s.ok*1000).toLocaleString('ru-RU')}.`:'Подписка ещё не отправлена на сервер.';
   }).catch(()=>{});
-  ['tg-en','tg-mon','tg-wat','tg-pay','tg-time','tg-dg'].forEach(id=>g(id).addEventListener('change',async e=>{
+  ['tg-en','tg-mon','tg-wat','tg-pay','tg-time','tg-dg','tg-wd'].forEach(id=>g(id).addEventListener('change',async e=>{
     const el=e.currentTarget;dim();
     try{const r=await save();stOk(el);if(r.warning)msg(r.warning);setTimeout(srvShow,4500)}catch(x){msg(x.message)}}));
   g('tg-srv').addEventListener('change',async e=>{
@@ -49,7 +50,7 @@ function bindSetTg(c,msg){
   srvShow();
   api('/api/tg/info').then(i=>{
     g('tg-bot').textContent='@'+String(i.bot||'tanalyticbot').replace(/^@/,'');
-    g('tg-state').textContent=!i.server?'Сервер данных выключен («off»): уведомления работают через него. Включите сервер данных в разделе «Подключение».':
+    g('tg-state').textContent=!i.server?'Сервер данных недоступен: уведомления работают через него.':
       i.state==='need_login'?'Войдите по ключу из бота — иначе уведомления отправить нельзя.':i.state==='offline'?'Сервер недоступен.':'';
   }).catch(()=>{});
   g('tg-test').onclick=e=>busy(e.currentTarget,async()=>{await save();await post('/api/tg/test');msg('Тестовое сообщение отправлено — проверьте Telegram.',1)});

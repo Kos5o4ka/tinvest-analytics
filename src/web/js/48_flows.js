@@ -19,7 +19,7 @@ function flwOpen(secid,cls,isin){
   else{S.flw.tab='book';S.flw.book.secid=secid;S.flw.book.data=null;render()}
 }
 function flwEmpty(d){
-  return`<div class="empty" style="padding:28px 12px">${d&&d.configured===false?'Сервер данных не подключён: потоки денег считаются на сервере. Подключите сервер в «Настройках» (раздел «Сервер данных»).':'Данных пока нет: сборщик ещё накапливает сделки (в нерабочее время биржи данных нет).'}</div>`;
+  return`<div class="empty" style="padding:28px 12px">${d&&d.configured===false?'Сервер данных недоступен: потоки денег считаются на сервере. Попробуйте позже или проверьте ключ в «Настройках».':'Данных пока нет: сборщик ещё накапливает сделки (в нерабочее время биржи данных нет).'}</div>`;
 }
 /* ── потоки ── */
 function loadFlw(force){

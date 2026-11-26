@@ -137,6 +137,28 @@ def primary_nip_for(row, screener=None, rusfar=None, freeze_days=4):
             "freeze_cost_pct": freeze_pct, "freeze_drag_bp": freeze_drag_bp, "net_nip_bp": net_nip_bp}
 
 
+_pri_scr_state = {"th": None, "t": 0.0}
+
+
+def _pri_scr_kick():
+    """Запускает фоновую загрузку скринера (не чаще раза в 2 минуты). -> True, пока загрузка идёт."""
+    def run():
+        try:
+            screener_payload()
+        except Exception:  # noqa: BLE001
+            pass
+    with _rt_lock:
+        th = _pri_scr_state["th"]
+        if th is not None and th.is_alive():
+            return True
+        if time.time() - _pri_scr_state["t"] < 120:
+            return False
+        _pri_scr_state["t"] = time.time()
+        th = _pri_scr_state["th"] = threading.Thread(target=run, daemon=True)
+    th.start()
+    return True
+
+
 def primary_payload():
     cal_error = None
     try:
@@ -144,12 +166,9 @@ def primary_payload():
     except Exception as e:  # noqa: BLE001
         rows, cal_error = [], str(e)[:200]      # без календаря экран всё равно показывает размещения Мосбиржи и калькулятор
     scr = _scr.get("rows") or []
+    scr_loading = False
     if not scr:
-        try:
-            screener_payload()
-            scr = _scr.get("rows") or []
-        except Exception:  # noqa: BLE001
-            scr = []
+        scr_loading = _pri_scr_kick()       # скринер нужен для медиан по рейтингу: грузим в фоне, экран не ждёт
     rusfar = None
     try:
         kr = key_rate_series()
@@ -179,7 +198,8 @@ def primary_payload():
         primary_snapshot(out_rows)
     except Exception:  # noqa: BLE001
         pass
-    return {"rows": out_rows, "updated": _pri["t"], "rusfar": rusfar, "peer_medians": peer_med, "cal_error": cal_error}
+    return {"rows": out_rows, "updated": _pri["t"], "rusfar": rusfar, "peer_medians": peer_med, "cal_error": cal_error,
+            "scr_loading": scr_loading}
 
 
 

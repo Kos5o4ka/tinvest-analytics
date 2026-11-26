@@ -40,7 +40,7 @@ function pDfl(){
   const since=d.since||'';
   const inP=r=>r.date&&r.date>=since,main=all.filter(inP),old=all.filter(r=>!inP(r));
   const sc=d.scan;
-  if(!d.configured)h+=`<div class="msg" style="margin:10px 0">Сервер данных не подключён: сообщения эмитентов недоступны. Ниже только флаги Мосбиржи.</div>`;
+  if(!d.configured)h+=`<div class="msg" style="margin:10px 0">Сервер данных недоступен: сообщения эмитентов не загружены. Ниже только флаги Мосбиржи.</div>`;
   if(sc&&sc.running)h+=`<div class="msg" style="margin:10px 0"><span class="dfl-spin"></span> <span id="dfl-prog">Проверяю выпуски Мосбиржи: ${sc.done} из ${sc.total}</span> — список дополняется по ходу проверки.</div>`;
   else if(sc&&sc.error)h+=`<div class="msg err" style="margin:10px 0">Обход рынка не завершён: ${esc(sc.error)}</div>`;
   const isn=new Set(all.map(r=>r.isin||r.issuer)),iss=new Set(all.map(r=>r.inn||r.issuer));

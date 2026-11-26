@@ -479,6 +479,19 @@ RULES = [
 DEFAULT_TTL = HOUR
 NOT_FOUND_TTL = 10 * MIN
 
+# Фоновое обновление: раз в WARM_PERIOD сервер сам перезапрашивает то, что клиенты брали за последние WARM_SINCE и что
+# истечёт до следующего прохода, — первый пользователь за день не ждёт источник. Просроченную долгоживущую запись (TTL от
+# SWR_MIN_TTL) клиент получает сразу, а свежая копия качается в фоне. Устаревшее удаляется в начале каждого прохода.
+WARM_PERIOD = HOUR
+WARM_AHEAD = 10 * MIN
+WARM_SINCE = 3 * DAY
+WARM_MAX = 20000
+WARM_BUDGET = 50 * MIN
+SWR_MIN_TTL = HOUR
+SWR_MAX_BG = 32
+PURGE_STALE_KEEP = 2 * DAY       # просроченное и не обновлённое дольше — удаляем (копия «на случай недоступности» не вечна)
+PURGE_IDLE = 14 * DAY            # к чему никто не обращался две недели — удаляем
+
 # Вежливость к источникам: минимальный интервал между запросами к одному хосту (запросов в секунду).
 RATES = {"iss.moex.com": 8.0, "www.moex.com": 4.0, "bo.nalog.gov.ru": 2.0, "smart-lab.ru": 1.0, "www.dohod.ru": 1.0}
 DEFAULT_RATE = 2.0
@@ -711,6 +724,8 @@ class Cache:
         self.db.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, status INTEGER, ctype TEXT, "
                         "body BLOB, fetched REAL, expires REAL, accessed REAL, size INTEGER)")
         self.db.execute("CREATE INDEX IF NOT EXISTS cache_acc ON cache(accessed)")
+        if "url" not in {r[1] for r in self.db.execute("PRAGMA table_info(cache)")}:
+            self.db.execute("ALTER TABLE cache ADD COLUMN url TEXT")     # адрес GET-записи — для фонового обновления
         self.total = self.db.execute("SELECT COALESCE(SUM(size),0) FROM cache").fetchone()[0]
 
     def count(self):
@@ -724,15 +739,36 @@ class Cache:
                 self.db.execute("UPDATE cache SET accessed=? WHERE key=?", (now, key))
         return row
 
-    def put(self, key, status, ctype, body, fetched, expires):
+    def put(self, key, status, ctype, body, fetched, expires, url=None, touch=True):
+        """touch=False — фоновое обновление: время последнего обращения клиента не меняется (иначе запись жила бы вечно)."""
         size = len(body) + 200
         with self.lock:
-            old = self.db.execute("SELECT size FROM cache WHERE key=?", (key,)).fetchone()
-            self.db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?,?,?,?,?,?)",
-                            (key, status, ctype, sqlite3.Binary(body), fetched, expires, fetched, size))
+            old = self.db.execute("SELECT size, accessed FROM cache WHERE key=?", (key,)).fetchone()
+            accessed = fetched if touch or not old else old[1]
+            self.db.execute("INSERT OR REPLACE INTO cache (key, status, ctype, body, fetched, expires, accessed, size, url) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (key, status, ctype, sqlite3.Binary(body), fetched, expires, accessed, size, url))
             self.total += size - (old[0] if old else 0)
             if self.total > self.max_bytes:
                 self._evict()
+
+    def refresh_candidates(self, now, ahead, since, limit):
+        """[(key, url)] GET-записей, которые клиенты запрашивали после since и срок которых истечёт в ближайшие ahead секунд."""
+        with self.lock:
+            return self.db.execute("SELECT key, url FROM cache WHERE url IS NOT NULL AND status=200 AND accessed>=? AND expires<=? "
+                                   "ORDER BY accessed DESC LIMIT ?", (since, now + ahead, int(limit))).fetchall()
+
+    def purge(self, now, stale_keep, idle):
+        """Удаляет устаревшее: просроченное больше stale_keep назад или то, к чему не обращались дольше idle. -> удалено записей."""
+        with self.lock:
+            n = self.db.execute("DELETE FROM cache WHERE expires<? OR accessed<?", (now - stale_keep, now - idle)).rowcount
+            self.total = self.db.execute("SELECT COALESCE(SUM(size),0) FROM cache").fetchone()[0]
+            if n:
+                try:
+                    self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
+        return n
 
     def _evict(self):
         """Удаляем самые давно использованные записи, пока не станет 90% лимита."""
@@ -828,6 +864,8 @@ class DataServer:
         self.started = time.time()
         self.upstream = upstream or self._http_upstream
         self._flights, self._flock = {}, threading.Lock()
+        self._bg_keys = set()                       # ключи, которые сейчас обновляются в фоне (stale-while-revalidate)
+        self.warm_last = None
         self._rate_lock, self._next_slot = threading.Lock(), {}
         self._stats_lock, self._stats = threading.Lock(), {}
         self._blk_lock, self._blk = threading.Lock(), {}      # host -> {"until", "n" (подряд блокировок), "s403" (времена 403)}
@@ -1015,6 +1053,11 @@ class DataServer:
         if row and row[4] > now:
             self._stat(host, "hit")
             return Result(row[0], row[1], row[2], "hit", int(now - row[3]))
+        if row and row[0] == 200 and method == "GET" and ttl >= SWR_MIN_TTL and now - row[4] < ttl:
+            # долгоживущие данные (история, графики выплат, отчётность) отдаём сразу, а свежую копию берём в фоне
+            self._refresh_bg(url, host, key, ttl)
+            self._stat(host, "stale")
+            return Result(row[0], row[1], row[2], "stale", int(now - row[3]))
         res = self._single_flight(key, lambda: self._do_upstream(method, url, body, ctype, headers, host, key, ttl, cacheable))
         if res.blocked is not None:
             self._stat(host, "blocked")
@@ -1099,10 +1142,62 @@ class DataServer:
             fl["ev"].set()
         return fl["res"]
 
+    # --- фоновое обновление кэша ---
+    def _refresh_one(self, url, host, key, ttl):
+        return self._single_flight(key, lambda: self._do_upstream("GET", url, None, "", {}, host, key, ttl, True, touch=False))
+
+    def _refresh_bg(self, url, host, key, ttl):
+        with self._flock:
+            if key in self._flights or len(self._bg_keys) >= SWR_MAX_BG or key in self._bg_keys:
+                return
+            self._bg_keys.add(key)
+
+        def run():
+            try:
+                self._refresh_one(url, host, key, ttl)
+            finally:
+                with self._flock:
+                    self._bg_keys.discard(key)
+        threading.Thread(target=run, daemon=True, name="swr").start()
+
+    def refresh_once(self, budget=None, limit=None):
+        """Один проход: удаляет устаревшее и заранее обновляет то, что клиенты запрашивали в последние WARM_SINCE секунд
+        и что истечёт до следующего прохода. Только GET с TTL от часа, лимиты источников и паузы хостов соблюдаются."""
+        t0 = now = self.clock()
+        purged = self.cache.purge(now, PURGE_STALE_KEEP, PURGE_IDLE)
+        st = {"purged": purged, "candidates": 0, "refreshed": 0, "failed": 0, "skipped": 0}
+        rows = self.cache.refresh_candidates(now, WARM_PERIOD + WARM_AHEAD, now - WARM_SINCE, limit or WARM_MAX)
+        st["candidates"] = len(rows)
+        for key, url in rows:
+            if self.clock() - t0 > (budget or WARM_BUDGET):
+                break
+            if not self.url_allowed(url):
+                st["skipped"] += 1
+                continue
+            host = urlparse(url).netloc.lower() if urlparse(url).netloc.lower() in self.allowed else urlparse(url).hostname
+            ttl = self.ttl_for(host, url, "GET", self.clock())
+            if ttl is None or ttl < SWR_MIN_TTL or self.cooldown_left(host):
+                st["skipped"] += 1                  # котировки (минуты) дёшевы и быстро устаревают; заблокированный хост ждём
+                continue
+            res = self._refresh_one(url, host, key, ttl)
+            st["failed" if res.error else "refreshed"] += 1
+        st["seconds"] = int(self.clock() - t0)
+        self.warm_last = dict(st, at=t0)
+        return st
+
+    def warm_loop(self, stop, period=None):
+        while not stop.is_set():
+            try:
+                st = self.refresh_once()
+                print("кэш: обновлено %(refreshed)d из %(candidates)d, ошибок %(failed)d, удалено %(purged)d за %(seconds)d с" % st, flush=True)
+            except Exception as e:  # noqa: BLE001
+                print("кэш: фоновое обновление не удалось: %s" % e, flush=True)
+            stop.wait(period or WARM_PERIOD)
+
     def _blocked_result(self, left):
         return Result(503, "text/plain", b"upstream blocked", error="blocked", blocked=left)
 
-    def _do_upstream(self, method, url, body, ctype, headers, host, key, ttl, cacheable):
+    def _do_upstream(self, method, url, body, ctype, headers, host, key, ttl, cacheable, touch=True):
         left = self.cooldown_left(host)
         if left:                                                # пауза хоста: к источнику не ходим вообще
             return self._blocked_result(left)
@@ -1130,10 +1225,11 @@ class DataServer:
             cookies = []
         if cacheable and not (cookies and method == "GET"):
             now = self.clock()
+            keep_url = url if method == "GET" else None
             if 200 <= status < 300:
-                self.cache.put(key, status, ct, data, now, now + ttl)
+                self.cache.put(key, status, ct, data, now, now + ttl, keep_url, touch)
             elif status == 404:
-                self.cache.put(key, status, ct, data, now, now + min(ttl, NOT_FOUND_TTL))
+                self.cache.put(key, status, ct, data, now, now + min(ttl, NOT_FOUND_TTL), keep_url, touch)
         return Result(status, ct, data, "miss", 0, cookies)
 
 
@@ -1172,6 +1268,8 @@ class Handler(BaseHTTPRequestHandler):
             h = {"ok": True, "version": VERSION, "uptime": int(time.time() - app.started),
                  "cache_items": app.cache.count(), "auth": auth_mode(app), "bot": app.bot,
                  "alerts": bool(app.alerts)}
+            if app.warm_last:
+                h["warm"] = {k: app.warm_last[k] for k in ("at", "refreshed", "failed", "purged", "seconds")}
             if app.alerts:
                 try:
                     ast = app.alerts.stats()
@@ -1327,6 +1425,7 @@ class Handler(BaseHTTPRequestHandler):
                 "sent": keys,
                 "bot_goals_rev": int(cur_sub.get("bot_goals_rev") or 0),
                 "goals": cur_sub.get("goals") or [],
+                "bot_deleted": alerts.fresh_bot_deleted(cur_sub, sub.get("bot_goals_rev")),
             })
         except alerts.AlertError as e:
             return self._send(e.code, {"ok": False, "error": e.error})
@@ -1382,6 +1481,9 @@ def main(argv=None):
     if app.checker and os.environ.get("TINVEST_ALERTS", "1") != "0":
         period = max(60, int(os.environ.get("TINVEST_ALERTS_PERIOD") or 900))
         threading.Thread(target=app.checker.loop, args=(threading.Event(), period), daemon=True, name="alerts").start()
+    if os.environ.get("TINVEST_WARM", "1") != "0":
+        period = max(300, int(os.environ.get("TINVEST_WARM_PERIOD") or WARM_PERIOD))
+        threading.Thread(target=app.warm_loop, args=(threading.Event(), period), daemon=True, name="warm").start()
     print("tinvest-data %s: http://%s:%d, кэш %s%s" % (VERSION, a.host, a.port, a.data, (", ключ включён" if a.key else "") + (", вход по ключам бота @%s" % app.bot if app.keystore else "")), flush=True)
     try:
         srv.serve_forever()

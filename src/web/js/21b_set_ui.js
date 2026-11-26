@@ -16,7 +16,7 @@ async function stTiles(c){
   /* сервер данных */
   if(!ds)stTileSet('st-t2','mu','Нет данных','Не удалось получить статус');
   else if(ds.mode==='server')stTileSet('st-t2','pos','Подключён',String(ds.url||'').replace(/^https?:\/\//,''));
-  else if(ds.mode==='direct')stTileSet('st-t2','mu','Напрямую',(c.data_server||'').toLowerCase()==='off'?'Сервер отключён вручную':'Прямые запросы к источникам');
+  else if(ds.mode==='direct')stTileSet('st-t2','mu','Напрямую','Прямые запросы к источникам');
   else stTileSet('st-t2','warn','Недоступен','Работаем напрямую, повтор через '+(ds.retry_in||'…')+' с');
   /* Telegram-бот */
   const loggedIn=au&&au.state==='ok'&&(au.username||au.expires);

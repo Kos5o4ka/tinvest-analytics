@@ -476,6 +476,18 @@ class Server(unittest.TestCase):
         self.assertEqual(cur2["bot_goals_rev"], 1)
         self.assertEqual([g["isin"] for g in cur2["goals"]], ["RU000A100001"])
 
+    def test_bot_goal_seen_by_app_not_resurrected(self):
+        self.st.put(1, self.sub(goals=[]))
+        self.st.upsert_bot_goal(1, {"isin": "RU000A10BOT1", "name": "Бот", "target_price": 95.0})       # rev 1
+        self.st.upsert_bot_goal(1, {"isin": "RU000A10BOT2", "name": "Бот 2", "target_price": 96.0})   # rev 2
+        # программа уже получила rev 1 и удалила BOT1 у себя: синхронизация с rev 1 не воскрешает BOT1
+        self.st.put(1, self.sub(goals=[], bot_goals_rev=1))
+        cur = self.st.get(1)["sub"]
+        self.assertEqual({g["isin"] for g in cur["goals"]}, {"RU000A10BOT2"})
+        self.st.delete_bot_goal(1, "RU000A10BOT2")                   # rev 3
+        self.assertEqual(SA.fresh_bot_deleted(self.st.get(1)["sub"], 2), ["RU000A10BOT2"])
+        self.assertEqual(SA.fresh_bot_deleted(self.st.get(1)["sub"], 3), [])
+
     def test_bot_goal_deletion_not_clobbered_and_watch_only(self):
         self.st.put(1, self.sub())
         rev = self.st.delete_bot_goal(1, "RU000A100001")

@@ -217,6 +217,19 @@ class Update(unittest.TestCase):
         open(L.APP, "wb").write(b"raise RuntimeError('broken')\n")
         self.assertEqual(L.run_inprocess([], L.Console()), 0)
 
+    def test_no_bak_fallback_on_interrupt_or_late_crash(self):
+        os.makedirs(L.APP_DIR)
+        open(L.APP + ".bak", "wb").write(b"import sys\nsys.exit(7)\n")
+        open(L.APP, "wb").write(b"raise KeyboardInterrupt\n")
+        self.assertEqual(L.run_inprocess([], L.Console()), 130)               # Ctrl+C — выход, а не запуск старой версии
+        open(L.APP, "wb").write(b"raise RuntimeError('late')\n")
+        import unittest.mock as mock
+        ts = iter([0.0, L.APP_START_GRACE + 5.0])
+        with mock.patch.object(L.time, "time", side_effect=lambda: next(ts)):
+            res = {}
+            L._exec_app([], res)
+        self.assertIn("late", res.get("err", ""))                              # упала после запуска — .bak не трогаем
+
 
 class NativeWindow(unittest.TestCase):
     def test_want_native(self):
