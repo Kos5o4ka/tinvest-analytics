@@ -23,7 +23,7 @@ function pBonds(){
   if(!b)return`<div class="card">${waitBox('Загружаю параметры облигаций и графики купонов…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   const m=b.metrics,tot=S.data.portfolio.total||1;
-  if(!m.count)returnemptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);
+  if(!m.count)return emptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);
   let rows=b.rows.slice();rows.forEach(r=>{r.rk=r.rating?RSC.indexOf(r.rating.v):null;r.next_d=r.next?r.next[0]:null;r.next_sum=r.next&&r.next[1]!=null?r.next[1]*(r.qty||0):null});const{k,d}=S.bsort;
   rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
   const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(1,...rows.map(r=>Math.min(r.ytm||0,60))),mxD=Math.max(...rows.map(r=>r.dur||0));
@@ -102,7 +102,7 @@ function radarCard(rad,compact){
     }else if(x.kind==='amort'){
       det=`выплата ${M(x.amount_rub,'rub',0)}${x.valueprc!=null?' ('+pctp(x.valueprc,1)+' номинала)':''}`;
     }
-    const attr=x.isin?` data-isin="${esc(x.isin)}" style="cursor:pointer;border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"`:` style="border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"`;
+    const attr=x.isin?` data-isin="${esc(x.isin)}" style="cursor:pointer;border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--card2);border-radius:6px;font-size:13px"`:` style="border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--card2);border-radius:6px;font-size:13px"`;
     return`<div${attr}><div class="row" style="justify-content:space-between;gap:8px;flex-wrap:wrap"><span><b>${esc(x.name)}</b> <span class="tag" style="color:${k.c}">${k.l}</span></span><span class="num mu">${ddm(x.date)} (через ${x.days_left} дн.)</span></div><div class="t2" style="margin-top:3px;font-size:12.5px">${det}</div></div>`;
   }).join('');
   const more=compact&&items.length>5?`<div class="mu" style="font-size:12px;margin-top:4px">И ещё ${items.length-5} во вкладке «Облигации».</div>`:'';

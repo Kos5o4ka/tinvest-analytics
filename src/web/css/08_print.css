@@ -1,14 +1,18 @@
 /* ── печать / PDF ── */
 @media print{
-  aside,.top .btn,.top .seg,.upd,#tip,.noprint,#boot-splash{display:none!important}
-  html,body{height:auto;overflow:visible;display:block;background:#fff!important}
+  :root,:root[data-theme=dark],:root[data-theme=light]{
+    --bg:#fff;--card:#fff;--card2:#f1f5f9;--line:#e2e8f0;--line2:#cbd5e1;
+    --tx:#0f172a;--tx2:#475569;--mu:#64748b;color-scheme:light
+  }
+  aside,.top .btn,.top .seg,.upd,#tip,.noprint,#boot-splash,#tkr{display:none!important}
+  html,body{height:auto;overflow:visible;display:block;background:#fff!important;color:var(--tx)!important}
   main{display:block}#view{overflow:visible;padding:0}
   .top{padding:0 0 10px;border:0}.pronly{display:block;color:#666;font-size:12px;width:100%}
-  .card{break-inside:avoid;box-shadow:none}.tbl{max-height:none!important;overflow:visible!important}
+  .card{break-inside:avoid;box-shadow:none}.card.tx-decl-card{break-inside:auto}.tbl{max-height:none!important;overflow:visible!important}
   .wrap{max-width:none}
   @page{margin:12mm}
 }
 @media print{
-  .disc{display:block!important;position:fixed;left:0;right:0;bottom:0;border:0;padding:0 0 2mm;color:#666;font-size:9px}
+  .disc{display:block!important;position:static;margin-top:12px;border:0;padding:6px 0 0;color:#666;font-size:9px}
   #toast,#kp-ov,#restore-bar{display:none!important}
 }

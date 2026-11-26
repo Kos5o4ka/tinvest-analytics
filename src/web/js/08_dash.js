@@ -67,7 +67,7 @@ function concCard(c){
   const b=c.below_a_minus||{},u=c.unrated_bonds||{},ws=c.warnings||[];
   const wHtml=ws.length?`<div style="margin-bottom:12px">${ws.map(w=>{
     const txt=w.kind==='sector'&&w.sector?`${esc(SECT[w.sector]||w.sector)} — ${pctp(w.value,1)} портфеля (порог ${f0(w.threshold)}%)`:esc(w.detail);
-    return`<div style="border-left:3px solid var(--${w.severity==='high'?'neg':'warn'});padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"><b>${esc(w.title)}:</b> ${txt}</div>`;
+    return`<div style="border-left:3px solid var(--${w.severity==='high'?'neg':'warn'});padding:7px 12px;margin-bottom:6px;background:var(--card2);border-radius:6px;font-size:13px"><b>${esc(w.title)}:</b> ${txt}</div>`;
   }).join('')}</div>`:'';
   const iss=(c.issuers||[]).slice(0,5).map((x,i)=>({n:x.name,v:x.share,c:x.share>15?S8:PAL[i%PAL.length]}));
   const sec=(c.sectors||[]).slice(0,5).map((x,i)=>({n:x.key?(SECT[x.key]||(x.key==='etf'?'Фонды':x.key)):'Без сектора',v:x.share,c:x.key&&x.key!=='etf'&&x.share>35?S8:PAL[i%PAL.length]}));

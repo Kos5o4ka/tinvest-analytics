@@ -5,7 +5,7 @@
 .tx .tx-ul li{margin:3px 0}
 .tx .card h2 .sp{font-weight:400}
 .tx select.in,.tx input[type=date].in{min-width:150px}
-@media print{.tx .tx-tabs{display:none!important}.tx .card{break-inside:avoid}}
+@media print{.tx .tx-tabs{display:none!important}.tx .card{break-inside:avoid}.tx .card.tx-decl-card{break-inside:auto}.tx .card.tx-decl-card tr{break-inside:avoid}}
 
 /* блоки вкладок налогов идут подряд без общей сетки: отступ, чтобы карточки не слипались */
 .tx>.g+*,.tx>.card+*,.tx>.tbl+*{margin-top:16px}

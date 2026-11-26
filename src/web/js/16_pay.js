@@ -1,20 +1,23 @@
 /* ── Выплаты ── */
 const PAY_UI={tab:'plan'};
-const PAY_J={st:'idle',data:null,err:'',acc:null,tries:0};
+const PAY_J={st:'idle',data:null,err:'',acc:null,tries:0,req:0};
 
 function pjLoad(){
-  if(PAY_J.st==='load')return;
-  const acc=S.account;PAY_J.st='load';PAY_J.acc=acc;PAY_J.err='';
+  const acc=S.account;
+  if(PAY_J.st==='load'&&PAY_J.acc===acc)return;
+  PAY_J.st='load';PAY_J.acc=acc;PAY_J.err='';
+  const req=++PAY_J.req;
   api('/api/pay/journal?'+new URLSearchParams({account:acc})).then(j=>{
-    if(S.account!==acc)return;
+    if(req!==PAY_J.req)return;
+    if(S.account!==acc){PAY_J.st='idle';if(S.page==='pay')renderSoon();return}
     if(j&&j.stale&&PAY_J.tries<10){PAY_J.tries++;PAY_J.data=j;PAY_J.st='ok';setTimeout(()=>{if(S.account===acc&&PAY_UI.tab==='journal'){PAY_J.st='idle';pjLoad()}},4000)}
     else{PAY_J.data=j;PAY_J.st='ok';PAY_J.tries=0}
     if(S.page==='pay')renderSoon();
-  }).catch(e=>{if(S.account!==acc)return;PAY_J.st='err';PAY_J.err=e.message||'Не удалось загрузить журнал выплат';if(S.page==='pay')renderSoon()});
+  }).catch(e=>{if(req!==PAY_J.req)return;if(S.account!==acc){PAY_J.st='idle';if(S.page==='pay')renderSoon();return}PAY_J.st='err';PAY_J.err=e.message||'Не удалось загрузить журнал выплат';if(S.page==='pay')renderSoon()});
 }
 
 function pjRender(){
-  if(PAY_J.acc!==null&&PAY_J.acc!==S.account&&PAY_J.st!=='load'){PAY_J.st='idle';PAY_J.data=null}
+  if(PAY_J.acc!==null&&PAY_J.acc!==S.account){PAY_J.st='idle';PAY_J.data=null;PAY_J.tries=0}
   if(PAY_J.st==='idle')pjLoad();
   if(PAY_J.st==='load'||PAY_J.st==='idle')return`<div class="card">${waitBox('Собираю фактические выплаты и считаю YOC…')}</div>`;
   if(PAY_J.st==='err')return`<div class="msg err">${esc(PAY_J.err)} <button class="btn ghost pj-retry">Повторить</button></div>`;
@@ -50,7 +53,7 @@ function payTabs(){
 function pPay(){
   const tab=PAY_UI.tab;
   if(tab==='journal')return payTabs()+pjRender();
-  if(tab==='cf36'){CF36.open=true;return payTabs()+cf36Section()}
+  if(tab==='cf36')return payTabs()+cf36Section();
   const b=S.bonds;
   if(!b)return payTabs()+`<div class="card">${waitBox('Собираю графики купонов и объявленные дивиденды…')}</div>`;
   if(b.error)return payTabs()+`<div class="msg err">${esc(b.error)}</div>`;
@@ -75,7 +78,7 @@ function pPay(){
 
 
 /* ── Матрица потоков на 3 года + «Снежный ком 2.0» (грузится лениво, при открытии раздела) ── */
-const CF36={open:false,st:'idle',data:null,err:'',acc:null,rate:'lqdt',traj:'flat',own:'12',reinv:true,usePut:true,useCall:false,tries:0};
+const CF36={open:false,st:'idle',data:null,err:'',acc:null,rate:'lqdt',traj:'flat',own:'12',reinv:true,usePut:true,useCall:false,tries:0,req:0};
 const CF36_K=[['coupon','Купоны',S1],['dividend','Дивиденды',S3],['amortization','Амортизации',S5],['redemption','Погашения',S4]];
 const cf36Pct=v=>v==null||isNaN(v)?'—':(+v).toFixed(2).replace('.',',')+' %';
 /* K(m) = K(m−1)·(1 + r(m)/12) + CF(m) — та же формула, что cf36_simulate на сервере */
@@ -122,7 +125,7 @@ function cf36SimMonths(){
       row.total+=amt;offerAdded+=amt;offerCount++;
       if(of.maturity_ym&&of.maturity_amount>0&&byYm[of.maturity_ym]){
         const mr=byYm[of.maturity_ym];
-        const red=+(mr.by&&mr.by.redemption||mr.total||0);
+        const red=+(mr.by&&mr.by.redemption!=null?mr.by.redemption:(mr.total||0));
         const sub=Math.min(+of.maturity_amount,red,mr.total);
         mr.total=Math.max(0,mr.total-sub);
         maturityShifted+=sub;
@@ -138,14 +141,17 @@ function cf36SimMonths(){
   return{months:ms,offerAdded,maturityShifted,offerCount,coupDiv,amortRed};
 }
 function cf36Load(){
-  if(CF36.st==='load')return;
-  const acc=S.account;CF36.st='load';CF36.acc=acc;CF36.err='';
+  const acc=S.account;
+  if(CF36.st==='load'&&CF36.acc===acc)return;
+  CF36.st='load';CF36.acc=acc;CF36.err='';
+  const req=++CF36.req;
   api('/api/cashflow36?'+new URLSearchParams({account:acc})).then(j=>{
-    if(S.account!==acc)return;
+    if(req!==CF36.req)return;
+    if(S.account!==acc){CF36.st='idle';if(S.page==='pay')renderSoon();return}
     if(j&&j.stale&&CF36.tries<10){CF36.tries++;CF36.data=j;CF36.st='ok';setTimeout(()=>{if(S.account===acc&&CF36.open){CF36.st='idle';cf36Load()}},4000)}
     else{CF36.data=j;CF36.st='ok';CF36.tries=0}
     if(S.page==='pay')renderSoon();
-  }).catch(e=>{if(S.account!==acc)return;CF36.st='err';CF36.err=e.message||'Не удалось получить данные';if(S.page==='pay')renderSoon()});
+  }).catch(e=>{if(req!==CF36.req)return;if(S.account!==acc){CF36.st='idle';if(S.page==='pay')renderSoon();return}CF36.st='err';CF36.err=e.message||'Не удалось получить данные';if(S.page==='pay')renderSoon()});
 }
 function cf36Grid(d){
   const ms=d.months||[],mx=Math.max(...ms.map(m=>m.total),1);
@@ -231,7 +237,7 @@ function cf36Body(){
     <p class="note">${(d.notes||[]).map(esc).join(' ')} Оценки помечены штриховкой; дивиденды не гарантированы и могут быть отменены или изменены, а будущие ставки — отличаться от прогноза. Это не инвестиционная рекомендация.</p>`;
 }
 function cf36Section(){
-  if(CF36.acc!==null&&CF36.acc!==S.account&&CF36.st!=='load'){CF36.st='idle';CF36.data=null}
+  if(CF36.acc!==null&&CF36.acc!==S.account){CF36.st='idle';CF36.data=null;CF36.tries=0}
   if(CF36.open&&CF36.st==='idle')cf36Load();
   if(CF36.open)chart('cf36-chart',(el)=>cf36Line(el),{});
   return`<div class="card cf36"><h2>Матрица потоков на 3 года<span class="sp"><button class="btn ghost cf36-tgl">${CF36.open?'Свернуть':'Показать'}</button></span></h2>
@@ -239,7 +245,7 @@ function cf36Section(){
 }
 document.addEventListener('click',e=>{
   const t=e.target;if(!t.closest)return;
-  const pt=t.closest('#pay-tabs [data-ptab]');if(pt){PAY_UI.tab=pt.dataset.ptab;render();return}
+  const pt=t.closest('#pay-tabs [data-ptab]');if(pt){PAY_UI.tab=pt.dataset.ptab;if(PAY_UI.tab==='cf36')CF36.open=true;render();return}
   if(t.closest('.pj-retry')){PAY_J.st='idle';PAY_J.tries=0;render();return}
   if(t.closest('.cf36-tgl')){CF36.open=!CF36.open;render();return}
   if(t.closest('.cf36-retry')){CF36.st='idle';CF36.tries=0;render();return}

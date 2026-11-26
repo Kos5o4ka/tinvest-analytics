@@ -1,7 +1,7 @@
 /* ── Налоговая оптимизация ── */
 .txo .txo-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin:10px 0}
 .txo .txo-form .field .in{width:100%}
-.txo .txo-sub{margin:14px 0 6px;font-size:14px;color:var(--text)}
+.txo .txo-sub{margin:14px 0 6px;font-size:14px;color:var(--tx)}
 .txo .txo-warn{color:var(--neg)}
 .txo ul.txo-ul{margin:6px 0 0;padding-left:20px;line-height:1.6}
 .txo .tag.txo-ldv{border:1px solid var(--neg);color:var(--neg)}

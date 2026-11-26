@@ -82,6 +82,7 @@ async function renderSettings(){
   const view=$('#view'),keep=view.querySelector('.st')?view.scrollTop:0;
   try{S.cfg=await api('/api/config')}catch(e){view.innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
   const c=S.cfg;
+  updateModeBadge(c);
   const msg=stMsg;
   /* подключение */
   const conn=stGroup('Т-Инвестиции',
@@ -168,6 +169,7 @@ async function renderSettings(){
   /* токен: кнопка активна, пока в поле есть новое значение */
   const dTok=stDirty('save',['tok','sb']);stEnter(['tok'],'save');
   $('#save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await post('/api/config',body());const r=await post('/api/test');reset();
+    try{S.cfg=await api('/api/config');updateModeBadge(S.cfg)}catch(_){updateModeBadge({token_set:true,sandbox:$('#sb').checked})}
     msg(`Подключено. Счетов: ${r.accounts}.`,1);S.page='dash';persist();renderNav();load(true)}catch(x){msg(x.message);dTok.upd()}};
   $('#test').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/config',body());const r=await post('/api/test');msg(`Подключение работает. Счетов: ${r.accounts}.`,1)});
   /* песочница и SSL — переключатели сохраняются сразу */
@@ -175,7 +177,7 @@ async function renderSettings(){
   $('#sb').onchange=e=>{const el=e.currentTarget;if(el.checked===!!c.sandbox)return;
     stMsg(el.checked?'Вставьте токен песочницы и нажмите «Сохранить и подключиться».':'Вставьте боевой токен (только чтение) и нажмите «Сохранить и подключиться».',1)};
   $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Заново загрузить все операции и цены из Т-Инвестиций? Это может занять время.'))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
-  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});reset();renderSettings()});
+  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
   if($('#sbpay'))$('#sbpay').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sandbox/payin',{accountId:S.account,amount:$('#amt').value});S.data=S.bonds=S.hist=null;msg('Счёт пополнен на '+M(+$('#amt').value,'rub',0),1);load(true)});
 }

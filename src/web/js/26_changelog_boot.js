@@ -125,7 +125,14 @@ let _lgN=0;
 function LOGO_SVG(px){const n='lg'+(++_lgN),sz=typeof px==='number'?px:28;
   return `<svg width="${sz}" height="${sz}" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="${n}g" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#2563eb"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient><linearGradient id="${n}a" x1="12" y1="6" x2="26" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.08)"/><path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="url(#${n}g)"/><path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="url(#${n}g)"/><path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="url(#${n}a)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`}
 setInterval(()=>{fetch('/api/ping').catch(()=>{})},20000);fetch('/api/ping').catch(()=>{});
-(async()=>{
+function updateModeBadge(c){
+  const m=$('#mode');if(!m)return;
+  c=c||S.cfg||{};
+  m.className='badge'+(c.sandbox?' sb':'');
+  m.innerHTML=c.token_set?'<b></b>'+(c.sandbox?'Песочница':'Боевой режим'):'';
+}
+async function boot(){
+  await Promise.resolve();
   try{
   if(!PAGES.some(p=>p&&p[0]===S.page))S.page='dash';
   if(!PERIODS.some(p=>p[0]===S.period))S.period='all';
@@ -134,7 +141,7 @@ setInterval(()=>{fetch('/api/ping').catch(()=>{})},20000);fetch('/api/ping').cat
   const c=S.cfg||{};
   try{uxSeenSync()}catch(e){}
   $('#ver').textContent='v'+(c.version||'');$('#ver').onclick=()=>{go('set');setTimeout(()=>{const w=$('#whatsnew');if(w)w.scrollIntoView({behavior:'smooth'})},400)};
-  $('#mode').className='badge'+(c.sandbox?' sb':'');$('#mode').innerHTML=c.token_set?'<b></b>'+(c.sandbox?'Песочница':'Боевой режим'):'';
+  updateModeBadge(c);
   if(!c.token_set&&!(c.imports||[]).length){
     if(typeof NO_PORTFOLIO_PAGES!=='undefined'&&NO_PORTFOLIO_PAGES.has(S.page)){renderNav();render();return}
     S.page='set';renderNav();renderSettings();bootDone();return;
@@ -142,4 +149,5 @@ setInterval(()=>{fetch('/api/ping').catch(()=>{})},20000);fetch('/api/ping').cat
   bootStatus('Синхронизирую данные Мосбиржи…');
   if(['set','imp','kb'].includes(S.page)){render();load(false)}else load(false);
   }catch(e){bootDone()}
-})();
+}
+boot();

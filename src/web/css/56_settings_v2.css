@@ -86,7 +86,7 @@
 .st-row.stack .st-c{justify-content:flex-start;flex-wrap:nowrap}
 .st-row.stack .st-wide{flex:1}
 .st-row.stack .ld-path{flex:1}
-.st-row.hit{background:#3b82f60d;box-shadow:inset 2px 0 0 var(--ac)}
+.st-row.st-hit,.st-row.hit{background:#3b82f60d;box-shadow:inset 2px 0 0 var(--ac)}
 .st-pad{padding:4px 20px 18px}
 .st-line{margin:0;padding:12px 20px;border-top:1px solid var(--line);font-size:12.5px;color:var(--mu);line-height:1.5}
 .st-line:empty{display:none}

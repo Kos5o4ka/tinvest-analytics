@@ -7,10 +7,24 @@ function txoF(){
   return Object.assign({open_year:new Date().getFullYear(),contribution:400000,yield:12,years:10,bracket:'13',income:'',coupon_share:50,reinvest:'1',ldv:'1'},S.txo.F||{});
 }
 function txoLoadH(force){
-  if(S.txo.hBusy)return;S.txo.hBusy=1;const acc=S.account;
+  const acc=S.account;
+  if(S.txo.hBusy&&S.txo.hBusyAcc===acc)return;
+  S.txo.hBusy=1;S.txo.hBusyAcc=acc;
+  const req=(S.txo.hReq||0)+1;S.txo.hReq=req;
   const p=Object.assign({account:acc},S.txo.fee!==''?{fee:S.txo.fee}:{},S.txo.skip?{skip_ldv2:'1'}:{},force?{force:'1'}:{});
-  api('/api/txo/harvest?'+new URLSearchParams(p)).then(j=>{S.txo.hBusy=0;S.txo.hAcc=acc;S.txo.hErr=null;S.txo.h=j;if(S.page==='txo'&&S.account===acc)renderSoon()})
-   .catch(e=>{S.txo.hBusy=0;S.txo.hAcc=acc;S.txo.h=null;S.txo.hErr=e.message;if(S.page==='txo')renderSoon()});
+  api('/api/txo/harvest?'+new URLSearchParams(p)).then(j=>{
+    if(req!==S.txo.hReq)return;
+    S.txo.hBusy=0;
+    if(S.account!==acc){if(S.page==='txo')renderSoon();return}
+    S.txo.hAcc=acc;S.txo.hErr=null;S.txo.h=j;
+    if(S.page==='txo')renderSoon();
+  }).catch(e=>{
+    if(req!==S.txo.hReq)return;
+    S.txo.hBusy=0;
+    if(S.account!==acc){if(S.page==='txo')renderSoon();return}
+    S.txo.hAcc=acc;S.txo.h=null;S.txo.hErr=e.message;
+    if(S.page==='txo')renderSoon();
+  });
 }
 function txoLoadP(){
   if(S.txo.pBusy)return;S.txo.pBusy=1;

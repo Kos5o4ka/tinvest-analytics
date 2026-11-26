@@ -561,5 +561,70 @@ class TestJsSmoke(unittest.TestCase):
         self.assertEqual(emoji_rx.findall(joined), [], "Color emojis found in src/web/js/*.js")
 
 
+class TestFrontendBugfixes(unittest.TestCase):
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _read(self, rel):
+        with open(os.path.join(self.ROOT, rel), encoding="utf-8") as f:
+            return f.read()
+
+    def test_bug1_no_returnemptyHint(self):
+        import glob
+        import re
+        for p in glob.glob(os.path.join(self.ROOT, "src/web/js/*.js")):
+            txt = open(p, encoding="utf-8").read()
+            self.assertIsNone(re.search(r"\breturnemptyHint\s*\(", txt), f"returnemptyHint in {p}")
+        for rel in ("src/web/js/09_ret.js", "src/web/js/12_bonds.js", "src/web/js/25_reb.js"):
+            self.assertIn("return emptyHint(", self._read(rel))
+
+    def test_bug2_no_undefined_css_vars(self):
+        import glob
+        import re
+        for ext in ("src/web/js/*.js", "src/web/css/*.css"):
+            for p in glob.glob(os.path.join(self.ROOT, ext)):
+                txt = open(p, encoding="utf-8").read()
+                self.assertIsNone(re.search(r"var\(--(?:bg2|text)\)", txt), f"Undefined CSS var in {p}")
+        self.assertIn("var(--card2)", self._read("src/web/js/08_dash.js"))
+        self.assertIn("var(--card2)", self._read("src/web/js/12_bonds.js"))
+        self.assertIn("var(--tx)", self._read("src/web/css/39_txo.css"))
+
+    def test_bug3_print_css_and_tax_decl_breaks(self):
+        pcss = self._read("src/web/css/08_print.css")
+        for v in ("--bg:", "--card:", "--card2:", "--tx:", "--tx2:", "--mu:", "--line:", "--line2:"):
+            self.assertIn(v, pcss, f"Missing print theme reset {v}")
+        self.assertIn("#tkr", pcss)
+        self.assertNotIn("position:fixed", pcss)
+        self.assertIn("tx-decl-card", pcss)
+        self.assertIn('class="tkr noprint" id="tkr"', self._read("src/web/shell.html"))
+        self.assertIn(".tx-decl-card{break-inside:auto}", self._read("src/web/css/20_tax.css"))
+        self.assertIn('class="card tx-decl-card"', self._read("src/web/js/19_tax.js"))
+
+    def test_bug6_boot_waits_for_late_pages(self):
+        boot = self._read("src/web/js/26_changelog_boot.js")
+        self.assertIn("async function boot()", boot)
+        idx_await = boot.index("await Promise.resolve()")
+        idx_check = boot.index("if(!PAGES.some(")
+        self.assertLess(idx_await, idx_check)
+
+    def test_bug7_9_10_pay_and_txo(self):
+        pay = self._read("src/web/js/16_pay.js")
+        self.assertIn("PAY_J.acc===acc", pay)
+        self.assertIn("CF36.acc===acc", pay)
+        self.assertIn("if(S.account!==acc){PAY_J.st='idle'", pay)
+        self.assertIn("if(S.account!==acc){CF36.st='idle'", pay)
+        self.assertNotIn("if(tab==='cf36'){CF36.open=true;", pay)
+        self.assertIn("mr.by.redemption!=null?mr.by.redemption:(mr.total||0)", pay)
+
+        txo = self._read("src/web/js/54_txo.js")
+        self.assertIn("S.txo.hBusyAcc===acc", txo)
+        self.assertIn("if(S.account!==acc){if(S.page==='txo')renderSoon();return}", txo)
+
+    def test_bug12_settings_mode_badge_and_hit_selector(self):
+        sui = self._read("src/web/js/21b_set_ui.js")
+        self.assertGreaterEqual(sui.count("updateModeBadge("), 3)
+        scss = self._read("src/web/css/56_settings_v2.css")
+        self.assertIn(".st-row.st-hit", scss)
+
+
 if __name__ == "__main__":
     unittest.main()

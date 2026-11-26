@@ -27422,16 +27422,20 @@ textarea.in{resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;fo
 }
 /* ── печать / PDF ── */
 @media print{
-  aside,.top .btn,.top .seg,.upd,#tip,.noprint,#boot-splash{display:none!important}
-  html,body{height:auto;overflow:visible;display:block;background:#fff!important}
+  :root,:root[data-theme=dark],:root[data-theme=light]{
+    --bg:#fff;--card:#fff;--card2:#f1f5f9;--line:#e2e8f0;--line2:#cbd5e1;
+    --tx:#0f172a;--tx2:#475569;--mu:#64748b;color-scheme:light
+  }
+  aside,.top .btn,.top .seg,.upd,#tip,.noprint,#boot-splash,#tkr{display:none!important}
+  html,body{height:auto;overflow:visible;display:block;background:#fff!important;color:var(--tx)!important}
   main{display:block}#view{overflow:visible;padding:0}
   .top{padding:0 0 10px;border:0}.pronly{display:block;color:#666;font-size:12px;width:100%}
-  .card{break-inside:avoid;box-shadow:none}.tbl{max-height:none!important;overflow:visible!important}
+  .card{break-inside:avoid;box-shadow:none}.card.tx-decl-card{break-inside:auto}.tbl{max-height:none!important;overflow:visible!important}
   .wrap{max-width:none}
   @page{margin:12mm}
 }
 @media print{
-  .disc{display:block!important;position:fixed;left:0;right:0;bottom:0;border:0;padding:0 0 2mm;color:#666;font-size:9px}
+  .disc{display:block!important;position:static;margin-top:12px;border:0;padding:6px 0 0;color:#666;font-size:9px}
   #toast,#kp-ov,#restore-bar{display:none!important}
 }
 [data-isin]{cursor:pointer}
@@ -27744,7 +27748,7 @@ tr.scr-low td{opacity:.5}
 .tx .tx-ul li{margin:3px 0}
 .tx .card h2 .sp{font-weight:400}
 .tx select.in,.tx input[type=date].in{min-width:150px}
-@media print{.tx .tx-tabs{display:none!important}.tx .card{break-inside:avoid}}
+@media print{.tx .tx-tabs{display:none!important}.tx .card{break-inside:avoid}.tx .card.tx-decl-card{break-inside:auto}.tx .card.tx-decl-card tr{break-inside:avoid}}
 
 /* блоки вкладок налогов идут подряд без общей сетки: отступ, чтобы карточки не слипались */
 .tx>.g+*,.tx>.card+*,.tx>.tbl+*{margin-top:16px}
@@ -28137,7 +28141,7 @@ tr.scr-low td{opacity:.5}
 /* ── Налоговая оптимизация ── */
 .txo .txo-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin:10px 0}
 .txo .txo-form .field .in{width:100%}
-.txo .txo-sub{margin:14px 0 6px;font-size:14px;color:var(--text)}
+.txo .txo-sub{margin:14px 0 6px;font-size:14px;color:var(--tx)}
 .txo .txo-warn{color:var(--neg)}
 .txo ul.txo-ul{margin:6px 0 0;padding-left:20px;line-height:1.6}
 .txo .tag.txo-ldv{border:1px solid var(--neg);color:var(--neg)}
@@ -28934,7 +28938,7 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 .st-row.stack .st-c{justify-content:flex-start;flex-wrap:nowrap}
 .st-row.stack .st-wide{flex:1}
 .st-row.stack .ld-path{flex:1}
-.st-row.hit{background:#3b82f60d;box-shadow:inset 2px 0 0 var(--ac)}
+.st-row.st-hit,.st-row.hit{background:#3b82f60d;box-shadow:inset 2px 0 0 var(--ac)}
 .st-pad{padding:4px 20px 18px}
 .st-line{margin:0;padding:12px 20px;border-top:1px solid var(--line);font-size:12.5px;color:var(--mu);line-height:1.5}
 .st-line:empty{display:none}
@@ -29074,7 +29078,7 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
   <div class="side-foot"><span class="badge" id="mode"></span><button class="ver" id="ver" title="Что нового"></button></div>
 </aside>
 <main>
-  <div class="tkr" id="tkr" hidden></div>
+  <div class="tkr noprint" id="tkr" hidden></div>
   <div class="top">
     <h1 id="title">Обзор</h1>
     <div class="acc-dd" id="acc-dd"></div>
@@ -29748,7 +29752,7 @@ function concCard(c){
   const b=c.below_a_minus||{},u=c.unrated_bonds||{},ws=c.warnings||[];
   const wHtml=ws.length?`<div style="margin-bottom:12px">${ws.map(w=>{
     const txt=w.kind==='sector'&&w.sector?`${esc(SECT[w.sector]||w.sector)} — ${pctp(w.value,1)} портфеля (порог ${f0(w.threshold)}%)`:esc(w.detail);
-    return`<div style="border-left:3px solid var(--${w.severity==='high'?'neg':'warn'});padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"><b>${esc(w.title)}:</b> ${txt}</div>`;
+    return`<div style="border-left:3px solid var(--${w.severity==='high'?'neg':'warn'});padding:7px 12px;margin-bottom:6px;background:var(--card2);border-radius:6px;font-size:13px"><b>${esc(w.title)}:</b> ${txt}</div>`;
   }).join('')}</div>`:'';
   const iss=(c.issuers||[]).slice(0,5).map((x,i)=>({n:x.name,v:x.share,c:x.share>15?S8:PAL[i%PAL.length]}));
   const sec=(c.sectors||[]).slice(0,5).map((x,i)=>({n:x.key?(SECT[x.key]||(x.key==='etf'?'Фонды':x.key)):'Без сектора',v:x.share,c:x.key&&x.key!=='etf'&&x.share>35?S8:PAL[i%PAL.length]}));
@@ -29787,7 +29791,7 @@ function pRet(){
   const h=S.hist;
   if(!h)return`<div class="card">${waitBox('Восстанавливаю историю стоимости портфеля по дневным ценам закрытия. Первый раз это может занять до минуты — дальше данные берутся из локальной базы.')}</div>`;
   if(h.error)return`<div class="msg err">${esc(h.error)}</div>`;
-  if(!h.days.length)returnemptyHint('Доходность считается по операциям: пополнениям, сделкам и выплатам. Подключите Т-Инвестиции или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['set','Настройки']]);
+  if(!h.days.length)return emptyHint('Доходность считается по операциям: пополнениям, сделкам и выплатам. Подключите Т-Инвестиции или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['set','Настройки']]);
   const hs=histSlice();
   const ms=Object.keys(h.monthly).sort(),years=[...new Set(ms.map(m=>m.slice(0,4)))].sort().reverse();
   const inP=m=>{const s=periodStart(),e=periodEnd();return(!s||m>=s.slice(0,7))&&(!e||m<=e.slice(0,7))};
@@ -29984,7 +29988,7 @@ function pBonds(){
   if(!b)return`<div class="card">${waitBox('Загружаю параметры облигаций и графики купонов…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   const m=b.metrics,tot=S.data.portfolio.total||1;
-  if(!m.count)returnemptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);
+  if(!m.count)return emptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);
   let rows=b.rows.slice();rows.forEach(r=>{r.rk=r.rating?RSC.indexOf(r.rating.v):null;r.next_d=r.next?r.next[0]:null;r.next_sum=r.next&&r.next[1]!=null?r.next[1]*(r.qty||0):null});const{k,d}=S.bsort;
   rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
   const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(1,...rows.map(r=>Math.min(r.ytm||0,60))),mxD=Math.max(...rows.map(r=>r.dur||0));
@@ -30063,7 +30067,7 @@ function radarCard(rad,compact){
     }else if(x.kind==='amort'){
       det=`выплата ${M(x.amount_rub,'rub',0)}${x.valueprc!=null?' ('+pctp(x.valueprc,1)+' номинала)':''}`;
     }
-    const attr=x.isin?` data-isin="${esc(x.isin)}" style="cursor:pointer;border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"`:` style="border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--bg2);border-radius:6px;font-size:13px"`;
+    const attr=x.isin?` data-isin="${esc(x.isin)}" style="cursor:pointer;border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--card2);border-radius:6px;font-size:13px"`:` style="border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--card2);border-radius:6px;font-size:13px"`;
     return`<div${attr}><div class="row" style="justify-content:space-between;gap:8px;flex-wrap:wrap"><span><b>${esc(x.name)}</b> <span class="tag" style="color:${k.c}">${k.l}</span></span><span class="num mu">${ddm(x.date)} (через ${x.days_left} дн.)</span></div><div class="t2" style="margin-top:3px;font-size:12.5px">${det}</div></div>`;
   }).join('');
   const more=compact&&items.length>5?`<div class="mu" style="font-size:12px;margin-top:4px">И ещё ${items.length-5} во вкладке «Облигации».</div>`:'';
@@ -30666,21 +30670,24 @@ function payDays(ps,limit){
 
 /* ── Выплаты ── */
 const PAY_UI={tab:'plan'};
-const PAY_J={st:'idle',data:null,err:'',acc:null,tries:0};
+const PAY_J={st:'idle',data:null,err:'',acc:null,tries:0,req:0};
 
 function pjLoad(){
-  if(PAY_J.st==='load')return;
-  const acc=S.account;PAY_J.st='load';PAY_J.acc=acc;PAY_J.err='';
+  const acc=S.account;
+  if(PAY_J.st==='load'&&PAY_J.acc===acc)return;
+  PAY_J.st='load';PAY_J.acc=acc;PAY_J.err='';
+  const req=++PAY_J.req;
   api('/api/pay/journal?'+new URLSearchParams({account:acc})).then(j=>{
-    if(S.account!==acc)return;
+    if(req!==PAY_J.req)return;
+    if(S.account!==acc){PAY_J.st='idle';if(S.page==='pay')renderSoon();return}
     if(j&&j.stale&&PAY_J.tries<10){PAY_J.tries++;PAY_J.data=j;PAY_J.st='ok';setTimeout(()=>{if(S.account===acc&&PAY_UI.tab==='journal'){PAY_J.st='idle';pjLoad()}},4000)}
     else{PAY_J.data=j;PAY_J.st='ok';PAY_J.tries=0}
     if(S.page==='pay')renderSoon();
-  }).catch(e=>{if(S.account!==acc)return;PAY_J.st='err';PAY_J.err=e.message||'Не удалось загрузить журнал выплат';if(S.page==='pay')renderSoon()});
+  }).catch(e=>{if(req!==PAY_J.req)return;if(S.account!==acc){PAY_J.st='idle';if(S.page==='pay')renderSoon();return}PAY_J.st='err';PAY_J.err=e.message||'Не удалось загрузить журнал выплат';if(S.page==='pay')renderSoon()});
 }
 
 function pjRender(){
-  if(PAY_J.acc!==null&&PAY_J.acc!==S.account&&PAY_J.st!=='load'){PAY_J.st='idle';PAY_J.data=null}
+  if(PAY_J.acc!==null&&PAY_J.acc!==S.account){PAY_J.st='idle';PAY_J.data=null;PAY_J.tries=0}
   if(PAY_J.st==='idle')pjLoad();
   if(PAY_J.st==='load'||PAY_J.st==='idle')return`<div class="card">${waitBox('Собираю фактические выплаты и считаю YOC…')}</div>`;
   if(PAY_J.st==='err')return`<div class="msg err">${esc(PAY_J.err)} <button class="btn ghost pj-retry">Повторить</button></div>`;
@@ -30716,7 +30723,7 @@ function payTabs(){
 function pPay(){
   const tab=PAY_UI.tab;
   if(tab==='journal')return payTabs()+pjRender();
-  if(tab==='cf36'){CF36.open=true;return payTabs()+cf36Section()}
+  if(tab==='cf36')return payTabs()+cf36Section();
   const b=S.bonds;
   if(!b)return payTabs()+`<div class="card">${waitBox('Собираю графики купонов и объявленные дивиденды…')}</div>`;
   if(b.error)return payTabs()+`<div class="msg err">${esc(b.error)}</div>`;
@@ -30741,7 +30748,7 @@ function pPay(){
 
 
 /* ── Матрица потоков на 3 года + «Снежный ком 2.0» (грузится лениво, при открытии раздела) ── */
-const CF36={open:false,st:'idle',data:null,err:'',acc:null,rate:'lqdt',traj:'flat',own:'12',reinv:true,usePut:true,useCall:false,tries:0};
+const CF36={open:false,st:'idle',data:null,err:'',acc:null,rate:'lqdt',traj:'flat',own:'12',reinv:true,usePut:true,useCall:false,tries:0,req:0};
 const CF36_K=[['coupon','Купоны',S1],['dividend','Дивиденды',S3],['amortization','Амортизации',S5],['redemption','Погашения',S4]];
 const cf36Pct=v=>v==null||isNaN(v)?'—':(+v).toFixed(2).replace('.',',')+' %';
 /* K(m) = K(m−1)·(1 + r(m)/12) + CF(m) — та же формула, что cf36_simulate на сервере */
@@ -30788,7 +30795,7 @@ function cf36SimMonths(){
       row.total+=amt;offerAdded+=amt;offerCount++;
       if(of.maturity_ym&&of.maturity_amount>0&&byYm[of.maturity_ym]){
         const mr=byYm[of.maturity_ym];
-        const red=+(mr.by&&mr.by.redemption||mr.total||0);
+        const red=+(mr.by&&mr.by.redemption!=null?mr.by.redemption:(mr.total||0));
         const sub=Math.min(+of.maturity_amount,red,mr.total);
         mr.total=Math.max(0,mr.total-sub);
         maturityShifted+=sub;
@@ -30804,14 +30811,17 @@ function cf36SimMonths(){
   return{months:ms,offerAdded,maturityShifted,offerCount,coupDiv,amortRed};
 }
 function cf36Load(){
-  if(CF36.st==='load')return;
-  const acc=S.account;CF36.st='load';CF36.acc=acc;CF36.err='';
+  const acc=S.account;
+  if(CF36.st==='load'&&CF36.acc===acc)return;
+  CF36.st='load';CF36.acc=acc;CF36.err='';
+  const req=++CF36.req;
   api('/api/cashflow36?'+new URLSearchParams({account:acc})).then(j=>{
-    if(S.account!==acc)return;
+    if(req!==CF36.req)return;
+    if(S.account!==acc){CF36.st='idle';if(S.page==='pay')renderSoon();return}
     if(j&&j.stale&&CF36.tries<10){CF36.tries++;CF36.data=j;CF36.st='ok';setTimeout(()=>{if(S.account===acc&&CF36.open){CF36.st='idle';cf36Load()}},4000)}
     else{CF36.data=j;CF36.st='ok';CF36.tries=0}
     if(S.page==='pay')renderSoon();
-  }).catch(e=>{if(S.account!==acc)return;CF36.st='err';CF36.err=e.message||'Не удалось получить данные';if(S.page==='pay')renderSoon()});
+  }).catch(e=>{if(req!==CF36.req)return;if(S.account!==acc){CF36.st='idle';if(S.page==='pay')renderSoon();return}CF36.st='err';CF36.err=e.message||'Не удалось получить данные';if(S.page==='pay')renderSoon()});
 }
 function cf36Grid(d){
   const ms=d.months||[],mx=Math.max(...ms.map(m=>m.total),1);
@@ -30897,7 +30907,7 @@ function cf36Body(){
     <p class="note">${(d.notes||[]).map(esc).join(' ')} Оценки помечены штриховкой; дивиденды не гарантированы и могут быть отменены или изменены, а будущие ставки — отличаться от прогноза. Это не инвестиционная рекомендация.</p>`;
 }
 function cf36Section(){
-  if(CF36.acc!==null&&CF36.acc!==S.account&&CF36.st!=='load'){CF36.st='idle';CF36.data=null}
+  if(CF36.acc!==null&&CF36.acc!==S.account){CF36.st='idle';CF36.data=null;CF36.tries=0}
   if(CF36.open&&CF36.st==='idle')cf36Load();
   if(CF36.open)chart('cf36-chart',(el)=>cf36Line(el),{});
   return`<div class="card cf36"><h2>Матрица потоков на 3 года<span class="sp"><button class="btn ghost cf36-tgl">${CF36.open?'Свернуть':'Показать'}</button></span></h2>
@@ -30905,7 +30915,7 @@ function cf36Section(){
 }
 document.addEventListener('click',e=>{
   const t=e.target;if(!t.closest)return;
-  const pt=t.closest('#pay-tabs [data-ptab]');if(pt){PAY_UI.tab=pt.dataset.ptab;render();return}
+  const pt=t.closest('#pay-tabs [data-ptab]');if(pt){PAY_UI.tab=pt.dataset.ptab;if(PAY_UI.tab==='cf36')CF36.open=true;render();return}
   if(t.closest('.pj-retry')){PAY_J.st='idle';PAY_J.tries=0;render();return}
   if(t.closest('.cf36-tgl')){CF36.open=!CF36.open;render();return}
   if(t.closest('.cf36-retry')){CF36.st='idle';CF36.tries=0;render();return}
@@ -31243,7 +31253,7 @@ function txDecl(d){
         sls.slice(0,200).map(s=>`<tr${stkAttrIf(s.ticker)}><td class="l">${tDt(s.sdate)}</td><td class="l">${tDt(s.bdate)}</td><td class="l">${esc(s.name)}<br><small class="mu">${esc(s.ticker)}${kindLbl[s.kind]?' · '+kindLbl[s.kind]:''}</small></td><td class="num">${NF0.format(s.qty)}</td><td class="num">${tR(s.proceeds)}</td><td class="num">${tR(s.cost)}</td><td class="num">${tR(s.fee)}</td><td class="num ${cls(s.result)}">${tS(s.result)}</td><td class="num">${s.ldv?`Да (${s.yrs} г.)`:'—'}</td></tr>`).join('')
       }</tbody></table></div>`:(g.lines.length?`<h3 style="margin:14px 0 6px;font-size:13px">Сделки по бумагам (до 80 крупнейших по результату)</h3><div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Кол-во</th><th>Выручка</th><th>Расход</th><th>Комиссия продажи</th><th>Результат</th><th>из них ЛДВ</th></tr></thead><tbody>${
         g.lines.map(l=>`<tr${stkAttrIf(l.ticker)}><td class="l">${esc(l.name)}<br><small class="mu">${esc(l.ticker)}${kindLbl[l.kind]?' · '+kindLbl[l.kind]:''}</small></td><td class="num">${NF0.format(l.qty)}</td><td class="num">${tR(l.proceeds)}</td><td class="num">${tR(l.cost)}</td><td class="num">${tR(l.fee)}</td><td class="num ${cls(l.result)}">${tS(l.result)}</td><td class="num">${Math.abs(l.ldv_result)>0.5?tS(l.ldv_result):'—'}</td></tr>`).join('')}</tbody></table></div>`:'');
-    return`<div class="card"><h2>${esc(g.name)}<span class="sp">${y}</span></h2><div class="tbl"><table><tbody>${rowsT.map(r=>`<tr><td class="l">${r[0]}</td><td class="num">${r[1]}</td></tr>`).join('')}</tbody></table></div>
+    return`<div class="card tx-decl-card"><h2>${esc(g.name)}<span class="sp">${y}</span></h2><div class="tbl"><table><tbody>${rowsT.map(r=>`<tr><td class="l">${r[0]}</td><td class="num">${r[1]}</td></tr>`).join('')}</tbody></table></div>
       ${iis?`<p class="note"><b>Вычет по ИИС (тип А):</b> взносы за год ${tR(iis.deposits)}, в вычет идёт ${tR(iis.deduct_base)}, к возврату до ${tR(iis.deduct)} (не больше уплаченного НДФЛ).</p>`:''}
       ${carryBox}${fxBox}${salesBox}</div>`}).join('')+
     `<p class="note">Данные для заполнения 3-НДФЛ — справочные. Если налог удержан брокером полностью, декларация нужна, чтобы заявить вычет по ИИС, ЛДВ или перенос убытка. Справку о доходах и удержанном налоге запросите у брокера.</p>`;
@@ -31819,6 +31829,7 @@ async function renderSettings(){
   const view=$('#view'),keep=view.querySelector('.st')?view.scrollTop:0;
   try{S.cfg=await api('/api/config')}catch(e){view.innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
   const c=S.cfg;
+  updateModeBadge(c);
   const msg=stMsg;
   /* подключение */
   const conn=stGroup('Т-Инвестиции',
@@ -31905,6 +31916,7 @@ async function renderSettings(){
   /* токен: кнопка активна, пока в поле есть новое значение */
   const dTok=stDirty('save',['tok','sb']);stEnter(['tok'],'save');
   $('#save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await post('/api/config',body());const r=await post('/api/test');reset();
+    try{S.cfg=await api('/api/config');updateModeBadge(S.cfg)}catch(_){updateModeBadge({token_set:true,sandbox:$('#sb').checked})}
     msg(`Подключено. Счетов: ${r.accounts}.`,1);S.page='dash';persist();renderNav();load(true)}catch(x){msg(x.message);dTok.upd()}};
   $('#test').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/config',body());const r=await post('/api/test');msg(`Подключение работает. Счетов: ${r.accounts}.`,1)});
   /* песочница и SSL — переключатели сохраняются сразу */
@@ -31912,7 +31924,7 @@ async function renderSettings(){
   $('#sb').onchange=e=>{const el=e.currentTarget;if(el.checked===!!c.sandbox)return;
     stMsg(el.checked?'Вставьте токен песочницы и нажмите «Сохранить и подключиться».':'Вставьте боевой токен (только чтение) и нажмите «Сохранить и подключиться».',1)};
   $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Заново загрузить все операции и цены из Т-Инвестиций? Это может занять время.'))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
-  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});reset();renderSettings()});
+  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
   if($('#sbpay'))$('#sbpay').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sandbox/payin',{accountId:S.account,amount:$('#amt').value});S.data=S.bonds=S.hist=null;msg('Счёт пополнен на '+M(+$('#amt').value,'rub',0),1);load(true)});
 }
@@ -32214,7 +32226,7 @@ function rebTaxHtml(act,keys){
 }
 function pReb(){
   const ps=S.data.portfolio.positions,tot=ps.reduce((a,x)=>a+(x.value_rub||0),0);
-  if(!(tot>0))returnemptyHint('Ребалансировке нужны активы в портфеле. Выберите счёт с бумагами или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']]);
+  if(!(tot>0))return emptyHint('Ребалансировке нужны активы в портфеле. Выберите счёт с бумагами или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']]);
   const cur={};ps.forEach(x=>{const t=x.type||'other';cur[t]=(cur[t]||0)+(x.value_rub||0)});
   if(!S.reb.draft)S.reb.draft=Object.assign({},(S.cfg&&S.cfg.targets)||{});
   const tg=S.reb.draft;
@@ -32385,7 +32397,14 @@ let _lgN=0;
 function LOGO_SVG(px){const n='lg'+(++_lgN),sz=typeof px==='number'?px:28;
   return `<svg width="${sz}" height="${sz}" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="${n}g" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#2563eb"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient><linearGradient id="${n}a" x1="12" y1="6" x2="26" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.08)"/><path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="url(#${n}g)"/><path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="url(#${n}g)"/><path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="url(#${n}a)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`}
 setInterval(()=>{fetch('/api/ping').catch(()=>{})},20000);fetch('/api/ping').catch(()=>{});
-(async()=>{
+function updateModeBadge(c){
+  const m=$('#mode');if(!m)return;
+  c=c||S.cfg||{};
+  m.className='badge'+(c.sandbox?' sb':'');
+  m.innerHTML=c.token_set?'<b></b>'+(c.sandbox?'Песочница':'Боевой режим'):'';
+}
+async function boot(){
+  await Promise.resolve();
   try{
   if(!PAGES.some(p=>p&&p[0]===S.page))S.page='dash';
   if(!PERIODS.some(p=>p[0]===S.period))S.period='all';
@@ -32394,7 +32413,7 @@ setInterval(()=>{fetch('/api/ping').catch(()=>{})},20000);fetch('/api/ping').cat
   const c=S.cfg||{};
   try{uxSeenSync()}catch(e){}
   $('#ver').textContent='v'+(c.version||'');$('#ver').onclick=()=>{go('set');setTimeout(()=>{const w=$('#whatsnew');if(w)w.scrollIntoView({behavior:'smooth'})},400)};
-  $('#mode').className='badge'+(c.sandbox?' sb':'');$('#mode').innerHTML=c.token_set?'<b></b>'+(c.sandbox?'Песочница':'Боевой режим'):'';
+  updateModeBadge(c);
   if(!c.token_set&&!(c.imports||[]).length){
     if(typeof NO_PORTFOLIO_PAGES!=='undefined'&&NO_PORTFOLIO_PAGES.has(S.page)){renderNav();render();return}
     S.page='set';renderNav();renderSettings();bootDone();return;
@@ -32402,7 +32421,8 @@ setInterval(()=>{fetch('/api/ping').catch(()=>{})},20000);fetch('/api/ping').cat
   bootStatus('Синхронизирую данные Мосбиржи…');
   if(['set','imp','kb'].includes(S.page)){render();load(false)}else load(false);
   }catch(e){bootDone()}
-})();
+}
+boot();
 // ── карточка облигации (боковая панель): клик по любому элементу с data-isin ──
 const BC={stack:[],tok:0,all:false,iss:{}};
 const BC_SEC={financial:'Финансы',industrials:'Промышленность',materials:'Сырьё',energy:'Энергетика',consumer:'Потребительский',government:'Государственные',real_estate:'Недвижимость',telecom:'Телеком',municipal:'Муниципальные',utilities:'Коммунальные',it:'IT',health_care:'Здравоохранение',other:'Прочее'};
@@ -36520,10 +36540,24 @@ function txoF(){
   return Object.assign({open_year:new Date().getFullYear(),contribution:400000,yield:12,years:10,bracket:'13',income:'',coupon_share:50,reinvest:'1',ldv:'1'},S.txo.F||{});
 }
 function txoLoadH(force){
-  if(S.txo.hBusy)return;S.txo.hBusy=1;const acc=S.account;
+  const acc=S.account;
+  if(S.txo.hBusy&&S.txo.hBusyAcc===acc)return;
+  S.txo.hBusy=1;S.txo.hBusyAcc=acc;
+  const req=(S.txo.hReq||0)+1;S.txo.hReq=req;
   const p=Object.assign({account:acc},S.txo.fee!==''?{fee:S.txo.fee}:{},S.txo.skip?{skip_ldv2:'1'}:{},force?{force:'1'}:{});
-  api('/api/txo/harvest?'+new URLSearchParams(p)).then(j=>{S.txo.hBusy=0;S.txo.hAcc=acc;S.txo.hErr=null;S.txo.h=j;if(S.page==='txo'&&S.account===acc)renderSoon()})
-   .catch(e=>{S.txo.hBusy=0;S.txo.hAcc=acc;S.txo.h=null;S.txo.hErr=e.message;if(S.page==='txo')renderSoon()});
+  api('/api/txo/harvest?'+new URLSearchParams(p)).then(j=>{
+    if(req!==S.txo.hReq)return;
+    S.txo.hBusy=0;
+    if(S.account!==acc){if(S.page==='txo')renderSoon();return}
+    S.txo.hAcc=acc;S.txo.hErr=null;S.txo.h=j;
+    if(S.page==='txo')renderSoon();
+  }).catch(e=>{
+    if(req!==S.txo.hReq)return;
+    S.txo.hBusy=0;
+    if(S.account!==acc){if(S.page==='txo')renderSoon();return}
+    S.txo.hAcc=acc;S.txo.h=null;S.txo.hErr=e.message;
+    if(S.page==='txo')renderSoon();
+  });
 }
 function txoLoadP(){
   if(S.txo.pBusy)return;S.txo.pBusy=1;
