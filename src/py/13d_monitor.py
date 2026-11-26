@@ -294,7 +294,15 @@ def build_monitor(cfg, acc):
 
 def _build_monitor(cfg, acc, th, t0):
     tm = {}
-    b = build_bonds(cfg, acc)
+    try:
+        b = build_bonds(cfg, acc)
+    except ApiError as e:
+        if e.status != 404:
+            raise
+        return {"empty": True, "updated": time.time(), "thresholds": th, "alerts": [], "rows": [],
+                "summary": {s: 0 for s in _SEV}, "timings": tm,
+                "notes": ["Добавьте API-токен в «Настройках» или импортируйте отчёт брокера."],
+                "log": {"events": 0, "since": None}, "cal_days": 0}
     tm["bonds"] = round(time.time() - t0, 2)
     rows = [r for r in (b.get("rows") or []) if r.get("isin") and r.get("qty")]
     return _monitor_core(rows, th, t0, tm, [])

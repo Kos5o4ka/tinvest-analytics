@@ -134,8 +134,13 @@ def ld_events(maturity, call, nominal, qty, k, amort, today, use_offer):
 
 
 def ladder_portfolio(cfg, acc="all"):
-    rep = build_bonds(cfg, acc)
     today = date.today().isoformat()
+    try:
+        rep = build_bonds(cfg, acc)
+    except ApiError as e:
+        if e.status != 404:
+            raise
+        return {"today": today, "empty": True, "value": 0.0, "variants": {}, "has_offers": False, "has_calls": False, "undated": []}
     rows = [r for r in rep.get("rows", []) if r.get("qty") and r.get("nominal") and (r.get("maturity") or r.get("call"))]
     value = sum(r.get("value_rub") or 0.0 for r in rep.get("rows", []))
     if not rows:

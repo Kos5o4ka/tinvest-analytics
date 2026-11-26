@@ -687,19 +687,34 @@ def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exa
                 b = bond_info(client, uid)
             except Exception:  # noqa: BLE001
                 b = None
+        allow_net = client is None or getattr(client, "ready", False)
         ex = (exacts or {}).get(uid)
         bz = (ex or {}).get("bz")
         if bz is None and isin:
-            try:
-                bz = moex_bondization(isin)
-            except Exception:  # noqa: BLE001
-                bz = None
+            if allow_net:
+                try:
+                    bz = moex_bondization(isin)
+                except Exception:  # noqa: BLE001
+                    bz = None
+            else:
+                try:
+                    _bv = store().get("bondiz2:" + isin, ttl=BC_TTL)
+                    bz = _bv if (_bv and _bv.get("ok")) else None
+                except Exception:  # noqa: BLE001
+                    bz = None
         opt = None
         if isin:
-            try:
-                opt = moex_bond_options(isin)
-            except Exception:  # noqa: BLE001
-                opt = None
+            if allow_net:
+                try:
+                    opt = moex_bond_options(isin)
+                except Exception:  # noqa: BLE001
+                    opt = None
+            else:
+                try:
+                    _ov = store().get("bopt1:" + isin, ttl=BC_TTL)
+                    opt = _ov if (_ov and _ov.get("ok")) else None
+                except Exception:  # noqa: BLE001
+                    opt = None
 
         mat = ((b or {}).get("maturity") or "")[:10]
         name = r.get("name") or (b or {}).get("name") or r.get("ticker") or isin
@@ -711,7 +726,7 @@ def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exa
             offs = []
 
         raw_coupons = list((bz or {}).get("coupons") or [])
-        if not raw_coupons and isin:
+        if not raw_coupons and isin and allow_net:
             try:
                 sched = moex_coupon_schedule(isin)
             except Exception:  # noqa: BLE001

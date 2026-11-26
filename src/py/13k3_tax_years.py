@@ -278,7 +278,8 @@ def tx_group_open(st, g):
 def tx_cur_tax(g, extra, cy, settings):
     """Налог текущего года по группе с дополнительными (гипотетическими) продажами."""
     exempt = g["kind"] == "iis" and g["iis"]["exempt"]
-    rows, _ = tax_group_years(g["sales"], g["inc"], settings["loss_carry"] if g["kind"] == "gen" else None, exempt, extra, settings.get("offset_coupons", False))
+    iis_limit = TAX_IIS3_EXEMPT_LIMIT if g["kind"] == "iis" and g["iis"]["type"] == "3" else None
+    rows, _ = tax_group_years(g["sales"], g["inc"], settings["loss_carry"] if g["kind"] == "gen" else None, exempt, extra, settings.get("offset_coupons", False), iis_limit)
     for r in rows:
         if r["year"] == cy:
             return r["tax"], r

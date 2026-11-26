@@ -12,7 +12,7 @@ PJ_TYPE_RU = {
 def _pj_fx_rate(cur, iso_day, fx_fallback, warns):
     """Курс валюты к рублю на дату выплаты: сначала ЦБ РФ на дату, затем текущий курс, иначе 1.0."""
     cur = (cur or "rub").lower()
-    if cur in ("", "rub"):
+    if cur in ("", "rub", "sur"):
         return 1.0
     r = None
     try:
@@ -27,7 +27,20 @@ def _pj_fx_rate(cur, iso_day, fx_fallback, warns):
     return float(r)
 
 
-def build_pay_journal(ops, names, client=None, today=None):
+def _pj_fifo_lots(ops, names, client=None, held=None):
+    """Сортирует операции, применяет обмены бумаг (ГДР -> акции и т.п.) и строит FIFO-лоты."""
+    cops = sorted(
+        [o for o in (ops or []) if not str(o.get("state") or "").endswith("CANCELED")],
+        key=lambda o: o.get("date") or "",
+    )
+    resolve = (lambda t: benchmark_uid(client, t)) if (client is not None and getattr(client, "ready", False)) else None
+    events = find_conversions(cops, names, held, resolve=resolve)
+    if events:
+        cops = apply_conversions(cops, events)
+    return fifo(cops)
+
+
+def build_pay_journal(ops, names, client=None, today=None, account_groups=None):
     """Строит журнал фактических купонов и дивидендов и рассчитывает YOC по FIFO-стоимости."""
     t_today = today or date.today()
     d12m = (t_today - timedelta(days=365)).isoformat()
@@ -36,7 +49,19 @@ def build_pay_journal(ops, names, client=None, today=None):
         [o for o in (ops or []) if not str(o.get("state") or "").endswith("CANCELED")],
         key=lambda o: o.get("date") or "",
     )
-    lots = fifo(clean_ops)
+    if account_groups:
+        lots = {}
+        for acc_ops, acc_held in account_groups:
+            for uid, lot in _pj_fifo_lots(acc_ops, names, client, acc_held).items():
+                q = float(lot.get("qty") or 0.0)
+                c = float(lot.get("cost") or 0.0)
+                if q <= 1e-9:
+                    continue
+                cur_lot = lots.setdefault(uid, {"qty": 0.0, "cost": 0.0})
+                cur_lot["qty"] += q
+                cur_lot["cost"] += c
+    else:
+        lots = _pj_fifo_lots(clean_ops, names, client)
 
     # Определяем валюту покупки по операциям/инструменту для пересчёта FIFO-стоимости в рубли
     buy_cur = {}
@@ -45,14 +70,14 @@ def build_pay_journal(ops, names, client=None, today=None):
         k = classify(o.get("type"))
         uid = o.get("instrumentUid") or o.get("figi") or ""
         cur = cur_of(o.get("payment"))
-        if k in ("buy", "sec_in") and uid and cur:
+        if k == "buy" and uid and cur:
             buy_cur[uid] = cur
-        elif k in ("coupons", "dividends") and cur and cur != "rub":
+        elif k in ("coupons", "dividends") and cur and cur not in ("rub", "sur"):
             payout_curs.add(cur)
 
     for uid in lots:
         c = buy_cur.get(uid) or ((names.get(uid) or {}).get("cur") or "rub").lower()
-        if c and c != "rub":
+        if c and c not in ("rub", "sur"):
             payout_curs.add(c)
 
     fx_fallback = {}
@@ -198,7 +223,7 @@ def build_pay_journal(ops, names, client=None, today=None):
 
     securities = []
     for sec in by_sec.values():
-        if sec["total_rub"] <= 0 and sec["cost_rub"] <= 0:
+        if sec["count"] <= 0 and sec["cost_rub"] <= 0:
             continue
         sec["coupons_rub"] = round(sec["coupons_rub"], 2)
         sec["dividends_rub"] = round(sec["dividends_rub"], 2)
@@ -246,7 +271,17 @@ def pay_journal_payload(cfg, acc, force=False):
                 keys.add((x.get("instrumentUid"), x.get("figi")))
         keys |= _op_inst_keys(ops)
         names = instruments(client, keys)
-        return build_pay_journal(ops, names, client=client)
+        account_groups = []
+        if acc == "all" and len(data) > 1:
+            for d in data:
+                acc_held = {}
+                for x in (d.get("port") or {}).get("positions") or []:
+                    u = x.get("instrumentUid") or x.get("figi")
+                    q = qf(x.get("quantity"))
+                    if u and q > 0:
+                        acc_held[u] = acc_held.get(u, 0.0) + q
+                account_groups.append((d["ops"], acc_held or None))
+        return build_pay_journal(ops, names, client=client, account_groups=account_groups or None)
 
     return cached_result("pay_journal", cfg, acc, BONDS_TTL, compute, force)
 

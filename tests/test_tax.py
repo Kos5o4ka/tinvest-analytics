@@ -605,3 +605,25 @@ class NdflDeclarationPackage(unittest.TestCase):
         with self.assertRaises(M.ApiError):
             M.tax_decl_csv_get({}, "all", {"year": "bad"}, False)
 
+    def test_tx_cur_tax_iis_type_b_unlimited_and_sur_as_rub(self):
+        # BUG #23: ИИС-Б освобождён без лимита 30 млн (iis_limit=None), ИИС-3 ограничен TAX_IIS3_EXEMPT_LIMIT
+        sale = {"sdate": date(2025, 6, 1), "bdate": date(2024, 1, 1), "qty": 1.0, "type": "share",
+                "proceeds": 35_000_000.0, "cost": 0.0, "fee": 0.0,
+                "bucket": "sec", "result": 35_000_000.0, "income": 35_000_000.0, "ldv": False, "blind": False}
+        g_b = {"kind": "iis", "iis": {"exempt": True, "type": "B"}, "sales": [sale], "inc": {}}
+        g_3 = {"kind": "iis", "iis": {"exempt": True, "type": "3"}, "sales": [sale], "inc": {}}
+        settings = {"loss_carry": {}, "offset_coupons": False}
+        tax_b, _ = M.tx_cur_tax(g_b, [], 2025, settings)
+        tax_3, _ = M.tx_cur_tax(g_3, [], 2025, settings)
+        self.assertEqual(tax_b, 0.0)
+        self.assertGreater(tax_3, 0.0)
+
+        # BUG #23: валюта "sur" считается как "rub" (курс 1.0, без предупреждения fx_sur)
+        ops = [
+            op("2025-04-01", "COUPON", pay=100.0, uid="u1", cur="sur", name="ОФЗ"),
+        ]
+        eng = M.tax_engine(ops, {"u1": {"type": "bond"}}, fx=lambda c, d: 99.0 if c != "rub" else 1.0)
+        self.assertEqual(eng["payouts"][0]["rate"], 1.0)
+        self.assertAlmostEqual(eng["payouts"][0]["amount_rub"], 100.0, places=2)
+        self.assertEqual(eng["warnings"], [])
+

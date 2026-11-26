@@ -340,3 +340,30 @@ class PrimaryCalendarUnavailable(unittest.TestCase):
             M.http_text, M.ds_parsed = saved[0], saved[1]
             M._pri.clear()
             M._pri.update(saved[2])
+
+
+class PrimaryScreenerPopulate(unittest.TestCase):
+    """BUG #22: primary_payload вызывает screener_payload(), если _scr['rows'] пуст."""
+
+    def test_primary_payload_populates_screener_when_empty(self):
+        called = []
+        fake_scr = [{"id": "RU0001", "kind": "corp", "cur": "RUB", "yield": 18.5, "rating": {"v": "A"}, "dur": 2.0}]
+
+        def fake_screener():
+            called.append(True)
+            M._scr["rows"] = list(fake_scr)
+
+        saved = (M.primary_rows, M.screener_payload, M.key_rate_series, M.primary_snapshot, dict(M._scr))
+        try:
+            M.primary_rows = lambda: []
+            M.screener_payload = fake_screener
+            M.key_rate_series = lambda: []
+            M.primary_snapshot = lambda rows: None
+            M._scr["rows"] = []
+            res = M.primary_payload()
+        finally:
+            M.primary_rows, M.screener_payload, M.key_rate_series, M.primary_snapshot = saved[:4]
+            M._scr.clear()
+            M._scr.update(saved[4])
+        self.assertEqual(len(called), 1)
+        self.assertEqual(res["peer_medians"], {"A": 18.5})

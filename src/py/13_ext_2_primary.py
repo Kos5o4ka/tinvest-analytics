@@ -144,6 +144,12 @@ def primary_payload():
     except Exception as e:  # noqa: BLE001
         rows, cal_error = [], str(e)[:200]      # без календаря экран всё равно показывает размещения Мосбиржи и калькулятор
     scr = _scr.get("rows") or []
+    if not scr:
+        try:
+            screener_payload()
+            scr = _scr.get("rows") or []
+        except Exception:  # noqa: BLE001
+            scr = []
     rusfar = None
     try:
         kr = key_rate_series()

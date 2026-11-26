@@ -254,7 +254,21 @@ def goal_defaults(cfg, acc):
 
 def calc_goal_get(cfg, acc, q, force=False):
     """GET /api/calc/goal?monthly=&years=|date=&yield=&value=&real=1&infl=  Ручные значения важнее данных портфеля; без токена работают только они."""
-    out = {"defaults": goal_defaults(cfg, acc), "infl": _goal_infl(), "tax": GOAL_TAX, "result": None, "error": None}
+    real = (q.get("real") or "1") not in ("0", "false", "")
+    i_param, i_err = None, None
+    try:
+        i_param = _goal_float(q, "infl")
+    except (ValueError, TypeError) as e:
+        i_err = str(e)
+    infl_info = _goal_infl() if (real and i_param is None and i_err is None) else {
+        "value": i_param if i_param is not None else 4.0,
+        "estimate": i_param is None,
+        "source": "ручной ввод" if i_param is not None else "условное значение",
+    }
+    out = {"defaults": goal_defaults(cfg, acc), "infl": infl_info, "tax": GOAL_TAX, "result": None, "error": None}
+    if i_err is not None:
+        out["error"] = i_err
+        return out
     try:
         monthly = _goal_float(q, "monthly")
         if monthly is None or monthly <= 0:
@@ -267,12 +281,10 @@ def calc_goal_get(cfg, acc, q, force=False):
             return out
         v = _goal_float(q, "value")
         v = (dfl["value"] or 0.0) if v is None else v
-        i = _goal_float(q, "infl")
-        i = out["infl"]["value"] if i is None else i
+        i = infl_info["value"] if i_param is None else i_param
         inc = _goal_float(q, "income")
         if inc is None:
             inc = dfl["income_month"] if dfl["income_month"] is not None else (v * y / 100.0 * (1 - GOAL_TAX) / 12.0 if v else None)
-        real = (q.get("real") or "1") not in ("0", "false", "")
         out["result"] = goal_calc(monthly, goal_months(q), y, v, i, real, inc)
         out["result"].update(yield_pct=y, infl_pct=i, real=real, monthly=monthly)
     except (ValueError, TypeError) as e:

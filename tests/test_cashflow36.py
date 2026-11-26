@@ -248,6 +248,127 @@ class OfferReinvest(unittest.TestCase):
         sim_hike = M.cf36_simulate_offers(months, tr["items"]["hike"]["rates"], offers=offers, offer_kinds=("offer_put",))
         self.assertGreater(sim_hike["final"], sim_cut["final"])
 
+    def test_simulate_offers_removes_post_flows_and_zero_redemption(self):
+        today = date(2026, 11, 25)
+        keys = M.cf36_month_keys(today)
+        months = [{"ym": k, "total": 100.0, "by": {"coupon": 100.0, "amortization": 0.0, "redemption": 0.0}} for k in keys]
+        months[7]["total"] += 500.0
+        months[7]["by"]["amortization"] = 500.0
+        # В месяце погашения redemption == 0.0 (только купон 100): red == 0.0 не должен сбрасываться на total!
+        offers = [{
+            "uid": "u1", "isin": "RU1", "name": "B1", "date": keys[5] + "-15", "ym": keys[5],
+            "kind": "offer_put", "amount": 10000.0, "maturity_ym": keys[-1], "maturity_amount": 10000.0,
+            "post_coupons": {keys[6]: 100.0, keys[7]: 100.0},
+            "post_amorts": {keys[7]: 500.0},
+        }]
+        sim = M.cf36_simulate_offers(months, 0.0, offers=offers, offer_kinds=("offer_put",))
+        # Было 36*100 + 500 = 4100; добавлена оферта +10000, сняты 2 купона (-200) и амортизация (-500),
+        # а в последнем месяце redemption == 0.0 => купон 100 не вычитается! Итого 4100 + 10000 - 700 = 13400.
+        self.assertAlmostEqual(sim["final_no"], 13400.0, places=2)
+        self.assertEqual(sim["maturity_shifted"], 0.0)
+
+    def test_cashflow36_payload_reads_rep_rows_for_offers(self):
+        today = date.today()
+        put_d = (today + timedelta(days=90)).isoformat()
+        mat_d = (today + timedelta(days=400)).isoformat()
+        names = ("build_summary", "bonds_report", "stock_dividends", "cf36_rates", "TInvest",
+                 "moex_bondization", "moex_bond_options")
+        saved = {k: getattr(M, k) for k in names}
+        M.build_summary = lambda cfg, acc, per: {"portfolio": {"positions": []}}
+        M.bonds_report = lambda c, rows, horizon_days=365: {
+            "rows": [{"uid": "u1", "isin": "RU000TEST001", "ticker": "T1", "name": "Тест",
+                      "qty": 5.0, "nominal": 1000.0, "face_cur": "rub", "maturity": mat_d, "put_date": put_d}],
+            "payments": [{"date": put_d, "kind": "coupon", "name": "Тест", "ticker": "T1", "amount": 50.0, "est": False},
+                         {"date": mat_d, "kind": "coupon", "name": "Тест", "ticker": "T1", "amount": 50.0, "est": False}],
+        }
+        M.TInvest = lambda cfg: object()
+        M.stock_dividends = lambda *a, **k: {"items": []}
+        M.cf36_rates = lambda: {"lqdt": 13.0, "ofz1y": 14.0}
+        M.moex_bondization = lambda isin: None
+        M.moex_bond_options = lambda isin: None
+        try:
+            r = M.cashflow36_payload({"token": "t", "sandbox": False}, "all", True)
+        finally:
+            for k, v in saved.items():
+                setattr(M, k, v)
+        self.assertEqual(r["offer_summary"]["put_count"], 1)
+        self.assertEqual(r["offers"][0]["post_coupons"], {mat_d[:7]: 50.0})
+
+
+class PayJournalRegressions(unittest.TestCase):
+    def test_sur_sec_in_negative_net_and_conversions(self):
+        today = date(2026, 11, 25)
+        ops = [
+            # Конвертация старой ГДР в новую акцию перед FIFO
+            {"id": "1", "date": "2024-01-10T10:00:00Z", "type": "OPERATION_TYPE_BUY", "instrumentUid": "old_gdr",
+             "quantityDone": 10, "payment": {"currency": "sur", "units": -1000, "nano": 0}},
+            {"id": "2", "date": "2025-02-01T10:00:00Z", "type": "OPERATION_TYPE_INPUT_SECURITIES", "instrumentUid": "new_sh",
+             "quantityDone": 10, "payment": {"currency": "rub", "units": 0, "nano": 0}},
+            {"id": "3", "date": "2026-06-01T10:00:00Z", "type": "OPERATION_TYPE_DIVIDEND", "instrumentUid": "new_sh",
+             "payment": {"currency": "sur", "units": 100, "nano": 0}},
+            # Бумага с sec_in в USD (payment cur="rub", но инструмент USD)
+            {"id": "4", "date": "2025-03-01T10:00:00Z", "type": "OPERATION_TYPE_INPUT_SECURITIES", "instrumentUid": "usd_b",
+             "quantityDone": 2, "payment": {"currency": "rub", "units": -100, "nano": 0}},
+            # Бумага с отрицательным нетто (выплата < 0, но count > 0)
+            {"id": "5", "date": "2026-07-01T10:00:00Z", "type": "OPERATION_TYPE_COUPON", "instrumentUid": "neg_b",
+             "payment": {"currency": "rub", "units": -50, "nano": 0}},
+        ]
+        names = {
+            "old_gdr": {"uid": "old_gdr", "name": "TCSG GDR", "ticker": "TCSG", "type": "share", "cur": "rub"},
+            "new_sh": {"uid": "new_sh", "name": "Т-Технологии", "ticker": "T", "type": "share", "cur": "rub"},
+            "usd_b": {"uid": "usd_b", "name": "USD Bond", "ticker": "USDB", "type": "bond", "cur": "usd"},
+            "neg_b": {"uid": "neg_b", "name": "Neg Bond", "ticker": "NEGB", "type": "bond", "cur": "rub"},
+        }
+        saved = (M.tax_cbr_rate, M.find_conversions, M.apply_conversions)
+        M.tax_cbr_rate = lambda cur, iso: 90.0 if (cur or "").lower() == "usd" else 1.0
+        M.find_conversions = lambda o, n, h=None, resolve=None: [{"old_uid": "old_gdr", "new_uid": "new_sh", "ratio": 1.0}]
+        M.apply_conversions = lambda o, ev: [
+            {"id": "conv_b", "date": "2024-01-10T10:00:00Z", "type": "OPERATION_TYPE_BUY", "instrumentUid": "new_sh",
+             "quantityDone": 10, "payment": {"currency": "sur", "units": -1000, "nano": 0}},
+            *[x for x in o if x["id"] not in ("1", "2")],
+        ]
+        try:
+            res = M.build_pay_journal(ops, names, today=today)
+        finally:
+            M.tax_cbr_rate, M.find_conversions, M.apply_conversions = saved
+        secs = {s["uid"]: s for s in res["securities"]}
+        self.assertIn("new_sh", secs)
+        self.assertAlmostEqual(secs["new_sh"]["cost_rub"], 1000.0, places=2)
+        self.assertAlmostEqual(secs["new_sh"]["yoc_pct"], 10.0, places=2)
+        # USD sec_in: 100 USD * 90 = 9000 RUB (не 100 RUB!)
+        self.assertAlmostEqual(secs["usd_b"]["cost_rub"], 9000.0, places=2)
+        # Отрицательное нетто сохраняется, т.к. есть выплата (count > 0)
+        self.assertIn("neg_b", secs)
+        self.assertEqual(secs["neg_b"]["count"], 1)
+        self.assertFalse(any("SUR" in n for n in res["notes"]))
+
+    def test_pay_journal_payload_per_account_fifo(self):
+        names_to_save = ("selection", "instruments", "TInvest", "tax_cbr_rate", "find_conversions")
+        saved = {k: getattr(M, k) for k in names_to_save}
+        # Счёт A: покупка 10 шт по 100 = 1000; Счёт B: продажа 5 шт без покупки (короткая/чужая),
+        # при общем FIFO продажа на B съела бы 5 шт со счёта A! При per-account FIFO на A остаётся 10 шт = 1000.
+        ops_a = [
+            {"id": "a1", "date": "2026-01-10T10:00:00Z", "type": "OPERATION_TYPE_BUY", "instrumentUid": "u1",
+             "quantityDone": 10, "payment": {"currency": "rub", "units": -1000, "nano": 0}},
+            {"id": "a2", "date": date.today().isoformat() + "T10:00:00Z", "type": "OPERATION_TYPE_COUPON",
+             "instrumentUid": "u1", "payment": {"currency": "rub", "units": 100, "nano": 0}},
+        ]
+        ops_b = [
+            {"id": "b1", "date": "2026-02-10T10:00:00Z", "type": "OPERATION_TYPE_SELL", "instrumentUid": "u1",
+             "quantityDone": 5, "payment": {"currency": "rub", "units": 500, "nano": 0}},
+        ]
+        M.selection = lambda cfg, acc, force=False: ([], [], [{"port": None, "ops": ops_a}, {"port": None, "ops": ops_b}])
+        M.instruments = lambda client, keys: {"u1": {"uid": "u1", "name": "Бонд 1", "ticker": "B1", "type": "bond"}}
+        M.TInvest = lambda cfg: object()
+        M.tax_cbr_rate = lambda cur, iso: 1.0
+        M.find_conversions = lambda *a, **k: []
+        try:
+            res = M.pay_journal_payload({"token": "t", "sandbox": False}, "all", True)
+        finally:
+            for k, v in saved.items():
+                setattr(M, k, v)
+        self.assertAlmostEqual(res["cost_rub"], 1000.0, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

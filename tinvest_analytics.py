@@ -2640,19 +2640,34 @@ def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exa
                 b = bond_info(client, uid)
             except Exception:  # noqa: BLE001
                 b = None
+        allow_net = client is None or getattr(client, "ready", False)
         ex = (exacts or {}).get(uid)
         bz = (ex or {}).get("bz")
         if bz is None and isin:
-            try:
-                bz = moex_bondization(isin)
-            except Exception:  # noqa: BLE001
-                bz = None
+            if allow_net:
+                try:
+                    bz = moex_bondization(isin)
+                except Exception:  # noqa: BLE001
+                    bz = None
+            else:
+                try:
+                    _bv = store().get("bondiz2:" + isin, ttl=BC_TTL)
+                    bz = _bv if (_bv and _bv.get("ok")) else None
+                except Exception:  # noqa: BLE001
+                    bz = None
         opt = None
         if isin:
-            try:
-                opt = moex_bond_options(isin)
-            except Exception:  # noqa: BLE001
-                opt = None
+            if allow_net:
+                try:
+                    opt = moex_bond_options(isin)
+                except Exception:  # noqa: BLE001
+                    opt = None
+            else:
+                try:
+                    _ov = store().get("bopt1:" + isin, ttl=BC_TTL)
+                    opt = _ov if (_ov and _ov.get("ok")) else None
+                except Exception:  # noqa: BLE001
+                    opt = None
 
         mat = ((b or {}).get("maturity") or "")[:10]
         name = r.get("name") or (b or {}).get("name") or r.get("ticker") or isin
@@ -2664,7 +2679,7 @@ def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exa
             offs = []
 
         raw_coupons = list((bz or {}).get("coupons") or [])
-        if not raw_coupons and isin:
+        if not raw_coupons and isin and allow_net:
             try:
                 sched = moex_coupon_schedule(isin)
             except Exception:  # noqa: BLE001
@@ -9160,6 +9175,12 @@ def primary_payload():
     except Exception as e:  # noqa: BLE001
         rows, cal_error = [], str(e)[:200]      # без календаря экран всё равно показывает размещения Мосбиржи и калькулятор
     scr = _scr.get("rows") or []
+    if not scr:
+        try:
+            screener_payload()
+            scr = _scr.get("rows") or []
+        except Exception:  # noqa: BLE001
+            scr = []
     rusfar = None
     try:
         kr = key_rate_series()
@@ -11992,7 +12013,15 @@ def build_monitor(cfg, acc):
 
 def _build_monitor(cfg, acc, th, t0):
     tm = {}
-    b = build_bonds(cfg, acc)
+    try:
+        b = build_bonds(cfg, acc)
+    except ApiError as e:
+        if e.status != 404:
+            raise
+        return {"empty": True, "updated": time.time(), "thresholds": th, "alerts": [], "rows": [],
+                "summary": {s: 0 for s in _SEV}, "timings": tm,
+                "notes": ["Добавьте API-токен в «Настройках» или импортируйте отчёт брокера."],
+                "log": {"events": 0, "since": None}, "cal_days": 0}
     tm["bonds"] = round(time.time() - t0, 2)
     rows = [r for r in (b.get("rows") or []) if r.get("isin") and r.get("qty")]
     return _monitor_core(rows, th, t0, tm, [])
@@ -12947,7 +12976,21 @@ def goal_defaults(cfg, acc):
 
 def calc_goal_get(cfg, acc, q, force=False):
     """GET /api/calc/goal?monthly=&years=|date=&yield=&value=&real=1&infl=  Ручные значения важнее данных портфеля; без токена работают только они."""
-    out = {"defaults": goal_defaults(cfg, acc), "infl": _goal_infl(), "tax": GOAL_TAX, "result": None, "error": None}
+    real = (q.get("real") or "1") not in ("0", "false", "")
+    i_param, i_err = None, None
+    try:
+        i_param = _goal_float(q, "infl")
+    except (ValueError, TypeError) as e:
+        i_err = str(e)
+    infl_info = _goal_infl() if (real and i_param is None and i_err is None) else {
+        "value": i_param if i_param is not None else 4.0,
+        "estimate": i_param is None,
+        "source": "ручной ввод" if i_param is not None else "условное значение",
+    }
+    out = {"defaults": goal_defaults(cfg, acc), "infl": infl_info, "tax": GOAL_TAX, "result": None, "error": None}
+    if i_err is not None:
+        out["error"] = i_err
+        return out
     try:
         monthly = _goal_float(q, "monthly")
         if monthly is None or monthly <= 0:
@@ -12960,12 +13003,10 @@ def calc_goal_get(cfg, acc, q, force=False):
             return out
         v = _goal_float(q, "value")
         v = (dfl["value"] or 0.0) if v is None else v
-        i = _goal_float(q, "infl")
-        i = out["infl"]["value"] if i is None else i
+        i = infl_info["value"] if i_param is None else i_param
         inc = _goal_float(q, "income")
         if inc is None:
             inc = dfl["income_month"] if dfl["income_month"] is not None else (v * y / 100.0 * (1 - GOAL_TAX) / 12.0 if v else None)
-        real = (q.get("real") or "1") not in ("0", "false", "")
         out["result"] = goal_calc(monthly, goal_months(q), y, v, i, real, inc)
         out["result"].update(yield_pct=y, infl_pct=i, real=real, monthly=monthly)
     except (ValueError, TypeError) as e:
@@ -14003,8 +14044,13 @@ def ld_events(maturity, call, nominal, qty, k, amort, today, use_offer):
 
 
 def ladder_portfolio(cfg, acc="all"):
-    rep = build_bonds(cfg, acc)
     today = date.today().isoformat()
+    try:
+        rep = build_bonds(cfg, acc)
+    except ApiError as e:
+        if e.status != 404:
+            raise
+        return {"today": today, "empty": True, "value": 0.0, "variants": {}, "has_offers": False, "has_calls": False, "undated": []}
     rows = [r for r in rep.get("rows", []) if r.get("qty") and r.get("nominal") and (r.get("maturity") or r.get("call"))]
     value = sum(r.get("value_rub") or 0.0 for r in rep.get("rows", []))
     if not rows:
@@ -14564,8 +14610,19 @@ def issuer_card(isin):
 
 # ── эмитенты портфеля ──
 
+def _iss_empty():
+    return {"empty": True, "rows": [], "n": 0, "n_scored": 0, "share_scored": 0, "share_bad": 0,
+            "avg_score": None, "dist": {k: 0 for _, k, _t in ISS_LABELS},
+            "gov_share": 0, "gov_n": 0, "updated": datetime.now().strftime("%H:%M")}
+
+
 def _iss_portfolio(cfg, acc, job):
-    rep_ = build_bonds(cfg, acc)
+    try:
+        rep_ = build_bonds(cfg, acc)
+    except ApiError as e:
+        if e.status != 404:
+            raise
+        return _iss_empty()
     rows = [r for r in rep_.get("rows", []) if r.get("isin") and r.get("value_rub")]
     gov = [r for r in rows if r.get("sector") == "government"]
     work = [r for r in rows if r.get("sector") != "government"]
@@ -14660,6 +14717,8 @@ def _iss_portfolio(cfg, acc, job):
 
 
 def issuers_payload(cfg, acc, q, force):
+    if not ((cfg or {}).get("token") or "").strip() and not imports_list():
+        return _iss_empty()
     key = (token_key(cfg), acc)
     with _iss_jobs_lock:
         job = _iss_jobs.get(key)
@@ -16370,10 +16429,10 @@ def tax_engine(ops, types=None, fx=None, held=None):
     из текущих позиций (для сверки лотов). Возвращает продажи, остатки лотов и денежные потоки по (счёт, год)."""
     types = types or {}
     warns = {}
-    fx = fx or (lambda cur, day: 1.0 if cur == "rub" else None)
+    fx = fx or (lambda cur, day: 1.0 if cur in ("", "rub", "sur") else None)
 
     def rate(cur, d):
-        if cur in ("", "rub"):
+        if cur in ("", "rub", "sur"):
             return 1.0
         r = fx(cur, d.isoformat())
         if not r:
@@ -16473,7 +16532,7 @@ def tax_engine(ops, types=None, fx=None, held=None):
         itype = {"bonds": "bond", "shares": "share"}.get(itype, itype) or "share"
         pay = qf(o.get("payment"))
         cur = cur_of(o.get("payment"))
-        raw_fx = 1.0 if cur in ("", "rub") else fx(cur, d.isoformat())
+        raw_fx = 1.0 if cur in ("", "rub", "sur") else fx(cur, d.isoformat())
         r = rate(cur, d)
         I = inc[(acc, d.year)]
         if uid and kind in ("buy", "sell", "sec_in", "repayments") and uid not in meta:
@@ -16490,7 +16549,7 @@ def tax_engine(ops, types=None, fx=None, held=None):
                 matched = [pay_tax_key[(acc, d.isoformat(), uid, kind)].pop(0)]
             tax_orig = sum(a for tc, a, _ in matched if tc == cur)
             tax_rub = sum(tr for _, _, tr in matched)
-            src_note = "Рублёвая выплата" if cur in ("", "rub") else ("ЦБ РФ на дату выплаты" if raw_fx else "Курс ЦБ не найден (взят 1.0)")
+            src_note = "Рублёвая выплата" if cur in ("", "rub", "sur") else ("ЦБ РФ на дату выплаты" if raw_fx else "Курс ЦБ не найден (взят 1.0)")
             payouts.append({
                 "id": o.get("id") or "", "acc": acc, "date": d.isoformat(), "year": d.year, "uid": uid,
                 "name": info.get("name") or o.get("name") or o.get("ticker") or uid or "—",
@@ -16953,7 +17012,8 @@ def tx_group_open(st, g):
 def tx_cur_tax(g, extra, cy, settings):
     """Налог текущего года по группе с дополнительными (гипотетическими) продажами."""
     exempt = g["kind"] == "iis" and g["iis"]["exempt"]
-    rows, _ = tax_group_years(g["sales"], g["inc"], settings["loss_carry"] if g["kind"] == "gen" else None, exempt, extra, settings.get("offset_coupons", False))
+    iis_limit = TAX_IIS3_EXEMPT_LIMIT if g["kind"] == "iis" and g["iis"]["type"] == "3" else None
+    rows, _ = tax_group_years(g["sales"], g["inc"], settings["loss_carry"] if g["kind"] == "gen" else None, exempt, extra, settings.get("offset_coupons", False), iis_limit)
     for r in rows:
         if r["year"] == cy:
             return r["tax"], r
@@ -22484,12 +22544,24 @@ def cf36_keyrate_trajectories(base_rate=None, n=CF36_MONTHS):
     }
 
 
-def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
+def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS, pays=None):
     """Реальные пут- и колл-оферты по облигациям портфеля в окне 36 месяцев (MOEX bondization/options + отчёт брокера)."""
     t = today or date.today()
     ti = t.isoformat()
     horizon = (t + timedelta(days=cf36_horizon_days(t, n))).isoformat()
     fx_rates = fx_rates or {}
+    pays_by_key = defaultdict(list)
+    for p in pays or []:
+        kd = p.get("kind")
+        if kd not in ("coupon", "amortization"):
+            continue
+        amt_p = float(p.get("amount") or 0.0)
+        d_p = (p.get("date") or "")[:10]
+        if amt_p <= 0 or not d_p:
+            continue
+        for k_p in (p.get("uid"), p.get("ticker"), p.get("name")):
+            if k_p:
+                pays_by_key[k_p].append((d_p, kd, amt_p))
     out = []
     for b in rep_bonds or []:
         qty = float(b.get("qty") or 0.0)
@@ -22556,6 +22628,11 @@ def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
                     amorts.append((ad, av))
 
         rem_mat = max(0.0, nominal - sum(av for _, av in amorts)) * qty * k_fx
+        bond_pays = None
+        for bk in (b.get("uid"), b.get("ticker"), b.get("name")):
+            if bk and bk in pays_by_key:
+                bond_pays = pays_by_key[bk]
+                break
         for od, (kind, price_pct) in sorted(dates_kind.items()):
             if mat and od >= mat:
                 continue
@@ -22563,6 +22640,24 @@ def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
             amt = rem_nom * (price_pct / 100.0) * qty * k_fx
             if amt <= 0:
                 continue
+            post_coupons = defaultdict(float)
+            post_amorts = defaultdict(float)
+            if bond_pays is not None:
+                for d_p, kd_p, amt_p in bond_pays:
+                    if od < d_p <= horizon and (not mat or d_p <= mat):
+                        if kd_p == "coupon":
+                            post_coupons[d_p[:7]] += amt_p
+                        else:
+                            post_amorts[d_p[:7]] += amt_p
+            else:
+                for c in (bz or {}).get("coupons") or []:
+                    cd = (c.get("coupondate") or "")[:10]
+                    cv = float(c.get("value") or 0.0)
+                    if cd and cv > 0 and od < cd <= horizon and (not mat or cd <= mat):
+                        post_coupons[cd[:7]] += cv * qty * k_fx
+                for ad, av in amorts:
+                    if od < ad <= horizon and (not mat or ad < mat):
+                        post_amorts[ad[:7]] += av * qty * k_fx
             out.append({
                 "uid": b.get("uid") or "",
                 "isin": isin,
@@ -22577,6 +22672,8 @@ def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
                 "maturity": mat,
                 "maturity_ym": mat[:7] if (mat and ti <= mat <= horizon) else "",
                 "maturity_amount": round(rem_mat, 2),
+                "post_coupons": {k: round(v, 2) for k, v in post_coupons.items() if v > 0},
+                "post_amorts": {k: round(v, 2) for k, v in post_amorts.items() if v > 0},
             })
     out.sort(key=lambda x: (x["date"], x["name"]))
     return out
@@ -22629,10 +22726,29 @@ def cf36_simulate_offers(months, rate_pct, start=0.0, reinvest=True, offers=None
         mamt = float(of.get("maturity_amount") or 0.0)
         if mym and mamt > 0 and mym in by_ym:
             mrow = by_ym[mym]
-            red = float((mrow.get("by") or {}).get("redemption") or mrow.get("total") or 0.0)
+            red = (mrow.get("by") or {}).get("redemption")
+            if red is None:
+                red = mrow.get("total")
+            red = float(red or 0.0)
             sub = min(mamt, red, float(mrow.get("total") or 0.0))
             mrow["total"] = round(max(0.0, float(mrow.get("total") or 0.0) - sub), 2)
+            if "redemption" in (mrow.get("by") or {}):
+                mrow["by"]["redemption"] = round(max(0.0, float(mrow["by"]["redemption"] or 0.0) - sub), 2)
             maturity_shifted += sub
+        for field, bkey_flow in (("post_coupons", "coupon"), ("post_amorts", "amortization")):
+            for pym, pamt in (of.get(field) or {}).items():
+                pamt = float(pamt or 0.0)
+                if pamt <= 0 or pym not in by_ym:
+                    continue
+                prow = by_ym[pym]
+                cur_f = (prow.get("by") or {}).get(bkey_flow)
+                if cur_f is None:
+                    cur_f = prow.get("total")
+                cur_f = float(cur_f or 0.0)
+                sub_f = min(pamt, cur_f, float(prow.get("total") or 0.0))
+                prow["total"] = round(max(0.0, float(prow.get("total") or 0.0) - sub_f), 2)
+                if bkey_flow in (prow.get("by") or {}):
+                    prow["by"][bkey_flow] = round(max(0.0, float(prow["by"][bkey_flow] or 0.0) - sub_f), 2)
     sim = cf36_simulate(adj, rate_pct, start=start, reinvest=reinvest)
     sim.update({
         "offer_added": round(offer_added, 2),
@@ -22655,9 +22771,10 @@ def cashflow36_payload(cfg, acc, f=False):
         months = cf36_bucket(pays + est_d, today)
         empty = [m["ym"] for m in months if m["total"] <= 0]
         rates = cf36_rates()
-        fx_curs = {b.get("face_cur") or "rub" for b in (rep.get("bonds") or [])}
+        rep_rows = rep.get("rows") or []
+        fx_curs = {b.get("face_cur") or "rub" for b in rep_rows}
         fx_rates = fx_now(client, fx_curs) if (fx_curs - {"rub"}) else {"rub": 1.0}
-        offers = cf36_offer_events(rep.get("bonds") or [], fx_rates, today)
+        offers = cf36_offer_events(rep_rows, fx_rates, today, pays=pays)
         trajectories = cf36_keyrate_trajectories(rates.get("key"))
         put_offers = [o for o in offers if o["kind"] == "offer_put"]
         call_offers = [o for o in offers if o["kind"] == "offer_call"]
@@ -22694,7 +22811,7 @@ PJ_TYPE_RU = {
 def _pj_fx_rate(cur, iso_day, fx_fallback, warns):
     """Курс валюты к рублю на дату выплаты: сначала ЦБ РФ на дату, затем текущий курс, иначе 1.0."""
     cur = (cur or "rub").lower()
-    if cur in ("", "rub"):
+    if cur in ("", "rub", "sur"):
         return 1.0
     r = None
     try:
@@ -22709,7 +22826,20 @@ def _pj_fx_rate(cur, iso_day, fx_fallback, warns):
     return float(r)
 
 
-def build_pay_journal(ops, names, client=None, today=None):
+def _pj_fifo_lots(ops, names, client=None, held=None):
+    """Сортирует операции, применяет обмены бумаг (ГДР -> акции и т.п.) и строит FIFO-лоты."""
+    cops = sorted(
+        [o for o in (ops or []) if not str(o.get("state") or "").endswith("CANCELED")],
+        key=lambda o: o.get("date") or "",
+    )
+    resolve = (lambda t: benchmark_uid(client, t)) if (client is not None and getattr(client, "ready", False)) else None
+    events = find_conversions(cops, names, held, resolve=resolve)
+    if events:
+        cops = apply_conversions(cops, events)
+    return fifo(cops)
+
+
+def build_pay_journal(ops, names, client=None, today=None, account_groups=None):
     """Строит журнал фактических купонов и дивидендов и рассчитывает YOC по FIFO-стоимости."""
     t_today = today or date.today()
     d12m = (t_today - timedelta(days=365)).isoformat()
@@ -22718,7 +22848,19 @@ def build_pay_journal(ops, names, client=None, today=None):
         [o for o in (ops or []) if not str(o.get("state") or "").endswith("CANCELED")],
         key=lambda o: o.get("date") or "",
     )
-    lots = fifo(clean_ops)
+    if account_groups:
+        lots = {}
+        for acc_ops, acc_held in account_groups:
+            for uid, lot in _pj_fifo_lots(acc_ops, names, client, acc_held).items():
+                q = float(lot.get("qty") or 0.0)
+                c = float(lot.get("cost") or 0.0)
+                if q <= 1e-9:
+                    continue
+                cur_lot = lots.setdefault(uid, {"qty": 0.0, "cost": 0.0})
+                cur_lot["qty"] += q
+                cur_lot["cost"] += c
+    else:
+        lots = _pj_fifo_lots(clean_ops, names, client)
 
     # Определяем валюту покупки по операциям/инструменту для пересчёта FIFO-стоимости в рубли
     buy_cur = {}
@@ -22727,14 +22869,14 @@ def build_pay_journal(ops, names, client=None, today=None):
         k = classify(o.get("type"))
         uid = o.get("instrumentUid") or o.get("figi") or ""
         cur = cur_of(o.get("payment"))
-        if k in ("buy", "sec_in") and uid and cur:
+        if k == "buy" and uid and cur:
             buy_cur[uid] = cur
-        elif k in ("coupons", "dividends") and cur and cur != "rub":
+        elif k in ("coupons", "dividends") and cur and cur not in ("rub", "sur"):
             payout_curs.add(cur)
 
     for uid in lots:
         c = buy_cur.get(uid) or ((names.get(uid) or {}).get("cur") or "rub").lower()
-        if c and c != "rub":
+        if c and c not in ("rub", "sur"):
             payout_curs.add(c)
 
     fx_fallback = {}
@@ -22880,7 +23022,7 @@ def build_pay_journal(ops, names, client=None, today=None):
 
     securities = []
     for sec in by_sec.values():
-        if sec["total_rub"] <= 0 and sec["cost_rub"] <= 0:
+        if sec["count"] <= 0 and sec["cost_rub"] <= 0:
             continue
         sec["coupons_rub"] = round(sec["coupons_rub"], 2)
         sec["dividends_rub"] = round(sec["dividends_rub"], 2)
@@ -22928,7 +23070,17 @@ def pay_journal_payload(cfg, acc, force=False):
                 keys.add((x.get("instrumentUid"), x.get("figi")))
         keys |= _op_inst_keys(ops)
         names = instruments(client, keys)
-        return build_pay_journal(ops, names, client=client)
+        account_groups = []
+        if acc == "all" and len(data) > 1:
+            for d in data:
+                acc_held = {}
+                for x in (d.get("port") or {}).get("positions") or []:
+                    u = x.get("instrumentUid") or x.get("figi")
+                    q = qf(x.get("quantity"))
+                    if u and q > 0:
+                        acc_held[u] = acc_held.get(u, 0.0) + q
+                account_groups.append((d["ops"], acc_held or None))
+        return build_pay_journal(ops, names, client=client, account_groups=account_groups or None)
 
     return cached_result("pay_journal", cfg, acc, BONDS_TTL, compute, force)
 
@@ -26886,10 +27038,18 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         def run():
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > 80 * 1024 * 1024:
-                raise ApiError("Файл слишком большой (больше 60 МБ).", 400)
-            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                raise ApiError("Некорректный заголовок Content-Length.", 400)
+            if n < 0 or n > 80 * 1024 * 1024:
+                raise ApiError("Файл слишком большой (больше 60 МБ)." if n > 0 else "Некорректный заголовок Content-Length.", 400)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except (ValueError, UnicodeDecodeError):
+                raise ApiError("Некорректный JSON.", 400)
+            if not isinstance(body, dict):
+                raise ApiError("Ожидался JSON-объект.", 400)
             cfg = load_config()
             if path == "/api/config":
                 if body.get("token"):

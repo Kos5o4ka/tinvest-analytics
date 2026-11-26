@@ -3,10 +3,10 @@ def tax_engine(ops, types=None, fx=None, held=None):
     из текущих позиций (для сверки лотов). Возвращает продажи, остатки лотов и денежные потоки по (счёт, год)."""
     types = types or {}
     warns = {}
-    fx = fx or (lambda cur, day: 1.0 if cur == "rub" else None)
+    fx = fx or (lambda cur, day: 1.0 if cur in ("", "rub", "sur") else None)
 
     def rate(cur, d):
-        if cur in ("", "rub"):
+        if cur in ("", "rub", "sur"):
             return 1.0
         r = fx(cur, d.isoformat())
         if not r:
@@ -106,7 +106,7 @@ def tax_engine(ops, types=None, fx=None, held=None):
         itype = {"bonds": "bond", "shares": "share"}.get(itype, itype) or "share"
         pay = qf(o.get("payment"))
         cur = cur_of(o.get("payment"))
-        raw_fx = 1.0 if cur in ("", "rub") else fx(cur, d.isoformat())
+        raw_fx = 1.0 if cur in ("", "rub", "sur") else fx(cur, d.isoformat())
         r = rate(cur, d)
         I = inc[(acc, d.year)]
         if uid and kind in ("buy", "sell", "sec_in", "repayments") and uid not in meta:
@@ -123,7 +123,7 @@ def tax_engine(ops, types=None, fx=None, held=None):
                 matched = [pay_tax_key[(acc, d.isoformat(), uid, kind)].pop(0)]
             tax_orig = sum(a for tc, a, _ in matched if tc == cur)
             tax_rub = sum(tr for _, _, tr in matched)
-            src_note = "Рублёвая выплата" if cur in ("", "rub") else ("ЦБ РФ на дату выплаты" if raw_fx else "Курс ЦБ не найден (взят 1.0)")
+            src_note = "Рублёвая выплата" if cur in ("", "rub", "sur") else ("ЦБ РФ на дату выплаты" if raw_fx else "Курс ЦБ не найден (взят 1.0)")
             payouts.append({
                 "id": o.get("id") or "", "acc": acc, "date": d.isoformat(), "year": d.year, "uid": uid,
                 "name": info.get("name") or o.get("name") or o.get("ticker") or uid or "—",

@@ -155,12 +155,24 @@ def cf36_keyrate_trajectories(base_rate=None, n=CF36_MONTHS):
     }
 
 
-def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
+def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS, pays=None):
     """Реальные пут- и колл-оферты по облигациям портфеля в окне 36 месяцев (MOEX bondization/options + отчёт брокера)."""
     t = today or date.today()
     ti = t.isoformat()
     horizon = (t + timedelta(days=cf36_horizon_days(t, n))).isoformat()
     fx_rates = fx_rates or {}
+    pays_by_key = defaultdict(list)
+    for p in pays or []:
+        kd = p.get("kind")
+        if kd not in ("coupon", "amortization"):
+            continue
+        amt_p = float(p.get("amount") or 0.0)
+        d_p = (p.get("date") or "")[:10]
+        if amt_p <= 0 or not d_p:
+            continue
+        for k_p in (p.get("uid"), p.get("ticker"), p.get("name")):
+            if k_p:
+                pays_by_key[k_p].append((d_p, kd, amt_p))
     out = []
     for b in rep_bonds or []:
         qty = float(b.get("qty") or 0.0)
@@ -227,6 +239,11 @@ def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
                     amorts.append((ad, av))
 
         rem_mat = max(0.0, nominal - sum(av for _, av in amorts)) * qty * k_fx
+        bond_pays = None
+        for bk in (b.get("uid"), b.get("ticker"), b.get("name")):
+            if bk and bk in pays_by_key:
+                bond_pays = pays_by_key[bk]
+                break
         for od, (kind, price_pct) in sorted(dates_kind.items()):
             if mat and od >= mat:
                 continue
@@ -234,6 +251,24 @@ def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
             amt = rem_nom * (price_pct / 100.0) * qty * k_fx
             if amt <= 0:
                 continue
+            post_coupons = defaultdict(float)
+            post_amorts = defaultdict(float)
+            if bond_pays is not None:
+                for d_p, kd_p, amt_p in bond_pays:
+                    if od < d_p <= horizon and (not mat or d_p <= mat):
+                        if kd_p == "coupon":
+                            post_coupons[d_p[:7]] += amt_p
+                        else:
+                            post_amorts[d_p[:7]] += amt_p
+            else:
+                for c in (bz or {}).get("coupons") or []:
+                    cd = (c.get("coupondate") or "")[:10]
+                    cv = float(c.get("value") or 0.0)
+                    if cd and cv > 0 and od < cd <= horizon and (not mat or cd <= mat):
+                        post_coupons[cd[:7]] += cv * qty * k_fx
+                for ad, av in amorts:
+                    if od < ad <= horizon and (not mat or ad < mat):
+                        post_amorts[ad[:7]] += av * qty * k_fx
             out.append({
                 "uid": b.get("uid") or "",
                 "isin": isin,
@@ -248,6 +283,8 @@ def cf36_offer_events(rep_bonds, fx_rates=None, today=None, n=CF36_MONTHS):
                 "maturity": mat,
                 "maturity_ym": mat[:7] if (mat and ti <= mat <= horizon) else "",
                 "maturity_amount": round(rem_mat, 2),
+                "post_coupons": {k: round(v, 2) for k, v in post_coupons.items() if v > 0},
+                "post_amorts": {k: round(v, 2) for k, v in post_amorts.items() if v > 0},
             })
     out.sort(key=lambda x: (x["date"], x["name"]))
     return out
@@ -300,10 +337,29 @@ def cf36_simulate_offers(months, rate_pct, start=0.0, reinvest=True, offers=None
         mamt = float(of.get("maturity_amount") or 0.0)
         if mym and mamt > 0 and mym in by_ym:
             mrow = by_ym[mym]
-            red = float((mrow.get("by") or {}).get("redemption") or mrow.get("total") or 0.0)
+            red = (mrow.get("by") or {}).get("redemption")
+            if red is None:
+                red = mrow.get("total")
+            red = float(red or 0.0)
             sub = min(mamt, red, float(mrow.get("total") or 0.0))
             mrow["total"] = round(max(0.0, float(mrow.get("total") or 0.0) - sub), 2)
+            if "redemption" in (mrow.get("by") or {}):
+                mrow["by"]["redemption"] = round(max(0.0, float(mrow["by"]["redemption"] or 0.0) - sub), 2)
             maturity_shifted += sub
+        for field, bkey_flow in (("post_coupons", "coupon"), ("post_amorts", "amortization")):
+            for pym, pamt in (of.get(field) or {}).items():
+                pamt = float(pamt or 0.0)
+                if pamt <= 0 or pym not in by_ym:
+                    continue
+                prow = by_ym[pym]
+                cur_f = (prow.get("by") or {}).get(bkey_flow)
+                if cur_f is None:
+                    cur_f = prow.get("total")
+                cur_f = float(cur_f or 0.0)
+                sub_f = min(pamt, cur_f, float(prow.get("total") or 0.0))
+                prow["total"] = round(max(0.0, float(prow.get("total") or 0.0) - sub_f), 2)
+                if bkey_flow in (prow.get("by") or {}):
+                    prow["by"][bkey_flow] = round(max(0.0, float(prow["by"][bkey_flow] or 0.0) - sub_f), 2)
     sim = cf36_simulate(adj, rate_pct, start=start, reinvest=reinvest)
     sim.update({
         "offer_added": round(offer_added, 2),
@@ -326,9 +382,10 @@ def cashflow36_payload(cfg, acc, f=False):
         months = cf36_bucket(pays + est_d, today)
         empty = [m["ym"] for m in months if m["total"] <= 0]
         rates = cf36_rates()
-        fx_curs = {b.get("face_cur") or "rub" for b in (rep.get("bonds") or [])}
+        rep_rows = rep.get("rows") or []
+        fx_curs = {b.get("face_cur") or "rub" for b in rep_rows}
         fx_rates = fx_now(client, fx_curs) if (fx_curs - {"rub"}) else {"rub": 1.0}
-        offers = cf36_offer_events(rep.get("bonds") or [], fx_rates, today)
+        offers = cf36_offer_events(rep_rows, fx_rates, today, pays=pays)
         trajectories = cf36_keyrate_trajectories(rates.get("key"))
         put_offers = [o for o in offers if o["kind"] == "offer_put"]
         call_offers = [o for o in offers if o["kind"] == "offer_call"]

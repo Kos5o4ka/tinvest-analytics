@@ -158,10 +158,18 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         def run():
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > 80 * 1024 * 1024:
-                raise ApiError("Файл слишком большой (больше 60 МБ).", 400)
-            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                raise ApiError("Некорректный заголовок Content-Length.", 400)
+            if n < 0 or n > 80 * 1024 * 1024:
+                raise ApiError("Файл слишком большой (больше 60 МБ)." if n > 0 else "Некорректный заголовок Content-Length.", 400)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except (ValueError, UnicodeDecodeError):
+                raise ApiError("Некорректный JSON.", 400)
+            if not isinstance(body, dict):
+                raise ApiError("Ожидался JSON-объект.", 400)
             cfg = load_config()
             if path == "/api/config":
                 if body.get("token"):
