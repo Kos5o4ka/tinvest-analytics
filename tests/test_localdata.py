@@ -187,6 +187,45 @@ class WatchSyncTests(unittest.TestCase):
         self.assertEqual(items2["RU000A107HG1"]["target_yield"], 22.0)
         self.assertNotIn("RU000A108EF2", items2)
 
+    def test_tg_srv_sync_sends_bot_goals_rev_and_clears_omitted_and_deletions(self):
+        st = M.store()
+        st.put(M.WATCH_KEY, [
+            {"isin": "RU000A107HG1", "added": "2026-10-01", "note": "заметка", "target_yield": 18.0, "target_price": 95.0},
+            {"isin": "RU000A108EF2", "added": "2026-10-01", "target_price": 99.0},
+            {"isin": "RU000A109999", "added": "2026-10-01"},
+        ])
+        sent_revs = []
+        responses = [
+            {"ok": True, "bot_goals_rev": 1, "goals": [{"isin": "RU000A107HG1", "target_price": 97.0}], "counts": {"goals": 1}},
+            {"ok": True, "bot_goals_rev": 2, "goals": [], "counts": {"goals": 0}},
+        ]
+
+        def fake_req(path, body=None, timeout=20):
+            sent_revs.append(body.get("bot_goals_rev"))
+            return 200, responses.pop(0)
+
+        orig_req = M.tg_srv_req
+        M.tg_srv_req = fake_req
+        try:
+            M._tg_srv_sync({"tg_server": True, "tg_enabled": True}, {}, force=True)
+            items1 = {x["isin"]: x for x in st.get(M.WATCH_KEY)}
+            # target_yield был опущен сервером -> очищен; RU000A108EF2 удалён (нет заметки); RU000A109999 без целей сохранён
+            self.assertNotIn("target_yield", items1["RU000A107HG1"])
+            self.assertEqual(items1["RU000A107HG1"]["target_price"], 97.0)
+            self.assertNotIn("RU000A108EF2", items1)
+            self.assertIn("RU000A109999", items1)
+
+            M._tg_srv_sync({"tg_server": True, "tg_enabled": True}, {}, force=True)
+            items2 = {x["isin"]: x for x in st.get(M.WATCH_KEY)}
+            # Последняя цель удалена ботом -> target_price очищен, но note сохранена
+            self.assertNotIn("target_price", items2["RU000A107HG1"])
+            self.assertEqual(items2["RU000A107HG1"]["note"], "заметка")
+            self.assertIn("RU000A109999", items2)
+        finally:
+            M.tg_srv_req = orig_req
+
+        self.assertEqual(sent_revs, [0, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -653,16 +653,20 @@ class Notifier:
         self._lock = threading.Lock()
         self._last_purge = 0.0
 
-    def enqueue(self, tg_id, text):
+    def enqueue(self, tg_id, text, severity=0):
         """-> id строки outbox. Бросает NotifyError(409 notify_off | 429 rate_limit | 503 unavailable)."""
         now = self.clock()
+        sev = int(severity or 0)
         with self._lock:
             c = self.ks._conn()
             try:
                 c.execute("BEGIN IMMEDIATE")
                 try:
                     c.execute("CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER NOT NULL, "
-                              "text TEXT NOT NULL, created REAL NOT NULL, tries INTEGER NOT NULL DEFAULT 0)")
+                              "text TEXT NOT NULL, created REAL NOT NULL, tries INTEGER NOT NULL DEFAULT 0, "
+                              "severity INTEGER NOT NULL DEFAULT 0)")
+                    if "severity" not in {r[1] for r in c.execute("PRAGMA table_info(outbox)")}:
+                        c.execute("ALTER TABLE outbox ADD COLUMN severity INTEGER NOT NULL DEFAULT 0")
                     c.execute("CREATE TABLE IF NOT EXISTS notify_log(tg_id INTEGER NOT NULL, created REAL NOT NULL)")
                     c.execute("CREATE INDEX IF NOT EXISTS notify_log_tg ON notify_log(tg_id, created)")
                     try:
@@ -677,7 +681,7 @@ class Notifier:
                     d = c.execute("SELECT COUNT(*) FROM notify_log WHERE tg_id=? AND created>?", (tg_id, now - DAY)).fetchone()[0]
                     if h >= self.per_hour or d >= self.per_day:
                         raise NotifyError(429, "rate_limit")
-                    cur = c.execute("INSERT INTO outbox(tg_id, text, created) VALUES(?,?,?)", (tg_id, text, now))
+                    cur = c.execute("INSERT INTO outbox(tg_id, text, created, severity) VALUES(?,?,?,?)", (tg_id, text, now, sev))
                     c.execute("INSERT INTO notify_log(tg_id, created) VALUES(?,?)", (tg_id, now))
                     if now - self._last_purge > HOUR:
                         self._last_purge = now
@@ -1261,15 +1265,25 @@ class Handler(BaseHTTPRequestHandler):
         if info.get("plan") != "pro":
             return self._send(402, {"error": "pro_required"})
         try:
-            text = json.loads(body.decode("utf-8")).get("text")
+            payload = json.loads(body.decode("utf-8"))
         except (ValueError, AttributeError, UnicodeDecodeError):
-            text = None
+            payload = None
+        text = payload.get("text") if isinstance(payload, dict) else None
         if not isinstance(text, str) or not text.strip():
             return self._send(400, {"error": "empty_text"})
         if len(text) > NOTIFY_MAX_CHARS:
             return self._send(400, {"error": "text_too_long", "max": NOTIFY_MAX_CHARS})
+        sev_raw = payload.get("severity", 0)
+        if sev_raw is None:
+            sev = 0
+        elif isinstance(sev_raw, str) and sev_raw in ("low", "info", "medium", "high"):
+            sev = {"low": 0, "info": 0, "medium": 1, "high": 2}[sev_raw]
+        elif not isinstance(sev_raw, bool) and isinstance(sev_raw, int) and 0 <= sev_raw <= 2:
+            sev = sev_raw
+        else:
+            return self._send(400, {"error": "bad_severity"})
         try:
-            qid = self.app.notifier.enqueue(info["tg_id"], text)
+            qid = self.app.notifier.enqueue(info["tg_id"], text, severity=sev)
         except NotifyError as e:
             return self._send(e.code, {"ok": False, "error": e.error})
         self._send(200, {"ok": True, "queued": qid})
@@ -1316,6 +1330,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         except alerts.AlertError as e:
             return self._send(e.code, {"ok": False, "error": e.error})
+        except ValueError:
+            return self._send(500, {"ok": False, "error": "internal_error"})
         except sqlite3.Error:
             return self._send(503, {"ok": False, "error": "unavailable"})
 

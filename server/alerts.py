@@ -52,7 +52,7 @@ DATE_RX = re.compile(r"^\d{4}-\d\d-\d\d$")
 NOTE_RX = re.compile(r"^n\d{1,24}$")
 PAY_KINDS = ("coupon", "dividend", "amortization", "redemption", "maturity", "offer", "call", "put", "buyback")
 FIELDS = {
-    "goals": {"isin", "name", "target_yield", "target_price"},
+    "goals": {"isin", "name", "target_yield", "target_price", "watch_only"},
     "reminders": {"id", "isin", "name", "date", "remind_on"},
     "offers": {"isin", "name", "kind", "date", "period_start", "period_end", "coupon_status", "new_rate"},
     "pays": {"date", "kind", "name", "amount"},
@@ -118,12 +118,18 @@ def validate(p):
                 _bad("field")
     out["goals"] = []
     for it in p.get("goals") or []:
+        wo = it.get("watch_only")
+        if wo is not None and not isinstance(wo, bool):
+            _bad("watch_only")
         g = {"isin": _isin(it.get("isin")), "name": _s(it.get("name"))}
         for k in ("target_yield", "target_price"):
             v = _numf(it.get(k), hi=1e6)
             if v is not None and v > 0:
                 g[k] = v
         if "target_yield" in g or "target_price" in g:
+            out["goals"].append(g)
+        elif wo:
+            g["watch_only"] = True
             out["goals"].append(g)
     out["reminders"] = []
     for it in p.get("reminders") or []:
@@ -457,10 +463,12 @@ class AlertStore:
             existing = json.loads(row[0]) if row else {}
             existing_rev = int(existing.get("bot_goals_rev") or 0)
             existing_bot_goals = [g for g in (existing.get("bot_goals") or []) if isinstance(g, dict) and g.get("isin")]
+            existing_deleted = [x for x in (existing.get("bot_deleted") or []) if isinstance(x, str)]
             client_rev = sub.get("bot_goals_rev")
             data = {k: v for k, v in sub.items() if k not in ("sent", "resume", "bot_goals_rev")}
             if existing_rev > 0 and (client_rev is None or client_rev < existing_rev):
-                merged = list(data.get("goals") or [])
+                deleted_set = set(existing_deleted)
+                merged = [g for g in (data.get("goals") or []) if g.get("isin") not in deleted_set]
                 idx = {g["isin"]: i for i, g in enumerate(merged)}
                 for bg in existing_bot_goals:
                     isin = bg["isin"]
@@ -471,6 +479,8 @@ class AlertStore:
                         merged.append(bg)
                 data["goals"] = merged
                 data["bot_goals"] = existing_bot_goals
+                if existing_deleted:
+                    data["bot_deleted"] = existing_deleted
                 data["bot_goals_rev"] = existing_rev
             elif existing_rev > 0:
                 data["bot_goals_rev"] = existing_rev
@@ -488,16 +498,23 @@ class AlertStore:
         return self.sent_keys(tg_id)
 
     def upsert_bot_goal(self, tg_id, goal):
-        """Добавляет или обновляет цель из бота, увеличивая bot_goals_rev. -> новый bot_goals_rev."""
+        """Добавляет, обновляет или удаляет цель из бота, увеличивая bot_goals_rev. -> новый bot_goals_rev."""
         if not isinstance(goal, dict):
             _bad("goal")
-        g = {"isin": _isin(goal.get("isin")), "name": _s(goal.get("name"))}
-        for k in ("target_yield", "target_price"):
-            v = _numf(goal.get(k), hi=1e6)
-            if v is not None and v > 0:
-                g[k] = v
-        if "target_yield" not in g and "target_price" not in g:
-            _bad("goal")
+        isin = _isin(goal.get("isin"))
+        is_del = bool(goal.get("deleted") or goal.get("delete"))
+        g = None
+        if not is_del:
+            g = {"isin": isin, "name": _s(goal.get("name"))}
+            for k in ("target_yield", "target_price"):
+                v = _numf(goal.get(k), hi=1e6)
+                if v is not None and v > 0:
+                    g[k] = v
+            if "target_yield" not in g and "target_price" not in g:
+                if goal.get("watch_only"):
+                    g["watch_only"] = True
+                else:
+                    _bad("goal")
         now = self.clock()
         c = self.conn()
         c.execute("BEGIN IMMEDIATE")
@@ -507,15 +524,25 @@ class AlertStore:
                 data = json.loads(row[0])
             else:
                 data = {"v": SUB_V, "goals": [], "reminders": [], "offers": [], "pay_days": 0, "pays": [], "weekly_digest": False}
-            for lst_key in ("goals", "bot_goals"):
-                lst = list(data.get(lst_key) or [])
-                for i, it in enumerate(lst):
-                    if it.get("isin") == g["isin"]:
-                        lst[i] = g
-                        break
-                else:
-                    lst.append(g)
-                data[lst_key] = lst
+            deleted = [x for x in (data.get("bot_deleted") or []) if isinstance(x, str) and x != isin]
+            if is_del:
+                for lst_key in ("goals", "bot_goals"):
+                    data[lst_key] = [it for it in (data.get(lst_key) or []) if it.get("isin") != isin]
+                deleted.append(isin)
+            else:
+                for lst_key in ("goals", "bot_goals"):
+                    lst = list(data.get(lst_key) or [])
+                    for i, it in enumerate(lst):
+                        if it.get("isin") == isin:
+                            lst[i] = g
+                            break
+                    else:
+                        lst.append(g)
+                    data[lst_key] = lst
+            if deleted:
+                data["bot_deleted"] = deleted[-LIMITS["goals"]:]
+            else:
+                data.pop("bot_deleted", None)
             rev = int(data.get("bot_goals_rev") or 0) + 1
             data["bot_goals_rev"] = rev
             raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
@@ -528,6 +555,10 @@ class AlertStore:
             c.execute("ROLLBACK")
             raise
         return rev
+
+    def delete_bot_goal(self, tg_id, isin):
+        """Удаляет цель из бота, увеличивая bot_goals_rev. -> новый bot_goals_rev."""
+        return self.upsert_bot_goal(tg_id, {"isin": isin, "deleted": True})
 
     def stats(self):
         """Количество активных подписок и время последней проверки: {subs, last_checked}."""
@@ -651,7 +682,8 @@ class AlertChecker:
         if live and not (self.quiet_hours and quiet(now, *self.quiet_hours)):
             today = msk_now(now).strftime("%Y-%m-%d")
             subs = {uid: (self.store.get(uid) or {}).get("sub") or {} for uid in live}
-            need = {g["isin"] for s in subs.values() for g in s.get("goals") or []}
+            need = {g["isin"] for s in subs.values() for g in s.get("goals") or []
+                    if g.get("target_yield") is not None or g.get("target_price") is not None}
             q = self.quotes(need)
             for uid, sub in subs.items():
                 if not self.store.get(uid):
@@ -661,8 +693,13 @@ class AlertChecker:
                 for text, keys in build_messages(sub, q, today, sent):
                     if not self.store.get(uid):
                         break
+                    sev = 2 if any(k.startswith("ofr|") and k.endswith("|close") for k in keys) else 0
+                    msg = fit(text, TG_LIMIT - len(TG_DISCLAIMER)) + TG_DISCLAIMER
                     try:
-                        self.notifier.enqueue(uid, fit(text, TG_LIMIT - len(TG_DISCLAIMER)) + TG_DISCLAIMER)
+                        if sev:
+                            self.notifier.enqueue(uid, msg, severity=sev)
+                        else:
+                            self.notifier.enqueue(uid, msg)
                     except Exception as e:  # noqa: BLE001   NotifyError: лимит/notify_off/нет пользователя — попробуем в следующий раз
                         if getattr(e, "error", "") == "unknown_user":
                             self.store.delete(uid)

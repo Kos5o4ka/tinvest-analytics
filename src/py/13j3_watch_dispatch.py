@@ -151,7 +151,8 @@ def tg_offer_due(items, today):
 
 def _tg_offer_items(cfg, today):
     """Оферты облигаций портфеля для напоминаний: ближайшие put (до TG_OFR_PUT_HORIZON дней) и call (до TG_OFR_CALL_DAYS)."""
-    rows = [r for r in build_bonds(cfg, "all")["rows"] if r.get("isin") and r.get("qty")]
+    rows = [r for r in build_bonds(cfg, "all")["rows"]
+            if isinstance(r.get("isin"), str) and re.fullmatch(r"[A-Z0-9]{6,16}", r["isin"]) and r.get("qty")]
     lim = _day_add(today, TG_OFR_PUT_HORIZON)
 
     def one(r):

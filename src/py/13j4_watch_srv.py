@@ -105,8 +105,6 @@ def _tg_srv_merge_goals(goals):
         isin = _isin_ok(g.get("isin"))
         if isin:
             by_isin[isin] = g
-    if not by_isin:
-        return False
     changed = False
     with _watch_lock:
         items = watch_items()
@@ -121,10 +119,11 @@ def _tg_srv_merge_goals(goals):
                 changed = True
             for k in ("target_yield", "target_price"):
                 if k not in g:
-                    continue
-                v = _num(g[k]) if g[k] is not None and str(g[k]).strip() != "" else None
-                if v is not None and v <= 0:
                     v = None
+                else:
+                    v = _num(g[k]) if g[k] is not None and str(g[k]).strip() != "" else None
+                    if v is not None and v <= 0:
+                        v = None
                 if v is None:
                     if k in cur:
                         cur.pop(k, None)
@@ -134,6 +133,16 @@ def _tg_srv_merge_goals(goals):
                     if cur.get(k) != rv:
                         cur[k] = rv
                         changed = True
+        kept = []
+        for x in items:
+            if x["isin"] not in by_isin and ("target_yield" in x or "target_price" in x):
+                x.pop("target_yield", None)
+                x.pop("target_price", None)
+                changed = True
+                if not x.get("note"):
+                    continue
+            kept.append(x)
+        items = kept
         if changed:
             store().put(WATCH_KEY, items)
     if changed:
@@ -148,6 +157,7 @@ def _tg_srv_sync(cfg, sent, force=False, resume=False):
     p = tg_srv_payload(cfg, sent)
     if resume:
         p["resume"] = True
+    p["bot_goals_rev"] = int((st or {}).get("bot_goals_rev") or 0)
     h = hashlib.sha256(json.dumps({k: v for k, v in p.items() if k not in ("sent", "resume")}, sort_keys=True).encode("utf-8")).hexdigest()
     if not force and st.get("active") and st.get("hash") == h and now - (st.get("ok") or 0) < TG_SRV_REFRESH:
         return True

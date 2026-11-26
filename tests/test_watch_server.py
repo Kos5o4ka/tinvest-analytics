@@ -325,12 +325,13 @@ class Validation(unittest.TestCase):
 
 class FakeNotifier:
     def __init__(self):
-        self.msgs, self.fail = [], None
+        self.msgs, self.sevs, self.fail = [], [], None
 
-    def enqueue(self, uid, text):
+    def enqueue(self, uid, text, severity=0):
         if self.fail:
             raise ts.NotifyError(429, self.fail)
         self.msgs.append((uid, text))
+        self.sevs.append(severity)
         return len(self.msgs)
 
 
@@ -475,6 +476,36 @@ class Server(unittest.TestCase):
         self.assertEqual(cur2["bot_goals_rev"], 1)
         self.assertEqual([g["isin"] for g in cur2["goals"]], ["RU000A100001"])
 
+    def test_bot_goal_deletion_not_clobbered_and_watch_only(self):
+        self.st.put(1, self.sub())
+        rev = self.st.delete_bot_goal(1, "RU000A100001")
+        self.assertEqual(rev, 1)
+        # Устаревший sync (bot_goals_rev=0) не должен воскрешать удалённую ботом цель
+        self.st.put(1, self.sub(bot_goals_rev=0))
+        self.assertEqual(self.st.get(1)["sub"]["goals"], [])
+        # Подтверждение ревизии bot_goals_rev=1 позволяет десктопу снова добавить цель
+        self.st.put(1, self.sub(bot_goals_rev=1))
+        self.assertEqual([g["isin"] for g in self.st.get(1)["sub"]["goals"]], ["RU000A100001"])
+
+        # watch_only цели без порогов валидируются и не запрашивают котировки
+        wo = SA.validate({"v": 1, "goals": [{"isin": "RU000A100002", "name": "w", "watch_only": True}]})
+        self.assertEqual(wo["goals"], [{"isin": "RU000A100002", "name": "w", "watch_only": True}])
+        rev2 = self.st.upsert_bot_goal(1, {"isin": "RU000A10BOT3", "name": "Watch", "watch_only": True})
+        self.assertEqual(rev2, 2)
+        self.st.put(1, SA.validate({"v": 1, "goals": [{"isin": "RU000A100002", "name": "w", "watch_only": True}], "bot_goals_rev": 2}))
+        self.fetches.clear()
+        self.ck.run_once()
+        self.assertEqual(self.fetches, [])
+
+    def test_high_severity_offer_close_marks_severity_2(self):
+        self.st.put(1, self.sub(
+            goals=[], reminders=[], pay_days=0, pays=[],
+            offers=[{"isin": "RU000A100002", "name": "Пут", "kind": "put", "date": "2026-11-30",
+                     "period_start": "2026-11-20", "period_end": "2026-11-25"}],
+        ))
+        self.ck.run_once()
+        self.assertEqual(self.nt.sevs, [2])
+
     def test_stats_counts_and_max_checked(self):
         self.assertEqual(self.st.stats(), {"subs": 0, "last_checked": None})
         self.st.put(1, self.sub(weekly_digest=True))
@@ -608,6 +639,56 @@ class EndToEnd(unittest.TestCase):
             h = json.loads(r.read().decode("utf-8"))
         self.assertEqual(h["alerts_subs"], 1)
         self.assertIsNotNone(h["alerts_last_checked"])
+
+    def test_notify_optional_severity_and_alerts_value_error(self):
+        import sqlite3
+        import urllib.error
+        import urllib.request
+
+        def post_notify(payload):
+            req = urllib.request.Request(
+                self.url + "/v1/notify",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json", "X-Client-Key": "TIA-AAAA-AAAA-AAAA"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read().decode("utf-8"))
+
+        self.assertEqual(post_notify({"text": "срочно", "severity": 2})[0], 200)
+        self.assertEqual(post_notify({"text": "тоже срочно", "severity": "high"})[0], 200)
+        self.assertEqual(post_notify({"text": "плохо", "severity": 9})[0], 400)
+        self.assertEqual(post_notify({"text": "плохо", "severity": True})[0], 400)
+        db = sqlite3.connect(self.dbp)
+        sevs = [r[0] for r in db.execute("SELECT severity FROM outbox ORDER BY id")]
+        self.assertEqual(sevs, [2, 2])
+        SA.AlertStore(self.dbp).conn().close()
+        db.execute("INSERT OR REPLACE INTO alert_subs(tg_id, data, created, updated) VALUES(1, '{bad_json', 1, 1)")
+        db.commit()
+        db.close()
+        code, j = M.tg_srv_req("status")
+        self.assertEqual(code, 500)
+        self.assertEqual(j.get("error"), "internal_error")
+
+    def test_offer_items_filters_non_isin_tickers(self):
+        saved = {k: getattr(M, k) for k in ("build_bonds", "moex_bondization", "moex_bond_options")}
+        queried = []
+        try:
+            M.build_bonds = lambda cfg, acc: {"rows": [
+                {"isin": "SBER", "qty": 1, "name": "Short"},
+                {"isin": "СБЕР", "qty": 1, "name": "Cyrillic"},
+                {"isin": "RU000A100001", "qty": 1, "name": "Valid"},
+            ]}
+            M.moex_bondization = lambda isin: (queried.append(isin), {"coupons": [], "offers": []})[1]
+            M.moex_bond_options = lambda isin: []
+            M._tg_offer_items({}, "2026-11-24")
+            self.assertEqual(queried, ["RU000A100001"])
+        finally:
+            for k, v in saved.items():
+                setattr(M, k, v)
 
 
 if __name__ == "__main__":
