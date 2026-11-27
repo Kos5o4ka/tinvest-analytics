@@ -27,6 +27,15 @@ def _auth_link_post(path, body):
     return code, (j if isinstance(j, dict) else {})
 
 
+def auth_confirm_code(verifier, nonce):
+    """Короткий код подтверждения (4 цифры): программа показывает его на экране, бот — в чате, и пользователь сверяет их перед
+    «Подтвердить вход». Так подсунутая чужая ссылка не пройдёт: у чужой ссылки код другой. Код считается от хеша verifier
+    (challenge, он и так хранится на сервере), а не от самого verifier, поэтому по коду verifier не подобрать."""
+    ch = hashlib.sha256(str(verifier).encode("utf-8")).digest()
+    h = hmac.new(ch, b"tinvest-auth-code|" + str(nonce).encode("utf-8"), hashlib.sha256).digest()
+    return "%04d" % (int.from_bytes(h[:4], "big") % 10000)
+
+
 def auth_link_start(cfg, body):
     nonce, verifier = secrets.token_urlsafe(18), secrets.token_urlsafe(32)      # 24 и 43 знака; в ссылке Telegram до 64 знаков
     code, j = _auth_link_post("start", {"nonce": nonce, "challenge": hashlib.sha256(verifier.encode("utf-8")).hexdigest()})
@@ -37,7 +46,8 @@ def auth_link_start(cfg, body):
     if code != 200 or not j.get("ok"):
         raise ApiError("Сервер не принял запрос входа (ответ %d)." % code, 502)
     _auth_link.update(nonce=nonce, verifier=verifier, at=time.time())
-    return {"ok": True, "url": "https://t.me/%s?start=auth_%s" % (_auth["bot"].lstrip("@"), nonce), "ttl": int(j.get("ttl") or AUTH_LINK_TTL)}
+    return {"ok": True, "url": "https://t.me/%s?start=auth_%s" % (_auth["bot"].lstrip("@"), nonce), "ttl": int(j.get("ttl") or AUTH_LINK_TTL),
+            "code": auth_confirm_code(verifier, nonce)}
 
 
 def auth_link_poll(cfg, body):

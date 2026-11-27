@@ -56,7 +56,7 @@ async function authOneClick(){
   try{
     const r=await post('/api/auth/link/start');
     const a=document.createElement('a');a.href=r.url;a.target='_blank';a.rel='noopener noreferrer';document.body.appendChild(a);a.click();a.remove();
-    say('Откройте Telegram и нажмите «Подтвердить вход» в чате с ботом. Жду подтверждения…');
+    say('Код подтверждения: '+(r.code||'')+'. Откройте Telegram, сверьте этот код с кодом в чате с ботом и только тогда нажмите «Подтвердить вход». Если коды разные, нажмите «Отклонить». Жду подтверждения…');
     const until=Date.now()+(r.ttl+20)*1000;
     const poll=async()=>{
       if(!$('#lg-one-st'))return;
