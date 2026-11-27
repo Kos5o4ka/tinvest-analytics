@@ -142,6 +142,8 @@ function tourClick(e){
     if(k==='x')tourStop();else if(k==='prev')tourNext(-1);else tourNext(1);
     return;
   }
+  /* клик по сайдбару не блокируется: тур закрывается, а переход выполняется как обычно */
+  if(e.target.closest&&e.target.closest('aside')&&!(TOUR.tgt&&TOUR.tgt.contains(e.target))){tourStop();return}
   /* микро-задача: клик по подсвеченному элементу проходит насквозь и переводит на следующий шаг */
   const st=TOUR.list[TOUR.i];
   if(st&&st.task&&TOUR.tgt&&TOUR.tgt.contains(e.target)){
