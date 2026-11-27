@@ -28,7 +28,7 @@ def crowd_url_ok(url):
 def crowd_srv_call(method, path, payload=None, timeout=25):
     """Запрос к серверу данных (только он): -> (код, dict). Исключение при сетевой ошибке. Не использует ext_open."""
     srv, key = ds_conf()
-    hd = {"User-Agent": EXT_UA["User-Agent"], "X-Client-Key": key}
+    hd = {"User-Agent": EXT_UA["User-Agent"], "X-Client-Key": key, **hwid_headers()}
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")

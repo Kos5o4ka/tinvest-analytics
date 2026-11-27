@@ -23,7 +23,7 @@ def sync_req(method, path, body=None, timeout=90):
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(srv.rstrip("/") + "/v1/sync/" + path, data=data, method=method,
                                  headers={"Content-Type": "application/json", "X-Client-Key": key,
-                                          "User-Agent": EXT_UA["User-Agent"]})
+                                          "User-Agent": EXT_UA["User-Agent"], **hwid_headers()})
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
             code, raw = r.status, r.read()

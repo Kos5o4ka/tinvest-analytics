@@ -176,6 +176,7 @@ def _ds_request(srv, key, url, data, headers, timeout):
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     for k, v in (headers or {}).items():
         if k.lower() in ("referer", "cookie", "accept", "accept-language"):
             hd["X-Up-" + k.title()] = v
@@ -224,6 +225,7 @@ def ds_parsed(name, params=None, timeout=20):
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     try:
         req = urllib.request.Request(srv + "/v1/parsed/" + name + q, headers=hd)
         with urllib.request.urlopen(req, timeout=timeout + 5, context=_ssl()) as r:
@@ -312,6 +314,7 @@ def ds_test(cfg, body):
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     try:
         with urllib.request.urlopen(urllib.request.Request(url + "/v1/health", headers=hd), timeout=10, context=_ssl()) as r:
             j = json.loads(r.read().decode("utf-8", "replace"))
@@ -374,7 +377,9 @@ def _auth_eval(srv, key):
                     trial_blocked=bool(j.get("trial_blocked")), message=str(j.get("message") or "") if j.get("trial_blocked") else "")
     if code == 401 or code == 403:
         err = str(j.get("error") or "")
-        return dict(base, state="need_login", error=err if err in ("expired", "banned") else "invalid")
+        if err in ("devices", "device_blocked"):
+            base["max_devices"] = j.get("max_devices") or 5
+        return dict(base, state="need_login", error=err if err in ("expired", "banned", "devices", "device_blocked") else "invalid")
     if code == 404:                                    # старый сервер без /v1/auth/check: доступ не ограничен
         return base
     return dict(base, state="offline", error="сервер ответил %d" % code)
@@ -417,7 +422,9 @@ def auth_login(cfg, body):
         raise ApiError("Сервер данных отключён в настройках: вход не нужен.", 400)
     res = _auth_eval(srv, key)
     if res["state"] == "need_login":
-        msgs = {"expired": "Ключ истёк — получите новый в боте", "banned": "Доступ ограничен"}
+        msgs = {"expired": "Ключ истёк — получите новый в боте", "banned": "Доступ ограничен",
+                "devices": "Ключ уже работает на %s компьютерах. Отвяжите лишний в боте: /devices" % res.get("max_devices", 5),
+                "device_blocked": "Этот компьютер отвязан от ключа в боте. Выпустите новый ключ: /key"}
         err = res["error"]
         return 401, {"error": msgs.get(err, "Неверный ключ"), "code": err, "bot": res["bot"]}
     if res["state"] == "offline":

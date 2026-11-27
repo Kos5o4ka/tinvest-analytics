@@ -16,7 +16,7 @@ def tg_post_notify(srv, key, text, timeout=15):
     """POST {srv}/v1/notify -> (код, dict). Бросает исключение при сетевой ошибке."""
     req = urllib.request.Request(srv.rstrip("/") + "/v1/notify", data=json.dumps({"text": text}).encode("utf-8"),
                                  headers={"Content-Type": "application/json", "X-Client-Key": key,
-                                          "User-Agent": EXT_UA["User-Agent"]}, method="POST")
+                                          "User-Agent": EXT_UA["User-Agent"], **hwid_headers()}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
             code, raw = r.status, r.read()

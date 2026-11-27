@@ -46,6 +46,7 @@ def _market_snap_fetch(kind="all", timeout=20):
     hd = {"User-Agent": EXT_UA["User-Agent"], "Accept-Encoding": "gzip"}   # токен Т-Инвестиций сюда не попадает никогда
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     old = _mkt_snap_etag.get(kind)
     if old:
         hd["If-None-Match"] = old[0]

@@ -5,7 +5,9 @@ function authTime(ts){
   return d.toDateString()===new Date().toDateString()?t:d.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'})+' '+t;
 }
 function authMsg(code){
-  return code==='expired'?'Ключ истёк — получите новый в боте':code==='banned'?'Доступ ограничен':code==='invalid'?'Неверный ключ':'';
+  return code==='expired'?'Ключ истёк — получите новый в боте':code==='banned'?'Доступ ограничен':code==='invalid'?'Неверный ключ':
+    code==='devices'?'Ключ уже работает на 5 компьютерах. Отвяжите лишний в боте командой /devices':
+    code==='device_blocked'?'Этот компьютер отвязан от ключа. Выпустите новый ключ в боте: /key':'';
 }
 function authWho(){
   const el=$('#who');if(!el)return;

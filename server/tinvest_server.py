@@ -33,6 +33,7 @@ import crowd  # noqa: E402  (очередь и приём страниц рас�
 import alerts  # noqa: E402  (серверная проверка тревог, пока приложение закрыто; см. alerts.py)
 import trial  # noqa: E402  (привязка пробного периода к ПК по хэшу, см. trial.py)
 import sync  # noqa: E402  (зашифрованная облачная копия, очередь из бота, вход в один клик; см. sync.py)
+import devices  # noqa: E402  (не больше N компьютеров на аккаунт по хэшу ПК, см. devices.py)
 
 VERSION = "1.1.0"
 MIN, HOUR, DAY = 60, 3600, 86400
@@ -729,7 +730,7 @@ def auth_mode(server):
 
 
 def authorize_ex(server, headers):
-    """-> (client_id | None, причина, инфо). Причина при отказе: invalid | expired | banned.
+    """-> (client_id | None, причина, инфо). Причина при отказе: invalid | expired | banned | devices | device_blocked.
     Принимается либо общий ключ (--key), либо личный ключ из бота (--keys-db); если не настроено ничего — открытый доступ."""
     if not server.key and not server.keystore:
         return "anon", None, None
@@ -739,6 +740,11 @@ def authorize_ex(server, headers):
     if server.keystore and got.strip():
         st, info = server.keystore.lookup(got)
         if st == "ok":
+            hw = str(headers.get("X-Hwid") or "").strip().lower()
+            if trial.valid_hwid(hw):                       # без заголовка (старые версии) лимит не проверяется
+                d = devices.check(server.keystore, info["tg_id"], hw)
+                if d != "ok":
+                    return None, d, info
             return "tg:%s" % info["tg_id"], None, info
         return None, (st if st in ("expired", "banned") else "invalid"), info
     return None, "invalid", None
@@ -1475,7 +1481,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._auth_link(u, body)
         client, reason, info = authorize_ex(app, self.headers)
         if client is None:
-            return self._send(401, {"ok": False, "error": reason or "invalid", "bot": app.bot})
+            err = {"ok": False, "error": reason or "invalid", "bot": app.bot}
+            if reason == "devices":
+                err["max_devices"] = devices.max_devices()
+            return self._send(401, err)
         if u.path == "/v1/auth/check":
             info, blocked = trial.apply(app.keystore, self.headers.get("X-Hwid"), info)
             return self._send(200, {"ok": True, "trial_blocked": blocked, "message": trial.MSG_USED if blocked else "",

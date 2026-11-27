@@ -60,7 +60,7 @@ def tg_srv_req(path, body=None, timeout=20):
         raise ApiError("Нужен сервер данных и вход по ключу из бота.", 400)
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(srv.rstrip("/") + "/v1/alerts/" + path, data=data, method="GET" if body is None else "POST",
-                                 headers={"Content-Type": "application/json", "X-Client-Key": key, "User-Agent": EXT_UA["User-Agent"]})
+                                 headers={"Content-Type": "application/json", "X-Client-Key": key, "User-Agent": EXT_UA["User-Agent"], **hwid_headers()})
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
             code, raw = r.status, r.read()
