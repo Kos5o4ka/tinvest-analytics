@@ -330,6 +330,7 @@ def _auth_http(srv, path, key):
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # только хэш ПК (см. 12e_hwid.py); для пробного периода
     try:
         with urllib.request.urlopen(urllib.request.Request(srv + path, headers=hd), timeout=10, context=_ssl()) as r:
             code, raw = r.status, r.read()
@@ -369,7 +370,8 @@ def _auth_eval(srv, key):
         return dict(base, expires=j.get("expires"), username=str(j.get("username") or ""),
                     plan="free" if plan == "free" else "pro",
                     pro_until=pu if isinstance(pu, (int, float)) and not isinstance(pu, bool) else None,
-                    trial=bool(j.get("trial")) and plan != "free")
+                    trial=bool(j.get("trial")) and plan != "free",
+                    trial_blocked=bool(j.get("trial_blocked")), message=str(j.get("message") or "") if j.get("trial_blocked") else "")
     if code == 401 or code == 403:
         err = str(j.get("error") or "")
         return dict(base, state="need_login", error=err if err in ("expired", "banned") else "invalid")
