@@ -1,5 +1,5 @@
 # ── Тепловая карта рынка: акции / облигации / фонды ──
-HM_BUCKETS = ["AAA", "AA", "A", "BBB", "≤BB", "без рейтинга"]
+HM_BUCKETS = ["ОФЗ", "AAA", "AA", "A", "BBB", "≤BB", "без рейтинга"]
 
 
 def treemap_layout(values, x, y, w, h):
@@ -60,11 +60,13 @@ def _hm_num(v):
 
 
 def _hm_stats(items):
-    up = sum(1 for i in items if i["chg"] > 0.005)
-    dn = sum(1 for i in items if i["chg"] < -0.005)
+    up = sum(1 for i in items if i["chg"] is not None and i["chg"] > 0.005)
+    dn = sum(1 for i in items if i["chg"] is not None and i["chg"] < -0.005)
     tot = sum(i["size"] for i in items)
     turn = sum(i.get("value") or 0 for i in items)
-    wch = sum(i["chg"] * i["size"] for i in items) / tot if tot > 0 else 0.0
+    valid = [i for i in items if i["chg"] is not None]
+    vtot = sum(i["size"] for i in valid)
+    wch = sum(i["chg"] * i["size"] for i in valid) / vtot if vtot > 0 else 0.0
     return {"up": up, "down": dn, "flat": len(items) - up - dn, "n": len(items),
             "turnover": round(turn), "wchg": round(wch, 2)}
 
@@ -77,7 +79,9 @@ def _hm_group(items, key):
     for name, its in groups.items():
         its.sort(key=lambda i: -i["size"])
         tot = sum(i["size"] for i in its)
-        wch = sum(i["chg"] * i["size"] for i in its) / tot if tot > 0 else 0.0
+        valid = [i for i in its if i["chg"] is not None]
+        vtot = sum(i["size"] for i in valid)
+        wch = sum(i["chg"] * i["size"] for i in valid) / vtot if vtot > 0 else 0.0
         out.append({"name": name, "size": tot, "chg": round(wch, 2), "items": its})
     out.sort(key=lambda g: -g["size"])
     return out
@@ -98,7 +102,7 @@ def _hm_equities(kind, period, size):
             continue
         sid = r.get("secid")
         items.append({"id": sid, "label": sid, "name": r.get("shortname") or r.get("name") or sid, "size": sz,
-                      "chg": chg if chg is not None else 0.0, "price": _hm_num(r.get("price")),
+                      "chg": chg, "price": _hm_num(r.get("price")),
                       "value": val, "cap": cap or None, "sector": r.get("sector") or "Прочее"})
     groups = _hm_group(items, lambda i: i["sector"])
     return {"groups": groups, "stats": _hm_stats(items)}
@@ -114,24 +118,41 @@ def _hm_bucket(rating):
 def _hm_bonds():
     rows = screener_rows() or []
     br = globals().get("best_rating")
-    rows = sorted((r for r in rows if (r.get("turn") or 0) > 0), key=lambda r: -r["turn"])[:300]
-    items = []
-    for r in rows:
+    traded = sorted((r for r in rows if (r.get("turn") or 0) > 0), key=lambda r: -r["turn"])
+    by_bk = {}
+    all_items = []
+    for r in traded:
         rt = r.get("rating")
-        if rt is None and br:
+        if rt is None and r.get("kind") != "ofz" and br:
             try:
                 x = br(r.get("isin"), r.get("name"))
                 rt = x["v"] if x else None
             except Exception:  # noqa: BLE001
                 rt = None
+        bk = "ОФЗ" if r.get("kind") == "ofz" else _hm_bucket(rt)
         isin = r.get("isin") or r["id"]
-        items.append({"id": isin, "label": r.get("name") or r["id"], "name": r.get("full") or r.get("name"),
-                      "size": r["turn"], "chg": _hm_num(r.get("chg")) or 0.0, "price": r.get("price"),
-                      "value": r["turn"], "cap": None, "yield": r.get("yield"), "rating": rt,
-                      "bucket": _hm_bucket(rt)})
-    groups = _hm_group(items, lambda i: i["bucket"])
+        it = {"id": isin, "label": r.get("name") or r["id"], "name": r.get("full") or r.get("name"),
+              "size": r["turn"], "chg": _hm_num(r.get("chg")) or 0.0, "price": r.get("price"),
+              "value": r["turn"], "cap": None, "yield": r.get("yield"), "rating": rt,
+              "bucket": bk}
+        all_items.append(it)
+        by_bk.setdefault(bk, []).append(it)
+    picked = []
+    seen = set()
+    for bk in HM_BUCKETS:
+        for it in by_bk.get(bk, [])[:40]:
+            if id(it) not in seen:
+                seen.add(id(it))
+                picked.append(it)
+    for it in all_items:
+        if len(picked) >= 300:
+            break
+        if id(it) not in seen:
+            seen.add(id(it))
+            picked.append(it)
+    groups = _hm_group(picked, lambda i: i["bucket"])
     groups.sort(key=lambda g: HM_BUCKETS.index(g["name"]) if g["name"] in HM_BUCKETS else 99)
-    return {"groups": groups, "stats": _hm_stats(items)}
+    return {"groups": groups, "stats": _hm_stats(picked)}
 
 
 def heatmap_payload(kind="stocks", period="d", size="cap"):

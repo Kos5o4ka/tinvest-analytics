@@ -81,6 +81,7 @@
 .st-t small code,.st-more code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;background:var(--card2);border-radius:4px;padding:1px 4px}
 .st-c{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex:0 1 auto;flex-wrap:wrap;min-width:0}
 .st-row.stack{flex-direction:column;align-items:stretch;gap:10px}
+.st-row.stack .st-t{flex:none}
 .st-row.stack .st-c{justify-content:flex-start;flex-wrap:nowrap}
 .st-row.stack .st-wide{flex:1}
 .st-row.stack .ld-path{flex:1}

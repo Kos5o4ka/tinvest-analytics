@@ -12,4 +12,7 @@
 .txo .txo-lc,.txo .tag.txo-bc{color:var(--neg)}
 .txo .tag.txo-bdg{white-space:normal;border:1px solid currentColor}
 .txo .txo-chart{min-height:240px}
+.txo .tbl{max-width:100%}
+.txo .tbl table th{white-space:normal;vertical-align:bottom;line-height:1.25}
+.txo .tbl table td.l{white-space:normal;max-width:240px;word-break:break-word}
 @media print{.txo .txo-form{display:none}}

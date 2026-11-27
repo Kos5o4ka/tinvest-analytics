@@ -49,12 +49,13 @@ function scrActiveCount(){
 function scrRows(noBox){
   const f=S.sf,q=f.q.trim().toLowerCase(),ri=f.rmin?RSC.indexOf(f.rmin):-1;
   const nv=x=>{const s=String(x??'').trim().replace(',','.');if(!s)return null;const n=parseFloat(s);return isNaN(n)?null:n};
-  const ymin=nv(f.ymin),ymax=nv(f.ymax),tmax=nv(f.tmax),turn=nv(f.turn),spmin=nv(f.spmin);
+  const isIsin=/^[A-Z]{2}[0-9A-Z]{10}$/i.test(q);
+  const ymin=nv(f.ymin),ymax=(q&&(isIsin||String(f.ymax).trim()===SCR_DEF.ymax))?null:nv(f.ymax),tmax=nv(f.tmax),turn=nv(f.turn),spmin=nv(f.spmin);
   let rs=S.scr.rows.filter(r=>{
     if(S.scrPreset==='fx'&&r.cur==='RUB')return false;
     if(f.cur!=='all'&&r.cur!==f.cur)return false;
     if(f.kind!=='all'&&r.kind!==f.kind)return false;
-    if(q&&!((r.name||'').toLowerCase().includes(q)||(r.isin||'').toLowerCase().includes(q)||(r.full||'').toLowerCase().includes(q)))return false;
+    if(q&&!((r.name||'').toLowerCase().includes(q)||(r.isin||'').toLowerCase().includes(q)||(r.full||'').toLowerCase().includes(q)||(r.issuer||'').toLowerCase().includes(q)))return false;
     if(ri>=0&&!(r.rating&&RSC.indexOf(r.rating)<=ri))return false;
     if(f.sector&&r.sector!==f.sector)return false;
     if(f.rated&&!r.rating)return false;

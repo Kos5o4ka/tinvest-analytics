@@ -36,8 +36,8 @@ aside{width:252px;flex:none;background:var(--side);border-right:1px solid var(--
 .badge.sb b{background:var(--ac);box-shadow:0 0 0 3px #3b82f622}
 
 main{flex:1;min-width:0;display:flex;flex-direction:column}
-.top{display:flex;align-items:center;gap:14px;padding:14px 28px;border-bottom:1px solid var(--line);flex-wrap:wrap}
-.top h1{font-size:20px;font-weight:650;letter-spacing:-.02em;margin-right:auto;display:flex;align-items:baseline;gap:10px}
+.top{display:flex;align-items:center;gap:14px;padding:14px 28px;border-bottom:1px solid var(--line);flex-wrap:nowrap}
+.top h1{font-size:20px;font-weight:650;letter-spacing:-.02em;margin-right:auto;display:flex;align-items:baseline;gap:10px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .top h1 small{font-size:13px;color:var(--mu);font-weight:500}
 .seg{display:flex;background:var(--card);border:1px solid var(--line);border-radius:11px;padding:3px;flex-wrap:wrap}
 .seg button{all:unset;cursor:pointer;padding:6px 12px;border-radius:8px;color:var(--tx2);font-size:13px;font-weight:500;transition:.15s;white-space:nowrap}

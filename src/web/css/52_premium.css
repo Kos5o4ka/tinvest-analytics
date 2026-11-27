@@ -105,17 +105,19 @@ aside{background:var(--side);border-right:1px solid var(--line)}
 .scr-chip{background:transparent;border-color:var(--line2)}
 .scr-chip.on{background:#3b82f61a;color:var(--ac-tx);border-color:#3b82f659}
 
-input.in,.in,select.in,textarea.in{background:#ffffff05;border:1px solid var(--line2);border-radius:10px;transition:border-color .15s,box-shadow .15s}
+input.in,.in,select.in,textarea.in{background-color:#ffffff05;border:1px solid var(--line2);border-radius:10px;transition:border-color .15s,box-shadow .15s;box-sizing:border-box}
+input.in,select.in{height:38px;padding:0 12px}
+select.in{-webkit-appearance:none;appearance:none;padding-right:32px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%238b93a7' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 11px center}
 .in:focus{outline:0;border-color:#3b82f699;box-shadow:0 0 0 3px var(--ac-glow)}
-[data-theme=light] .in{background:#fff}
+[data-theme=light] .in{background-color:#fff}
 
 /* ── навигация раздела: подчёркнутые вкладки вместо коробки ── */
-.ux-sub{background:transparent;border:0;border-bottom:1px solid var(--line);border-radius:0;padding:0;gap:22px}
-.ux-sub button{padding:9px 1px 11px;border-radius:0;font-size:13.5px;color:var(--mu)}
+.ux-sub{background:transparent;border:0;border-bottom:1px solid var(--line);border-radius:10px 10px 0 0;padding:2px 6px 0;gap:20px}
+.ux-sub button{padding:9px 6px 11px;border-radius:8px 8px 0 0;font-size:13.5px;color:var(--mu)}
 .ux-sub button:hover{color:var(--tx)}
 .ux-sub button.on{background:transparent;color:var(--tx);box-shadow:inset 0 -2px 0 var(--ac)}
 [data-theme=light] .ux-sub button.on{background:transparent;box-shadow:inset 0 -2px 0 var(--ac)}
-.ux-subwrap{margin-bottom:0;width:100%}
+.ux-subwrap{margin-bottom:0;width:100%;border-radius:12px;padding:0 2px}
 .ux-subwrap .ux-sub{flex:1}
 .ux-why{background:transparent;border:0;padding:0 2px;color:var(--mu);font-size:12.5px}
 .ux-why-x{border-color:var(--line)}

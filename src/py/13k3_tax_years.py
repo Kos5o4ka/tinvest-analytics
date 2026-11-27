@@ -166,7 +166,125 @@ def tx_pos_price(r):
     return p or None
 
 
-def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resolve=None):
+def tx_apply_splits(ops, names, today=None, splits=None, resolve_isin=None):
+    """Применяет сплиты/консолидации Мосбиржи к операциям без дублирования уже вставленных пар split:*."""
+    if not splits:
+        return ops
+    today = today or date.today()
+    names = names or {}
+    existing = set()
+    by_key = {}
+    dates = []
+    for o in ops:
+        d = (o.get("date") or "")[:10]
+        if d:
+            dates.append(d)
+        acc = o.get("_acc") or ""
+        uid = o.get("instrumentUid") or o.get("figi") or o.get("_ident") or ""
+        info = names.get(uid) or names.get(o.get("figi") or "") or {}
+        isin = info.get("isin") or o.get("isin") or o.get("_sec") or ""
+        if (o.get("_conv") or {}).get("source") == "moex_split" or str(o.get("id") or "").startswith("split:"):
+            if uid:
+                existing.add((acc, uid, d))
+            if isin:
+                existing.add((acc, isin, d))
+            continue
+        k = classify(o.get("type"))
+        if k not in ("buy", "sell", "sec_in", "sec_out", "conv_in", "conv_out", "repayments"):
+            continue
+        pk = pos_key(o)
+        if not pk:
+            continue
+        itype = o.get("instrumentType") or info.get("type") or ""
+        itype = {"bonds": "bond", "shares": "share"}.get(itype, itype) or "share"
+        if itype in TAX_SKIP_TYPES or itype == "option":
+            continue
+        g = by_key.setdefault((acc, pk), {"acc": acc, "pk": pk, "ops": [], "uids": set(), "isins": set(), "tickers": set(),
+                                          "uid": None, "pos": None, "figi": None, "kind": None, "itype": itype, "name": ""})
+        g["ops"].append(o)
+        if uid:
+            g["uids"].add(uid)
+            g["uid"] = uid
+        if isin:
+            g["isins"].add(isin)
+        tk = info.get("ticker") or o.get("ticker") or ""
+        if tk:
+            g["tickers"].add(tk)
+        g["pos"] = g["pos"] or o.get("positionUid")
+        g["figi"] = g["figi"] or o.get("figi")
+        g["kind"] = g["kind"] or o.get("instrumentKind")
+        g["name"] = g["name"] or info.get("name") or o.get("name") or tk
+    if not dates or not by_key:
+        return ops
+    d_from, d_to = min(dates), max(max(dates), today.isoformat())
+    rows = [r for r in splits if r.get("date") and d_from <= r["date"] <= d_to and r.get("before") and r.get("after") and r["before"] != r["after"]]
+    if not rows:
+        return ops
+    all_isins = {i for g in by_key.values() for i in g["isins"]}
+    all_tickers = {t for g in by_key.values() for t in g["tickers"]}
+    sec_isin = {}
+    if resolve_isin and all_isins:
+        need = sorted({r["secid"] for r in rows if r["secid"] not in all_isins and r["secid"] not in all_tickers and not ISIN_RE.match(r["secid"])})
+        for sid in need:
+            try:
+                res = resolve_isin(sid)
+                if res:
+                    sec_isin[sid] = res
+            except Exception:  # noqa: BLE001
+                pass
+    out = list(ops)
+    zero = to_money(0, "rub")
+    qs = lambda x: str(int(x)) if x == int(x) else repr(x)
+    for g in by_key.values():
+        evs = []
+        for r in rows:
+            sid = r["secid"]
+            if sid in g["isins"] or sid in g["tickers"] or (sec_isin.get(sid) and sec_isin[sid] in g["isins"]):
+                evs.append((r["date"], float(r["after"]) / float(r["before"]), float(r["before"]), float(r["after"])))
+        if not evs:
+            continue
+        evs.sort(key=lambda x: x[0])
+        gops = sorted(g["ops"], key=lambda o: o.get("date") or "")
+        for idx, (day, ratio, before, after) in enumerate(evs):
+            if any((g["acc"], u, day) in existing for u in g["uids"] | g["isins"]):
+                continue
+            qty, ei = 0.0, 0
+            for o in gops:
+                d = (o.get("date") or "")[:10]
+                if d >= day:
+                    break
+                while ei < idx and evs[ei][0] <= d:
+                    qty *= evs[ei][1]
+                    ei += 1
+                k, q = classify(o.get("type")), op_qty(o)
+                if k in ("buy", "sec_in", "conv_in"):
+                    qty += q
+                elif k in ("sell", "sec_out", "conv_out"):
+                    qty -= q
+                elif k == "repayments" and op_type(o) == "BOND_REPAYMENT_FULL":
+                    qty = 0.0
+            while ei < idx:
+                qty *= evs[ei][1]
+                ei += 1
+            if qty <= 1e-6:
+                continue
+            new_q = qty * ratio
+            new_q = int(round(new_q)) if abs(new_q - round(new_q)) < 1e-6 else round(new_q, 6)
+            uid = g["uid"]
+            cv = {"from_key": uid, "to_key": uid, "ratio": ratio, "label": split_label(before, after), "source": "moex_split",
+                  "old_uids": sorted(g["uids"]) or [uid], "new_uid": uid, "old_qty": qty, "new_qty": new_q}
+            base = {"date": day + "T00:00:01Z", "state": "OPERATION_STATE_EXECUTED", "payment": dict(zero), "_acc": g["acc"],
+                    "_conv": cv, "name": g["name"], "instrumentUid": uid, "positionUid": g["pos"], "figi": g["figi"],
+                    "instrumentKind": g["kind"] or "INSTRUMENT_TYPE_SHARE", "instrumentType": g["itype"]}
+            cid = "split:%s:%s:%s" % (g["acc"], g["pk"], day)
+            out.append(dict(base, id=cid + ":out", type="OPERATION_TYPE_X_CONV_OUT", quantity=qs(qty), quantityDone=qs(qty)))
+            out.append(dict(base, id=cid + ":in", date=day + "T00:00:02Z", type="OPERATION_TYPE_X_CONV_IN",
+                            quantity=qs(new_q), quantityDone=qs(new_q)))
+    out.sort(key=lambda o: o.get("date") or "")
+    return out
+
+
+def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resolve=None, splits=None, resolve_isin=None):
     """Чистая часть расчёта (без сети): ops + позиции + выбранные счета -> структура состояния."""
     today = today or date.today()
     pos = {}
@@ -176,6 +294,7 @@ def tax_compute(ops, names, positions, sel, settings, fx=None, today=None, resol
     held = {u: r["qty"] for u, r in pos.items()} if pos else None
     events = find_conversions(ops, names, held, resolve=resolve)
     ops = apply_conversions(ops, events)
+    ops = tx_apply_splits(ops, names, today=today, splits=splits, resolve_isin=resolve_isin)
     eng = tax_engine(ops, names, fx, held)
     accs = {a["id"]: a for a in sel}
     groups = {}
@@ -245,8 +364,11 @@ def tx_ldv_tables(st):
         days = (frm - today).days
         tgt = ready if days <= 0 else groups
         k = l["uid"] if days <= 0 else (l["uid"], frm)
+        acc_name = ((st.get("accs") or {}).get(l["acc"]) or {}).get("name") or l["acc"]
         e = tgt.setdefault(k, {"uid": l["uid"], "name": l["name"], "ticker": l["ticker"], "type": l["type"], "date": frm.isoformat(), "days": days,
-                               "qty": 0.0, "cost": 0.0, "value": 0.0, "gain": 0.0, "known": True})
+                               "qty": 0.0, "cost": 0.0, "value": 0.0, "gain": 0.0, "known": True, "_accs": set()})
+        if acc_name:
+            e["_accs"].add(acc_name)
         e["qty"] += l["qty"]
         e["cost"] += cost
         if value is None:
@@ -256,6 +378,7 @@ def tx_ldv_tables(st):
             e["gain"] += value - cost
     up = sorted(groups.values(), key=lambda e: e["days"])
     for e in up + list(ready.values()):
+        e["acc"] = ", ".join(sorted(e.pop("_accs", ())))
         e["tax_now"] = max(0.0, e["gain"]) * rate if e["known"] else None
     return up, sorted(ready.values(), key=lambda e: -e["gain"]), rate
 

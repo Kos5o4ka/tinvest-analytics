@@ -169,9 +169,16 @@ def _stk_changes(rows):
     for field, n in (("chg_w", STK_WEEK), ("chg_m", STK_MONTH)):
         if len(ses) <= n:
             continue
-        try:
-            base = stock_history_closes(ses[-1 - n])
-        except Exception:  # noqa: BLE001
+        base = None
+        for idx in range(-1 - n, -len(ses) - 1, -1):
+            try:
+                b = stock_history_closes(ses[idx])
+                if b:
+                    base = b
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if not base:
             continue
         for r in rows:
             b = base.get(r["secid"])

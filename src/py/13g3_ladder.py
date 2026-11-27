@@ -101,7 +101,8 @@ def ladder_payload(cfg, q=None):
     mr = mr if mr in RATING_SCALE else "A"
     floaters, amort = _ld_flag(q.get("floaters"), False), _ld_flag(q.get("amort"), True)
     monthly = _ld_flag(q.get("monthly"), False)
-    cap = _fnum(q.get("max_issuer"), 1.0, 100.0, max(5, round(100.0 / rungs_n / 2)))
+    _raw_cap = _fnum(q.get("max_issuer"), 0.0, 100.0, 100.0)
+    cap = 100.0 if _raw_cap <= 0 else _raw_cap
     min_turn = _fnum(q.get("min_turnover"), 0.0, 1e12, 1000000.0)
     par = {"sum": total, "years": years, "rungs": rungs_n, "min_rating": mr, "floaters": floaters, "amort": amort,
            "max_issuer": cap, "min_turnover": min_turn, "monthly": monthly}

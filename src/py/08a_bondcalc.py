@@ -118,19 +118,45 @@ def fl_estimates(bz, today, face, path=None):
 
 
 FL_SPREAD_KEY, FL_SPREAD_TTL, FL_SPREAD_RPS = "fl_spread1:", 30 * 86400, 4
+_FL_BASE_RX = (
+    ("rusfar", re.compile(r"\bRUSFAR(?:\s*(?:ON|1W|2W|1M|3M|6M))?\b", re.I)),
+    ("ruonia", re.compile(r"\bRUONIA\b", re.I)),
+    ("infl", re.compile(r"ИПЦ|ИНФЛ", re.I)),
+    ("key", re.compile(r"КЛЮЧЕВ[А-ЯЁ]*\s+СТАВК[А-ЯЁ]*(?:\s+(?:БАНКА\s+РОССИИ|ЦБ(?:\s+РФ)?))?|(?<![А-ЯЁA-Z])КС(?![А-ЯЁA-Z])", re.I)),
+)
+_FL_SPREAD_RX = re.compile(r"^\s*[^0-9+\-−]*?([+\-−])\s*(\d+(?:[.,]\d+)?)\s*(?:%|П\.?\s*П\.?)?(?=$|\s|[,;)])", re.I)
+
+
+def fl_parse_formula(details):
+    """Парсит формулу флоатера из ISS COUPON_DETAILS -> (base, spread). Если не распознано — (None, None)."""
+    d = (details or "").strip()
+    if not d:
+        return None, None
+    for base, rx in _FL_BASE_RX:
+        m = rx.search(d)
+        if not m:
+            continue
+        if base == "infl":
+            return "infl", None
+        sm = _FL_SPREAD_RX.match(d[m.end():])
+        if not sm:
+            return base, None
+        sp = float(sm.group(2).replace(",", "."))
+        if sm.group(1) in ("-", "−"):
+            sp = -sp
+        return base, (round(sp, 2) if FL_SPREAD_RANGE[0] <= sp <= FL_SPREAD_RANGE[1] else None)
+    return None, None
 
 
 def fl_base_kind(name, kind=None, details=None):
-    """База флоатера, если она видна: сначала поле ISS COUPON_DETAILS («Ключевая ставка», «ИПЦ», «RUONIA»), затем по названию:
-    ruonia (ОФЗ-ПК — все плавающие ОФЗ привязаны к RUONIA; «RUONIA» в названии), infl (ОФЗ-ИН, «инфляц»), иначе key."""
-    d = (details or "").upper()
-    if "RUONIA" in d:
-        return "ruonia"
-    if "ИПЦ" in d or "ИНФЛ" in d:
-        return "infl"
-    if "КЛЮЧЕВ" in d:
-        return "key"
+    """База флоатера, если она видна: сначала поле ISS COUPON_DETAILS («Ключевая ставка»/«КС», «RUSFAR», «RUONIA», «ИПЦ»),
+    затем по названию: rusfar, ruonia (ОФЗ-ПК), infl (ОФЗ-ИН, «инфляц»), иначе key."""
+    pb, _ = fl_parse_formula(details)
+    if pb:
+        return pb
     n = (name or "").upper()
+    if "RUSFAR" in n:
+        return "rusfar"
     if kind == "ofz" or "RUONIA" in n or re.search(r"ОФЗ[\s-]*ПК", n):
         return "ruonia"
     if "ИНФЛ" in n or re.search(r"ОФЗ[\s-]*ИН\b", n):
@@ -154,7 +180,7 @@ def fl_spread_calc(bz, face, today=None):
     am_all = sorted((a["amortdate"], a.get("value")) for a in bz.get("amort") or [] if a.get("amortdate") and a.get("value"))
     samples = []
     for i, (d, v, vp) in enumerate(cps):
-        if not v or i == 0 or d > today:
+        if not (v or vp) or i == 0 or d > today:
             continue
         p0 = cps[i - 1][0]
         k = key_rate_on(ser, p0)
@@ -172,13 +198,25 @@ def fl_spread_calc(bz, face, today=None):
 
 
 def fl_spread_put(isin, name, bz, face, kind=None, details=None):
-    """Считает и кладёт в kv fl_spread1:<isin> -> {spread, base, ts}; для не ключевой базы спред не показываем."""
-    base = fl_base_kind(name, kind, details)
-    if base == "key" and not bz:
+    """Считает и кладёт в kv fl_spread1:<isin> -> {spread, base, ts}.
+    Первичный источник — формула в COUPON_DETAILS; при её отсутствии — расчёт по прошлым купонам.
+    При пустых прошлых купонах (spread is None) не кэшируем на 30 суток, чтобы повторить позже."""
+    pb, psp = fl_parse_formula(details)
+    if pb and psp is not None:
+        v = {"spread": psp, "base": pb, "ts": time.time()}
+        store().put(FL_SPREAD_KEY + isin, v)
+        return v
+    base = pb or fl_base_kind(name, kind, details)
+    if base in ("key", "ruonia", "rusfar") and not bz:
+        if base == "ruonia":              # ОФЗ-ПК без графика: подпись «RUONIA» без спреда
+            v = {"spread": None, "base": base, "ts": time.time()}
+            store().put(FL_SPREAD_KEY + isin, v)
+            return v
         return None                       # нет графика выплат — не кэшируем на 30 суток, повторим позже
-    sp = fl_spread_calc(bz, face) if base == "key" else None
+    sp = fl_spread_calc(bz, face) if base in ("key", "ruonia", "rusfar") else None
     v = {"spread": sp, "base": base, "ts": time.time()}
-    store().put(FL_SPREAD_KEY + isin, v)
+    if sp is not None or base == "infl":
+        store().put(FL_SPREAD_KEY + isin, v)
     return v
 
 
@@ -198,18 +236,20 @@ def fl_spread_cached(isins=None):
 
 
 def fl_label(info, floating=True):
-    """Подпись типа купона: «КС + 3,50%» / «RUONIA» / «ИНФЛЯЦИЯ» / «ФЛОАТЕР»; фикс — «ФИКС»."""
+    """Подпись типа купона: «КС + 3,50%» / «RUONIA + 1,40%» / «RUSFAR + 1,50%» / «ИНФЛЯЦИЯ» / «ФЛОАТЕР»; фикс — «ФИКС»."""
     if not floating:
         return "ФИКС"
     info = info or {}
     b = info.get("base")
-    if b == "ruonia":
-        return "RUONIA"
     if b == "infl":
         return "ИНФЛЯЦИЯ"
     sp = info.get("spread")
-    if b == "key" and sp is not None:
-        return "КС %s %s%%" % ("+" if sp >= 0 else "−", ("%.2f" % abs(sp)).replace(".", ","))
+    if b in ("key", "ruonia", "rusfar"):
+        pref = {"key": "КС", "ruonia": "RUONIA", "rusfar": "RUSFAR"}[b]
+        if sp is not None:
+            return "%s %s %s%%" % (pref, "+" if sp >= 0 else "−", ("%.2f" % abs(sp)).replace(".", ","))
+        if b in ("ruonia", "rusfar"):
+            return pref
     return "ФЛОАТЕР"
 
 

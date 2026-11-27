@@ -10,10 +10,18 @@ document.addEventListener('keydown',e=>{
 
 /* ── Колокольчик: тревоги мониторинга, открытые оферты и ближайшие выплаты ── */
 const BELL={open:false,tries:0};
+function bellAlertHtml(a){
+  const[s,c,dot]=(typeof MON_SEV!=='undefined'&&MON_SEV[a.severity])||(typeof MON_SEV!=='undefined'&&MON_SEV.info)||['Инфо','mon-i','mu'];
+  const n=(a.isins||[]).length;
+  const nm=a.kind==='rating'?`${esc(a.name)}${n?` <small class="mu">· ${esc((a.bonds||[]).slice(0,2).join(', '))}${n>2?' и ещё '+(n-2):''}</small>`:''}`:esc(a.name||'');
+  const au=typeof safeUrl==='function'?safeUrl(a.url):'';
+  const dt=a.asof?'сейчас':a.date?ddm(a.date):'';
+  return`<div class="bell-card ${c}"><div class="bell-top"><span class="st-dot ${dot}"></span><span class="mon-sev">${s}</span>${dt?`<span class="mon-d num">${dt}</span>`:''}${au?`<a class="bell-lnk" href="${esc(au)}" target="_blank" rel="noopener" title="Источник">↗</a>`:''}</div><div class="bell-body"><b>${nm}</b><span>${esc(a.message||'')}</span></div></div>`;
+}
 function bellItems(){
   const out=[];
   const m=S.mon&&S.mon.data;
-  if(m&&m.alerts)m.alerts.filter(a=>a.severity!=='info').slice(0,6).forEach(a=>out.push({sev:a.severity,html:monAlertHtml(a),go:'mon'}));
+  if(m&&m.alerts)m.alerts.filter(a=>a.severity!=='info').slice(0,6).forEach(a=>out.push({sev:a.severity,html:bellAlertHtml(a),go:'mon'}));
   const d=S.today&&S.today.data;
   if(d&&!d.empty){
     if(d.offers&&d.offers.items)d.offers.items.filter(o=>o.status==='open').slice(0,3).forEach(o=>out.push({sev:'medium',html:`<div class="bell-it">${tdOfferText(o)}</div>`,go:'off'}));
@@ -54,6 +62,7 @@ function bellRefresh(){
   w.innerHTML=`<button class="btn ghost" id="bell" type="button" title="Уведомления: тревоги, оферты, выплаты" aria-label="Уведомления" aria-haspopup="true" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 16v-5a6 6 0 0 0-12 0v5l-2 3h16z"/><path d="M10 21h4"/></svg><span class="bell-n"></span></button><div class="more-dd bell-dd noprint" id="bell-dd" hidden></div>`;
   srch.parentNode.insertBefore(w,srch);
   w.addEventListener('click',e=>{
+    if(e.target.closest('a'))return;
     const g=e.target.closest('[data-bgo]');
     if(g){BELL.open=false;bellDraw();go(g.dataset.bgo);return}
     if(e.target.closest('#bell')){BELL.open=!BELL.open;if(BELL.open)bellRefresh();else bellDraw()}

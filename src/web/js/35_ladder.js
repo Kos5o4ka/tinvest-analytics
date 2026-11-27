@@ -86,7 +86,7 @@ function ladMy(){
     <div class="tbl"><table class="ld-tbl" id="ld-det"><thead><tr><th class="l">Облигация</th><th>Дата</th><th class="l">Тип</th><th colspan="2">Сумма</th><th>Доля</th><th>Доходность</th></tr></thead><tbody>${ladGroups(ps,O)}</tbody></table></div>
     <div class="note" style="margin-top:10px;font-size:12px;color:var(--mu)">«Доля» — часть всех будущих возвратов номинала по облигациям портфеля. Суммы — номинал по текущему количеству бумаг (без купонов и налога)${d.undated.length?'; без даты погашения, не вошли: '+esc(d.undated.join(', ')):''}.</div></div>`;
 }
-S.ladQ={sum:'500000',years:'5',rungs:'',rating:'A',floaters:false,amort:true,monthly:false};
+S.ladQ={sum:'500000',years:'5',rungs:'',rating:'A',max_issuer:'',floaters:false,amort:true,monthly:false};
 try{const v=JSON.parse(localStorage.getItem('lad_q')||'null');if(v&&typeof v==='object')Object.assign(S.ladQ,v)}catch(e){}
 const LAD_RT=['AAA','AA','A','BBB','BB'];
 const LAD_MN=['янв','фев','мар','апр','мая','июн','июл','авг','сен','окт','ноя','дек'];
@@ -94,6 +94,7 @@ function ladRun(){
   const q=S.ladQ;try{localStorage.setItem('lad_q',JSON.stringify(q))}catch(e){}
   const p=new URLSearchParams({sum:String(q.sum||'500000').replace(/\s/g,'').replace(',','.'),years:q.years||'5',min_rating:q.rating||'A',floaters:q.floaters?'1':'0',amort:q.amort?'1':'0',monthly:q.monthly?'1':'0'});
   if(q.rungs)p.set('rungs',q.rungs);
+  if(q.max_issuer)p.set('max_issuer',q.max_issuer);
   S.lad={loading:true};render();
   api('/api/ladder?'+p).then(d=>{S.lad={data:d};if(S.page==='lad')renderSoon()}).catch(e=>{S.lad={error:e.message};if(S.page==='lad')renderSoon()});
 }
@@ -143,6 +144,7 @@ function pLadBuild(){
     <label class="field"><span>Горизонт, лет (1–10)</span><input class="in" id="ld-years" type="number" min="1" max="10" step="1" value="${esc(q.years)}"></label>
     <label class="field"><span>Ступеней</span><input class="in" id="ld-rungs" type="number" min="1" max="12" step="1" placeholder="= лет" value="${esc(q.rungs)}"></label>
     <label class="field"><span>Рейтинг не ниже</span><select class="in" id="ld-rt">${LAD_RT.map(r=>`<option${q.rating===r?' selected':''}>${r}</option>`).join('')}</select></label>
+    <label class="field"><span>Макс. на эмитента, %</span><input class="in" id="ld-cap" type="number" min="5" max="100" step="5" placeholder="без лимита" value="${esc(q.max_issuer||'')}"></label>
     <label class="sw"><input type="checkbox" id="ld-fl" ${q.floaters?'checked':''}><i></i><div><b>Флоатеры</b><small>купон плавает со ставкой</small></div></label>
     <label class="sw"><input type="checkbox" id="ld-am" ${q.amort?'checked':''}><i></i><div><b>Амортизация</b><small>долг гасится частями</small></div></label>
     <label class="sw"><input type="checkbox" id="ld-mo" ${q.monthly?'checked':''}><i></i><div><b>Ровный доход</b><small>купоны в разные месяцы</small></div></label>
@@ -168,7 +170,7 @@ function bindLad(){
   const setAll=v=>{const d=S.ladP&&S.ladP.data;if(!d||d.empty)return;const V=d.variants[S.ladO.offers&&d.has_offers?'offer':'maturity']||d.variants.offer;(S.ladO.gran==='quarter'?V.quarter:V.year).forEach(p=>{S.ladO.col[p.key]=v});render()};
   const cl=$('#ld-cl'),ex=$('#ld-ex');if(cl)cl.onclick=()=>setAll(true);if(ex)ex.onclick=()=>setAll(false);
   const g=$('#ld-go');if(!g)return;
-  g.onclick=()=>{const q=S.ladQ;q.sum=$('#ld-sum').value;q.years=$('#ld-years').value;q.rungs=$('#ld-rungs').value;q.rating=$('#ld-rt').value;
+  g.onclick=()=>{const q=S.ladQ;q.sum=$('#ld-sum').value;q.years=$('#ld-years').value;q.rungs=$('#ld-rungs').value;q.rating=$('#ld-rt').value;q.max_issuer=($('#ld-cap')||{}).value||'';
     q.floaters=$('#ld-fl').checked;q.amort=$('#ld-am').checked;q.monthly=$('#ld-mo').checked;ladRun()};
-  ['#ld-sum','#ld-years','#ld-rungs'].forEach(i=>{const e=$(i);if(e)e.onkeydown=ev=>{if(ev.key==='Enter')g.click()}});
+  ['#ld-sum','#ld-years','#ld-rungs','#ld-cap'].forEach(i=>{const e=$(i);if(e)e.onkeydown=ev=>{if(ev.key==='Enter')g.click()}});
 }

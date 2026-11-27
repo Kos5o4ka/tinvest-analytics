@@ -366,5 +366,84 @@ class TestSettingsEnhancements(unittest.TestCase):
         self.assertIn(".st-dirty-bar", css_set)
 
 
+class TestUiFixesBatch(unittest.TestCase):
+    def test_roadmap_removed_and_changelog_kept(self):
+        s_ui = _read("src/web/js/21b_set_ui.js")
+        s_boot = _read("src/web/js/26_changelog_boot.js")
+        self.assertNotIn("Роадмап", s_ui)
+        self.assertNotIn("roadmapHtml", s_ui)
+        self.assertIn("whatsnew", s_ui)
+        self.assertNotIn("roadmapHtml", s_boot)
+        self.assertIn("changelogHtml", s_boot)
+
+    def test_calc_split_and_aside_width(self):
+        css = _read("src/web/css/15_calc.css")
+        self.assertIn("minmax(340px,400px) minmax(0,1fr)", css)
+        self.assertIn("aside.cl-side,.cl-side", css)
+        self.assertIn("width:100%", css)
+        self.assertIn("@media(max-width:1100px){.cl-split{grid-template-columns:1fr}", css)
+
+    def test_arb_null_guard_nowrap_and_ux_sub(self):
+        arb = _read("src/web/js/59_arb.js")
+        prem = _read("src/web/css/52_premium.css")
+        self.assertIn("S.page==='arb'&&$('#view')", arb)
+        self.assertIn("flex-wrap:nowrap", arb)
+        self.assertIn("border-radius:10px 10px 0 0", prem)
+        self.assertIn("border-radius:12px", prem)
+
+    def test_flows_default_period_day(self):
+        flw = _read("src/web/js/48_flows.js")
+        self.assertIn("period:'day'", flw)
+
+    def test_bell_compact_card_and_css(self):
+        ux = _read("src/web/js/68_ux_extra.js")
+        winfix = _read("src/web/css/59_winfix.css")
+        self.assertIn("function bellAlertHtml(", ux)
+        self.assertIn("bell-card", ux)
+        self.assertIn("bell-top", ux)
+        self.assertIn("bell-body", ux)
+        self.assertIn(".bell-card{", winfix)
+        self.assertIn(".bell-top{", winfix)
+        self.assertIn(".bell-body{", winfix)
+
+    def test_settings_stack_and_unified_inputs(self):
+        css_set = _read("src/web/css/56_settings_v2.css")
+        css_tbl = _read("src/web/css/05_tables_forms.css")
+        css_prem = _read("src/web/css/52_premium.css")
+        self.assertIn(".st-row.stack .st-t{flex:none}", css_set)
+        for css in (css_tbl, css_prem):
+            self.assertIn("height:38px", css)
+            self.assertIn("box-sizing:border-box", css)
+            self.assertIn("appearance:none", css)
+
+    def test_dash_hero_logo_test_png_and_monitor_error(self):
+        logos_path = os.path.join(ROOT, "src", "web", "js", "05_logos.js")
+        core_path = os.path.join(ROOT, "src", "web", "js", "01_core.js")
+        code = DOM_STUB + f"""
+        load({json.dumps(core_path)});
+        load({json.dumps(logos_path)});
+        const html1 = logo({{name:'Тест', ticker:'TEST', logo:'test.png'}}, 34);
+        const html2 = logo({{name:'Сбер', ticker:'SBER', logo:'sber.png'}}, 34);
+        print(JSON.stringify({{ hasTest: html1.includes('/logo/'), hasSber: html2.includes('/logo/sber.png') }}));
+        """
+        out = _run_jsc(code)
+        res = json.loads(out.strip().splitlines()[-1])
+        self.assertFalse(res["hasTest"])
+        self.assertTrue(res["hasSber"])
+
+        mon = _read("src/web/js/31_monitor.js")
+        self.assertIn("if(['mon','dash'].includes(S.page))renderSoon()", mon.split(".catch(")[1])
+
+        winfix = _read("src/web/css/59_winfix.css")
+        self.assertIn(".hero>.meta{position:relative;z-index:1}", winfix)
+        self.assertIn("top:auto;bottom:0", winfix)
+
+    def test_topbar_nowrap_desktop(self):
+        lay = _read("src/web/css/02_layout.css")
+        winfix = _read("src/web/css/59_winfix.css")
+        self.assertIn("flex-wrap:nowrap", lay)
+        self.assertIn(".top{flex-wrap:nowrap}", winfix)
+
+
 if __name__ == "__main__":
     unittest.main()

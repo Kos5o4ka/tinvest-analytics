@@ -10,8 +10,9 @@ function setSyncHtml(c){
   const off=`<div class="st-callout">Синхронизация <b>выключена</b>. Пока вы её не включите, портфель остаётся только на этом компьютере. Если включить, данные ниже будут храниться на сервере в зашифрованном виде.</div>
     <p class="st-line">${what}</p><p class="st-line">${how}</p>
     <div id="sy-need" class="st-line" hidden>Сначала войдите по ключу из Telegram-бота: синхронизация привязана к вашему аккаунту Telegram.</div>
-    ${stRow('Первое устройство','Создать облачную копию. Кодовую фразу можно придумать самому (от 12 знаков) или оставить поле пустым: тогда программа создаст случайную',`<input class="in st-wide" id="sy-new" placeholder="своя кодовая фраза (по желанию)" autocomplete="off" spellcheck="false" aria-label="Своя кодовая фраза"><button class="btn" id="sy-create">Включить и создать копию</button>`,{stack:1})}
-    ${stRow('Второе устройство','Подключиться к копии, созданной на другом компьютере: нужна её кодовая фраза',`<input class="in st-wide" id="sy-join-ph" placeholder="кодовая фраза с первого устройства" autocomplete="off" spellcheck="false" aria-label="Кодовая фраза"><button class="btn ghost" id="sy-join">Подключить это устройство</button>`,{stack:1})}`;
+    <div id="sy-found" class="st-callout" hidden></div>
+    <div id="sy-create-wrap">${stRow('Первое устройство','Создать облачную копию. Кодовую фразу можно придумать самому (от 12 знаков) или оставить поле пустым: тогда программа создаст случайную',`<input class="in st-wide" id="sy-new" placeholder="своя кодовая фраза (по желанию)" autocomplete="off" spellcheck="false" aria-label="Своя кодовая фраза"><button class="btn" id="sy-create">Включить и создать копию</button>`,{stack:1})}</div>
+    <div id="sy-join-wrap">${stRow('Второе устройство','Подключиться к копии, созданной на другом компьютере: нужна её кодовая фраза',`<input class="in st-wide" id="sy-join-ph" placeholder="кодовая фраза с первого устройства" autocomplete="off" spellcheck="false" aria-label="Кодовая фраза"><button class="btn ghost" id="sy-join">Подключить это устройство</button>`,{stack:1})}</div>`;
   const on=`<div class="st-callout"><b>Синхронизация включена.</b> Данные шифруются на этом компьютере; сервер хранит только шифртекст.</div>
     <p class="st-line" id="sy-st">Загружаю…</p>
     ${stRow('Действия','Обмен происходит сам: через несколько секунд после изменений и раз в 10 минут, пока программа открыта',`<button class="btn" id="sy-now">Синхронизировать сейчас</button><button class="btn ghost" id="sy-off">Выключить на этом компьютере</button>`)}
@@ -32,7 +33,20 @@ function bindSetSync(c,msg){
     }catch(e){el.textContent=e.message||''}
   };
   const need=g('sy-need');
-  if(need)api('/api/sync').then(s=>{need.hidden=!!s.logged_in}).catch(()=>{});
+  if(need)api('/api/sync?force=1').then(s=>{
+    need.hidden=!!s.logged_in;
+    if(s.logged_in&&s.server&&s.server.exists){
+      const cw=g('sy-create-wrap'),fd=g('sy-found'),jb=g('sy-join'),jw=g('sy-join-wrap');
+      if(cw)cw.hidden=true;
+      if(fd){
+        fd.hidden=false;
+        const dev=s.server.device?`, устройство «${esc(s.server.device)}»`:'';
+        fd.innerHTML=`<b>На сервере уже есть ваша облачная копия</b> (версия ${s.server.rev||1}${dev}). Подключите это устройство к вашей копии, введя кодовую фразу.`;
+      }
+      if(jb){jb.className='btn';jb.textContent='Подключить к вашей копии'}
+      if(jw){const t=jw.querySelector('.st-k');if(t)t.textContent='Подключить к вашей копии'}
+    }
+  }).catch(()=>{});
   if(g('sy-create'))g('sy-create').onclick=e=>busy(e.currentTarget,async()=>{
     if(!await uiConfirm({title:'Включить синхронизацию?', body:'На сервер будет отправлен зашифрованный на этом компьютере блок: счета и операции, наблюдение, дневник, цели, тарифы и налоговые настройки. Токен Т-Инвестиций не отправляется. Без кодовой фразы расшифровать блок нельзя.', okText:'Включить'}))return;
     const r=await post('/api/sync',{action:'enable',mode:'create',phrase:g('sy-new').value});

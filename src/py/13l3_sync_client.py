@@ -406,7 +406,7 @@ def sync_post(cfg, body):
 
 def sync_get(cfg, acc, q, force):
     out = sync_status(cfg)
-    if force and out["logged_in"]:
+    if (force or (isinstance(q, dict) and q.get("check") == "1")) and out["logged_in"]:
         try:
             out["server"] = sync_server_info()
         except ApiError as e:

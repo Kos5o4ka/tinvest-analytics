@@ -2,8 +2,8 @@
 S.arb={tab:'pairs',fee:'0.05',data:null,loading:false,err:''};
 function arbLoad(force){
   const D=S.arb;if(D.loading&&!force)return;D.loading=true;D.err='';
-  api('/api/arb?'+new URLSearchParams({fee:D.fee})).then(j=>{D.loading=false;D.data=j;if(S.page==='arb')renderSoon()})
-    .catch(e=>{D.loading=false;D.err=e.message||String(e);if(S.page==='arb')renderSoon()});
+  api('/api/arb?'+new URLSearchParams({fee:D.fee})).then(j=>{D.loading=false;D.data=j;if(S.page==='arb'&&$('#view'))renderSoon()})
+    .catch(e=>{D.loading=false;D.err=e.message||String(e);if(S.page==='arb'&&$('#view'))renderSoon()});
 }
 function pArb(){
   const D=S.arb;
@@ -15,12 +15,12 @@ function pArb(){
   const st=d.stats||{};
   const kpis=`<div class="g g4">${kpi('Эмитентов в анализе',st.issuers_rub||0,'торгуемые рублёвые фиксы')}${kpi('Перекосы внутри кривой',st.pairs||0,'спред ≥ 80 б.п. при близкой дюрации',st.pairs?'pos':'')}
     ${kpi('Инверсии кривой (риск)',st.inversions||0,'короткий выпуск ≥ +250 б.п. к длинному',st.inversions?'neg':'')}${kpi('Рубль vs Валюта',st.fx_pairs||0,'один эмитент в RUB и USD/CNY/EUR')}</div>`;
-  const seg=`<div class="row" style="gap:12px;flex-wrap:wrap;align-items:center"><div class="seg" id="arb-tabs">
+  const seg=`<div class="row arb-bar" style="gap:12px;flex-wrap:nowrap;align-items:center"><div class="seg" id="arb-tabs" style="min-width:0;overflow-x:auto;flex-wrap:nowrap;flex:0 1 auto">
     <button class="${D.tab==='pairs'?'on':''}" data-t="pairs">Арбитраж внутри эмитента (${(d.pairs||[]).length})</button>
     <button class="${D.tab==='inv'?'on':''}" data-t="inv">Инверсия кривой — риск (${(d.inversions||[]).length})</button>
     <button class="${D.tab==='fx'?'on':''}" data-t="fx">Рубль vs Валюта (${(d.fx_vs_rub||[]).length})</button></div>
-    <label class="row" style="margin-left:auto;gap:6px;font-size:12.5px"><span class="mu">Комиссия брокера, %</span><input class="in num" id="arb-fee" style="width:74px;padding:5px 8px" value="${esc(D.fee)}"></label>
-    <button class="btn ghost" id="arb-r">Обновить</button></div>`;
+    <div class="row" style="margin-left:auto;gap:8px;flex-wrap:nowrap;flex:none"><label class="row" style="gap:6px;font-size:12.5px;flex-wrap:nowrap"><span class="mu" style="white-space:nowrap">Комиссия брокера, %</span><input class="in num" id="arb-fee" style="width:74px;padding:5px 8px" value="${esc(D.fee)}"></label>
+    <button class="btn ghost" id="arb-r" style="flex:none;white-space:nowrap">Обновить</button></div></div>`;
   let body='';
   if(D.tab==='pairs'){
     const rs=d.pairs||[];

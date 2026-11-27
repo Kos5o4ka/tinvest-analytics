@@ -160,12 +160,11 @@ function inflWeekHtml(){
   const byW=y=>{const a=Array(52).fill(null);(x.years[y]||[]).forEach(r=>{if(r.week>=1&&r.week<=52)a[r.week-1]=r.pct});return a};
   const av=Array(52).fill(null);(x.avg||[]).forEach(([w,v])=>{if(w>=1&&w<=52)av[w-1]=v});
   const A='var(--s1)',series=[{n:cy,c:A,v:byW(cy),w:3}];
-  if(x.years[py])series.push({n:py,c:'var(--s1)',v:byW(py),w:2});
+  if(x.years[py])series.push({n:py,c:'var(--s2)',v:byW(py),w:2});
   if(av.some(v=>v!=null))series.push({n:'Среднее '+(x.avg_label||'2017–2021'),c:'var(--mu)',v:av,w:2,dash:true});
   const last=(x.years[cy]||[]).slice(-1)[0],f=v=>(+v).toFixed(2).replace('.',',')+'%';
   chart('c-infl-w',line,{h:300,zero:true,labels:W.map(String),fa:v=>(+v).toFixed(1).replace('.',',')+'%',ft:f,series});
   return`<div class="card rates"><h2>Недельная инфляция<span class="sp">${last?'последняя ('+ddm(last.date)+'): <b>'+f(last.pct)+'</b>':''}</span></h2>
-    <div class="legend rx-lg">${series.map(s=>`<span><i style="background:${s.c}"></i>${esc(s.n)}</span>`).join('')}</div>
     <div class="axt">Прирост цен за неделю, %</div><div id="c-infl-w" class="chart"></div><div class="axt" style="text-align:center">Номер недели года</div>
     <p class="note">Росстат, оценка индекса потребительских цен за неделю (к предыдущей дате регистрации). Данные с ${x.history_from?esc(ddm(x.history_from)+' '+x.history_from.slice(0,4)):'—'}${(x.avg||[]).length?'; пунктир — среднее за '+esc(x.avg_label)+' по номеру недели':'; для среднего за 2017–2021 в архиве Росстата нет доступных заметок'}.${x.loading?' Историю ещё докачиваю…':''}</p></div>`;
 }

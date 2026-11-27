@@ -294,6 +294,29 @@ def flows_query(data_dir, name, params):
     return 200, {"ok": True, "v": PARSED_V, "data": data}
 
 
+def market_snapshot_query(data_dir, params):
+    """/v1/market/snapshot?kind=all|bonds|stocks|heatmap|status -> (http-код, json). Только чтение, без кэша."""
+    try:
+        kind = _dp_arg(params, "kind", r"all|bonds|stocks|heatmap|status", "bad kind") or "all"
+    except ValueError as e:
+        return 400, {"ok": False, "error": str(e)}
+    import market_worker
+    path = os.path.join(data_dir, "market.sqlite")
+    empty = {"empty": True, "kind": kind}
+    if not os.path.exists(path):
+        return 200, {"ok": True, "v": PARSED_V, "data": empty}
+    db = None
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % quote(path.replace("\\", "/"), safe="/:"), uri=True, timeout=5)
+        data = market_worker.query_snapshot(db, kind)
+    except (sqlite3.Error, ValueError):
+        return 200, {"ok": True, "v": PARSED_V, "data": empty}
+    finally:
+        if db:
+            db.close()
+    return 200, {"ok": True, "v": PARSED_V, "data": data}
+
+
 class _TtlFlight:
     """Короткий кэш с single-flight: пока один поток ходит к источнику, остальные ждут его результат."""
 
@@ -1092,6 +1115,8 @@ class DataServer:
             return calc_query(self.data_dir, name, self.clock())
         if name.startswith("md/"):
             return md_query(self, name, params)
+        if name == "market/snapshot":
+            return market_snapshot_query(self.data_dir, params)
         mk = PARSERS.get(name)
         if not mk:
             return 404, {"ok": False, "error": "unknown parser"}
@@ -1320,6 +1345,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(r.status, r.body, r.ctype, extra)
         if u.path.startswith("/v1/crowd/"):
             return self._crowd(u, client, body)
+        if u.path == "/v1/market/snapshot":
+            if self.command != "GET":
+                return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", "GET")])
+            code, obj = market_snapshot_query(app.data_dir, parse_qs(u.query))
+            return self._send(code, obj)
         if u.path.startswith("/v1/parsed/"):
             if self.command != "GET":
                 return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", "GET")])

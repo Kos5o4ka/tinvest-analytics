@@ -410,13 +410,19 @@ class Server(unittest.TestCase):
 
     def test_purge(self):
         self.st.put(1, self.sub())
-        self.st.put(3, self.sub())                                          # ключ истёк
-        self.assertEqual(self.ck.run_once()["purged"], 1)
+        self.st.put(3, self.sub())                                          # ключ истёк — подписка сохраняется на паузе
+        self.assertEqual(self.ck.run_once()["purged"], 0)
+        self.assertIsNotNone(self.st.get(3))
+        self.db.execute("UPDATE keys SET revoked=1 WHERE tg_id=1")          # отзыв ключа не удаляет подписку
+        self.db.commit()
+        self.assertEqual(self.ck.run_once()["purged"], 0)
+        self.assertIsNotNone(self.st.get(1))
+        self.db.execute("DELETE FROM users WHERE tg_id=3")                  # удаление аккаунта (/delete) стирает подписку
+        self.db.execute("UPDATE users SET banned=1 WHERE tg_id=1")          # бан тоже стирает
+        self.db.commit()
+        self.assertEqual(self.ck.run_once()["purged"], 2)
         self.assertIsNone(self.st.get(3))
         self.assertEqual(self.st.sent_keys(3), [])
-        self.db.execute("UPDATE keys SET revoked=1 WHERE tg_id=1")
-        self.db.commit()
-        self.ck.run_once()
         self.assertIsNone(self.st.get(1))
 
     def test_delete_returns_sent(self):

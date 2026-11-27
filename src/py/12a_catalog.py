@@ -68,7 +68,7 @@ def tcat_info(isin):
         return None
     return {"sector": b["s"] or None, "floating": b["fl"], "amort": b["am"], "subordinated": b["sub"],
             "perpetual": b["pp"], "risk": b["rk"] or None, "name": b["n"], "maturity": b["mat"] or None,
-            "currency": b["cur"] or None}
+            "currency": b["cur"] or None, "issuer": b.get("br") or None}
 
 
 def _norm_level(s):

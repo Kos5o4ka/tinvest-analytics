@@ -216,7 +216,14 @@ def fl_spread_job(todo):
 
 def fl_spread_kick(rows, cached):
     """Запускает фоновый расчёт спредов для флоатеров без кэша; одновременно не больше одного задания."""
-    todo = [r for r in rows if r.get("floating") and r.get("isin") and r["isin"] not in cached and r.get("cur") == "RUB"]
+    def _need(r):
+        if not (r.get("floating") and r.get("isin") and r.get("cur") == "RUB"):
+            return False
+        if r["isin"] in cached:
+            return False
+        _, psp = fl_parse_formula(r.get("cpn_det"))
+        return psp is None
+    todo = [r for r in rows if _need(r)]
     if not todo or _fl_job["running"]:
         return False
     _fl_job["running"] = True
@@ -249,6 +256,7 @@ def screener_payload():
             except Exception:  # noqa: BLE001
                 info = None
         r["sector"] = info.get("sector") if info else None
+        r["issuer"] = (info.get("issuer") if info else None) or (rt.get("issuer") if rt else None)
         r["floating"] = info.get("floating") if info else None
         if r["floating"] is None and r.get("btype"):      # без справочника T-Invest — по типу облигации из ISS
             r["floating"] = "плава" in r["btype"].lower()
@@ -266,11 +274,20 @@ def screener_payload():
             r["days_to_offer"] = (datetime.strptime(of, "%Y-%m-%d").date() - date.today()).days if up else None
         except Exception:  # noqa: BLE001
             r["days_to_offer"] = None
-    try:        # спред флоатера к КС из кэша (без ожидания); недостающее считает фоновое задание
+    try:        # спред флоатера к КС/RUONIA/RUSFAR из кэша или COUPON_DETAILS; недостающее считает фоновое задание
         fsp = fl_spread_cached()
         for r in rows:
-            r["fl_label"] = fl_label(fsp.get(r.get("isin")), True) if r.get("floating") else None
-            r["fl_base"] = (fsp.get(r.get("isin")) or {}).get("base") if r.get("floating") else None
+            if r.get("floating"):
+                info = fsp.get(r.get("isin"))
+                if (not info or info.get("spread") is None) and r.get("cpn_det"):
+                    pb, psp = fl_parse_formula(r.get("cpn_det"))
+                    if pb and (psp is not None or not info):
+                        info = {"base": pb, "spread": psp}
+                r["fl_label"] = fl_label(info, True)
+                r["fl_base"] = (info or {}).get("base")
+            else:
+                r["fl_label"] = None
+                r["fl_base"] = None
         fl_spread_kick(rows, fsp)
     except Exception:  # noqa: BLE001
         pass

@@ -1,5 +1,5 @@
 /* ── «Кто покупает»: потоки денег по классам и секторам, крупные сделки, всплески объёма, стакан (сервер данных, /api/flows*) ── */
-S.flw={period:'1h',tab:'flow',data:null,key:null,loading:false,large:{cls:'',min:0,data:null,key:null,loading:false},
+S.flw={period:'day',tab:'flow',data:null,key:null,loading:false,large:{cls:'',min:0,data:null,key:null,loading:false},
   spikes:{data:null,loading:false,key:null},book:{secid:'SBER',depth:20,data:null,err:'',busy:false,list:null,inst:null}};
 const FLW_CLS={share:'Акции',bond:'Облигации',fund:'Фонды'};
 const FLW_SRC={tinvest:'T-Invest, реальное время',iss:'Мосбиржа, задержка 15 мин'};

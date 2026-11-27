@@ -220,7 +220,8 @@ def tax_state(cfg, acc, force=False):
         names = instruments(client, keys)
         positions = build_summary(cfg, acc, "all", force)["portfolio"]["positions"]
         st = tax_compute(ops, names, positions, sel, settings, tax_cbr_rate,
-                         resolve=lambda t: benchmark_uid(client, t) if client.ready else None)
+                         resolve=lambda t: benchmark_uid(client, t) if client.ready else None,
+                         splits=moex_splits_list(), resolve_isin=moex_secid_isin)
         return mem_put(key, st), settings
 
 

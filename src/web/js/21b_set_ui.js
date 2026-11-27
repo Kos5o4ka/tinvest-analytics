@@ -75,8 +75,7 @@ function setNewsHtml(c){
   const cur=CHANGELOG[0]||['',''];
   return`<div class="st-card" id="whatsnew" data-q="версия что нового изменения журнал"><div class="st-ver"><div class="st-vn mono">v${esc(c.version||'')}</div><div class="st-vt"><b>TAnalytic</b><span>${cur[1]?'Обновление от '+esc(cur[1]):'Текущая версия'}</span></div></div>
     <div class="st-pad">${stChangelog(CHANGELOG.slice(0,1))}</div>
-    ${CHANGELOG.length>1?stMore('Предыдущие версии ('+(CHANGELOG.length-1)+')',stChangelog(CHANGELOG.slice(1))):''}</div>`+
-    stGroup('Роадмап',`<div class="st-pad">${roadmapHtml()}</div>`,{hint:'что планируется'});
+    ${CHANGELOG.length>1?stMore('Предыдущие версии ('+(CHANGELOG.length-1)+')',stChangelog(CHANGELOG.slice(1))):''}</div>`;
 }
 async function renderSettings(){
   S.charts=[];

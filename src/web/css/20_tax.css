@@ -9,3 +9,7 @@
 
 /* блоки вкладок налогов идут подряд без общей сетки: отступ, чтобы карточки не слипались */
 .tx>.g+*,.tx>.card+*,.tx>.tbl+*{margin-top:16px}
+.tx .tbl table th{white-space:normal;vertical-align:bottom;line-height:1.25}
+.tx .tbl table th:first-child,.tx .tbl table td:first-child{max-width:240px;white-space:normal;word-break:break-word}
+.tx .hb.w .r{grid-template-columns:minmax(90px,1.3fr) minmax(32px,1fr) auto;gap:8px}
+.tx .hb .r .vv{white-space:nowrap}

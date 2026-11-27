@@ -618,7 +618,7 @@ class AlertStore:
         return bool(n), keys
 
     def user_state(self, tg_id):
-        """-> gone (нет пользователя/заблокирован/нет действующего ключа) | paused (не Pro или уведомления выключены) | ok."""
+        """-> gone (нет пользователя или заблокирован) | paused (нет действующего ключа, не Pro или уведомления выключены) | ok."""
         c, now = self.conn(), self.clock()
         try:
             u = c.execute("SELECT banned, notify, plan_until FROM users WHERE tg_id=?", (tg_id,)).fetchone()
@@ -627,9 +627,7 @@ class AlertStore:
         if not u or u[0]:
             return "gone"
         k = c.execute("SELECT COUNT(*) FROM keys WHERE tg_id=? AND revoked=0 AND expires>?", (tg_id, now)).fetchone()[0]
-        if not k:
-            return "gone"
-        if not u[1] or not (u[2] and u[2] > now):
+        if not k or not u[1] or not (u[2] and u[2] > now):
             return "paused"
         return "ok"
 

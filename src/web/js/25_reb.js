@@ -1,5 +1,12 @@
 /* ── Ребалансировка + Снежный ком купонов (безналоговая ребалансировка, #9) ── */
 S.reb={contrib:'',monthly:'',buyOnly:true,draft:null,tax:null,lvl:lsGet('ta_reb_lvl')||'class',rtDraft:lsJson('ta_reb_rt',null),secDraft:lsJson('ta_reb_sec',null)};S.payDays=90;
+function rebSavedLoad(){
+  let a=null;try{a=JSON.parse(lsGet('reb_saved')||'null')}catch(e){}
+  if(!Array.isArray(a))a=[];
+  return a.filter(x=>x&&x.id&&x.name&&x.tg&&typeof x.tg==='object');
+}
+function rebSavedStore(a){S.rebSaved=a;lsSet('reb_saved',JSON.stringify(a))}
+S.rebSaved=rebSavedLoad();S.rebSaving=false;S.rebPreset='';
 const REB_RT_BUCKETS=['AAA','AA','A','BBB','BB и ниже','Без рейтинга'];
 function rebRtBucket(r){
   if(!r||!r.rating||!r.rating.v)return'Без рейтинга';
@@ -54,7 +61,7 @@ function rebSnowballHtml(cur,keys,w,tot,dev0){
     <div class="tbl"><table><thead><tr><th class="l">Месяц</th><th>Выплаты портфеля</th><th>Пополнение</th><th class="l">Что докупить (без продаж)</th><th>Отклонение после</th></tr></thead><tbody>`+
     plan.map(r=>`<tr><td class="l"><b>${esc(mlabel(r.mk))} ${r.mk.slice(0,4)}</b></td><td class="num">${r.pay>0?M(r.pay,'rub',0):'<span class="mu">—</span>'}</td>
       <td class="num">${r.extra>0?M(r.extra,'rub',0):'<span class="mu">—</span>'}</td>
-      <td class="l">${r.buys.length?r.buys.sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<span class="tag">${esc(TYPES[k]||k)}: ${M(v,'rub',0)}</span>`).join(' '):'<span class="mu">нет поступлений</span>'}</td>
+      <td class="l">${r.buys.length?r.buys.sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<span class="tag">${esc(TYPES[k]||'Прочее')}: ${M(v,'rub',0)}</span>`).join(' '):'<span class="mu">нет поступлений</span>'}</td>
       <td class="num">${pctp(r.dev,1)}</td></tr>`).join('')+`</tbody></table></div></div>`;
 }
 /* налог при продаже (маршрут /api/tax/reb): сначала продаём бумаги с убытком и с наступившей ЛДВ */
@@ -78,7 +85,7 @@ function rebTaxHtml(act,keys){
   const why=w=>w==='убыток'?'<span class="pos">убыток: налог не возникает</span>':w==='есть налог'?'<span class="neg">есть налог</span>':'<span class="pos">ЛДВ: прибыль освобождена</span>';
   return`<div class="card"><h2>Налог при продаже<span class="sp">оценка НДФЛ за текущий год с учётом уже полученной прибыли</span></h2>
     <div class="g g4">${kpi('Налог по плану',M(tot,'rub',0),'сначала лоты с убытком и с наступившей ЛДВ',tot>0?'neg':'pos')}${kpi('Если продавать пропорционально',M(nv,'rub',0),'всем бумагам класса поровну')}${kpi('Выгода порядка продаж',M(Math.max(0,nv-tot),'rub',0),'меньше налога',nv>tot?'pos':'')}</div>
-    ${it.map(x=>`<h3 style="margin:14px 0 6px;font-size:13px">${esc(TYPES[x.cls]||x.cls)}: продать на ${M(x.covered,'rub',0)}${x.covered<x.amount-1?` (из ${M(x.amount,'rub',0)} — не хватает бумаг с известной ценой)`:''} · налог ${M(x.tax_plan,'rub',0)}</h3>
+    ${it.map(x=>`<h3 style="margin:14px 0 6px;font-size:13px">${esc(TYPES[x.cls]||'Прочее')}: продать на ${M(x.covered,'rub',0)}${x.covered<x.amount-1?` (из ${M(x.amount,'rub',0)} — не хватает бумаг с известной ценой)`:''} · налог ${M(x.tax_plan,'rub',0)}</h3>
       <div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Продать</th><th>Результат продажи</th><th class="l">Почему</th></tr></thead><tbody>${x.plan.map(p=>`<tr${stkAttrIf(p.ticker)}><td class="l"><b>${esc(p.name)}</b><br><small class="mu">${esc(p.ticker)}</small></td><td class="num">${M(p.sell_rub,'rub',0)}<br><small class="mu">${NF0.format(p.qty)} шт.</small></td><td class="num ${cls(p.result)}">${SM(p.result)}</td>
         <td class="l">${why(p.why)}${p.ldv_soon?'<br><small class="neg">ЛДВ наступит меньше чем через полгода — лучше подождать</small>':''}</td></tr>`).join('')||'<tr><td colspan="4" class="l mu">Нет данных о лотах</td></tr>'}</tbody></table></div>`).join('')}
     <p class="note">Справочная оценка: порядок бумаг подбирается по ожидаемому налогу, продажа идёт по FIFO внутри каждой бумаги. Брокер как налоговый агент считает сам; это не налоговая консультация.</p></div>`;
@@ -183,7 +190,7 @@ function pReb(){
   const{sumT,has,T2,w,act,need0,dev}=rebCalcActions(cur,tg,keys,tot,C,buyOnly);
   const rows=keys.map(k=>{const cp=(cur[k]||0)/tot*100,tp=has?w(k)*100:0,dv=cp-tp,a=act[k]||0;
     const scrBtn=(k==='bond'&&a>100)?rebScrBtn('cls:bond',a):'';
-    return`<tr><td class="l"><b>${esc(TYPES[k]||(k==='other'?'Прочее':k))}</b></td><td class="num">${M(cur[k]||0)}</td><td class="num">${pctp(cp)}</td>
+    return`<tr><td class="l"><b>${esc(TYPES[k]||'Прочее')}</b></td><td class="num">${M(cur[k]||0)}</td><td class="num">${pctp(cp)}</td>
       <td class="num"><input class="in num reb-in" data-k="${esc(k)}" type="number" min="0" max="100" step="0.5" value="${tg[k]!=null?tg[k]:''}" placeholder="0"> %</td>
       <td class="num ${has?(Math.abs(dv)<0.5?'mu':dv>0?'neg':'pos'):'mu'}">${has?(dv>0?'+':'')+dv.toFixed(1).replace('.',',')+' п.п.':'—'}</td>
       <td class="num ${a>0.5?'pos':a<-0.5?'neg':'mu'}">${Math.abs(a)<1?'—':(a>0?'Докупить ':'Продать ')+M(Math.abs(a))}${scrBtn}</td>
@@ -192,7 +199,7 @@ function pReb(){
     ${kpi('Отклонение от целей',has?pctp(dev):'—','сколько % портфеля стоит «не там»',has&&dev>5?'neg':'')}${kpi('Без продаж нужно внести',has?M(need0):'—','чтобы выйти на цели одними покупками')}</div>
   <div class="card"><h2>Целевая структура по классам активов</h2>
     ${rebCtlBar(buyOnly)}
-    <div class="scr-presets reb-pre noprint" style="margin-bottom:12px"><span class="mu" style="font-size:12.5px">Быстрые цели:</span>${[['6040','Акции 60 / Облигации 40'],['5050','50 / 50'],['8020','Акции 80 / Облигации 20'],['eq','Равные доли']].map(([k,t])=>`<button type="button" class="scr-chip" data-rbp="${k}">${t}</button>`).join('')}</div>
+    <div class="scr-presets reb-pre noprint" style="margin-bottom:12px"><span class="mu" style="font-size:12.5px">Быстрые цели:</span>${[['6040','Акции 60 / Облигации 40'],['5050','50 / 50'],['8020','Акции 80 / Облигации 20'],['eq','Равные доли']].map(([k,t])=>`<button type="button" class="scr-chip${S.rebPreset===k?' on':''}" data-rbp="${k}">${t}</button>`).join('')}${S.rebSaved.map(x=>`<span class="scr-chip scr-sv${S.rebPreset==='sv:'+x.id?' on':''}"><button type="button" class="scr-sv-b" data-rsv="${esc(x.id)}" title="Мой сохранённый пресет">${esc(x.name)}</button><button type="button" class="scr-sv-x" data-rsvx="${esc(x.id)}" aria-label="Удалить пресет ${esc(x.name)}" title="Удалить">×</button></span>`).join('')}${S.rebSaving?`<span class="scr-sv-new"><input class="in" id="reb-sv-name" maxlength="40" placeholder="Название пресета" aria-label="Название пресета"><button type="button" class="btn" id="reb-sv-ok">Сохранить</button><button type="button" class="btn ghost" id="reb-sv-no">Отмена</button></span>`:(has?`<button type="button" class="scr-chip" id="reb-sv-add" title="Запомнить текущие целевые доли">+ Сохранить пресет</button>`:'')}</div>
     <div class="tbl"><table><thead><tr><th class="l">Класс</th><th>Сейчас, ₽</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>Действие</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="row" style="margin-top:14px"><button class="btn" id="rb-s">Сохранить цели</button><button class="btn ghost" id="rb-r">Сбросить</button><span class="reb-sum" id="rb-sum"></span></div></div>
   ${rebTaxHtml(act,keys)}
@@ -210,7 +217,7 @@ function bindReb(){
     }else rebGoScreener({rmin:'A-',amt});
   });
   const d=S.reb.draft;
-  $('#view').querySelectorAll('.reb-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)d[i.dataset.k]=Math.min(100,v);else delete d[i.dataset.k];render()});
+  $('#view').querySelectorAll('.reb-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));S.rebPreset='';if(v>0)d[i.dataset.k]=Math.min(100,v);else delete d[i.dataset.k];render()});
   $('#view').querySelectorAll('.reb-rt-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)S.reb.rtDraft[i.dataset.k]=Math.min(100,v);else delete S.reb.rtDraft[i.dataset.k];lsSet('ta_reb_rt',JSON.stringify(S.reb.rtDraft));render()});
   $('#view').querySelectorAll('.reb-sec-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)S.reb.secDraft[i.dataset.k]=Math.min(100,v);else delete S.reb.secDraft[i.dataset.k];lsSet('ta_reb_sec',JSON.stringify(S.reb.secDraft));render()});
   $('#view').querySelectorAll('[data-rtrp]').forEach(btn=>btn.onclick=()=>{
@@ -228,14 +235,41 @@ function bindReb(){
   });
   $('#view').querySelectorAll('[data-rbp]').forEach(btn=>btn.onclick=()=>{
     const k=btn.dataset.rbp,pr={'6040':[60,40],'5050':[50,50],'8020':[80,20]}[k];
+    S.rebPreset=k;
     Object.keys(d).forEach(x=>delete d[x]);
     if(pr){d.share=pr[0];d.bond=pr[1]}
     else{const ks=[...$('#view').querySelectorAll('.reb-in')].map(i=>i.dataset.k).filter(x=>!['currency','other'].includes(x));const v=ks.length?Math.round(1000/ks.length)/10:0;ks.forEach(x=>d[x]=v)}
     render();
   });
+  document.querySelectorAll('.scr-sv-b[data-rsv]').forEach(b=>b.onclick=()=>{
+    const k='sv:'+b.dataset.rsv;
+    Object.keys(d).forEach(x=>delete d[x]);
+    if(S.rebPreset===k){S.rebPreset=''}
+    else{const p=S.rebSaved.find(x=>x.id===b.dataset.rsv);if(!p)return;S.rebPreset=k;Object.assign(d,p.tg)}
+    render();
+  });
+  document.querySelectorAll('.scr-sv-x[data-rsvx]').forEach(b=>b.onclick=e=>{
+    e.stopPropagation();rebSavedStore(S.rebSaved.filter(x=>x.id!==b.dataset.rsvx));
+    if(S.rebPreset==='sv:'+b.dataset.rsvx)S.rebPreset='';
+    render();
+  });
+  const rsva=$('#reb-sv-add');if(rsva)rsva.onclick=()=>{S.rebSaving=true;render()};
+  const rsvn=$('#reb-sv-name');
+  if(rsvn){
+    rsvn.focus();
+    const ok=()=>{
+      const nm=rsvn.value.trim();if(!nm){rsvn.focus();return}
+      const id='u'+Date.now().toString(36);
+      rebSavedStore(S.rebSaved.concat([{id,name:nm.slice(0,40),tg:Object.assign({},d)}]));
+      S.rebSaving=false;S.rebPreset='sv:'+id;render();
+    };
+    $('#reb-sv-ok').onclick=ok;
+    rsvn.onkeydown=e=>{if(e.key==='Enter')ok();else if(e.key==='Escape'){S.rebSaving=false;render()}};
+    $('#reb-sv-no').onclick=()=>{S.rebSaving=false;render()};
+  }
   const rbc=$('#rb-c');if(rbc)rbc.onchange=e=>{S.reb.contrib=e.target.value;render()};
   const rm=$('#rb-m');if(rm)rm.onchange=e=>{S.reb.monthly=e.target.value;render()};
   const rbb=$('#rb-b');if(rbb)rbb.onchange=e=>{S.reb.buyOnly=e.target.checked;render()};
-  const rbr=$('#rb-r');if(rbr)rbr.onclick=()=>{S.reb.draft=null;S.reb.contrib='';S.reb.monthly='';render()};
+  const rbr=$('#rb-r');if(rbr)rbr.onclick=()=>{S.reb.draft=null;S.rebPreset='';S.reb.contrib='';S.reb.monthly='';render()};
   const rbs=$('#rb-s');if(rbs)rbs.onclick=async e=>{e.currentTarget.disabled=true;try{await post('/api/config',{targets:d});S.cfg.targets=Object.assign({},d);$('#rb-sum').textContent='Сохранено'}catch(x){$('#rb-sum').textContent=x.message}finally{e.currentTarget.disabled=false}};
 }
