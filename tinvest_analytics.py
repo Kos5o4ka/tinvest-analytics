@@ -4533,12 +4533,12 @@ def import_merge_ops(old, new, periods=None, old_periods=None):
             per = o.get("_period")
             if per and len(per) == 2 and per[0] and per[1]:
                 old_ranges.append((per[0], per[1]))
-        ds = [(o.get("date") or "")[:10] for o in old_list if not o.get("_opening") and (o.get("date") or "")[:10]]
+        ds = [(o.get("date") or "")[:10] for o in old_list if not o.get("_opening") and not o.get("_manual") and (o.get("date") or "")[:10]]
         if ds:
             old_ranges.append((min(ds), max(ds)))
     avail = defaultdict(int)
     for o in old_list:
-        if not o.get("_opening") and op_key(o) not in new_keys:
+        if not o.get("_opening") and not o.get("_manual") and op_key(o) not in new_keys:
             avail[_op_sem_sig(o)] += 1
     by_id = {}
     for o in old_list:
@@ -4557,19 +4557,11 @@ def import_merge_ops(old, new, periods=None, old_periods=None):
     return ops
 
 
-def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, synth=True, old_periods=None):
-    """Находит бумаги, склеивает с уже сохранёнными операциями счёта (existing) и пересчитывает по всему набору:
-    досчитанные пополнения (synth) и FIFO идут по всей истории, а не только по новому файлу."""
-    if not keep_demo:
-        demo_remove()  # настоящий отчёт заменяет демо-портфель
-    existing = [dict(o) for o in existing or []]
-    for o in existing:
-        o.pop("yield", None)
-        o.pop("_yield", None)
-        if str(o.get("instrumentUid") or "").startswith("imp:"):  # раньше не нашлись на бирже — пробуем ещё раз
-            o["_ident"] = o.pop("instrumentUid")[4:]
-    ids = resolve_idents(client, [o.get("_ident") for o in list(ops) + existing])
-    for o in list(ops) + existing:
+def imp_apply_idents(client, all_ops):
+    """Находит бумаги по коду из отчёта (_ident): проставляет instrumentUid и название; не найденные получают «imp:КОД».
+    Меняет операции на месте. -> {код: описание}."""
+    ids = resolve_idents(client, [o.get("_ident") for o in all_ops])
+    for o in all_ops:
         ident = o.pop("_ident", "")
         if ident:
             o["_sec"] = ident      # код бумаги в отчёте (ISIN или тикер): по нему находятся сплиты при слиянии файлов
@@ -4585,6 +4577,25 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
         elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out",
                                                "fee_broker", "tax_trade", "tax_dividend", "tax_coupon"):
             o["instrumentUid"] = "imp:" + ident
+    return ids
+
+
+def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, synth=True, old_periods=None, report=None):
+    """Находит бумаги, склеивает с уже сохранёнными операциями счёта (existing) и пересчитывает по всему набору:
+    досчитанные пополнения (synth) и FIFO идут по всей истории, а не только по новому файлу."""
+    if not keep_demo:
+        demo_remove()  # настоящий отчёт заменяет демо-портфель
+    existing = [dict(o) for o in existing or []]
+    for o in existing:
+        o.pop("yield", None)
+        o.pop("_yield", None)
+        if str(o.get("instrumentUid") or "").startswith("imp:"):  # раньше не нашлись на бирже — пробуем ещё раз
+            o["_ident"] = o.pop("instrumentUid")[4:]
+    ids = imp_apply_idents(client, list(ops) + existing)
+    if existing:                         # ручные сделки, уже попавшие в новый отчёт, заменяются строками отчёта
+        existing, rec = reconcile_manual_with_report(existing, ops)
+        if report is not None:
+            report["reconciled"] = rec
     ops = import_merge_ops(existing, ops, periods, old_periods=old_periods) if existing else sorted(
         ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
     ops = import_apply_splits(ops)   # пары обмена на дни сплитов по всей истории счёта
@@ -4635,6 +4646,8 @@ def find_duplicate_import(raw, ops=None, lst=None):
     new_ids = set(_imp_op_ids(ops)) if ops is not None else set()
     ops_hash = _imp_ops_hash(ops) if ops is not None else None
     for acc in lst:
+        if acc.get("sync_src"):
+            continue                         # снимок счёта из облака: в него отчёты не загружаются
         for f in acc.get("files") or []:
             if f.get("sha256") == file_sha:
                 return {"id": acc["id"], "name": acc.get("name") or acc["id"], "file": f.get("name") or ""}
@@ -4677,6 +4690,8 @@ def find_overlap_account(ops, lst=None):
             new_loose.add(_op_loose_sig(o))
     best = None
     for acc in lst:
+        if acc.get("sync_src"):
+            continue
         ex_ops = st.ops(acc["id"])
         ex_ids = {op_key(o) for o in ex_ops if not o.get("_opening") and not o.get("_synthetic")}
         hits = len(new_ids & ex_ids)
@@ -4705,7 +4720,8 @@ def import_parse_info(body):
     overlap = None if dup else find_overlap_account(ops, lst)
     return {"count": len(ops), "skipped": skipped, "kinds": kinds, "sample": sample,
             "from": ops[0]["date"][:10] if ops else None, "to": ops[-1]["date"][:10] if ops else None,
-            "duplicate_of": dup, "overlap_account": overlap}
+            "duplicate_of": dup, "overlap_account": overlap,
+            "manual_matches": manual_matches_preview(ops, body.get("target"), lst)}
 
 
 def import_commit(client, body):
@@ -4736,8 +4752,9 @@ def import_commit(client, body):
         finfo["from"], finfo["to"] = f_from, f_to
     old_periods = [(f.get("from"), f.get("to")) for f in ex["files"] if f.get("from") and f.get("to")]
     periods = old_periods + ([(f_from, f_to)] if f_from and f_to else [])
-    ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) if ex["files"] else None,
-                               periods=periods, synth=not fmt, old_periods=old_periods)
+    rep = {}
+    ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) or None,       # и счёт, где пока только ручные записи
+                               periods=periods, synth=not fmt, old_periods=old_periods, report=rep)
     ex["files"].append(finfo)
     ex["ops"] = len(ops)
     store().ops_clear(acc_id)
@@ -4745,8 +4762,9 @@ def import_commit(client, body):
     store().put("imports", lst)
     mem_clear()
     found = sum(1 for v in ids.values() if v.get("uid"))
+    sync_kick_safe()
     return {"ok": True, "id": acc_id, "count": finfo["count"], "total": len(ops), "skipped": skipped,
-            "resolved": found, "idents": len(ids)}
+            "resolved": found, "idents": len(ids), "reconciled": len(rep.get("reconciled") or [])}
 
 
 TEMPLATE_CSV = ("Дата;Тип операции;ISIN;Тикер;Название;Количество;Цена;Сумма;Валюта;Комиссия;НКД\n"
@@ -6048,6 +6066,339 @@ def split_timeline(events, splits):
     """Сделки (время, ±кол-во, цена) вперемешку с маркерами сплитов (время, None, коэффициент) в хронологическом порядке."""
     return sorted(list(events) + [(datetime.strptime(d, "%Y-%m-%d"), None, r) for d, r in splits],
                   key=lambda z: (z[0], 0 if z[1] is None else 1))
+# ═══════════════════════════ ручной учёт сделок и сверка с отчётами брокера ═══════════════════════════
+# Ручная запись — обычная операция счёта (как строка отчёта) с пометкой _manual: поэтому FIFO, доходность, налоги и графики
+# работают без особых случаев. Одна «группа» записей (id вида man-<12 знаков>): сама сделка, комиссия («<id>-f») и пополнение
+# под покупку («<id>-c», _manual_autocash), чтобы остаток денег не уходил в минус. Ручные записи возможны только в счетах
+# с кодом imp-…: операции счетов Т-Инвестиций заново загружаются из API и перезаписываются целиком.
+# Когда позже загружается отчёт брокера с этими же сделками, ручные дубли заменяются строками отчёта (reconcile_manual_with_report).
+
+MAN_TYPES = {"buy": "BUY", "sell": "SELL", "coupon": "COUPON", "dividend": "DIVIDEND", "deposit": "INPUT",
+             "withdraw": "OUTPUT", "fee": "SERVICE_FEE"}
+MAN_TRADE, MAN_NEED_SEC = ("buy", "sell"), ("buy", "sell", "coupon", "dividend")
+MAN_SIGN = {"buy": -1, "sell": 1, "coupon": 1, "dividend": 1, "deposit": 1, "withdraw": -1, "fee": -1}
+MAN_DAYS, MAN_QTY_EPS, MAN_PAY_ABS, MAN_PAY_REL = 2, 1e-3, 5.0, 0.01
+_man_lock = threading.Lock()
+
+
+def sync_kick_safe():
+    """Данные изменились: отправить в облако, если синхронизация включена (ошибки не мешают основной работе)."""
+    try:
+        fn = globals().get("sync_kick")
+        if fn:
+            fn()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ───────────── сверка ручных сделок с отчётом ─────────────
+def _man_idents(o):
+    """Все известные коды бумаги операции (ISIN, тикер, uid) в верхнем регистре."""
+    out = set()
+    for k in ("instrumentUid", "figi", "_sec", "_ident", "_isin", "_ticker"):
+        v = str(o.get(k) or "").strip().upper()
+        if v.startswith("IMP:"):
+            v = v[4:]
+        if v:
+            out.add(v)
+    return out
+
+
+def _man_day(o):
+    try:
+        return datetime.strptime((o.get("date") or "")[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def reconcile_manual_with_report(existing, new_ops, apply=True):
+    """Находит ручные сделки (_manual), уже попавшие в загружаемый отчёт: та же бумага и направление, количество (±0,001),
+    дата не дальше 2 дней (Т+1, выходные), сумма отличается меньше чем на 1 % (но не меньше 5 ₽).
+    Каждая строка отчёта «закрывает» не больше одной ручной записи. Совпавшие ручные записи заменяются строками отчёта;
+    вместе с ними уходят их комиссия и пополнение под покупку, если в отчёте есть свои комиссии и пополнения (иначе остаются,
+    чтобы остаток денег не изменился). -> (оставшиеся записи счёта, [описание заменённых]).
+    apply=False — только подсчёт (для предварительного просмотра)."""
+    rep = [o for o in new_ops or [] if not o.get("_opening") and not o.get("_synthetic")]
+    rep_kinds = {classify(o.get("type")) for o in rep}
+    used, hit = set(), {}
+    for man in existing or []:
+        if not man.get("_manual") or man.get("_manual_autocash") or man.get("_pair"):
+            continue
+        kind = classify(man.get("type"))
+        if kind not in ("buy", "sell", "coupons", "dividends"):
+            continue
+        ids, day, qty, pay = _man_idents(man), _man_day(man), op_qty(man), abs(qf(man.get("payment")))
+        if not ids or day is None:
+            continue
+        best = None
+        for i, r in enumerate(rep):
+            if i in used or classify(r.get("type")) != kind or not (ids & _man_idents(r)):
+                continue
+            if abs(op_qty(r) - qty) > MAN_QTY_EPS:
+                continue
+            rd = _man_day(r)
+            if rd is None or abs((rd - day).days) > MAN_DAYS:
+                continue
+            if abs(abs(qf(r.get("payment"))) - pay) > max(MAN_PAY_ABS, pay * MAN_PAY_REL):
+                continue
+            gap = abs((rd - day).days)
+            if best is None or gap < best[0]:
+                best = (gap, i)
+        if best:
+            used.add(best[1])
+            hit[man["id"]] = man
+    if not hit:
+        return list(existing or []), []
+    drop = set(hit)
+    for o in existing or []:
+        pair = o.get("_pair")
+        if pair in hit and ((o.get("_manual_autocash") and "deposits" in rep_kinds) or
+                            (classify(o.get("type")) == "fee_broker" and "fee_broker" in rep_kinds)):
+            drop.add(o.get("id"))
+    info = [{"id": m["id"], "date": (m.get("date") or "")[:10], "name": m.get("name") or "", "type": classify(m.get("type")),
+             "qty": op_qty(m), "amount": round(abs(qf(m.get("payment"))), 2)} for m in hit.values()]
+    info.sort(key=lambda x: (x["date"], x["id"]))
+    if not apply:
+        return list(existing or []), info
+    return [o for o in existing or [] if o.get("id") not in drop], info
+
+
+def manual_matches_preview(new_ops, target, lst=None):
+    """Сколько ручных сделок уже есть в загружаемом отчёте: {count, sample[]}. Проверяются счёт target или все счета."""
+    lst = imports_list() if lst is None else lst
+    ex = []
+    for a in lst:
+        if a.get("sync_src") or (target and str(target).startswith("imp-") and a["id"] != target):
+            continue
+        ex += [o for o in store().ops(a["id"]) if o.get("_manual")]
+    if not ex:
+        return {"count": 0, "sample": []}
+    _kept, info = reconcile_manual_with_report(ex, new_ops, apply=False)
+    return {"count": len(info), "sample": info[:5]}
+
+
+# ───────────── пересчёт счёта ─────────────
+def manual_recompute(client, ops):
+    """Операции счёта после правки: поиск бумаг для новых записей, порядок по датам, FIFO и доходность сделок."""
+    ops = [dict(o) for o in ops]
+    for o in ops:
+        o.pop("yield", None)
+        o.pop("_yield", None)
+        if str(o.get("instrumentUid") or "").startswith("imp:") and not o.get("_ident"):
+            o["_ident"] = o["instrumentUid"][4:]
+    if any(o.get("_ident") for o in ops):
+        imp_apply_idents(client, ops)
+    ops.sort(key=lambda o: (o.get("date") or "", 0 if o.get("_opening") else 1))
+    fifo(ops)
+    for o in ops:
+        if "_yield" in o:
+            o["yield"] = to_money(round(o.pop("_yield"), 9), cur_of(o["payment"]))
+    return ops
+
+
+def _man_check_acc(lst, acc_id):
+    x = next((a for a in lst if a.get("id") == acc_id), None)
+    if x is None or not str(acc_id).startswith("imp-") or x.get("sync_src") or x.get("demo") or acc_id == DEMO_ID:
+        raise ApiError("Ручные записи можно добавлять только в счета из импорта и ручные счета.", 400)
+    return x
+
+
+def _man_num(v, name, lo=0.0, hi=1e12, req=False):
+    if v is None or str(v).strip() == "":
+        if req:
+            raise ApiError("Заполните поле «%s»." % name, 400)
+        return None
+    try:
+        x = float(str(v).replace(",", ".").replace(" ", "").replace(" ", ""))
+    except ValueError:
+        raise ApiError("Поле «%s»: нужно число." % name, 400)
+    if x != x or x < lo or x > hi:
+        raise ApiError("Поле «%s»: значение вне допустимых границ." % name, 400)
+    return x
+
+
+def manual_build(body, now=None):
+    """Тело запроса -> список операций группы (сделка, комиссия, пополнение). Проверяет значения."""
+    kind = str(body.get("kind") or "buy")
+    if kind not in MAN_TYPES:
+        raise ApiError("Неизвестный тип операции.", 400)
+    mode = "position" if body.get("mode") == "position" else "op"
+    try:
+        day = datetime.strptime(str(body.get("date") or date.today().isoformat())[:10], "%Y-%m-%d").date()
+    except ValueError:
+        raise ApiError("Дата указана неверно.", 400)
+    if day > date.today() + timedelta(days=1) or day.year < 1990:
+        raise ApiError("Дата вне допустимых границ.", 400)
+    cur = str(body.get("currency") or "rub").lower()
+    if not re.fullmatch(r"[a-z]{3}", cur):
+        raise ApiError("Валюта указана неверно.", 400)
+    ident = str(body.get("ident") or "").strip().upper()[:24]
+    ticker = str(body.get("ticker") or "").strip().upper()[:24]
+    name = str(body.get("name") or "").strip()[:120]
+    if mode == "position":
+        kind = "buy"
+    if kind in MAN_NEED_SEC and not ident:
+        raise ApiError("Укажите бумагу: тикер или ISIN.", 400)
+    qty = _man_num(body.get("qty"), "Количество", 0.0, 1e9, req=kind in MAN_TRADE)
+    if kind in MAN_TRADE and not qty:
+        raise ApiError("Количество должно быть больше нуля.", 400)
+    price = _man_num(body.get("price"), "Цена", 0.0, 1e9)
+    amount = _man_num(body.get("amount"), "Сумма", 0.0, 1e12)
+    nkd = _man_num(body.get("nkd"), "НКД", 0.0, 1e12) or 0.0
+    comm = _man_num(body.get("commission"), "Комиссия", 0.0, 1e9) or 0.0
+    if kind in MAN_TRADE:
+        total = amount if amount else (qty * price + nkd if price else None)
+    else:
+        total = amount
+    if not total or total <= 0:
+        raise ApiError("Укажите цену или сумму операции.", 400)
+    total = round(total, 2)
+    gid = str(body.get("group") or "")
+    if gid:
+        if not re.fullmatch(r"man-[a-z0-9]{3,24}", gid):
+            raise ApiError("Неверный номер записи.", 400)
+    else:
+        gid = "man-" + uuid.uuid4().hex[:12]
+    t = (now if now is not None else time.time())
+    iso = day.strftime("%Y-%m-%dT12:00:00Z")
+    main = {"id": gid, "date": iso, "type": "OPERATION_TYPE_" + MAN_TYPES[kind],
+            "payment": to_money(MAN_SIGN[kind] * total, cur), "name": name or ident or ticker or "Ручная запись",
+            "_manual": True, "_u": t}
+    if ident:
+        main["_ident"] = ident
+    if ticker and ticker != ident:
+        main["_ticker"] = ticker
+    if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}\d", ident):
+        main["_isin"] = ident
+    if mode == "position":
+        main["_position"] = True
+    if qty:
+        main["quantity"] = main["quantityDone"] = str(int(qty)) if qty == int(qty) else repr(round(qty, 9))
+        main["price"] = to_money(round(total / qty, 9) if kind in MAN_TRADE else (price or 0), cur)
+    out = [main]
+    if comm and kind in MAN_TRADE:
+        out.append({"id": gid + "-f", "date": iso, "type": "OPERATION_TYPE_BROKER_FEE", "payment": to_money(-round(comm, 2), cur),
+                    "name": "Комиссия: " + main["name"], "_manual": True, "_pair": gid, "_u": t,
+                    **({"_ident": ident} if ident else {})})
+    if kind == "buy" and body.get("autocash", True):
+        out.append({"id": gid + "-c", "date": iso, "type": "OPERATION_TYPE_INPUT", "payment": to_money(round(total + comm, 2), cur),
+                    "name": "Пополнение под покупку", "_manual": True, "_manual_autocash": True, "_pair": gid, "_u": t})
+    return out
+
+
+def _man_group(o):
+    i = str(o.get("id") or "")
+    return i[:-2] if i.endswith(("-f", "-c")) and o.get("_pair") else i
+
+
+def manual_post(cfg, body):
+    act = str(body.get("action") or "save")
+    st = store()
+    with _man_lock:
+        lst = imports_list()
+        if act == "delete":
+            acc_id, gid = str(body.get("acc") or ""), str(body.get("group") or "")
+            _man_check_acc(lst, acc_id)
+            ops = st.ops(acc_id)
+            keep = [o for o in ops if not (o.get("_manual") and _man_group(o) == gid)]
+            if len(keep) == len(ops):
+                raise ApiError("Запись не найдена.", 404)
+            _man_store(cfg, lst, acc_id, keep)
+            return {"ok": True, "removed": len(ops) - len(keep)}
+        acc_id = str(body.get("acc") or "")
+        if not acc_id:
+            nm = str(body.get("acc_name") or "").strip()[:80]
+            if not nm:
+                raise ApiError("Выберите счёт или назовите новый ручной счёт.", 400)
+            demo_remove()
+            acc_id = "imp-" + uuid.uuid4().hex[:10]
+            lst.append({"id": acc_id, "name": nm, "broker": "Ручной учёт", "created": utc_now_str(), "files": [], "manual": True,
+                        "broker_id": broker_detect_import("", b"", "", str(body.get("broker") or ""), nm)})
+        _man_check_acc(lst, acc_id)
+        new = manual_build(body)
+        gid = new[0]["id"]
+        ops = [o for o in st.ops(acc_id) if not (o.get("_manual") and _man_group(o) == gid)]
+        if str(body.get("group") or "") and len(ops) == len(st.ops(acc_id)):
+            raise ApiError("Запись для правки не найдена.", 404)
+        _man_store(cfg, lst, acc_id, ops + new)
+        return {"ok": True, "acc": acc_id, "group": gid}
+
+
+def _man_store(cfg, lst, acc_id, ops):
+    ops = manual_recompute(TInvest(cfg), ops)
+    st = store()
+    st.ops_clear(acc_id)
+    st.ops_put(acc_id, ops)
+    for a in lst:
+        if a["id"] == acc_id:
+            a["ops"] = len(ops)
+    st.put("imports", lst)
+    mem_clear()
+    sync_kick_safe()
+
+
+def manual_list(cfg, acc, q, force):
+    """Ручные записи счёта: группы (сделка + комиссия + пополнение) для таблицы правки."""
+    acc_id = str((q or {}).get("acc") or "")
+    lst = imports_list()
+    out = []
+    for a in lst:
+        if acc_id and a["id"] != acc_id:
+            continue
+        if a.get("sync_src") or a.get("demo") or a["id"] == DEMO_ID:
+            continue
+        groups = {}
+        for o in store().ops(a["id"]):
+            if o.get("_manual"):
+                groups.setdefault(_man_group(o), []).append(o)
+        for gid, g in groups.items():
+            m = next((o for o in g if o["id"] == gid), None)
+            if not m:
+                continue
+            fee = next((o for o in g if o["id"].endswith("-f")), None)
+            out.append({"acc": a["id"], "acc_name": a.get("name"), "group": gid, "date": (m.get("date") or "")[:10],
+                        "type": classify(m.get("type")), "name": m.get("name") or "", "ident": m.get("_sec") or m.get("_isin") or "",
+                        "qty": op_qty(m), "amount": round(abs(qf(m.get("payment"))), 2), "currency": cur_of(m.get("payment")).upper(),
+                        "commission": round(abs(qf(fee.get("payment"))), 2) if fee else 0.0,
+                        "autocash": any(o.get("_manual_autocash") for o in g), "position": bool(m.get("_position"))})
+    out.sort(key=lambda r: (r["date"], r["group"]), reverse=True)
+    return {"rows": out[:500], "accounts": [{"id": a["id"], "name": a.get("name")} for a in lst
+                                           if str(a["id"]).startswith("imp-") and not (a.get("sync_src") or a.get("demo") or a["id"] == DEMO_ID)]}
+
+
+def manual_search(cfg, acc, q, force):
+    """Поиск бумаги для ручной записи: тикер, ISIN или название (облигации, акции, фонды). Цена — по рынку."""
+    s = str((q or {}).get("q") or "").strip().lower()
+    if len(s) < 2:
+        return {"rows": []}
+    out = []
+
+    def ok(*vals):
+        return any(s in str(v or "").lower() for v in vals)
+    try:
+        for r in screener_rows():
+            if ok(r.get("name"), r.get("isin"), r.get("id"), r.get("full")):
+                out.append({"ident": r.get("isin") or r["id"], "ticker": r["id"], "name": r.get("name") or r["id"], "kind": "bond",
+                            "price": r.get("price"), "price_pct": True, "nominal": r.get("nominal"), "nkd": r.get("nkd"),
+                            "currency": (r.get("cur") or "RUB").lower(), "turn": r.get("turn") or 0})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for r in list(stocks_universe()) + list(funds_universe()):
+            if ok(r.get("secid"), r.get("isin"), r.get("name"), r.get("shortname")):
+                out.append({"ident": r.get("isin") or r["secid"], "ticker": r["secid"], "name": r.get("shortname") or r.get("name"),
+                            "kind": "fund" if r.get("is_fund") else "share", "price": r.get("price"), "price_pct": False,
+                            "currency": "rub", "turn": r.get("value_today") or 0})
+    except Exception:  # noqa: BLE001
+        pass
+    out.sort(key=lambda x: (not str(x["name"]).lower().startswith(s) and not x["ticker"].lower().startswith(s), -(x["turn"] or 0)))
+    return {"rows": out[:12]}
+
+
+API_POST["/api/ops/manual"] = manual_post
+API_POST["/api/ops/manual/delete"] = lambda cfg, body: manual_post(cfg, dict(body, action="delete"))
+API_GET["/api/ops/manual"] = manual_list
+API_GET["/api/ops/manual/search"] = manual_search
 # ═══════════════════════════════ счета и сводка ═══════════════════════════════
 
 _mem, _mem_lock = {}, threading.Lock()
@@ -6160,7 +6511,16 @@ def _list_accounts(cfg, key):
         for a, (t, n) in zip(accs, pool_map(tot, accs)):
             a["total"], a["empty"] = t, (t < 0.01 and n == 0)
             a["broker_id"], a["broker_name"] = "tinvest", BROKERS["tinvest"]
+        if accs and not client.sandbox:
+            try:        # названия счетов нужны облачной синхронизации (счёт без токена на другом устройстве)
+                store().put(SYNC_TB_KEY, {a["id"]: {"name": a["name"], "type": a["type"], "opened": a.get("opened")}
+                                          for a in accs if not a["closed"]})
+            except Exception:  # noqa: BLE001
+                pass
+    live = {a["id"] for a in accs}
     for imp in imports_list():
+        if imp.get("sync_src") and imp.get("src_acc") in live:
+            continue                          # на этом компьютере счёт идёт по API: снимок из облака не нужен
         a = {"id": imp["id"], "name": imp["name"], "kind": "import", "type": imp.get("broker") or "",
              "closed": False, "opened": None}
         a["broker_id"], a["broker_name"] = broker_of_account(imp)
@@ -15368,6 +15728,7 @@ def watch_post(cfg, body):
         store().put(WATCH_KEY, items)
     mem_clear_watch()
     tg_srv_kick()
+    sync_kick_safe()
     return {"ok": True, "isins": [x["isin"] for x in items], "in_watch": any(x["isin"] == isin for x in items)}
 
 
@@ -15434,6 +15795,7 @@ def notes_post(cfg, body):
         store().put(NOTES_KEY, items)
     mem_clear_watch()
     tg_srv_kick()
+    sync_kick_safe()
     return {"ok": True}
 
 
@@ -16474,6 +16836,7 @@ def tax_settings_save(cfg, body):
                 cur["loss_carry"][str(y)] = round(a, 2)
     store().put(TAX_SETTINGS_KEY, cur)
     mem_clear_tax()
+    sync_kick_safe()
     return tax_settings()
 
 
@@ -17540,6 +17903,690 @@ API_GET["/api/tax"] = tax_get
 API_GET["/api/tax/reb"] = tax_reb_get
 API_GET["/api/tax/decl.csv"] = tax_decl_csv_get
 API_POST["/api/tax/settings"] = tax_post_settings
+# ═══════════════ облачная синхронизация между устройствами: шифрование, слепок, слияние ═══════════════
+# Токен Т-Инвестиций в слепок не входит никогда. В слепок попадают только: счета, импортированные из отчётов и добавленные
+# вручную (названия, брокер, список файлов), их операции, «снимки» счетов Т-Инвестиций (операции без токена, чтобы открыть
+# счёт на втором компьютере), список наблюдения, дневник, несекретные настройки (цели ребалансировки, тарифы брокеров, налоговые
+# настройки). Слепок сжимается и шифруется на этом компьютере ключом из кодовой фразы (AES-256-CTR + HMAC-SHA256, как у резервной
+# копии) — сервер хранит только шифртекст и прочитать его не может.
+# Слияние — трёхстороннее (прежнее согласованное состояние, локальное, удалённое) по записям: правка с одной стороны побеждает
+# неизменённое с другой, удаление с одной стороны переносится, при правках с обеих сторон побеждает более свежая запись.
+import zlib
+
+SYNC_MAGIC = b"TINVSYN1"
+SYNC_ITER = 300000
+SYNC_V = 1
+SYNC_TOMB_DAYS = 180
+SYNC_CFG_KEYS = ("targets", "broker_tariffs")
+SYNC_BASE_KEY, SYNC_STATE_KEY, SYNC_TB_KEY = "sync_base_v1", "sync_state_v1", "tb_accounts_v1"
+SYNC_BOT_ACC = "imp-tgbot"           # ручной счёт для операций, присланных боту
+SYNC_MASS_LOSS = 0.5                  # пропала больше половины записей: считаем, что локальные данные сброшены, а не удалены
+SYNC_SECRET_FIELDS = ("token", "data_key", "backup_password", "sync_master")
+SECRET_KEYS.add("sync_master")
+
+
+class SyncError(Exception):
+    pass
+
+
+# ───────────── шифрование ─────────────
+def sync_derive(phrase, salt_b64):
+    """Кодовая фраза + соль -> 32-байтный мастер-ключ (PBKDF2-HMAC-SHA256). Фраза на диск не сохраняется."""
+    import unicodedata
+    p = unicodedata.normalize("NFC", str(phrase or "")).strip()
+    if len(p) < 12:
+        raise SyncError("Кодовая фраза слишком короткая: нужно не меньше 12 символов.")
+    salt = base64.b64decode(salt_b64.encode("ascii"))
+    return hashlib.pbkdf2_hmac("sha256", p.encode("utf-8"), salt, SYNC_ITER, 32)
+
+
+def sync_new_salt():
+    return base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+
+
+def sync_new_phrase():
+    """Случайная фраза: 5 групп по 4 символа из алфавита без похожих знаков (около 100 бит)."""
+    al = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "-".join("".join(secrets.choice(al) for _ in range(4)) for _ in range(5))
+
+
+def _sync_keys(master):
+    return (hmac.new(master, b"tinvest-sync-enc", hashlib.sha256).digest(),
+            hmac.new(master, b"tinvest-sync-mac", hashlib.sha256).digest())
+
+
+def sync_seal(master, plain):
+    """MAGIC(8) | nonce(12) | шифртекст | HMAC-SHA256(32) по всему предыдущему."""
+    ek, mk = _sync_keys(master)
+    nonce = secrets.token_bytes(12)
+    head = SYNC_MAGIC + nonce
+    body = aes256_ctr(ek, nonce + b"\0\0\0\0", plain)
+    return head + body + hmac.new(mk, head + body, hashlib.sha256).digest()
+
+
+def sync_open(master, blob):
+    if len(blob) < 8 + 12 + 32 or blob[:8] != SYNC_MAGIC:
+        raise SyncError("Облачная копия повреждена или создана другой версией программы.")
+    ek, mk = _sync_keys(master)
+    if not hmac.compare_digest(hmac.new(mk, blob[:-32], hashlib.sha256).digest(), blob[-32:]):
+        raise SyncError("Неверная кодовая фраза или облачная копия повреждена.")
+    return aes256_ctr(ek, blob[8:20] + b"\0\0\0\0", blob[20:-32])
+
+
+def sync_pack(recs, tombs, device="", now=None):
+    doc = {"v": SYNC_V, "device": device, "at": now if now is not None else time.time(), "recs": recs, "tombs": tombs}
+    return zlib.compress(json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 6)
+
+
+def sync_unpack(plain):
+    try:
+        doc = json.loads(zlib.decompress(plain).decode("utf-8"))
+    except (zlib.error, ValueError, UnicodeDecodeError):
+        raise SyncError("Облачная копия повреждена.")
+    if not isinstance(doc, dict) or doc.get("v") != SYNC_V or not isinstance(doc.get("recs"), dict):
+        raise SyncError("Облачная копия создана более новой версией программы: обновите TAnalytic.")
+    return doc["recs"], dict(doc.get("tombs") or {})
+
+
+# ───────────── записи слепка ─────────────
+def _sync_sig(v):
+    return json.dumps(v, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _sync_same(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    return _sync_sig(a.get("v")) == _sync_sig(b.get("v"))
+
+
+def _sync_logical(acc_id):
+    return acc_id
+
+
+def _sync_rec_op(o, derived):
+    """Запись операции; метка времени — момент правки ручной записи (_u), чтобы в споре побеждала правка, сделанная позже,
+    а не та, что раньше дошла до облака."""
+    r = {"k": "op", "v": _sync_op_clean(o, derived)}
+    if o.get("_u"):
+        r["u"] = float(o["_u"])
+    return r
+
+
+def _sync_op_clean(o, derived):
+    o = {k: v for k, v in o.items() if k not in ("_acc", "_accname")}
+    if derived:                       # доходность сделки пересчитывается FIFO на каждом устройстве
+        o.pop("yield", None)
+        o.pop("_yield", None)
+    return o
+
+
+def sync_collect(cfg, st=None):
+    """Локальное состояние -> {rid: {"k": вид, "v": значение}}. Без токена, счетов брокера по API и секретов."""
+    st = st or store()
+    recs = {}
+    demo = lambda x: bool(x.get("demo") or x.get("id") == DEMO_ID)      # noqa: E731
+    live_ids = set()
+    tbm = st.get(SYNC_TB_KEY) or {}
+    if (cfg.get("token") or "").strip() and not cfg.get("sandbox"):
+        pre = token_key(cfg) + ":"
+        for aid, m in tbm.items():
+            ops = st.ops(pre + aid)
+            if not ops:
+                continue
+            live_ids.add(aid)
+            recs["acc:tb:" + aid] = {"k": "acc", "v": {"kind": "tb", "aid": aid, "name": str(m.get("name") or aid)[:80],
+                                                         "type": str(m.get("type") or "")[:20]}}
+            for o in ops:
+                recs["op:tb:%s|%s" % (aid, op_key(o))] = _sync_rec_op(o, False)
+    for x in imports_list():
+        if demo(x) or not str(x.get("id") or "").startswith("imp-"):
+            continue
+        xid = x["id"]
+        if x.get("sync_src") == "tinvest":                      # снимок счёта Т-Инвестиций, полученный из облака
+            aid = x.get("src_acc") or ""
+            if aid in live_ids or not aid:
+                continue                                       # на компьютере с токеном источник истины — API
+            recs["acc:tb:" + aid] = {"k": "acc", "v": {"kind": "tb", "aid": aid, "name": str(x.get("name") or aid)[:80],
+                                                         "type": str(x.get("type") or "")[:20]}}
+            for o in st.ops(xid):
+                recs["op:tb:%s|%s" % (aid, op_key(o))] = _sync_rec_op(o, False)
+            continue
+        v = {k: val for k, val in x.items() if k != "ops"}
+        recs["acc:" + xid] = {"k": "acc", "v": v}
+        for o in st.ops(xid):
+            recs["op:%s|%s" % (xid, op_key(o))] = _sync_rec_op(o, True)
+    for it in watch_items():
+        recs["watch:" + it["isin"]] = {"k": "watch", "v": it}
+    for n in notes_all():
+        recs["note:" + n["id"]] = {"k": "note", "v": n}
+    for k in SYNC_CFG_KEYS:
+        if cfg.get(k):
+            recs["cfg:" + k] = {"k": "cfg", "v": cfg[k]}
+    tax = st.get(TAX_SETTINGS_KEY)
+    if tax:
+        recs["kv:tax"] = {"k": "kv", "v": tax}
+    return recs
+
+
+def _sync_deletable(rid):
+    """Исчезновение записи считается удалением пользователем. Операции счетов Т-Инвестиций по API не удаляются никогда."""
+    return not rid.startswith("op:tb:")
+
+
+def sync_local_view(cur, base, now):
+    """Локальные записи с метками времени правки + удаления с прошлой синхронизации. -> (recs, tombs, base_eff).
+    Метка записи: прежняя, если запись не менялась с прошлой синхронизации; иначе «сейчас»; без прежнего состояния (первая
+    синхронизация этого устройства) — 0, чтобы в спорах побеждали данные облака. Если пропало больше половины записей
+    (стёрта база, восстановлена копия), это не удаление: прежнее состояние отбрасывается, и данные вернутся из облака."""
+    brecs, btombs = base.get("recs") or {}, dict(base.get("tombs") or {})
+    lost = [rid for rid in brecs if rid not in cur and _sync_deletable(rid)]
+    if len(brecs) >= 20 and len(lost) > len(brecs) * SYNC_MASS_LOSS:
+        base, brecs, lost = {"recs": {}, "tombs": btombs}, {}, []
+    recs = {}
+    for rid, r in cur.items():
+        b = brecs.get(rid)
+        recs[rid] = {"k": r["k"], "v": r["v"], "u": (b.get("u") or 0) if b and _sync_same(b, r) else (r.get("u") or (now if brecs else 0))}
+    for rid in lost:
+        btombs[rid] = max(now, btombs.get(rid, 0))
+    return recs, btombs, base
+
+
+def _sync_killed(tombs, rid, rec):
+    t = tombs.get(rid)
+    return t is not None and t >= (rec.get("u") or 0)
+
+
+def _sync_merge_acc(a, b):
+    """Один счёт правили на двух устройствах: свежая запись + объединённый список загруженных файлов."""
+    new, old = (a, b) if (a.get("u") or 0) >= (b.get("u") or 0) else (b, a)
+    v = dict(new["v"])
+    files, seen = [], set()
+    for f in (new["v"].get("files") or []) + (old["v"].get("files") or []):
+        key = f.get("sha256") or f.get("name")
+        if key not in seen:
+            seen.add(key)
+            files.append(f)
+    if files:
+        v["files"] = files
+    return {"k": "acc", "v": v, "u": new.get("u") or 0}
+
+
+def sync_merge(base, local, remote, tombs_l, tombs_r, now):
+    """Трёхстороннее слияние записей. base/local/remote: {rid: {"k","v","u"}}. -> (merged, tombs).
+    Удаления: запись пропала с одной стороны относительно base — удаляем; удалили с одной стороны, а с другой правили —
+    побеждает более поздняя из двух меток (время удаления против времени правки)."""
+    tombs = {}
+    cutoff = now - SYNC_TOMB_DAYS * 86400
+    for src in (tombs_r or {}, tombs_l or {}):
+        for rid, ts in src.items():
+            if ts > tombs.get(rid, 0):
+                tombs[rid] = ts
+    tombs = {k: v for k, v in tombs.items() if v > cutoff}
+    out = {}
+    for rid in set(base) | set(local) | set(remote):
+        b, l, r = base.get(rid), local.get(rid), remote.get(rid)
+        if _sync_same(l, r):
+            res = l if l is not None else None
+            if l is not None and r is not None and (r.get("u") or 0) > (l.get("u") or 0):
+                res = r
+        elif _sync_same(b, l):
+            res = r
+        elif _sync_same(b, r):
+            res = l
+        elif l is None or r is None:
+            live = l if l is not None else r
+            res = None if _sync_killed(tombs, rid, live) else live
+        elif l["k"] == "acc":
+            res = _sync_merge_acc(l, r)
+        else:
+            res = r if (r.get("u") or 0) > (l.get("u") or 0) else l
+        if res is not None and _sync_killed(tombs, rid, res):
+            res = None                                    # удалено позже, чем правили
+        if res is not None:
+            out[rid] = res
+    # операции удалённых счетов не нужны
+    accs = {rid[4:] for rid in out if rid.startswith("acc:")}
+    for rid in [r for r in out if r.startswith("op:")]:
+        if rid[3:].split("|", 1)[0] not in accs:
+            out.pop(rid)
+    return out, tombs
+
+
+# ───────────── очередь из бота ─────────────
+SYNC_BOT_KINDS = {"buy": "BUY", "sell": "SELL", "deposit": "INPUT", "withdraw": "OUTPUT"}
+
+
+def sync_queue_recs(items, now):
+    """Элементы очереди бота -> записи слепка (ручные операции в счёте «Из Telegram» и заметки).
+    Идентификатор операции строится из номера в очереди, поэтому повторная обработка ничего не дублирует.
+    -> (recs, ids): ids — все разобранные элементы (в т.ч. непригодные), чтобы подтвердить и не копить их."""
+    recs, ids = {}, []
+    for it in items or []:
+        try:
+            qid = int(it["id"])
+            op = it.get("op") or {}
+            created = float(it.get("created_at") or now)
+        except (KeyError, TypeError, ValueError):
+            continue
+        ids.append(qid)
+        kind = str(op.get("kind") or "")
+        day = str(op.get("date") or "")[:10]
+        if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+            day = datetime.fromtimestamp(created, timezone.utc).strftime("%Y-%m-%d")
+        if kind == "note":
+            isin = str(op.get("isin") or "").strip().upper()
+            text = str(op.get("text") or "").strip()[:2000]
+            if re.fullmatch(r"[A-Z0-9]{6,16}", isin) and text:
+                nid = "nb%d" % qid
+                recs["note:" + nid] = {"k": "note", "u": created, "v": {"id": nid, "isin": isin, "date": day, "text": text}}
+            continue
+        if kind not in SYNC_BOT_KINDS:
+            continue
+        try:
+            qty = float(op.get("qty") or 0)
+            price = float(op.get("price") or 0)
+            amount = float(op.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        ident = str(op.get("secid") or "").strip().upper()[:24]
+        oid = "man-bot%d" % qid
+        if kind in ("buy", "sell"):
+            if not ident or qty <= 0 or (price <= 0 and amount <= 0) or qty > 1e9 or price > 1e9:
+                continue
+            total = round(amount if amount > 0 else qty * price, 2)
+            sign = -1 if kind == "buy" else 1
+            o = {"id": oid, "date": day + "T12:00:00Z", "type": "OPERATION_TYPE_" + SYNC_BOT_KINDS[kind],
+                 "payment": to_money(sign * total), "name": ident, "_ident": ident, "_manual": True, "_u": created,
+                 "quantity": str(int(qty)) if qty == int(qty) else repr(qty), "price": to_money(round(total / qty, 6))}
+            o["quantityDone"] = o["quantity"]
+            recs["op:%s|%s" % (SYNC_BOT_ACC, oid)] = {"k": "op", "u": created, "v": o}
+            if kind == "buy":                                  # деньги на покупку: пополнение на ту же сумму
+                c = {"id": oid + "-c", "date": o["date"], "type": "OPERATION_TYPE_INPUT", "payment": to_money(total),
+                     "name": "Пополнение под покупку", "_manual": True, "_manual_autocash": True, "_pair": oid, "_u": created}
+                recs["op:%s|%s" % (SYNC_BOT_ACC, c["id"])] = {"k": "op", "u": created, "v": c}
+        else:
+            if amount <= 0 or amount > 1e12:
+                continue
+            o = {"id": oid, "date": day + "T12:00:00Z", "type": "OPERATION_TYPE_" + SYNC_BOT_KINDS[kind],
+                 "payment": to_money(amount if kind == "deposit" else -amount),
+                 "name": "Пополнение" if kind == "deposit" else "Вывод", "_manual": True, "_u": created}
+            recs["op:%s|%s" % (SYNC_BOT_ACC, oid)] = {"k": "op", "u": created, "v": o}
+    if any(r["k"] == "op" for r in recs.values()):
+        recs["acc:" + SYNC_BOT_ACC] = {"k": "acc", "u": 0, "v": {
+            "id": SYNC_BOT_ACC, "name": "Из Telegram", "broker": "Ручной учёт", "manual": True, "files": [],
+            "created": utc_now_str()}}
+    return recs, ids
+# ═══════════════ облачная синхронизация: обмен с сервером данных, применение слияния, настройки ═══════════════
+# По умолчанию выключена (cfg["sync_enabled"]). Токен Т-Инвестиций на сервер не передаётся никогда; на сервер уходит
+# только зашифрованный на этом компьютере блок (см. 13l2_sync_core.py). Ключ шифрования (производный от кодовой фразы)
+# хранится в настройках как секрет и в резервные копии не попадает; сама фраза на диск не записывается.
+
+SYNC_PERIOD = 600                      # опрос облака, пока программа открыта
+SYNC_KICK_DELAY = 6                    # после правки данных — через столько секунд
+_sync_lock = threading.Lock()
+_sync_kick_state = {"timer": None}
+
+
+def sync_device_name(cfg):
+    import platform
+    name = str(cfg.get("sync_device") or "").strip()
+    return (name or {"Darwin": "macOS", "Windows": "Windows", "Linux": "Linux"}.get(platform.system(), platform.system() or "ПК"))[:40]
+
+
+def sync_req(method, path, body=None, timeout=90):
+    """{сервер}/v1/sync/<path> -> (код, dict). Бросает ApiError, если сервера или ключа нет или нет связи."""
+    srv, key = ds_conf()
+    if not srv or not key:
+        raise ApiError("Для синхронизации нужен вход по ключу из Telegram-бота.", 400)
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(srv.rstrip("/") + "/v1/sync/" + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json", "X-Client-Key": key,
+                                          "User-Agent": EXT_UA["User-Agent"]})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+            code, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        code, raw = e.code, e.read()
+    except Exception as e:  # noqa: BLE001
+        raise ApiError("Нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__), 502)
+    try:
+        j = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        j = None
+    j = j if isinstance(j, dict) else {}
+    if code in (401, 403):
+        raise ApiError("Ключ из бота не принят: войдите заново.", 401)
+    if code == 404:
+        raise ApiError("Этот сервер данных пока не поддерживает синхронизацию.", 404)
+    if code == 429:
+        raise ApiError("Слишком частые обращения к серверу, повторим позже.", 429)
+    return code, j
+
+
+def _sync_recs_equal(a, b):
+    if set(a) != set(b):
+        return False
+    return all(_sync_same(a[k], b[k]) and (a[k].get("u") or 0) == (b[k].get("u") or 0) for k in a)
+
+
+def _sync_ops_sigs(recs):
+    return {rid: _sync_sig(r["v"]) for rid, r in recs.items() if r["k"] == "op"}
+
+
+def sync_apply(cfg, merged, cur):
+    """Записывает результат слияния в локальную базу. cur — состояние до слияния (sync_collect). Токен и секреты не трогает."""
+    st = store()
+    # --- счета и операции ---
+    lst_old = imports_list()
+    byid = {x.get("id"): x for x in lst_old}
+    keep = [x for x in lst_old if x.get("demo") or x.get("id") == DEMO_ID or not str(x.get("id") or "").startswith("imp-")]
+    ops_by = defaultdict(list)
+    for rid, r in merged.items():
+        if r["k"] == "op":
+            ops_by[rid[3:].split("|", 1)[0]].append(r["v"])
+    cur_sigs, new_sigs = _sync_ops_sigs(cur), _sync_ops_sigs(merged)
+    dirty = set()
+    for rid in set(cur_sigs) | set(new_sigs):
+        if cur_sigs.get(rid) != new_sigs.get(rid):
+            dirty.add(rid[3:].split("|", 1)[0])
+    client = TInvest(cfg)
+    new_list, seen = list(keep), set()
+    for rid in sorted(merged):
+        r = merged[rid]
+        if r["k"] != "acc":
+            continue
+        v = r["v"]
+        if v.get("kind") == "tb":
+            logical, xid = "tb:" + v["aid"], "imp-tb-" + v["aid"]
+            ex = dict(byid.get(xid) or {})
+            ex.update({"id": xid, "name": v.get("name") or v["aid"], "broker": "Т-Инвестиции", "broker_id": "tinvest",
+                       "type": v.get("type") or "", "sync_src": "tinvest", "src_acc": v["aid"], "snapshot": True})
+            ex.setdefault("files", [])
+            ex.setdefault("created", utc_now_str())
+            derived = False
+        else:
+            logical, xid, ex, derived = v["id"], v["id"], dict(v), True
+        seen.add(xid)
+        ops = [dict(o) for o in ops_by.get(logical, [])]
+        if logical in dirty or xid not in byid:
+            if derived:
+                ops = manual_recompute(client, ops)
+            else:
+                ops.sort(key=lambda o: o.get("date") or "")
+            st.ops_clear(xid)
+            st.ops_put(xid, ops)
+        ex["ops"] = len(ops)
+        new_list.append(ex)
+    for x in lst_old:                              # счета, удалённые на другом устройстве
+        xid = str(x.get("id") or "")
+        if xid.startswith("imp-") and not (x.get("demo") or xid == DEMO_ID) and xid not in seen:
+            st.ops_clear(xid)
+    st.put("imports", new_list)
+    # --- наблюдение, дневник ---
+    for name, key, getter in (("watch", WATCH_KEY, watch_items), ("note", NOTES_KEY, notes_all)):
+        sid = (lambda it: it["isin"]) if name == "watch" else (lambda it: it["id"])
+        want = {rid[len(name) + 1:]: r["v"] for rid, r in merged.items() if r["k"] == name}
+        have = {sid(it): it for it in getter()}
+        if _sync_sig(want) != _sync_sig(have):
+            order = [k for k in have if k in want] + sorted(k for k in want if k not in have)
+            st.put(key, [want[k] for k in order])
+    # --- настройки ---
+    upd = {}
+    for k in SYNC_CFG_KEYS:
+        r = merged.get("cfg:" + k)
+        if r and cfg.get(k) != r["v"]:
+            upd[k] = r["v"]
+    if upd:
+        c2 = load_config()
+        c2.update(upd)
+        save_config(c2)
+    t = merged.get("kv:tax")
+    if t and st.get(TAX_SETTINGS_KEY) != t["v"]:
+        st.put(TAX_SETTINGS_KEY, t["v"])
+    mem_clear()
+    try:
+        mem_clear_watch()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sync_state_save(**kw):
+    st = dict(store().get(SYNC_STATE_KEY) or {})
+    st.update(kw)
+    store().put(SYNC_STATE_KEY, st)
+    return st
+
+
+def sync_cfg_ready(cfg):
+    return bool(cfg.get("sync_enabled") and cfg.get("sync_master") and cfg.get("sync_salt"))
+
+
+def sync_run(reason=""):
+    """Один цикл: забрать из облака, слить, при необходимости отправить обратно и применить локально. -> статус."""
+    cfg = load_config()
+    if not sync_cfg_ready(cfg):
+        raise ApiError("Синхронизация выключена.", 400)
+    with _sync_lock:
+        try:
+            res = _sync_run(cfg)
+            _sync_state_save(error="", at=time.time(), **res)
+        except ApiError as e:
+            _sync_state_save(error=str(e))
+            raise
+        except SyncError as e:
+            _sync_state_save(error=str(e))
+            raise ApiError(str(e), 400)
+    return sync_status()
+
+
+def _sync_run(cfg):
+    st = store()
+    master, salt = bytes.fromhex(cfg["sync_master"]), cfg["sync_salt"]
+    state = st.get(SYNC_STATE_KEY) or {}
+    base = st.get(SYNC_BASE_KEY) or {}
+    device = sync_device_name(cfg)
+    now = time.time()
+    cur = sync_collect(cfg, st)
+    for _attempt in range(4):
+        code, j = sync_req("GET", "pull")
+        if code != 200 or not j.get("ok"):
+            raise ApiError("Сервер ответил %d на запрос облачной копии." % code, 502)
+        queue = j.get("queue_items") or []
+        if j.get("exists"):
+            if j.get("salt") != salt:
+                raise ApiError("Облачная копия создана с другой кодовой фразой. Выключите синхронизацию и подключитесь заново.", 409)
+            remote, tombs_r = sync_unpack(sync_open(master, base64.b64decode(j["blob"])))
+            rev = int(j["rev"])
+        else:
+            if state.get("rev"):
+                _sync_off(cfg)
+                raise ApiError("Облачная копия удалена на сервере (возможно, кнопкой на другом устройстве). Синхронизация выключена, "
+                               "данные на этом компьютере не тронуты.", 410)
+            remote, tombs_r, rev = {}, {}, 0
+        qrecs, qids = sync_queue_recs(queue, now)
+        local, tombs_l, base_eff = sync_local_view(cur, base, now)
+        for rid, r in qrecs.items():
+            if rid not in local and not _sync_killed(tombs_l, rid, r):
+                local[rid] = r
+        merged, tombs = sync_merge(base_eff.get("recs") or {}, local, remote, tombs_l, tombs_r, now)
+        pushed = False
+        if not j.get("exists") or not _sync_recs_equal(merged, remote) or tombs != tombs_r or qids:
+            blob = sync_seal(master, sync_pack(merged, tombs, device, now))
+            code, pj = sync_req("POST", "push", {"base_rev": rev, "device": device, "salt": salt, "sha256": hashlib.sha256(blob).hexdigest(),
+                                                  "blob": base64.b64encode(blob).decode("ascii"), "ack_queue_ids": qids})
+            if code == 409:
+                continue                                    # кто-то успел раньше: заново забираем и сливаем
+            if code == 413:
+                raise ApiError("Данные не помещаются в облачную копию (до 4 МБ в сжатом виде).", 413)
+            if code != 200 or not pj.get("ok"):
+                raise ApiError("Сервер не принял облачную копию (ответ %d)." % code, 502)
+            rev, pushed = int(pj["rev"]), True
+        if not _sync_recs_equal(merged, cur_with_u(cur, merged)):
+            sync_apply(cfg, merged, cur)
+        st.put(SYNC_BASE_KEY, {"recs": merged, "tombs": tombs})
+        return {"rev": rev, "device": device, "pushed": pushed, "records": len(merged), "queue_taken": len(qids)}
+    raise ApiError("Не удалось согласовать изменения: данные одновременно меняют на нескольких устройствах. Повторите позже.", 409)
+
+
+def cur_with_u(cur, merged):
+    """Локальные записи с метками слияния (для сравнения «изменилось ли что-то локально»)."""
+    return {rid: dict(r, u=(merged.get(rid) or {}).get("u") or 0) for rid, r in cur.items()}
+
+
+def _sync_off(cfg):
+    c2 = load_config()
+    c2["sync_enabled"], c2["sync_master"] = False, ""
+    save_config(c2)
+    store().put(SYNC_BASE_KEY, {})
+
+
+def sync_status(cfg=None):
+    cfg = cfg or load_config()
+    st = store().get(SYNC_STATE_KEY) or {}
+    srv, key = ds_conf()
+    return {"enabled": bool(cfg.get("sync_enabled")), "ready": sync_cfg_ready(cfg), "logged_in": bool(srv and key),
+            "rev": st.get("rev") or 0, "at": st.get("at"), "error": st.get("error") or "", "device": st.get("device") or sync_device_name(cfg),
+            "records": st.get("records") or 0, "queue_taken": st.get("queue_taken") or 0}
+
+
+def sync_run_bg(reason=""):
+    try:
+        sync_run(reason)
+    except Exception:  # noqa: BLE001      ошибка уже записана в состояние и показывается в Настройках
+        pass
+
+
+def sync_kick(delay=SYNC_KICK_DELAY):
+    """Данные изменились: через несколько секунд отправить в облако (если синхронизация включена). Серия правок — один запуск."""
+    try:
+        if not sync_cfg_ready(load_config()):
+            return
+    except Exception:  # noqa: BLE001
+        return
+    with _sync_lock_kick:
+        t = _sync_kick_state.get("timer")
+        if t:
+            t.cancel()
+        t = threading.Timer(delay, sync_run_bg, args=("kick",))
+        t.daemon = True
+        _sync_kick_state["timer"] = t
+        t.start()
+
+
+_sync_lock_kick = threading.Lock()
+
+
+def sync_loop():
+    time.sleep(25)
+    while True:
+        try:
+            if sync_cfg_ready(load_config()):
+                sync_run_bg("loop")
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(SYNC_PERIOD)
+
+
+def sync_start():
+    threading.Thread(target=sync_loop, daemon=True, name="sync").start()
+
+
+STARTUP_HOOKS.append(sync_start)
+
+
+# ───────────── включение, выключение, удаление ─────────────
+def sync_enable(cfg, body):
+    mode = str(body.get("mode") or "create")
+    srv, key = ds_conf()
+    if not srv or not key:
+        raise ApiError("Для синхронизации нужен вход по ключу из Telegram-бота.", 400)
+    code, meta = sync_req("GET", "meta")
+    phrase, generated = str(body.get("phrase") or "").strip(), False
+    if mode == "create":
+        if meta.get("exists"):
+            raise ApiError("На сервере уже есть облачная копия. Подключитесь к ней по её кодовой фразе или сначала удалите её.", 409)
+        if not phrase:
+            phrase, generated = sync_new_phrase(), True
+        salt = sync_new_salt()
+        master = sync_derive(phrase, salt)
+    elif mode == "join":
+        if not meta.get("exists"):
+            raise ApiError("На сервере нет облачной копии: сначала включите синхронизацию на другом устройстве.", 404)
+        salt = meta["salt"]
+        try:
+            master = sync_derive(phrase, salt)
+            code, j = sync_req("GET", "pull")
+            sync_open(master, base64.b64decode(j["blob"]))          # проверка кодовой фразы до сохранения
+        except SyncError as e:
+            raise ApiError(str(e), 400)
+    else:
+        raise ApiError("Неизвестный режим.", 400)
+    c2 = load_config()
+    c2.update(sync_enabled=True, sync_master=master.hex(), sync_salt=salt)
+    save_config(c2)
+    store().put(SYNC_BASE_KEY, {})
+    store().put(SYNC_STATE_KEY, {})
+    try:
+        sync_run("enable")
+    except ApiError:
+        pass
+    out = sync_status()
+    out["ok"] = True
+    if generated:
+        out["phrase"] = phrase
+    return out
+
+
+def sync_disable(cfg, delete_remote=False):
+    """Выключает синхронизацию; локальные данные остаются. delete_remote — ещё и стирает облачную копию и очередь на сервере."""
+    deleted = None
+    if delete_remote:
+        code, j = sync_req("POST", "delete", {})
+        if code != 200:
+            raise ApiError("Не удалось удалить данные на сервере (ответ %d). Синхронизация осталась включённой." % code, 502)
+        deleted = bool(j.get("deleted"))
+    c2 = load_config()
+    c2["sync_enabled"], c2["sync_master"], c2["sync_salt"] = False, "", ""
+    save_config(c2)
+    store().put(SYNC_BASE_KEY, {})
+    store().put(SYNC_STATE_KEY, {})
+    out = sync_status()
+    out.update(ok=True, deleted=deleted)
+    return out
+
+
+def sync_server_info():
+    """Есть ли облачная копия на сервере (для экрана подключения второго устройства)."""
+    code, j = sync_req("GET", "meta")
+    return {"exists": bool(j.get("exists")), "rev": j.get("rev") or 0, "updated_at": j.get("updated_at"),
+            "device": j.get("device") or "", "size": j.get("size") or 0, "queue": j.get("queue") or 0}
+
+
+def sync_post(cfg, body):
+    act = str(body.get("action") or "")
+    if act == "enable":
+        return sync_enable(cfg, body)
+    if act == "now":
+        return sync_run("manual")
+    if act == "disable":
+        return sync_disable(cfg, bool(body.get("delete_remote")))
+    if act == "delete":
+        return sync_disable(cfg, True)
+    raise ApiError("Неизвестное действие.", 400)
+
+
+def sync_get(cfg, acc, q, force):
+    out = sync_status(cfg)
+    if force and out["logged_in"]:
+        try:
+            out["server"] = sync_server_info()
+        except ApiError as e:
+            out["server_error"] = str(e)
+    return out
+
+
+API_GET["/api/sync"] = sync_get
+API_POST["/api/sync"] = sync_post
 # ═══════════════════════════════ зашифрованная резервная копия и экспорт ═══════════════════════════════
 # Шифрование: стандартный AES-256 (FIPS-197) в режиме CTR (NIST SP 800-38A) на чистом Python + HMAC-SHA256
 # (encrypt-then-MAC), ключи из пароля через PBKDF2-HMAC-SHA256. Своих шифров нет.
@@ -18658,7 +19705,7 @@ def _ld_protected_keys():
     names = ("WATCH_KEY", "NOTES_KEY", "TG_SENT_KEY", "TG_STATE_KEY", "TG_SRV_KEY", "TAX_SETTINGS_KEY",
              "SIG_HIST_KEY", "RT_LOG_KEY", "MKT_HIST_KEY", "MKT_HIST2_KEY", "MON_SNAP_KEY",
              "PRI_SNAP_KEY", "BF_KEY", "FNG_SP_KEY", "FNG_FL_KEY", "_WI_KEY")
-    keys = {"backup_status", "weekly_cpi_notes_v1"}
+    keys = {"backup_status", "weekly_cpi_notes_v1", "sync_base_v1", "sync_state_v1", "tb_accounts_v1"}
     for n in names:
         v = globals().get(n)
         if isinstance(v, str):
@@ -27205,6 +28252,8 @@ class Handler(BaseHTTPRequestHandler):
                 save_config(cfg)
                 ds_reset()
                 mem_clear(persist=False)        # сохранённые отчёты привязаны к токену (token_key): настройки их не портят
+                if "targets" in body or "broker_tariffs" in body:
+                    sync_kick_safe()
                 return self.send(200, {"ok": True})
             if path == "/api/ratings/refresh":
                 return self.send(200, {"started": ratings_start(force=True), **ratings_status()})
@@ -27253,6 +28302,7 @@ class Handler(BaseHTTPRequestHandler):
                 store().put("imports", lst)
                 store().ops_clear(body.get("id") or "")
                 mem_clear()
+                sync_kick_safe()
                 return self.send(200, {"ok": True})
             if path in ("/api/sandbox/open", "/api/sandbox/payin"):
                 if not cfg["sandbox"]:

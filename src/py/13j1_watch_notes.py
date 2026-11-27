@@ -97,6 +97,7 @@ def watch_post(cfg, body):
         store().put(WATCH_KEY, items)
     mem_clear_watch()
     tg_srv_kick()
+    sync_kick_safe()
     return {"ok": True, "isins": [x["isin"] for x in items], "in_watch": any(x["isin"] == isin for x in items)}
 
 
@@ -163,6 +164,7 @@ def notes_post(cfg, body):
         store().put(NOTES_KEY, items)
     mem_clear_watch()
     tg_srv_kick()
+    sync_kick_safe()
     return {"ok": True}
 
 

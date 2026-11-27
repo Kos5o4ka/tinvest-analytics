@@ -110,7 +110,16 @@ def _list_accounts(cfg, key):
         for a, (t, n) in zip(accs, pool_map(tot, accs)):
             a["total"], a["empty"] = t, (t < 0.01 and n == 0)
             a["broker_id"], a["broker_name"] = "tinvest", BROKERS["tinvest"]
+        if accs and not client.sandbox:
+            try:        # названия счетов нужны облачной синхронизации (счёт без токена на другом устройстве)
+                store().put(SYNC_TB_KEY, {a["id"]: {"name": a["name"], "type": a["type"], "opened": a.get("opened")}
+                                          for a in accs if not a["closed"]})
+            except Exception:  # noqa: BLE001
+                pass
+    live = {a["id"] for a in accs}
     for imp in imports_list():
+        if imp.get("sync_src") and imp.get("src_acc") in live:
+            continue                          # на этом компьютере счёт идёт по API: снимок из облака не нужен
         a = {"id": imp["id"], "name": imp["name"], "kind": "import", "type": imp.get("broker") or "",
              "closed": False, "opened": None}
         a["broker_id"], a["broker_name"] = broker_of_account(imp)
