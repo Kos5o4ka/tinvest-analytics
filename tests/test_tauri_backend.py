@@ -86,7 +86,7 @@ class TauriShellStatus(unittest.TestCase):
         self.assertTrue(st["tauri"])
         self.assertFalse(st["tray"])
         self.assertFalse(st["outdated"])
-        self.assertFalse(st["autostart"])
+        self.assertNotIn("autostart", st)
 
     def test_tauri_without_rev_not_outdated(self):
         self.assertFalse(M.shell_status(env={"TINVEST_SHELL": "tauri"}, frozen=True)["outdated"])
@@ -96,7 +96,7 @@ class TauriShellStatus(unittest.TestCase):
         os.environ["TINVEST_SHELL"] = "tauri"
         try:
             with self.assertRaises(M.ApiError):
-                M.api_shell_tray({}, {"autostart": True})
+                M.api_shell_tray({}, {"tray_close": True})
         finally:
             if old is None:
                 os.environ.pop("TINVEST_SHELL", None)

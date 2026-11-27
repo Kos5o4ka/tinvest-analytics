@@ -44,7 +44,6 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; GroupDescription: "Дополнительно:"
-Name: "autostart"; Description: "Запускать {#MyAppName} вместе с Windows (свёрнутой в трей)"; GroupDescription: "Дополнительно:"; Flags: unchecked
 
 [Files]
 Source: "..\build_out\dist\TAnalytic\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -57,12 +56,6 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: deskto
 ; onedir: при обновлении убираем прежнюю папку библиотек, чтобы в ней не копились лишние файлы старых версий
 Type: filesandordirs; Name: "{app}\_internal"
 
-[Registry]
-; Автозапуск пишем только при ручной установке: тихое обновление из программы повторяет прежние галочки
-; (UsePreviousTasks), и выключенный в Настройках автозапуск иначе включался бы заново
-; То же имя значения и та же команда, что у переключателя «Запускать вместе с Windows» в Настройках программы
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExe}"" --tray"; Flags: uninsdeletevalue; Tasks: autostart; Check: InteractiveInstall
-
 [Run]
 Filename: "{app}\{#MyAppExe}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifsilent
 ; Тихое обновление из программы (/SILENT /RELAUNCH=1): старая копия уже закрылась сама, поэтому /RESTARTAPPLICATIONS
@@ -73,11 +66,6 @@ Filename: "{app}\{#MyAppExe}"; Flags: nowait; Check: RelaunchAfterUpdate
 var
   DownloadPage: TDownloadWizardPage;
   WebView2File: String;
-
-function InteractiveInstall(): Boolean;
-begin
-  Result := not WizardSilent;
-end;
 
 function RelaunchAfterUpdate(): Boolean;
 begin
@@ -147,7 +135,7 @@ var
   dataDir: String;
 begin
   if CurUninstallStep = usUninstall then
-    // автозапуск мог включить сам пользователь в Настройках, тогда запись не от установщика
+    // автозапуска в программе больше нет: убираем значение, оставшееся от прошлых версий
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}');
   if CurUninstallStep = usPostUninstall then
   begin

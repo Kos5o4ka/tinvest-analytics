@@ -4,8 +4,7 @@
 ;  * находим её по AppId в HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppId}_is1;
 ;  * тихо запускаем её деинсталлятор (/VERYSILENT /SUPPRESSMSGBOXES /NORESTART). В тихом режиме он данные
 ;    пользователя (%USERPROFILE%\.tinvest_analytics) не удаляет: вопрос о них задаётся только при `not UninstallSilent`;
-;  * убираем старый автозапуск: значение TAnalytic в HKCU\...\Run, оканчивающееся на " --tray" (его писал старый установщик).
-;    Автозапуск оболочки Tauri пишет то же имя значения, но без аргументов, поэтому его не трогаем.
+;  * автозапуска в программе больше нет: старое значение TAnalytic в HKCU\...\Run (его писали прежние версии) удаляем.
 
 !macro NSIS_HOOK_PREINSTALL
   ; --- старая установка Inno Setup ---
@@ -26,20 +25,15 @@
     ${EndIf}
   ${EndIf}
 
-  ; --- автозапуск старой оболочки: "...\TAnalytic.exe" --tray ---
-  ReadRegStr $R2 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "TAnalytic"
-  ${If} $R2 != ""
-    StrCpy $R3 $R2 7 -7
-    ${If} $R3 == " --tray"
-      DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "TAnalytic"
-    ${EndIf}
-  ${EndIf}
+  ; --- старый автозапуск ---
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "TAnalytic"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "TAnalytic"
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL

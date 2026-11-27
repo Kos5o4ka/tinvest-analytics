@@ -3,7 +3,7 @@
 # Автообновление меняет только tinvest_analytics.py; окно, иконка и экран обновления живут в самой оболочке.
 # Оболочка сообщает свою ревизию через TINVEST_SHELL_REV (с ревизии 2); старые оболочки её не передают.
 # Ревизия 3 — заставка на pywebview с бесшовным переходом в окно программы.
-# Ревизия 4 — установщик Windows (onedir), значок в трее, автозапуск и обновление оболочки из программы;
+# Ревизия 4 — установщик Windows (onedir), значок в трее и обновление оболочки из программы;
 # на macOS то же обновление из образа .dmg (ревизию не поднимали: сборка macOS с образом уже умеет обновляться).
 # Ревизия 5 — оболочка Tauri (установщик NSIS на Windows и образ .dmg на macOS, автообновление через tauri-plugin-updater).
 # Оболочки pywebview (ревизия 4 и ниже) получают баннер с предложением перейти на неё: скачать новый установщик.
@@ -12,8 +12,6 @@ SHELL_RELEASES = "https://github.com/Kos5o4ka/tinvest-analytics/releases/latest"
 
 
 DEFAULT_CONFIG.setdefault("tray_close", False)      # «При закрытии окна сворачивать в трей» (Windows); по умолчанию выключено
-AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-AUTOSTART_NAME = "TAnalytic"                         # то же имя значения пишет установщик (packaging/TAnalytic.iss)
 
 
 def shell_rev(env=None):
@@ -31,53 +29,12 @@ def is_tauri_shell(env=None):
 
 
 def tray_supported(env=None, frozen=None, plat=None):
-    """Трей и автозапуск — только у собранной оболочки ревизии 4+ на Windows (на macOS пункты скрыты).
-    Оболочка Tauri управляет треем и автозапуском сама (команды tauri_autostart_*), реестр Run не трогаем."""
+    """Трей — только у собранной оболочки pywebview ревизии 4+ на Windows (на macOS пункты скрыты).
+    У оболочки Tauri настройки трея нет. Автозапуска в программе нет нигде."""
     if is_tauri_shell(env):
         return False
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     return bool(frozen and (sys.platform if plat is None else plat) == "win32" and shell_rev(env) >= 4)
-
-
-def autostart_command(exe=None):
-    return '"%s" --tray' % (exe or sys.executable)
-
-
-def autostart_get(reg=None):
-    """Включён ли запуск вместе с Windows: есть ли значение TAnalytic в HKCU\\...\\Run. reg — модуль winreg (подменяется в тестах)."""
-    try:
-        reg = reg or __import__("winreg")
-        k = reg.OpenKey(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_READ)
-        try:
-            reg.QueryValueEx(k, AUTOSTART_NAME)
-            return True
-        finally:
-            reg.CloseKey(k)
-    except Exception:  # noqa: BLE001 — нет ключа, нет winreg (macOS), нет прав
-        return False
-
-
-def autostart_set(on, reg=None, exe=None):
-    """Включает или выключает запуск вместе с Windows (запись текущего пользователя, права администратора не нужны)."""
-    reg = reg or __import__("winreg")
-    if on:
-        k = reg.CreateKeyEx(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_SET_VALUE)
-        try:
-            reg.SetValueEx(k, AUTOSTART_NAME, 0, reg.REG_SZ, autostart_command(exe))
-        finally:
-            reg.CloseKey(k)
-        return True
-    try:
-        k = reg.OpenKey(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_SET_VALUE)
-    except OSError:
-        return False                                  # ключа нет — выключать нечего
-    try:
-        reg.DeleteValue(k, AUTOSTART_NAME)
-    except OSError:
-        pass                                          # значения уже нет
-    finally:
-        reg.CloseKey(k)
-    return False
 
 
 def tray_close_wanted():
@@ -88,7 +45,7 @@ def tray_close_wanted():
         return False
 
 
-def shell_status(env=None, frozen=None, cfg=None, reg=None):
+def shell_status(env=None, frozen=None, cfg=None):
     env = os.environ if env is None else env
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     rev = shell_rev(env)
@@ -99,13 +56,12 @@ def shell_status(env=None, frozen=None, cfg=None, reg=None):
     return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "tauri": tauri,
             "outdated": bool(frozen and not tauri and rev < SHELL_REV_LATEST),
             "url": SHELL_RELEASES, "asset": asset,
-            "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close")),
-            "autostart": bool(tray and autostart_get(reg))}
+            "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close"))}
 
 
 def api_shell_tray(cfg, body):
     if not tray_supported():
-        raise ApiError("Трей и автозапуск доступны только в установленной версии для Windows.", 400)
+        raise ApiError("Трей доступен только в установленной версии для Windows.", 400)
     if "tray_close" in body:
         cfg["tray_close"] = bool(body["tray_close"])
         save_config(cfg)
@@ -115,11 +71,6 @@ def api_shell_tray(cfg, body):
                 hook()
             except Exception:  # noqa: BLE001
                 pass
-    if "autostart" in body:
-        try:
-            autostart_set(bool(body["autostart"]))
-        except Exception as e:  # noqa: BLE001
-            raise ApiError("Не удалось изменить автозапуск: %s" % e, 500)
     return shell_status(cfg=cfg)
 
 
