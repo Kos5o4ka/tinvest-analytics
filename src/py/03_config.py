@@ -67,13 +67,24 @@ def _dpapi_unprotect(val):
         return ""
 
 
+def lock_marker_path():
+    """Маркер «блокировка была включена» рядом с config.json: если конфиг не читается, по маркеру программа остаётся
+    заблокированной (fail-closed). Создаётся при включении PIN, удаляется при выключении."""
+    return os.path.join(os.path.dirname(CONFIG_PATH), "lock.enabled")
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     try:
         with open(CONFIG_PATH, encoding="utf-8-sig") as f:   # utf-8-sig: Блокнот Windows пишет BOM
-            cfg.update(json.load(f))
+            j = json.load(f)
+        if not isinstance(j, dict):
+            raise ValueError("config.json: ожидался объект")
+        cfg.update(j)
     except (OSError, ValueError):
-        pass
+        if os.path.exists(lock_marker_path()):              # конфиг повреждён/не читается, но блокировка была включена
+            cfg.update(lock_enabled=True, lock_pin_hash="!config-unreadable", lock_pin_salt="", lock_bio=False,
+                       _lock_corrupt=True)
     for k in ("token", "data_key", "sync_master"):
         if isinstance(cfg.get(k), str) and cfg[k].startswith("dpapi:"):
             cfg[k] = _dpapi_unprotect(cfg[k])
@@ -108,6 +119,8 @@ def make_backup():
 
 
 def save_config(cfg):
+    if cfg.get("_lock_corrupt"):       # конфиг не читался (см. load_config): подменённые значения на диск не пишем
+        return
     out = dict(cfg)
     env_tok = os.environ.get("TINVEST_TOKEN")      # токен из окружения на диск не пишем: оставляем сохранённый там
     with _cfg_lock:

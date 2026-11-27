@@ -1692,13 +1692,24 @@ def _dpapi_unprotect(val):
         return ""
 
 
+def lock_marker_path():
+    """Маркер «блокировка была включена» рядом с config.json: если конфиг не читается, по маркеру программа остаётся
+    заблокированной (fail-closed). Создаётся при включении PIN, удаляется при выключении."""
+    return os.path.join(os.path.dirname(CONFIG_PATH), "lock.enabled")
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     try:
         with open(CONFIG_PATH, encoding="utf-8-sig") as f:   # utf-8-sig: Блокнот Windows пишет BOM
-            cfg.update(json.load(f))
+            j = json.load(f)
+        if not isinstance(j, dict):
+            raise ValueError("config.json: ожидался объект")
+        cfg.update(j)
     except (OSError, ValueError):
-        pass
+        if os.path.exists(lock_marker_path()):              # конфиг повреждён/не читается, но блокировка была включена
+            cfg.update(lock_enabled=True, lock_pin_hash="!config-unreadable", lock_pin_salt="", lock_bio=False,
+                       _lock_corrupt=True)
     for k in ("token", "data_key", "sync_master"):
         if isinstance(cfg.get(k), str) and cfg[k].startswith("dpapi:"):
             cfg[k] = _dpapi_unprotect(cfg[k])
@@ -1733,6 +1744,8 @@ def make_backup():
 
 
 def save_config(cfg):
+    if cfg.get("_lock_corrupt"):       # конфиг не читался (см. load_config): подменённые значения на диск не пишем
+        return
     out = dict(cfg)
     env_tok = os.environ.get("TINVEST_TOKEN")      # токен из окружения на диск не пишем: оставляем сохранённый там
     with _cfg_lock:
@@ -20170,6 +20183,25 @@ def _sync_ops_sigs(recs):
     return {rid: _sync_sig(r["v"]) for rid, r in recs.items() if r["k"] == "op"}
 
 
+def _sync_prewarm_idents(cfg, merged):
+    """Сетевой поиск бумаг для ручных сделок — ДО взятия замка ручного учёта: ответы оседают в кэше, и manual_recompute
+    под замком (в sync_apply) сети уже не касается. Любой сбой молча пропускаем: тогда поиск пройдёт под замком, как раньше."""
+    try:
+        idents = set()
+        for rid, r in merged.items():
+            if r.get("k") != "op":
+                continue
+            v = r.get("v") or {}
+            uid = str(v.get("instrumentUid") or "")
+            ident = v.get("_ident") or (uid[4:] if uid.startswith("imp:") else "")
+            if ident:
+                idents.add(ident)
+        if idents:
+            resolve_idents(TInvest(cfg), sorted(idents))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def sync_apply(cfg, merged, cur):
     """Записывает результат слияния в локальную базу. cur — состояние до слияния (sync_collect). Токен и секреты не трогает."""
     st = store()
@@ -20344,6 +20376,7 @@ def _sync_run(cfg):
             if code != 200 or not pj.get("ok"):
                 raise ApiError("Сервер не принял облачную копию (ответ %d)." % code, 502)
             rev, pushed = int(pj["rev"]), True
+        _sync_prewarm_idents(cfg, merged)                   # сеть — без замка; под замком только быстрое применение
         with _man_lock:                                     # тот же замок, что у ручного учёта и импорта
             if sync_collect(cfg, st) != cur or _sync_dels_get(st) != dels:
                 changed = True
@@ -30118,6 +30151,22 @@ def _lock_verify_pin(cfg, pin):
     return hmac.compare_digest(cand, h)
 
 
+def _lock_marker_sync(cfg):
+    """Маркер рядом с конфигом отражает «блокировка включена» (см. lock_marker_path). Ошибки записи не критичны."""
+    if cfg.get("_lock_corrupt"):
+        return
+    try:
+        mp = lock_marker_path()
+        if _lock_configured(cfg):
+            if not os.path.exists(mp):
+                _private_write(mp, ("TAnalytic: PIN-блокировка включена. Удалите этот файл вместе с PIN-настройками, "
+                                   "чтобы снять блокировку.\n").encode("utf-8"))
+        elif os.path.exists(mp):
+            os.remove(mp)
+    except OSError:
+        pass
+
+
 def _lock_configured(cfg):
     """Блокировка действует только с заданным PIN: биометрия — удобство поверх PIN, а не единственный ключ
     (иначе без Touch ID / Windows Hello в программу не войти)."""
@@ -30229,9 +30278,19 @@ def lock_status_dict(cfg):
         "has_pin": bool(cfg.get("lock_pin_hash")),
         "bio": bool(cfg.get("lock_bio", True)),
         "bio_available": bio_available(),
-        "reset_hint": "Если PIN забыт: закройте программу и удалите строки lock_enabled, lock_pin_hash и lock_pin_salt "
-                      "из файла %s" % CONFIG_PATH,
+        "config_corrupt": bool(cfg.get("_lock_corrupt")),
+        "reset_hint": _lock_reset_hint(cfg),
     }
+
+
+def _lock_reset_hint(cfg):
+    mp = lock_marker_path()
+    if cfg.get("_lock_corrupt"):
+        return ("Файл настроек %s повреждён, поэтому программа осталась заблокированной. Закройте программу и удалите файл "
+                "%s: блокировка снимется, данные портфеля не пострадают (удалять базу и сам config.json не нужно: "
+                "исправьте его или восстановите из резервной копии)." % (CONFIG_PATH, mp))
+    return ("Если PIN забыт: закройте программу и удалите строки lock_enabled, lock_pin_hash и lock_pin_salt из файла %s, "
+            "а также файл-маркер %s. Данные портфеля при этом не удаляются." % (CONFIG_PATH, mp))
 
 
 def lock_status_get(cfg, acc, q, force):
@@ -30269,6 +30328,7 @@ def lock_setup_post(cfg, body):
         cfg["lock_enabled"] = enabled
         _lock_unlocked[0] = True                             # текущую сессию сразу после настройки не блокируем
         save_config(cfg)
+        _lock_marker_sync(cfg)
         return dict(lock_status_dict(cfg), ok=True)
 
 
@@ -30279,7 +30339,7 @@ def lock_unlock_post(cfg, body):
         _lock_throttle_check()
         method = str(body.get("method") or ("bio" if body.get("bio") else "pin"))
         if method == "bio":
-            if not cfg.get("lock_bio", True):
+            if cfg.get("_lock_corrupt") or not cfg.get("lock_bio", True):
                 raise ApiError("Биометрическая разблокировка отключена.", 403)
             ok, err = bio_verify(str(body.get("reason") or "Разблокировать TAnalytic"))
             if not ok:
@@ -30311,6 +30371,7 @@ def lock_now_post(cfg, body):
 def _lock_on_startup():
     with _lock_state_lock:
         _lock_unlocked[0] = False
+        _lock_marker_sync(load_config())                     # включённая раньше блокировка получает маркер (после обновления)
 
 
 API_GET["/api/lock/status"] = lock_status_get

@@ -69,6 +69,22 @@ def _lock_verify_pin(cfg, pin):
     return hmac.compare_digest(cand, h)
 
 
+def _lock_marker_sync(cfg):
+    """Маркер рядом с конфигом отражает «блокировка включена» (см. lock_marker_path). Ошибки записи не критичны."""
+    if cfg.get("_lock_corrupt"):
+        return
+    try:
+        mp = lock_marker_path()
+        if _lock_configured(cfg):
+            if not os.path.exists(mp):
+                _private_write(mp, ("TAnalytic: PIN-блокировка включена. Удалите этот файл вместе с PIN-настройками, "
+                                   "чтобы снять блокировку.\n").encode("utf-8"))
+        elif os.path.exists(mp):
+            os.remove(mp)
+    except OSError:
+        pass
+
+
 def _lock_configured(cfg):
     """Блокировка действует только с заданным PIN: биометрия — удобство поверх PIN, а не единственный ключ
     (иначе без Touch ID / Windows Hello в программу не войти)."""
@@ -180,9 +196,19 @@ def lock_status_dict(cfg):
         "has_pin": bool(cfg.get("lock_pin_hash")),
         "bio": bool(cfg.get("lock_bio", True)),
         "bio_available": bio_available(),
-        "reset_hint": "Если PIN забыт: закройте программу и удалите строки lock_enabled, lock_pin_hash и lock_pin_salt "
-                      "из файла %s" % CONFIG_PATH,
+        "config_corrupt": bool(cfg.get("_lock_corrupt")),
+        "reset_hint": _lock_reset_hint(cfg),
     }
+
+
+def _lock_reset_hint(cfg):
+    mp = lock_marker_path()
+    if cfg.get("_lock_corrupt"):
+        return ("Файл настроек %s повреждён, поэтому программа осталась заблокированной. Закройте программу и удалите файл "
+                "%s: блокировка снимется, данные портфеля не пострадают (удалять базу и сам config.json не нужно: "
+                "исправьте его или восстановите из резервной копии)." % (CONFIG_PATH, mp))
+    return ("Если PIN забыт: закройте программу и удалите строки lock_enabled, lock_pin_hash и lock_pin_salt из файла %s, "
+            "а также файл-маркер %s. Данные портфеля при этом не удаляются." % (CONFIG_PATH, mp))
 
 
 def lock_status_get(cfg, acc, q, force):
@@ -220,6 +246,7 @@ def lock_setup_post(cfg, body):
         cfg["lock_enabled"] = enabled
         _lock_unlocked[0] = True                             # текущую сессию сразу после настройки не блокируем
         save_config(cfg)
+        _lock_marker_sync(cfg)
         return dict(lock_status_dict(cfg), ok=True)
 
 
@@ -230,7 +257,7 @@ def lock_unlock_post(cfg, body):
         _lock_throttle_check()
         method = str(body.get("method") or ("bio" if body.get("bio") else "pin"))
         if method == "bio":
-            if not cfg.get("lock_bio", True):
+            if cfg.get("_lock_corrupt") or not cfg.get("lock_bio", True):
                 raise ApiError("Биометрическая разблокировка отключена.", 403)
             ok, err = bio_verify(str(body.get("reason") or "Разблокировать TAnalytic"))
             if not ok:
@@ -262,6 +289,7 @@ def lock_now_post(cfg, body):
 def _lock_on_startup():
     with _lock_state_lock:
         _lock_unlocked[0] = False
+        _lock_marker_sync(load_config())                     # включённая раньше блокировка получает маркер (после обновления)
 
 
 API_GET["/api/lock/status"] = lock_status_get

@@ -489,6 +489,43 @@ class Fixes(Devices):
         finally:
             M._man_lock.release()
 
+    def test_network_lookup_of_sync_runs_without_manual_lock(self):
+        """Пока сеть синхронизации (поиск бумаг) висит, ручной ввод сделок проходит сразу: сеть идёт без замка."""
+        self.manual()
+        M.sync_enable(M.load_config(), {"mode": "create", "phrase": PHRASE})
+        self.join_b()
+        self.use("A")
+        self.manual(acc_name="Ещё один")
+        self.sync()
+        self.use("B")
+        ev_in, ev_go = threading.Event(), threading.Event()
+        real = M.resolve_idents
+        sync_thread = []
+
+        def slow(client, idents):
+            if threading.current_thread() in sync_thread:
+                ev_in.set()
+                ev_go.wait(10)
+            return real(client, idents)
+        M.resolve_idents = slow
+        res = []
+        t = threading.Thread(target=lambda: res.append(self.sync()))
+        sync_thread.append(t)
+        try:
+            t.start()
+            self.assertTrue(ev_in.wait(5), "поиск бумаг синхронизацией не начался")
+            t0 = time.time()
+            self.manual(acc_name="Пока висит сеть")
+            self.assertLess(time.time() - t0, 1.5)
+            self.assertTrue(M._man_lock.acquire(False))          # замок свободен
+            M._man_lock.release()
+        finally:
+            ev_go.set()
+            t.join(15)
+            M.resolve_idents = real
+        self.assertTrue(res)
+        self.assertIn("Пока висит сеть", [a["name"] for a in M.imports_list()])
+
     def test_R7_failed_first_push_does_not_report_enabled(self):
         self.manual()
         real = M.sync_req

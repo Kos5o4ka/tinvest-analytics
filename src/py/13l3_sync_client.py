@@ -55,6 +55,25 @@ def _sync_ops_sigs(recs):
     return {rid: _sync_sig(r["v"]) for rid, r in recs.items() if r["k"] == "op"}
 
 
+def _sync_prewarm_idents(cfg, merged):
+    """Сетевой поиск бумаг для ручных сделок — ДО взятия замка ручного учёта: ответы оседают в кэше, и manual_recompute
+    под замком (в sync_apply) сети уже не касается. Любой сбой молча пропускаем: тогда поиск пройдёт под замком, как раньше."""
+    try:
+        idents = set()
+        for rid, r in merged.items():
+            if r.get("k") != "op":
+                continue
+            v = r.get("v") or {}
+            uid = str(v.get("instrumentUid") or "")
+            ident = v.get("_ident") or (uid[4:] if uid.startswith("imp:") else "")
+            if ident:
+                idents.add(ident)
+        if idents:
+            resolve_idents(TInvest(cfg), sorted(idents))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def sync_apply(cfg, merged, cur):
     """Записывает результат слияния в локальную базу. cur — состояние до слияния (sync_collect). Токен и секреты не трогает."""
     st = store()
@@ -229,6 +248,7 @@ def _sync_run(cfg):
             if code != 200 or not pj.get("ok"):
                 raise ApiError("Сервер не принял облачную копию (ответ %d)." % code, 502)
             rev, pushed = int(pj["rev"]), True
+        _sync_prewarm_idents(cfg, merged)                   # сеть — без замка; под замком только быстрое применение
         with _man_lock:                                     # тот же замок, что у ручного учёта и импорта
             if sync_collect(cfg, st) != cur or _sync_dels_get(st) != dels:
                 changed = True
