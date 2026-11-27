@@ -32,3 +32,8 @@ packaging/hidden_imports.txt
 graphify-out/
 .agents/
 .claude/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
