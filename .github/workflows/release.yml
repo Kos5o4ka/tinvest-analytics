@@ -1,26 +1,21 @@
 name: release-binaries
-# Собирает нативные приложения (лаунчер в PyInstaller) и добавляет их к релизу.
-# Ассет tinvest_analytics.py и его строку в SHA256SUMS не трогает: на них опирается лаунчер.
-# Windows: onedir-сборка PyInstaller упаковывается установщиком Inno Setup (packaging/TAnalytic.iss) — TAnalytic-Setup-win.exe.
-# Этот же файл программа скачивает сама при обновлении оболочки и сверяет с SHA256SUMS (tinvest.py, prepare_installer).
-# macOS: onedir-сборка .app упаковывается в образ диска .dmg (packaging/make_dmg.sh: приложение и ярлык «Программы»);
-# по одному образу на архитектуру (arm64 и x86_64). Прежние zip больше не публикуются: на них не ссылается ни программа, ни README.
-# Подпись и нотаризация необязательны — включаются секретами APPLE_DEVELOPER_ID_CERT, APPLE_CERT_PASSWORD, APPLE_ID,
-# APPLE_TEAM_ID, APPLE_APP_PASSWORD (packaging/mac_codesign.sh, описание — в packaging/README.md); без них образ с ad-hoc подписью.
-# Прежний одиночный TAnalytic-win.exe больше не публикуется: на него не ссылается ни одна версия лаунчера.
+# Собирает приложение на Tauri v2 (Rust-оболочка + Python-сервер TAnalytic-backend, PyInstaller --onedir в ресурсах бандла) и добавляет сборки к релизу.
+# Публикуются под стабильными именами (их ждут баннер обновления, README и самообновление старых оболочек pywebview):
+#   TAnalytic-Setup-win.exe (NSIS, x64), TAnalytic-mac-arm64.dmg, TAnalytic-mac-x64.dmg,
+#   а для автообновления — подписи (*.sig), архивы *.app.tar.gz и latest.json.
+# Ассет tinvest_analytics.py релиза не трогаем; в SHA256SUMS заменяются только строки наших файлов.
 #
-# Подпись и репутация (настраиваются вне этого файла, здесь только заметка):
-#  * SignPath Foundation (бесплатно для открытого кода): после заявки подписывать TAnalytic-Setup-win.exe и TAnalytic.exe
-#    отдельным шагом (signpath/github-action-submit-signing-request) между «Сборка установщика» и загрузкой артефакта;
-#  * сразу после релиза отправлять установщик в Microsoft Security Intelligence (Submit a file for malware analysis,
-#    «Software developer») — снимает ложные срабатывания Defender и копит репутацию SHA-256 для SmartScreen.
+# Секреты (все необязательны, без них сборка не падает):
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD — подпись обновлений (без ключа latest.json не создаётся);
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID — подпись и нотаризация macOS.
+# Описание — в packaging/tauri/README.md.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Тег релиза, к которому добавить сборки (например v0.16)"
+        description: "Тег релиза, к которому добавить сборки (например v0.31)"
         required: true
 
 permissions:
@@ -29,7 +24,7 @@ permissions:
 env:
   TAG: ${{ github.event.release.tag_name || inputs.tag }}
   GH_TOKEN: ${{ github.token }}
-  PYTHONUTF8: "1"              # русский вывод скриптов на Windows (иначе cp1252)
+  PYTHONUTF8: "1"
 
 jobs:
   build:
@@ -38,95 +33,166 @@ jobs:
       matrix:
         include:
           - os: macos-latest        # Apple Silicon (arm64)
+            target: aarch64-apple-darwin
             asset: TAnalytic-mac-arm64.dmg
+            platform: darwin-aarch64
           - os: macos-15-intel      # Intel; метка раннера может измениться — при необходимости обновите
+            target: x86_64-apple-darwin
             asset: TAnalytic-mac-x64.dmg
+            platform: darwin-x86_64
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
             asset: TAnalytic-Setup-win.exe
+            platform: windows-x86_64
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: bash
     steps:
-      # скрипты сборки — из ветки запуска (при релизе это тег, при ручном запуске — main); программа — из ассета релиза
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Зависимости сборки (только для сборки, в программе их нет)
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Версия из тега в конфигурации Tauri
         run: |
-          # Загрузчик PyInstaller собираем из исходников (MSVC / clang на раннере): готовый загрузчик из колеса
-          # одинаков у тысяч программ, и эвристики антивирусов помечают любую сборку с ним как подозрительную.
+          python - << 'PY'
+          import json, os, re
+          nums = (re.findall(r"\d+", os.environ["TAG"]) + ["0", "0", "0"])[:3]
+          ver = ".".join(nums)
+          p = "src-tauri/tauri.conf.json"
+          d = json.load(open(p, encoding="utf-8"))
+          d["version"] = ver
+          json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          print("версия Tauri:", ver)
+          PY
+
+      - name: Сборка tinvest_analytics.py из src/
+        run: python build.py
+
+      - name: Зависимости и скрытые импорты для sidecar
+        run: |
+          # Загрузчик PyInstaller собираем из исходников: готовый загрузчик из колеса помечается антивирусами
           PYINSTALLER_COMPILE_BOOTLOADER=1 pip install --no-binary pyinstaller pyinstaller==6.22.3
-          pip install certifi pillow pywebview==6.2.1
-          # Windows: pywebview берёт Edge WebView2 через pythonnet (ставится как зависимость; явно — на случай смены метаданных)
-          if [ "$RUNNER_OS" = "Windows" ]; then pip install pythonnet clr_loader; fi
-      - name: Программа из релиза (чтобы собрать список её импортов)
-        run: gh release download "$TAG" -p tinvest_analytics.py -D release_app --clobber
-      - name: Колёса дополнительных библиотек (скачиваются по SHA256 из замка, код не запускается)
-        run: python packaging/vendor_lock.py --download vendor_wheels
-      - name: Список импортов программы и её дополнительных библиотек
-        run: python packaging/gen_hidden_imports.py release_app/tinvest_analytics.py --wheels vendor_wheels -o packaging/hidden_imports.txt
-      - name: Иконки
-        run: python packaging/make_icon.py build_icons
-      - name: Сборка
-        env:
-          TINVEST_APP_SRC: release_app/tinvest_analytics.py
-          TINVEST_ICON_DIR: build_icons
-        run: pyinstaller --noconfirm --distpath build_out/dist --workpath build_out/work packaging/tinvest.spec
-      - name: Проверка архитектуры (macOS)
-        if: runner.os == 'macOS'
+          pip install --upgrade pip certifi pillow
+          python packaging/vendor_lock.py --download vendor_wheels
+          python packaging/gen_hidden_imports.py tinvest_analytics.py --wheels vendor_wheels -o packaging/hidden_imports.txt
+
+      - name: Сборка Python-сервера (PyInstaller --onedir, кладётся в ресурсы бандла)
         run: |
           set -euo pipefail
-          APP="build_out/dist/TAnalytic.app"
-          want="${{ contains(matrix.asset, 'arm64') && 'arm64' || 'x86_64' }}"
-          info="$(file "$APP/Contents/MacOS/TAnalytic")"
-          echo "$info"
-          echo "$info" | grep -q "$want" || { echo "::error::ожидалась архитектура $want"; exit 1; }
-      - name: Подпись приложения (macOS; Developer ID, если заданы секреты, иначе ad-hoc)
+          ARGS=(
+            --onedir
+            --noconfirm
+            --name TAnalytic-backend
+            --collect-data certifi
+            --collect-submodules encodings
+            --distpath build_tauri_sidecar/dist
+            --workpath build_tauri_sidecar/work
+          )
+          if [ "$RUNNER_OS" = "Windows" ]; then ARGS+=(--noconsole); fi
+          while IFS= read -r mod; do
+            mod="${mod%%#*}"
+            mod="${mod//[$'\r\n ']}"
+            if [ -n "$mod" ]; then
+              ARGS+=(--hidden-import "$mod")
+            fi
+          done < packaging/hidden_imports.txt
+          pyinstaller "${ARGS[@]}" tinvest_analytics.py
+          mkdir -p src-tauri/resources/backend
+          cp -R build_tauri_sidecar/dist/TAnalytic-backend/. src-tauri/resources/backend/
+          ls src-tauri/resources/backend | head
+
+      - name: Подпись Python-сервера внутри бандла (macOS; Developer ID, если задан сертификат, иначе ad-hoc)
         if: runner.os == 'macOS'
         env:
-          APPLE_DEVELOPER_ID_CERT: ${{ secrets.APPLE_DEVELOPER_ID_CERT }}
-          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_DEVELOPER_ID_CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
+          # Tauri подписывает само приложение, но не Mach-O внутри ресурсов: подписываем их до упаковки
+          # (hardened runtime и права из packaging/entitlements.plist); без сертификата — ad-hoc, иначе arm64 не запустит
           packaging/mac_codesign.sh setup
-          packaging/mac_codesign.sh app build_out/dist/TAnalytic.app
-      - name: Образ диска (macOS)
-        if: runner.os == 'macOS'
+          packaging/mac_codesign.sh dir src-tauri/resources/backend
+
+      - name: Иконки Tauri
         run: |
-          # без раскладки Finder (нет графического сеанса) скрипт сам собирает образ без неё и не падает
-          packaging/make_dmg.sh build_out/dist/TAnalytic.app "${{ matrix.asset }}" TAnalytic
-      - name: Подпись образа и нотаризация (macOS; пропускается без секретов Apple)
-        if: runner.os == 'macOS'
+          python - << 'PY'
+          import os, sys
+          sys.path.insert(0, "packaging")
+          import make_icon
+          out = "src-tauri/icons"
+          os.makedirs(out, exist_ok=True)
+          make_icon.draw(32).save(os.path.join(out, "32x32.png"))
+          make_icon.draw(128).save(os.path.join(out, "128x128.png"))
+          make_icon.draw(256).save(os.path.join(out, "128x128@2x.png"))
+          big = make_icon.draw(1024)
+          big.save(os.path.join(out, "icon.png"))
+          sizes = (16, 24, 32, 48, 64, 128, 256)
+          frames = [make_icon.draw(s) for s in sizes]
+          frames[-1].save(os.path.join(out, "icon.ico"), format="ICO", sizes=[(s, s) for s in sizes], append_images=frames[:-1])
+          big.save(os.path.join(out, "icon.icns"))
+          PY
+
+      - name: Подпись обновлений (без секрета артефакты обновления отключаются)
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          UPD_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          packaging/mac_codesign.sh dmg "${{ matrix.asset }}"
-          packaging/mac_codesign.sh notarize "${{ matrix.asset }}"
+          if [ -z "$UPD_KEY" ]; then
+            echo '{"bundle":{"createUpdaterArtifacts":false}}' > src-tauri/tauri.noupdater.conf.json
+            echo "TAURI_EXTRA=--config tauri.noupdater.conf.json" >> "$GITHUB_ENV"
+            echo "::warning::секрет TAURI_SIGNING_PRIVATE_KEY не задан: автообновление в этой сборке отключено"
+          else
+            echo "TAURI_EXTRA=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Сборка приложения Tauri v2
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: src-tauri
+          args: --target ${{ matrix.target }} ${{ env.TAURI_EXTRA }}
+
       - name: Убрать временную связку ключей (macOS)
         if: always() && runner.os == 'macOS'
         run: packaging/mac_codesign.sh cleanup
-      - name: Inno Setup (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          # Inno Setup на раннере может отсутствовать или быть старым (нужен 6.3+ для x64compatible) — upgrade ставит и в том, и в другом случае
-          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
-          choco upgrade innosetup -y --no-progress
-          test -f "$ISCC" || { echo "::error::не найден ISCC.exe"; exit 1; }
-      - name: Сборка установщика (Windows)
-        if: runner.os == 'Windows'
+
+      - name: Файлы под стабильными именами
         run: |
           set -euo pipefail
-          test -f build_out/dist/TAnalytic/TAnalytic.exe || { echo "::error::нет onedir-сборки build_out/dist/TAnalytic"; exit 1; }
-          export APP_VER="${TAG#v}"
-          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" packaging/TAnalytic.iss
-          cp build_out/TAnalytic-Setup-win.exe "${{ matrix.asset }}"
+          B="src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p out
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "$B"/nsis/*-setup.exe "out/${{ matrix.asset }}"
+            if ls "$B"/nsis/*-setup.exe.sig >/dev/null 2>&1; then cp "$B"/nsis/*-setup.exe.sig "out/${{ matrix.asset }}.sig"; fi
+          else
+            cp "$B"/dmg/*.dmg "out/${{ matrix.asset }}"
+            TARNAME="${{ matrix.asset }}"; TARNAME="${TARNAME%.dmg}.app.tar.gz"
+            if ls "$B"/macos/*.app.tar.gz >/dev/null 2>&1; then cp "$B"/macos/*.app.tar.gz "out/$TARNAME"; fi
+            if ls "$B"/macos/*.app.tar.gz.sig >/dev/null 2>&1; then cp "$B"/macos/*.app.tar.gz.sig "out/$TARNAME.sig"; fi
+          fi
+          ls -l out
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          path: out/*
           if-no-files-found: error
 
   publish:
@@ -142,6 +208,32 @@ jobs:
           path: src_checkout
       - name: Колёса дополнительных библиотек — запасной источник для программы (основной — PyPI)
         run: python3 src_checkout/packaging/vendor_lock.py --download bin
+      - name: latest.json для автообновления (только если сборки подписаны)
+        run: |
+          python3 - << 'PY'
+          import datetime, json, os, re
+          tag = os.environ["TAG"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          nums = (re.findall(r"\d+", tag) + ["0", "0", "0"])[:3]
+          base = "https://github.com/%s/releases/download/%s/" % (repo, tag)
+          items = {
+              "windows-x86_64": "TAnalytic-Setup-win.exe",
+              "darwin-aarch64": "TAnalytic-mac-arm64.app.tar.gz",
+              "darwin-x86_64": "TAnalytic-mac-x64.app.tar.gz",
+          }
+          plats = {}
+          for plat, name in items.items():
+              sig = os.path.join("bin", name + ".sig")
+              if os.path.isfile(sig):
+                  plats[plat] = {"signature": open(sig, encoding="utf-8").read().strip(), "url": base + name}
+          if plats:
+              doc = {"version": ".".join(nums), "notes": "", "platforms": plats,
+                     "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+              json.dump(doc, open("bin/latest.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+              print("latest.json:", sorted(plats))
+          else:
+              print("подписей нет — latest.json не создаётся")
+          PY
       - name: Контрольные суммы и загрузка в релиз
         run: |
           set -euo pipefail
@@ -149,7 +241,7 @@ jobs:
           gh release download "$TAG" -p SHA256SUMS -R "$GITHUB_REPOSITORY" || touch SHA256SUMS
           cd ../bin
           ls -l
-          # строки для наших бинарников заменяем, остальные (в том числе tinvest_analytics.py) не трогаем
+          # строки для наших файлов заменяем, остальные (в том числе tinvest_analytics.py) не трогаем
           for f in *; do
             awk -v n="$f" '{ if ($2 != n && $2 != "*" n) print }' ../sums/SHA256SUMS > ../sums/tmp
             mv ../sums/tmp ../sums/SHA256SUMS

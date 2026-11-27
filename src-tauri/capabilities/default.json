@@ -5,8 +5,7 @@
   "windows": ["main"],
   "remote": {
     "urls": [
-      "http://127.0.0.1:*/*",
-      "http://localhost:*/*"
+      "http://127.0.0.1:*/*"
     ]
   },
   "permissions": [
@@ -16,7 +15,6 @@
     "core:window:allow-is-maximized",
     "core:window:allow-close",
     "core:window:allow-start-dragging",
-    "dialog:default",
-    "autostart:default"
+    "dialog:default"
   ]
 }

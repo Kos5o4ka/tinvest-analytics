@@ -456,12 +456,86 @@ def app_shutdown():
 sys.tanalytic_shutdown = app_shutdown        # лаунчер вызывает перед выходом (собранное приложение)
 
 
+# ── оболочка Tauri: следим за её процессом, чтобы сервер не остался сиротой, если оболочку убили или она упала ──
+def parent_alive_checker(pid, plat=None, getppid=None, kill=None):
+    """Возвращает функцию «процесс pid ещё жив». Подменяемые getppid/kill нужны тестам.
+    В onefile-сборке PyInstaller прямой родитель — загрузчик, а не оболочка, поэтому полагаемся на переданный PID,
+    а сравнение с getppid() делаем, только если мы запущены оболочкой напрямую (getppid() == pid в начале)."""
+    plat = sys.platform if plat is None else plat
+    if plat == "win32":
+        def alive_win(_=None):
+            import ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            k32.WaitForSingleObject.restype = ctypes.c_uint32
+            k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            h = k32.OpenProcess(0x00100000 | 0x1000, 0, int(pid))   # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return ctypes.get_last_error() == 5                  # ERROR_ACCESS_DENIED: процесс есть, но чужой
+            try:
+                return k32.WaitForSingleObject(h, 0) == 0x102        # WAIT_TIMEOUT: ещё не завершился
+            finally:
+                k32.CloseHandle(h)
+        return alive_win
+    getppid = getppid or os.getppid
+    kill = kill or os.kill
+    direct = getppid() == pid
+
+    def alive_posix(_=None):
+        if direct and getppid() != pid:
+            return False                                             # нас усыновил init/launchd: родитель умер
+        try:
+            kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+    return alive_posix
+
+
+def parent_died():
+    app_shutdown()
+    os._exit(0)
+
+
+def parent_watch_start(pid, interval=2.0, alive=None, on_dead=None):
+    """Фоновый поток: раз в interval секунд проверяет родителя и при его смерти завершает сервер."""
+    alive = alive or parent_alive_checker(pid)
+
+    def loop():
+        while True:
+            time.sleep(interval)
+            try:
+                ok = alive(pid)
+            except Exception:  # noqa: BLE001 — не смогли проверить: считаем родителя живым
+                ok = True
+            if not ok:
+                (on_dead or parent_died)()
+                return
+    t = threading.Thread(target=loop, daemon=True, name="parent-watch")
+    t.start()
+    return t
+
+
 def main():
     cfg = load_config()
     port = int(os.environ.get("TINVEST_PORT") or cfg["port"])
+    parent_pid = 0
     for i, a in enumerate(sys.argv):
         if a == "--port" and i + 1 < len(sys.argv):
             port = int(sys.argv[i + 1])
+        if a == "--parent-pid" and i + 1 < len(sys.argv):
+            try:
+                parent_pid = int(sys.argv[i + 1])
+            except ValueError:
+                parent_pid = 0
+    if parent_pid > 0:
+        parent_watch_start(parent_pid)
     store()
     try:
         srv = LocalHTTPServer(("127.0.0.1", port), Handler)
@@ -513,7 +587,7 @@ def main():
         app_shutdown()
     # окно закрыто или Ctrl+C: фоновые расчёты (пулы потоков) прерываем сразу, иначе они падают с трассировкой
     # «cannot schedule new futures after interpreter shutdown». База SQLite транзакционная, данные не теряются.
-    if not getattr(sys, "frozen", False):        # в собранном приложении выходом управляет лаунчер
+    if parent_pid > 0 or not getattr(sys, "frozen", False):   # sidecar оболочки Tauri выходит сам; в приложении с лаунчером — он
         sys.stdout.flush()
         os._exit(0)
 

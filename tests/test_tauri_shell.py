@@ -31,7 +31,7 @@ class TauriConfigAndFiles(unittest.TestCase):
             conf = json.load(f)
         self.assertEqual(conf["productName"], "TAnalytic")
         self.assertEqual(conf["version"], "0.31.0")
-        self.assertEqual(conf["identifier"], "ru.tanalytic.app")
+        self.assertEqual(conf["identifier"], "ru.tanalytic.desktop")
         win = conf["app"]["windows"][0]
         self.assertEqual(win["label"], "main")
         self.assertEqual((win["width"], win["height"]), (1280, 860))
@@ -63,7 +63,6 @@ class TauriConfigAndFiles(unittest.TestCase):
                 "tauri",
                 "tauri-plugin-single-instance",
                 "tauri-plugin-dialog",
-                "tauri-plugin-autostart",
                 "serde",
                 "serde_json",
             ):
@@ -74,7 +73,6 @@ class TauriConfigAndFiles(unittest.TestCase):
                 'name = "tanalytic"',
                 'tauri-plugin-single-instance = "2"',
                 'tauri-plugin-dialog = "2"',
-                'tauri-plugin-autostart = "2"',
                 '"tray-icon"',
             ):
                 self.assertIn(needle, raw)
@@ -87,7 +85,6 @@ class TauriConfigAndFiles(unittest.TestCase):
         self.assertIn("main", cap["windows"])
         urls = cap["remote"]["urls"]
         self.assertIn("http://127.0.0.1:*/*", urls)
-        self.assertIn("http://localhost:*/*", urls)
         perms = set(cap["permissions"])
         for req in (
             "core:default",
@@ -96,7 +93,6 @@ class TauriConfigAndFiles(unittest.TestCase):
             "core:window:allow-close",
             "core:window:allow-start-dragging",
             "dialog:default",
-            "autostart:default",
         ):
             self.assertIn(req, perms)
 
@@ -114,9 +110,6 @@ class TauriConfigAndFiles(unittest.TestCase):
             "tauri_win_toggle_max",
             "tauri_win_close",
             "tauri_pick_file",
-            "tauri_autostart_get",
-            "tauri_autostart_set",
-            "tauri_bio_verify",
         ):
             self.assertRegex(lib_rs, r"#\[tauri::command\][\s\S]{0,120}\b" + cmd + r"\b")
             self.assertIn(cmd, lib_rs.split("generate_handler![", 1)[1])
@@ -133,11 +126,25 @@ class TauriConfigAndFiles(unittest.TestCase):
             "hidden_title(true)",
             "--no-window",
             "TAnalytic-backend",
+            "--parent-pid",
+            "TINVEST_SHELL",
+            "on_navigation",
+            "Повторить",
         ):
             self.assertIn(needle, lib_rs)
+        self.assertNotIn("tauri_bio_verify", lib_rs)
+        self.assertNotIn("--tray", lib_rs)
+        self.assertNotIn("autostart", lib_rs.lower())
+        # single-instance — первый плагин, sidecar стартует в setup, а не до Builder
+        self.assertLess(lib_rs.index("tauri_plugin_single_instance::init"), lib_rs.index("tauri_plugin_dialog::init"))
+        self.assertNotIn("spawn_sidecar(port).ok()", lib_rs)
+        self.assertIn("start_backend(app.handle())", lib_rs.split(".setup(", 1)[1])
+        with open(os.path.join(TAURI_DIR, "capabilities", "default.json"), encoding="utf-8") as f:
+            caps = json.load(f)
+        self.assertEqual(caps["remote"]["urls"], ["http://127.0.0.1:*/*"])
 
     def test_workflows_and_docs(self):
-        yml_path = os.path.join(ROOT, ".github", "workflows", "tauri.yml")
+        yml_path = os.path.join(ROOT, ".github", "workflows", "release.yml")
         self.assertTrue(os.path.isfile(yml_path))
         yml = open(yml_path, encoding="utf-8").read()
         for runner in ("macos-latest", "macos-15-intel", "windows-latest"):
@@ -145,6 +152,76 @@ class TauriConfigAndFiles(unittest.TestCase):
         self.assertIn("TAnalytic-backend", yml)
         self.assertIn("tauri-apps/tauri-action@v0", yml)
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "packaging", "tauri", "README.md")))
+
+
+class TauriReleasePackaging(unittest.TestCase):
+    def conf(self):
+        with open(os.path.join(TAURI_DIR, "tauri.conf.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_installers_configured(self):
+        b = self.conf()["bundle"]
+        self.assertEqual(b["resources"], {"resources/backend/": "backend/"})
+        self.assertNotIn("externalBin", b)
+        nsis = b["windows"]["nsis"]
+        self.assertEqual(nsis["languages"], ["Russian"])
+        self.assertEqual(nsis["installMode"], "currentUser")
+        self.assertEqual(b["windows"]["webviewInstallMode"]["type"], "downloadBootstrapper")
+        for key in ("headerImage", "sidebarImage", "installerIcon", "installerHooks"):
+            self.assertTrue(os.path.isfile(os.path.join(TAURI_DIR, nsis[key])), key)
+        mac = b["macOS"]
+        self.assertEqual(mac["minimumSystemVersion"], "11.0")
+        self.assertTrue(os.path.isfile(os.path.join(TAURI_DIR, mac["entitlements"])))
+        self.assertTrue(os.path.isfile(os.path.join(TAURI_DIR, mac["dmg"]["background"])))
+        self.assertEqual((mac["dmg"]["windowSize"]["width"], mac["dmg"]["windowSize"]["height"]), (660, 400))
+        self.assertTrue(b["createUpdaterArtifacts"])
+
+    def test_installer_images_sizes(self):
+        import struct
+        def bmp(name):
+            with open(os.path.join(TAURI_DIR, "installer", name), "rb") as f:
+                head = f.read(30)
+            self.assertEqual(head[:2], b"BM")
+            w, h = struct.unpack("<ii", head[18:26])
+            bpp = struct.unpack("<H", head[28:30])[0]
+            return w, abs(h), bpp
+        self.assertEqual(bmp("header.bmp"), (150, 57, 24))
+        self.assertEqual(bmp("sidebar.bmp"), (164, 314, 24))
+
+    def test_nsis_hook_migrates_inno(self):
+        hook = open(os.path.join(TAURI_DIR, "installer", "hooks.nsh"), encoding="utf-8").read()
+        iss = open(os.path.join(ROOT, "packaging", "TAnalytic.iss"), encoding="utf-8-sig").read()
+        app_id = iss.split("AppId={{", 1)[1].split("}", 1)[0]
+        self.assertIn("{%s}_is1" % app_id, hook)
+        self.assertIn("/VERYSILENT", hook)
+        self.assertIn("/SUPPRESSMSGBOXES", hook)
+        self.assertIn("NSIS_HOOK_PREINSTALL", hook)
+        # Inno в тихом режиме данные не удаляет
+        self.assertIn("not UninstallSilent", iss)
+
+    def test_updater_configured(self):
+        conf = self.conf()
+        up = conf["plugins"]["updater"]
+        self.assertEqual(up["endpoints"], ["https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/latest.json"])
+        self.assertTrue(up["pubkey"])
+        lib_rs = open(os.path.join(TAURI_DIR, "src", "lib.rs"), encoding="utf-8").read()
+        for cmd in ("tauri_update_status", "tauri_update_check", "tauri_update_apply"):
+            self.assertIn(cmd, lib_rs.split("generate_handler![", 1)[1])
+        self.assertIn("tauri_plugin_updater", lib_rs)
+        cargo = open(os.path.join(TAURI_DIR, "Cargo.toml"), encoding="utf-8").read()
+        self.assertIn("tauri-plugin-updater", cargo)
+
+    def test_release_workflow_publishes_tauri_assets(self):
+        yml = open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8").read()
+        for asset in ("TAnalytic-Setup-win.exe", "TAnalytic-mac-arm64.dmg", "TAnalytic-mac-x64.dmg", "latest.json"):
+            self.assertIn(asset, yml)
+        self.assertIn("--onedir", yml)
+        self.assertNotIn("--onefile", yml)
+        self.assertIn("PYINSTALLER_COMPILE_BOOTLOADER=1", yml)
+        self.assertIn("mac_codesign.sh dir", yml)
+        self.assertIn("gh release upload", yml)
+        self.assertIn("SHA256SUMS", yml)
+        self.assertNotIn("ISCC", yml)
 
 
 class FrontendTauriIntegration(unittest.TestCase):
@@ -161,6 +238,8 @@ class FrontendTauriIntegration(unittest.TestCase):
         self.assertIn("tauri_win_minimize", js)
         self.assertIn("tauri_win_toggle_max", js)
         self.assertIn("tauri_win_close", js)
+        self.assertNotIn("dblclick", js)       # двойной клик по шапке обрабатывает сам Tauri (drag-region)
+        self.assertNotIn("tauri_bio_verify", js)
 
         self.assertIn("html.is-tauri .tauri-bar", css)
         self.assertIn("height:34px", css)
@@ -201,51 +280,10 @@ class LauncherTauriHooks(unittest.TestCase):
         api.win_close()
         self.assertEqual(api._win.calls, ["min", "max", "restore", "close"])
 
-    def test_check_lock_gate_default_and_biometric_flows(self):
-        # По умолчанию (lock_enabled=False) биометрия не запрашивается
-        called = []
-        r0 = L.check_lock_gate(
-            "http://127.0.0.1:9999/",
-            cfg={},
-            get_status=lambda _u: {"enabled": False, "unlocked": True, "_ok": True},
-            verify_fn=lambda: called.append("bio") or True,
-        )
-        self.assertEqual(r0["unlocked"], True)
-        self.assertEqual(called, [])
-
-        # Включено и заблокировано, биометрия прошла -> авторазблокировка
-        unlocked_urls = []
-        r1 = L.check_lock_gate(
-            "http://127.0.0.1:9999/",
-            cfg={"lock_enabled": True},
-            get_status=lambda _u: {"enabled": True, "unlocked": False, "biometric": True, "_ok": True},
-            verify_fn=lambda: True,
-            unlock_fn=lambda u: unlocked_urls.append(u) or True,
-        )
-        self.assertEqual(r1, {"locked": True, "unlocked": True, "method": "biometric"})
-        self.assertEqual(unlocked_urls, ["http://127.0.0.1:9999/"])
-
-        # Биометрия отклонена -> остаёмся на веб-экране блокировки
-        unlocked_urls.clear()
-        r2 = L.check_lock_gate(
-            "http://127.0.0.1:9999/",
-            cfg={"lock_enabled": True},
-            get_status=lambda _u: {"enabled": True, "unlocked": False, "biometric": True, "_ok": True},
-            verify_fn=lambda: False,
-            unlock_fn=lambda u: unlocked_urls.append(u) or True,
-        )
-        self.assertEqual(r2, {"locked": True, "unlocked": False, "method": "web"})
-        self.assertEqual(unlocked_urls, [])
-
-        # Уже разблокировано на сервере -> биометрия не запускается
-        r3 = L.check_lock_gate(
-            "http://127.0.0.1:9999/",
-            cfg={"lock_enabled": True},
-            get_status=lambda _u: {"enabled": True, "unlocked": True, "_ok": True},
-            verify_fn=lambda: self.fail("verify_fn must not run when already unlocked"),
-        )
-        self.assertFalse(r3["locked"])
-        self.assertTrue(r3["unlocked"])
+    def test_launcher_has_no_lock_gate(self):
+        # блокировку целиком показывает сервер (PIN обязателен); лаунчер не должен ни спрашивать биометрию, ни ждать
+        for name in ("check_lock_gate", "post_lock_unlock", "fetch_lock_status", "bio_verify"):
+            self.assertFalse(hasattr(L, name), name)
 
     def test_shutdown_posts_endpoint_and_runs_hook(self):
         hits = []

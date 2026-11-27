@@ -1,0 +1,1 @@
+Сюда CI кладёт папку PyInstaller --onedir (TAnalytic-backend); файл нужен, чтобы каталог был в репозитории.

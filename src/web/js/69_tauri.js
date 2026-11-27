@@ -18,9 +18,9 @@
     toggleMaximize: () => invoke("tauri_win_toggle_max"),
     close: () => invoke("tauri_win_close"),
     pickFile: () => invoke("tauri_pick_file"),
-    autostartGet: () => invoke("tauri_autostart_get"),
-    autostartSet: (enabled) => invoke("tauri_autostart_set", { enabled: !!enabled }),
-    bioVerify: (reason) => invoke("tauri_bio_verify", { reason: reason || "Подтвердите вход в TAnalytic" })
+    updateStatus: () => invoke("tauri_update_status"),
+    updateCheck: () => invoke("tauri_update_check"),
+    updateApply: () => invoke("tauri_update_apply")
   };
   window.TAURI_BRIDGE = bridge;
 
@@ -74,10 +74,7 @@
 
     main.prepend(bar);
 
-    bar.addEventListener("dblclick", (e) => {
-      if (e.target && e.target.closest && e.target.closest("button")) return;
-      bridge.toggleMaximize().catch(() => {});
-    });
+    /* Двойной клик по шапке разворачивает окно сам Tauri (data-tauri-drag-region): свой обработчик дал бы двойное переключение. */
 
     if (!isMac) {
       const bMin = document.getElementById("tauri-min");

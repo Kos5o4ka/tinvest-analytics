@@ -1,6 +1,6 @@
 # Сборка приложений
 
-Собирает `.github/workflows/release.yml` при публикации релиза; руками — так же, как в этом файле.
+УСТАРЕЛО: релизы теперь собирает оболочка Tauri (`.github/workflows/release.yml`, `packaging/tauri/README.md`). Ниже — описание сборки прежней оболочки pywebview.
 
 | Система | Результат | Как |
 |---|---|---|
@@ -13,8 +13,7 @@
 * перед копированием проверяет Microsoft Edge WebView2 Runtime и при его отсутствии докачивает официальный установщик Microsoft;
 * `AppMutex=TAnalyticSingleInstanceMutex` — это имя создаёт лаунчер (`SingleInstance` в `tinvest.py`); `CloseApplications` закрывает запущенную программу;
 * при удалении спрашивает, стирать ли данные (`%USERPROFILE%\.tinvest_analytics`); по умолчанию — «Нет»;
-* опция «Запускать вместе с Windows» пишет в `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` значение `TAnalytic` с командой `"...\TAnalytic.exe" --tray`;
-  ту же запись ведёт переключатель в «Настройках» (`src/py/13z_shell.py`);
+* автозапуска нет: установщик его не включает; при удалении значение `TAnalytic` в `HKCU\...\Run` убирается, если осталось от прошлых версий;
 * версия берётся из переменной окружения `APP_VER` (в CI — тег без буквы `v`);
 * файл `TAnalytic.iss` хранится в UTF-8 с BOM.
 

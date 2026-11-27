@@ -30039,15 +30039,15 @@ STARTUP_HOOKS.append(_lock_on_startup)
 # Автообновление меняет только tinvest_analytics.py; окно, иконка и экран обновления живут в самой оболочке.
 # Оболочка сообщает свою ревизию через TINVEST_SHELL_REV (с ревизии 2); старые оболочки её не передают.
 # Ревизия 3 — заставка на pywebview с бесшовным переходом в окно программы.
-# Ревизия 4 — установщик Windows (onedir), значок в трее, автозапуск и обновление оболочки из программы;
+# Ревизия 4 — установщик Windows (onedir), значок в трее и обновление оболочки из программы;
 # на macOS то же обновление из образа .dmg (ревизию не поднимали: сборка macOS с образом уже умеет обновляться).
-SHELL_REV_LATEST = 4
+# Ревизия 5 — оболочка Tauri (установщик NSIS на Windows и образ .dmg на macOS, автообновление через tauri-plugin-updater).
+# Оболочки pywebview (ревизия 4 и ниже) получают баннер с предложением перейти на неё: скачать новый установщик.
+SHELL_REV_LATEST = 5
 SHELL_RELEASES = "https://github.com/Kos5o4ka/tinvest-analytics/releases/latest"
 
 
 DEFAULT_CONFIG.setdefault("tray_close", False)      # «При закрытии окна сворачивать в трей» (Windows); по умолчанию выключено
-AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-AUTOSTART_NAME = "TAnalytic"                         # то же имя значения пишет установщик (packaging/TAnalytic.iss)
 
 
 def shell_rev(env=None):
@@ -30058,51 +30058,19 @@ def shell_rev(env=None):
         return 0
 
 
+def is_tauri_shell(env=None):
+    """Сервер запущен как sidecar оболочки Tauri (она ставит TINVEST_SHELL=tauri)."""
+    env = os.environ if env is None else env
+    return (env.get("TINVEST_SHELL") or "").strip().lower() == "tauri"
+
+
 def tray_supported(env=None, frozen=None, plat=None):
-    """Трей и автозапуск — только у собранной оболочки ревизии 4+ на Windows (на macOS пункты скрыты)."""
+    """Трей — только у собранной оболочки pywebview ревизии 4+ на Windows (на macOS пункты скрыты).
+    У оболочки Tauri настройки трея нет. Автозапуска в программе нет нигде."""
+    if is_tauri_shell(env):
+        return False
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     return bool(frozen and (sys.platform if plat is None else plat) == "win32" and shell_rev(env) >= 4)
-
-
-def autostart_command(exe=None):
-    return '"%s" --tray' % (exe or sys.executable)
-
-
-def autostart_get(reg=None):
-    """Включён ли запуск вместе с Windows: есть ли значение TAnalytic в HKCU\\...\\Run. reg — модуль winreg (подменяется в тестах)."""
-    try:
-        reg = reg or __import__("winreg")
-        k = reg.OpenKey(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_READ)
-        try:
-            reg.QueryValueEx(k, AUTOSTART_NAME)
-            return True
-        finally:
-            reg.CloseKey(k)
-    except Exception:  # noqa: BLE001 — нет ключа, нет winreg (macOS), нет прав
-        return False
-
-
-def autostart_set(on, reg=None, exe=None):
-    """Включает или выключает запуск вместе с Windows (запись текущего пользователя, права администратора не нужны)."""
-    reg = reg or __import__("winreg")
-    if on:
-        k = reg.CreateKeyEx(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_SET_VALUE)
-        try:
-            reg.SetValueEx(k, AUTOSTART_NAME, 0, reg.REG_SZ, autostart_command(exe))
-        finally:
-            reg.CloseKey(k)
-        return True
-    try:
-        k = reg.OpenKey(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_SET_VALUE)
-    except OSError:
-        return False                                  # ключа нет — выключать нечего
-    try:
-        reg.DeleteValue(k, AUTOSTART_NAME)
-    except OSError:
-        pass                                          # значения уже нет
-    finally:
-        reg.CloseKey(k)
-    return False
 
 
 def tray_close_wanted():
@@ -30113,22 +30081,23 @@ def tray_close_wanted():
         return False
 
 
-def shell_status(env=None, frozen=None, cfg=None, reg=None):
+def shell_status(env=None, frozen=None, cfg=None):
     env = os.environ if env is None else env
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     rev = shell_rev(env)
     asset = {"darwin": "TAnalytic-mac-arm64.dmg" if platform.machine() == "arm64" else "TAnalytic-mac-x64.dmg",
              "win32": "TAnalytic-Setup-win.exe"}.get(sys.platform)
     tray = tray_supported(env, frozen)
-    return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "outdated": bool(frozen and rev < SHELL_REV_LATEST),
+    tauri = is_tauri_shell(env)
+    return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "tauri": tauri,
+            "outdated": bool(frozen and not tauri and rev < SHELL_REV_LATEST),
             "url": SHELL_RELEASES, "asset": asset,
-            "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close")),
-            "autostart": bool(tray and autostart_get(reg))}
+            "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close"))}
 
 
 def api_shell_tray(cfg, body):
     if not tray_supported():
-        raise ApiError("Трей и автозапуск доступны только в установленной версии для Windows.", 400)
+        raise ApiError("Трей доступен только в установленной версии для Windows.", 400)
     if "tray_close" in body:
         cfg["tray_close"] = bool(body["tray_close"])
         save_config(cfg)
@@ -30138,11 +30107,6 @@ def api_shell_tray(cfg, body):
                 hook()
             except Exception:  # noqa: BLE001
                 pass
-    if "autostart" in body:
-        try:
-            autostart_set(bool(body["autostart"]))
-        except Exception as e:  # noqa: BLE001
-            raise ApiError("Не удалось изменить автозапуск: %s" % e, 500)
     return shell_status(cfg=cfg)
 
 
@@ -30607,12 +30571,86 @@ def app_shutdown():
 sys.tanalytic_shutdown = app_shutdown        # лаунчер вызывает перед выходом (собранное приложение)
 
 
+# ── оболочка Tauri: следим за её процессом, чтобы сервер не остался сиротой, если оболочку убили или она упала ──
+def parent_alive_checker(pid, plat=None, getppid=None, kill=None):
+    """Возвращает функцию «процесс pid ещё жив». Подменяемые getppid/kill нужны тестам.
+    В onefile-сборке PyInstaller прямой родитель — загрузчик, а не оболочка, поэтому полагаемся на переданный PID,
+    а сравнение с getppid() делаем, только если мы запущены оболочкой напрямую (getppid() == pid в начале)."""
+    plat = sys.platform if plat is None else plat
+    if plat == "win32":
+        def alive_win(_=None):
+            import ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            k32.WaitForSingleObject.restype = ctypes.c_uint32
+            k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            h = k32.OpenProcess(0x00100000 | 0x1000, 0, int(pid))   # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return ctypes.get_last_error() == 5                  # ERROR_ACCESS_DENIED: процесс есть, но чужой
+            try:
+                return k32.WaitForSingleObject(h, 0) == 0x102        # WAIT_TIMEOUT: ещё не завершился
+            finally:
+                k32.CloseHandle(h)
+        return alive_win
+    getppid = getppid or os.getppid
+    kill = kill or os.kill
+    direct = getppid() == pid
+
+    def alive_posix(_=None):
+        if direct and getppid() != pid:
+            return False                                             # нас усыновил init/launchd: родитель умер
+        try:
+            kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+    return alive_posix
+
+
+def parent_died():
+    app_shutdown()
+    os._exit(0)
+
+
+def parent_watch_start(pid, interval=2.0, alive=None, on_dead=None):
+    """Фоновый поток: раз в interval секунд проверяет родителя и при его смерти завершает сервер."""
+    alive = alive or parent_alive_checker(pid)
+
+    def loop():
+        while True:
+            time.sleep(interval)
+            try:
+                ok = alive(pid)
+            except Exception:  # noqa: BLE001 — не смогли проверить: считаем родителя живым
+                ok = True
+            if not ok:
+                (on_dead or parent_died)()
+                return
+    t = threading.Thread(target=loop, daemon=True, name="parent-watch")
+    t.start()
+    return t
+
+
 def main():
     cfg = load_config()
     port = int(os.environ.get("TINVEST_PORT") or cfg["port"])
+    parent_pid = 0
     for i, a in enumerate(sys.argv):
         if a == "--port" and i + 1 < len(sys.argv):
             port = int(sys.argv[i + 1])
+        if a == "--parent-pid" and i + 1 < len(sys.argv):
+            try:
+                parent_pid = int(sys.argv[i + 1])
+            except ValueError:
+                parent_pid = 0
+    if parent_pid > 0:
+        parent_watch_start(parent_pid)
     store()
     try:
         srv = LocalHTTPServer(("127.0.0.1", port), Handler)
@@ -30664,7 +30702,7 @@ def main():
         app_shutdown()
     # окно закрыто или Ctrl+C: фоновые расчёты (пулы потоков) прерываем сразу, иначе они падают с трассировкой
     # «cannot schedule new futures after interpreter shutdown». База SQLite транзакционная, данные не теряются.
-    if not getattr(sys, "frozen", False):        # в собранном приложении выходом управляет лаунчер
+    if parent_pid > 0 or not getattr(sys, "frozen", False):   # sidecar оболочки Tauri выходит сам; в приложении с лаунчером — он
         sys.stdout.flush()
         os._exit(0)
 
@@ -36568,19 +36606,18 @@ async function bindSetCrowd(c,msg){
   on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});stOk(on);msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
   show();
 }
-/* ── Окно программы: трей и автозапуск (только установленная версия для Windows; на macOS карточки нет) ── */
+/* ── Окно программы: трей (только установленная версия pywebview для Windows; под Tauri и на macOS карточки нет) ── */
 async function bindSetShell(msg){
   let s;try{s=await api("/api/shell")}catch(e){return}
   const sec=document.getElementById("set-look");
   if(!s||!s.tray||!sec||document.getElementById("shell-card"))return;
   sec.insertAdjacentHTML("beforeend",stGroup("Окно программы",
-    stRow("При закрытии окна сворачивать в трей","Программа продолжает работать в фоне: резервные копии, проверка тревог. Выйти можно из меню значка в трее",stSw("tray-close",!!s.tray_close,"При закрытии окна сворачивать в трей"))+
-    stRow("Запускать вместе с Windows","После входа в систему программа открывается сразу в трее, без окна",stSw("tray-auto",!!s.autostart,"Запускать вместе с Windows")),
+    stRow("При закрытии окна сворачивать в трей","Программа продолжает работать в фоне: резервные копии, проверка тревог. Выйти можно из меню значка в трее",stSw("tray-close",!!s.tray_close,"При закрытии окна сворачивать в трей")),
     {id:"shell-card",hint:"Windows"}));
   const bind=(id,key)=>{const el=document.getElementById(id);if(!el)return;
     el.onchange=async()=>{try{const r=await post("/api/shell/tray",{[key]:el.checked});stOk(el);
       el.checked=!!r[key];msg("Сохранено",1,true)}catch(e){msg(e.message);el.checked=!el.checked}}};
-  bind("tray-close","tray_close");bind("tray-auto","autostart");
+  bind("tray-close","tray_close");
 }
 /* ── Настройки: панель состояния, поиск, журнал изменений и сборка экрана ── */
 /* ── панель состояния ── */
@@ -44116,8 +44153,32 @@ function shellLinkBar(s){
     <span class="sb-b">${href?`<a class="btn" href="${esc(href)}" target="_blank" rel="noopener noreferrer">Скачать</a>`:''}${su?`<a class="btn ghost" href="${esc(su)}" target="_blank" rel="noopener noreferrer">Что нового</a>`:''}<button class="btn ghost" id="shell-later">Позже</button></span>`);
   if(bar)shellLater(bar);
 }
+/* Оболочка Tauri — единственный канал обновлений: она сама проверяет latest.json при старте и раз в 6 часов и скачивает
+   подписанное обновление в фоне. Здесь только баннер «готово — Перезапустить»; не нажали — обновление поставится при закрытии. */
+function tauriUpdateNotice(){
+  const br=window.TAURI_BRIDGE;if(!br||!br.updateStatus)return;
+  let shown=false;
+  const poll=async()=>{
+    try{if(sessionStorage.getItem('shell_later'))return}catch(e){}
+    let u;try{u=await br.updateStatus()}catch(e){u=null}
+    if(!u||!u.version){setTimeout(poll,5*60*1000);return}      /* пока нет скачанного обновления — спросим позже */
+    if(shown||document.getElementById('shell-bar'))return;
+    const bar=shellBar(`<span><b>Готово обновление до версии ${esc(String(u.version))}.</b> Программа перезапустится; если не нажимать, оно установится при закрытии. Данные и настройки сохранятся.</span>
+      <span class="sb-b"><button class="btn" id="shell-go">Перезапустить</button><button class="btn ghost" id="shell-later">Позже</button></span>`);
+    if(!bar)return;
+    shown=true;shellLater(bar);
+    bar.querySelector('#shell-go').onclick=async e=>{
+      const b=e.currentTarget;b.disabled=true;b.textContent='Обновляю…';
+      try{await br.updateApply()}
+      catch(err){b.disabled=false;b.textContent='Перезапустить';
+        const sp=bar.querySelector('span');if(sp)sp.insertAdjacentHTML('beforeend',` <span class="neg">Не удалось обновить: ${esc(String(err&&err.message||err))}</span>`)}
+    };
+  };
+  poll();
+}
 async function shellNotice(){
   let s;try{s=await api('/api/shell')}catch(e){return}
+  if(s&&s.tauri){tauriUpdateNotice();return}      /* под Tauri старый канал обновления оболочки не используется */
   if(!s||!s.outdated)return;
   try{if(sessionStorage.getItem('shell_later'))return}catch(e){}
   if(document.getElementById('shell-bar'))return;
@@ -44426,9 +44487,9 @@ if(typeof bcIssuerCurve==='function'&&typeof chartEnhanceIssuerCurve==='function
     toggleMaximize: () => invoke("tauri_win_toggle_max"),
     close: () => invoke("tauri_win_close"),
     pickFile: () => invoke("tauri_pick_file"),
-    autostartGet: () => invoke("tauri_autostart_get"),
-    autostartSet: (enabled) => invoke("tauri_autostart_set", { enabled: !!enabled }),
-    bioVerify: (reason) => invoke("tauri_bio_verify", { reason: reason || "Подтвердите вход в TAnalytic" })
+    updateStatus: () => invoke("tauri_update_status"),
+    updateCheck: () => invoke("tauri_update_check"),
+    updateApply: () => invoke("tauri_update_apply")
   };
   window.TAURI_BRIDGE = bridge;
 
@@ -44482,10 +44543,7 @@ if(typeof bcIssuerCurve==='function'&&typeof chartEnhanceIssuerCurve==='function
 
     main.prepend(bar);
 
-    bar.addEventListener("dblclick", (e) => {
-      if (e.target && e.target.closest && e.target.closest("button")) return;
-      bridge.toggleMaximize().catch(() => {});
-    });
+    /* Двойной клик по шапке разворачивает окно сам Tauri (data-tauri-drag-region): свой обработчик дал бы двойное переключение. */
 
     if (!isMac) {
       const bMin = document.getElementById("tauri-min");

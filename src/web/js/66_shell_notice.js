@@ -31,8 +31,32 @@ function shellLinkBar(s){
     <span class="sb-b">${href?`<a class="btn" href="${esc(href)}" target="_blank" rel="noopener noreferrer">Скачать</a>`:''}${su?`<a class="btn ghost" href="${esc(su)}" target="_blank" rel="noopener noreferrer">Что нового</a>`:''}<button class="btn ghost" id="shell-later">Позже</button></span>`);
   if(bar)shellLater(bar);
 }
+/* Оболочка Tauri — единственный канал обновлений: она сама проверяет latest.json при старте и раз в 6 часов и скачивает
+   подписанное обновление в фоне. Здесь только баннер «готово — Перезапустить»; не нажали — обновление поставится при закрытии. */
+function tauriUpdateNotice(){
+  const br=window.TAURI_BRIDGE;if(!br||!br.updateStatus)return;
+  let shown=false;
+  const poll=async()=>{
+    try{if(sessionStorage.getItem('shell_later'))return}catch(e){}
+    let u;try{u=await br.updateStatus()}catch(e){u=null}
+    if(!u||!u.version){setTimeout(poll,5*60*1000);return}      /* пока нет скачанного обновления — спросим позже */
+    if(shown||document.getElementById('shell-bar'))return;
+    const bar=shellBar(`<span><b>Готово обновление до версии ${esc(String(u.version))}.</b> Программа перезапустится; если не нажимать, оно установится при закрытии. Данные и настройки сохранятся.</span>
+      <span class="sb-b"><button class="btn" id="shell-go">Перезапустить</button><button class="btn ghost" id="shell-later">Позже</button></span>`);
+    if(!bar)return;
+    shown=true;shellLater(bar);
+    bar.querySelector('#shell-go').onclick=async e=>{
+      const b=e.currentTarget;b.disabled=true;b.textContent='Обновляю…';
+      try{await br.updateApply()}
+      catch(err){b.disabled=false;b.textContent='Перезапустить';
+        const sp=bar.querySelector('span');if(sp)sp.insertAdjacentHTML('beforeend',` <span class="neg">Не удалось обновить: ${esc(String(err&&err.message||err))}</span>`)}
+    };
+  };
+  poll();
+}
 async function shellNotice(){
   let s;try{s=await api('/api/shell')}catch(e){return}
+  if(s&&s.tauri){tauriUpdateNotice();return}      /* под Tauri старый канал обновления оболочки не используется */
   if(!s||!s.outdated)return;
   try{if(sessionStorage.getItem('shell_later'))return}catch(e){}
   if(document.getElementById('shell-bar'))return;

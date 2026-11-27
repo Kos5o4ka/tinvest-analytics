@@ -18,7 +18,7 @@ HOME = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), "
 APP_DIR = os.path.join(HOME, "app")
 APP, VER = os.path.join(APP_DIR, FILE), os.path.join(APP_DIR, "version.txt")
 OK_HOSTS = ("api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com")
-SHELL_REV = 4                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
+SHELL_REV = 5                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
                                          # 3 — заставка на pywebview и бесшовный переход в окно программы
                                          # 4 — установщик (onedir), трей, автозапуск и обновление оболочки из программы
 os.environ["TINVEST_SHELL_REV"] = str(SHELL_REV)
@@ -153,12 +153,14 @@ def update(report=lambda *a: None, cancel=None, fetch=fetch):
 
 # ───────────────────────────── обновление оболочки: установщик с GitHub ─────────────────────────────
 
-SETUP_ASSET = "TAnalytic-Setup-win.exe"          # установщик Inno Setup (packaging/TAnalytic.iss), публикуется в релизе
+SETUP_ASSET = "TAnalytic-Setup-win.exe"          # установщик NSIS (оболочка Tauri, src-tauri/), публикуется в релизе
 MAC_ASSETS = {"arm64": "TAnalytic-mac-arm64.dmg", "x86_64": "TAnalytic-mac-x64.dmg"}   # образы macOS (packaging/make_dmg.sh)
 MAC_APP_NAME = "TAnalytic.app"                   # так называется приложение внутри образа и на диске
 SETUP_LIMIT = 300_000_000                        # установщик заметно больше одного .py (по умолчанию fetch берёт до 20 МБ)
 UPDATE_DIR = os.path.join(HOME, "update")
-SETUP_ARGS = ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/RELAUNCH=1")   # /RELAUNCH — свой параметр .iss
+# NSIS (Tauri): /S — тихая установка, /UPDATE — режим обновления (установщик закрывает старую копию и сам запускает новую).
+# Старые лаунчеры (ревизия 4 и ниже) передают ключи Inno (/SILENT ...): NSIS их не понимает и просто показывает окно установщика.
+SETUP_ARGS = ("/S", "/UPDATE")
 
 
 def shell_asset(plat=None, machine=None):
@@ -975,123 +977,6 @@ def read_app_config(path=None):
         return {}
 
 
-def bio_verify(reason="Разблокируйте TAnalytic"):
-    """Нативная проверка биометрии/пароля ОС (Touch ID на macOS, Windows Hello на Windows)."""
-    if sys.platform == "darwin":
-        try:
-            import objc  # noqa: F401
-            from Foundation import NSBundle
-            bundle = NSBundle.bundleWithPath_("/System/Library/Frameworks/LocalAuthentication.framework")
-            if bundle and bundle.load():
-                LAContext = objc.lookUpClass("LAContext")
-                ctx = LAContext.alloc().init()
-                ok_can, _ = ctx.canEvaluatePolicy_error_(2, None)  # LAPolicyDeviceOwnerAuthentication
-                if ok_can:
-                    ev, res = threading.Event(), [False]
-
-                    def reply(success, _err):
-                        res[0] = bool(success)
-                        ev.set()
-
-                    ctx.evaluatePolicy_localizedReason_reply_(2, str(reason), reply)
-                    ev.wait(60)
-                    return bool(res[0])
-        except Exception:
-            pass
-        try:
-            swift_code = (
-                "import Foundation\nimport LocalAuthentication\n"
-                "let ctx = LAContext()\n"
-                "let reason = ProcessInfo.processInfo.environment[\"TA_BIO_REASON\"] ?? \"Unlock TAnalytic\"\n"
-                "var err: NSError?\n"
-                "if !ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) { exit(2) }\n"
-                "let sem = DispatchSemaphore(value: 0)\nvar ok = false\n"
-                "ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { s, _ in ok = s; sem.signal() }\n"
-                "sem.wait()\nexit(ok ? 0 : 1)\n"
-            )
-            env = dict(os.environ, TA_BIO_REASON=str(reason))
-            r = subprocess.run(["swift", "-e", swift_code], env=env, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-            return r.returncode == 0
-        except Exception:
-            return False
-    if sys.platform == "win32":
-        try:
-            ps = (
-                "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
-                "$null = [Windows.Security.Credentials.UI.UserConsentVerifier,"
-                "Windows.Security.Credentials.UI,ContentType=WindowsRuntime]; "
-                "$op = [Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync($env:TA_BIO_REASON); "
-                "$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { "
-                "$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethod })[0]"
-                ".MakeGenericMethod([Windows.Security.Credentials.UI.UserConsentVerificationResult]); "
-                "$res = $asTask.Invoke($null, @($op)).GetAwaiter().GetResult(); "
-                "if ($res -eq [Windows.Security.Credentials.UI.UserConsentVerificationResult]::Verified) { exit 0 } else { exit 1 }"
-            )
-            env = dict(os.environ, TA_BIO_REASON=str(reason))
-            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                               env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, creationflags=0x08000000, timeout=60)
-            return r.returncode == 0
-        except Exception:
-            return False
-    return False
-
-
-def fetch_lock_status(url, timeout=2.0):
-    """Запрашивает GET /api/lock/status. Если маршрут отсутствует, считает блокировку выключенной."""
-    try:
-        with urllib.request.urlopen(url.rstrip("/") + "/api/lock/status", timeout=timeout) as r:
-            if r.status == 200:
-                d = json.loads(r.read().decode("utf-8") or "{}")
-                if isinstance(d, dict):
-                    d.setdefault("_ok", True)
-                    return d
-    except Exception:
-        pass
-    return {"enabled": False, "unlocked": True, "_ok": False}
-
-
-def post_lock_unlock(url, timeout=2.0):
-    """Разблокирует сессию после успешной нативной биометрии (POST /api/lock/unlock)."""
-    try:
-        req = urllib.request.Request(
-            url.rstrip("/") + "/api/lock/unlock",
-            data=b'{"biometric":true}',
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            if r.status == 200:
-                d = json.loads(r.read().decode("utf-8") or "{}")
-                return bool(d.get("unlocked", True))
-    except Exception:
-        pass
-    return False
-
-
-def check_lock_gate(url, cfg=None, get_status=None, verify_fn=None, unlock_fn=None):
-    """Предварительная проверка блокировки перед показом окна.
-    Если включена защита (cfg.get('lock_enabled') или /api/lock/status -> enabled=True, unlocked=False),
-    пробует нативную биометрию; при успехе автоматически разблокирует сессию, при отказе — оставляет веб-экран PIN."""
-    cfg = read_app_config() if cfg is None else cfg
-    cfg_enabled = bool(cfg.get("lock_enabled", False))
-    status = (get_status or fetch_lock_status)(url) if url else {"enabled": False, "unlocked": True, "_ok": False}
-    if status.get("_ok"):
-        enabled = bool(status.get("enabled", cfg_enabled))
-        unlocked = bool(status.get("unlocked", not enabled))
-    else:
-        enabled = cfg_enabled
-        unlocked = not cfg_enabled
-    if not enabled or unlocked:
-        return {"locked": False, "unlocked": True, "method": "none"}
-    allow_bio = bool(cfg.get("lock_bio", True)) and bool(status.get("biometric", True))
-    if allow_bio and (verify_fn or bio_verify)():
-        ok = (unlock_fn or post_lock_unlock)(url) if url else True
-        return {"locked": True, "unlocked": bool(ok), "method": "biometric"}
-    return {"locked": True, "unlocked": False, "method": "web"}
-
-
 WEBVIEW_DIR = os.path.join(HOME, "webview")      # постоянный профиль WebView: тема, режим, меню переживают перезапуск
 
 
@@ -1807,10 +1692,6 @@ class WebShell:
             url, html = cap.url, None
             global _ACTIVE_URL
             _ACTIVE_URL = url or ""
-            if url and not self.tray_start:
-                if read_app_config().get("lock_enabled"):
-                    self.push(detail="Проверка доступа…")
-                check_lock_gate(url)
         self.push(detail="Открываю окно программы…")
         self.main = app_window(self.wv, url, t, self.geom, hidden=True, html=html, remember_geometry=not self.demo)
         self.main.events.loaded.wait(10)                         # показываем уже отрисованную страницу, без белого кадра
@@ -1918,7 +1799,6 @@ def run_inprocess(args, ui, native=False):
     if cap.url:
         global _ACTIVE_URL
         _ACTIVE_URL = cap.url
-        check_lock_gate(cap.url)
     try:
         open_native(cap.url, t)
         return result.get("code") or 0
