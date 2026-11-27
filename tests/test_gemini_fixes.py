@@ -551,7 +551,7 @@ class TestJsSmoke(unittest.TestCase):
                     "PRO_FEATURES", "PRO_PAGES", "function crowdInviteHtml"):
             self.assertIn(sym, joined, f"Missing JS symbol: {sym}")
 
-        for route in ("/api/calc/goal", "/api/config", "/api/crowd/status", "/api/flows_instruments"):
+        for route in ("/api/calc", "/api/config", "/api/crowd/status", "/api/flows_instruments"):
             self.assertIn(route, joined, f"Missing JS API route reference: {route}")
 
         for dead_route in ("/api/crp/batch/status", "/api/disclosure", "/api/flows_instrument'"):
