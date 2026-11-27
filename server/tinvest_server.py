@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tinvest_md  # noqa: E402  (токен владельца сервера, только чтение; см. tinvest_md.py)
 import crowd  # noqa: E402  (очередь и приём страниц раскрытия от приложений пользователей, см. crowd.py)
 import alerts  # noqa: E402  (серверная проверка тревог, пока приложение закрыто; см. alerts.py)
+import sync  # noqa: E402  (зашифрованная облачная копия, очередь из бота, вход в один клик; см. sync.py)
 
 VERSION = "1.1.0"
 MIN, HOUR, DAY = 60, 3600, 86400
@@ -852,6 +853,7 @@ class DataServer:
         self.keystore = KeyStore(keys_db, clock) if keys_db else None
         self.notifier = Notifier(self.keystore, clock) if self.keystore else None
         self.alerts = alerts.AlertStore(keys_db, clock) if keys_db else None
+        self.sync = sync.SyncStore(keys_db, clock) if keys_db else None
         self.checker = alerts.AlertChecker(self.alerts, self.notifier, self.fetch_json, clock,
                                            quiet_hours=_quiet_env()) if self.alerts else None
         self.allowed = dict(ALLOWED_HOSTS)
@@ -1260,7 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         body = b""
         n = int(self.headers.get("Content-Length") or 0)
-        if n > MAX_BODY_IN:
+        if n > (sync.MAX_BODY if u.path == "/v1/sync/push" else MAX_BODY_IN):
             return self._send(413, {"error": "body too large"})
         if n:
             body = self.rfile.read(n)
@@ -1278,6 +1280,8 @@ class Handler(BaseHTTPRequestHandler):
                 except sqlite3.Error:
                     pass
             return self._send(200, h)
+        if u.path in ("/v1/auth/start", "/v1/auth/poll"):          # до проверки ключа: ключа у приложения ещё нет
+            return self._auth_link(u, body)
         client, reason, info = authorize_ex(app, self.headers)
         if client is None:
             return self._send(401, {"ok": False, "error": reason or "invalid", "bot": app.bot})
@@ -1290,6 +1294,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._notify(client, info, body)
         if u.path.startswith("/v1/alerts/"):
             return self._alerts(u, info, body)
+        if u.path.startswith("/v1/sync/"):
+            return self._sync(u, info, body)
         if u.path == "/v1/stats":
             return self._send(200, app.stats())
         if u.path == "/v1/fetch":
@@ -1385,6 +1391,65 @@ class Handler(BaseHTTPRequestHandler):
         except NotifyError as e:
             return self._send(e.code, {"ok": False, "error": e.error})
         self._send(200, {"ok": True, "queued": qid})
+
+    def _auth_link(self, u, body):
+        """Вход в один клик. /v1/auth/start {nonce, challenge} -> {ok, ttl}; /v1/auth/poll {nonce, verifier} -> {ok, state[, key]}."""
+        st = self.app.sync
+        if self.command != "POST":
+            return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", "POST")])
+        if not st:
+            return self._send(404, {"ok": False, "error": "not available"})
+        try:
+            j = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            j = None
+        if not isinstance(j, dict):
+            return self._send(400, {"ok": False, "error": "bad_json"})
+        xff = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip()
+        ip = xff or self.client_address[0]
+        try:
+            if u.path == "/v1/auth/start":
+                if not st.auth_rate_ok(ip):
+                    return self._send(429, {"ok": False, "error": "rate_limit"})
+                return self._send(200, dict(st.auth_start(j.get("nonce"), j.get("challenge")), ok=True))
+            return self._send(200, dict(st.auth_poll(j.get("nonce"), j.get("verifier")), ok=True))
+        except sync.SyncError as e:
+            return self._send(e.code, {"ok": False, "error": e.error})
+        except sqlite3.Error:
+            return self._send(503, {"ok": False, "error": "unavailable"})
+
+    def _sync(self, u, info, body):
+        """Зашифрованная облачная копия: /v1/sync/meta (GET), /pull (GET), /push (POST), /delete (POST). Только по ключу из бота.
+        Содержимое блока серверу недоступно (шифруется кодовой фразой на компьютере)."""
+        st = self.app.sync
+        name = u.path[len("/v1/sync/"):]
+        if name not in ("meta", "pull", "push", "delete"):
+            return self._send(404, {"ok": False, "error": "not found"})
+        want = "GET" if name in ("meta", "pull") else "POST"
+        if self.command != want:
+            return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", want)])
+        if not st or not info:
+            return self._send(403, {"ok": False, "error": "key_required"})
+        uid = info["tg_id"]
+        try:
+            if name == "meta":
+                return self._send(200, dict(st.meta(uid), ok=True))
+            if name == "pull":
+                meta, blob, q = st.pull(uid)
+                return self._send(200, dict(meta, ok=True, blob=blob, queue_items=q))
+            if name == "delete":
+                return self._send(200, {"ok": True, "deleted": st.delete(uid)})
+            if not st.rate_ok(uid):
+                return self._send(429, {"ok": False, "error": "rate_limit"})
+            try:
+                j = json.loads(body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return self._send(400, {"ok": False, "error": "bad_json"})
+            return self._send(200, dict(st.push(uid, j), ok=True))
+        except sync.SyncError as e:
+            return self._send(e.code, dict(e.extra, ok=False, error=e.error))
+        except sqlite3.Error:
+            return self._send(503, {"ok": False, "error": "unavailable"})
 
     def _alerts(self, u, info, body):
         """Подписка на серверную проверку тревог: /v1/alerts/sync (POST), /status (GET), /delete (POST). Только Pro по ключу из бота."""
