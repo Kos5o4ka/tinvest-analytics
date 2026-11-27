@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Сборка лаунчера:  pyinstaller --noconfirm --distpath OUT/dist --workpath OUT/build packaging/tinvest.spec
 #   macOS   -> «TAnalytic.app» (onedir, без консоли)
-#   Windows -> TAnalytic.exe (onefile, без консоли)
+#   Windows -> папка TAnalytic\ с TAnalytic.exe (onedir, без консоли); в установщик её упаковывает packaging/TAnalytic.iss
 # Иконки (необязательно): packaging/make_icon.py <папка> и переменная TINVEST_ICON_DIR.
 import os, platform, sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
@@ -72,5 +72,7 @@ else:
                   StringStruct("ProductName", "TAnalytic"),
                   StringStruct("ProductVersion", vs)])]),
               VarFileInfo([VarStruct("Translation", [0x0419, 1200])])])
-    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="TAnalytic", console=False, icon=icon("ico"),
+    # onedir: ничего не распаковывается во %TEMP% при каждом запуске (быстрый старт, меньше ложных срабатываний антивирусов)
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="TAnalytic", console=False, icon=icon("ico"),
               upx=False, version=version)
+    coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="TAnalytic")

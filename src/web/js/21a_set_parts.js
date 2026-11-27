@@ -137,3 +137,17 @@ async function bindSetCrowd(c,msg){
   on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});stOk(on);msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
   show();
 }
+/* ── Окно программы: трей и автозапуск (только установленная версия для Windows; на macOS карточки нет) ── */
+async function bindSetShell(msg){
+  let s;try{s=await api("/api/shell")}catch(e){return}
+  const sec=document.getElementById("set-look");
+  if(!s||!s.tray||!sec||document.getElementById("shell-card"))return;
+  sec.insertAdjacentHTML("beforeend",stGroup("Окно программы",
+    stRow("При закрытии окна сворачивать в трей","Программа продолжает работать в фоне: резервные копии, проверка тревог. Выйти можно из меню значка в трее",stSw("tray-close",!!s.tray_close,"При закрытии окна сворачивать в трей"))+
+    stRow("Запускать вместе с Windows","После входа в систему программа открывается сразу в трее, без окна",stSw("tray-auto",!!s.autostart,"Запускать вместе с Windows")),
+    {id:"shell-card",hint:"Windows"}));
+  const bind=(id,key)=>{const el=document.getElementById(id);if(!el)return;
+    el.onchange=async()=>{try{const r=await post("/api/shell/tray",{[key]:el.checked});stOk(el);
+      el.checked=!!r[key];msg("Сохранено",1,true)}catch(e){msg(e.message);el.checked=!el.checked}}};
+  bind("tray-close","tray_close");bind("tray-auto","autostart");
+}

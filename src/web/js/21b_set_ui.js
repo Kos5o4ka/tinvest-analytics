@@ -161,6 +161,7 @@ async function renderSettings(){
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
   try{bindSetCrowd(c,msg)}catch(e){}
+  try{bindSetShell(msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
   /* адреса API, сертификат и проверка SSL больше не редактируются в окне: в настройках остаются как были */
   const body=()=>({token:stSecVal('tok'),sandbox:$('#sb').checked});

@@ -18,8 +18,9 @@ HOME = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), "
 APP_DIR = os.path.join(HOME, "app")
 APP, VER = os.path.join(APP_DIR, FILE), os.path.join(APP_DIR, "version.txt")
 OK_HOSTS = ("api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com")
-SHELL_REV = 3                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
+SHELL_REV = 4                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
                                          # 3 — заставка на pywebview и бесшовный переход в окно программы
+                                         # 4 — установщик (onedir), трей, автозапуск и обновление оболочки из программы
 os.environ["TINVEST_SHELL_REV"] = str(SHELL_REV)
 FROZEN = bool(getattr(sys, "frozen", False))      # собрано PyInstaller: sys.executable — сам лаунчер, не Python
 
@@ -148,6 +149,73 @@ def update(report=lambda *a: None, cancel=None, fetch=fetch):
     with open(VER, "w") as f:
         f.write(tag)
     return "updated"
+
+
+# ───────────────────────────── обновление оболочки: установщик с GitHub ─────────────────────────────
+
+SETUP_ASSET = "TAnalytic-Setup-win.exe"          # установщик Inno Setup (packaging/TAnalytic.iss), публикуется в релизе
+SETUP_LIMIT = 300_000_000                        # установщик заметно больше одного .py (по умолчанию fetch берёт до 20 МБ)
+UPDATE_DIR = os.path.join(HOME, "update")
+SETUP_ARGS = ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/RELAUNCH=1")   # /RELAUNCH — свой параметр .iss
+
+
+def shell_update_supported():
+    """Самообновление оболочки — только у собранного .exe на Windows (на macOS ссылка на скачивание)."""
+    return sys.platform == "win32" and FROZEN
+
+
+def pick_setup(rel, name=SETUP_ASSET):
+    """Из описания релиза GitHub: (адрес установщика, адрес SHA256SUMS). Оба — только домены GitHub."""
+    urls = {a.get("name"): a.get("browser_download_url") for a in rel.get("assets", []) if isinstance(a, dict)}
+    if not urls.get(name) or not urls.get(SUMS):
+        raise ValueError("в релизе %s нет установщика или контрольных сумм" % rel.get("tag_name", "?"))
+    return check_url(urls[name]), check_url(urls[SUMS])
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def prepare_installer(dest_dir=None, report=lambda *a: None, cancel=None, fetch=fetch):
+    """Скачивает установщик последнего релиза и сверяет SHA256 с SHA256SUMS из того же релиза.
+    Возвращает {"path", "tag", "sha"}; при несовпадении суммы файл не сохраняется."""
+    rel = json.loads(fetch("https://api.github.com/repos/%s/releases/latest" % REPO, cancel=cancel))
+    tag = rel["tag_name"]
+    url, sums_url = pick_setup(rel)
+    want = parse_sums(fetch(sums_url, cancel=cancel).decode(), SETUP_ASSET)
+    dest_dir = dest_dir or UPDATE_DIR
+    path = os.path.join(dest_dir, SETUP_ASSET)
+    try:
+        if os.path.exists(path) and sha256_file(path) == want:       # уже скачан и цел
+            return {"path": path, "tag": tag, "sha": want}
+    except OSError:
+        pass
+    data = fetch(url, limit=SETUP_LIMIT, progress=lambda d, t, s: report("progress", d, t, s), cancel=cancel)
+    if hashlib.sha256(data).hexdigest() != want:
+        raise ValueError("не совпала контрольная сумма SHA256 — установщик отклонён")
+    os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return {"path": path, "tag": tag, "sha": want}
+
+
+def start_installer(info, popen=None):
+    """Запускает скачанный установщик тихо; процесс не привязан к лаунчеру и переживает его выход.
+    Перед запуском сумма файла проверяется ещё раз (между скачиванием и согласием пользователя он мог измениться)."""
+    path = info["path"]
+    if sha256_file(path) != info["sha"]:
+        raise ValueError("файл установщика изменился после проверки — обновление отклонено")
+    popen = popen or subprocess.Popen
+    kw = {"close_fds": True}
+    if sys.platform == "win32":
+        kw["creationflags"] = 0x00000008 | 0x00000200            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    return popen([path] + list(SETUP_ARGS), **kw)
 
 
 def worker(q, cancel):
@@ -850,6 +918,8 @@ class MainApi:
     """Мост окна программы (window.pywebview.api.*): тема шапки, управление окном, выбор файла."""
     def __init__(self):
         self._win = None
+        self._setup = None
+        self._upd_lock = threading.Lock()
 
     def set_theme(self, theme):
         if sys.platform == "win32" and self._win is not None:
@@ -876,6 +946,26 @@ class MainApi:
 
     def close(self):
         self._win and self._win.destroy()
+
+    def shell_update_prepare(self):
+        """Скачивает и проверяет установщик новой оболочки. → {ok, tag} или {error}. Сеть — здесь, не в браузере."""
+        if not shell_update_supported():
+            return {"error": "Обновление оболочки из программы доступно только в установленной версии для Windows"}
+        with self._upd_lock:
+            try:
+                self._setup = prepare_installer()
+                return {"ok": True, "tag": self._setup["tag"]}
+            except Exception as e:
+                self._setup = None
+                return {"error": str(getattr(e, "reason", None) or e)}
+
+    def shell_update_run(self):
+        """«Обновить и перезапустить»: запускает проверенный установщик и закрывает программу."""
+        info = self._setup
+        if not info or not shell_update_supported():
+            return {"error": "Установщик не подготовлен"}
+        threading.Thread(target=install_and_exit, args=(info,), daemon=True).start()   # ответ страница получит до выхода
+        return {"ok": True}
 
     def pick_file(self, kinds="Отчёты брокера (*.xlsx;*.xls;*.csv;*.html;*.htm;*.xml)"):
         """Системный диалог выбора файла (запасной путь, если <input type=file> не открылся). → {name, b64} или None."""
@@ -936,6 +1026,16 @@ def app_window(webview, url, thread, geom, hidden=False, html=None, remember_geo
     if remember_geometry:
         for ev in (win.events.closing, win.events.resized, win.events.moved):   # closing не вызывается при выходе по Cmd+Q
             ev += remember
+    if sys.platform == "win32":
+        global TRAY
+        tray = win._ta_tray = TRAY = Tray(win)
+        sys.tanalytic_tray_sync = tray_sync                      # программа сообщает, что настройку трея изменили
+
+        def on_closing(*_):
+            if should_hide_on_close(QUITTING.is_set(), tray.ready, tray_wanted()):
+                threading.Thread(target=tray.hide_window, daemon=True).start()   # прячем уже после ответа: окно из обработчика не трогаем
+                return False                                     # закрытие отменено
+        win.events.closing += on_closing
 
     def shown(*_):
         if sys.platform == "win32":
@@ -949,7 +1049,7 @@ def app_window(webview, url, thread, geom, hidden=False, html=None, remember_geo
     if not hidden:
         win.events.shown += shown
     if thread is not None:
-        threading.Thread(target=lambda: (thread.join(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
+        threading.Thread(target=lambda: (thread.join(), QUITTING.set(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
     return win
 
 
@@ -957,8 +1057,14 @@ def open_native(url, thread):
     """Окно программы на pywebview (WKWebView / Edge WebView2). Возвращает управление после закрытия окна;
     бросает исключение, если окно показать не удалось (тогда запускается запасное окно tk)."""
     import webview
-    app_window(webview, url, thread, webview_setup(webview))
-    webview.start(**start_kwargs())
+    win = app_window(webview, url, thread, webview_setup(webview))
+
+    def boot():
+        tray = getattr(win, "_ta_tray", None)
+        if tray is not None and tray_wanted():
+            win.events.loaded.wait(10)
+            tray.start()
+    webview.start(boot, **start_kwargs())
 
 
 # ───────────────────────────── заставка на pywebview (оболочка ревизии 3) ─────────────────────────────
@@ -1177,8 +1283,9 @@ DEMO_PAGE = ("<!doctype html><html><body style='margin:0;height:100vh;display:gr
 class WebShell:
     """Заставка обновления и запуск программы в одном цикле pywebview (главный поток занят GUI)."""
 
-    def __init__(self, webview, args, no_update=False, demo=""):
+    def __init__(self, webview, args, no_update=False, demo="", tray_start=False):
         self.wv, self.args, self.no_update, self.demo = webview, args, no_update, demo
+        self.tray_start = tray_start                             # запуск с --tray (автозапуск Windows): окно не показываем, если есть значок
         self.q = queue.Queue()
         self.splash = self.main = None
         self.flow_started = False
@@ -1196,6 +1303,12 @@ class WebShell:
     def push(self, **s):
         if self.splash is None:
             return
+        quiet = s.pop("quiet", False)
+        if self.tray_start and s.get("stage") == "error" and not quiet:
+            try:
+                self.splash.show()                               # скрытая заставка: ошибку пользователь должен увидеть
+            except Exception:
+                pass
         if "ver" not in s and not s.get("bye"):
             s["ver"] = ver(self.tag) if self.tag else ""
         try:
@@ -1215,7 +1328,7 @@ class WebShell:
         sx, sy = center(SPLASH_W, SPLASH_H, self.geom[5])
         self.splash = wv.create_window(TITLE, html=splash_html(), js_api=SplashApi(self), width=SPLASH_W, height=SPLASH_H,
                                        x=sx, y=sy, resizable=False, frameless=True, easy_drag=True, transparent=mac,
-                                       background_color=BG, min_size=(SPLASH_W, SPLASH_H))
+                                       background_color=BG, min_size=(SPLASH_W, SPLASH_H), hidden=self.tray_start)
         wv.start(self.flow, **start_kwargs())
         return self.result.get("code") or self.code
 
@@ -1324,7 +1437,7 @@ class WebShell:
                         btns.insert(0, ["close", "Закрыть", ""])
                     self.push(stage="error", step=last_step,
                               title="Нет связи с GitHub" if net else "Обновление не установлено",
-                              detail=msg[:1].upper() + msg[1:], pct=False, buttons=btns,
+                              detail=msg[:1].upper() + msg[1:], pct=False, buttons=btns, quiet=bool(net and self.have()),
                               hint="" if not (net and self.have()) else "Автозапуск через 6 с")
                     if not self.have():
                         self.code = 1
@@ -1397,11 +1510,17 @@ class WebShell:
         self.main = app_window(self.wv, url, t, self.geom, hidden=True, html=html, remember_geometry=not self.demo)
         self.main.events.loaded.wait(10)                         # показываем уже отрисованную страницу, без белого кадра
         time.sleep(0.05)
-        self.main.show()
-        try:
-            self.main._ta_shown()                                # тёмная шапка Windows и развёрнутое окно, как было
-        except Exception:
-            pass
+        tray = getattr(self.main, "_ta_tray", None)
+        in_tray = False
+        if tray is not None and (self.tray_start or tray_wanted()):
+            in_tray = tray.start(force=self.tray_start) and self.tray_start      # значок есть; окно прячем только при запуске с --tray
+        if not in_tray:                                          # значка нет — окно показываем всегда, невидимой программы не бывает
+            self.main.show()
+            try:
+                self.main._ta_shown()                            # тёмная шапка Windows и развёрнутое окно, как было
+                self.main._ta_shown_once = True
+            except Exception:
+                pass
         self.push(bye=True)                                      # заставка растворяется под окном программы
         time.sleep(0.22)
         try:
@@ -1411,13 +1530,13 @@ class WebShell:
         self.splash = None
 
 
-def run_webshell(args, no_update, demo=""):
+def run_webshell(args, no_update, demo="", tray_start=False):
     """Заставка и окно на pywebview. None — pywebview недоступен или не запустился (тогда работает прежний путь с tk)."""
     try:
         import webview
     except Exception:
         return None
-    shell = WebShell(webview, args, no_update, demo)
+    shell = WebShell(webview, args, no_update, demo, tray_start)
     try:
         return shell.run()
     except Exception as e:
@@ -1573,19 +1692,237 @@ def activate_running():
         return False
 
 
-def graceful_exit(code, wait=3.0):
-    """Выход без обрыва: программа сбрасывает журнал SQLite (wal_checkpoint) и закрывает соединения,
-    затем процесс завершается, не дожидаясь фоновых потоков (пулы сетевых запросов)."""
+QUITTING = threading.Event()        # настоящий выход (а не «закрыть в трей»): обработчик закрытия окна пропускает закрытие
+LOCK = None                         # SingleInstance этого процесса (создаётся в main)
+
+
+def run_shutdown_hook(wait=3.0):
+    """Программа сбрасывает журнал SQLite (wal_checkpoint) и закрывает соединения."""
     hook = getattr(sys, "tanalytic_shutdown", None)
     if callable(hook):
         t = threading.Thread(target=hook, daemon=True)
         t.start()
         t.join(wait)
+
+
+def graceful_exit(code, wait=3.0):
+    """Выход без обрыва: сброс журнала SQLite, затем процесс завершается, не дожидаясь
+    фоновых потоков (пулы сетевых запросов)."""
+    QUITTING.set()
+    run_shutdown_hook(wait)
+    try:
+        tray_dispose()
+    except Exception:
+        pass
     try:
         sys.stdout and sys.stdout.flush()
     except Exception:
         pass
     os._exit(code)
+
+
+def install_and_exit(info, popen=None, exit_fn=None):
+    """Запускает установщик и выходит. Мьютекс одной копии отпускаем до запуска (иначе AppMutex установщика
+    успеет увидеть его и потребует закрыть программу); если запуск не удался — берём его обратно и остаёмся."""
+    QUITTING.set()
+    held = LOCK is not None
+    if held:
+        LOCK.release()
+    try:
+        start_installer(info, popen)
+    except Exception as e:
+        QUITTING.clear()
+        if held:
+            LOCK.acquire()
+        sys.stderr.write("Не удалось запустить установщик: %s\n" % e)
+        return False
+    (exit_fn or graceful_exit)(0)
+    return True
+
+
+# ───────────────────────────── трей Windows: значок в области уведомлений ─────────────────────────────
+# WinForms NotifyIcon из pythonnet (он уже есть в сборке pywebview). macOS: трея нет, пункты в Настройках скрыты.
+# Настройка «При закрытии окна сворачивать в трей» лежит в config.json программы (sys.tanalytic_tray),
+# автозапуск — в ключе Run реестра текущего пользователя (src/py/13z_shell.py); запуск с ключом --tray открывает
+# программу сразу в трее.
+
+TRAY = None
+
+
+def tray_wanted():
+    """Включено ли в Настройках «сворачивать в трей при закрытии» (спрашиваем у программы)."""
+    hook = getattr(sys, "tanalytic_tray", None)
+    try:
+        return bool(hook()) if callable(hook) else False
+    except Exception:
+        return False
+
+
+def should_hide_on_close(quitting, icon_ready, wanted):
+    """Закрытие окна → в трей, только если выход не настоящий, значок уже есть и настройка включена."""
+    return bool(not quitting and icon_ready and wanted)
+
+
+class Tray:
+    """Значок в трее для окна программы. Весь WinForms-код — под try/except: не вышло — окно работает как раньше."""
+    def __init__(self, win):
+        self.win, self.ni, self.ready, self.force, self.told = win, None, False, False, False
+        self.keep = []                                           # ссылки на меню и обработчики, чтобы их не убрал сборщик мусора
+
+    def _ui(self, fn, wait=5):
+        """Выполняет fn в потоке интерфейса WinForms окна программы. True — выполнено."""
+        form = getattr(self.win, "native", None)
+        if form is None or sys.platform != "win32":
+            return False
+        done, res = threading.Event(), {}
+
+        def run():
+            try:
+                fn()
+                res["ok"] = True
+            except Exception as e:
+                res["err"] = e
+            finally:
+                done.set()
+        try:
+            from System import Action
+            form.BeginInvoke(Action(run))                        # не Invoke: после остановки цикла интерфейса он мог бы зависнуть
+        except Exception:
+            return False
+        done.wait(wait)
+        return bool(res.get("ok"))
+
+    def _create(self):
+        import clr
+        clr.AddReference("System.Windows.Forms")
+        clr.AddReference("System.Drawing")
+        from System.Windows.Forms import NotifyIcon, ContextMenuStrip, ToolStripMenuItem, MouseButtons
+        from System.Drawing import Icon, SystemIcons
+        ni = NotifyIcon()
+        try:
+            ni.Icon = Icon.ExtractAssociatedIcon(sys.executable)   # значок самого TAnalytic.exe
+        except Exception:
+            ni.Icon = SystemIcons.Application
+        ni.Text = TITLE
+        menu = ContextMenuStrip()
+        it_open, it_exit = ToolStripMenuItem("Открыть TAnalytic"), ToolStripMenuItem("Выход")
+        on_open = lambda s, e: threading.Thread(target=self.show, daemon=True).start()    # обработчики — не в потоке интерфейса
+        on_exit = lambda s, e: threading.Thread(target=self.quit, daemon=True).start()
+        on_click = lambda s, e: on_open(s, e) if e.Button == MouseButtons.Left else None
+        it_open.Click += on_open
+        it_exit.Click += on_exit
+        ni.MouseClick += on_click
+        menu.Items.Add(it_open)
+        menu.Items.Add(it_exit)
+        ni.ContextMenuStrip = menu
+        ni.Visible = True
+        self.ni = ni
+        self.keep = [menu, it_open, it_exit, on_open, on_exit, on_click]
+        try:                                                     # выход из Windows не должен упираться в «закрыть в трей»
+            from Microsoft.Win32 import SystemEvents
+            on_end = lambda s, e: QUITTING.set()
+            SystemEvents.SessionEnding += on_end
+            self.keep.append(on_end)
+        except Exception:
+            pass
+        try:                                                     # наш обработчик FormClosing стоит после обработчика pywebview и решает последним
+            def on_form_closing(s, e):
+                if "Shut" in str(e.CloseReason) or "TaskManager" in str(e.CloseReason):   # WindowsShutDown, TaskManagerClosing
+                    QUITTING.set()
+                    e.Cancel = False
+            self.win.native.FormClosing += on_form_closing
+            self.keep.append(on_form_closing)
+        except Exception:
+            pass
+
+    def start(self, force=False):
+        """Создаёт значок. True — значок есть. force — держать его, даже если настройка выключена (запуск с --tray)."""
+        self.force = self.force or force
+        if self.ni is None and not self._ui(self._create):
+            return False
+        if self.ni is not None:
+            self._ui(lambda: setattr(self.ni, "Visible", True))
+        self.ready = True
+        return True
+
+    def sync(self):
+        """Настройку в программе изменили: показать значок или убрать (окно при этом открыто)."""
+        want = self.force or tray_wanted()
+        if want and not self.ready:
+            self.start()
+        elif not want and self.ni is not None:
+            self._ui(lambda: setattr(self.ni, "Visible", False))
+            self.ready = False
+
+    def show(self):
+        """«Открыть»: вернуть окно из трея на передний план."""
+        try:
+            self.win.show()
+            if not getattr(self.win, "_ta_shown_once", False):
+                self.win._ta_shown_once = True
+                fn = getattr(self.win, "_ta_shown", None)
+                fn and fn()                                      # тёмная шапка и развёрнутое окно при первом показе из трея
+            self.win.restore()
+        except Exception:
+            pass
+        activate_running()
+
+    def hide_window(self):
+        try:
+            self.win.hide()
+        except Exception:
+            return
+        if self.ni is not None and not self.told:
+            self.told = True
+
+            def tip():
+                from System.Windows.Forms import ToolTipIcon
+                self.ni.ShowBalloonTip(3000, TITLE, "Программа продолжает работать в трее. Выход — в меню значка.", ToolTipIcon.Info)
+            self._ui(tip, 2)
+
+    def quit(self):
+        """«Выход»: настоящее закрытие программы."""
+        QUITTING.set()
+        self.dispose()
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+    def dispose(self):
+        ni, self.ni, self.ready = self.ni, None, False
+        if ni is None:
+            return
+
+        def kill():
+            ni.Visible = False
+            ni.Dispose()
+        if not self._ui(kill, 2):                                # цикл интерфейса уже остановлен — NotifyIcon можно убрать и отсюда
+            try:
+                kill()
+            except Exception:
+                pass
+
+
+def tray_dispose():
+    """Убирает значок из области уведомлений при выходе: иначе он остаётся до наведения мыши."""
+    if TRAY is not None:
+        TRAY.dispose()
+
+
+def tray_sync():
+    if TRAY is not None:
+        threading.Thread(target=TRAY.sync, daemon=True).start()
+
+
+def split_args(argv, env=None, plat=None):
+    """Ключи лаунчера отделяются от ключей программы: (без обновления, без окна, запуск в трее, остальные аргументы).
+    --tray ставит в автозапуск установщик и Настройки: на Windows открывает программу сразу в трее, программе он не передаётся."""
+    env = os.environ if env is None else env
+    plat = sys.platform if plat is None else plat
+    own = ("--no-update", "--no-gui", "--tray")
+    return ("--no-update" in argv, "--no-gui" in argv or env.get("TINVEST_NO_GUI") == "1",
+            "--tray" in argv and plat == "win32", [a for a in argv if a not in own])
 
 
 def webbrowser_open(url):
@@ -1601,18 +1938,17 @@ def main():
         except Exception:
             pass
     argv = sys.argv[1:]
-    no_update = "--no-update" in argv
-    no_gui = "--no-gui" in argv or os.environ.get("TINVEST_NO_GUI") == "1"
-    args = [a for a in argv if a not in ("--no-update", "--no-gui")]
+    no_update, no_gui, tray_start, args = split_args(argv)
     demo = os.environ.get("TINVEST_SPLASH_DEMO", "")            # 1 / net / checksum: показать заставку без сети и файлов
     demo = "ok" if demo == "1" else demo
+    global LOCK
     if FROZEN and not demo:
-        lock = SingleInstance()
+        lock = LOCK = SingleInstance()
         if not lock.acquire():                                   # программа уже открыта: показать её окно и выйти
             activate_running()
             sys.exit(0)
     if demo or (want_native(FROZEN, no_gui) and "--no-window" not in args):
-        code = run_webshell(args + ["--no-window"], no_update, demo)     # окно открывает оболочка, не браузер программы
+        code = run_webshell(args + ["--no-window"], no_update, demo, tray_start)     # окно открывает оболочка, не браузер программы
         if code is not None:
             graceful_exit(code)                                 # не ждём фоновые потоки программы
     ui = None

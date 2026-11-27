@@ -13,7 +13,7 @@
 |---|---|
 | macOS, Apple Silicon (M1 и новее) | [TAnalytic-mac-arm64.zip](https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/TAnalytic-mac-arm64.zip) |
 | macOS, Intel | [TAnalytic-mac-x64.zip](https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/TAnalytic-mac-x64.zip) |
-| Windows 10/11 | [TAnalytic-win.exe](https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/TAnalytic-win.exe) |
+| Windows 10/11 | [TAnalytic-Setup-win.exe](https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/TAnalytic-Setup-win.exe) (установщик) |
 
 Не знаете, какой Mac: меню  → «Об этом Mac»; если в строке «Чип» написано Apple — берите Apple Silicon.
 
@@ -27,7 +27,7 @@
 xattr -dr com.apple.quarantine "/Applications/TAnalytic.app"
 ```
 
-**Windows.** Приложение тоже не подписано, поэтому SmartScreen покажет «Система Windows защитила ваш компьютер»: нажмите **«Подробнее → Выполнить в любом случае»**.
+**Windows.** Запустите установщик: права администратора не нужны, программа ставится в «%LOCALAPPDATA%\Programs\TAnalytic», в меню «Пуск» появляется ярлык, а новые версии оболочки программа предложит установить сама. Установщик не подписан, поэтому SmartScreen покажет «Система Windows защитила ваш компьютер»: нажмите **«Подробнее → Выполнить в любом случае»**.
 
 Программа обновляется сама: при каждом запуске показывает окно проверки обновлений и при необходимости скачивает новую версию (с проверкой контрольной суммы).
 Скачанное приложение — это только запускалка, перекачивать его ради новых версий не нужно. Пока программа работает, остаётся небольшое окно

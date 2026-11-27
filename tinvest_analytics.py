@@ -26960,24 +26960,115 @@ API_GET["/api/ticker"] = _api_ticker
 # Автообновление меняет только tinvest_analytics.py; окно, иконка и экран обновления живут в самой оболочке.
 # Оболочка сообщает свою ревизию через TINVEST_SHELL_REV (с ревизии 2); старые оболочки её не передают.
 # Ревизия 3 — заставка на pywebview с бесшовным переходом в окно программы.
-SHELL_REV_LATEST = 3
+# Ревизия 4 — установщик Windows (onedir), значок в трее, автозапуск и обновление оболочки из программы.
+SHELL_REV_LATEST = 4
 SHELL_RELEASES = "https://github.com/Kos5o4ka/tinvest-analytics/releases/latest"
 
 
-def shell_status(env=None, frozen=None):
+DEFAULT_CONFIG.setdefault("tray_close", False)      # «При закрытии окна сворачивать в трей» (Windows); по умолчанию выключено
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "TAnalytic"                         # то же имя значения пишет установщик (packaging/TAnalytic.iss)
+
+
+def shell_rev(env=None):
+    env = os.environ if env is None else env
+    try:
+        return int(env.get("TINVEST_SHELL_REV") or 0)
+    except ValueError:
+        return 0
+
+
+def tray_supported(env=None, frozen=None, plat=None):
+    """Трей и автозапуск — только у собранной оболочки ревизии 4+ на Windows (на macOS пункты скрыты)."""
+    frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    return bool(frozen and (sys.platform if plat is None else plat) == "win32" and shell_rev(env) >= 4)
+
+
+def autostart_command(exe=None):
+    return '"%s" --tray' % (exe or sys.executable)
+
+
+def autostart_get(reg=None):
+    """Включён ли запуск вместе с Windows: есть ли значение TAnalytic в HKCU\\...\\Run. reg — модуль winreg (подменяется в тестах)."""
+    try:
+        reg = reg or __import__("winreg")
+        k = reg.OpenKey(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_READ)
+        try:
+            reg.QueryValueEx(k, AUTOSTART_NAME)
+            return True
+        finally:
+            reg.CloseKey(k)
+    except Exception:  # noqa: BLE001 — нет ключа, нет winreg (macOS), нет прав
+        return False
+
+
+def autostart_set(on, reg=None, exe=None):
+    """Включает или выключает запуск вместе с Windows (запись текущего пользователя, права администратора не нужны)."""
+    reg = reg or __import__("winreg")
+    if on:
+        k = reg.CreateKeyEx(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_SET_VALUE)
+        try:
+            reg.SetValueEx(k, AUTOSTART_NAME, 0, reg.REG_SZ, autostart_command(exe))
+        finally:
+            reg.CloseKey(k)
+        return True
+    try:
+        k = reg.OpenKey(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_SET_VALUE)
+    except OSError:
+        return False                                  # ключа нет — выключать нечего
+    try:
+        reg.DeleteValue(k, AUTOSTART_NAME)
+    except OSError:
+        pass                                          # значения уже нет
+    finally:
+        reg.CloseKey(k)
+    return False
+
+
+def tray_close_wanted():
+    """Читает лаунчер при закрытии окна (sys.tanalytic_tray)."""
+    try:
+        return bool(load_config().get("tray_close"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def shell_status(env=None, frozen=None, cfg=None, reg=None):
     env = os.environ if env is None else env
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
-    try:
-        rev = int(env.get("TINVEST_SHELL_REV") or 0)
-    except ValueError:
-        rev = 0
+    rev = shell_rev(env)
     asset = {"darwin": "TAnalytic-mac-arm64.zip" if platform.machine() == "arm64" else "TAnalytic-mac-x64.zip",
-             "win32": "TAnalytic-win.exe"}.get(sys.platform)
+             "win32": "TAnalytic-Setup-win.exe"}.get(sys.platform)
+    tray = tray_supported(env, frozen)
     return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "outdated": bool(frozen and rev < SHELL_REV_LATEST),
-            "url": SHELL_RELEASES, "asset": asset}
+            "url": SHELL_RELEASES, "asset": asset,
+            "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close")),
+            "autostart": bool(tray and autostart_get(reg))}
 
 
-API_GET["/api/shell"] = lambda cfg, acc, q, force: shell_status()
+def api_shell_tray(cfg, body):
+    if not tray_supported():
+        raise ApiError("Трей и автозапуск доступны только в установленной версии для Windows.", 400)
+    if "tray_close" in body:
+        cfg["tray_close"] = bool(body["tray_close"])
+        save_config(cfg)
+        hook = getattr(sys, "tanalytic_tray_sync", None)       # лаунчер показывает или убирает значок в трее
+        if callable(hook):
+            try:
+                hook()
+            except Exception:  # noqa: BLE001
+                pass
+    if "autostart" in body:
+        try:
+            autostart_set(bool(body["autostart"]))
+        except Exception as e:  # noqa: BLE001
+            raise ApiError("Не удалось изменить автозапуск: %s" % e, 500)
+    return shell_status(cfg=cfg)
+
+
+API_GET["/api/shell"] = lambda cfg, acc, q, force: shell_status(cfg=cfg)
+API_POST["/api/shell/tray"] = api_shell_tray
+sys.tanalytic_tray = tray_close_wanted               # лаунчер спрашивает при закрытии окна: свернуть в трей или выйти
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -32243,6 +32334,20 @@ async function bindSetCrowd(c,msg){
   on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});stOk(on);msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
   show();
 }
+/* ── Окно программы: трей и автозапуск (только установленная версия для Windows; на macOS карточки нет) ── */
+async function bindSetShell(msg){
+  let s;try{s=await api("/api/shell")}catch(e){return}
+  const sec=document.getElementById("set-look");
+  if(!s||!s.tray||!sec||document.getElementById("shell-card"))return;
+  sec.insertAdjacentHTML("beforeend",stGroup("Окно программы",
+    stRow("При закрытии окна сворачивать в трей","Программа продолжает работать в фоне: резервные копии, проверка тревог. Выйти можно из меню значка в трее",stSw("tray-close",!!s.tray_close,"При закрытии окна сворачивать в трей"))+
+    stRow("Запускать вместе с Windows","После входа в систему программа открывается сразу в трее, без окна",stSw("tray-auto",!!s.autostart,"Запускать вместе с Windows")),
+    {id:"shell-card",hint:"Windows"}));
+  const bind=(id,key)=>{const el=document.getElementById(id);if(!el)return;
+    el.onchange=async()=>{try{const r=await post("/api/shell/tray",{[key]:el.checked});stOk(el);
+      el.checked=!!r[key];msg("Сохранено",1,true)}catch(e){msg(e.message);el.checked=!el.checked}}};
+  bind("tray-close","tray_close");bind("tray-auto","autostart");
+}
 /* ── Настройки: панель состояния, поиск, журнал изменений и сборка экрана ── */
 /* ── панель состояния ── */
 function stTile(id,lbl,ico,go){return`<div class="st-tile" id="${id}"><div class="st-tl"><i>${stIco(ico)}</i>${lbl}<span class="st-dot mu" data-d></span></div><div class="st-tv" data-v>…</div><div class="st-ts" data-s>Загружаю</div><button class="btn ghost st-ta" data-to="${go}" data-a>Открыть</button></div>`}
@@ -32406,6 +32511,7 @@ async function renderSettings(){
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
   try{bindSetCrowd(c,msg)}catch(e){}
+  try{bindSetShell(msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
   /* адреса API, сертификат и проверка SSL больше не редактируются в окне: в настройках остаются как были */
   const body=()=>({token:stSecVal('tok'),sandbox:$('#sb').checked});
@@ -38795,18 +38901,59 @@ function calcEval(raw){
 const calcFmt=v=>v.toLocaleString('ru-RU',{maximumFractionDigits:6});
 const calcRaw=v=>String(Math.round(v*1e8)/1e8).replace('.',',');
 /* ── устаревшая оболочка приложения: новая иконка и экран запуска приходят только со скачанным .app/.exe ── */
+/* Оболочка ревизии 4+ на Windows умеет обновить себя сама (мост pywebview): скачивает установщик с GitHub, сверяет сумму
+   и предлагает «Обновить и перезапустить». У старых оболочек и на macOS остаётся ссылка на скачивание. */
+function shellBridge(){
+  return new Promise(res=>{
+    const ok=()=>{const a=window.pywebview&&pywebview.api;return a&&a.shell_update_prepare&&a.shell_update_run?a:null};
+    if(ok())return res(ok());
+    if(!window.pywebview)return res(null);                  /* обычный браузер: моста нет */
+    const t=setTimeout(()=>res(ok()),3000);
+    window.addEventListener('pywebviewready',()=>{clearTimeout(t);res(ok())},{once:true});
+  });
+}
+function shellBar(html){
+  let bar=document.getElementById('shell-bar');
+  if(!bar){
+    const top=document.querySelector('main .top');if(!top)return null;
+    bar=document.createElement('div');bar.id='shell-bar';bar.className='noprint';
+    top.insertAdjacentElement('afterend',bar);
+  }
+  bar.innerHTML=html;return bar;
+}
+function shellLater(bar){const b=bar.querySelector('#shell-later');if(b)b.onclick=()=>{try{sessionStorage.setItem('shell_later','1')}catch(e){}bar.remove()}}
+function shellLinkBar(s){
+  const win=/Setup/.test(s.asset||'');
+  const href=safeUrl(s.asset?`https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/${encodeURIComponent(s.asset)}`:s.url),su=safeUrl(s.url);
+  const bar=shellBar(`<span><b>Доступна новая версия приложения.</b> ${win
+    ?'Программа обновилась сама, а окно, значок в трее и установка с обновлениями придут с установщиком: скачайте и запустите его, данные и настройки сохранятся.'
+    :'Программа обновилась сама, а новая иконка и экран запуска придут, когда вы скачаете приложение заново и замените старое.'}</span>
+    <span class="sb-b">${href?`<a class="btn" href="${esc(href)}" target="_blank" rel="noopener noreferrer">Скачать</a>`:''}${su?`<a class="btn ghost" href="${esc(su)}" target="_blank" rel="noopener noreferrer">Что нового</a>`:''}<button class="btn ghost" id="shell-later">Позже</button></span>`);
+  if(bar)shellLater(bar);
+}
 async function shellNotice(){
   let s;try{s=await api('/api/shell')}catch(e){return}
   if(!s||!s.outdated)return;
   try{if(sessionStorage.getItem('shell_later'))return}catch(e){}
   if(document.getElementById('shell-bar'))return;
-  const bar=document.createElement('div');bar.id='shell-bar';bar.className='noprint';
-  const href=safeUrl(s.asset?`https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/${encodeURIComponent(s.asset)}`:s.url),su=safeUrl(s.url);
-  bar.innerHTML=`<span><b>Доступна новая версия приложения.</b> Программа обновилась сама, а новая иконка и экран запуска придут, когда вы скачаете приложение заново и замените старое.</span>
-    <span class="sb-b">${href?`<a class="btn" href="${esc(href)}" target="_blank" rel="noopener noreferrer">Скачать</a>`:''}${su?`<a class="btn ghost" href="${esc(su)}" target="_blank" rel="noopener noreferrer">Что нового</a>`:''}<button class="btn ghost" id="shell-later">Позже</button></span>`;
-  const top=document.querySelector('main .top');if(!top)return;
-  top.insertAdjacentElement('afterend',bar);
-  bar.querySelector('#shell-later').onclick=()=>{try{sessionStorage.setItem('shell_later','1')}catch(e){}bar.remove()};
+  const br=await shellBridge();
+  if(!br)return shellLinkBar(s);
+  /* установщик скачивает сама программа (не браузер): значит, и метки «из интернета» у файла нет */
+  const bar=shellBar('<span><b>Доступна новая версия приложения.</b> Скачиваю установщик и проверяю контрольную сумму…</span>');
+  if(!bar)return;
+  let r;try{r=await br.shell_update_prepare()}catch(e){r={error:e&&e.message||String(e)}}
+  if(!document.getElementById('shell-bar'))return;
+  if(!r||!r.ok){shellLinkBar(s);return}
+  const tag=String(r.tag||'').replace(/^v/i,'');
+  bar.innerHTML=`<span><b>Готова новая версия${tag?' '+esc(tag):''}.</b> Установщик скачан и проверен. Программа закроется, обновится и откроется снова; данные и настройки сохранятся.</span>
+    <span class="sb-b"><button class="btn" id="shell-go">Обновить и перезапустить</button><button class="btn ghost" id="shell-later">Позже</button></span>`;
+  shellLater(bar);
+  bar.querySelector('#shell-go').onclick=async e=>{
+    e.currentTarget.disabled=true;e.currentTarget.textContent='Перезапускаю…';
+    let x;try{x=await br.shell_update_run()}catch(err){x=null}
+    if(x&&x.error){shellLinkBar(s)}
+    else setTimeout(()=>{if(document.getElementById('shell-go'))shellLinkBar(s)},20000);   /* программа не закрылась — установщик не запустился */
+  };
 }
 setTimeout(shellNotice,1500);
 /* ── Плавное закрытие выезжающих панелей ──
