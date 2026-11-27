@@ -63,7 +63,6 @@ class TauriConfigAndFiles(unittest.TestCase):
                 "tauri",
                 "tauri-plugin-single-instance",
                 "tauri-plugin-dialog",
-                "tauri-plugin-autostart",
                 "serde",
                 "serde_json",
             ):
@@ -74,7 +73,6 @@ class TauriConfigAndFiles(unittest.TestCase):
                 'name = "tanalytic"',
                 'tauri-plugin-single-instance = "2"',
                 'tauri-plugin-dialog = "2"',
-                'tauri-plugin-autostart = "2"',
                 '"tray-icon"',
             ):
                 self.assertIn(needle, raw)
@@ -95,7 +93,6 @@ class TauriConfigAndFiles(unittest.TestCase):
             "core:window:allow-close",
             "core:window:allow-start-dragging",
             "dialog:default",
-            "autostart:default",
         ):
             self.assertIn(req, perms)
 
@@ -113,8 +110,6 @@ class TauriConfigAndFiles(unittest.TestCase):
             "tauri_win_toggle_max",
             "tauri_win_close",
             "tauri_pick_file",
-            "tauri_autostart_get",
-            "tauri_autostart_set",
         ):
             self.assertRegex(lib_rs, r"#\[tauri::command\][\s\S]{0,120}\b" + cmd + r"\b")
             self.assertIn(cmd, lib_rs.split("generate_handler![", 1)[1])
@@ -139,6 +134,7 @@ class TauriConfigAndFiles(unittest.TestCase):
             self.assertIn(needle, lib_rs)
         self.assertNotIn("tauri_bio_verify", lib_rs)
         self.assertNotIn("--tray", lib_rs)
+        self.assertNotIn("autostart", lib_rs.lower())
         # single-instance — первый плагин, sidecar стартует в setup, а не до Builder
         self.assertLess(lib_rs.index("tauri_plugin_single_instance::init"), lib_rs.index("tauri_plugin_dialog::init"))
         self.assertNotIn("spawn_sidecar(port).ok()", lib_rs)
@@ -165,7 +161,8 @@ class TauriReleasePackaging(unittest.TestCase):
 
     def test_installers_configured(self):
         b = self.conf()["bundle"]
-        self.assertEqual(b["externalBin"], ["binaries/TAnalytic-backend"])
+        self.assertEqual(b["resources"], {"resources/backend/": "backend/"})
+        self.assertNotIn("externalBin", b)
         nsis = b["windows"]["nsis"]
         self.assertEqual(nsis["languages"], ["Russian"])
         self.assertEqual(nsis["installMode"], "currentUser")
@@ -208,7 +205,7 @@ class TauriReleasePackaging(unittest.TestCase):
         self.assertEqual(up["endpoints"], ["https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/latest.json"])
         self.assertTrue(up["pubkey"])
         lib_rs = open(os.path.join(TAURI_DIR, "src", "lib.rs"), encoding="utf-8").read()
-        for cmd in ("tauri_update_check", "tauri_update_install"):
+        for cmd in ("tauri_update_status", "tauri_update_check", "tauri_update_apply"):
             self.assertIn(cmd, lib_rs.split("generate_handler![", 1)[1])
         self.assertIn("tauri_plugin_updater", lib_rs)
         cargo = open(os.path.join(TAURI_DIR, "Cargo.toml"), encoding="utf-8").read()
@@ -218,6 +215,10 @@ class TauriReleasePackaging(unittest.TestCase):
         yml = open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8").read()
         for asset in ("TAnalytic-Setup-win.exe", "TAnalytic-mac-arm64.dmg", "TAnalytic-mac-x64.dmg", "latest.json"):
             self.assertIn(asset, yml)
+        self.assertIn("--onedir", yml)
+        self.assertNotIn("--onefile", yml)
+        self.assertIn("PYINSTALLER_COMPILE_BOOTLOADER=1", yml)
+        self.assertIn("mac_codesign.sh dir", yml)
         self.assertIn("gh release upload", yml)
         self.assertIn("SHA256SUMS", yml)
         self.assertNotIn("ISCC", yml)

@@ -17,32 +17,43 @@ Tauri — основная оболочка релиза. Старая обол�
 
 ## Структура `src-tauri/`
 
-- `Cargo.toml`, `Cargo.lock` — Tauri v2 (`tray-icon`), плагины `single-instance`, `dialog`, `autostart`, `updater`. Проверка `/api/ping` и `POST /api/app/shutdown` идут через `std::net::TcpStream`.
-- `tauri.conf.json` — окно, бандл (`externalBin`, NSIS, DMG, `createUpdaterArtifacts`), `plugins.updater`.
+- `Cargo.toml`, `Cargo.lock` — Tauri v2 (`tray-icon`), плагины `single-instance`, `dialog`, `updater`. Проверка `/api/ping` и `POST /api/app/shutdown` идут через `std::net::TcpStream`.
+- `tauri.conf.json` — окно, бандл (`resources`, NSIS, DMG, `createUpdaterArtifacts`), `plugins.updater`.
 - `capabilities/default.json` — IPC только для `http://127.0.0.1:*/*`.
-- `src/lib.rs` — порт, запуск sidecar в `setup()` (после single-instance), ожидание `/api/ping` до 60 с с кнопкой «Повторить», трей, `on_navigation` (внешние ссылки открываются в системном браузере), команды окна, выбора файла, автозапуска и обновления.
+- `src/lib.rs` — порт, запуск Python-сервера в `setup()` (после single-instance), ожидание `/api/ping` до 60 с с кнопкой «Повторить», трей (пункты «Открыть» и «Выход»), `on_navigation` (внешние ссылки открываются в системном браузере), команды окна, выбора файла и обновления.
+- `resources/backend/` — сюда CI кладёт папку PyInstaller `--onedir` (`TAnalytic-backend[.exe]` и `_internal/`); Tauri включает её в ресурсы бандла, Rust запускает `<resource_dir>/backend/TAnalytic-backend[.exe]`. Содержимое каталога не хранится в репозитории (в нём только `placeholder.txt`).
 - `installer/` — картинки установщиков (`header.bmp`, `sidebar.bmp`, `dmg-background.png`; генерирует `packaging/tauri/make_installer_art.py`, нужен Pillow) и `hooks.nsh`.
-- `entitlements.plist` — права hardened runtime для macOS (копия `packaging/entitlements.plist`: Python-sidecar выделяет исполняемую память и грузит чужие библиотеки).
+- `entitlements.plist` — права hardened runtime для macOS (копия `packaging/entitlements.plist`: Python выделяет исполняемую память и грузит чужие библиотеки).
 
-## Как sidecar связан с оболочкой
+Python внутри бандла: пользователь ничего отдельно не скачивает. `--onedir` вместо `--onefile` — нет распаковки во временную папку при каждом запуске, быстрее старт, реже ложные срабатывания антивирусов, при kill не остаётся распакованного ребёнка. Загрузчик PyInstaller собирается из исходников (`PYINSTALLER_COMPILE_BOOTLOADER=1`).
+
+## Как сервер связан с оболочкой
 
 - Оболочка передаёт `--no-window --port <порт> --parent-pid <PID оболочки>` и переменные `TINVEST_SHELL=tauri`, `TINVEST_SHELL_REV=5`.
-- Сервер раз в 2 с проверяет, жив ли процесс `--parent-pid`; если оболочку убили или она упала, сервер сам завершается (в onefile-сборке PyInstaller прямой родитель Python — загрузчик, поэтому PID передаётся явно). Job Object на Windows не используется: `--parent-pid` закрывает ту же проблему без `unsafe`.
+- Сервер раз в 2 с проверяет, жив ли процесс `--parent-pid`; если оболочку убили или она упала, сервер сам завершается. Job Object на Windows не используется: `--parent-pid` закрывает ту же проблему без `unsafe`.
 - При штатном выходе оболочка шлёт `POST /api/app/shutdown`, ждёт до 3 с и только затем убивает процесс.
-- Под Tauri карточка «Окно программы» (трей и реестр Run) в Настройках скрыта: там остаётся только «Запускать вместе с системой» через `tauri_autostart_*`. Автозапуск стартует без аргументов; пункт трея «Открыть» показывает окно.
+- Данные пользователя те же, что у прежней оболочки: `~/.tinvest_analytics` (сервер определяет папку сам, оболочка `TINVEST_HOME` не задаёт).
+- Автозапуска нет ни в каком виде (ни плагина, ни ключа реестра, ни пункта в Настройках). Настройка трея в Настройках под Tauri скрыта.
 - Блокировку программы целиком показывает сервер (экран PIN); оболочка биометрию не запрашивает.
 
 ## Установщик Windows
 
-NSIS (русский язык, `currentUser`, свои картинки, ярлыки). WebView2 скачивается bootstrapper-ом, если его нет. Хук `installer/hooks.nsh` при установке находит старую установку Inno Setup по `AppId` (`HKCU\...\Uninstall\{EFBF9C3A-...}_is1`), тихо запускает её деинсталлятор (`/VERYSILENT /SUPPRESSMSGBOXES`, данные в `%USERPROFILE%\.tinvest_analytics` в тихом режиме не удаляются: вопрос о них задаётся только при `not UninstallSilent`) и убирает старый автозапуск (значение `TAnalytic` в `HKCU\...\Run`, оканчивающееся на ` --tray`).
+NSIS (русский язык, `currentUser`, свои картинки, ярлыки). WebView2 скачивается bootstrapper-ом, если его нет. Хук `installer/hooks.nsh` при установке находит старую установку Inno Setup по `AppId` (`HKCU\...\Uninstall\{EFBF9C3A-...}_is1`), тихо запускает её деинсталлятор (`/VERYSILENT /SUPPRESSMSGBOXES`, данные в `%USERPROFILE%\.tinvest_analytics` в тихом режиме не удаляются: вопрос о них задаётся только при `not UninstallSilent`) и удаляет значение `TAnalytic` в `HKCU\...\Run`, если оно осталось от прошлых версий (то же при удалении).
 
 ## Установщик macOS
 
 DMG с фоном 660x400, значок приложения слева и «Программы» справа. `minimumSystemVersion` 11.0. Без секретов Apple сборка не падает (подпись ad-hoc, при первом запуске нужно «Открыть» в меню Finder или разрешить в «Конфиденциальность и безопасность»).
 
-## Автообновление
+## Автообновление (единственный канал)
 
-Плагин `tauri-plugin-updater`, адрес: `https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/latest.json`, публичный ключ вписан в `tauri.conf.json`. В программе баннер (`66_shell_notice.js`) спрашивает обновление командой `tauri_update_check` и после согласия пользователя вызывает `tauri_update_install` (скачивание, проверка подписи, закрытие сервера, установка, перезапуск).
+После первой установки обновляется всё сразу (оболочка, Python-сервер, программа): `tauri-plugin-updater`, адрес `https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/latest.json`, публичный ключ в `tauri.conf.json`. Старый канал самообновления `tinvest_analytics.py` под Tauri не работает: сервер в бандле всегда той же версии, что оболочка, а баннер оболочки pywebview не показывается (`TINVEST_SHELL=tauri`).
+
+Схема по шагам:
+
+1. Через 20 с после запуска и затем раз в 6 часов Rust запрашивает `latest.json`.
+2. Если версия новее, подписанное обновление скачивается в фоне (подпись проверяет плагин публичным ключом).
+3. Баннер в программе (`66_shell_notice.js`, опрос `tauri_update_status`) показывает «Готово обновление до версии X» и кнопку «Перезапустить» (`tauri_update_apply`: остановка сервера, установка, перезапуск).
+4. Не нажали кнопку: обновление ставится при закрытии программы. Windows: NSIS в режиме `passive` в папку пользователя, без UAC; macOS: плагин заменяет `.app`.
 
 Ключ подписи уже создан владельцем локально (`~/.tauri/tanalytic.key`, пароль пустой). Нужно один раз добавить секреты репозитория (Settings, Secrets and variables, Actions):
 
@@ -53,19 +64,19 @@ DMG с фоном 660x400, значок приложения слева и «П�
 
 ## Подпись macOS (необязательно)
 
-Секреты: `APPLE_CERTIFICATE` (сертификат Developer ID Application в base64 `.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD` (пароль приложения), `APPLE_TEAM_ID`. `tauri-action` импортирует сертификат, Tauri подписывает бандл (включая sidecar из `externalBin`) с правами из `entitlements.plist` и отправляет на нотаризацию.
+Python-сервер лежит в ресурсах бандла, а Tauri подписывает только само приложение, поэтому перед упаковкой CI подписывает все Mach-O папки `resources/backend` (`packaging/mac_codesign.sh dir`: Developer ID с hardened runtime и `entitlements.plist`, без сертификата ad-hoc). Секреты: `APPLE_CERTIFICATE` (сертификат Developer ID Application в base64 `.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD` (пароль приложения), `APPLE_TEAM_ID`. `tauri-action` импортирует сертификат, Tauri подписывает бандл с правами из `entitlements.plist` и отправляет на нотаризацию.
 
-## Переход пользователей pywebview
+## Переход пользователей pywebview (один раз)
 
-`SHELL_REV_LATEST` в `src/py/13z_shell.py` равен 5; sidecar Tauri сообщает ревизию 5 и `TINVEST_SHELL=tauri`, поэтому у него баннер оболочки не показывается. У оболочек pywebview (ревизия 4 и ниже) баннер предлагает установить новую версию: Windows скачивает `TAnalytic-Setup-win.exe`, сверяет сумму и запускает его (старые лаунчеры передают ключи Inno, NSIS показывает обычное окно установщика; хук удаляет старую копию), macOS заменяет `.app` из `.dmg`.
+`SHELL_REV_LATEST` в `src/py/13z_shell.py` равен 5; сервер Tauri сообщает ревизию 5 и `TINVEST_SHELL=tauri`, поэтому у него баннер оболочки не показывается. У оболочек pywebview (ревизия 4 и ниже) баннер предлагает установить новую версию: Windows скачивает `TAnalytic-Setup-win.exe` (теперь NSIS), сверяет сумму и запускает его (старые лаунчеры передают ключи Inno, NSIS показывает обычное окно установщика; хук удаляет старую Inno-установку и ключ автозапуска, данные не трогает), macOS заменяет `.app` содержимым `.dmg` (приложение называется так же, `TAnalytic.app`). Дальше обновляет сам Tauri.
 
 ## Локальная разработка и сборка
 
 ```bash
 python3 build.py
-mkdir -p src-tauri/binaries && touch src-tauri/binaries/TAnalytic-backend-aarch64-apple-darwin   # заглушка для cargo check
+mkdir -p src-tauri/resources/backend   # в каталоге должен быть хотя бы placeholder.txt; для cargo check этого достаточно
 cd src-tauri && cargo check --target aarch64-apple-darwin
 cargo tauri dev        # найдёт tinvest_analytics.py в корне и запустит python3
 ```
 
-Полная сборка (`cargo tauri build --target ...`) требует настоящего sidecar `src-tauri/binaries/TAnalytic-backend-<triple>`, как в `release.yml`. Без ключа обновлений добавьте `--config '{"bundle":{"createUpdaterArtifacts":false}}'`.
+Полная сборка (`cargo tauri build --target ...`) требует собранной папки Python-сервера в `src-tauri/resources/backend/`, как в `release.yml`. Без ключа обновлений добавьте `--config '{"bundle":{"createUpdaterArtifacts":false}}'`.

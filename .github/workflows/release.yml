@@ -1,5 +1,5 @@
 name: release-binaries
-# Собирает приложение на Tauri v2 (Rust-оболочка + Python-сервер TAnalytic-backend как sidecar) и добавляет сборки к релизу.
+# Собирает приложение на Tauri v2 (Rust-оболочка + Python-сервер TAnalytic-backend, PyInstaller --onedir в ресурсах бандла) и добавляет сборки к релизу.
 # Публикуются под стабильными именами (их ждут баннер обновления, README и самообновление старых оболочек pywebview):
 #   TAnalytic-Setup-win.exe (NSIS, x64), TAnalytic-mac-arm64.dmg, TAnalytic-mac-x64.dmg,
 #   а для автообновления — подписи (*.sig), архивы *.app.tar.gz и latest.json.
@@ -87,12 +87,11 @@ jobs:
           python packaging/vendor_lock.py --download vendor_wheels
           python packaging/gen_hidden_imports.py tinvest_analytics.py --wheels vendor_wheels -o packaging/hidden_imports.txt
 
-      - name: Сборка Python sidecar (TAnalytic-backend)
+      - name: Сборка Python-сервера (PyInstaller --onedir, кладётся в ресурсы бандла)
         run: |
           set -euo pipefail
-          mkdir -p src-tauri/binaries
           ARGS=(
-            --onefile
+            --onedir
             --noconfirm
             --name TAnalytic-backend
             --collect-data certifi
@@ -100,8 +99,7 @@ jobs:
             --distpath build_tauri_sidecar/dist
             --workpath build_tauri_sidecar/work
           )
-          EXT=""
-          if [ "$RUNNER_OS" = "Windows" ]; then ARGS+=(--noconsole); EXT=".exe"; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then ARGS+=(--noconsole); fi
           while IFS= read -r mod; do
             mod="${mod%%#*}"
             mod="${mod//[$'\r\n ']}"
@@ -110,7 +108,20 @@ jobs:
             fi
           done < packaging/hidden_imports.txt
           pyinstaller "${ARGS[@]}" tinvest_analytics.py
-          cp "build_tauri_sidecar/dist/TAnalytic-backend${EXT}" "src-tauri/binaries/TAnalytic-backend-${{ matrix.target }}${EXT}"
+          mkdir -p src-tauri/resources/backend
+          cp -R build_tauri_sidecar/dist/TAnalytic-backend/. src-tauri/resources/backend/
+          ls src-tauri/resources/backend | head
+
+      - name: Подпись Python-сервера внутри бандла (macOS; Developer ID, если задан сертификат, иначе ad-hoc)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_DEVELOPER_ID_CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Tauri подписывает само приложение, но не Mach-O внутри ресурсов: подписываем их до упаковки
+          # (hardened runtime и права из packaging/entitlements.plist); без сертификата — ad-hoc, иначе arm64 не запустит
+          packaging/mac_codesign.sh setup
+          packaging/mac_codesign.sh dir src-tauri/resources/backend
 
       - name: Иконки Tauri
         run: |
@@ -157,6 +168,10 @@ jobs:
         with:
           projectPath: src-tauri
           args: --target ${{ matrix.target }} ${{ env.TAURI_EXTRA }}
+
+      - name: Убрать временную связку ключей (macOS)
+        if: always() && runner.os == 'macOS'
+        run: packaging/mac_codesign.sh cleanup
 
       - name: Файлы под стабильными именами
         run: |

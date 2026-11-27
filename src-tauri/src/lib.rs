@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -117,27 +116,27 @@ enum SidecarTarget {
     PythonScript { python: String, script: PathBuf },
 }
 
-fn locate_sidecar() -> Result<SidecarTarget, String> {
+#[cfg(target_os = "windows")]
+const BACKEND_EXE: &str = "TAnalytic-backend.exe";
+#[cfg(not(target_os = "windows"))]
+const BACKEND_EXE: &str = "TAnalytic-backend";
+
+/// Python-сервер лежит в ресурсах бандла (PyInstaller --onedir): <resource_dir>/backend/TAnalytic-backend[.exe].
+fn locate_sidecar(resource_dir: Option<PathBuf>) -> Result<SidecarTarget, String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(r) = resource_dir {
+        dirs.push(r.join("backend"));
+    }
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let mut candidates: Vec<PathBuf> = Vec::new();
-            #[cfg(target_os = "windows")]
-            {
-                candidates.push(dir.join("TAnalytic-backend.exe"));
-                candidates.push(dir.join("TAnalytic-backend").join("TAnalytic-backend.exe"));
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                candidates.push(dir.join("TAnalytic-backend"));
-                candidates.push(dir.join("TAnalytic-backend").join("TAnalytic-backend"));
-                candidates.push(dir.join("../Resources/TAnalytic-backend"));
-                candidates.push(dir.join("../Resources/TAnalytic-backend/TAnalytic-backend"));
-            }
-            for cand in candidates {
-                if cand.is_file() {
-                    return Ok(SidecarTarget::Binary(cand));
-                }
-            }
+        if let Some(d) = exe.parent() {
+            dirs.push(d.join("backend"));
+            dirs.push(d.join("../Resources/backend"));
+        }
+    }
+    for dir in dirs {
+        let cand = dir.join(BACKEND_EXE);
+        if cand.is_file() {
+            return Ok(SidecarTarget::Binary(cand));
         }
     }
 
@@ -165,11 +164,11 @@ fn locate_sidecar() -> Result<SidecarTarget, String> {
         }
     }
 
-    Err("Не найден сервер TAnalytic-backend или tinvest_analytics.py".to_string())
+    Err("Не найден сервер TAnalytic-backend (папка backend рядом с программой) или tinvest_analytics.py".to_string())
 }
 
-fn spawn_sidecar(port: u16) -> Result<Child, String> {
-    let target = locate_sidecar()?;
+fn spawn_sidecar(app: &AppHandle, port: u16) -> Result<Child, String> {
+    let target = locate_sidecar(app.path().resource_dir().ok())?;
     let port_str = port.to_string();
     let pid_str = std::process::id().to_string();
     let mut cmd = match target {
@@ -266,7 +265,7 @@ fn start_backend(app: &AppHandle) {
         http_post_shutdown(state.port);
     }
     let mut spawn_error: Option<String> = None;
-    match spawn_sidecar(state.port) {
+    match spawn_sidecar(app, state.port) {
         Ok(ch) => {
             if let Ok(mut guard) = state.child.lock() {
                 *guard = Some(ch);
@@ -476,44 +475,74 @@ async fn tauri_pick_file(app: AppHandle) -> Result<Option<PickedFile>, String> {
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-fn tauri_autostart_get(app: AppHandle) -> Result<bool, String> {
-    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+/// Скачанное в фоне обновление ждёт перезапуска: пользователь нажимает кнопку в баннере, иначе оно ставится при закрытии.
+struct PendingUpdate {
+    slot: Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>,
 }
 
-#[tauri::command]
-fn tauri_autostart_set(app: AppHandle, enabled: bool) -> Result<bool, String> {
-    let mgr = app.autolaunch();
-    if enabled {
-        mgr.enable().map_err(|e| e.to_string())?;
-    } else {
-        mgr.disable().map_err(|e| e.to_string())?;
-    }
-    mgr.is_enabled().map_err(|e| e.to_string())
-}
-
-/// Проверка обновления оболочки (tauri-plugin-updater, подпись проверяется открытым ключом из tauri.conf.json).
-#[tauri::command]
-async fn tauri_update_check(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let found = updater.check().await.map_err(|e| e.to_string())?;
-    Ok(found.map(|u| UpdateInfo {
+fn pending_version(app: &AppHandle) -> Option<UpdateInfo> {
+    let pend = app.try_state::<PendingUpdate>()?;
+    let guard = pend.slot.lock().ok()?;
+    guard.as_ref().map(|(u, _)| UpdateInfo {
         version: u.version.clone(),
         notes: u.body.clone(),
-    }))
+    })
 }
 
-/// Скачивает и ставит обновление, затем перезапускает программу. Вызывается только после согласия пользователя.
-#[tauri::command]
-async fn tauri_update_install(app: AppHandle) -> Result<(), String> {
+/// Проверяет latest.json и, если есть подписанное обновление, скачивает его в память (подпись проверяет плагин).
+async fn check_and_download(app: &AppHandle) -> Result<(), String> {
+    if pending_version(app).is_some() {
+        return Ok(());
+    }
     let updater = app.updater().map_err(|e| e.to_string())?;
     let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
-        return Err("Обновлений нет".to_string());
+        return Ok(());
     };
     let bytes = update
         .download(|_chunk, _total| {}, || {})
         .await
         .map_err(|e| e.to_string())?;
+    if let Some(pend) = app.try_state::<PendingUpdate>() {
+        if let Ok(mut guard) = pend.slot.lock() {
+            *guard = Some((update, bytes));
+        }
+    }
+    Ok(())
+}
+
+/// Проверка при старте (через 20 с, когда окно уже загрузилось) и затем раз в 6 часов.
+fn start_update_loop(app: AppHandle) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(20));
+        loop {
+            let _ = tauri::async_runtime::block_on(check_and_download(&app));
+            std::thread::sleep(Duration::from_secs(6 * 60 * 60));
+        }
+    });
+}
+
+/// Версия уже скачанного обновления (или null): баннер в программе опрашивает эту команду.
+#[tauri::command]
+fn tauri_update_status(app: AppHandle) -> Option<UpdateInfo> {
+    pending_version(&app)
+}
+
+/// Принудительная проверка; возвращает версию готового обновления.
+#[tauri::command]
+async fn tauri_update_check(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    check_and_download(&app).await?;
+    Ok(pending_version(&app))
+}
+
+/// Ставит скачанное обновление и перезапускает программу. Вызывается по кнопке «Перезапустить».
+#[tauri::command]
+fn tauri_update_apply(app: AppHandle) -> Result<(), String> {
+    let taken = app
+        .try_state::<PendingUpdate>()
+        .and_then(|p| p.slot.lock().ok().and_then(|mut g| g.take()));
+    let Some((update, bytes)) = taken else {
+        return Err("Обновление ещё не скачано".to_string());
+    };
     // сервер закрываем до замены файлов (на Windows установщик завершает программу сам)
     if let Some(st) = app.try_state::<BackendState>() {
         shutdown_backend(&st);
@@ -526,6 +555,16 @@ async fn tauri_update_install(app: AppHandle) -> Result<(), String> {
         return Err(e.to_string());
     }
     app.restart()
+}
+
+/// Не нажали «Перезапустить» — обновление ставится при закрытии программы.
+fn install_pending_on_exit(app: &AppHandle) {
+    let taken = app
+        .try_state::<PendingUpdate>()
+        .and_then(|p| p.slot.lock().ok().and_then(|mut g| g.take()));
+    if let Some((update, bytes)) = taken {
+        let _ = update.install(bytes);
+    }
 }
 
 fn build_splash_html(message: &str, is_error: bool, retry: bool) -> String {
@@ -632,8 +671,10 @@ pub fn run() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(PendingUpdate {
+            slot: Mutex::new(None),
+        })
         .manage(BackendState {
             port,
             child: Mutex::new(None),
@@ -645,15 +686,15 @@ pub fn run() {
             tauri_win_toggle_max,
             tauri_win_close,
             tauri_pick_file,
-            tauri_autostart_get,
-            tauri_autostart_set,
+            tauri_update_status,
             tauri_update_check,
-            tauri_update_install,
+            tauri_update_apply,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;
             create_main_window(app.handle())?;
             start_backend(app.handle());
+            start_update_loop(app.handle().clone());
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -663,6 +704,7 @@ pub fn run() {
                 if let Some(st) = app_handle.try_state::<BackendState>() {
                     shutdown_backend(&st);
                 }
+                install_pending_on_exit(app_handle);
             }
             _ => {}
         });

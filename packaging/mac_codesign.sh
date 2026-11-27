@@ -2,6 +2,7 @@
 # Подпись и нотаризация macOS. Без секретов Apple ничего не ломает: приложение подписывается ad-hoc, нотаризация пропускается.
 #   packaging/mac_codesign.sh setup            импорт сертификата Developer ID во временную связку ключей (если задан APPLE_DEVELOPER_ID_CERT)
 #   packaging/mac_codesign.sh app <.app>       подпись приложения (Developer ID + hardened runtime + entitlements, иначе ad-hoc)
+#   packaging/mac_codesign.sh dir <папка>      подпись всех Mach-O в папке (Python-сервер для ресурсов Tauri): Developer ID + hardened runtime, иначе ad-hoc
 #   packaging/mac_codesign.sh dmg <.dmg>       подпись образа (только Developer ID)
 #   packaging/mac_codesign.sh notarize <файл>  нотаризация и staple (только если заданы APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD)
 #   packaging/mac_codesign.sh cleanup          удалить временную связку ключей
@@ -54,6 +55,21 @@ sign_app() {
   codesign -dv "$app" 2>&1 | head -6
 }
 
+sign_dir() {
+  local dir="$1" id; id="$(identity)"
+  # самые глубокие файлы первыми; каждому Mach-O своя подпись (в папке PyInstaller их сотни: .so, .dylib, исполняемый файл)
+  find "$dir" -type f -print0 | while IFS= read -r -d '' f; do
+    if file -b "$f" | grep -q "Mach-O"; then echo "$f"; fi
+  done | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2- | while IFS= read -r f; do
+    if [ -z "$id" ]; then
+      codesign --force -s - "$f"
+    else
+      codesign --force --timestamp --options runtime --entitlements "$HERE/entitlements.plist" -s "$id" "$f"
+    fi
+  done
+  echo "Подписано: $dir"
+}
+
 sign_dmg() {
   local id; id="$(identity)"
   if [ -z "$id" ]; then echo "Образ без подписи (нет Developer ID)."; return 0; fi
@@ -75,6 +91,7 @@ cleanup() { security delete-keychain "$KC_PATH" 2>/dev/null || true; rm -f "$IDE
 case "${1:-}" in
   setup) setup ;;
   app) sign_app "${2:?нужен путь к .app}" ;;
+  dir) sign_dir "${2:?нужна папка}" ;;
   dmg) sign_dmg "${2:?нужен путь к .dmg}" ;;
   notarize) notarize "${2:?нужен путь к файлу}" ;;
   cleanup) cleanup ;;
