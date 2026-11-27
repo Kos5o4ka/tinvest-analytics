@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "TAnalytic"
-APP_VERSION = "0.29"
+APP_VERSION = "0.31"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -5512,7 +5512,7 @@ def tbank_preview(ops, meta):
     bad_cash = {c: [a, b] for c, (a, b) in rec["cash"].items() if abs(a - b) >= 1.0}
     bad_pos = sorted(((abs(a - b), k, a, b) for k, (a, b) in rec["pos"].items() if abs(a - b) >= 0.5), reverse=True)
     st = meta["stat"]
-    mine = [x for x in imports_list() if x.get("format") == meta["format"]]  # добавлять предлагаем только к счетам того же брокера
+    mine = [x for x in imports_list() if (x.get("format") == meta["format"] or x.get("manual")) and not x.get("sync_src")]  # добавлять предлагаем только к счетам того же брокера
     return {"format": meta["format"], "title": meta["title"], "period": meta["period"], "count": len(ops),
             "kinds": dict(kinds), "kinds_ru": TB_KIND_RU, "repo_skipped": st.get("repo", 0), "mirror_skipped": st.get("mirror", 0),
             "opening_sec": st.get("opening_sec", 0), "xfer": st.get("xfer_in", 0) + st.get("xfer_out", 0),
@@ -5520,7 +5520,8 @@ def tbank_preview(ops, meta):
             "pos_worst": [[k, a, b] for _, k, a, b in bad_pos[:5]],
             "sample": [[o["date"][:10], op_type(o), o.get("name") or "", op_qty(o), qf(o["payment"]), cur_of(o["payment"])]
                        for o in ops if not o.get("_opening") and classify(o["type"]) != "other"][:12],
-            "targets": [{"id": x["id"], "name": x.get("name") or ""} for x in mine]}
+            "targets": [{"id": x["id"], "name": x.get("name") or ""} for x in mine],
+            "manual_matches": manual_matches_preview(ops, None)}
 
 
 def import_preview_any(filename, raw):
@@ -6777,6 +6778,69 @@ def warmup_start():
         except Exception:  # noqa: BLE001
             pass
     threading.Thread(target=job, daemon=True, name="warmup").start()
+# ═══════════════ вход в один клик: ссылка t.me/<бот>?start=auth_<нонс> без копирования ключа ═══════════════
+# Приложение создаёт на сервере ожидающую ссылку: нонс (идёт в ссылку, на сервере хранится хешем) и хеш секрета verifier
+# (сам секрет остаётся в памяти программы). Пользователь подтверждает вход в боте; приложение опрашивает сервер, предъявляя
+# verifier, и получает ключ один раз (pending -> approved -> consumed, 120 секунд). Токен Т-Инвестиций в этом обмене не участвует.
+
+_auth_link = {"nonce": "", "verifier": "", "at": 0.0}
+AUTH_LINK_TTL = 120
+
+
+def _auth_link_post(path, body):
+    srv = ds_conf()[0]
+    if not srv:
+        raise ApiError("Сервер данных отключён: вход не нужен.", 400)
+    req = urllib.request.Request(srv + "/v1/auth/" + path, data=json.dumps(body).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": EXT_UA["User-Agent"]})
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=_ssl()) as r:
+            code, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        code, raw = e.code, e.read()
+    except Exception as e:  # noqa: BLE001
+        raise ApiError("Нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__), 502)
+    try:
+        j = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        j = None
+    return code, (j if isinstance(j, dict) else {})
+
+
+def auth_link_start(cfg, body):
+    nonce, verifier = secrets.token_urlsafe(18), secrets.token_urlsafe(32)      # 24 и 43 знака; в ссылке Telegram до 64 знаков
+    code, j = _auth_link_post("start", {"nonce": nonce, "challenge": hashlib.sha256(verifier.encode("utf-8")).hexdigest()})
+    if code == 404:
+        raise ApiError("Этот сервер данных пока не поддерживает вход в один клик: вставьте ключ из бота.", 404)
+    if code == 429:
+        raise ApiError("Слишком много попыток входа, повторите позже.", 429)
+    if code != 200 or not j.get("ok"):
+        raise ApiError("Сервер не принял запрос входа (ответ %d)." % code, 502)
+    _auth_link.update(nonce=nonce, verifier=verifier, at=time.time())
+    return {"ok": True, "url": "https://t.me/%s?start=auth_%s" % (_auth["bot"].lstrip("@"), nonce), "ttl": int(j.get("ttl") or AUTH_LINK_TTL)}
+
+
+def auth_link_poll(cfg, body):
+    nonce, verifier = _auth_link["nonce"], _auth_link["verifier"]
+    if not nonce or time.time() - _auth_link["at"] > AUTH_LINK_TTL + 15:
+        _auth_link.update(nonce="", verifier="")
+        return {"state": "expired"}
+    code, j = _auth_link_post("poll", {"nonce": nonce, "verifier": verifier})
+    if code != 200 or not j.get("ok"):
+        _auth_link.update(nonce="", verifier="")
+        return {"state": "expired"}
+    st = j.get("state")
+    if st == "approved" and j.get("key"):
+        _auth_link.update(nonce="", verifier="")
+        res = auth_login(cfg, {"key": j["key"]})
+        if isinstance(res, tuple):
+            return {"state": "expired"}
+        return {"state": "approved", "auth": res}
+    return {"state": "pending" if st == "pending" else "expired"}
+
+
+API_POST["/api/auth/link/start"] = auth_link_start
+API_POST["/api/auth/link/poll"] = auth_link_poll
 # ═══════════════ единая точка исходящих запросов за ПУБЛИЧНЫМИ данными (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО, логотипы) ═══════════════
 # Публичные данные идут через сервер данных (DS_DEFAULT; для разработки и тестов — TINVEST_DATA_SERVER / TINVEST_DATA_KEY):
 # GET|POST {сервер}/v1/fetch?url=... Сервер кэширует ответы и сам ходит к источникам. При любой неудаче сервера
@@ -32258,8 +32322,9 @@ function pOps(){
   return`<div class="card"><div class="row" style="margin-bottom:14px">
     <input class="in" id="oq" placeholder="Поиск: название, тикер, тип операции…" value="${esc(S.opsQ)}" style="flex:1;min-width:240px">
     <div class="seg" id="ok">${KINDS.map(([k,t])=>`<button class="${k===S.opsK?'on':''}" data-k="${k}">${t}</button>`).join('')}</div>
-    <a class="btn ghost" style="text-decoration:none" href="/api/operations.csv?${new URLSearchParams({period:S.period,account:S.account})}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',2)}CSV</a></div>
-    <div id="otab"></div></div>`;
+    <a class="btn ghost" style="text-decoration:none" href="/api/operations.csv?${new URLSearchParams({period:S.period,account:S.account})}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',2)}CSV</a>
+    <button class="btn" id="man-add" title="Внести сделку или текущую позицию вручную, без загрузки отчёта">+ Добавить сделку</button></div>
+    <div id="otab"></div></div><div id="man-list"></div>`;
 }
 function drawOps(){
   const all=opsFiltered(),rows=all.slice(0,S.opsN),el=$('#otab');if(!el)return;
@@ -32620,6 +32685,7 @@ async function renderImport(){
     const cash=Object.entries(pv.cash_bad||{});
     step=`<div class="card fade"><h2>2. ${esc(pv.title)}<span class="sp">${esc(im.filename)} · ${ddm(pv.period.from)} — ${ddm(pv.period.to)}</span></h2>
       <div class="msg ok">Распознан формат «${esc(pv.title)}». Операций: <b>${pv.count}</b><br>${Object.entries(bd).filter(e=>e[1]).map(([k,v])=>`${ru[k]||k}: ${v}`).join(' · ')}</div>
+      ${pv.manual_matches&&pv.manual_matches.count?`<div class="msg info">Найдено ручных сделок, уже попавших в этот отчёт: <b>${pv.manual_matches.count}</b>. При загрузке они будут заменены строками отчёта, а не задвоятся.${pv.manual_matches.sample.map(m=>`<br>${ddm(m.date)} · ${esc(m.name)} · ${m.qty} шт. · ${f2(m.amount)}`).join('')}</div>`:''}
       <p class="note" style="margin:10px 0">${pv.repo_skipped?`Сделки РЕПО (${pv.repo_skipped} строк) и строки`:'Строки'} отчёта, дублирующие сделки (${pv.mirror_skipped}), не считаются: деньги и бумаги берутся из сделок, выплат и налогов. Входящие остатки на начало периода (бумаг: ${pv.opening_sec}) добавляются служебными операциями и снимаются сами, когда загружен более ранний отчёт${pv.xfer?`; движений бумаг без сделок: ${pv.xfer}`:''}.</p>
       <div class="msg ${pv.cash_ok&&!pv.pos_bad?'ok':'err'}">Сверка с итогами отчёта: деньги ${pv.cash_ok?'сходятся':'не сходятся ('+cash.map(([c,v])=>`${c.toUpperCase()}: по отчёту ${f0(v[0])}, по операциям ${f0(v[1])}`).join('; ')+')'}; бумаги — ${pv.pos_bad?`расхождений: ${pv.pos_bad} из ${pv.pos_total}`:`все ${pv.pos_total} сходятся`}.</div>
       <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${pv.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>
@@ -32641,13 +32707,14 @@ async function renderImport(){
         <div style="margin-top:8px;font-weight:600">Перетащите файл сюда или нажмите, чтобы выбрать</div>
         <div class="note" style="margin-top:4px">CSV, Excel (.xlsx) или HTML-отчёт брокера — Сбер, ВТБ, Альфа, БКС, Финам и др.</div></div>
       <div class="g g3" style="margin-top:16px;gap:12px">
-        <label class="field"><span>Куда загрузить</span><select class="in" id="itarget"><option value="">Новый счёт</option>${imps.map(x=>`<option value="${esc(x.id)}"${im&&im.target===x.id?' selected':''}>${esc(x.name)}</option>`).join('')}</select></label>
+        <label class="field"><span>Куда загрузить</span><select class="in" id="itarget"><option value="">Новый счёт</option>${imps.filter(x=>!x.sync_src).map(x=>`<option value="${esc(x.id)}"${im&&im.target===x.id?' selected':''}>${esc(x.name)}</option>`).join('')}</select></label>
         <label class="field"><span>Название счёта</span><input class="in" id="iname" placeholder="Например: Сбер ИИС" value="${esc(im&&im.name||'')}"></label>
         <label class="field"><span>Брокер</span><input class="in" id="ibroker" placeholder="Сбер, ВТБ, БКС…" value="${esc(im&&im.broker||'')}"></label></div>
       <p class="note" style="margin-top:12px">Лучше всего подходит выгрузка всех операций (сделки + движение денег) за всё время. Если формат не распознаётся — заполните <a href="/api/import/template.csv" style="color:var(--ac)">шаблон CSV</a>. Бумаги находятся по ISIN или тикеру через API Т-Инвестиций, чтобы подтянуть текущие цены, названия, логотипы и купоны. Данные сохраняются только в локальной базе.</p></div>
     ${step}
     <div class="card"><h2>Импортированные счета</h2>${imps.length?`<div class="li">${imps.map(x=>{const ps=(x.files||[]).map(f=>f.from&&f.to?[f.from,f.to]:null).filter(Boolean);const span=ps.length?` · ${ddm(ps.map(p=>p[0]).sort()[0])} — ${ddm(ps.map(p=>p[1]).sort().slice(-1)[0])}`:'';return`<div class="it">${logo({name:x.name,ticker:x.name},34)}<div><b>${esc(x.name)}</b><small>${esc(x.broker||'')}${x.broker?' · ':''}файлов: ${x.files.length} · операций: ${f0(x.ops||x.files.reduce((a,f)=>a+f.count,0))}${span}</small></div>
-      <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`}).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div></div>`;
+      <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`}).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div>
+    <div class="card"><h2>Ручной учёт</h2><p class="note">Купили бумаги у другого брокера или хотите быстро внести текущую позицию? Добавьте сделку вручную: загружать отчёт не нужно. Когда отчёт появится, совпавшие записи заменятся строками отчёта, дублей не будет.</p><div class="row" style="margin-top:10px"><button class="btn" id="man-add2">Добавить сделку или позицию</button></div></div><div id="man-list"></div></div>`;
   const msg=(t,k)=>{$('#imsg').innerHTML=t?`<div class="msg ${k||'err'}">${t}</div>`:'';if(t)$('#imsg').scrollIntoView({block:'nearest'})};
   const drop=$('#drop'),inp=$('#ifile');
   drop.onclick=()=>inp.click();
@@ -32673,7 +32740,7 @@ async function renderImport(){
       document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=true);b.textContent='Импортирую…';
       try{const res=await post('/api/import/commit',{filename:im.filename,data:im.data,name:$('#iname').value||im.name,broker:$('#ibroker').value,target:b.dataset.tbc});
         S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
-        await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
+        await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.${res.reconciled?` Ручных записей заменено строками отчёта: ${res.reconciled}.`:''}`,'ok');load(true)}
       catch(err){document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=false);await renderImport();msg(esc(err.message))}})
   }
   if(im&&im.preview&&!tb){
@@ -32684,17 +32751,19 @@ async function renderImport(){
         let ovNote='';
         if(!$('#itarget').value&&r.overlap_account){$('#itarget').value=r.overlap_account.id;S.imp.target=r.overlap_account.id;ovNote=`<div class="msg info" style="margin-top:10px">Найдены пересекающиеся операции со счётом «${esc(r.overlap_account.name)}» (${r.overlap_account.matches} шт.) — выбран этот счёт, чтобы сделки за общий период не продублировались.</div>`}
         if(r.duplicate_of)msg('');      // то же предупреждение уже есть ниже, рядом с результатом разбора
+        const mmNote=r.manual_matches&&r.manual_matches.count?`<div class="msg info" style="margin-top:10px">Найдено ручных сделок, уже попавших в этот отчёт: <b>${r.manual_matches.count}</b>. При загрузке они будут заменены строками отчёта, а не задвоятся.${r.manual_matches.sample.map(m=>`<br>${ddm(m.date)} · ${esc(m.name)} · ${m.qty} шт. · ${f2(m.amount)}`).join('')}</div>`:'';
         const dupMsg=r.duplicate_of?`<div class="msg err" style="margin-top:10px">Этот отчёт уже загружен в счёт «${esc(r.duplicate_of.name)}». Повторная загрузка запрещена, чтобы сделки не задвоились.</div>`:'';
         $('#iresult').innerHTML=`<div class="msg ${r.count?'ok':'err'}">Распознано операций: <b>${r.count}</b>${r.skipped?`, пропущено строк: ${r.skipped}`:''}${r.from?` · с ${ddm(r.from)} по ${ddm(r.to)}`:''}<br>${Object.entries(r.kinds).map(([k,v])=>`${K[k]||k}: ${v}`).join(' · ')}</div>${dupMsg}${ovNote}
-          <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${r.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>
+          <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${r.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>${mmNote}
           ${r.count&&!r.duplicate_of?'<div class="row" style="margin-top:14px"><button class="btn" id="icommit">Импортировать</button><span class="note">Бумаги будут найдены через API Т-Инвестиций — это займёт несколько секунд.</span></div>':''}`;
         const c=$('#icommit');if(c)c.onclick=async ev=>{const bb=ev.currentTarget;bb.disabled=true;bb.textContent='Импортирую…';
           try{const res=await post('/api/import/commit',{...req(),name:$('#iname').value||im.name,broker:$('#ibroker').value,target:$('#itarget').value});
             S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
-            await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
+            await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.${res.reconciled?` Ручных записей заменено строками отчёта: ${res.reconciled}.`:''}`,'ok');load(true)}
           catch(err){bb.disabled=false;bb.textContent='Импортировать';msg(esc(err.message))}}}
       catch(err){$('#iresult').innerHTML=`<div class="msg err">${esc(err.message)}</div>`}finally{b.disabled=false}};
   }
+  try{const mb=$('#man-add2');if(mb)mb.onclick=()=>manualOpen();manualDrawList()}catch(e){}
   document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(!confirm('Удалить импортированный счёт и его операции из локальной базы?'))return;
     await post('/api/import/delete',{id:b.dataset.del});if(S.account===b.dataset.del)S.account='all';S.data=S.bonds=S.hist=null;persist();renderImport();load(true)});
   document.querySelectorAll('[data-brk]').forEach(s=>s.onchange=async()=>{
@@ -32702,6 +32771,109 @@ async function renderImport(){
   document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{S.account=b.dataset.open;S.bonds=S.hist=null;persist();S.page='dash';renderNav();load(false)});
 }
 
+/* ── Ручной учёт: добавить сделку или текущую позицию, не загружая отчёт ── */
+const MAN={rows:[],accounts:[],pick:null};
+const MAN_KINDS=[['buy','Покупка'],['sell','Продажа'],['coupon','Купон'],['dividend','Дивиденд'],['deposit','Пополнение'],['withdraw','Вывод'],['fee','Комиссия, обслуживание']];
+const MAN_TYPE={buy:'buy',sell:'sell',coupons:'coupon',dividends:'dividend',deposits:'deposit',withdrawals:'withdraw',fee_service:'fee',fee_broker:'fee'};
+function manNum(v){const x=parseFloat(String(v==null?'':v).replace(/\s/g,'').replace(',','.'));return isFinite(x)?x:0}
+function manClose(){const o=document.getElementById('man-ov');if(o)o.remove()}
+async function manualOpen(row){
+  manClose();
+  let accs=[];
+  try{accs=(await api('/api/ops/manual')).accounts}catch(e){toast(e.message,'err');return}
+  const ed=row||null;MAN.pick=ed?{ident:ed.ident,ticker:'',name:ed.name}:null;
+  const kind=ed?(MAN_TYPE[ed.type]||'buy'):'buy';
+  const ov=document.createElement('div');ov.id='man-ov';ov.className='shr-bg';
+  ov.innerHTML=`<div class="card" role="dialog" aria-modal="true" aria-label="Ручная запись" style="width:min(640px,100%);max-height:92vh;overflow:auto">
+    <h2>${ed?'Изменить запись':'Добавить сделку или позицию'}<span class="sp"><button class="btn ghost" id="man-x" aria-label="Закрыть">Закрыть</button></span></h2>
+    <p class="note">Запись становится обычной операцией счёта: доходность, налоги и графики считаются как по отчёту. Когда вы позже загрузите отчёт брокера с этой сделкой, ручная запись будет заменена строкой отчёта, а не задвоится.</p>
+    <div class="seg" id="man-mode" style="margin:10px 0"><button data-m="op" class="${ed&&ed.position?'':'on'}">Операция</button><button data-m="position" class="${ed&&ed.position?'on':''}">Текущая позиция без истории</button></div>
+    <div class="g g3" style="gap:12px">
+      <label class="field"><span>Счёт</span><select class="in" id="man-acc">${ed?'':'<option value="">Новый ручной счёт</option>'}${accs.map(a=>`<option value="${esc(a.id)}"${ed&&ed.acc===a.id?' selected':''}>${esc(a.name)}</option>`).join('')}</select></label>
+      <label class="field" id="man-newname"><span>Название нового счёта</span><input class="in" id="man-accname" placeholder="Например: Другой брокер" value="Ручной счёт"></label>
+      <label class="field" id="man-kindf"><span>Тип операции</span><select class="in" id="man-kind">${MAN_KINDS.map(([k,t])=>`<option value="${k}"${k===kind?' selected':''}>${t}</option>`).join('')}</select></label>
+    </div>
+    <div id="man-secbox"><label class="field" style="margin-top:12px"><span>Бумага: тикер, ISIN или название</span><input class="in" id="man-q" placeholder="Например: SBER или ОФЗ 26238" autocomplete="off" value="${esc(ed?ed.name:'')}"></label>
+      <div id="man-found" class="li" style="margin-top:6px"></div></div>
+    <div class="g g3" style="gap:12px;margin-top:12px">
+      <label class="field"><span>Дата</span><input class="in" type="date" id="man-date" value="${esc(ed?ed.date:localIso(new Date()))}"></label>
+      <label class="field" id="man-qtyf"><span>Количество, шт.</span><input class="in" id="man-qty" inputmode="decimal" value="${ed&&ed.qty?esc(ed.qty):''}"></label>
+      <label class="field" id="man-pricef"><span id="man-pricel">Цена за штуку, ₽</span><input class="in" id="man-price" inputmode="decimal" value="${ed&&ed.qty?esc(+(ed.amount/ed.qty).toFixed(4)):''}"></label>
+      <label class="field" id="man-nkdf"><span>НКД, ₽ (облигации)</span><input class="in" id="man-nkd" inputmode="decimal"></label>
+      <label class="field"><span id="man-amountl">Сумма, ₽</span><input class="in" id="man-amount" inputmode="decimal" value="${ed?esc(ed.amount):''}"></label>
+      <label class="field" id="man-commf"><span>Комиссия, ₽</span><input class="in" id="man-comm" inputmode="decimal" value="${ed&&ed.commission?esc(ed.commission):''}"></label>
+    </div>
+    <label class="row" id="man-cashf" style="margin-top:12px;gap:8px;align-items:center"><input type="checkbox" id="man-cash"${!ed||ed.autocash?' checked':''}><span>Учесть пополнение под покупку: деньги на счёте не уйдут в минус</span></label>
+    <div class="msg err" id="man-err" style="display:none;margin-top:10px"></div>
+    <div class="row" style="margin-top:14px"><button class="btn" id="man-save">Сохранить</button><button class="btn ghost" id="man-cancel">Отмена</button></div></div>`;
+  document.body.appendChild(ov);
+  const g=id=>document.getElementById(id),mode=()=>g('man-mode').querySelector('.on').dataset.m;
+  const showHide=()=>{
+    const pos=mode()==='position',k=pos?'buy':g('man-kind').value,trade=k==='buy'||k==='sell',sec=['buy','sell','coupon','dividend'].includes(k);
+    g('man-newname').style.display=g('man-acc').value===''?'':'none';
+    g('man-kindf').style.display=pos?'none':'';
+    g('man-secbox').style.display=sec?'':'none';
+    g('man-qtyf').style.display=trade?'':'none';g('man-pricef').style.display=trade?'':'none';g('man-nkdf').style.display=k==='buy'&&!pos?'':'none';
+    g('man-commf').style.display=trade&&!pos?'':'none';g('man-cashf').style.display=k==='buy'?'':'none';
+    g('man-pricel').textContent=MAN.pick&&MAN.pick.pct?'Цена, % от номинала':'Цена за штуку, ₽';
+    g('man-amountl').textContent=trade?'Сумма сделки, ₽ (считается сама)':'Сумма, ₽';
+    g('man-date').previousElementSibling.textContent=pos?'Дата покупки (по желанию)':'Дата';
+  };
+  const calc=()=>{
+    const q=manNum(g('man-qty').value),p=manNum(g('man-price').value),n=manNum(g('man-nkd').value);
+    const unit=MAN.pick&&MAN.pick.pct?p*(MAN.pick.nominal||1000)/100:p;
+    if(q&&p)g('man-amount').value=(+(q*unit+n).toFixed(2)).toString();
+  };
+  g('man-acc').onchange=showHide;g('man-kind').onchange=showHide;
+  g('man-mode').onclick=e=>{const b=e.target.closest('[data-m]');if(!b)return;g('man-mode').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));showHide()};
+  ['man-qty','man-price','man-nkd'].forEach(id=>g(id).oninput=calc);
+  let to;
+  g('man-q').oninput=()=>{clearTimeout(to);MAN.pick=null;to=setTimeout(async()=>{
+    const q=g('man-q').value.trim();if(q.length<2){g('man-found').innerHTML='';return}
+    try{const r=await api('/api/ops/manual/search?q='+encodeURIComponent(q));
+      g('man-found').innerHTML=r.rows.length?r.rows.map((x,i)=>`<div class="it" data-i="${i}" style="cursor:pointer"><div><b>${esc(x.name)}</b><small>${esc(x.ticker)}${x.ident&&x.ident!==x.ticker?' · '+esc(x.ident):''} · ${x.kind==='bond'?'облигация':x.kind==='fund'?'фонд':'акция'}${x.price?' · '+(x.price_pct?x.price+' %':f2(x.price)+' ₽'):''}</small></div></div>`).join(''):'<div class="note">Ничего не найдено: можно ввести тикер или ISIN вручную.</div>';
+      g('man-found').onclick=e=>{const it=e.target.closest('[data-i]');if(!it)return;const x=r.rows[+it.dataset.i];
+        MAN.pick={ident:x.ident,ticker:x.ticker,name:x.name,pct:!!x.price_pct,nominal:+x.nominal||1000};
+        g('man-q').value=x.name;g('man-found').innerHTML='';
+        if(x.price&&!g('man-price').value)g('man-price').value=x.price;
+        if(x.price_pct&&x.nkd&&!g('man-nkd').value)g('man-nkd').value=x.nkd;
+        showHide();calc()}}
+    catch(e){g('man-found').innerHTML=''}},250)};
+  g('man-x').onclick=g('man-cancel').onclick=manClose;
+  ov.addEventListener('mousedown',e=>{if(e.target===ov)manClose()});
+  g('man-save').onclick=async e=>{
+    const b=e.currentTarget,er=g('man-err');er.style.display='none';
+    const pos=mode()==='position',k=pos?'buy':g('man-kind').value,typed=g('man-q').value.trim();
+    const pk=MAN.pick||{ident:typed.toUpperCase().replace(/\s+/g,''),ticker:'',name:typed};
+    const unit=MAN.pick&&MAN.pick.pct?manNum(g('man-price').value)*(MAN.pick.nominal||1000)/100:manNum(g('man-price').value);
+    const body={acc:g('man-acc').value,acc_name:g('man-accname').value,group:ed?ed.group:'',mode:pos?'position':'op',kind:k,date:g('man-date').value||undefined,
+      ident:pk.ident,ticker:pk.ticker,name:pk.name,qty:g('man-qty').value,price:unit||'',amount:g('man-amount').value,nkd:manNum(g('man-nkd').value)||'',
+      commission:g('man-comm').value,autocash:g('man-cash').checked};
+    b.disabled=true;
+    try{await post('/api/ops/manual',body);manClose();S.data=S.bonds=S.hist=null;toast('Запись сохранена.','ok');
+      if(S.page==='ops'||S.page==='imp'){S.page==='imp'?renderImport():manualDrawList()}load(true)}
+    catch(x){er.textContent=x.message;er.style.display=''}finally{b.disabled=false}
+  };
+  showHide();
+}
+async function manualDrawList(){
+  const box=document.getElementById('man-list');if(!box)return;
+  try{const r=await api('/api/ops/manual');MAN.rows=r.rows;
+    if(!r.rows.length){box.innerHTML='';return}
+    const T={buy:'Покупка',sell:'Продажа',coupons:'Купон',dividends:'Дивиденд',deposits:'Пополнение',withdrawals:'Вывод',fee_service:'Комиссия',fee_broker:'Комиссия'};
+    box.innerHTML=`<div class="card"><h2>Ручные записи<span class="sp">${r.rows.length}</span></h2><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Операция</th><th class="l">Бумага</th><th class="l">Счёт</th><th>Кол-во</th><th>Сумма</th><th></th></tr></thead><tbody>${
+      r.rows.slice(0,100).map((x,i)=>`<tr><td class="l num t2">${esc(x.date)}</td><td class="l"><span class="tag">${esc(x.position?'Позиция':T[x.type]||x.type)}</span></td><td class="l">${esc(x.name)}</td><td class="l t2">${esc(x.acc_name||'')}</td><td class="num">${x.qty||''}</td><td class="num">${f2(x.amount)}</td><td class="num"><button class="btn ghost" data-me="${i}">Изменить</button> <button class="btn ghost danger" data-md="${i}">Удалить</button></td></tr>`).join('')}</tbody></table></div></div>`;
+    box.onclick=async e=>{
+      const be=e.target.closest('[data-me]'),bd=e.target.closest('[data-md]');
+      if(be)return manualOpen(MAN.rows[+be.dataset.me]);
+      if(bd){const x=MAN.rows[+bd.dataset.md];if(!confirm('Удалить ручную запись «'+x.name+'» от '+x.date+'? Вместе с ней уйдут её комиссия и пополнение под покупку.'))return;
+        try{await post('/api/ops/manual/delete',{acc:x.acc,group:x.group});S.data=S.bonds=S.hist=null;toast('Запись удалена.','ok');manualDrawList();load(true)}catch(err){toast(err.message,'err')}}};
+  }catch(e){box.innerHTML=''}
+}
+function manualBindOps(){
+  const b=document.getElementById('man-add');if(b)b.onclick=()=>manualOpen();
+  manualDrawList();
+}
 /* ── Настройки: двухпанельный экран (навигация слева, панель состояния, строки-настройки) ── */
 /* ── кирпичики разметки ── */
 const ST_ICO={
@@ -32824,7 +32996,7 @@ function setDsHtml(c){
     stRow('Ключ доступа',`Выдаёт @${esc(AUTH.bot)}${keySet?' · <span class="pos">сохранён</span>, пустое поле ничего не меняет':''}`,stSecret('ds-key',keySet?'••••••••':'вставьте ключ','autocomplete="off"','Ключ доступа к серверу данных'))+
     stRow('Действия','',`<button class="btn" id="ds-save" disabled>Сохранить</button><button class="btn ghost" id="ds-test">Проверить</button>${keySet?'<button class="btn ghost danger" id="ds-clr">Удалить ключ</button>':''}`)+
     `<p class="st-line" id="ds-st">Загружаю…</p>`+
-    stMore('Что передаётся на сервер','Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через сервер TAnalytic: он сам обновляет их раз в час, поэтому экраны открываются без ожидания источников. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.'),
+    stMore('Что передаётся на сервер','Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через сервер TAnalytic: он сам обновляет их раз в час, поэтому экраны открываются без ожидания источников. Токен Т-Инвестиций идёт только напрямую в Т-Банк и на сервер не передаётся никогда. Портфель на сервер не передаётся, пока вы не включите синхронизацию между устройствами (Настройки, «Данные»): тогда на сервер уходит копия, зашифрованная на вашем компьютере, которую сервер прочитать не может.'),
     {id:'ds-card',hint:'данные рынка'});
 }
 async function dsStatus(){
@@ -33180,7 +33352,7 @@ async function renderSettings(){
     <div class="msg info" id="st-empty" hidden>Ничего не найдено. Попробуйте другое слово, например «токен», «тема» или «копия».</div>
   </div></div>`;
   const main=document.getElementById('st-main');
-  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)),
+  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)+setSyncHtml(c)),
     sec(5,setNewsHtml(c)),sec(6,setDangerHtml(c))];
   main.insertAdjacentHTML('beforeend',html.join(''));
   if(keep){view.scrollTop=keep;const st=view.querySelector('.st');if(st)st.classList.remove('fade')}
@@ -33211,6 +33383,7 @@ async function renderSettings(){
   try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
+  try{bindSetSync(c,msg)}catch(e){}
   try{bindSetCrowd(c,msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
   /* адреса API, сертификат и проверка SSL больше не редактируются в окне: в настройках остаются как были */
@@ -33232,6 +33405,65 @@ async function renderSettings(){
   if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
   if($('#sbpay'))$('#sbpay').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sandbox/payin',{accountId:S.account,amount:$('#amt').value});S.data=S.bonds=S.hist=null;msg('Счёт пополнен на '+M(+$('#amt').value,'rub',0),1);load(true)});
+}
+/* ── Настройки: синхронизация между устройствами (выключена по умолчанию, данные шифруются на этом компьютере) ── */
+function setSyncHtml(c){
+  const enabled=!!c.sync_enabled;
+  const what='<b>Что уходит на сервер:</b> счета из отчётов брокеров и ручные счета с их операциями (даты, бумаги, количество, суммы), '+
+    'снимки счетов Т-Инвестиций (только операции, без токена), список наблюдения, дневник (вместе с текстом заметок), цели ребалансировки, тарифы брокеров и налоговые настройки. '+
+    '<b>Что не уходит никогда:</b> токен Т-Инвестиций, ключ входа, пароль резервной копии и рыночный кэш.';
+  const how='Всё это сжимается и шифруется <b>на вашем компьютере</b> ключом из кодовой фразы (AES-256). На сервере лежит только шифрованный блок: ни администратор сервера, ни бот прочитать его не могут. '+
+    'Поэтому бот не показывает ваш портфель. <b>Потеряете кодовую фразу — расшифровать копию не сможет никто</b>: её придётся удалить и создать заново. '+
+    'Одно исключение: сделки, которые вы отправили боту командами <code>/buy</code> и <code>/sell</code>, лежат на сервере открытым текстом, пока программа не заберёт их при ближайшей синхронизации.';
+  const off=`<div class="st-callout">Синхронизация <b>выключена</b>. Пока вы её не включите, портфель остаётся только на этом компьютере. Если включить, данные ниже будут храниться на сервере в зашифрованном виде.</div>
+    <p class="st-line">${what}</p><p class="st-line">${how}</p>
+    <div id="sy-need" class="st-line" hidden>Сначала войдите по ключу из Telegram-бота: синхронизация привязана к вашему аккаунту Telegram.</div>
+    ${stRow('Первое устройство','Создать облачную копию. Кодовую фразу можно придумать самому (от 12 знаков) или оставить поле пустым: тогда программа создаст случайную',`<input class="in st-wide" id="sy-new" placeholder="своя кодовая фраза (по желанию)" autocomplete="off" spellcheck="false" aria-label="Своя кодовая фраза"><button class="btn" id="sy-create">Включить и создать копию</button>`,{stack:1})}
+    ${stRow('Второе устройство','Подключиться к копии, созданной на другом компьютере: нужна её кодовая фраза',`<input class="in st-wide" id="sy-join-ph" placeholder="кодовая фраза с первого устройства" autocomplete="off" spellcheck="false" aria-label="Кодовая фраза"><button class="btn ghost" id="sy-join">Подключить это устройство</button>`,{stack:1})}`;
+  const on=`<div class="st-callout"><b>Синхронизация включена.</b> Данные шифруются на этом компьютере; сервер хранит только шифртекст.</div>
+    <p class="st-line" id="sy-st">Загружаю…</p>
+    ${stRow('Действия','Обмен происходит сам: через несколько секунд после изменений и раз в 10 минут, пока программа открыта',`<button class="btn" id="sy-now">Синхронизировать сейчас</button><button class="btn ghost" id="sy-off">Выключить на этом компьютере</button>`)}
+    ${stRow('Данные на сервере','Стирает облачную копию и очередь сделок из бота, выключает синхронизацию. Данные на этом компьютере остаются',`<button class="btn ghost danger" id="sy-del">Удалить мои данные с сервера</button>`)}
+    <p class="st-line">${what}</p><p class="st-line">${how}</p>`;
+  return stGroup('Синхронизация между устройствами',`<div id="sy-body">${enabled?on:off}</div><div id="sy-phrase"></div>`,{id:'sy-card',hint:'по желанию, выключена'});
+}
+function bindSetSync(c,msg){
+  const g=id=>document.getElementById(id);if(!g('sy-card'))return;
+  const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
+  const redraw=async()=>{try{S.cfg=await api('/api/config');if(typeof renderSettings==='function')renderSettings()}catch(e){}};
+  const showSt=async()=>{
+    const el=g('sy-st');if(!el)return;
+    try{
+      const s=await api('/api/sync');
+      el.textContent=(s.error?'Ошибка: '+s.error+' ':'')+(s.at?`Последняя синхронизация: ${authTime(s.at)}, версия ${s.rev}, устройство «${s.device}», записей: ${s.records}.`:'Ещё не синхронизировано.');
+      el.classList.toggle('st-err',!!s.error);
+    }catch(e){el.textContent=e.message||''}
+  };
+  const need=g('sy-need');
+  if(need)api('/api/sync').then(s=>{need.hidden=!!s.logged_in}).catch(()=>{});
+  if(g('sy-create'))g('sy-create').onclick=e=>busy(e.currentTarget,async()=>{
+    if(!confirm('Включить синхронизацию?\n\nНа сервер будет отправлен ЗАШИФРОВАННЫЙ на этом компьютере блок: счета и операции, наблюдение, дневник, цели, тарифы и налоговые настройки. Токен Т-Инвестиций не отправляется. Без кодовой фразы расшифровать блок нельзя.'))return;
+    const r=await post('/api/sync',{action:'enable',mode:'create',phrase:g('sy-new').value});
+    if(r.phrase){
+      g('sy-phrase').innerHTML=`<div class="st-callout warn"><b>Запишите кодовую фразу сейчас.</b> Она показывается один раз и нигде не сохраняется; без неё второе устройство не подключить, а копию не восстановить.<div style="margin:8px 0"><code id="sy-ph-val" style="font-size:16px;user-select:all">${esc(r.phrase)}</code></div><button class="btn ghost" id="sy-ph-copy">Скопировать</button> <button class="btn" id="sy-ph-ok">Я записал(а) фразу</button></div>`;
+      g('sy-ph-copy').onclick=async()=>{try{await navigator.clipboard.writeText(r.phrase);msg('Фраза скопирована.',1)}catch(x){msg('Выделите фразу и скопируйте вручную.')}};
+      g('sy-ph-ok').onclick=()=>redraw();
+      g('sy-body').hidden=true;
+    }else{msg('Синхронизация включена.',1);redraw()}
+  });
+  if(g('sy-join'))g('sy-join').onclick=e=>busy(e.currentTarget,async()=>{
+    const ph=g('sy-join-ph').value;if(!ph.trim())return msg('Введите кодовую фразу.');
+    await post('/api/sync',{action:'enable',mode:'join',phrase:ph});msg('Устройство подключено, данные загружены.',1);
+    try{S.data=S.bonds=S.hist=null}catch(x){}redraw();
+  });
+  if(g('sy-now'))g('sy-now').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sync',{action:'now'});msg('Синхронизировано.',1);showSt();try{S.data=S.bonds=S.hist=null}catch(x){}});
+  if(g('sy-off'))g('sy-off').onclick=e=>busy(e.currentTarget,async()=>{
+    if(!confirm('Выключить синхронизацию на этом компьютере?\n\nДанные здесь и копия на сервере останутся; чтобы вернуться, понадобится кодовая фраза.'))return;
+    await post('/api/sync',{action:'disable'});msg('Синхронизация выключена.',1);redraw()});
+  if(g('sy-del'))g('sy-del').onclick=e=>busy(e.currentTarget,async()=>{
+    if(!confirm('Удалить облачную копию с сервера?\n\nБудут стёрты зашифрованный блок и очередь сделок из бота; синхронизация выключится. Данные на этом компьютере останутся. На других устройствах синхронизация остановится сама. Это нельзя отменить.'))return;
+    await post('/api/sync',{action:'delete'});msg('Данные удалены с сервера.',1);redraw()});
+  showSt();
 }
 /* ── тема, печать ── */
 function themeNow(t){return t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}
@@ -33577,6 +33809,7 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+  ['0.31','27.11.2026',['<b>Синхронизация между устройствами</b> (по желанию, выключена по умолчанию; Настройки, раздел «Данные»): счета из отчётов и ручные счета, операции, снимки счетов Т-Инвестиций, наблюдение, дневник, цели и налоговые настройки переносятся на другой компьютер. Данные шифруются на вашем компьютере кодовой фразой (AES-256), сервер хранит только шифртекст и прочитать его не может; токен Т-Инвестиций не передаётся никогда. Правки с двух устройств сливаются по записям, удаления не «воскресают». Кнопка «Удалить мои данные с сервера»','<b>Ручной учёт</b>: «Добавить сделку» в разделе «Операции» и «Импорт» (покупка, продажа, купон, дивиденд, пополнение, вывод, комиссия) и режим «Текущая позиция без истории»; запись можно изменить и удалить. Когда позже загружается отчёт брокера с этой же сделкой, ручная запись заменяется строкой отчёта, а не задваивается; счёт, где были только ручные записи, больше не теряет их при первой загрузке отчёта','<b>Вход в один клик</b>: кнопка «Войти через Telegram» открывает бота, вы нажимаете «Подтвердить вход», и ключ приходит в программу сам — без копирования','<b>Сделки с телефона</b>: команды бота <code>/buy</code>, <code>/sell</code>, <code>/deposit</code>, <code>/withdraw</code> и <code>/note</code> попадают в программу при следующей синхронизации (нужна включённая синхронизация); тихие часы и часовой пояс в уведомлениях сервера теперь берутся из настроек бота (<code>/quiet</code>), а несколько срабатываний за проверку приходят одним сообщением']],
   ['0.29','25.11.2026',['<b>Проверка тревог на сервере, пока программа закрыта</b>: цели по наблюдению, напоминания дневника (без текста заметок), ближайшие оферты и выплаты по облигациям портфеля проверяются сервером данных каждые 15 минут, кроме ночи (22:00–08:00 МСК). Включается в «Настройках»; управлять и удалить подписку можно и в боте командой <code>/alerts</code>','<b>СЧА и расчётная цена (iNAV) фондов</b>: в карточке фонда показываются текущая iNAV Мосбиржи, отклонение биржевой цены от расчётной, последняя СЧА по отчётам УК, дата и управляющая компания','<b>Настройки</b>: кнопка «глаз» теперь показывает ранее сохранённые секреты (токен, ключ сервера данных, пароль резервной копии) с проверкой доступа только из окна программы','<b>Обучающий тур и дивиденды</b>: рамка тура отслеживает сдвиги интерфейса и появление бегущей строки; таблица дивидендных гэпов в карточке акции открывается сразу развёрнутой']],
   ['0.28','24.11.2026',['<b>Фонды</b> открываются в карточке: котировка, график, теханализ, управляющая компания и <b>состав фонда</b> с долями бумаг (у фондов Т-Капитала — фактический, у индексных — состав индекса)','<b>Дивиденды в карточке акции</b>: история выплат с 2000-х (dohod.ru), рост за 5 и 10 лет, сколько лет подряд платят, надёжность, закрытие гэпа, «держать или продать» и ваши полученные дивиденды. Выплаты, операции, календарь и скринер открывают карточку сразу на этой вкладке','<b>Комиссии</b>: оптимизатор тарифа считает только счета Т-Инвестиций и всегда за последние 12 месяцев. Брокер импортированного отчёта определяется автоматически; для других брокеров — свой блок с выбором тарифа (пока заданы тарифы ВТБ)','<b>Календарь</b>: купоны по импортированным отчётам и демо-портфелю теперь видны (график берётся с Мосбиржи), строка с ключевой ставкой и днями до следующего заседания ЦБ','Облигации в юанях и долларах получают цену с Мосбиржи без токена (по курсу ЦБ)','Рейтинги в карточке облигации ведут на пресс-релизы агентств; на кривой эмитента подписано, что значит линия','Новый экран загрузки и обновления в стиле программы, плавный переход в основное окно. Если ваше приложение устарело, программа предложит скачать новое','Обучающий тур запускается только после обновления, подсказки стали непрозрачными; база данных сама чистится от устаревшего кэша; плавное закрытие выезжающей панели']],
   ['0.27','23.11.2026',['<b>Премиальный облик</b>: спокойная графитовая палитра, карточки с глубиной, шапка в одну строку, аккуратные вкладки разделов, приглушённые значки бумаг, новая иконка приложения и лаунчер в том же стиле','<b>Графики</b> в едином стиле: широкие скруглённые столбики, тонкая сетка, линии с заливкой, пончик с зазорами, плавное появление и новые подсказки','<b>Настройки</b> заново: разделы слева и поиск по настройкам, плитки состояния (токен, сервер данных, бот, данные), переключатели сохраняются сразу, опасные действия — в отдельной зоне','<b>Рейтинги из канала @ru_ratings</b>: клик по рейтингу открывает пресс-релиз агентства, при нескольких агентствах — список','<b>Горячие клавиши</b> (? — шпаргалка): g и буква — переход в раздел, r — обновить, h — скрыть суммы, t — тема; в поиске Ctrl+K — калькулятор (например 150000*0,13) и быстрые команды','<b>Первичка</b>: затянувшиеся размещения больше не теряются, «размещено» считается с даты старта, видно число дней размещения','<b>Налоги</b>: лимит освобождения ИИС-3 (30 млн ₽), ставка вычета ИИС 13 или 15 % — в настройках налогов','Уведомления в Telegram оформлены аккуратнее; звук интерфейса убран','Исправлено: дробные количества при импорте отчётов, доходность XIRR при неупорядоченных потоках, ошибка дюрации у дефолтных бумаг, кнопка «Повторить» на карте рынка, повторные фоновые пересчёты, вход по адресу [::1]']],
@@ -33591,7 +33824,7 @@ const CHANGELOG=[
  ['0.18','12.11.2026',['<b>Новое название — TAnalytic</b> (ранее T-Invest Analytics). Ваши данные и настройки остаются на месте','<b>Ключ из бота действует 7 дней</b> вместо суток','<b>Демо-портфель</b>: на первом экране можно посмотреть программу на модельном портфеле облигаций, не вводя токен','<b>Оферты и сравнение с аналогами</b>: вместо подсказок «предъявить / держать» — сравнение доходностей к оферте, к погашению и медианы похожих выпусков','<b>Калькулятор</b>: из типов счёта оставлены обычный счёт и ИИС-3 — с 2024 года открыть ИИС типа А или Б нельзя','Календарь размещений и отчётность МСФО теперь разбираются на сервере данных — меньше поломок при изменении сайтов-источников','Защита локального сервера программы от запросов с чужих сайтов']],
  ['0.17','12.11.2026',['<b>Оферты PUT и CALL</b>: тип каждой оферты по данным Мосбиржи, все будущие даты (не только ближайшие), фильтры по сроку и типу; у одного выпуска могут быть обе','<b>Помощник по оферте</b>: когда эмитент объявит новый купон, подсказка — оставить бумагу или предъявить, и даты подачи заявки','<b>Доходность с учётом колла</b>: для CALL — худшая из доходностей к погашению и к колл-дате; лесенка переносит ступень только на пут-оферту','<b>Календарь и Telegram</b>: приём заявок, последний день и выкуп по пут-оферте, возможный колл; напоминания от @tanalyticbot','<b>Сравнение облигаций</b> рядом (до 4) и <b>документы выпуска</b> в карточке: раскрытие информации эмитента и страница на Мосбирже','<b>Налоги</b>: прогноз на 31 декабря и какие убыточные бумаги продать до конца года, чтобы уменьшить налог (с учётом ЛДВ)','<b>Калькулятор</b>: цель по пассивному доходу — сколько нужно капитала и сколько докладывать в месяц','<b>Тарифы Free и Pro</b>: портфель бесплатно, инструменты анализа — в Pro; новым пользователям 7 дней Pro в подарок','<b>Первый запуск по шагам</b>, карточка <b>«Сегодня»</b> на обзоре, <b>база знаний</b>, понятные настройки и раздел «Данные на компьютере»','Исправлено: LQDT и TMOS на графике доходности после перевода фондов на другой режим торгов; песочница больше не включена по умолчанию']],
  ['0.16','12.11.2026',['<b>Вход по ключу из Telegram-бота</b> @tanalyticbot: ключ действует 7 дней, новый — командой /key. Токен Т-Инвестиций остаётся только на этом компьютере','<b>Приложения для macOS и Windows</b>: скачать и открыть, без установки Python; программа обновляется сама, окно загрузки с прогрессом','<b>«Лесенка облигаций»</b>: вкладка «Мой портфель» — когда вернутся деньги по годам и кварталам, перегруженные и пустые годы, таблица по периодам','<b>«Первичка»</b>: объём выпуска, сколько размещено, оборот за день и разбивка по дням для новых выпусков','<b>«Ставки»</b>: понятная кривая КБД — сегодня против выбранной даты, выводы простыми словами и таблица по срокам; подписи дат на графиках больше не наезжают друг на друга']],
- ['0.15','11.11.2026',['<b>Обмены бумаг</b>: ГДР и АДР, обменянные на российские акции (TCS → T, YNDX → YDEX, FIVE → X5, Хэдхантер, Циан, Эталон, ВК), и слияние выпусков учитываются без продажи: история стоимости без провалов, налоговые лоты переходят на новую бумагу с ценой и датой покупки','<b>История стоимости</b>: дивиденды, выплаченные на карту, больше не попадают в остаток на счёте; бумаги после делистинга с нулевой оценкой брокера не держат старую цену — расчёт сходится с фактической стоимостью счетов','<b>Финансы эмитентов по МСФО</b>: отчётность групп (данные smart-lab) для эмитентов с акциями на бирже и их «дочек» (Газпром капитал, ИКС 5 Финанс и др.), отдельные схемы для банков и лизинга; РСБУ остаётся рядом для сравнения','<b>Меню по разделам</b>: «Портфель», «Учёт и планы», «Рынок», «Риски и контроль»; разделы сворачиваются, ненужные можно скрыть в «Настройках»','<b>Быстрый поиск</b> Ctrl+K / ⌘K: разделы, бумаги портфеля и каталога, команды','<b>Скрыть суммы</b> (глаз в шапке): балансы и суммы заменяются точками, проценты остаются — для скриншотов','<b>Облигации</b>: наборы колонок «Основное», «Аналитика», «Календарь»; скринер — фильтры по обороту, типу купона и сроку до оферты; ISIN копируется по клику','<b>Налоги</b>: ожидаемая доплата по прогрессивной шкале, если доходы на нескольких счетах вместе превышают порог; импорт отчётов больше не принимает удержание НДФЛ за дивиденд или купон','<b>Сервер данных</b> (по желанию): данные Мосбиржи, ФНС, ЦБ, рейтингов и МСФО можно брать через свой сервер с общим кэшем; если он недоступен — напрямую. Токен и портфель на сервер не передаются','<b>Подсказка по токену</b> со ссылкой на страницу выпуска токена в Т-Инвестициях','Исправлено: число эмитентов в облигациях, дивиденды в валюте в календаре выплат, себестоимость амортизируемых облигаций в импорте, сброс набранного текста при фоновом обновлении, понятное сообщение о восстановлении копии; строка «не является ИИР» в интерфейсе, PDF и Telegram']],
+ ['0.15','11.11.2026',['<b>Обмены бумаг</b>: ГДР и АДР, обменянные на российские акции (TCS → T, YNDX → YDEX, FIVE → X5, Хэдхантер, Циан, Эталон, ВК), и слияние выпусков учитываются без продажи: история стоимости без провалов, налоговые лоты переходят на новую бумагу с ценой и датой покупки','<b>История стоимости</b>: дивиденды, выплаченные на карту, больше не попадают в остаток на счёте; бумаги после делистинга с нулевой оценкой брокера не держат старую цену — расчёт сходится с фактической стоимостью счетов','<b>Финансы эмитентов по МСФО</b>: отчётность групп (данные smart-lab) для эмитентов с акциями на бирже и их «дочек» (Газпром капитал, ИКС 5 Финанс и др.), отдельные схемы для банков и лизинга; РСБУ остаётся рядом для сравнения','<b>Меню по разделам</b>: «Портфель», «Учёт и планы», «Рынок», «Риски и контроль»; разделы сворачиваются, ненужные можно скрыть в «Настройках»','<b>Быстрый поиск</b> Ctrl+K / ⌘K: разделы, бумаги портфеля и каталога, команды','<b>Скрыть суммы</b> (глаз в шапке): балансы и суммы заменяются точками, проценты остаются — для скриншотов','<b>Облигации</b>: наборы колонок «Основное», «Аналитика», «Календарь»; скринер — фильтры по обороту, типу купона и сроку до оферты; ISIN копируется по клику','<b>Налоги</b>: ожидаемая доплата по прогрессивной шкале, если доходы на нескольких счетах вместе превышают порог; импорт отчётов больше не принимает удержание НДФЛ за дивиденд или купон','<b>Сервер данных</b> (по желанию): данные Мосбиржи, ФНС, ЦБ, рейтингов и МСФО можно брать через свой сервер с общим кэшем; если он недоступен — напрямую. Токен на сервер не передаётся никогда; портфель уходит на сервер только если вы сами включили синхронизацию между устройствами, и только в зашифрованном на вашем компьютере виде (с версии 0.31)','<b>Подсказка по токену</b> со ссылкой на страницу выпуска токена в Т-Инвестициях','Исправлено: число эмитентов в облигациях, дивиденды в валюте в календаре выплат, себестоимость амортизируемых облигаций в импорте, сброс набранного текста при фоновом обновлении, понятное сообщение о восстановлении копии; строка «не является ИИР» в интерфейсе, PDF и Telegram']],
  ['0.14','11.11.2026',['<b>Налоги по лотам</b> (FIFO): налог по годам против удержанного брокером, ЛДВ по датам покупки и когда она наступит, ИИС (А, Б, ИИС-3), перенос убытков прошлых лет, курсовые разницы по курсу ЦБ, подсказки до конца года, сводка для 3-НДФЛ','<b>Ребалансировка с учётом налога</b>: сначала лоты с убытком или с наступившей ЛДВ','<b>Точная история стоимости портфеля</b>: исправлены фьючерсы (в кэш попадала условная стоимость контракта), одна бумага под разными идентификаторами, сплиты и консолидации, амортизация и задержка купона — исчезли ложные скачки до ±24 % в день, доходность за период и просадка теперь совпадают с XIRR по пополнениям','Рейтинги эмитентов на странице «Эмитенты» берутся из данных облигаций портфеля']],
  ['0.13','11.11.2026',['<b>«Эмитенты»</b>: отчётность компаний из ГИР БО ФНС (выручка, прибыль, долг, капитал за несколько лет), скоринг 0–100 с объяснением баллов, «рынок оценивает риск выше или ниже, чем следует из отчётности», кредитная история; блок «Финансы эмитента» в карточке облигации','<b>«Наблюдение»</b>: бумаги вне портфеля с тревогами и целями по доходности и цене, ★ в скринере и карточке; <b>дневник</b> с напоминаниями пересмотреть','<b>Уведомления в личный Telegram-бот</b> (по желанию): тревоги, цели, выплаты, ежедневная сводка','<b>«Календарь событий»</b>: заседания ЦБ, купоны, погашения, амортизации, оферты, размещения, бумаги из наблюдения; экспорт в Google/Apple Календарь (.ics)','<b>Первичка против вторички</b>: как торгуются новые выпуски через 1, 7 и 30 дней по рейтингам и отраслям','<b>«Ставки»</b>: кривая КБД сейчас против 1–12 месяцев назад и история спредов по рейтингам','<b>Зашифрованная резервная копия</b> (AES-256) в папку облачного диска, автоматически раз в день, с восстановлением; <b>экспорт таблиц</b> в Excel и CSV','Токены и пароли не попадают в обычную резервную копию']],
  ['0.12','11.11.2026',['<b>«Сравнение с рынком»</b>: портфель против индексов облигаций Мосбиржи (ОФЗ, корпоративные, ВДО), фондов ликвидности и облигационных фондов; «те же деньги в те же дни» в рублях; волатильность, просадка, коэффициент Шарпа, бета; ликвидность позиций и премия к фонду ликвидности','<b>«Калькулятор»</b> инвестиций: пополнения, реинвест купонов с округлением до лотов, налоги 13/15 %, ИИС-3 и ЛДВ, инфляция по прогнозу ЦБ, сценарии ключевой ставки, ожидаемые потери от дефолтов, сравнение стратегий и расчёт цели «пассивный доход в месяц»','<b>«Оферты»</b>: держать, предъявить к выкупу или продать на бирже — с учётом нового купона и доходности аналогов','<b>«Лесенка облигаций»</b>: подбор бумаг под сумму, срок и минимальный рейтинг с графиком выплат','Дюрационный разрыв и <b>реальная доходность</b> (за вычетом инфляции) в «Рисках и сценариях»','Флоатеры и амортизации в <b>календаре выплат</b> — по прогнозу ключевой ставки','Линия фонда ликвидности на карте рынка и в скринере','Быстрый повторный запуск: данные открываются сразу и обновляются в фоне; автотесты расчётов']],
@@ -33687,7 +33920,7 @@ function bindPage(){
   if(S.page==='pos'){sortable('#ptab','sort');const pt=$('#ptype');if(pt)pt.onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;S.posType=b.dataset.t;render()}}
   if(S.page==='bonds')sortable('#btab','bsort');
   if(S.page==='ops'){let to;$('#oq').oninput=e=>{clearTimeout(to);to=setTimeout(()=>{S.opsQ=e.target.value;S.opsN=200;drawOps()},150)};
-    $('#ok').onclick=e=>{const b=e.target.closest('[data-k]');if(!b)return;S.opsK=b.dataset.k;S.opsN=200;$('#ok').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));drawOps()};drawOps()}
+    $('#ok').onclick=e=>{const b=e.target.closest('[data-k]');if(!b)return;S.opsK=b.dataset.k;S.opsN=200;$('#ok').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));drawOps()};drawOps();try{manualBindOps()}catch(x){}}
 }
 
 /* заставка: скрывается после первой отрисовки страницы, по таймеру (8 с) или при ошибке запуска */
@@ -36048,7 +36281,9 @@ function authOverlay(show,err){
     <div class="logo"><i>${typeof LOGO_SVG==='function'?LOGO_SVG(28):''}</i>
       <div>TAnalytic<small>аналитика портфеля</small></div></div>
     <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует 7 дней.</p>
-    <a class="btn" id="lg-bot" href="https://t.me/${bot}?start=app" target="_blank" rel="noopener noreferrer">Открыть @${bot}</a>
+    <button class="btn" id="lg-one" type="button">Войти через Telegram</button>
+    <div class="lg-n" id="lg-one-st" style="display:none" role="status"></div>
+    <a class="btn ghost" id="lg-bot" href="https://t.me/${bot}?start=app" target="_blank" rel="noopener noreferrer">Открыть @${bot} и взять ключ</a>
     <form id="lg-form" autocomplete="off">
       <input class="in" id="lg-key" placeholder="TIA-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" autofocus>
       <div class="lg-err" id="lg-err" style="display:${err?'':'none'}">${esc(err||'')}</div>
@@ -36065,7 +36300,31 @@ function authOverlay(show,err){
     catch(x){er.textContent=x.message||'Не удалось войти';er.style.display=''}
     finally{AUTH.busy=false;b.disabled=false}
   };
+  $('#lg-one').onclick=authOneClick;
   setTimeout(()=>inp.focus(),30);
+}
+/* Вход в один клик: ссылка в бота, подтверждение в Telegram, ключ приходит сам (без копирования) */
+let authLinkTimer=0;
+async function authOneClick(){
+  const st=$('#lg-one-st'),b=$('#lg-one'),er=$('#lg-err');if(!st||!b||AUTH.busy)return;
+  const say=t=>{st.textContent=t;st.style.display=t?'':'none'};
+  clearTimeout(authLinkTimer);er.style.display='none';b.disabled=true;
+  try{
+    const r=await post('/api/auth/link/start');
+    const a=document.createElement('a');a.href=r.url;a.target='_blank';a.rel='noopener noreferrer';document.body.appendChild(a);a.click();a.remove();
+    say('Откройте Telegram и нажмите «Подтвердить вход» в чате с ботом. Жду подтверждения…');
+    const until=Date.now()+(r.ttl+20)*1000;
+    const poll=async()=>{
+      if(!$('#lg-one-st'))return;
+      try{
+        const p=await post('/api/auth/link/poll');
+        if(p.state==='approved'){AUTH.st=p.auth;authApply();try{load(false)}catch(x){}return}
+        if(p.state==='expired'||Date.now()>until){say('Время подтверждения вышло. Нажмите кнопку ещё раз или вставьте ключ вручную.');b.disabled=false;return}
+      }catch(x){say(x.message||'Не удалось проверить подтверждение.');b.disabled=false;return}
+      authLinkTimer=setTimeout(poll,2000);
+    };
+    authLinkTimer=setTimeout(poll,2000);
+  }catch(x){say('');er.textContent=x.message||'Не удалось начать вход';er.style.display='';b.disabled=false}
 }
 function authApply(){
   const s=AUTH.st;if(!s)return;
@@ -36287,7 +36546,8 @@ const KB=[
 <p><b>Pro</b> — инструменты анализа: скринер и сравнение облигаций, лесенка, сигналы, риски и сценарии, мониторинг, карта рынка, сравнение доходностей по оферте, прогноз налога на 31 декабря и уведомления в Telegram.</p>
 <p><b>Пробный период.</b> Новому пользователю бот <b>@tanalyticbot</b> сам даёт 7 дней Pro после первого согласия на обработку данных. За два дня до конца и в день окончания бот пришлёт напоминание.</p>
 <p><b>Как получить Pro.</b> Оплата пока не подключена: напишите боту команду <code>/pro</code> — он покажет, что входит в Pro и к кому обратиться. После выдачи Pro программа подхватит его в течение минуты, перезапускать её не нужно.</p>
-<p><b>Токен Т-Инвестиций</b> хранится только на вашем компьютере и никогда не передаётся боту или серверу данных, на любом тарифе. Тариф влияет лишь на набор функций программы. Если Pro закончился, ваши данные остаются на месте, закрываются только страницы Pro.</p>`}
+<p><b>Токен Т-Инвестиций</b> хранится только на вашем компьютере и никогда не передаётся боту или серверу данных, на любом тарифе. Тариф влияет лишь на набор функций программы. Если Pro закончился, ваши данные остаются на месте, закрываются только страницы Pro.</p>
+<p><b>Синхронизация между устройствами</b> выключена, пока вы её не включите (Настройки, раздел «Данные»). Если включить, на сервер уходит копия счетов, операций, наблюдения и дневника, <b>зашифрованная на вашем компьютере кодовой фразой</b>: сервер и бот прочитать её не могут. Токен Т-Инвестиций не уходит и в этом режиме. Кодовую фразу восстановить нельзя: потеряв её, копию придётся удалить и создать заново.</p>`}
 ];
 
 /* текст статьи без тегов — для поиска */

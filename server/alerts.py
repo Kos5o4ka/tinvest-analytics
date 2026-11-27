@@ -632,6 +632,18 @@ class AlertStore:
         return "ok"
 
 
+def prefs_of(store, tg_id):
+    """Личные тихие часы и часовой пояс из настроек бота (/quiet): (с, до, UTC-смещение). Нет колонок (старая база) — (None, None, 3)."""
+    try:
+        r = store.conn().execute("SELECT quiet_from, quiet_to, tz_offset FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return None, None, 3
+    if not r:
+        return None, None, 3
+    tz = r[2] if isinstance(r[2], int) and -12 <= r[2] <= 14 else 3
+    return r[0], r[1], tz
+
+
 def summary(sub):
     return {"goals": len(sub.get("goals") or []), "reminders": len(sub.get("reminders") or []),
             "offers": len(sub.get("offers") or []), "pays": len(sub.get("pays") or []), "pay_days": sub.get("pay_days") or 0}
@@ -645,6 +657,51 @@ def msk_now(now):
 def quiet(now, start=22, end=8):
     h = msk_now(now).hour
     return (h >= start or h < end) if start > end else start <= h < end
+
+
+def local_now(now, tz_offset=3):
+    return datetime.fromtimestamp(now, timezone(timedelta(hours=tz_offset)))
+
+
+def quiet_local(now, tz_offset, start, end):
+    """Тихие часы по местному времени пользователя (то же правило, что в боте: начало == конец — нет тихих часов)."""
+    if start is None or end is None or start == end:
+        return False
+    h = local_now(now, tz_offset).hour
+    return (h >= start or h < end) if start > end else start <= h < end
+
+
+DIGEST_MIN, DIGEST_LINES, DIGEST_HEAD = 3, 14, "<b>Сводка событий по вашему портфелю и наблюдению</b>"
+
+
+def _digest_lines(text):
+    """Строки сводки из текста сообщения: абзацы после заголовка; в длинном абзаце (список выплат) — первые строки и счётчик."""
+    pars = [p for p in text.split("\n\n") if p.strip()]
+    out = []
+    for p in (pars[1:] if len(pars) > 1 else pars):
+        ls = [x.strip()[:200] for x in p.split("\n") if x.strip()]
+        out += ls[:4] + (["…и ещё %d" % (len(ls) - 4)] if len(ls) > 4 else [])
+    return out
+
+
+def coalesce_messages(msgs, urgent=lambda keys: False):
+    """Несколько сообщений за одну проверку склеиваются в один дайджест (срочные остаются отдельными). Дайджест берёт сообщения
+    целиком, пока в нём не больше DIGEST_LINES строк; остальные не отправляются и не помечаются отправленными: попадут в следующую
+    проверку. -> (что отправить сейчас, [(текст, ключи)], отложено)."""
+    keep = [m for m in msgs if urgent(m[1])]
+    rest = [m for m in msgs if not urgent(m[1])]
+    if len(rest) < DIGEST_MIN:
+        return msgs, 0
+    lines, keys, used = [], [], 0
+    for text, ks in rest:
+        ln = _digest_lines(text)
+        if lines and len(lines) + len(ln) > DIGEST_LINES:
+            break
+        lines += ln
+        keys += ks
+        used += 1
+    digest = DIGEST_HEAD + "\n\n" + "\n".join("• " + x for x in lines) + "\n\n<i>Подробности — в приложении TAnalytic.</i>"
+    return keep + [(digest, keys)], len(rest) - used
 
 
 def build_messages(sub, quotes, today, sent):
@@ -699,18 +756,26 @@ class AlertChecker:
                 stats["purged"] += 1
             elif st == "ok":
                 live.append(uid)
-        if live and not (self.quiet_hours and quiet(now, *self.quiet_hours)):
-            today = msk_now(now).strftime("%Y-%m-%d")
-            subs = {uid: (self.store.get(uid) or {}).get("sub") or {} for uid in live}
+        if live:
+            st_now = {}
+            for uid in live:                     # у каждого свой часовой пояс и тихие часы (настройки бота /quiet)
+                qf, qt, tz = prefs_of(self.store, uid)
+                if qf is None or qt is None:
+                    qf, qt = self.quiet_hours if self.quiet_hours else (None, None)
+                st_now[uid] = (tz, quiet_local(now, tz, qf, qt))
+            subs = {uid: (self.store.get(uid) or {}).get("sub") or {} for uid in live if not st_now[uid][1]}
             need = {g["isin"] for s in subs.values() for g in s.get("goals") or []
                     if g.get("target_yield") is not None or g.get("target_price") is not None}
-            q = self.quotes(need)
+            q = self.quotes(need) if subs else {}
             for uid, sub in subs.items():
                 if not self.store.get(uid):
                     continue
                 stats["users"] += 1
+                today = local_now(now, st_now[uid][0]).strftime("%Y-%m-%d")
                 sent = set(self.store.sent_keys(uid))
-                for text, keys in build_messages(sub, q, today, sent):
+                msgs, deferred = coalesce_messages(build_messages(sub, q, today, sent), lambda ks: any(k.startswith("ofr|") and k.endswith("|close") for k in ks))
+                stats["deferred"] = stats.get("deferred", 0) + deferred
+                for text, keys in msgs:
                     if not self.store.get(uid):
                         break
                     sev = 2 if any(k.startswith("ofr|") and k.endswith("|close") for k in keys) else 0
