@@ -94,7 +94,7 @@ function bnPremium(d){
 }
 function pBench(){
   const e=bnCur();
-  if(!e){bnLoadData();return`<div class="card">${bnPerSeg()}${waitBox('Сравниваю портфель с индексами и фондами Мосбиржи. Первый раз это может занять несколько минут (загружается история цен и оценивается ликвидность), потом данные берутся из локального кэша…')}</div>`}
+  if(!e){bnLoadData();return`<div class="card">${bnPerSeg()}${waitChart('Сравниваю портфель с индексами и фондами Мосбиржи. Первый раз это может занять несколько минут (загружается история цен и оценивается ликвидность), потом данные берутся из локального кэша…')}</div>`}
   const d=e.d;
   if(d.error)return bnPerSeg()+`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="bn-retry">Повторить</button></div>`;
   const p=d.portfolio,B=c=>d.bench.find(b=>b.code===c&&b.available),lq=B('LQDT'),cb=B('RUCBTRNS');

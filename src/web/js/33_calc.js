@@ -43,6 +43,7 @@ function clEnv(P,F,startDate,rng){
   const fsp=lq.estimate?(lq.spread!=null?lq.spread:.7):Math.max(0,Math.min(3,kr0-lq.yield));
   const fundRate=k=>(!lq.estimate&&k<2&&!rng)?lq.yield:Math.max(key(k)-fsp,.1);
   const dsp=F.depSpread!=null?+F.depSpread:(P.deposit?P.deposit.spread:1.5);
+  const depFix=F.depFixed!==''&&F.depFixed!=null&&isFinite(+F.depFixed)?Math.max(+F.depFixed,.1):null;   /* своя ставка вклада, % годовых, вместо «ключевая − спред» */
   const st=P.stocks||{div:8,growth:6,sigma:22},sg=(+F.stkSig||st.sigma||22)/100,gr=F.stkGrow!==''&&F.stkGrow!=null?+F.stkGrow:st.growth;
   const fxs=P.fx_bonds||{yield:6,fx:5,sigma:12};
   /* индексы накопления: фонд ликвидности, цена акций (с шоками, коррелированными с ключевой), курс валюты */
@@ -50,7 +51,16 @@ function clEnv(P,F,startDate,rng){
   for(let k=0;k<M-1;k++){G.push(G[k]*(1+fundRate(k)/1200));
     let ze=0,zf=0;if(rng){ze=-.3*zq[k+1]+.954*rng.n();zf=.4*ze+.917*rng.n()}
     E.push(E[k]*Math.exp(mu-(rng?sm*sm/2:0)+sm*ze));X.push(X[k]*Math.exp(fxm-(rng?fsm*fsm/2:0)+fsm*zf))}
-  return{key,kr0,D,fundRate,depRate:k=>Math.max(key(k)-dsp,.1),y0,m0,infl:io!=null?io:last+ish,iy,G,E,X,stDiv:(F.stkDiv!==''&&F.stkDiv!=null?+F.stkDiv:st.div),rng};
+  return{key,kr0,D,fundRate,depRate:k=>depFix!=null?depFix:Math.max(key(k)-dsp,.1),y0,m0,infl:io!=null?io:last+ish,iy,G,E,X,stDiv:(F.stkDiv!==''&&F.stkDiv!=null?+F.stkDiv:st.div),rng};
+}
+/* точка обгона вклада: первый месяц k ≥ 1, начиная с которого капитал бумаги после налогов выше капитала вклада до конца срока.
+   cur, dep — массивы cap (по месяцам 0..N). {beats:false, ever} — до конца срока обгона нет (ever: на каком-то отрезке бумага всё же была впереди) */
+function clOvertake(cur,dep){
+  const N=Math.min(cur.length,dep.length)-1;if(!(N>=1))return{beats:false,ever:false};
+  let ever=false;for(let k=1;k<=N;k++)if(cur[k]>dep[k]){ever=true;break}
+  if(!(cur[N]>dep[N]))return{beats:false,ever};
+  let k=N;while(k>1&&cur[k-1]>dep[k-1])k--;
+  return{beats:true,month:k,ever:true,gap:cur[N]-dep[N]};
 }
 function clContrib(p,k){return k===0?p.start:(k<=p.months?p.monthly*Math.pow(1+p.idx/100,Math.floor((k-1)/12)):0)}
 /* счёт: вычет ИИС-3 (ставка и потолок по зарплатному НДФЛ), срок по году открытия, освобождение дохода до 30 млн ₽ */

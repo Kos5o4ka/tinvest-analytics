@@ -1,14 +1,12 @@
 /* ── Позиции ── */
 function taCsvDownload(filename, headers, rows){
-  const escCell=v=>{const s=v==null?'':String(v);return/[;"\r\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
-  const lines=[headers.map(escCell).join(';')].concat(rows.map(r=>r.map(escCell).join(';')));
-  const blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8;'});
+  const blob=new Blob([taCsvText(headers,rows)],{type:'text/csv;charset=utf-8;'});
   const url=URL.createObjectURL(blob),a=document.createElement('a');
   a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();
   setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function taCsvBtn(id,title){
-  return`<button type="button" class="btn ghost tbl-csv noprint" id="${id}" title="${esc(title||'Скачать таблицу в CSV')}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',1.8)}Экспорт CSV</button>`;
+  return`<button type="button" class="btn ghost tbl-csv noprint" id="${id}" title="${esc(title||'Скачать таблицу в CSV')}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',1.8)}Скачать CSV</button>`;
 }
 
 S.posGroup=lsGet('ta_pos_group')||'flat';
