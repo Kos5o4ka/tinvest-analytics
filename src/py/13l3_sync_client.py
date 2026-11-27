@@ -161,6 +161,13 @@ def sync_run(reason=""):
     return sync_status()
 
 
+SYNC_LOCAL_RETRIES = 2                  # сколько раз повторить цикл, если локальные данные изменились во время обмена
+
+
+def _sync_dels_get(st):
+    return dict(st.get(SYNC_DELS_KEY) or {})
+
+
 def _sync_run(cfg):
     st = store()
     master, salt = bytes.fromhex(cfg["sync_master"]), cfg["sync_salt"]
@@ -168,17 +175,33 @@ def _sync_run(cfg):
     base = st.get(SYNC_BASE_KEY) or {}
     device = sync_device_name(cfg)
     now = time.time()
-    cur = sync_collect(cfg, st)
-    for _attempt in range(4):
+    local_tries, conflicts = 0, 0
+    while True:
+        cur, dels = sync_collect(cfg, st), _sync_dels_get(st)
         code, j = sync_req("GET", "pull")
         if code != 200 or not j.get("ok"):
             raise ApiError("Сервер ответил %d на запрос облачной копии." % code, 502)
         queue = j.get("queue_items") or []
+        warning = ""
+        use_base = base
         if j.get("exists"):
             if j.get("salt") != salt:
                 raise ApiError("Облачная копия создана с другой кодовой фразой. Выключите синхронизацию и подключитесь заново.", 409)
-            remote, tombs_r = sync_unpack(sync_open(master, base64.b64decode(j["blob"])))
+            doc = sync_doc(sync_open(master, base64.b64decode(j["blob"])))
+            remote, tombs_r = doc["recs"], dict(doc.get("tombs") or {})
             rev = int(j["rev"])
+            if doc.get("rev") is not None and int(doc["rev"]) != rev:
+                raise ApiError("Облачная копия не соответствует номеру версии на сервере (подмена блока или сбой сервера). "
+                               "Данные на этом компьютере не тронуты.", 409)
+            if doc.get("salt") not in (None, salt):
+                raise ApiError("Облачная копия создана с другой кодовой фразой. Выключите синхронизацию и подключитесь заново.", 409)
+            if rev < int(state.get("rev") or 0):
+                # сервер вернул версию старее той, что уже была: откат или подсунутый старый блок. Удалений из сравнения со
+                # старым состоянием не применяем: данные объединяются, затем уходят в облако как новая версия.
+                warning = ("Сервер вернул более старую версию облачной копии (откат или подмена). Удаления на этот раз не "
+                           "применялись: данные объединены и отправлены заново.")
+                use_base = {"recs": {}, "tombs": base.get("tombs") or {}}
+                tombs_r = {}
         else:
             if state.get("rev"):
                 _sync_off(cfg)
@@ -186,28 +209,45 @@ def _sync_run(cfg):
                                "данные на этом компьютере не тронуты.", 410)
             remote, tombs_r, rev = {}, {}, 0
         qrecs, qids = sync_queue_recs(queue, now)
-        local, tombs_l, base_eff = sync_local_view(cur, base, now)
+        local, tombs_l, base_eff = sync_local_view(cur, use_base, now, dels)
         for rid, r in qrecs.items():
             if rid not in local and not _sync_killed(tombs_l, rid, r):
                 local[rid] = r
         merged, tombs = sync_merge(base_eff.get("recs") or {}, local, remote, tombs_l, tombs_r, now)
         pushed = False
-        if not j.get("exists") or not _sync_recs_equal(merged, remote) or tombs != tombs_r or qids:
-            blob = sync_seal(master, sync_pack(merged, tombs, device, now))
+        if not j.get("exists") or not _sync_recs_equal(merged, remote) or tombs != tombs_r or qids or warning:
+            blob = sync_seal(master, sync_pack(merged, tombs, device, now, rev=rev + 1, salt=salt))
             code, pj = sync_req("POST", "push", {"base_rev": rev, "device": device, "salt": salt, "sha256": hashlib.sha256(blob).hexdigest(),
                                                   "blob": base64.b64encode(blob).decode("ascii"), "ack_queue_ids": qids})
             if code == 409:
+                conflicts += 1
+                if conflicts > 4:
+                    break
                 continue                                    # кто-то успел раньше: заново забираем и сливаем
             if code == 413:
                 raise ApiError("Данные не помещаются в облачную копию (до 4 МБ в сжатом виде).", 413)
             if code != 200 or not pj.get("ok"):
                 raise ApiError("Сервер не принял облачную копию (ответ %d)." % code, 502)
             rev, pushed = int(pj["rev"]), True
-        if not _sync_recs_equal(merged, cur_with_u(cur, merged)):
-            sync_apply(cfg, merged, cur)
-        st.put(SYNC_BASE_KEY, {"recs": merged, "tombs": tombs})
-        return {"rev": rev, "device": device, "pushed": pushed, "records": len(merged), "queue_taken": len(qids)}
-    raise ApiError("Не удалось согласовать изменения: данные одновременно меняют на нескольких устройствах. Повторите позже.", 409)
+        with _man_lock:                                     # тот же замок, что у ручного учёта и импорта
+            if sync_collect(cfg, st) != cur or _sync_dels_get(st) != dels:
+                changed = True
+            else:
+                changed = False
+                if not _sync_recs_equal(merged, cur_with_u(cur, merged)):
+                    sync_apply(cfg, merged, cur)
+                st.put(SYNC_BASE_KEY, {"recs": merged, "tombs": tombs})
+                left = {k: v for k, v in _sync_dels_get(st).items() if k not in dels}
+                st.put(SYNC_DELS_KEY, left)
+        if not changed:
+            return {"rev": rev, "device": device, "pushed": pushed, "records": len(merged), "queue_taken": len(qids), "warning": warning}
+        # Пока шёл обмен, данные на этом компьютере изменились (ручная запись, импорт): прежнее состояние не трогаем, цикл заново.
+        # Облако уже содержит наш результат, трёхстороннее слияние с прежним состоянием учтёт и новые правки.
+        local_tries += 1
+        if local_tries > SYNC_LOCAL_RETRIES:
+            break
+    raise ApiError("Не удалось согласовать изменения: данные одновременно меняют на нескольких устройствах или на этом компьютере. "
+                   "Повторим позже.", 409)
 
 
 def cur_with_u(cur, merged):
@@ -228,7 +268,7 @@ def sync_status(cfg=None):
     srv, key = ds_conf()
     return {"enabled": bool(cfg.get("sync_enabled")), "ready": sync_cfg_ready(cfg), "logged_in": bool(srv and key),
             "rev": st.get("rev") or 0, "at": st.get("at"), "error": st.get("error") or "", "device": st.get("device") or sync_device_name(cfg),
-            "records": st.get("records") or 0, "queue_taken": st.get("queue_taken") or 0}
+            "records": st.get("records") or 0, "queue_taken": st.get("queue_taken") or 0, "warning": st.get("warning") or ""}
 
 
 def sync_run_bg(reason=""):
@@ -308,10 +348,16 @@ def sync_enable(cfg, body):
     save_config(c2)
     store().put(SYNC_BASE_KEY, {})
     store().put(SYNC_STATE_KEY, {})
+    store().put(SYNC_DELS_KEY, {})
     try:
         sync_run("enable")
-    except ApiError:
-        pass
+    except ApiError as e:                       # первый обмен не удался: не говорим «включена», настройки возвращаем как были
+        c3 = load_config()
+        c3["sync_enabled"], c3["sync_master"], c3["sync_salt"] = False, "", ""
+        save_config(c3)
+        store().put(SYNC_BASE_KEY, {})
+        store().put(SYNC_STATE_KEY, {})
+        raise ApiError("Не удалось включить синхронизацию: %s" % e, getattr(e, "status", 502) or 502)
     out = sync_status()
     out["ok"] = True
     if generated:
@@ -332,6 +378,7 @@ def sync_disable(cfg, delete_remote=False):
     save_config(c2)
     store().put(SYNC_BASE_KEY, {})
     store().put(SYNC_STATE_KEY, {})
+    store().put(SYNC_DELS_KEY, {})
     out = sync_status()
     out.update(ok=True, deleted=deleted)
     return out

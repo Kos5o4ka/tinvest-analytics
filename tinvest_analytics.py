@@ -1698,7 +1698,7 @@ def load_config():
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
-    for k in ("token", "data_key"):
+    for k in ("token", "data_key", "sync_master"):
         if isinstance(cfg.get(k), str) and cfg[k].startswith("dpapi:"):
             cfg[k] = _dpapi_unprotect(cfg[k])
     if os.environ.get("TINVEST_TOKEN"):
@@ -1748,7 +1748,7 @@ def save_config(cfg):
                 demo_remove()  # реальный токен заменяет демо-портфель
             except Exception:  # noqa: BLE001
                 pass
-        for k in ("token", "data_key"):
+        for k in ("token", "data_key", "sync_master"):
             if out.get(k):
                 out[k] = _dpapi_protect(str(out[k]))
         _private_write(CONFIG_PATH, json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -7474,6 +7474,17 @@ def sync_kick_safe():
         fn = globals().get("sync_kick")
         if fn:
             fn()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def sync_mark_deleted_safe(acc_id):
+    """Пользователь сам удалил счёт: запомнить как явное удаление для облачной синхронизации (если она включена)."""
+    try:
+        fn = globals().get("sync_mark_deleted")
+        cfg = load_config()
+        if fn and cfg.get("sync_enabled"):
+            fn(acc_id)
     except Exception:  # noqa: BLE001
         pass
 
@@ -19478,7 +19489,9 @@ SYNC_TOMB_DAYS = 180
 SYNC_CFG_KEYS = ("targets", "broker_tariffs")
 SYNC_BASE_KEY, SYNC_STATE_KEY, SYNC_TB_KEY = "sync_base_v1", "sync_state_v1", "tb_accounts_v1"
 SYNC_BOT_ACC = "imp-tgbot"           # ручной счёт для операций, присланных боту
-SYNC_MASS_LOSS = 0.5                  # пропала больше половины записей: считаем, что локальные данные сброшены, а не удалены
+SYNC_MASS_LOSS = 0.5                  # пропала больше половины СЧЕТОВ: считаем, что локальные данные сброшены, а не удалены
+SYNC_MASS_MIN_ACCS = 4                # с меньшим числом счетов долю не считаем (пустая локальная база проверяется отдельно)
+SYNC_DELS_KEY = "sync_dels_v1"        # явные удаления счетов, ещё не отправленные в облако: {rid счёта: время}
 SYNC_SECRET_FIELDS = ("token", "data_key", "backup_password", "sync_master")
 SECRET_KEYS.add("sync_master")
 
@@ -19531,19 +19544,31 @@ def sync_open(master, blob):
     return aes256_ctr(ek, blob[8:20] + b"\0\0\0\0", blob[20:-32])
 
 
-def sync_pack(recs, tombs, device="", now=None):
+def sync_pack(recs, tombs, device="", now=None, rev=None, salt=None):
+    """rev и salt вкладываются в зашифрованные данные (они под HMAC): сервер не сможет незаметно подсунуть старый блок под новым
+    номером версии или блок от другой соли. Старые блоки без этих полей читаются как раньше."""
     doc = {"v": SYNC_V, "device": device, "at": now if now is not None else time.time(), "recs": recs, "tombs": tombs}
+    if rev is not None:
+        doc["rev"] = int(rev)
+    if salt is not None:
+        doc["salt"] = str(salt)
     return zlib.compress(json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 6)
 
 
 def sync_unpack(plain):
+    d = sync_doc(plain)
+    return d["recs"], dict(d.get("tombs") or {})
+
+
+def sync_doc(plain):
+    """Разобранный документ слепка целиком (recs, tombs, rev, salt, device)."""
     try:
         doc = json.loads(zlib.decompress(plain).decode("utf-8"))
     except (zlib.error, ValueError, UnicodeDecodeError):
         raise SyncError("Облачная копия повреждена.")
     if not isinstance(doc, dict) or doc.get("v") != SYNC_V or not isinstance(doc.get("recs"), dict):
         raise SyncError("Облачная копия создана более новой версией программы: обновите TAnalytic.")
-    return doc["recs"], dict(doc.get("tombs") or {})
+    return doc
 
 
 # ───────────── записи слепка ─────────────
@@ -19627,26 +19652,72 @@ def sync_collect(cfg, st=None):
 
 
 def _sync_deletable(rid):
-    """Исчезновение записи считается удалением пользователем. Операции счетов Т-Инвестиций по API не удаляются никогда."""
-    return not rid.startswith("op:tb:")
+    """Исчезновение записи считается удалением пользователем. Счета Т-Инвестиций из API (acc:tb:) и их операции (op:tb:) так
+    не удаляются: токен могли очистить, сменить, включить песочницу, а это не удаление счёта. Явное удаление снимка счёта
+    идёт через надгробие (sync_mark_deleted)."""
+    return not rid.startswith(("op:tb:", "acc:tb:"))
 
 
-def sync_local_view(cur, base, now):
+def _sync_acc_rid(rid):
+    return rid.startswith("acc:") and not rid.startswith("acc:tb:")
+
+
+def sync_mark_deleted(acc_id):
+    """Пользователь сам удалил счёт (импорт, ручной счёт или снимок счёта Т-Инвестиций): запомнить как явное удаление, чтобы
+    эвристика «база сброшена» не вернула счёт из облака. acc_id — код счёта в списке (imp-…)."""
+    acc_id = str(acc_id or "")
+    if not acc_id.startswith("imp-"):
+        return
+    rid = "acc:tb:" + acc_id[len("imp-tb-"):] if acc_id.startswith("imp-tb-") else "acc:" + acc_id
+    st = store()
+    d = dict(st.get(SYNC_DELS_KEY) or {})
+    d[rid] = time.time()
+    st.put(SYNC_DELS_KEY, d)
+
+
+def sync_local_view(cur, base, now, dels=None):
     """Локальные записи с метками времени правки + удаления с прошлой синхронизации. -> (recs, tombs, base_eff).
     Метка записи: прежняя, если запись не менялась с прошлой синхронизации; иначе «сейчас»; без прежнего состояния (первая
-    синхронизация этого устройства) — 0, чтобы в спорах побеждали данные облака. Если пропало больше половины записей
-    (стёрта база, восстановлена копия), это не удаление: прежнее состояние отбрасывается, и данные вернутся из облака."""
+    синхронизация этого устройства) — 0, чтобы в спорах побеждали данные облака.
+    Если пропала большая доля СЧЕТОВ или в базе не осталось ни одного счёта (стёрта база, восстановлена копия), это не удаление:
+    прежнее состояние отбрасывается, и данные вернутся из облака. Одиночное удаление счёта эвристика не считает сбросом, а
+    явные удаления (dels: {acc:<id>: время}) всегда становятся надгробиями. Записи, исчезновение которых не считается удалением
+    (acc:tb:, op:tb:), переносятся в локальный вид без изменений."""
     brecs, btombs = base.get("recs") or {}, dict(base.get("tombs") or {})
-    lost = [rid for rid in brecs if rid not in cur and _sync_deletable(rid)]
-    if len(brecs) >= 20 and len(lost) > len(brecs) * SYNC_MASS_LOSS:
-        base, brecs, lost = {"recs": {}, "tombs": btombs}, {}, []
+    dels = {rid: ts for rid, ts in (dels or {}).items() if rid not in cur}
+    base_accs = [rid for rid in brecs if _sync_acc_rid(rid)]
+    lost_accs = [rid for rid in base_accs if rid not in cur and rid not in dels]
+    if lost_accs and (not any(_sync_acc_rid(rid) for rid in cur)
+                      or (len(base_accs) >= SYNC_MASS_MIN_ACCS and len(lost_accs) > len(base_accs) * SYNC_MASS_LOSS)):
+        base, brecs = {"recs": {}, "tombs": btombs}, {}
+    lost = [rid for rid in brecs if rid not in cur and _sync_deletable(rid) and not _sync_dead_acc(rid, dels)]
     recs = {}
     for rid, r in cur.items():
         b = brecs.get(rid)
         recs[rid] = {"k": r["k"], "v": r["v"], "u": (b.get("u") or 0) if b and _sync_same(b, r) else (r.get("u") or (now if brecs else 0))}
+    for rid, b in brecs.items():
+        if rid not in cur and not _sync_deletable(rid) and not _sync_dead_acc(rid, dels):
+            recs[rid] = dict(b)                                 # исчезло не по воле пользователя: локально «не менялось»
     for rid in lost:
         btombs[rid] = max(now, btombs.get(rid, 0))
+    for arid, ts in dels.items():
+        btombs[arid] = max(ts, btombs.get(arid, 0))
+        lid = arid[4:]
+        for rid in brecs:
+            if rid.startswith("op:" + lid + "|"):
+                btombs[rid] = max(ts, btombs.get(rid, 0))
+                recs.pop(rid, None)
+        recs.pop(arid, None)
     return recs, btombs, base
+
+
+def _sync_dead_acc(rid, dels):
+    """Запись относится к счёту, удалённому явно."""
+    if rid.startswith("acc:"):
+        return rid in dels
+    if rid.startswith("op:"):
+        return ("acc:" + rid[3:].split("|", 1)[0]) in dels
+    return False
 
 
 def _sync_killed(tombs, rid, rec):
@@ -19937,6 +20008,13 @@ def sync_run(reason=""):
     return sync_status()
 
 
+SYNC_LOCAL_RETRIES = 2                  # сколько раз повторить цикл, если локальные данные изменились во время обмена
+
+
+def _sync_dels_get(st):
+    return dict(st.get(SYNC_DELS_KEY) or {})
+
+
 def _sync_run(cfg):
     st = store()
     master, salt = bytes.fromhex(cfg["sync_master"]), cfg["sync_salt"]
@@ -19944,17 +20022,33 @@ def _sync_run(cfg):
     base = st.get(SYNC_BASE_KEY) or {}
     device = sync_device_name(cfg)
     now = time.time()
-    cur = sync_collect(cfg, st)
-    for _attempt in range(4):
+    local_tries, conflicts = 0, 0
+    while True:
+        cur, dels = sync_collect(cfg, st), _sync_dels_get(st)
         code, j = sync_req("GET", "pull")
         if code != 200 or not j.get("ok"):
             raise ApiError("Сервер ответил %d на запрос облачной копии." % code, 502)
         queue = j.get("queue_items") or []
+        warning = ""
+        use_base = base
         if j.get("exists"):
             if j.get("salt") != salt:
                 raise ApiError("Облачная копия создана с другой кодовой фразой. Выключите синхронизацию и подключитесь заново.", 409)
-            remote, tombs_r = sync_unpack(sync_open(master, base64.b64decode(j["blob"])))
+            doc = sync_doc(sync_open(master, base64.b64decode(j["blob"])))
+            remote, tombs_r = doc["recs"], dict(doc.get("tombs") or {})
             rev = int(j["rev"])
+            if doc.get("rev") is not None and int(doc["rev"]) != rev:
+                raise ApiError("Облачная копия не соответствует номеру версии на сервере (подмена блока или сбой сервера). "
+                               "Данные на этом компьютере не тронуты.", 409)
+            if doc.get("salt") not in (None, salt):
+                raise ApiError("Облачная копия создана с другой кодовой фразой. Выключите синхронизацию и подключитесь заново.", 409)
+            if rev < int(state.get("rev") or 0):
+                # сервер вернул версию старее той, что уже была: откат или подсунутый старый блок. Удалений из сравнения со
+                # старым состоянием не применяем: данные объединяются, затем уходят в облако как новая версия.
+                warning = ("Сервер вернул более старую версию облачной копии (откат или подмена). Удаления на этот раз не "
+                           "применялись: данные объединены и отправлены заново.")
+                use_base = {"recs": {}, "tombs": base.get("tombs") or {}}
+                tombs_r = {}
         else:
             if state.get("rev"):
                 _sync_off(cfg)
@@ -19962,28 +20056,45 @@ def _sync_run(cfg):
                                "данные на этом компьютере не тронуты.", 410)
             remote, tombs_r, rev = {}, {}, 0
         qrecs, qids = sync_queue_recs(queue, now)
-        local, tombs_l, base_eff = sync_local_view(cur, base, now)
+        local, tombs_l, base_eff = sync_local_view(cur, use_base, now, dels)
         for rid, r in qrecs.items():
             if rid not in local and not _sync_killed(tombs_l, rid, r):
                 local[rid] = r
         merged, tombs = sync_merge(base_eff.get("recs") or {}, local, remote, tombs_l, tombs_r, now)
         pushed = False
-        if not j.get("exists") or not _sync_recs_equal(merged, remote) or tombs != tombs_r or qids:
-            blob = sync_seal(master, sync_pack(merged, tombs, device, now))
+        if not j.get("exists") or not _sync_recs_equal(merged, remote) or tombs != tombs_r or qids or warning:
+            blob = sync_seal(master, sync_pack(merged, tombs, device, now, rev=rev + 1, salt=salt))
             code, pj = sync_req("POST", "push", {"base_rev": rev, "device": device, "salt": salt, "sha256": hashlib.sha256(blob).hexdigest(),
                                                   "blob": base64.b64encode(blob).decode("ascii"), "ack_queue_ids": qids})
             if code == 409:
+                conflicts += 1
+                if conflicts > 4:
+                    break
                 continue                                    # кто-то успел раньше: заново забираем и сливаем
             if code == 413:
                 raise ApiError("Данные не помещаются в облачную копию (до 4 МБ в сжатом виде).", 413)
             if code != 200 or not pj.get("ok"):
                 raise ApiError("Сервер не принял облачную копию (ответ %d)." % code, 502)
             rev, pushed = int(pj["rev"]), True
-        if not _sync_recs_equal(merged, cur_with_u(cur, merged)):
-            sync_apply(cfg, merged, cur)
-        st.put(SYNC_BASE_KEY, {"recs": merged, "tombs": tombs})
-        return {"rev": rev, "device": device, "pushed": pushed, "records": len(merged), "queue_taken": len(qids)}
-    raise ApiError("Не удалось согласовать изменения: данные одновременно меняют на нескольких устройствах. Повторите позже.", 409)
+        with _man_lock:                                     # тот же замок, что у ручного учёта и импорта
+            if sync_collect(cfg, st) != cur or _sync_dels_get(st) != dels:
+                changed = True
+            else:
+                changed = False
+                if not _sync_recs_equal(merged, cur_with_u(cur, merged)):
+                    sync_apply(cfg, merged, cur)
+                st.put(SYNC_BASE_KEY, {"recs": merged, "tombs": tombs})
+                left = {k: v for k, v in _sync_dels_get(st).items() if k not in dels}
+                st.put(SYNC_DELS_KEY, left)
+        if not changed:
+            return {"rev": rev, "device": device, "pushed": pushed, "records": len(merged), "queue_taken": len(qids), "warning": warning}
+        # Пока шёл обмен, данные на этом компьютере изменились (ручная запись, импорт): прежнее состояние не трогаем, цикл заново.
+        # Облако уже содержит наш результат, трёхстороннее слияние с прежним состоянием учтёт и новые правки.
+        local_tries += 1
+        if local_tries > SYNC_LOCAL_RETRIES:
+            break
+    raise ApiError("Не удалось согласовать изменения: данные одновременно меняют на нескольких устройствах или на этом компьютере. "
+                   "Повторим позже.", 409)
 
 
 def cur_with_u(cur, merged):
@@ -20004,7 +20115,7 @@ def sync_status(cfg=None):
     srv, key = ds_conf()
     return {"enabled": bool(cfg.get("sync_enabled")), "ready": sync_cfg_ready(cfg), "logged_in": bool(srv and key),
             "rev": st.get("rev") or 0, "at": st.get("at"), "error": st.get("error") or "", "device": st.get("device") or sync_device_name(cfg),
-            "records": st.get("records") or 0, "queue_taken": st.get("queue_taken") or 0}
+            "records": st.get("records") or 0, "queue_taken": st.get("queue_taken") or 0, "warning": st.get("warning") or ""}
 
 
 def sync_run_bg(reason=""):
@@ -20084,10 +20195,16 @@ def sync_enable(cfg, body):
     save_config(c2)
     store().put(SYNC_BASE_KEY, {})
     store().put(SYNC_STATE_KEY, {})
+    store().put(SYNC_DELS_KEY, {})
     try:
         sync_run("enable")
-    except ApiError:
-        pass
+    except ApiError as e:                       # первый обмен не удался: не говорим «включена», настройки возвращаем как были
+        c3 = load_config()
+        c3["sync_enabled"], c3["sync_master"], c3["sync_salt"] = False, "", ""
+        save_config(c3)
+        store().put(SYNC_BASE_KEY, {})
+        store().put(SYNC_STATE_KEY, {})
+        raise ApiError("Не удалось включить синхронизацию: %s" % e, getattr(e, "status", 502) or 502)
     out = sync_status()
     out["ok"] = True
     if generated:
@@ -20108,6 +20225,7 @@ def sync_disable(cfg, delete_remote=False):
     save_config(c2)
     store().put(SYNC_BASE_KEY, {})
     store().put(SYNC_STATE_KEY, {})
+    store().put(SYNC_DELS_KEY, {})
     out = sync_status()
     out.update(ok=True, deleted=deleted)
     return out
@@ -30342,23 +30460,28 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/import/parse":
                 return self.send(200, import_parse_info(body))
             if path == "/api/import/commit":
-                return self.send(200, import_commit(client, body))
+                with _man_lock:
+                    res = import_commit(client, body)
+                return self.send(200, res)
             if path == "/api/import/broker":
                 bid = str(body.get("broker_id") or "")
                 if bid not in BROKERS:
                     raise ApiError("Неизвестный брокер.", 400)
-                lst = imports_list()
-                ex = next((x for x in lst if x["id"] == body.get("id")), None)
-                if ex is None:
-                    raise ApiError("Импортированный счёт не найден.", 404)
-                ex["broker_id"] = bid
-                store().put("imports", lst)
+                with _man_lock:
+                    lst = imports_list()
+                    ex = next((x for x in lst if x["id"] == body.get("id")), None)
+                    if ex is None:
+                        raise ApiError("Импортированный счёт не найден.", 404)
+                    ex["broker_id"] = bid
+                    store().put("imports", lst)
                 mem_clear()
                 return self.send(200, {"ok": True, "broker_id": bid})
             if path == "/api/import/delete":
-                lst = [x for x in imports_list() if x["id"] != body.get("id")]
-                store().put("imports", lst)
-                store().ops_clear(body.get("id") or "")
+                with _man_lock:
+                    lst = [x for x in imports_list() if x["id"] != body.get("id")]
+                    store().put("imports", lst)
+                    store().ops_clear(body.get("id") or "")
+                    sync_mark_deleted_safe(body.get("id"))
                 mem_clear()
                 sync_kick_safe()
                 return self.send(200, {"ok": True, "app": APP_NAME})
@@ -36687,7 +36810,7 @@ function setSyncHtml(c){
   const enabled=!!c.sync_enabled;
   const what='<b>Что уходит на сервер:</b> счета из отчётов брокеров и ручные счета с их операциями (даты, бумаги, количество, суммы), '+
     'снимки счетов Т-Инвестиций (только операции, без токена), список наблюдения, дневник (вместе с текстом заметок), цели ребалансировки, тарифы брокеров и налоговые настройки. '+
-    '<b>Что не уходит никогда:</b> токен Т-Инвестиций, ключ входа, пароль резервной копии и рыночный кэш.';
+    '<b>Что не уходит никогда:</b> токен Т-Инвестиций, пароль резервной копии, кодовая фраза и рыночный кэш. Ключ из Telegram-бота нужен серверу только для доступа к вашей копии и не позволяет расшифровать данные. Сервер при этом видит размер блока, время обновления и имя устройства.';
   const how='Всё это сжимается и шифруется <b>на вашем компьютере</b> ключом из кодовой фразы (AES-256). На сервере лежит только шифрованный блок: ни администратор сервера, ни бот прочитать его не могут. '+
     'Поэтому бот не показывает ваш портфель. <b>Потеряете кодовую фразу — расшифровать копию не сможет никто</b>: её придётся удалить и создать заново. '+
     'Одно исключение: сделки, которые вы отправили боту командами <code>/buy</code> и <code>/sell</code>, лежат на сервере открытым текстом, пока программа не заберёт их при ближайшей синхронизации.';
@@ -36711,8 +36834,8 @@ function bindSetSync(c,msg){
     const el=g('sy-st');if(!el)return;
     try{
       const s=await api('/api/sync');
-      el.textContent=(s.error?'Ошибка: '+s.error+' ':'')+(s.at?`Последняя синхронизация: ${authTime(s.at)}, версия ${s.rev}, устройство «${s.device}», записей: ${s.records}.`:'Ещё не синхронизировано.');
-      el.classList.toggle('st-err',!!s.error);
+      el.textContent=(s.error?'Ошибка: '+s.error+' ':'')+(s.warning?'Внимание: '+s.warning+' ':'')+(s.at?`Последняя синхронизация: ${authTime(s.at)}, версия ${s.rev}, устройство «${s.device}», записей: ${s.records}.`:'Ещё не синхронизировано.');
+      el.classList.toggle('st-err',!!(s.error||s.warning));
     }catch(e){el.textContent=e.message||''}
   };
   const need=g('sy-need');

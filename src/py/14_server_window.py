@@ -320,23 +320,28 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/import/parse":
                 return self.send(200, import_parse_info(body))
             if path == "/api/import/commit":
-                return self.send(200, import_commit(client, body))
+                with _man_lock:
+                    res = import_commit(client, body)
+                return self.send(200, res)
             if path == "/api/import/broker":
                 bid = str(body.get("broker_id") or "")
                 if bid not in BROKERS:
                     raise ApiError("Неизвестный брокер.", 400)
-                lst = imports_list()
-                ex = next((x for x in lst if x["id"] == body.get("id")), None)
-                if ex is None:
-                    raise ApiError("Импортированный счёт не найден.", 404)
-                ex["broker_id"] = bid
-                store().put("imports", lst)
+                with _man_lock:
+                    lst = imports_list()
+                    ex = next((x for x in lst if x["id"] == body.get("id")), None)
+                    if ex is None:
+                        raise ApiError("Импортированный счёт не найден.", 404)
+                    ex["broker_id"] = bid
+                    store().put("imports", lst)
                 mem_clear()
                 return self.send(200, {"ok": True, "broker_id": bid})
             if path == "/api/import/delete":
-                lst = [x for x in imports_list() if x["id"] != body.get("id")]
-                store().put("imports", lst)
-                store().ops_clear(body.get("id") or "")
+                with _man_lock:
+                    lst = [x for x in imports_list() if x["id"] != body.get("id")]
+                    store().put("imports", lst)
+                    store().ops_clear(body.get("id") or "")
+                    sync_mark_deleted_safe(body.get("id"))
                 mem_clear()
                 sync_kick_safe()
                 return self.send(200, {"ok": True, "app": APP_NAME})

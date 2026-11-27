@@ -74,7 +74,7 @@ def load_config():
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
-    for k in ("token", "data_key"):
+    for k in ("token", "data_key", "sync_master"):
         if isinstance(cfg.get(k), str) and cfg[k].startswith("dpapi:"):
             cfg[k] = _dpapi_unprotect(cfg[k])
     if os.environ.get("TINVEST_TOKEN"):
@@ -124,7 +124,7 @@ def save_config(cfg):
                 demo_remove()  # реальный токен заменяет демо-портфель
             except Exception:  # noqa: BLE001
                 pass
-        for k in ("token", "data_key"):
+        for k in ("token", "data_key", "sync_master"):
             if out.get(k):
                 out[k] = _dpapi_protect(str(out[k]))
         _private_write(CONFIG_PATH, json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8"))

@@ -161,6 +161,84 @@ class LocalView(unittest.TestCase):
         self.assertEqual(set(tombs), {"watch:X"})
 
 
+def _acc(i, k="acc"):
+    return {"k": k, "v": {"id": i, "name": i}, "u": 1}
+
+
+class LocalViewAccounts(unittest.TestCase):
+    """SYNC-R1/R3: потери считаются по счетам; явное удаление не отменяется; счета Т-Инвестиций не удаляются по исчезновению."""
+
+    def base_with(self, n, ops_each=30):
+        recs = {}
+        for i in range(n):
+            recs["acc:imp-%d" % i] = _acc("imp-%d" % i)
+            for j in range(ops_each):
+                recs["op:imp-%d|o%d" % (i, j)] = {"k": "op", "v": {"id": "o%d" % j}, "u": 1}
+        return {"recs": recs, "tombs": {}}
+
+    def test_deleting_one_big_account_sticks(self):
+        base = self.base_with(3)
+        base["recs"].update({"op:imp-9|o%d" % j: {"k": "op", "v": {"id": j}, "u": 1} for j in range(300)})
+        base["recs"]["acc:imp-9"] = _acc("imp-9")
+        cur = {k: dict(v) for k, v in base["recs"].items() if "imp-9" not in k}
+        recs, tombs, eff = M.sync_local_view(cur, base, 500.0)
+        self.assertIn("acc:imp-9", tombs)                          # удаление не принято за сброс базы
+        self.assertTrue(eff["recs"])
+
+    def test_explicit_deletion_of_the_only_account(self):
+        base = self.base_with(1)
+        recs, tombs, eff = M.sync_local_view({}, base, 500.0, {"acc:imp-0": 400.0})
+        self.assertEqual(tombs["acc:imp-0"], 400.0)
+        self.assertTrue(eff["recs"])                               # прежнее состояние не отброшено
+        merged, _t = M.sync_merge(eff["recs"], recs, base["recs"], tombs, {}, 500.0)
+        self.assertEqual([r for r in merged if r.startswith(("acc:", "op:"))], [])
+
+    def test_without_explicit_mark_empty_local_is_reset(self):
+        base = self.base_with(1)
+        recs, tombs, eff = M.sync_local_view({}, base, 500.0)
+        self.assertEqual((tombs, eff["recs"]), ({}, {}))
+
+    def test_majority_of_accounts_lost_is_reset(self):
+        base = self.base_with(6, 5)
+        cur = {k: v for k, v in base["recs"].items() if k.endswith(("imp-0",)) or "|" in k and "imp-0" in k}
+        recs, tombs, eff = M.sync_local_view(cur, base, 500.0)
+        self.assertEqual(eff["recs"], {})
+        self.assertFalse([t for t in tombs if t.startswith("acc:")])
+
+    def test_minority_of_accounts_lost_is_deletion(self):
+        base = self.base_with(6, 1)
+        cur = {k: v for k, v in base["recs"].items() if "imp-5" not in k}
+        _r, tombs, _e = M.sync_local_view(cur, base, 500.0)
+        self.assertIn("acc:imp-5", tombs)
+
+    def test_tinvest_accounts_survive_cleared_token(self):
+        tb = {"acc:tb:A": {"k": "acc", "v": {"kind": "tb", "aid": "A"}, "u": 2}, "op:tb:A|x": {"k": "op", "v": {"id": "x"}, "u": 2}}
+        base = {"recs": dict(tb), "tombs": {}}
+        recs, tombs, eff = M.sync_local_view({}, base, 500.0)
+        self.assertEqual(tombs, {})
+        merged, _t = M.sync_merge(eff["recs"], recs, dict(tb), tombs, {}, 500.0)
+        self.assertEqual(sorted(merged), ["acc:tb:A", "op:tb:A|x"])      # облако не потеряло счёт, хотя токена нет
+
+    def test_explicit_deletion_of_tinvest_snapshot(self):
+        tb = {"acc:tb:A": {"k": "acc", "v": {"kind": "tb", "aid": "A"}, "u": 2}, "op:tb:A|x": {"k": "op", "v": {"id": "x"}, "u": 2}}
+        base = {"recs": dict(tb), "tombs": {}}
+        recs, tombs, eff = M.sync_local_view({}, base, 500.0, {"acc:tb:A": 450.0})
+        merged, _t = M.sync_merge(eff["recs"], recs, dict(tb), tombs, {}, 500.0)
+        self.assertEqual(merged, {})
+
+
+class Format(unittest.TestCase):
+    def test_rev_and_salt_inside_mac_and_old_blocks_open(self):
+        salt = M.sync_new_salt()
+        key = M.sync_derive("правильная-фраза-123", salt)
+        blob = M.sync_seal(key, M.sync_pack({}, {}, "x", rev=7, salt=salt))
+        doc = M.sync_doc(M.sync_open(key, blob))
+        self.assertEqual((doc["rev"], doc["salt"]), (7, salt))
+        old = M.sync_seal(key, M.sync_pack({}, {}))             # без rev и соли: как у прежних версий
+        self.assertNotIn("rev", M.sync_doc(M.sync_open(key, old)))
+        self.assertEqual(M.sync_unpack(M.sync_open(key, blob)), ({}, {}))
+
+
 class QueueAndCollect(unittest.TestCase):
     def test_bot_queue_makes_manual_ops_idempotently(self):
         items = [{"id": 5, "created_at": 1_700_000_000, "op": {"kind": "buy", "secid": "sber", "qty": 10, "price": 295.4}},

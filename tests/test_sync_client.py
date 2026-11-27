@@ -330,5 +330,198 @@ class BotQueueAndDelete(Devices):
         self.assertEqual(len(M.imports_list()), 1)
 
 
+class Fixes(Devices):
+    """Исправления по ревью: удаление счёта, откат версии, счета Т-Инвестиций без токена, гонка с ручным учётом, сбой включения."""
+
+    def join_b(self):
+        self.use("B")
+        M.sync_enable(M.load_config(), {"mode": "join", "phrase": PHRASE})
+
+    def http_delete_account(self, acc_id):
+        import http.client
+        srv = M.LocalHTTPServer(("127.0.0.1", 0), M.Handler)
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
+            c.request("POST", "/api/import/delete", body=json.dumps({"id": acc_id}),
+                      headers={"Host": "127.0.0.1:%d" % srv.server_address[1], "Content-Type": "application/json", "X-TA-Secret": "1"})
+            r = c.getresponse()
+            r.read()
+            c.close()
+            return r.status
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_R1_deleting_one_big_account_is_kept_deleted(self):
+        small = self.manual()["acc"]
+        big = self.manual(acc_name=None, acc=None)["acc"] if False else self.manual(**{"acc_name": "Большой"})["acc"]
+        for i in range(60):
+            M.manual_post(M.load_config(), {"kind": "buy", "date": "2025-11-15", "ident": ISIN, "ticker": "SBER", "name": "Сбербанк",
+                                           "qty": 1 + i, "price": 280, "acc": big})
+        M.sync_enable(M.load_config(), {"mode": "create", "phrase": PHRASE})
+        self.join_b()
+        self.use("A")
+        self.assertEqual(self.http_delete_account(big), 200)
+        self.assertEqual([a["id"] for a in M.imports_list()], [small])
+        self.sync()
+        self.assertEqual([a["id"] for a in M.imports_list()], [small])      # не вернулся из облака
+        self.assertEqual(M.store().ops(big), [])
+        self.use("B")
+        self.sync()
+        self.assertEqual([a["id"] for a in M.imports_list()], [small])      # и на втором компьютере исчез
+        self.use("A")
+        self.sync()
+        self.assertEqual([a["id"] for a in M.imports_list()], [small])
+
+    def test_R2_older_server_version_does_not_apply_deletions(self):
+        acc = self.manual()["acc"]
+        self.watch("RU000A0AAAA1")
+        self.watch("RU000A0BBBB2")
+        M.sync_enable(M.load_config(), {"mode": "create", "phrase": PHRASE})            # rev 1
+        old = self.app.sync.pull(1)
+        con = sqlite3.connect(self.dbp)
+        old_row = con.execute("SELECT blob, sha256, size FROM user_sync WHERE tg_id=1").fetchone()
+        M.watch_post(M.load_config(), {"action": "remove", "isin": "RU000A0BBBB2"})
+        self.sync()                                                                    # rev 2: наблюдение сократилось
+        self.assertEqual(self.app.sync.meta(1)["rev"], 2)
+        self.assertEqual([w["isin"] for w in M.watch_items()], ["RU000A0AAAA1"])
+        # сервер «откатился»: на месте версии 2 лежит версия 1
+        con.execute("UPDATE user_sync SET rev=1, blob=?, sha256=?, size=? WHERE tg_id=1", old_row)
+        con.commit()
+        self.assertEqual(self.app.sync.meta(1)["rev"], 1)
+        self.watch("RU000A0CCCC3")
+        st = self.sync()
+        self.assertIn("старую", st["warning"])
+        isins = sorted(w["isin"] for w in M.watch_items())
+        self.assertEqual(isins, ["RU000A0AAAA1", "RU000A0CCCC3"])                      # локально ничего не пропало
+        key = bytes.fromhex(M.load_config()["sync_master"])
+        doc = M.sync_doc(M.sync_open(key, base64.b64decode(self.app.sync.pull(1)[1])))
+        self.assertEqual(doc["rev"], self.app.sync.meta(1)["rev"])
+        self.assertTrue(doc["salt"])
+        self.assertEqual(self.qty(acc), 10)
+        self.assertEqual(self.sync()["warning"], "")                                   # следующий обмен уже без предупреждения
+
+    def test_R2_block_with_wrong_rev_inside_is_refused(self):
+        self.watch("RU000A0AAAA1")
+        M.sync_enable(M.load_config(), {"mode": "create", "phrase": PHRASE})
+        key = bytes.fromhex(M.load_config()["sync_master"])
+        recs, tombs = M.sync_unpack(M.sync_open(key, base64.b64decode(self.app.sync.pull(1)[1])))
+        blob = M.sync_seal(key, M.sync_pack(recs, tombs, "x", rev=5, salt=M.load_config()["sync_salt"]))
+        self.app.sync.push(1, tss.body(blob, 1, salt=M.load_config()["sync_salt"]))     # сервер хранит rev 2, внутри написано 5
+        with self.assertRaises(M.ApiError) as cm:
+            self.sync()
+        self.assertIn("не соответствует", str(cm.exception))
+
+    def test_R3_tinvest_account_kept_when_token_cleared(self):
+        cfg = dict(M.load_config(), token=TOKEN, sandbox=False)
+        M.save_config(cfg)
+        M.store().put(M.SYNC_TB_KEY, {"2000111": {"name": "Брокерский", "type": ""}})
+        M.store().ops_put(M.token_key(cfg) + ":2000111", [
+            {"id": "api1", "date": "2025-10-01T10:00:00Z", "type": "OPERATION_TYPE_BUY", "payment": M.to_money(-1000),
+             "quantity": "1", "quantityDone": "1", "instrumentUid": "uid-1", "name": "Бумага"}])
+        self.manual()
+        M.sync_enable(M.load_config(), {"mode": "create", "phrase": PHRASE})
+        M.save_config(dict(M.load_config(), token=""))                               # токен очищен
+        self.sync()
+        key = bytes.fromhex(M.load_config()["sync_master"])
+        recs, _t = M.sync_unpack(M.sync_open(key, base64.b64decode(self.app.sync.pull(1)[1])))
+        self.assertIn("acc:tb:2000111", recs)
+        self.assertIn("op:tb:2000111|api1", recs)
+        self.assertIn("imp-tb-2000111", [a["id"] for a in M.imports_list()])         # на этом компьютере остался как снимок
+
+    def test_R4_local_change_during_exchange_is_not_lost(self):
+        self.watch("RU000A0AAAA1")
+        M.sync_enable(M.load_config(), {"mode": "create", "phrase": PHRASE})
+        self.join_b()
+        self.use("A")
+        self.watch("RU000A0BBBB2")
+        real = M.sync_req
+        fired = {"n": 0}
+
+        def racing(method, path, body=None, timeout=90):
+            res = real(method, path, body, timeout)
+            if method == "POST" and path == "push" and not fired["n"]:
+                fired["n"] = 1                                                        # пока шёл обмен, пользователь добавил запись
+                self.manual(**{"acc_name": "Во время обмена"})
+            return res
+        M.sync_req = racing
+        try:
+            self.sync()
+        finally:
+            M.sync_req = real
+        self.assertIn("Во время обмена", [a["name"] for a in M.imports_list()])
+        self.sync()
+        self.use("B")
+        self.sync()
+        self.assertIn("Во время обмена", [a["name"] for a in M.imports_list()])
+        self.assertEqual(sorted(w["isin"] for w in M.watch_items()), ["RU000A0AAAA1", "RU000A0BBBB2"])
+
+    def test_R4_gives_up_after_two_retries_without_applying(self):
+        self.watch("RU000A0AAAA1")
+        M.sync_enable(M.load_config(), {"mode": "create", "phrase": PHRASE})
+        real = M.sync_req
+        n = {"i": 0}
+
+        def racing(method, path, body=None, timeout=90):
+            res = real(method, path, body, timeout)
+            if method == "GET" and path == "pull":
+                n["i"] += 1
+                self.watch("RU000A0ZZ%03d" % n["i"])
+            return res
+        M.sync_req = racing
+        try:
+            with self.assertRaises(M.ApiError) as cm:
+                self.sync()
+        finally:
+            M.sync_req = real
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(n["i"], 3)
+
+    def test_manual_and_import_share_the_lock(self):
+        self.assertTrue(M._man_lock.acquire(False))
+        try:
+            got = []
+            t = threading.Thread(target=lambda: got.append(M._man_lock.acquire(True, 0.2)))
+            t.start()
+            t.join()
+            self.assertEqual(got, [False])
+        finally:
+            M._man_lock.release()
+
+    def test_R7_failed_first_push_does_not_report_enabled(self):
+        self.manual()
+        real = M.sync_req
+
+        def failing(method, path, body=None, timeout=90):
+            if method == "POST" and path == "push":
+                return 500, {}
+            return real(method, path, body, timeout)
+        M.sync_req = failing
+        try:
+            with self.assertRaises(M.ApiError) as cm:
+                M.sync_enable(M.load_config(), {"mode": "create", "phrase": PHRASE})
+        finally:
+            M.sync_req = real
+        self.assertIn("Не удалось включить", str(cm.exception))
+        self.assertFalse(M.sync_status()["enabled"])
+        self.assertEqual(M.load_config()["sync_master"], "")
+        M.sync_enable(M.load_config(), {"mode": "create", "phrase": PHRASE})        # повторная попытка проходит
+        self.assertTrue(M.sync_status()["enabled"])
+
+    def test_R7_sync_master_is_protected_like_token(self):
+        calls = []
+        real_p, real_u = M._dpapi_protect, M._dpapi_unprotect
+        M._dpapi_protect = lambda t: calls.append(t) or "dpapi:" + t[::-1]
+        M._dpapi_unprotect = lambda v: v[6:][::-1] if v.startswith("dpapi:") else v
+        try:
+            M.save_config(dict(M.load_config(), sync_master="ab" * 32))
+            with open(M.CONFIG_PATH, encoding="utf-8") as f:
+                self.assertTrue(json.load(f)["sync_master"].startswith("dpapi:"))
+            self.assertEqual(M.load_config()["sync_master"], "ab" * 32)
+        finally:
+            M._dpapi_protect, M._dpapi_unprotect = real_p, real_u
+
+
 if __name__ == "__main__":
     unittest.main()

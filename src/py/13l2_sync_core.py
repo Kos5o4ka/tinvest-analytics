@@ -15,7 +15,9 @@ SYNC_TOMB_DAYS = 180
 SYNC_CFG_KEYS = ("targets", "broker_tariffs")
 SYNC_BASE_KEY, SYNC_STATE_KEY, SYNC_TB_KEY = "sync_base_v1", "sync_state_v1", "tb_accounts_v1"
 SYNC_BOT_ACC = "imp-tgbot"           # ручной счёт для операций, присланных боту
-SYNC_MASS_LOSS = 0.5                  # пропала больше половины записей: считаем, что локальные данные сброшены, а не удалены
+SYNC_MASS_LOSS = 0.5                  # пропала больше половины СЧЕТОВ: считаем, что локальные данные сброшены, а не удалены
+SYNC_MASS_MIN_ACCS = 4                # с меньшим числом счетов долю не считаем (пустая локальная база проверяется отдельно)
+SYNC_DELS_KEY = "sync_dels_v1"        # явные удаления счетов, ещё не отправленные в облако: {rid счёта: время}
 SYNC_SECRET_FIELDS = ("token", "data_key", "backup_password", "sync_master")
 SECRET_KEYS.add("sync_master")
 
@@ -68,19 +70,31 @@ def sync_open(master, blob):
     return aes256_ctr(ek, blob[8:20] + b"\0\0\0\0", blob[20:-32])
 
 
-def sync_pack(recs, tombs, device="", now=None):
+def sync_pack(recs, tombs, device="", now=None, rev=None, salt=None):
+    """rev и salt вкладываются в зашифрованные данные (они под HMAC): сервер не сможет незаметно подсунуть старый блок под новым
+    номером версии или блок от другой соли. Старые блоки без этих полей читаются как раньше."""
     doc = {"v": SYNC_V, "device": device, "at": now if now is not None else time.time(), "recs": recs, "tombs": tombs}
+    if rev is not None:
+        doc["rev"] = int(rev)
+    if salt is not None:
+        doc["salt"] = str(salt)
     return zlib.compress(json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 6)
 
 
 def sync_unpack(plain):
+    d = sync_doc(plain)
+    return d["recs"], dict(d.get("tombs") or {})
+
+
+def sync_doc(plain):
+    """Разобранный документ слепка целиком (recs, tombs, rev, salt, device)."""
     try:
         doc = json.loads(zlib.decompress(plain).decode("utf-8"))
     except (zlib.error, ValueError, UnicodeDecodeError):
         raise SyncError("Облачная копия повреждена.")
     if not isinstance(doc, dict) or doc.get("v") != SYNC_V or not isinstance(doc.get("recs"), dict):
         raise SyncError("Облачная копия создана более новой версией программы: обновите TAnalytic.")
-    return doc["recs"], dict(doc.get("tombs") or {})
+    return doc
 
 
 # ───────────── записи слепка ─────────────
@@ -164,26 +178,72 @@ def sync_collect(cfg, st=None):
 
 
 def _sync_deletable(rid):
-    """Исчезновение записи считается удалением пользователем. Операции счетов Т-Инвестиций по API не удаляются никогда."""
-    return not rid.startswith("op:tb:")
+    """Исчезновение записи считается удалением пользователем. Счета Т-Инвестиций из API (acc:tb:) и их операции (op:tb:) так
+    не удаляются: токен могли очистить, сменить, включить песочницу, а это не удаление счёта. Явное удаление снимка счёта
+    идёт через надгробие (sync_mark_deleted)."""
+    return not rid.startswith(("op:tb:", "acc:tb:"))
 
 
-def sync_local_view(cur, base, now):
+def _sync_acc_rid(rid):
+    return rid.startswith("acc:") and not rid.startswith("acc:tb:")
+
+
+def sync_mark_deleted(acc_id):
+    """Пользователь сам удалил счёт (импорт, ручной счёт или снимок счёта Т-Инвестиций): запомнить как явное удаление, чтобы
+    эвристика «база сброшена» не вернула счёт из облака. acc_id — код счёта в списке (imp-…)."""
+    acc_id = str(acc_id or "")
+    if not acc_id.startswith("imp-"):
+        return
+    rid = "acc:tb:" + acc_id[len("imp-tb-"):] if acc_id.startswith("imp-tb-") else "acc:" + acc_id
+    st = store()
+    d = dict(st.get(SYNC_DELS_KEY) or {})
+    d[rid] = time.time()
+    st.put(SYNC_DELS_KEY, d)
+
+
+def sync_local_view(cur, base, now, dels=None):
     """Локальные записи с метками времени правки + удаления с прошлой синхронизации. -> (recs, tombs, base_eff).
     Метка записи: прежняя, если запись не менялась с прошлой синхронизации; иначе «сейчас»; без прежнего состояния (первая
-    синхронизация этого устройства) — 0, чтобы в спорах побеждали данные облака. Если пропало больше половины записей
-    (стёрта база, восстановлена копия), это не удаление: прежнее состояние отбрасывается, и данные вернутся из облака."""
+    синхронизация этого устройства) — 0, чтобы в спорах побеждали данные облака.
+    Если пропала большая доля СЧЕТОВ или в базе не осталось ни одного счёта (стёрта база, восстановлена копия), это не удаление:
+    прежнее состояние отбрасывается, и данные вернутся из облака. Одиночное удаление счёта эвристика не считает сбросом, а
+    явные удаления (dels: {acc:<id>: время}) всегда становятся надгробиями. Записи, исчезновение которых не считается удалением
+    (acc:tb:, op:tb:), переносятся в локальный вид без изменений."""
     brecs, btombs = base.get("recs") or {}, dict(base.get("tombs") or {})
-    lost = [rid for rid in brecs if rid not in cur and _sync_deletable(rid)]
-    if len(brecs) >= 20 and len(lost) > len(brecs) * SYNC_MASS_LOSS:
-        base, brecs, lost = {"recs": {}, "tombs": btombs}, {}, []
+    dels = {rid: ts for rid, ts in (dels or {}).items() if rid not in cur}
+    base_accs = [rid for rid in brecs if _sync_acc_rid(rid)]
+    lost_accs = [rid for rid in base_accs if rid not in cur and rid not in dels]
+    if lost_accs and (not any(_sync_acc_rid(rid) for rid in cur)
+                      or (len(base_accs) >= SYNC_MASS_MIN_ACCS and len(lost_accs) > len(base_accs) * SYNC_MASS_LOSS)):
+        base, brecs = {"recs": {}, "tombs": btombs}, {}
+    lost = [rid for rid in brecs if rid not in cur and _sync_deletable(rid) and not _sync_dead_acc(rid, dels)]
     recs = {}
     for rid, r in cur.items():
         b = brecs.get(rid)
         recs[rid] = {"k": r["k"], "v": r["v"], "u": (b.get("u") or 0) if b and _sync_same(b, r) else (r.get("u") or (now if brecs else 0))}
+    for rid, b in brecs.items():
+        if rid not in cur and not _sync_deletable(rid) and not _sync_dead_acc(rid, dels):
+            recs[rid] = dict(b)                                 # исчезло не по воле пользователя: локально «не менялось»
     for rid in lost:
         btombs[rid] = max(now, btombs.get(rid, 0))
+    for arid, ts in dels.items():
+        btombs[arid] = max(ts, btombs.get(arid, 0))
+        lid = arid[4:]
+        for rid in brecs:
+            if rid.startswith("op:" + lid + "|"):
+                btombs[rid] = max(ts, btombs.get(rid, 0))
+                recs.pop(rid, None)
+        recs.pop(arid, None)
     return recs, btombs, base
+
+
+def _sync_dead_acc(rid, dels):
+    """Запись относится к счёту, удалённому явно."""
+    if rid.startswith("acc:"):
+        return rid in dels
+    if rid.startswith("op:"):
+        return ("acc:" + rid[3:].split("|", 1)[0]) in dels
+    return False
 
 
 def _sync_killed(tombs, rid, rec):

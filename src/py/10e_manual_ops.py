@@ -24,6 +24,17 @@ def sync_kick_safe():
         pass
 
 
+def sync_mark_deleted_safe(acc_id):
+    """Пользователь сам удалил счёт: запомнить как явное удаление для облачной синхронизации (если она включена)."""
+    try:
+        fn = globals().get("sync_mark_deleted")
+        cfg = load_config()
+        if fn and cfg.get("sync_enabled"):
+            fn(acc_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ───────────── сверка ручных сделок с отчётом ─────────────
 def _man_idents(o):
     """Все известные коды бумаги операции (ISIN, тикер, uid) в верхнем регистре."""
