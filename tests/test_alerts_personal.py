@@ -67,6 +67,18 @@ class Checker(unittest.TestCase):
         self.ck.run_once()
         self.assertTrue(self.nt.msgs)
 
+    def test_equal_hours_mean_no_window_but_null_means_default(self):
+        """Бот при «выкл» пишет 0 и 0: окна нет, общие 22-8 не действуют. NULL — пользователь ничего не настраивал."""
+        self.st.put(1, self.sub())
+        self.clock[0] = self.NOW + 11 * 3600                               # 23:00 по Москве
+        self.prefs(1, None, None)
+        self.ck.run_once()
+        self.assertEqual(self.nt.msgs, [])                                 # не настроено: общее окно 22-8
+        self.prefs(1, 0, 0)
+        self.ck.run_once()
+        self.assertTrue(self.nt.msgs)                                      # выключено явно: сообщения приходят
+        self.assertEqual(SA.prefs_of(self.st, 1)[:2], (0, 0))
+
     def test_one_user_quiet_does_not_block_another(self):
         self.st.put(1, self.sub())
         self.db.execute("UPDATE users SET plan_until=? WHERE tg_id=2", (self.NOW + 30 * 86400,))
@@ -127,6 +139,26 @@ class Checker(unittest.TestCase):
         out, deferred = SA.coalesce_messages(msgs[:1] + [urgent] + msgs[1:], urgent=lambda ks: ks[0].startswith("ofr|"))
         self.assertEqual((len(out), out[0], deferred), (2, urgent, 1))     # срочное — отдельным сообщением и первым
         self.assertEqual(SA.coalesce_messages(msgs[:2]), (msgs[:2], 0))
+
+    def test_digest_links_are_not_bullets_and_long_lists_are_not_truncated(self):
+        link = '<a href="https://example.com/x">Подробнее</a> · <a href="https://www.moex.com/ru/issue.aspx?code=X">на Мосбирже</a>'
+        m1 = ("Цели\n\n<b>Выпуск А</b> — цель достигнута\n" + link, ["gy|A"])
+        m2 = ("Раскрытия\n\n<b>Выпуск Б</b> — новое раскрытие\n" + link, ["dc|B"])
+        m3 = ("Прочее\n\n<b>Выпуск В</b> — событие", ["x|C"])
+        out, deferred = SA.coalesce_messages([m1, m2, m3])
+        self.assertEqual((len(out), deferred), (1, 0))
+        bullets = [x for x in out[0][0].split("\n") if x.startswith("• ")]
+        self.assertEqual(len(bullets), 3)                                  # ссылки приклеены к своим пунктам
+        self.assertTrue(bullets[0].endswith("на Мосбирже</a>"))
+        self.assertFalse([x for x in out[0][0].split("\n") if x.startswith("• <a ")])
+        long_msg = ("Выплаты\n\n" + "\n".join("<b>Бумага %d</b> — купон" % i for i in range(9)), ["pay|%d" % i for i in range(9)])
+        out, deferred = SA.coalesce_messages([m1, long_msg, m3])
+        texts = {t: ks for t, ks in out}
+        self.assertIn(long_msg[0], texts)                                  # длинное сообщение целиком, без «…и ещё»
+        self.assertEqual(texts[long_msg[0]], long_msg[1])
+        shown = [ks for t, ks in out if t.startswith(SA.DIGEST_HEAD)][0]
+        self.assertEqual(sorted(shown), ["gy|A", "x|C"])
+        self.assertNotIn("…и ещё", "".join(t for t, _k in out))
 
     def test_disclosure_and_flow_alerts_units(self):
         sub = self.sub(

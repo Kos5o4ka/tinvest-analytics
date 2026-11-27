@@ -635,7 +635,9 @@ class AlertStore:
 
 
 def prefs_of(store, tg_id):
-    """Личные тихие часы и часовой пояс из настроек бота (/quiet): (с, до, UTC-смещение). Нет колонок (старая база) — (None, None, 3)."""
+    """Личные тихие часы и часовой пояс из настроек бота (/quiet): (с, до, UTC-смещение). Нет колонок (старая база) — (None, None, 3).
+    NULL, NULL — пользователь тихие часы не настраивал (действует общее окно); равные значения (бот при «выкл» пишет 0 и 0) —
+    окна нет совсем."""
     try:
         r = store.conn().execute("SELECT quiet_from, quiet_to, tz_offset FROM users WHERE tg_id=?", (tg_id,)).fetchone()
     except sqlite3.OperationalError:
@@ -707,34 +709,57 @@ def quiet_local(now, tz_offset, start, end):
 DIGEST_MIN, DIGEST_LINES, DIGEST_HEAD = 3, 14, "<b>Сводка событий по вашему портфелю и наблюдению</b>"
 
 
-def _digest_lines(text):
-    """Строки сводки из текста сообщения: абзацы после заголовка; в длинном абзаце (список выплат) — первые строки и счётчик."""
+def _digest_items(text):
+    """Пункты сводки из текста сообщения: абзацы после заголовка. Строка со ссылками («Подробнее · на Мосбирже») относится к
+    предыдущему пункту и отдельным пунктом не становится. -> (пункты, True, если в сообщении не больше 4 пунктов в абзаце)."""
     pars = [p for p in text.split("\n\n") if p.strip()]
-    out = []
+    out, full = [], True
     for p in (pars[1:] if len(pars) > 1 else pars):
-        ls = [x.strip()[:200] for x in p.split("\n") if x.strip()]
-        out += ls[:4] + (["…и ещё %d" % (len(ls) - 4)] if len(ls) > 4 else [])
-    return out
+        items = []
+        for x in p.split("\n"):
+            x = x.strip()
+            if not x:
+                continue
+            if x.startswith("<a ") and items:
+                items[-1] += " · " + x
+            else:
+                items.append(fit(x, 200).replace("\n…", "…") if len(x) > 200 else x)
+        out += items[:4]
+        full = full and len(items) <= 4
+    return out, full
+
+
+def _digest_lines(text):
+    return _digest_items(text)[0]
 
 
 def coalesce_messages(msgs, urgent=lambda keys: False):
     """Несколько сообщений за одну проверку склеиваются в один дайджест (срочные остаются отдельными). Дайджест берёт сообщения
     целиком, пока в нём не больше DIGEST_LINES строк; остальные не отправляются и не помечаются отправленными: попадут в следующую
-    проверку. -> (что отправить сейчас, [(текст, ключи)], отложено)."""
+    проверку. Сообщение, которое не помещается в сводку без урезания (длинный список), уходит отдельным сообщением целиком:
+    скрытые за «…и ещё N» события отправленными не помечаются. -> (что отправить сейчас, отложено)."""
     keep = [m for m in msgs if urgent(m[1])]
     rest = [m for m in msgs if not urgent(m[1])]
     if len(rest) < DIGEST_MIN:
         return msgs, 0
-    lines, keys, used = [], [], 0
+    lines, keys, used, deferred = [], [], 0, 0
+    full_msgs = []
     for text, ks in rest:
-        ln = _digest_lines(text)
+        ln, full = _digest_items(text)
+        if not full:
+            full_msgs.append((text, ks))
+            continue
         if lines and len(lines) + len(ln) > DIGEST_LINES:
-            break
+            deferred += 1
+            continue
         lines += ln
         keys += ks
         used += 1
-    digest = DIGEST_HEAD + "\n\n" + "\n".join("• " + x for x in lines) + "\n\n<i>Подробности — в приложении TAnalytic.</i>"
-    return keep + [(digest, keys)], len(rest) - used
+    out = keep + full_msgs
+    if used:
+        digest = DIGEST_HEAD + "\n\n" + "\n".join("• " + x for x in lines) + "\n\n<i>Подробности — в приложении TAnalytic.</i>"
+        out.append((digest, keys))
+    return out, deferred
 
 
 def _watched_isins(sub):
