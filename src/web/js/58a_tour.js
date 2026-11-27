@@ -9,7 +9,7 @@ const TOUR_STEPS=[
   {sel:['#nav [data-p="dgap"]','#nav button[title="Акции и фонды"]'],title:'Дивиденды',text:'Ближайшие дивиденды по акциям портфеля, их надёжность и поведение цены в день отсечки. Полный анализ любой акции — вкладка «Дивиденды» в её карточке. Раздел для режима «Профи».'},
   {sel:['#srch'],title:'Быстрый поиск '+MOD+'K',text:'Находите бумаги, эмитентов и разделы программы с клавиатуры.'}
 ];
-const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0,ro:null,loop:0,lr:''};
+const TOUR={key:TOUR_KEY,on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0,ro:null,loop:0,lr:''};
 /* слежение за целью: бегущая строка, догрузка данных и т. п. сдвигают раскладку — подсветка и подсказка едут следом.
    ResizeObserver ловит изменения размеров, а дешёвая проверка getBoundingClientRect раз в кадр — сдвиги без ресайза цели. */
 function tourRect(){const t=TOUR.tgt;if(!t)return'';const r=t.getBoundingClientRect();return Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+','+Math.round(r.height)+','+window.innerWidth+','+window.innerHeight}
@@ -114,7 +114,7 @@ function tourNext(d){
 }
 function tourStop(){
   if(!TOUR.on)return;
-  TOUR.on=false;uiSet(TOUR_KEY,tourVer());
+  TOUR.on=false;if(TOUR.key)uiSet(TOUR.key,tourVer());
   clearTimeout(TOUR.tm);clearTimeout(TOUR.tm2);
   if(TOUR.raf){cancelAnimationFrame(TOUR.raf);TOUR.raf=0}
   if(TOUR.loop){cancelAnimationFrame(TOUR.loop);TOUR.loop=0}
@@ -150,15 +150,17 @@ function tourClick(e){
     clearTimeout(TOUR.tm2);TOUR.tm2=setTimeout(()=>tourNext(1),450);
   }
 }
-function tourStart(){
+/* steps — свой список шагов (тур раздела по кнопке «Как пользоваться»): тогда отметка «тур показан» не ставится */
+function tourStart(steps,label){
   if(TOUR.on)return;
-  const list=TOUR_STEPS.filter(st=>tourFind(st));
+  const own=Array.isArray(steps);
+  const list=(own?steps:TOUR_STEPS).filter(st=>tourFind(st));
   if(!list.length)return;
-  TOUR.list=list;TOUR.on=true;
+  TOUR.list=list;TOUR.on=true;TOUR.key=own?null:TOUR_KEY;
   const ov=document.createElement('div');ov.id='tour-ov';ov.className='tour-ov';
   ov.innerHTML=`<svg class="tour-svg" width="100%" height="100%" aria-hidden="true"><defs><mask id="tour-mk" maskUnits="userSpaceOnUse" x="0" y="0" width="100%" height="100%"><rect x="0" y="0" width="100%" height="100%" fill="#fff"/><rect id="tour-hole" rx="10" ry="10" fill="#000"/></mask></defs><rect x="0" y="0" width="100%" height="100%" class="tour-dim" mask="url(#tour-mk)"/></svg><div class="tour-bk"></div><div class="tour-bk"></div><div class="tour-bk"></div><div class="tour-bk"></div><div class="tour-ring"></div>`;
   document.body.appendChild(ov);
-  const pop=document.createElement('div');pop.className='tour-pop';pop.setAttribute('role','dialog');pop.setAttribute('aria-label','Тур по интерфейсу');
+  const pop=document.createElement('div');pop.className='tour-pop';pop.setAttribute('role','dialog');pop.setAttribute('aria-label',own&&label?String(label):'Тур по интерфейсу');
   document.body.appendChild(pop);
   TOUR.ov=ov;TOUR.pop=pop;TOUR.hole=ov.querySelector('#tour-hole');TOUR.ring=ov.querySelector('.tour-ring');TOUR.bk=[...ov.querySelectorAll('.tour-bk')];
   window.addEventListener('resize',tourSched);window.addEventListener('scroll',tourSched,true);

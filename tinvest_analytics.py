@@ -34227,6 +34227,22 @@ table.cmp .cmp-slot{min-width:200px;vertical-align:middle;background:var(--card2
 .tbl-auto{padding:0 0 8px}
 .tbl-auto .tbl-csv{margin-left:auto}
 @media(max-width:560px){.card h2 .per-local{margin:6px 0 0;order:5}.card h2{flex-wrap:wrap}}
+/* ── Гид по разделу (71_guides.js): свёрнут — одна строка, открыт — короткий список понятий ── */
+.guide{margin:0 0 14px;padding:7px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card)}
+.guide-row{display:flex;align-items:center;gap:10px}
+.guide-sum{flex:1;min-width:0;font-size:12.5px;color:var(--mu);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.guide.open .guide-sum{white-space:normal}
+.guide-acts{display:flex;gap:6px;flex:none}
+.guide-b{all:unset;cursor:pointer;font-size:12px;color:var(--tx2);white-space:nowrap;padding:3px 9px;border-radius:7px;border:1px solid var(--line)}
+.guide-b:hover{color:var(--tx);border-color:var(--line2)}
+.guide-b:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.guide-body{margin-top:10px;padding-top:10px;border-top:1px solid var(--line);font-size:13px;color:var(--tx2);line-height:1.5}
+.guide-body h3{margin:0 0 8px;font-size:14px;color:var(--tx)}
+.guide-body ul{margin:0;padding-left:18px;display:grid;gap:6px}
+.guide-body b{color:var(--tx)}
+.guide-kb{margin-top:10px;font-size:12px;color:var(--mu)}
+.guide-kb a{color:var(--ac)}
+@media(max-width:700px){.guide-row{flex-wrap:wrap}.guide-sum{flex-basis:100%;white-space:normal}}
 </style></head>
 <body>
 <div id="boot-splash" class="boot-splash" aria-hidden="true"><div class="boot-box"><div class="boot-logo"><svg width="64" height="64" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bsg" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#2563eb"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient><linearGradient id="bsa" x1="12" y1="6" x2="26" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.08)"/><path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="url(#bsg)"/><path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="url(#bsg)"/><path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="url(#bsa)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="boot-title">TAnalytic <span class="boot-ver">Pro</span></div><div class="boot-bar"><div class="boot-bar-fill"></div></div><div class="boot-status" id="boot-status">Загружаю портфель…</div></div></div>
@@ -44313,7 +44329,7 @@ const TOUR_STEPS=[
   {sel:['#nav [data-p="dgap"]','#nav button[title="Акции и фонды"]'],title:'Дивиденды',text:'Ближайшие дивиденды по акциям портфеля, их надёжность и поведение цены в день отсечки. Полный анализ любой акции — вкладка «Дивиденды» в её карточке. Раздел для режима «Профи».'},
   {sel:['#srch'],title:'Быстрый поиск '+MOD+'K',text:'Находите бумаги, эмитентов и разделы программы с клавиатуры.'}
 ];
-const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0,ro:null,loop:0,lr:''};
+const TOUR={key:TOUR_KEY,on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0,ro:null,loop:0,lr:''};
 /* слежение за целью: бегущая строка, догрузка данных и т. п. сдвигают раскладку — подсветка и подсказка едут следом.
    ResizeObserver ловит изменения размеров, а дешёвая проверка getBoundingClientRect раз в кадр — сдвиги без ресайза цели. */
 function tourRect(){const t=TOUR.tgt;if(!t)return'';const r=t.getBoundingClientRect();return Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+','+Math.round(r.height)+','+window.innerWidth+','+window.innerHeight}
@@ -44418,7 +44434,7 @@ function tourNext(d){
 }
 function tourStop(){
   if(!TOUR.on)return;
-  TOUR.on=false;uiSet(TOUR_KEY,tourVer());
+  TOUR.on=false;if(TOUR.key)uiSet(TOUR.key,tourVer());
   clearTimeout(TOUR.tm);clearTimeout(TOUR.tm2);
   if(TOUR.raf){cancelAnimationFrame(TOUR.raf);TOUR.raf=0}
   if(TOUR.loop){cancelAnimationFrame(TOUR.loop);TOUR.loop=0}
@@ -44454,15 +44470,17 @@ function tourClick(e){
     clearTimeout(TOUR.tm2);TOUR.tm2=setTimeout(()=>tourNext(1),450);
   }
 }
-function tourStart(){
+/* steps — свой список шагов (тур раздела по кнопке «Как пользоваться»): тогда отметка «тур показан» не ставится */
+function tourStart(steps,label){
   if(TOUR.on)return;
-  const list=TOUR_STEPS.filter(st=>tourFind(st));
+  const own=Array.isArray(steps);
+  const list=(own?steps:TOUR_STEPS).filter(st=>tourFind(st));
   if(!list.length)return;
-  TOUR.list=list;TOUR.on=true;
+  TOUR.list=list;TOUR.on=true;TOUR.key=own?null:TOUR_KEY;
   const ov=document.createElement('div');ov.id='tour-ov';ov.className='tour-ov';
   ov.innerHTML=`<svg class="tour-svg" width="100%" height="100%" aria-hidden="true"><defs><mask id="tour-mk" maskUnits="userSpaceOnUse" x="0" y="0" width="100%" height="100%"><rect x="0" y="0" width="100%" height="100%" fill="#fff"/><rect id="tour-hole" rx="10" ry="10" fill="#000"/></mask></defs><rect x="0" y="0" width="100%" height="100%" class="tour-dim" mask="url(#tour-mk)"/></svg><div class="tour-bk"></div><div class="tour-bk"></div><div class="tour-bk"></div><div class="tour-bk"></div><div class="tour-ring"></div>`;
   document.body.appendChild(ov);
-  const pop=document.createElement('div');pop.className='tour-pop';pop.setAttribute('role','dialog');pop.setAttribute('aria-label','Тур по интерфейсу');
+  const pop=document.createElement('div');pop.className='tour-pop';pop.setAttribute('role','dialog');pop.setAttribute('aria-label',own&&label?String(label):'Тур по интерфейсу');
   document.body.appendChild(pop);
   TOUR.ov=ov;TOUR.pop=pop;TOUR.hole=ov.querySelector('#tour-hole');TOUR.ring=ov.querySelector('.tour-ring');TOUR.bk=[...ov.querySelectorAll('.tour-bk')];
   window.addEventListener('resize',tourSched);window.addEventListener('scroll',tourSched,true);
@@ -45808,6 +45826,117 @@ if(typeof document!=='undefined')document.addEventListener('click',e=>{
 });
 /* вкладка карточки облигации запоминается между открытиями */
 function bcSavedTab(){const t=typeof lsGet==='function'?lsGet('ta_bc_tab'):null;return typeof BC_TABS!=='undefined'&&BC_TABS.some(x=>x[0]===t)?t:'overview'}
+/* ── Гиды по разделам: строка «Зачем этот экран» раскрывается в короткое объяснение понятий.
+   При первом заходе в раздел гид открыт, дальше свёрнут (отметка в ui_seen.guides). Для сложных экранов —
+   кнопка «Как пользоваться»: тур по шагам на движке тура главной (58a_tour.js), сам он не запускается. ── */
+const GUIDES={
+  ret:{sum:'Насколько хорошо работают ваши деньги: две доходности, которые отвечают на разные вопросы.',
+    t:'Как читать доходность портфеля',kb:['xirr'],items:[
+    ['TWR, доходность по времени','Качество самих вложений без учёта того, когда вы пополняли счёт или выводили деньги. Крупное пополнение перед падением рынка её не портит. Именно её честно сравнивать с индексами.'],
+    ['XIRR, ваша годовая ставка','Учитывает даты и суммы каждого пополнения и вывода. Это доходность именно ваших рублей, как ставка по вкладу.'],
+    ['Как сравнивать','Если XIRR ниже TWR, пополнения чаще приходились на дорогой рынок, а выводы на дешёвый. Если выше, вы удачно докупали на просадках.']]},
+  bench:{t:'Сравнение с рынком: обгоняете ли вы его',kb:['sharpe','diversification'],items:[
+    ['Те же деньги в те же даты','Для каждого индекса и фонда программа берёт ваши пополнения и выводы и считает, сколько было бы, если бы деньги лежали там. Так сравнение честное.'],
+    ['Индексы полной доходности','Например, RGBITR учитывает не только цену, но и реинвестированные купоны. С ценовым индексом сравнивать портфель некорректно: он занижает рынок.'],
+    ['Шарп и просадка','Шарп показывает доходность на единицу колебаний: выше — лучше. Максимальная просадка — самое глубокое падение от пика за период.'],
+    ['Бета к портфелю','Насколько индекс движется вместе с вашим портфелем. Около 1 — портфель повторяет рынок, около 0 — живёт своей жизнью.']]},
+  lad:{t:'Лесенка облигаций: деньги приходят равномерно',kb:['ladder','duration'],items:[
+    ['Зачем она','Погашения распределяются по месяцам и годам равномерно. Когда ступень гасится, деньги вкладываются заново по ставкам того времени.'],
+    ['Защита от ставок','Если ставки вырастут, вы не заперты в старых выпусках надолго: регулярные погашения дают деньги на покупку под новый процент.'],
+    ['Чего избегать','Перекоса, когда большая часть портфеля гасится в один год, а остальные годы пустые.']]},
+  off:{t:'Оферты: даты, которые нельзя пропустить',kb:['offers'],items:[
+    ['Put-оферта, по вашему желанию','Вы вправе вернуть облигацию эмитенту по номиналу. После оферты эмитент часто снижает купон. Чтобы продать по оферте, нужно подать заявку брокеру в период предъявления, обычно за несколько дней до даты.'],
+    ['Call-оферта, по решению эмитента','Эмитент может досрочно погасить выпуск по номиналу. Ничего делать не нужно: деньги придут на счёт.'],
+    ['Что проверить','Перед put-офертой посмотрите новый купон. Если он невыгоден, подайте заявку вовремя: после окончания периода предъявления остаётся только продажа на бирже по рыночной цене.']]},
+  dfl:{t:'Технический дефолт: что это и что делать',kb:['default','ratings'],items:[
+    ['Что произошло','Эмитент не заплатил вовремя купон, номинал или по оферте.'],
+    ['Технический дефолт','У эмитента есть короткий срок, чтобы всё же заплатить: он задан в документах выпуска, обычно до 10 рабочих дней. Часто это задержка платежа, а не банкротство.'],
+    ['Дефолт','Если за этот срок деньги не пришли, наступает дефолт. Владельцы вправе требовать досрочного погашения выпуска.'],
+    ['Что делать','Включите «Мой портфель»: если выпуск есть у вас, читайте сообщения эмитента по ссылке на e-disclosure.']]},
+  reb:{t:'Ребалансировка: доли портфеля под контролем',kb:['rebalance','diversification'],items:[
+    ['Зачем','Выросшие активы со временем занимают слишком большую долю и повышают риск всего портфеля.'],
+    ['Мягкий способ','Пополнения, купоны и дивиденды направлять в то, чья доля ниже целевой. Продавать не нужно, налога нет.'],
+    ['Жёсткий способ','Частично продать то, что выросло, и докупить отставшее. Продажа с прибылью может потребовать налог.'],
+    ['Когда действовать','Отклонения на 1–2 % можно не трогать. Обычно выравнивают, когда доля ушла от цели на 5 % и больше.']]},
+  tax:{t:'Налоги: как платить меньше законно',kb:[],items:[
+    ['ЛДВ, льгота долгосрочного владения','Бумаги российских эмитентов, которые вы держали больше 3 лет, можно продать без налога с прибыли: до 3 млн ₽ прибыли за каждый полный год владения.'],
+    ['Учёт убытков','Убыток по одной продаже уменьшает налог с прибыли по другим в том же году. Убытки прошлых лет можно перенести через декларацию.'],
+    ['ИИС-3','Вычет на взносы до 400 тыс. ₽ в год, то есть до 52–60 тыс. ₽ налога назад. Если продержать счёт минимальный срок, доход до 30 млн ₽ освобождается от налога.'],
+    ['Точные суммы','Налог как налоговый агент считает брокер. Здесь — расчёт по лотам для проверки и подготовки декларации.']]},
+  scr:{t:'Как выбирать облигации в скринере',kb:['yield','duration','ratings','spread'],items:[
+    ['Доходность к погашению','Учитывает купоны и разницу между ценой покупки и номиналом. Это не то же самое, что купон, делённый на цену.'],
+    ['Дюрация','На сколько процентов изменится цена облигации, если её доходность изменится на 1 процентный пункт. Длинная дюрация сильнее выигрывает от снижения ставок и сильнее теряет при росте.'],
+    ['Рейтинг','Чем ниже рейтинг, тем выше доходность и риск неплатежа. Высокая доходность почти всегда плата за риск.'],
+    ['Спред к ОФЗ','Сколько выпуск платит сверх государственных облигаций того же срока. Если спред заметно больше, чем у соседей по рейтингу, рынок видит повышенный риск.']]},
+  mkt:{t:'Ставки и кривая ОФЗ (КБД)',kb:['kbd','keyrate','float'],items:[
+    ['Что такое КБД','Доходность государственных облигаций на разные сроки, от нескольких месяцев до 30 лет. Корпоративные выпуски оценивают как КБД плюс надбавку за риск эмитента.'],
+    ['Обычная форма','Длинные сроки доходнее коротких: это плата за то, что деньги заняты дольше.'],
+    ['Перевёрнутая кривая','Короткие доходности выше длинных. Так бывает при высокой ключевой ставке: рынок ждёт, что ставки дальше пойдут вниз.']]},
+  calc:{sum:'Сколько накопится и когда стратегия обгонит вклад: расчёт по месяцам с налогами и инфляцией.',
+    t:'Калькулятор: как читать результат',kb:['keyrate'],items:[
+    ['Точка обгона вклада','Месяц, после которого стратегия стабильно опережает вклад. В начале вклад может быть впереди: налоги, комиссии и цена входа съедают первые месяцы.'],
+    ['Инфляция','На сроке от 3 лет смотрите на капитал в сегодняшних деньгах: та же сумма через 10 лет купит заметно меньше.'],
+    ['Пополнения','Регулярные взносы на горизонте 5 лет и больше дают итогу больше, чем попытка угадать момент входа.']]}
+};
+
+/* туры по кнопке: только экраны, где неочевиден порядок действий. Селекторы проверяет tests/test_guides.py */
+const GUIDE_TOURS={
+  calc:[
+    {sel:['.cl-tabs'],title:'Три режима',text:'«Накопить капитал» — сколько будет через N лет. «Жизнь с капитала» — на сколько хватит денег. «Подбор под цель» — сколько вносить, чтобы дойти до суммы.'},
+    {sel:['#cl-pre'],title:'Готовые сценарии',text:'Начните с готового набора параметров, потом поправьте под себя. «Мой портфель» берёт доли вашего портфеля.'},
+    {sel:['#cl-years'],title:'Срок',text:'Горизонт расчёта в годах. На длинном сроке разница между стратегиями видна лучше всего.'},
+    {sel:['#cl-strat'],title:'Что сравниваем',text:'Отметьте стратегии: вклад, фонд ликвидности, ОФЗ, корпоративные, акции и другие. Каждая появится на графике и в таблице.'},
+    {sel:['#cl-adv'],title:'Дополнительно',text:'Ставка вклада, ИИС-3, сценарий ключевой ставки, инфляция и комиссии. Если не уверены, оставьте значения по умолчанию.'},
+    {sel:['#cl-out'],title:'Результат',text:'Итог в рублях и в сегодняшних деньгах, график роста капитала и точка обгона вклада. Наведите на график, чтобы увидеть значения по месяцам.'}],
+  tax:[
+    {sel:['.tx-tabs'],title:'Разделы налогов',text:'Начните с «Обзора»: сколько уже удержано и сколько ещё ожидается. Остальные вкладки — подробности.'},
+    {sel:['.tx-tabs button:nth-child(2)'],title:'Прогноз на 31.12',text:'Сколько налога брокер удержит в конце года, если ничего не продавать, и что можно сделать до конца года.'},
+    {sel:['.tx-tabs button:nth-child(4)'],title:'ЛДВ',text:'Какие бумаги скоро станут свободны от налога по льготе долгосрочного владения и сколько это сэкономит.'},
+    {sel:['.tx-tabs button:nth-child(5)'],title:'ИИС',text:'Вычеты и сроки по индивидуальным инвестиционным счетам.'},
+    {sel:['.tx-tabs button:nth-child(6)'],title:'Подсказки',text:'Конкретные шаги: где можно учесть убыток, что не стоит продавать до срока.'},
+    {sel:['.tx-tabs button:nth-child(7)'],title:'Для декларации',text:'Суммы по годам в виде, удобном для переноса в 3-НДФЛ.'}],
+  scr:[
+    {sel:['.scr-presets'],title:'Готовые подборки',text:'Надёжные ОФЗ, корпоративные с высоким рейтингом, флоатеры и другие. Один клик — и фильтры настроены.'},
+    {sel:['.scr-quick'],title:'Быстрые фильтры',text:'Частые условия одной кнопкой: без оферт, ежемесячный купон и подобные.'},
+    {sel:['#scr-ftog'],title:'Все фильтры',text:'Доходность, срок, рейтинг, валюта, тип купона. Удачный набор можно сохранить кнопкой «+ Сохранить фильтр».'},
+    {sel:['#scr-real'],title:'Реальная доходность',text:'Покажет доходность за вычетом ожидаемой инфляции: сколько вы заработаете на самом деле.'},
+    {sel:['#scr-tw'],title:'Таблица',text:'Нажмите на заголовок, чтобы отсортировать, и на строку, чтобы открыть карточку облигации с графиком и выплатами.'},
+    {sel:['#scr-csv'],title:'Выгрузка',text:'Сохранить текущую подборку в CSV для Excel.'}]
+};
+const GUIDE_OPEN={};
+
+function guideSeen(){const v=uiGet('guides');return v&&typeof v==='object'?v:{}}
+function guideHtml(page){
+  const g=GUIDES[page];if(!g)return null;
+  let open=GUIDE_OPEN[page];
+  if(open==null){
+    const seen=guideSeen(),hid=typeof UX!=='undefined'&&UX.whyOff&&UX.whyOff[page];
+    open=!seen[page]&&!hid;GUIDE_OPEN[page]=open;
+    if(!seen[page])uiSet('guides',Object.assign({},seen,{[page]:1}));
+  }
+  const sum=g.sum||(typeof UX_WHY!=='undefined'&&UX_WHY[page])||g.t;
+  const kb=(g.kb||[]).filter(id=>typeof KB==='undefined'||KB.some(a=>a.id===id))
+    .map(id=>{const a=typeof KB!=='undefined'&&KB.find(x=>x.id===id);return`<a href="#" data-kb="${esc(id)}">${esc(a?a.t:id)}</a>`});
+  return`<section class="guide noprint${open?' open':''}" data-guide="${esc(page)}" aria-label="Гид по разделу">
+    <div class="guide-row"><span class="guide-sum">${esc(sum)}</span><span class="guide-acts">
+      <button type="button" class="guide-b" data-guide-tog="${esc(page)}" aria-expanded="${open}">${open?'Свернуть':'Как это работает'}</button>
+      ${GUIDE_TOURS[page]?`<button type="button" class="guide-b" data-guide-tour="${esc(page)}">Как пользоваться</button>`:''}</span></div>
+    ${open?`<div class="guide-body"><h3>${esc(g.t)}</h3><ul>${g.items.map(([b,t])=>`<li><b>${esc(b)}.</b> ${esc(t)}</li>`).join('')}</ul>
+      ${kb.length?`<div class="guide-kb">Подробнее в базе знаний: ${kb.join(' · ')}</div>`:''}</div>`:''}
+  </section>`;
+}
+if(typeof uxWhyBanner==='function'){
+  const _why=uxWhyBanner;
+  uxWhyBanner=function(page){const h=guideHtml(page);return h!=null?h:_why(page)};
+}
+if(typeof document!=='undefined')document.addEventListener('click',e=>{
+  const t=e.target.closest&&e.target.closest('[data-guide-tog],[data-guide-tour]');if(!t)return;
+  const page=t.dataset.guideTog||t.dataset.guideTour;
+  if(t.dataset.guideTour){if(typeof tourStart==='function')tourStart(GUIDE_TOURS[page],'Как пользоваться разделом');return}
+  GUIDE_OPEN[page]=!GUIDE_OPEN[page];
+  const box=t.closest('.guide');if(!box)return;
+  const w=document.createElement('div');w.innerHTML=guideHtml(page);box.replaceWith(w.firstElementChild);
+});
 </script></body></html>
 '''
 
