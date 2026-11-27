@@ -5,6 +5,12 @@ function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}const h=
 /* окно программы (pywebview): системная шапка Windows в тон теме */
 function nativeTheme(){try{const a=window.pywebview&&pywebview.api;if(a&&a.set_theme)a.set_theme(document.documentElement.dataset.theme==='light'?'light':'dark')}catch(e){}}
 window.addEventListener('pywebviewready',nativeTheme);
+/* акцентный цвет и плотность интерфейса: хранятся в браузере окна, применяются до отрисовки (см. скрипт в <head>) */
+const ACCENTS=[['blue','Синий','#3b82f6'],['emerald','Изумрудный','#10b981'],['graphite','Графит','#64748b'],['violet','Фиолетовый','#8b5cf6']];
+function curAccent(){let a='blue';try{a=localStorage.getItem('ta_accent')||'blue'}catch(e){}return ACCENTS.some(x=>x[0]===a)?a:'blue'}
+function curDensity(){let d='comfort';try{d=localStorage.getItem('ta_density')||'comfort'}catch(e){}return d==='compact'?'compact':'comfort'}
+function applyAccent(a){try{localStorage.setItem('ta_accent',a)}catch(e){}const h=document.documentElement;if(a==='blue')delete h.dataset.accent;else h.dataset.accent=a}
+function applyDensity(d){try{localStorage.setItem('ta_density',d)}catch(e){}const h=document.documentElement;if(d==='compact')h.dataset.density='compact';else delete h.dataset.density}
 function thmLabel(){const e=document.getElementById('thm-t');if(e)e.textContent=document.documentElement.dataset.theme==='light'?'Тёмная тема':'Светлая тема'}
 function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
 // один клик = видимая смена: от того, что сейчас на экране (раньше цикл auto→light→dark→auto при тёмной системе давал «пустой» клик dark→auto)

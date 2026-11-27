@@ -39,13 +39,13 @@ function bindSetTg(c,msg){
     try{const r=await save();stOk(el);if(r.warning)msg(r.warning);setTimeout(srvShow,4500)}catch(x){msg(x.message)}}));
   g('tg-srv').addEventListener('change',async e=>{
     const el=e.currentTarget;
-    if(el.checked&&!confirm('Включить проверку на сервере?\n\nНа сервер данных будут отправлены: ISIN и названия бумаг из списка наблюдения с целями, даты напоминаний дневника (без текста), даты ближайших оферт и выплат по облигациям портфеля (с суммами выплат). Токен, счета и стоимость портфеля не передаются.\n\nУдалить данные можно в любой момент кнопкой «Удалить данные с сервера» или в боте командой /alerts.')){el.checked=false;return}
+    if(el.checked&&!await uiConfirm({title:'Включить проверку на сервере?', body:'На сервер данных будут отправлены: ISIN и названия бумаг из списка наблюдения с целями, даты напоминаний дневника (без текста), даты ближайших оферт и выплат по облигациям портфеля (с суммами выплат). Токен, счета и стоимость портфеля не передаются.\n\nУдалить данные можно в любой момент кнопкой «Удалить данные с сервера» или в боте командой /alerts.', okText:'Включить'})){el.checked=false;return}
     try{const r=await save();
       if(el.checked){const s=await post('/api/tg/server',{action:'sync'});const n=s.counts||{};msg(`Сервер будет проверять: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}.`,1)}
       else msg(r.warning||'Проверка на сервере выключена, данные удалены с сервера.',!r.warning);
     }catch(x){msg(x.message)}finally{srvShow()}});
   g('tg-srv-del').onclick=e=>busy(e.currentTarget,async()=>{
-    if(!confirm('Удалить подписку на тревоги с сервера и выключить проверку на сервере?'))return;
+    if(!await uiConfirm({title:'Удалить подписку с сервера?', body:'Подписка на тревоги будет удалена с сервера, проверка на сервере выключится.', danger:true, okText:'Удалить'}))return;
     await post('/api/tg/server',{action:'delete'});g('tg-srv').checked=false;c.tg_server=false;msg('Данные удалены с сервера.',1);srvShow()});
   srvShow();
   api('/api/tg/info').then(i=>{
@@ -104,13 +104,13 @@ function bindSetBackup(c,msg){
   stEnter(['bkdir','bkpw','bkkeep'],'bksave');
   $('#bksave').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();dirty.rebase();stOk(b);show()}catch(x){msg(x.message);dirty.upd()}};
   $('#bkauto').onchange=async e=>{const el=e.currentTarget;try{await save();dirty.rebase();stOk(el);show()}catch(x){el.checked=!el.checked;msg(x.message)}};
-  $('#bkclr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Забыть пароль? Автоматические копии отключатся. Сами копии останутся и откроются прежним паролем.'))return;await post('/api/backup/settings',{clear_password:true});$('#bkauto').checked=false;msg('Пароль удалён из настроек.',1);show()});
+  $('#bkclr').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Забыть пароль копий?', body:'Автоматические копии отключатся. Сами копии останутся и откроются прежним паролем.', danger:true, okText:'Забыть'}))return;await post('/api/backup/settings',{clear_password:true});$('#bkauto').checked=false;msg('Пароль удалён из настроек.',1);show()});
   $('#bkrun').onclick=e=>busy(e.currentTarget,async()=>{
     const pw=$('#bkpw').value;await post('/api/backup/settings',{backup_dir:$('#bkdir').value,backup_keep:$('#bkkeep').value});
     await post('/api/backup/run',{password:pw});msg('Копия запущена, статус обновится ниже.',1);setTimeout(show,800)});
   $('#bkrest').onclick=e=>busy(e.currentTarget,async()=>{
     const f=$('#bkfile').files[0];if(!f)return msg('Выберите файл копии (.tinvbak).');
-    if(!confirm('Восстановить данные из этой копии? Текущая база будет сохранена рядом, замена произойдёт при следующем запуске.'))return;
+    if(!await uiConfirm({title:'Восстановить данные из копии?', body:'Текущая база будет сохранена рядом, замена произойдёт при следующем запуске.', okText:'Восстановить'}))return;
     msg('Расшифровываю и проверяю копию…',1);
     const b64=await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]||'');r.onerror=()=>no(new Error('Не удалось прочитать файл'));r.readAsDataURL(f)});
     await post('/api/backup/restore',{data:b64,password:$('#bkrpw').value});$('#bkrpw').value='';

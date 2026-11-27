@@ -1,15 +1,6 @@
 /* ── Графики: единая палитра, волосяная сетка, скруглённые столбики, подсветка при наведении, анимация появления ──
    Загружается после 52_premium.css. Палитра серий --s1..--s8: синий, голубой, бирюзовый, янтарный, розовый, оливковый, фиолетовый, коралловый
    (порядок диаграмм задаёт PAL в 01_core.js: синий → бирюзовый → янтарный → фиолетовый → розовый → голубой → оливковый → коралловый). */
-:root{
-  --s1:#4f8ef7;--s2:#4cc3ec;--s3:#2bbf9a;--s4:#e3a540;--s5:#ec6f91;--s6:#a7c35a;--s7:#9b87f5;--s8:#f08a5d;
-  --zero-line:#ffffff2e;
-}
-:root[data-theme=light]{
-  --s1:#3b78e6;--s2:#1fa3d4;--s3:#12a383;--s4:#d08c1c;--s5:#d94f78;--s6:#86a63a;--s7:#7f6ae0;--s8:#e2703a;
-  --zero-line:#0f172a3d;
-}
-
 /* сетка и оси */
 :root .grid-l{stroke:var(--line);stroke-width:1;stroke-dasharray:2 4;shape-rendering:crispEdges}
 :root .grid-l.z{stroke:var(--zero-line);stroke-dasharray:none}

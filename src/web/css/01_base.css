@@ -1,13 +1,6 @@
-:root{
-  --bg:#06080e;--side:#0a0d15;--card:#0f1420;--card2:#161e30;--line:#1e293b;--line2:#283548;
-  --tx:#f8fafc;--tx2:#94a3b8;--mu:#64748b;--ac:#3b82f6;--ac2:#60a5fa;--ac-tx:#60a5fa;--pos:#10b981;--neg:#f0605d;
-  --card-hover:#1a2338;--ac-glow:rgba(59,130,246,.35);--fl:#7c3aed;--fix:#10b981;--lnk:#0ea5e9;--sub:#c026d3;--warn:#d97706;
-  --sk-1:#0f1420;--sk-2:#172033;--zero-line:#ffffff26;--err-tx:#ff9a9a;--info-tx:#93c5fd;
-  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;
-  --r:14px;color-scheme:dark}
 *{box-sizing:border-box;margin:0}
 html,body{height:100%}
-body{background:var(--bg);color:var(--tx);font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text","Segoe UI",Inter,Roboto,"Helvetica Neue",system-ui,sans-serif;
+body{background:var(--bg);color:var(--tx);font:14px/1.45 var(--font);
   letter-spacing:-.006em;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility;font-synthesis:none;display:flex;overflow:hidden}
 .num,td,.v,th{font-variant-numeric:tabular-nums lining-nums}
 h1,h2,h3,h4,.logo-tx{letter-spacing:-.02em}
@@ -15,6 +8,5 @@ html.thm-anim *,html.thm-anim *::before,html.thm-anim *::after{transition:backgr
 @media (prefers-reduced-motion:reduce){html.thm-anim *,html.thm-anim *::before,html.thm-anim *::after{transition:none!important}}
 button,input,select,textarea{font:inherit;color:inherit}
 button:focus-visible,a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
-::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#283548;border-radius:8px;border:2px solid var(--bg)}
 ::-webkit-scrollbar-track{background:transparent}
 

@@ -105,6 +105,10 @@ async function renderSettings(){
   const perm=('Notification' in window)?Notification.permission:'unsupported';
   const look=stGroup('Тема оформления',
     `<div class="st-pad"><div class="st-themes" id="thsel" role="group" aria-label="Тема оформления">${themes.map(([k,t,d])=>`<button type="button" data-t="${k}" class="${th===k?'on':''}" aria-pressed="${th===k}">${k==='auto'?`<span class="th-prev th-auto">${prev('dark')}${prev('light')}</span>`:prev(k)}<span class="th-n"><b>${t}</b>${d?`<small>${d}</small>`:''}</span><em class="th-c">${stIco('check',2.6)}</em></button>`).join('')}</div></div>`,{hint:'применяется сразу',q:'светлая тёмная авто оформление'})+
+    stGroup('Акцент и плотность',
+    stRow('Акцентный цвет','Цвет кнопок, ссылок и выделений во всей программе',`<div class="st-acc" id="accsel" role="group" aria-label="Акцентный цвет">${ACCENTS.map(([k,t,c])=>`<button type="button" data-a="${k}" class="${curAccent()===k?'on':''}" aria-pressed="${curAccent()===k}" title="${t}" style="--sw:${c}"><i></i><span>${t}</span></button>`).join('')}</div>`)+
+    stRow('Плотность интерфейса','Компактная убирает лишние отступы: на экране помещается больше строк',`<div class="st-acc st-dens" id="denssel" role="group" aria-label="Плотность интерфейса">${[['comfort','Комфортная'],['compact','Компактная']].map(([k,t])=>`<button type="button" data-d="${k}" class="${curDensity()===k?'on':''}" aria-pressed="${curDensity()===k}"><span>${t}</span></button>`).join('')}</div>`),
+    {hint:'внешний вид',q:'акцент цвет плотность компактная комфортная синий изумрудный графит фиолетовый'})+
     stGroup('Напоминания',
     stRow('Напоминать о выплатах','За сколько дней предупреждать на «Обзоре» и в «Выплатах» (0 — выключить)',`<input class="in num st-num" id="nd" type="number" min="0" max="60" value="${c.notify_days??7}" aria-label="За сколько дней напоминать о выплатах"><span class="st-unit">дн.</span>`)+
     stRow('Системные уведомления','Приходят, пока программа открыта',`<span class="st-who" id="ntf-st">${perm==='granted'?'Разрешены':perm==='denied'?'Запрещены в браузере':perm==='unsupported'?'Не поддерживаются':'Не разрешены'}</span><button class="btn ghost" id="ntf" ${perm==='granted'||perm==='unsupported'?'disabled':''}>Разрешить</button>`)+
@@ -146,6 +150,10 @@ async function renderSettings(){
   view.addEventListener('scroll',window._stSpyH,{passive:true});stSpy();
   stTiles(c);
   /* тема: сохраняется сразу */
+  $('#accsel').onclick=e=>{const b=e.target.closest('[data-a]');if(!b)return;applyAccent(b.dataset.a);
+    $('#accsel').querySelectorAll('button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-pressed',on)});stMsg('Акцентный цвет сохранён',1,true)};
+  $('#denssel').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;applyDensity(b.dataset.d);
+    $('#denssel').querySelectorAll('button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-pressed',on)});stMsg('Плотность сохранена',1,true)};
   $('#thsel').onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;applyTheme(b.dataset.t);post('/api/config',{theme:b.dataset.t}).then(()=>stOk(b)).catch(()=>{});
     $('#thsel').querySelectorAll('button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-pressed',on)});stMsg('Тема сохранена',1,true)};
   /* ключевая ставка: сохраняется сразу */
@@ -178,8 +186,8 @@ async function renderSettings(){
   /* песочница меняет и адреса API, и нужный токен — применяется вместе с токеном по «Сохранить и подключиться», а не сразу */
   $('#sb').onchange=e=>{const el=e.currentTarget;if(el.checked===!!c.sandbox)return;
     stMsg(el.checked?'Вставьте токен песочницы и нажмите «Сохранить и подключиться».':'Вставьте боевой токен (только чтение) и нажмите «Сохранить и подключиться».',1)};
-  $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Заново загрузить все операции и цены из Т-Инвестиций? Это может занять время.'))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
-  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
+  $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Загрузить данные заново?', body:'Все операции и цены будут заново загружены из Т-Инвестиций. Это может занять время.', okText:'Загрузить'}))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
+  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Удалить токен?', body:'Сохранённый токен Т-Инвестиций будет стёрт с этого компьютера.', danger:true, okText:'Удалить'}))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
   if($('#sbpay'))$('#sbpay').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sandbox/payin',{accountId:S.account,amount:$('#amt').value});S.data=S.bonds=S.hist=null;msg('Счёт пополнен на '+M(+$('#amt').value,'rub',0),1);load(true)});
 }
