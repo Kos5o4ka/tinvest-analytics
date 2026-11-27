@@ -65,6 +65,24 @@ function uxSyncMode(){
 }
 uxSyncMode();
 
+/* Мгновенные подсказки справа от значков в свёрнутом сайдбаре (родные подсказки браузера появляются с задержкой) */
+{
+  let navTip=null;
+  const hide=()=>{if(navTip){navTip.remove();navTip=null}};
+  document.addEventListener('mouseover',e=>{
+    const b=e.target.closest&&e.target.closest('aside .nav button[data-tip]');
+    if(!b||!document.body.classList.contains('side-mini')){hide();return}
+    hide();
+    const r=b.getBoundingClientRect();
+    navTip=document.createElement('div');navTip.className='nav-tip';navTip.textContent=b.dataset.tip;
+    document.body.appendChild(navTip);
+    navTip.style.left=(r.right+8)+'px';
+    navTip.style.top=(r.top+r.height/2-navTip.offsetHeight/2)+'px';
+  });
+  document.addEventListener('mouseout',e=>{if(e.target.closest&&e.target.closest('aside .nav button[data-tip]'))hide()});
+  document.addEventListener('click',hide,true);
+}
+
 function uxSetMode(m){
   UX.mode=m==='pro'?'pro':'basic';
   lsSet('ta_ux_mode',UX.mode);
@@ -154,15 +172,16 @@ renderNav=function(){
     const act=curSec&&curSec.id===s.id;
     const target=(UX.lastTab[s.id]&&tabs.includes(UX.lastTab[s.id]))?UX.lastTab[s.id]:tabs[0];
     const cnt=tabs.length>1?`<span class="ux-cnt">${tabs.length}</span>`:'';
-    return`<button class="${act?'on':''}" data-p="${esc(target)}" title="${esc(s.title)}">${svgI(IC[s.icon]||IC.dash)}<span class="nav-t">${esc(s.title)}</span>${cnt}</button>`;
+    return`<button class="${act?'on':''}" data-p="${esc(target)}" title="${esc(s.title)}" data-tip="${esc(s.title)}">${svgI(IC[s.icon]||IC.dash)}<span class="nav-t">${esc(s.title)}</span>${cnt}</button>`;
   }).join('');
   if(extra.length){
-    h+='<div class="sep"></div>'+extra.map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}">${svgI(IC[p[0]]||IC.dash)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
+    h+='<div class="sep"></div>'+extra.map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}" data-tip="${esc(p[1])}">${svgI(IC[p[0]]||IC.dash)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
   }
-  h+='<div class="sep"></div>'+NAV_FIXED.map(k=>PAGES.find(p=>p&&p[0]===k)).filter(Boolean).map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}">${svgI(IC[p[0]]||IC.set)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
+  const fx=NAV_FIXED.map(k=>PAGES.find(p=>p&&p[0]===k)).filter(Boolean).map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}" data-tip="${esc(p[1])}">${svgI(IC[p[0]]||IC.set)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
   $('#nav').innerHTML=h;
+  const nf=$('#nav-fix');if(nf)nf.innerHTML=fx;
   $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
-  $('#period').style.visibility=PERIOD_PAGES.includes(S.page)&&S.data?'visible':'hidden';
+  $('#period').style.display=PERIOD_PAGES.includes(S.page)&&S.data?'':'none';
   const a=S.accounts.find(x=>x.id===S.account);
   const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
   if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}

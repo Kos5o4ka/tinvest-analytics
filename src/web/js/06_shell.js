@@ -15,7 +15,7 @@ function renderNav(){
   h+='<div class="sep"></div>'+NAV_FIXED.map(k=>pg(k)).filter(Boolean).map(navBtn).join('');
   $('#nav').innerHTML=h;
   $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
-  $('#period').style.visibility=PERIOD_PAGES.includes(S.page)?'visible':'hidden';
+  $('#period').style.display=PERIOD_PAGES.includes(S.page)?'':'none';
   const a=S.accounts.find(x=>x.id===S.account);
   const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
   if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}
@@ -32,6 +32,7 @@ function renderAccounts(){
     (S.hideEmpty&&vis.length<accs.length?`<div class="note" style="padding:4px 10px">Скрыто пустых: ${accs.length-vis.length}</div>`:'');
 }
 $('#nav').onclick=e=>{const g=e.target.closest('[data-g]');if(g){const n=g.dataset.g;S.navShut[n]=!S.navShut[n];lsSet('ta_nav_shut',JSON.stringify(S.navShut));renderNav();return}const b=e.target.closest('[data-p]');if(!b)return;go(b.dataset.p)};
+$('#nav-fix').onclick=e=>{const b=e.target.closest('[data-p]');if(b)go(b.dataset.p)};
 $('#period').onclick=e=>{const b=e.target.closest('[data-k]');if(!b||b.dataset.k===S.period)return;S.period=b.dataset.k;persist();renderNav();load(false,true)};
 $('#acl').onclick=e=>{const b=e.target.closest('[data-a]');if(!b||b.dataset.a===S.account)return;S.account=b.dataset.a;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
 $('#hideEmpty').onchange=e=>{S.hideEmpty=e.target.checked;persist();renderAccounts()};

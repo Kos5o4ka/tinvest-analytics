@@ -1,0 +1,22 @@
+/* ── Исправления вёрстки по ревью (Windows, узкие окна) ── */
+
+/* Сайдбар: прокручивается только основной список, служебные пункты закреплены внизу */
+@media(min-width:761px){
+  aside{overflow:hidden}
+  aside .nav-main{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
+  aside .nav-fix{flex:none;border-top:1px solid var(--line);margin-top:6px;padding-top:6px}
+  aside .side-foot{margin-top:0;flex:none}
+}
+@media(max-width:760px){.nav-fix{flex-direction:row;overflow-x:auto;border-top:0;padding:0}}
+.nav-tip{position:fixed;z-index:3000;pointer-events:none;background:var(--card2);color:var(--tx);border:1px solid var(--line2);border-radius:8px;padding:5px 10px;font-size:12.5px;font-weight:550;white-space:nowrap;box-shadow:0 8px 22px #00000066}
+
+/* Полоса прокрутки не сдвигает вёрстку при появлении */
+#view{scrollbar-gutter:stable}
+
+/* Шапка: заголовок не сжимается до пары букв, период не переносится по строкам */
+.top h1{display:block;flex:1 1 150px;min-width:110px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.top #period{flex:none;flex-wrap:nowrap}
+.top #period button{white-space:nowrap}
+@media(min-width:761px) and (max-width:1100px){
+  .top{flex-wrap:wrap;row-gap:8px}
+}
