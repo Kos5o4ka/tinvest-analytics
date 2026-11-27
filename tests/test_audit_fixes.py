@@ -96,12 +96,21 @@ class ShellStatus(unittest.TestCase):
     def test_old_shell_outdated(self):
         self.assertTrue(M.shell_status(env={}, frozen=True)["outdated"])
 
-    def test_rev2_shell_outdated(self):                      # ревизия 3: заставка на pywebview
+    def test_rev2_shell_outdated(self):                      # ревизия 4: установщик, трей, обновление оболочки
         self.assertTrue(M.shell_status(env={"TINVEST_SHELL_REV": "2"}, frozen=True)["outdated"])
+        self.assertTrue(M.shell_status(env={"TINVEST_SHELL_REV": "3"}, frozen=True)["outdated"])
 
     def test_new_shell_ok(self):
-        self.assertFalse(M.shell_status(env={"TINVEST_SHELL_REV": "3"}, frozen=True)["outdated"])
         self.assertFalse(M.shell_status(env={"TINVEST_SHELL_REV": "4"}, frozen=True)["outdated"])
+        self.assertFalse(M.shell_status(env={"TINVEST_SHELL_REV": "5"}, frozen=True)["outdated"])
+
+    def test_windows_asset_is_installer(self):
+        old = M.sys.platform
+        M.sys.platform = "win32"
+        try:
+            self.assertEqual(M.shell_status(env={}, frozen=True)["asset"], "TAnalytic-Setup-win.exe")
+        finally:
+            M.sys.platform = old
 
     def test_launcher_matches_latest(self):
         import re

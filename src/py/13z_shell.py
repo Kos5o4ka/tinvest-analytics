@@ -3,7 +3,8 @@
 # Автообновление меняет только tinvest_analytics.py; окно, иконка и экран обновления живут в самой оболочке.
 # Оболочка сообщает свою ревизию через TINVEST_SHELL_REV (с ревизии 2); старые оболочки её не передают.
 # Ревизия 3 — заставка на pywebview с бесшовным переходом в окно программы.
-SHELL_REV_LATEST = 3
+# Ревизия 4 — установщик Windows (onedir), значок в трее, автозапуск и обновление оболочки из программы.
+SHELL_REV_LATEST = 4
 SHELL_RELEASES = "https://github.com/Kos5o4ka/tinvest-analytics/releases/latest"
 
 
@@ -15,7 +16,7 @@ def shell_status(env=None, frozen=None):
     except ValueError:
         rev = 0
     asset = {"darwin": "TAnalytic-mac-arm64.zip" if platform.machine() == "arm64" else "TAnalytic-mac-x64.zip",
-             "win32": "TAnalytic-win.exe"}.get(sys.platform)
+             "win32": "TAnalytic-Setup-win.exe"}.get(sys.platform)
     return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "outdated": bool(frozen and rev < SHELL_REV_LATEST),
             "url": SHELL_RELEASES, "asset": asset}
 

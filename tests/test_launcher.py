@@ -337,5 +337,132 @@ class Splash(unittest.TestCase):
         self.assertEqual([n for n in dir(api) if not n.startswith("_")], ["browser", "close", "minimize", "retry", "run"])
 
 
+class ShellUpdate(unittest.TestCase):
+    """Обновление оболочки: установщик с GitHub, сверка SHA256, запуск без сети и без Windows."""
+    SETUP = b"MZ fake installer" * 100
+    SETUP_SHA = hashlib.sha256(SETUP).hexdigest()
+
+    def rel(self, tag="v9.9", url="https://github.com/x/Setup.exe"):
+        return {"tag_name": tag, "assets": [
+            {"name": L.SETUP_ASSET, "browser_download_url": url},
+            {"name": "SHA256SUMS", "browser_download_url": "https://github.com/x/sums"}]}
+
+    def fake(self, rel=None, sums=None, blob=None):
+        rel = rel or self.rel()
+        sums = sums if sums is not None else "%s  tinvest_analytics.py\n%s  %s\n" % (SHA, self.SETUP_SHA, L.SETUP_ASSET)
+        blob = self.SETUP if blob is None else blob
+        calls = []
+
+        def fetch(url, limit=0, progress=None, cancel=None):
+            calls.append((url, limit))
+            if url.endswith("/latest"):
+                return json.dumps(rel).encode()
+            if url.endswith("/sums"):
+                return sums.encode()
+            return blob
+        fetch.calls = calls
+        return fetch
+
+    def test_asset_name_matches_workflow(self):
+        yml = open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8").read()
+        self.assertIn("asset: " + L.SETUP_ASSET, yml)
+        self.assertEqual(L.SETUP_ARGS[:3], ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"))
+
+    def test_pick_setup(self):
+        self.assertEqual(L.pick_setup(self.rel()), ("https://github.com/x/Setup.exe", "https://github.com/x/sums"))
+        with self.assertRaises(ValueError):
+            L.pick_setup({"tag_name": "v1", "assets": [{"name": "SHA256SUMS", "browser_download_url": "https://github.com/x/sums"}]})
+        with self.assertRaises(ValueError):                       # адрес не с доменов GitHub
+            L.pick_setup(self.rel(url="https://evil.example/Setup.exe"))
+        with self.assertRaises(ValueError):
+            L.pick_setup(self.rel(url="http://github.com/x/Setup.exe"))
+
+    def test_prepare_downloads_and_verifies(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = self.fake()
+            info = L.prepare_installer(d, fetch=f)
+            self.assertEqual(info["tag"], "v9.9")
+            self.assertEqual(info["path"], os.path.join(d, L.SETUP_ASSET))
+            self.assertEqual(open(info["path"], "rb").read(), self.SETUP)
+            self.assertEqual(f.calls[-1][1], L.SETUP_LIMIT)       # установщик больше обычного лимита в 20 МБ
+            self.assertGreater(L.SETUP_LIMIT, 20_000_000)
+            self.assertFalse(os.path.exists(info["path"] + ".part"))
+
+    def test_prepare_rejects_bad_checksum(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                L.prepare_installer(d, fetch=self.fake(blob=b"substituted"))
+            self.assertEqual(os.listdir(d), [])                   # на диск ничего не попало
+
+    def test_prepare_missing_sum_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                L.prepare_installer(d, fetch=self.fake(sums="%s  tinvest_analytics.py\n" % SHA))
+            self.assertEqual(os.listdir(d), [])
+
+    def test_prepare_reuses_verified_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            L.prepare_installer(d, fetch=self.fake())
+            f = self.fake(blob=b"must not be downloaded")
+            info = L.prepare_installer(d, fetch=f)
+            self.assertEqual(info["sha"], self.SETUP_SHA)
+            self.assertEqual(len(f.calls), 2)                      # описание релиза и суммы, сам файл не качали
+
+    def test_prepare_replaces_corrupt_old_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, L.SETUP_ASSET), "wb") as fh:
+                fh.write(b"corrupt")
+            info = L.prepare_installer(d, fetch=self.fake())
+            self.assertEqual(open(info["path"], "rb").read(), self.SETUP)
+
+    def test_start_installer_args_and_recheck(self):
+        with tempfile.TemporaryDirectory() as d:
+            info = L.prepare_installer(d, fetch=self.fake())
+            got = []
+            L.start_installer(info, popen=lambda cmd, **kw: got.append((cmd, kw)))
+            cmd, kw = got[0]
+            self.assertEqual(cmd[0], info["path"])
+            for flag in ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"):
+                self.assertIn(flag, cmd)
+            self.assertTrue(kw["close_fds"])
+            with open(info["path"], "ab") as fh:                   # файл изменили после проверки
+                fh.write(b"x")
+            with self.assertRaises(ValueError):
+                L.start_installer(info, popen=lambda *a, **k: self.fail("не должен запускаться"))
+
+    def test_install_and_exit_releases_lock_first(self):
+        order = []
+
+        class Lock:
+            def release(self): order.append("release")
+            def acquire(self): order.append("acquire")
+        old = L.LOCK
+        L.LOCK = Lock()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                info = L.prepare_installer(d, fetch=self.fake())
+                self.assertTrue(L.install_and_exit(info, popen=lambda *a, **k: order.append("popen"),
+                                                   exit_fn=lambda c: order.append("exit%d" % c)))
+                self.assertEqual(order, ["release", "popen", "exit0"])
+                self.assertTrue(L.QUITTING.is_set())
+                L.QUITTING.clear()
+                order.clear()
+                with open(info["path"], "ab") as fh:
+                    fh.write(b"x")
+                self.assertFalse(L.install_and_exit(info, popen=lambda *a, **k: order.append("popen"),
+                                                    exit_fn=lambda c: order.append("exit")))
+                self.assertEqual(order, ["release", "acquire"])    # запуск не удался: мьютекс возвращён, выхода нет
+                self.assertFalse(L.QUITTING.is_set())
+        finally:
+            L.LOCK = old
+            L.QUITTING.clear()
+
+    def test_update_supported_only_in_frozen_windows(self):
+        self.assertFalse(L.shell_update_supported())               # тесты идут из исходников
+        r = L.MainApi().shell_update_prepare()
+        self.assertIn("error", r)
+        self.assertIn("error", L.MainApi().shell_update_run())
+
+
 if __name__ == "__main__":
     unittest.main()

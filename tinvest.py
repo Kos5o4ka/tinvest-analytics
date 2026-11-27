@@ -18,8 +18,9 @@ HOME = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), "
 APP_DIR = os.path.join(HOME, "app")
 APP, VER = os.path.join(APP_DIR, FILE), os.path.join(APP_DIR, "version.txt")
 OK_HOSTS = ("api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com")
-SHELL_REV = 3                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
+SHELL_REV = 4                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
                                          # 3 — заставка на pywebview и бесшовный переход в окно программы
+                                         # 4 — установщик (onedir), трей, автозапуск и обновление оболочки из программы
 os.environ["TINVEST_SHELL_REV"] = str(SHELL_REV)
 FROZEN = bool(getattr(sys, "frozen", False))      # собрано PyInstaller: sys.executable — сам лаунчер, не Python
 
@@ -148,6 +149,73 @@ def update(report=lambda *a: None, cancel=None, fetch=fetch):
     with open(VER, "w") as f:
         f.write(tag)
     return "updated"
+
+
+# ───────────────────────────── обновление оболочки: установщик с GitHub ─────────────────────────────
+
+SETUP_ASSET = "TAnalytic-Setup-win.exe"          # установщик Inno Setup (packaging/TAnalytic.iss), публикуется в релизе
+SETUP_LIMIT = 300_000_000                        # установщик заметно больше одного .py (по умолчанию fetch берёт до 20 МБ)
+UPDATE_DIR = os.path.join(HOME, "update")
+SETUP_ARGS = ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/RELAUNCH=1")   # /RELAUNCH — свой параметр .iss
+
+
+def shell_update_supported():
+    """Самообновление оболочки — только у собранного .exe на Windows (на macOS ссылка на скачивание)."""
+    return sys.platform == "win32" and FROZEN
+
+
+def pick_setup(rel, name=SETUP_ASSET):
+    """Из описания релиза GitHub: (адрес установщика, адрес SHA256SUMS). Оба — только домены GitHub."""
+    urls = {a.get("name"): a.get("browser_download_url") for a in rel.get("assets", []) if isinstance(a, dict)}
+    if not urls.get(name) or not urls.get(SUMS):
+        raise ValueError("в релизе %s нет установщика или контрольных сумм" % rel.get("tag_name", "?"))
+    return check_url(urls[name]), check_url(urls[SUMS])
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def prepare_installer(dest_dir=None, report=lambda *a: None, cancel=None, fetch=fetch):
+    """Скачивает установщик последнего релиза и сверяет SHA256 с SHA256SUMS из того же релиза.
+    Возвращает {"path", "tag", "sha"}; при несовпадении суммы файл не сохраняется."""
+    rel = json.loads(fetch("https://api.github.com/repos/%s/releases/latest" % REPO, cancel=cancel))
+    tag = rel["tag_name"]
+    url, sums_url = pick_setup(rel)
+    want = parse_sums(fetch(sums_url, cancel=cancel).decode(), SETUP_ASSET)
+    dest_dir = dest_dir or UPDATE_DIR
+    path = os.path.join(dest_dir, SETUP_ASSET)
+    try:
+        if os.path.exists(path) and sha256_file(path) == want:       # уже скачан и цел
+            return {"path": path, "tag": tag, "sha": want}
+    except OSError:
+        pass
+    data = fetch(url, limit=SETUP_LIMIT, progress=lambda d, t, s: report("progress", d, t, s), cancel=cancel)
+    if hashlib.sha256(data).hexdigest() != want:
+        raise ValueError("не совпала контрольная сумма SHA256 — установщик отклонён")
+    os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return {"path": path, "tag": tag, "sha": want}
+
+
+def start_installer(info, popen=None):
+    """Запускает скачанный установщик тихо; процесс не привязан к лаунчеру и переживает его выход.
+    Перед запуском сумма файла проверяется ещё раз (между скачиванием и согласием пользователя он мог измениться)."""
+    path = info["path"]
+    if sha256_file(path) != info["sha"]:
+        raise ValueError("файл установщика изменился после проверки — обновление отклонено")
+    popen = popen or subprocess.Popen
+    kw = {"close_fds": True}
+    if sys.platform == "win32":
+        kw["creationflags"] = 0x00000008 | 0x00000200            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    return popen([path] + list(SETUP_ARGS), **kw)
 
 
 def worker(q, cancel):
@@ -850,6 +918,8 @@ class MainApi:
     """Мост окна программы (window.pywebview.api.*): тема шапки, управление окном, выбор файла."""
     def __init__(self):
         self._win = None
+        self._setup = None
+        self._upd_lock = threading.Lock()
 
     def set_theme(self, theme):
         if sys.platform == "win32" and self._win is not None:
@@ -876,6 +946,26 @@ class MainApi:
 
     def close(self):
         self._win and self._win.destroy()
+
+    def shell_update_prepare(self):
+        """Скачивает и проверяет установщик новой оболочки. → {ok, tag} или {error}. Сеть — здесь, не в браузере."""
+        if not shell_update_supported():
+            return {"error": "Обновление оболочки из программы доступно только в установленной версии для Windows"}
+        with self._upd_lock:
+            try:
+                self._setup = prepare_installer()
+                return {"ok": True, "tag": self._setup["tag"]}
+            except Exception as e:
+                self._setup = None
+                return {"error": str(getattr(e, "reason", None) or e)}
+
+    def shell_update_run(self):
+        """«Обновить и перезапустить»: запускает проверенный установщик и закрывает программу."""
+        info = self._setup
+        if not info or not shell_update_supported():
+            return {"error": "Установщик не подготовлен"}
+        threading.Thread(target=install_and_exit, args=(info,), daemon=True).start()   # ответ страница получит до выхода
+        return {"ok": True}
 
     def pick_file(self, kinds="Отчёты брокера (*.xlsx;*.xls;*.csv;*.html;*.htm;*.xml)"):
         """Системный диалог выбора файла (запасной путь, если <input type=file> не открылся). → {name, b64} или None."""
@@ -949,7 +1039,7 @@ def app_window(webview, url, thread, geom, hidden=False, html=None, remember_geo
     if not hidden:
         win.events.shown += shown
     if thread is not None:
-        threading.Thread(target=lambda: (thread.join(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
+        threading.Thread(target=lambda: (thread.join(), QUITTING.set(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
     return win
 
 
@@ -1573,19 +1663,56 @@ def activate_running():
         return False
 
 
-def graceful_exit(code, wait=3.0):
-    """Выход без обрыва: программа сбрасывает журнал SQLite (wal_checkpoint) и закрывает соединения,
-    затем процесс завершается, не дожидаясь фоновых потоков (пулы сетевых запросов)."""
+QUITTING = threading.Event()        # настоящий выход (а не «закрыть в трей»): обработчик закрытия окна пропускает закрытие
+LOCK = None                         # SingleInstance этого процесса (создаётся в main)
+
+
+def run_shutdown_hook(wait=3.0):
+    """Программа сбрасывает журнал SQLite (wal_checkpoint) и закрывает соединения."""
     hook = getattr(sys, "tanalytic_shutdown", None)
     if callable(hook):
         t = threading.Thread(target=hook, daemon=True)
         t.start()
         t.join(wait)
+
+
+def graceful_exit(code, wait=3.0):
+    """Выход без обрыва: сброс журнала SQLite, затем процесс завершается, не дожидаясь
+    фоновых потоков (пулы сетевых запросов)."""
+    QUITTING.set()
+    run_shutdown_hook(wait)
+    try:
+        tray_dispose()
+    except Exception:
+        pass
     try:
         sys.stdout and sys.stdout.flush()
     except Exception:
         pass
     os._exit(code)
+
+
+def install_and_exit(info, popen=None, exit_fn=None):
+    """Запускает установщик и выходит. Мьютекс одной копии отпускаем до запуска (иначе AppMutex установщика
+    успеет увидеть его и потребует закрыть программу); если запуск не удался — берём его обратно и остаёмся."""
+    QUITTING.set()
+    held = LOCK is not None
+    if held:
+        LOCK.release()
+    try:
+        start_installer(info, popen)
+    except Exception as e:
+        QUITTING.clear()
+        if held:
+            LOCK.acquire()
+        sys.stderr.write("Не удалось запустить установщик: %s\n" % e)
+        return False
+    (exit_fn or graceful_exit)(0)
+    return True
+
+
+def tray_dispose():
+    """Убирает значок из области уведомлений при выходе (замена ниже, когда появится трей)."""
 
 
 def webbrowser_open(url):
@@ -1606,8 +1733,9 @@ def main():
     args = [a for a in argv if a not in ("--no-update", "--no-gui")]
     demo = os.environ.get("TINVEST_SPLASH_DEMO", "")            # 1 / net / checksum: показать заставку без сети и файлов
     demo = "ok" if demo == "1" else demo
+    global LOCK
     if FROZEN and not demo:
-        lock = SingleInstance()
+        lock = LOCK = SingleInstance()
         if not lock.acquire():                                   # программа уже открыта: показать её окно и выйти
             activate_running()
             sys.exit(0)
