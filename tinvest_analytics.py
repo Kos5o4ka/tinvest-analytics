@@ -8671,6 +8671,7 @@ def _auth_http(srv, path, key):
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # только хэш ПК (см. 12e_hwid.py); для пробного периода
     try:
         with urllib.request.urlopen(urllib.request.Request(srv + path, headers=hd), timeout=10, context=_ssl()) as r:
             code, raw = r.status, r.read()
@@ -8710,7 +8711,8 @@ def _auth_eval(srv, key):
         return dict(base, expires=j.get("expires"), username=str(j.get("username") or ""),
                     plan="free" if plan == "free" else "pro",
                     pro_until=pu if isinstance(pu, (int, float)) and not isinstance(pu, bool) else None,
-                    trial=bool(j.get("trial")) and plan != "free")
+                    trial=bool(j.get("trial")) and plan != "free",
+                    trial_blocked=bool(j.get("trial_blocked")), message=str(j.get("message") or "") if j.get("trial_blocked") else "")
     if code == 401 or code == 403:
         err = str(j.get("error") or "")
         return dict(base, state="need_login", error=err if err in ("expired", "banned") else "invalid")
@@ -10686,6 +10688,77 @@ def market_snapshot_stocks(max_age=MARKET_SNAP_TTL, force=False):
 def market_snapshot_heatmap(max_age=MARKET_SNAP_TTL, force=False):
     d = market_snapshot_get("heatmap", max_age=max_age, force=force)
     return d.get("data") if isinstance(d, dict) else None
+# ═══════════════ HWID: хэш идентификатора ПК для привязки пробного периода ═══════════════
+# Наружу уходит только sha256(машинный id + соль приложения); сырой id нигде не хранится и не отправляется.
+# Токен Т-Инвестиций в этом обмене не участвует. Если машинный id получить не удалось, берётся случайный id,
+# сохранённый в папке данных (файл hwid.id).
+
+HWID_SALT = "tanalytic-hwid-v1"
+
+
+def _hwid_machine_raw():
+    """Сырой машинный id или пустая строка. Только для вычисления хэша."""
+    try:
+        if sys.platform.startswith("win"):
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0,
+                                winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)) as k:
+                return str(winreg.QueryValueEx(k, "MachineGuid")[0]).strip()
+        if sys.platform == "darwin":
+            out = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], capture_output=True, timeout=5).stdout
+            m = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out.decode("utf-8", "replace"))
+            return m.group(1).strip() if m else ""
+        for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    v = f.read().strip()
+            except OSError:
+                continue
+            if v:
+                return v
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _hwid_fallback_raw():
+    p = os.path.join(APP_DIR, "hwid.id")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+        if len(v) >= 16:
+            return v
+    except OSError:
+        pass
+    v = uuid.uuid4().hex + uuid.uuid4().hex
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(v)
+    except OSError:
+        pass
+    return v
+
+
+def hwid_hash(raw):
+    return hashlib.sha256((str(raw) + "|" + HWID_SALT).encode("utf-8")).hexdigest()
+
+
+_hwid_cache = {"v": ""}
+
+
+def hwid_get():
+    """sha256-хэш (64 hex-знака) идентификатора этого ПК."""
+    if not _hwid_cache["v"]:
+        _hwid_cache["v"] = hwid_hash(_hwid_machine_raw() or _hwid_fallback_raw())
+    return _hwid_cache["v"]
+
+
+def hwid_headers():
+    try:
+        return {"X-Hwid": hwid_get()}
+    except Exception:  # noqa: BLE001
+        return {}
 # ── курс КБД сегодня, спред к КБД ──
 
 _kbd_now = {"t": 0, "pts": []}
@@ -41658,6 +41731,7 @@ function proPill(){
 /* Мягкое напоминание за 3 дня до конца (можно закрыть до следующего срока) */
 function proBanner(){
   const s=AUTH&&AUTH.st,d=proDaysLeft();
+  if(s&&s.trial_blocked&&s.message)return`<div class="msg info pro-ban"><span>${esc(s.message)}.</span></div>`;
   if(!s||s.plan!=='pro'||!s.pro_until||d==null||d<=0||d>3)return'';
   if(String(uiGet('pro_ban')||lsGet('ta_pro_ban')||'')===String(s.pro_until))return'';
   return`<div class="msg info pro-ban"><span>Pro действует до ${proDm(s.pro_until)}${d<=1?' (остался день)':''}. Продлить: <a href="${esc(proUrl())}" target="_blank" rel="noopener noreferrer">@${esc(proBot())}</a>, команда /pro.</span><button data-pro-dismiss title="Скрыть">×</button></div>`;

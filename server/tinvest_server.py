@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tinvest_md  # noqa: E402  (токен владельца сервера, только чтение; см. tinvest_md.py)
 import crowd  # noqa: E402  (очередь и приём страниц раскрытия от приложений пользователей, см. crowd.py)
 import alerts  # noqa: E402  (серверная проверка тревог, пока приложение закрыто; см. alerts.py)
+import trial  # noqa: E402  (привязка пробного периода к ПК по хэшу, см. trial.py)
 import sync  # noqa: E402  (зашифрованная облачная копия, очередь из бота, вход в один клик; см. sync.py)
 
 VERSION = "1.1.0"
@@ -1476,7 +1477,9 @@ class Handler(BaseHTTPRequestHandler):
         if client is None:
             return self._send(401, {"ok": False, "error": reason or "invalid", "bot": app.bot})
         if u.path == "/v1/auth/check":
-            return self._send(200, {"ok": True, "expires": info["expires"] if info else None,
+            info, blocked = trial.apply(app.keystore, self.headers.get("X-Hwid"), info)
+            return self._send(200, {"ok": True, "trial_blocked": blocked, "message": trial.MSG_USED if blocked else "",
+                                    "trial_days": trial.trial_days(), "price_stars": trial.price_stars(), "expires": info["expires"] if info else None,
                                     "username": info["username"] if info else "", "plan": info["plan"] if info else "",
                                     "pro_until": info.get("pro_until") if info else None,
                                     "trial": bool(info and info.get("trial")), "bot": app.bot})

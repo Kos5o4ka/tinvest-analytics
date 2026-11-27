@@ -65,6 +65,7 @@ function proPill(){
 /* Мягкое напоминание за 3 дня до конца (можно закрыть до следующего срока) */
 function proBanner(){
   const s=AUTH&&AUTH.st,d=proDaysLeft();
+  if(s&&s.trial_blocked&&s.message)return`<div class="msg info pro-ban"><span>${esc(s.message)}.</span></div>`;
   if(!s||s.plan!=='pro'||!s.pro_until||d==null||d<=0||d>3)return'';
   if(String(uiGet('pro_ban')||lsGet('ta_pro_ban')||'')===String(s.pro_until))return'';
   return`<div class="msg info pro-ban"><span>Pro действует до ${proDm(s.pro_until)}${d<=1?' (остался день)':''}. Продлить: <a href="${esc(proUrl())}" target="_blank" rel="noopener noreferrer">@${esc(proBot())}</a>, команда /pro.</span><button data-pro-dismiss title="Скрыть">×</button></div>`;
