@@ -5,7 +5,9 @@
 .cl-sec{font-size:12px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.04em;margin:18px 0 10px}
 .cl-row{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin:10px 0}
 .cl-chips{display:flex;flex-wrap:wrap;gap:8px}
-.cl-chip input{display:none}
+.cl-chip input{position:absolute;opacity:0;width:1px;height:1px;margin:0;pointer-events:none}
+.cl-chip{position:relative}
+.cl-chip input:focus-visible+span{outline:2px solid var(--ac);outline-offset:2px}
 .cl-chip span{display:inline-flex;align-items:center;gap:8px;padding:7px 13px;border:1px solid var(--line2);border-radius:999px;cursor:pointer;color:var(--tx2);font-size:13px;user-select:none;transition:.15s}
 .cl-chip span i,.cl-dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
 .cl-dot{margin-right:8px}
