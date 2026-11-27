@@ -1,5 +1,5 @@
 """Тесты лаунчера tinvest.py: без сети, без окна, в временной папке данных."""
-import sys, hashlib, importlib.util, io, json, os, queue, tempfile, threading, unittest, urllib.request
+import sys, hashlib, importlib.util, io, json, os, queue, shutil, subprocess, tempfile, threading, unittest, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -501,6 +501,208 @@ class ShellUpdate(unittest.TestCase):
         r = L.MainApi().shell_update_prepare()
         self.assertIn("error", r)
         self.assertIn("error", L.MainApi().shell_update_run())
+
+
+class FakeProc:
+    def __init__(self, rc=0, err=b""):
+        self.returncode, self.stderr, self.stdout = rc, err, b""
+
+
+class MacShellUpdate(unittest.TestCase):
+    """Обновление оболочки на macOS: выбор образа, сверка суммы, отказ при транслокации, откат. Без hdiutil и без сети."""
+    DMG = b"fake dmg" * 200
+    DMG_SHA = hashlib.sha256(DMG).hexdigest()
+
+    def test_asset_by_platform_and_arch(self):
+        self.assertEqual(L.shell_asset("darwin", "arm64"), "TAnalytic-mac-arm64.dmg")
+        self.assertEqual(L.shell_asset("darwin", "x86_64"), "TAnalytic-mac-x64.dmg")
+        self.assertEqual(L.shell_asset("win32", "AMD64"), L.SETUP_ASSET)
+        self.assertIsNone(L.shell_asset("linux", "x86_64"))
+        yml = open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8").read()
+        for a in L.MAC_ASSETS.values():
+            self.assertIn("asset: " + a, yml)
+
+    def test_prepare_mac_dmg_verifies_sum(self):
+        name = L.MAC_ASSETS["arm64"]
+        rel = {"tag_name": "v9.9", "assets": [{"name": name, "browser_download_url": "https://github.com/x/m.dmg"},
+                                              {"name": "SHA256SUMS", "browser_download_url": "https://github.com/x/sums"}]}
+
+        def fake(blob):
+            sums = "%s  %s\n" % (self.DMG_SHA, name)
+
+            def fetch(url, limit=0, progress=None, cancel=None):
+                return json.dumps(rel).encode() if url.endswith("/latest") else sums.encode() if url.endswith("/sums") else blob
+            return fetch
+        with tempfile.TemporaryDirectory() as d:
+            info = L.prepare_installer(d, fetch=fake(self.DMG), asset=name)
+            self.assertEqual(info["path"], os.path.join(d, name))
+            self.assertEqual(info["sha"], self.DMG_SHA)
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                L.prepare_installer(d, fetch=fake(b"substituted"), asset=name)
+            self.assertFalse(os.path.exists(os.path.join(d, name)))
+        with tempfile.TemporaryDirectory() as d:                   # для образа x64 в релизе нет ни файла, ни суммы
+            with self.assertRaises(ValueError):
+                L.prepare_installer(d, fetch=fake(self.DMG), asset=L.MAC_ASSETS["x86_64"])
+
+    def test_app_path_from_executable(self):
+        self.assertEqual(L.mac_app_path("/Applications/TAnalytic.app/Contents/MacOS/TAnalytic"), "/Applications/TAnalytic.app")
+        self.assertEqual(L.mac_app_path("/Users/u/Apps/My App.app/Contents/MacOS/TAnalytic"), "/Users/u/Apps/My App.app")
+        self.assertIsNone(L.mac_app_path("/usr/bin/python3"))
+
+    def test_blocker_translocation_readonly_not_app(self):
+        yes = lambda p, m: True
+        self.assertIsNone(L.mac_update_blocker("/Applications/TAnalytic.app", access=yes))
+        self.assertIn("временной копии", L.mac_update_blocker(
+            "/private/var/folders/ab/T/AppTranslocation/1-2-3/d/TAnalytic.app", access=yes))
+        self.assertIn("временной копии", L.mac_update_blocker("/private/var/folders/x/TAnalytic.app", access=yes))
+        self.assertIn("нельзя заменить", L.mac_update_blocker("/Volumes/TAnalytic/TAnalytic.app", access=lambda p, m: False))
+        self.assertIn("не из", L.mac_update_blocker(None, access=yes))
+
+    def make_world(self, d):
+        """Установленное приложение с меткой OLD и образ-файл с верной суммой."""
+        app = os.path.join(d, "Apps", "TAnalytic.app")
+        os.makedirs(os.path.join(app, "Contents"))
+        with open(os.path.join(app, "Contents", "v.txt"), "w") as f:
+            f.write("OLD")
+        dmg = os.path.join(d, "x.dmg")
+        with open(dmg, "wb") as f:
+            f.write(self.DMG)
+        return app, {"path": dmg, "sha": self.DMG_SHA}
+
+    def fake_run(self, fail=None, src_ok=True):
+        """Подмена subprocess.run: «монтирование» создаёт папку с новым приложением, ditto копирует."""
+        log = []
+
+        def run(cmd, **kw):
+            log.append(cmd)
+            tool = cmd[0]
+            if fail == tool:
+                return FakeProc(1, b"boom\n")
+            if tool == "hdiutil" and cmd[1] == "attach":
+                mnt = cmd[cmd.index("-mountpoint") + 1]
+                if src_ok:
+                    os.makedirs(os.path.join(mnt, "TAnalytic.app", "Contents"))
+                    with open(os.path.join(mnt, "TAnalytic.app", "Contents", "v.txt"), "w") as f:
+                        f.write("NEW")
+            elif tool == "ditto":
+                shutil.copytree(cmd[1], cmd[2])
+            return FakeProc()
+        run.log = log
+        return run
+
+    def read(self, app):
+        with open(os.path.join(app, "Contents", "v.txt")) as f:
+            return f.read()
+
+    def test_replace_ok_and_command_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            app, info = self.make_world(d)
+            run = self.fake_run()
+            res = L.mac_replace_app(info, app, run=run, workdir=os.path.join(d, "w"), pid=7)
+            self.assertEqual(self.read(app), "NEW")
+            self.assertEqual(self.read(res["old"]), "OLD")
+            self.assertEqual(os.path.dirname(res["old"]), os.path.dirname(app))      # рядом: переименование внутри одного тома
+            self.assertEqual([c[0] for c in run.log], ["hdiutil", "ditto", "xattr", "codesign", "hdiutil"])
+            for flag in ("-nobrowse", "-readonly"):
+                self.assertIn(flag, run.log[0])
+            self.assertEqual(run.log[2][:3], ["xattr", "-dr", "com.apple.quarantine"])
+            self.assertEqual(run.log[-1][:2], ["hdiutil", "detach"])
+            self.assertEqual([n for n in os.listdir(os.path.dirname(app)) if "new" in n], [])   # временной копии не осталось
+
+    def test_rollback_on_each_failure(self):
+        for fail in ("ditto", "xattr", "codesign"):
+            with tempfile.TemporaryDirectory() as d:
+                app, info = self.make_world(d)
+                run = self.fake_run(fail=fail)
+                with self.assertRaises(L.MacUpdateError):
+                    L.mac_replace_app(info, app, run=run, workdir=os.path.join(d, "w"), pid=7)
+                self.assertEqual(self.read(app), "OLD", fail)
+                self.assertEqual(sorted(os.listdir(os.path.dirname(app))), ["TAnalytic.app"], fail)
+                self.assertEqual(run.log[-1][:2], ["hdiutil", "detach"], fail)       # образ отмонтирован и при ошибке
+
+    def test_rollback_when_final_rename_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            app, info = self.make_world(d)
+            real = os.rename
+
+            def rename(a, b):
+                if b == app and a.endswith("new-7"):
+                    raise OSError("нет места")
+                return real(a, b)
+            L.os.rename = rename
+            try:
+                with self.assertRaises(L.MacUpdateError):
+                    L.mac_replace_app(info, app, run=self.fake_run(), workdir=os.path.join(d, "w"), pid=7)
+            finally:
+                L.os.rename = real
+            self.assertEqual(self.read(app), "OLD")
+            self.assertEqual(sorted(os.listdir(os.path.dirname(app))), ["TAnalytic.app"])
+
+    def test_image_without_app_and_changed_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            app, info = self.make_world(d)
+            with self.assertRaises(L.MacUpdateError):
+                L.mac_replace_app(info, app, run=self.fake_run(src_ok=False), workdir=os.path.join(d, "w"), pid=7)
+            self.assertEqual(self.read(app), "OLD")
+            with open(info["path"], "ab") as f:
+                f.write(b"x")
+            run = self.fake_run()
+            with self.assertRaises(L.MacUpdateError):
+                L.mac_replace_app(info, app, run=run, workdir=os.path.join(d, "w"), pid=7)
+            self.assertEqual(run.log, [])                          # изменённый образ даже не монтируется
+
+    def test_install_refuses_translocated_and_does_not_touch(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, info = self.make_world(d)
+            run = self.fake_run()
+            ok = L.install_mac_and_exit(info, app="/private/var/folders/ab/T/AppTranslocation/1/d/TAnalytic.app",
+                                        run=run, popen=lambda *a, **k: self.fail("перезапуск не нужен"),
+                                        exit_fn=lambda c: self.fail("выходить нельзя"))
+            self.assertFalse(ok)
+            self.assertEqual(run.log, [])
+            self.assertFalse(L.QUITTING.is_set())
+
+    def test_install_relaunch_then_exit_and_rollback(self):
+        old_blocker, old_dir = L.mac_update_blocker, L.UPDATE_DIR
+        L.mac_update_blocker = lambda a, access=None: None
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                L.UPDATE_DIR = os.path.join(d, "upd")
+                app, info = self.make_world(d)
+                order = []
+
+                def popen(cmd, **kw):
+                    order.append("popen")
+                    self.assertEqual(cmd[:2], ["/bin/sh", "-c"])
+                    self.assertIn("open -n", cmd[2])
+                    self.assertEqual(cmd[-2], app)                  # перезапускаем именно тот путь, где стоит приложение
+                    self.assertTrue(kw["start_new_session"])
+                self.assertTrue(L.install_mac_and_exit(info, app=app, run=self.fake_run(), popen=popen,
+                                                       exit_fn=lambda c: order.append("exit%d" % c)))
+                self.assertEqual(order, ["popen", "exit0"])         # выход — только после запуска перезапуска
+                self.assertEqual(self.read(app), "NEW")
+                L.QUITTING.clear()
+                # перезапуск запустить не удалось — прежнее приложение возвращается, программа не закрывается
+                d2 = os.path.join(d, "b")
+                os.makedirs(d2)
+                app2, info2 = self.make_world(d2)
+
+                def bad(*a, **k):
+                    raise OSError("нет sh")
+                ok = L.install_mac_and_exit(info2, app=app2, run=self.fake_run(), popen=bad,
+                                            exit_fn=lambda c: self.fail("выходить нельзя"))
+                self.assertFalse(ok)
+                self.assertEqual(self.read(app2), "OLD")
+                self.assertEqual(sorted(os.listdir(os.path.dirname(app2))), ["TAnalytic.app"])
+                self.assertFalse(L.QUITTING.is_set())
+        finally:
+            L.mac_update_blocker, L.UPDATE_DIR = old_blocker, old_dir
+            L.QUITTING.clear()
+
+    def test_relaunch_command_is_valid_shell(self):
+        r = subprocess.run(["/bin/sh", "-n", "-c", L.MAC_RELAUNCH], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 if __name__ == "__main__":

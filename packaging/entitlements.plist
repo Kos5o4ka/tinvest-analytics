@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Права для подписи с «hardened runtime» (нотаризация требует его). Приложение не в песочнице, поэтому права на сеть
+     (com.apple.security.network.client) и на WKWebView не нужны: они относятся только к App Sandbox. -->
+<plist version="1.0">
+<dict>
+    <!-- Python: ctypes и libffi (в том числе замыкания pyobjc для WKWebView) выделяют исполняемую память -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <!-- Python.framework и расширения из pip-колёс подписаны чужими сертификатами: без этого hardened runtime их не загрузит -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

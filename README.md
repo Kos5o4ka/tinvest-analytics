@@ -11,16 +11,14 @@
 
 | Система | Файл |
 |---|---|
-| macOS, Apple Silicon (M1 и новее) | [TAnalytic-mac-arm64.zip](https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/TAnalytic-mac-arm64.zip) |
-| macOS, Intel | [TAnalytic-mac-x64.zip](https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/TAnalytic-mac-x64.zip) |
+| macOS, Apple Silicon (M1 и новее) | [TAnalytic-mac-arm64.dmg](https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/TAnalytic-mac-arm64.dmg) |
+| macOS, Intel | [TAnalytic-mac-x64.dmg](https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/TAnalytic-mac-x64.dmg) |
 | Windows 10/11 | [TAnalytic-Setup-win.exe](https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/TAnalytic-Setup-win.exe) (установщик) |
 
 Не знаете, какой Mac: меню  → «Об этом Mac»; если в строке «Чип» написано Apple — берите Apple Silicon.
 
-**macOS.** Распакуйте архив, перенесите «TAnalytic» в «Программы» и откройте. Приложение не подписано сертификатом разработчика Apple,
-поэтому при первом запуске система его заблокирует: откройте «Системные настройки → Конфиденциальность и безопасность», прокрутите вниз до сообщения
-о «TAnalytic» и нажмите **«Всё равно открыть»**. На более старых macOS достаточно щёлкнуть по приложению правой кнопкой и выбрать «Открыть».
-Это нужно один раз. Есть отдельные сборки для Apple Silicon (M1–M4, `mac-arm64`) и для Intel (`mac-x64`), нужна macOS 11 или новее.
+**macOS.** Откройте скачанный образ `.dmg` и перетащите «TAnalytic» на ярлык «Программы», затем запустите приложение из «Программ» (не из образа). Новые версии оболочки программа предложит установить сама: кнопка «Обновить и перезапустить» заменит приложение на месте. Нужна macOS 11 или новее; сборки раздельные: Apple Silicon (M1–M4, `mac-arm64`) и Intel (`mac-x64`).
+Если релиз собран без подписи разработчика Apple, при первом запуске система заблокирует приложение: щёлкните по нему правой кнопкой и выберите **«Открыть»**, затем ещё раз «Открыть» в окне предупреждения. Если такого пункта нет (macOS 15 и новее), откройте «Системные настройки → Конфиденциальность и безопасность», прокрутите вниз до сообщения о «TAnalytic» и нажмите **«Всё равно открыть»**. Это нужно один раз.
 Если macOS пишет, что приложение «повреждено» или «не может быть проверено», снимите карантинную метку в Терминале:
 
 ```

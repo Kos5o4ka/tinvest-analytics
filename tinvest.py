@@ -7,7 +7,7 @@
                                        (=net — ошибка сети с автозапуском, =checksum — неверная контрольная сумма)
 Токен лаунчер не читает и никуда не отправляет: он лежит только в папке данных на этом компьютере.
 """
-import hashlib, json, os, queue, re, socket, ssl, subprocess, sys, threading, time, urllib.request
+import hashlib, json, os, platform, queue, re, shutil, socket, ssl, subprocess, sys, threading, time, urllib.request
 from urllib.parse import urlparse
 
 REPO = "Kos5o4ka/tinvest-analytics"
@@ -154,14 +154,50 @@ def update(report=lambda *a: None, cancel=None, fetch=fetch):
 # ───────────────────────────── обновление оболочки: установщик с GitHub ─────────────────────────────
 
 SETUP_ASSET = "TAnalytic-Setup-win.exe"          # установщик Inno Setup (packaging/TAnalytic.iss), публикуется в релизе
+MAC_ASSETS = {"arm64": "TAnalytic-mac-arm64.dmg", "x86_64": "TAnalytic-mac-x64.dmg"}   # образы macOS (packaging/make_dmg.sh)
+MAC_APP_NAME = "TAnalytic.app"                   # так называется приложение внутри образа и на диске
 SETUP_LIMIT = 300_000_000                        # установщик заметно больше одного .py (по умолчанию fetch берёт до 20 МБ)
 UPDATE_DIR = os.path.join(HOME, "update")
 SETUP_ARGS = ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/RELAUNCH=1")   # /RELAUNCH — свой параметр .iss
 
 
+def shell_asset(plat=None, machine=None):
+    """Файл оболочки в релизе для этой системы и архитектуры (или None, если для неё установщика нет)."""
+    plat = sys.platform if plat is None else plat
+    if plat == "win32":
+        return SETUP_ASSET
+    if plat == "darwin":
+        m = (platform.machine() if machine is None else machine).lower()
+        return MAC_ASSETS["arm64" if m in ("arm64", "aarch64") else "x86_64"]
+    return None
+
+
+def mac_app_path(executable=None):
+    """Путь к «TAnalytic.app», из которого запущена оболочка: .../TAnalytic.app/Contents/MacOS/TAnalytic. Иначе None."""
+    parts = os.path.abspath(executable or sys.executable).split(os.sep)
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i].endswith(".app") and parts[i + 1:i + 3] == ["Contents", "MacOS"]:
+            return os.sep.join(parts[:i + 1]) or os.sep
+    return None
+
+
+def mac_update_blocker(app, access=os.access):
+    """Почему на macOS нельзя заменить приложение на месте (текст для пользователя), или None, если можно.
+    Нельзя: приложение запущено не из .app, из временной копии App Translocation (карантин, запуск из образа
+    или загрузок без переноса) либо из места, куда пользователь не может писать (образ диска, чужая папка)."""
+    if not app:
+        return "Приложение запущено не из «%s»." % MAC_APP_NAME
+    if "/AppTranslocation/" in app or app.startswith("/private/var/folders/"):
+        return "macOS запустила приложение из временной копии. Перенесите «%s» в «Программы» и откройте оттуда." % MAC_APP_NAME
+    parent = os.path.dirname(app)
+    if not (access(app, os.W_OK) and access(parent, os.W_OK)):
+        return "Приложение лежит там, где его нельзя заменить (например, в открытом образе диска)."
+    return None
+
+
 def shell_update_supported():
-    """Самообновление оболочки — только у собранного .exe на Windows (на macOS ссылка на скачивание)."""
-    return sys.platform == "win32" and FROZEN
+    """Самообновление оболочки — только у собранного приложения: .exe на Windows и .app на macOS."""
+    return sys.platform in ("win32", "darwin") and FROZEN
 
 
 def pick_setup(rel, name=SETUP_ASSET):
@@ -180,15 +216,15 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def prepare_installer(dest_dir=None, report=lambda *a: None, cancel=None, fetch=fetch):
-    """Скачивает установщик последнего релиза и сверяет SHA256 с SHA256SUMS из того же релиза.
+def prepare_installer(dest_dir=None, report=lambda *a: None, cancel=None, fetch=fetch, asset=SETUP_ASSET):
+    """Скачивает установщик (asset — файл оболочки: .exe или .dmg, см. shell_asset) последнего релиза и сверяет SHA256 с SHA256SUMS из того же релиза.
     Возвращает {"path", "tag", "sha"}; при несовпадении суммы файл не сохраняется."""
     rel = json.loads(fetch("https://api.github.com/repos/%s/releases/latest" % REPO, cancel=cancel))
     tag = rel["tag_name"]
-    url, sums_url = pick_setup(rel)
-    want = parse_sums(fetch(sums_url, cancel=cancel).decode(), SETUP_ASSET)
+    url, sums_url = pick_setup(rel, asset)
+    want = parse_sums(fetch(sums_url, cancel=cancel).decode(), asset)
     dest_dir = dest_dir or UPDATE_DIR
-    path = os.path.join(dest_dir, SETUP_ASSET)
+    path = os.path.join(dest_dir, asset)
     try:
         if os.path.exists(path) and sha256_file(path) == want:       # уже скачан и цел
             return {"path": path, "tag": tag, "sha": want}
@@ -216,6 +252,118 @@ def start_installer(info, popen=None):
     if sys.platform == "win32":
         kw["creationflags"] = 0x00000008 | 0x00000200            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     return popen([path] + list(SETUP_ARGS), **kw)
+
+
+class MacUpdateError(Exception):
+    pass
+
+
+def _run_checked(run, cmd, what, timeout=300):
+    """Запускает служебную команду macOS; при ошибке — MacUpdateError с понятным текстом."""
+    try:
+        r = run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except Exception as e:
+        raise MacUpdateError("%s: %s" % (what, e))
+    if r.returncode != 0:
+        tail = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+        raise MacUpdateError("%s не удалось (код %s) %s" % (what, r.returncode, tail[0]))
+    return r
+
+
+def mac_replace_app(info, app, run=None, workdir=None, pid=None):
+    """Заменяет приложение app на копию из скачанного образа .dmg. Возвращает {"app", "old"}: old — прежняя
+    копия, которую удалит перезапуск после выхода. Порядок: образ монтируется только для чтения, приложение
+    копируется во временную папку рядом с прежним (ditto сохраняет подпись), с копии снимается карантин,
+    подпись проверяется, затем два переименования: прежнее → «.old», новое → на место. Любая ошибка —
+    прежнее приложение остаётся нетронутым (если упало второе переименование, оно возвращается на место)."""
+    run = run or subprocess.run
+    if sha256_file(info["path"]) != info["sha"]:
+        raise MacUpdateError("файл образа изменился после проверки — обновление отклонено")
+    pid = os.getpid() if pid is None else pid
+    parent = os.path.dirname(app)
+    new, old = os.path.join(parent, ".%s.new-%s" % (MAC_APP_NAME, pid)), os.path.join(parent, ".%s.old-%s" % (MAC_APP_NAME, pid))
+    work = workdir or os.path.join(UPDATE_DIR, "mnt")
+    mnt = os.path.join(work, "mount-%s" % pid)
+    os.makedirs(mnt, mode=0o700, exist_ok=True)
+    mounted = False
+    try:
+        _run_checked(run, ["hdiutil", "attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mnt, info["path"]],
+                     "Не удалось открыть образ диска")
+        mounted = True
+        src = os.path.join(mnt, MAC_APP_NAME)
+        if not os.path.isdir(src):
+            raise MacUpdateError("в образе нет «%s»" % MAC_APP_NAME)
+        _run_checked(run, ["ditto", src, new], "Не удалось скопировать приложение")
+        _run_checked(run, ["xattr", "-dr", "com.apple.quarantine", new], "Не удалось снять карантинную метку", 60)
+        _run_checked(run, ["codesign", "--verify", "--deep", "--strict", new], "Проверка подписи новой копии", 120)
+        os.rename(app, old)
+        try:
+            os.rename(new, app)
+        except OSError:
+            os.rename(old, app)                                      # новую копию на место не поставить — возвращаем прежнюю
+            raise
+    except Exception as e:
+        shutil.rmtree(new, ignore_errors=True)
+        if isinstance(e, MacUpdateError):
+            raise
+        raise MacUpdateError("Не удалось заменить приложение: %s" % e)
+    finally:
+        if mounted:
+            try:
+                _run_checked(run, ["hdiutil", "detach", mnt], "Не удалось закрыть образ", 60)
+            except MacUpdateError:
+                try:
+                    run(["hdiutil", "detach", "-force", mnt], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                except Exception:
+                    pass
+        try:
+            os.rmdir(mnt)
+        except OSError:
+            pass
+    return {"app": app, "old": old}
+
+
+def mac_rollback(res):
+    """Возвращает прежнее приложение на место (если перезапуск не удалось подготовить)."""
+    shutil.rmtree(res["app"], ignore_errors=True)
+    os.rename(res["old"], res["app"])
+
+
+MAC_RELAUNCH = ('i=0; while kill -0 "$1" 2>/dev/null && [ $i -lt 150 ]; do sleep 0.2; i=$((i+1)); done; '
+                'open -n "$2"; rm -rf "$3"')
+
+
+def mac_spawn_relaunch(res, popen=None, pid=None):
+    """Отдельный короткий процесс: ждёт выхода текущего (до 30 секунд), открывает новое приложение через
+    «open -n» и стирает прежнюю копию. Он не привязан к лаунчеру и переживает его выход."""
+    popen = popen or subprocess.Popen
+    return popen(["/bin/sh", "-c", MAC_RELAUNCH, "sh", str(os.getpid() if pid is None else pid), res["app"], res["old"]],
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                 close_fds=True, start_new_session=True)
+
+
+def install_mac_and_exit(info, app=None, run=None, popen=None, exit_fn=None):
+    """macOS: заменяет приложение (mac_replace_app), запускает перезапуск и выходит. Не удалось — остаёмся в прежнем."""
+    app = app or mac_app_path()
+    QUITTING.set()
+    res = None
+    try:
+        why = mac_update_blocker(app)
+        if why:
+            raise MacUpdateError(why)
+        res = mac_replace_app(info, app, run=run)
+        mac_spawn_relaunch(res, popen)
+    except Exception as e:
+        if res is not None:
+            try:
+                mac_rollback(res)
+            except OSError as e2:
+                sys.stderr.write("Не удалось вернуть прежнее приложение: %s\n" % e2)
+        QUITTING.clear()
+        sys.stderr.write("Не удалось обновить приложение: %s\n" % e)
+        return False
+    (exit_fn or graceful_exit)(0)
+    return True
 
 
 def worker(q, cancel):
@@ -948,22 +1096,36 @@ class MainApi:
         self._win and self._win.destroy()
 
     def shell_update_prepare(self):
-        """Скачивает и проверяет установщик новой оболочки. → {ok, tag} или {error}. Сеть — здесь, не в браузере."""
+        """Скачивает и проверяет установщик новой оболочки (Windows — .exe, macOS — .dmg). → {ok, tag} или {error}.
+        Сеть — здесь, не в браузере. На macOS заранее проверяет, что приложение можно заменить на месте."""
         if not shell_update_supported():
-            return {"error": "Обновление оболочки из программы доступно только в установленной версии для Windows"}
+            return {"error": "Обновление оболочки из программы доступно только в установленной версии для Windows и macOS"}
+        if sys.platform == "darwin":
+            why = mac_update_blocker(mac_app_path())
+            if why:
+                return {"error": why}
         with self._upd_lock:
             try:
-                self._setup = prepare_installer()
+                self._setup = prepare_installer(asset=shell_asset())
                 return {"ok": True, "tag": self._setup["tag"]}
             except Exception as e:
                 self._setup = None
                 return {"error": str(getattr(e, "reason", None) or e)}
 
     def shell_update_run(self):
-        """«Обновить и перезапустить»: запускает проверенный установщик и закрывает программу."""
+        """«Обновить и перезапустить»: запускает проверенный установщик (Windows) или заменяет .app (macOS) и закрывает программу."""
         info = self._setup
         if not info or not shell_update_supported():
             return {"error": "Установщик не подготовлен"}
+        if sys.platform == "darwin":
+            res = {}
+
+            def go():
+                res["ok"] = install_mac_and_exit(info)
+            t = threading.Thread(target=go, daemon=True)
+            t.start()
+            t.join(120)                  # при удаче процесс завершится внутри; при ошибке страница получит причину
+            return {"error": "Не удалось заменить приложение (подробности в журнале запуска)"} if res.get("ok") is False else {"ok": True}
         threading.Thread(target=install_and_exit, args=(info,), daemon=True).start()   # ответ страница получит до выхода
         return {"ok": True}
 
