@@ -139,9 +139,13 @@ function line(el,o){
       segs.forEach(sg=>{const f=sg[0].split(','),l=sg[sg.length-1].split(',');s+=`<polygon class="la" points="${f[0]},${base} ${sg.join(' ')} ${l[0]},${base}" fill="url(#${gid})"/>`})}
     segs.forEach(sg=>s+=`<polyline${se.dash?' class="ls"':' class="ln" pathLength="1"'} points="${sg.join(' ')}" fill="none" stroke="${se.c}" stroke-width="${se.w||2}" stroke-linejoin="round" stroke-linecap="round"${se.dash?' stroke-dasharray="5 4"':''}/>`);
     if(!se.dash&&last>=0)ends+=`<g class="ld"><circle cx="${X(last).toFixed(1)}" cy="${Y(se.v[last]).toFixed(1)}" r="8" fill="${se.c}" fill-opacity=".18"/><circle cx="${X(last).toFixed(1)}" cy="${Y(se.v[last]).toFixed(1)}" r="3.5" fill="${se.c}" stroke="var(--card)" stroke-width="1.5"/></g>`});
+  /* вертикальные отметки событий: o.marks=[{i:индекс в исходных labels, t:подпись, c:цвет}] */
+  let mk='';const dk=o.labels.length>420?Math.ceil(o.labels.length/420):1;
+  (o.marks||[]).forEach(m=>{const i=m.i/dk;if(!(i>=0&&i<=n-1))return;const x=X(i),right=x>pl+pw*.7;
+    mk+=`<g class="ch-mark"><line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${pt}" y2="${pt+ph}" stroke="${m.c||'var(--ac)'}" stroke-width="1.5" stroke-dasharray="4 3"/><text class="ax" x="${(x+(right?-6:6)).toFixed(1)}" y="${pt+11}" text-anchor="${right?'end':'start'}" style="fill:${m.c||'var(--ac)'};font-weight:600">${esc(m.t||'')}</text></g>`});
   let hits='';const cw=pw/(n-1);
   for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${X(i)-cw/2}" y="${pt}" width="${cw}" height="${ph}" fill="transparent"/>`;
-  el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${s}${ends}<g class="hv"></g>${hits}</svg>`;
+  el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${s}${ends}${mk}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
   el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`+
     ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>`<circle cx="${X(i)}" cy="${Y(se.v[i])}" r="8" fill="${se.c}" fill-opacity=".18"/><circle cx="${X(i)}" cy="${Y(se.v[i])}" r="4.5" fill="${se.c}" stroke="var(--card)" stroke-width="2"/>`).join('')};

@@ -56,7 +56,7 @@ function cmpDockRender(){
 }
 function pBonds(){
   const b=S.bonds;
-  if(!b)return`<div class="card">${waitBox('Загружаю параметры облигаций и графики купонов…')}</div>`;
+  if(!b)return`<div class="card">${waitChart('Загружаю параметры облигаций и графики купонов…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   const m=b.metrics,tot=S.data.portfolio.total||1;
   if(!m.count)return emptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);

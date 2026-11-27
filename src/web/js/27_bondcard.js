@@ -109,7 +109,7 @@ function bcBind(dr,c,tok){
   const tb=dr.querySelector('#bc-tabs');
   if(tb)tb.onclick=e=>{
     const bt=e.target.closest('[data-bct]');if(!bt||bt.dataset.bct===BC.tab||!c)return;
-    BC.tab=bt.dataset.bct;bcRenderCard(dr,c,tok);
+    BC.tab=bt.dataset.bct;lsSet('ta_bc_tab',BC.tab);bcRenderCard(dr,c,tok);
   };
   const mr=dr.querySelector('#bc-more');
   if(mr&&c)mr.onclick=()=>{BC.all=true;bcRenderCard(dr,c,tok);BC.all=false};
@@ -122,9 +122,9 @@ async function openBond(isin,opts){
   }else if(!opts.fromNav){
     if(BC.stack[BC.stack.length-1]!==isin)BC.stack.push(isin);
   }
-  if(!opts||!opts.keepTab)BC.tab='overview';
+  if(!opts||!opts.keepTab)BC.tab=bcSavedTab();
   const tok=++BC.tok,dr=bcMount();
-  dr.innerHTML=bcBar()+`<div class="bc-load">Загружаю данные по ${esc(isin)}…</div>`;bcBind(dr,null,tok);dr.scrollTop=0;
+  dr.innerHTML=bcBar()+`<div class="bc-load">${typeof chartSkeletonHtml==='function'?chartSkeletonHtml(260,'Загружаю данные по '+isin+'…'):'Загружаю данные по '+esc(isin)+'…'}</div>`;bcBind(dr,null,tok);dr.scrollTop=0;
   let c;
   try{c=await api('/api/bond?isin='+encodeURIComponent(isin))}
   catch(e){if(tok!==BC.tok)return;dr.innerHTML=bcBar()+`<div class="st-callout warn">Не удалось загрузить карточку: ${esc(e.message||e)}</div>`;bcBind(dr,null,tok);return}

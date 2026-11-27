@@ -44,7 +44,7 @@ const pc1=v=>v==null?'—':(+v).toFixed(2).replace(/0$/,'').replace(/\.0$/,'').r
 const ppf=v=>(v>0?'+':'')+v.toFixed(2).replace('.',',')+' п.п.';
 function pMkt(){
   const r=S.rates;
-  if(!r){loadRates();return`<div class="card">${waitBox('Загружаю кривую доходности и ключевую ставку…')}</div>`}
+  if(!r){loadRates();return`<div class="card">${waitChart('Загружаю кривую доходности и ключевую ставку…')}</div>`}
   if(r.error)return`<div class="msg err">${esc(r.error)}</div>`;
   const n=r.labels.length,i0=n-1,tms=r.terms||S.rTerms,K=t=>(r.kbd||{})[String(t)]||[];
   const seg=`<div class="seg" id="rdays">${RDAYS.map(([d,t])=>`<button data-d="${d}" class="${d===S.ratesDays?'on':''}">${t}</button>`).join('')}</div>`;

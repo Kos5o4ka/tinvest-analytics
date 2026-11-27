@@ -9,7 +9,7 @@ function convNote(list,tax){
   return`<p class="note">Учтены обмены бумаг: ${items}. ${tax?'Стоимость покупки и даты владения (для ЛДВ) сохранены.':'Брокер не отдаёт такие обмены в операциях, поэтому они восстановлены по таблице известных обменов.'}${auto?' Обмены с пометкой «предположение» найдены автоматически (остаток старой бумаги и продажа новой без покупки на то же количество) — они могут быть неточными.':''}</p>`}
 function pRet(){
   const h=S.hist;
-  if(!h)return`<div class="card">${waitBox('Восстанавливаю историю стоимости портфеля по дневным ценам закрытия. Первый раз это может занять до минуты — дальше данные берутся из локальной базы.')}</div>`;
+  if(!h)return`<div class="card">${waitChart('Восстанавливаю историю стоимости портфеля по дневным ценам закрытия. Первый раз это может занять до минуты — дальше данные берутся из локальной базы.')}</div>`;
   if(h.error)return`<div class="msg err">${esc(h.error)}</div>`;
   if(!h.days.length)return emptyHint('Доходность считается по операциям: пополнениям, сделкам и выплатам. Подключите Т-Инвестиции или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['set','Настройки']]);
   const hs=histSlice();
@@ -34,7 +34,7 @@ function pRet(){
     chart('c-twr',line,{h:300,labels:labs,tipLabels:tips,series:ser,fa:fp,ft:v=>pct(v),zero:false});
     chart('c-dd',line,{h:200,area:'neg',labels:labs,tipLabels:tips,series:[{n:'Просадка',c:'var(--neg)',v:hs.dd.map(x=>x*100)}],fa:fp,ft:v=>pct(v)});
     chart('c-pl',line,{h:200,area:true,labels:labs,tipLabels:tips,series:[{n:'Прибыль (стоимость − вложено)',c:'var(--pos)',v:hs.value.map((v,i)=>v-hs.invested[i])}]});
-    out+=`<div class="card"><h2>Доходность портфеля и бенчмарков, %<span class="sp">${periodName()}</span></h2><div id="c-twr" class="chart"></div></div>
+    out+=`<div class="card"><h2>Доходность портфеля и бенчмарков, %<span class="sp">${periodName()}</span>${periodSegLocal()}</h2><div id="c-twr" class="chart"></div></div>
       <div class="g g2"><div class="card"><h2>Просадка от максимума, %</h2><div id="c-dd" class="chart"></div></div>
       <div class="card"><h2>Прибыль в рублях</h2><div id="c-pl" class="chart"></div></div></div>`;
   }

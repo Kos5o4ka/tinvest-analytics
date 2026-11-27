@@ -34165,6 +34165,12 @@ table.cmp .cmp-slot{min-width:200px;vertical-align:middle;background:var(--card2
 .imp-prog-bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--ac),var(--pos));transition:width .3s ease}
 .imp-prog-bar.indet i{width:45%;animation:impSlide 1.2s ease-in-out infinite}
 @keyframes impSlide{0%{transform:translateX(-100%)}100%{transform:translateX(240%)}}
+/* ── Остатки ревью интерфейса: локальный период в карточке графика, автокнопка «Скачать CSV» ── */
+.card h2 .per-local{margin:0 0 0 10px;font-weight:500}
+.card h2 .per-local button{padding:4px 9px;font-size:12px}
+.tbl-auto{padding:0 0 8px}
+.tbl-auto .tbl-csv{margin-left:auto}
+@media(max-width:560px){.card h2 .per-local{margin:6px 0 0;order:5}.card h2{flex-wrap:wrap}}
 </style></head>
 <body>
 <div id="boot-splash" class="boot-splash" aria-hidden="true"><div class="boot-box"><div class="boot-logo"><svg width="64" height="64" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bsg" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#2563eb"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient><linearGradient id="bsa" x1="12" y1="6" x2="26" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.08)"/><path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="url(#bsg)"/><path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="url(#bsg)"/><path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="url(#bsa)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="boot-title">TAnalytic <span class="boot-ver">Pro</span></div><div class="boot-bar"><div class="boot-bar-fill"></div></div><div class="boot-status" id="boot-status">Загружаю портфель…</div></div></div>
@@ -34585,9 +34591,13 @@ function line(el,o){
       segs.forEach(sg=>{const f=sg[0].split(','),l=sg[sg.length-1].split(',');s+=`<polygon class="la" points="${f[0]},${base} ${sg.join(' ')} ${l[0]},${base}" fill="url(#${gid})"/>`})}
     segs.forEach(sg=>s+=`<polyline${se.dash?' class="ls"':' class="ln" pathLength="1"'} points="${sg.join(' ')}" fill="none" stroke="${se.c}" stroke-width="${se.w||2}" stroke-linejoin="round" stroke-linecap="round"${se.dash?' stroke-dasharray="5 4"':''}/>`);
     if(!se.dash&&last>=0)ends+=`<g class="ld"><circle cx="${X(last).toFixed(1)}" cy="${Y(se.v[last]).toFixed(1)}" r="8" fill="${se.c}" fill-opacity=".18"/><circle cx="${X(last).toFixed(1)}" cy="${Y(se.v[last]).toFixed(1)}" r="3.5" fill="${se.c}" stroke="var(--card)" stroke-width="1.5"/></g>`});
+  /* вертикальные отметки событий: o.marks=[{i:индекс в исходных labels, t:подпись, c:цвет}] */
+  let mk='';const dk=o.labels.length>420?Math.ceil(o.labels.length/420):1;
+  (o.marks||[]).forEach(m=>{const i=m.i/dk;if(!(i>=0&&i<=n-1))return;const x=X(i),right=x>pl+pw*.7;
+    mk+=`<g class="ch-mark"><line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${pt}" y2="${pt+ph}" stroke="${m.c||'var(--ac)'}" stroke-width="1.5" stroke-dasharray="4 3"/><text class="ax" x="${(x+(right?-6:6)).toFixed(1)}" y="${pt+11}" text-anchor="${right?'end':'start'}" style="fill:${m.c||'var(--ac)'};font-weight:600">${esc(m.t||'')}</text></g>`});
   let hits='';const cw=pw/(n-1);
   for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${X(i)-cw/2}" y="${pt}" width="${cw}" height="${ph}" fill="transparent"/>`;
-  el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${s}${ends}<g class="hv"></g>${hits}</svg>`;
+  el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${s}${ends}${mk}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
   el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`+
     ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>`<circle cx="${X(i)}" cy="${Y(se.v[i])}" r="8" fill="${se.c}" fill-opacity=".18"/><circle cx="${X(i)}" cy="${Y(se.v[i])}" r="4.5" fill="${se.c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
@@ -34904,6 +34914,7 @@ const SECT={financial:'Финансы',it:'IT',telecom:'Телеком',energy:'
 function kpi(k,v,s,c,dot,go){return`<div class="card kpi${go?' kpi-go':''}"${go?` data-go="${go}" role="link" tabindex="0" title="Открыть раздел"`:''}><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}"${/<|\n/.test(String(v))?'':` data-tick="kpi-${S.page}-${k}"`}>${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
 const periodName=()=>PERIODS.find(p=>p[0]===S.period)[1].toLowerCase();
 const waitBox=t=>`<div class="wait">${t||'Считаю…'}</div>`;
+const waitChart=(t,h)=>typeof chartSkeletonHtml==='function'?chartSkeletonHtml(h||300,t):waitBox(t);   /* серый мерцающий плейсхолдер графика вместо надписи */
 function monthsSeries(n=36){
   let ms=S.data.months;if(ms.length>n)ms=ms.slice(-n);
   return{labels:ms.map(m=>mlabel(m[0])),tips:ms.map(m=>{const[y,mm]=m[0].split('-');return MONF[+mm-1]+' '+y}),rows:ms.map(m=>m[1])};
@@ -35062,7 +35073,7 @@ function pDash(){
     <div><div class="mu" style="font-size:12px">Уровень достаточности</div><div class="num ${d.margin.fundsSufficiencyLevel<1.1&&d.margin.fundsSufficiencyLevel>0?'neg':''}" style="font-weight:650;font-size:16px;margin-top:4px">${f2(d.margin.fundsSufficiencyLevel)}</div></div></div></div>`:'';
   const uxBlocks=typeof uxDashBlocks==='function'?uxDashBlocks():'';
   const eqDelta=dashDeltaBadge(hs);
-  return hero+todayCard()+uxBlocks+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения${eqDelta}<span class="sp">${periodName()}</span></h2>${eq}</div>
+  return hero+todayCard()+uxBlocks+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения${eqDelta}<span class="sp">${periodName()}</span>${periodSegLocal()}</h2>${eq}</div>
     <div class="card"><h2>Структура портфеля</h2><div id="c-alloc" class="chart"></div></div></div>
     <div class="g g2"><div class="card"><h2>Доходность по месяцам<span class="sp">последние 12 мес</span></h2>${mret}</div>
     <div class="card"><h2>Ближайшие выплаты<span class="sp">купоны · дивиденды · погашения</span></h2>${pays}</div></div>
@@ -35115,7 +35126,7 @@ function convNote(list,tax){
   return`<p class="note">Учтены обмены бумаг: ${items}. ${tax?'Стоимость покупки и даты владения (для ЛДВ) сохранены.':'Брокер не отдаёт такие обмены в операциях, поэтому они восстановлены по таблице известных обменов.'}${auto?' Обмены с пометкой «предположение» найдены автоматически (остаток старой бумаги и продажа новой без покупки на то же количество) — они могут быть неточными.':''}</p>`}
 function pRet(){
   const h=S.hist;
-  if(!h)return`<div class="card">${waitBox('Восстанавливаю историю стоимости портфеля по дневным ценам закрытия. Первый раз это может занять до минуты — дальше данные берутся из локальной базы.')}</div>`;
+  if(!h)return`<div class="card">${waitChart('Восстанавливаю историю стоимости портфеля по дневным ценам закрытия. Первый раз это может занять до минуты — дальше данные берутся из локальной базы.')}</div>`;
   if(h.error)return`<div class="msg err">${esc(h.error)}</div>`;
   if(!h.days.length)return emptyHint('Доходность считается по операциям: пополнениям, сделкам и выплатам. Подключите Т-Инвестиции или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['set','Настройки']]);
   const hs=histSlice();
@@ -35140,7 +35151,7 @@ function pRet(){
     chart('c-twr',line,{h:300,labels:labs,tipLabels:tips,series:ser,fa:fp,ft:v=>pct(v),zero:false});
     chart('c-dd',line,{h:200,area:'neg',labels:labs,tipLabels:tips,series:[{n:'Просадка',c:'var(--neg)',v:hs.dd.map(x=>x*100)}],fa:fp,ft:v=>pct(v)});
     chart('c-pl',line,{h:200,area:true,labels:labs,tipLabels:tips,series:[{n:'Прибыль (стоимость − вложено)',c:'var(--pos)',v:hs.value.map((v,i)=>v-hs.invested[i])}]});
-    out+=`<div class="card"><h2>Доходность портфеля и бенчмарков, %<span class="sp">${periodName()}</span></h2><div id="c-twr" class="chart"></div></div>
+    out+=`<div class="card"><h2>Доходность портфеля и бенчмарков, %<span class="sp">${periodName()}</span>${periodSegLocal()}</h2><div id="c-twr" class="chart"></div></div>
       <div class="g g2"><div class="card"><h2>Просадка от максимума, %</h2><div id="c-dd" class="chart"></div></div>
       <div class="card"><h2>Прибыль в рублях</h2><div id="c-pl" class="chart"></div></div></div>`;
   }
@@ -35160,15 +35171,13 @@ function pRet(){
 
 /* ── Позиции ── */
 function taCsvDownload(filename, headers, rows){
-  const escCell=v=>{const s=v==null?'':String(v);return/[;"\r\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
-  const lines=[headers.map(escCell).join(';')].concat(rows.map(r=>r.map(escCell).join(';')));
-  const blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8;'});
+  const blob=new Blob([taCsvText(headers,rows)],{type:'text/csv;charset=utf-8;'});
   const url=URL.createObjectURL(blob),a=document.createElement('a');
   a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();
   setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function taCsvBtn(id,title){
-  return`<button type="button" class="btn ghost tbl-csv noprint" id="${id}" title="${esc(title||'Скачать таблицу в CSV')}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',1.8)}Экспорт CSV</button>`;
+  return`<button type="button" class="btn ghost tbl-csv noprint" id="${id}" title="${esc(title||'Скачать таблицу в CSV')}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',1.8)}Скачать CSV</button>`;
 }
 
 S.posGroup=lsGet('ta_pos_group')||'flat';
@@ -35435,7 +35444,7 @@ function cmpDockRender(){
 }
 function pBonds(){
   const b=S.bonds;
-  if(!b)return`<div class="card">${waitBox('Загружаю параметры облигаций и графики купонов…')}</div>`;
+  if(!b)return`<div class="card">${waitChart('Загружаю параметры облигаций и графики купонов…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   const m=b.metrics,tot=S.data.portfolio.total||1;
   if(!m.count)return emptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);
@@ -36648,7 +36657,7 @@ function pFees(){
   const items=[['fee_broker',S1],['fee_service',S3],['fee_other',S4],['margin_fee',S5]];
   const ms=monthsSeries();
   chart('c-fees',bars,{labels:ms.labels,tipLabels:ms.tips,stack:true,total:true,skipZero:true,series:items.map(([k,c])=>({n:L[k],c,v:ms.rows.map(r=>r[k]||0)}))});
-  out+=`<div class="g c-2-1"><div class="card"><h2>Комиссии по месяцам, ₽<span class="sp">${periodName()}</span></h2><div id="c-fees" class="chart"></div></div>
+  out+=`<div class="g c-2-1"><div class="card"><h2>Комиссии по месяцам, ₽<span class="sp">${periodName()}</span>${periodSegLocal()}</h2><div id="c-fees" class="chart"></div></div>
     <div class="card"><h2>Структура расходов, ₽</h2>${total?hbars(items.filter(([k])=>t[k]).map(([k,c])=>({n:L[k],v:t[k]||0,c,s:pctp((t[k]||0)/total*100)})),S1,null,1):'<div class="empty">Комиссий нет</div>'}
     <p class="note" style="margin-top:16px">Положительная сумма — уплачено, возвраты её уменьшают.</p></div></div>`;
   out+=feeTariffOptimizer();
@@ -38063,7 +38072,7 @@ const pc1=v=>v==null?'—':(+v).toFixed(2).replace(/0$/,'').replace(/\.0$/,'').r
 const ppf=v=>(v>0?'+':'')+v.toFixed(2).replace('.',',')+' п.п.';
 function pMkt(){
   const r=S.rates;
-  if(!r){loadRates();return`<div class="card">${waitBox('Загружаю кривую доходности и ключевую ставку…')}</div>`}
+  if(!r){loadRates();return`<div class="card">${waitChart('Загружаю кривую доходности и ключевую ставку…')}</div>`}
   if(r.error)return`<div class="msg err">${esc(r.error)}</div>`;
   const n=r.labels.length,i0=n-1,tms=r.terms||S.rTerms,K=t=>(r.kbd||{})[String(t)]||[];
   const seg=`<div class="seg" id="rdays">${RDAYS.map(([d,t])=>`<button data-d="${d}" class="${d===S.ratesDays?'on':''}">${t}</button>`).join('')}</div>`;
@@ -38688,7 +38697,7 @@ function bcBind(dr,c,tok){
   const tb=dr.querySelector('#bc-tabs');
   if(tb)tb.onclick=e=>{
     const bt=e.target.closest('[data-bct]');if(!bt||bt.dataset.bct===BC.tab||!c)return;
-    BC.tab=bt.dataset.bct;bcRenderCard(dr,c,tok);
+    BC.tab=bt.dataset.bct;lsSet('ta_bc_tab',BC.tab);bcRenderCard(dr,c,tok);
   };
   const mr=dr.querySelector('#bc-more');
   if(mr&&c)mr.onclick=()=>{BC.all=true;bcRenderCard(dr,c,tok);BC.all=false};
@@ -38701,9 +38710,9 @@ async function openBond(isin,opts){
   }else if(!opts.fromNav){
     if(BC.stack[BC.stack.length-1]!==isin)BC.stack.push(isin);
   }
-  if(!opts||!opts.keepTab)BC.tab='overview';
+  if(!opts||!opts.keepTab)BC.tab=bcSavedTab();
   const tok=++BC.tok,dr=bcMount();
-  dr.innerHTML=bcBar()+`<div class="bc-load">Загружаю данные по ${esc(isin)}…</div>`;bcBind(dr,null,tok);dr.scrollTop=0;
+  dr.innerHTML=bcBar()+`<div class="bc-load">${typeof chartSkeletonHtml==='function'?chartSkeletonHtml(260,'Загружаю данные по '+isin+'…'):'Загружаю данные по '+esc(isin)+'…'}</div>`;bcBind(dr,null,tok);dr.scrollTop=0;
   let c;
   try{c=await api('/api/bond?isin='+encodeURIComponent(isin))}
   catch(e){if(tok!==BC.tok)return;dr.innerHTML=bcBar()+`<div class="st-callout warn">Не удалось загрузить карточку: ${esc(e.message||e)}</div>`;bcBind(dr,null,tok);return}
@@ -39633,7 +39642,7 @@ function bnPremium(d){
 }
 function pBench(){
   const e=bnCur();
-  if(!e){bnLoadData();return`<div class="card">${bnPerSeg()}${waitBox('Сравниваю портфель с индексами и фондами Мосбиржи. Первый раз это может занять несколько минут (загружается история цен и оценивается ликвидность), потом данные берутся из локального кэша…')}</div>`}
+  if(!e){bnLoadData();return`<div class="card">${bnPerSeg()}${waitChart('Сравниваю портфель с индексами и фондами Мосбиржи. Первый раз это может занять несколько минут (загружается история цен и оценивается ликвидность), потом данные берутся из локального кэша…')}</div>`}
   const d=e.d;
   if(d.error)return bnPerSeg()+`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="bn-retry">Повторить</button></div>`;
   const p=d.portfolio,B=c=>d.bench.find(b=>b.code===c&&b.available),lq=B('LQDT'),cb=B('RUCBTRNS');
@@ -39714,6 +39723,7 @@ function clEnv(P,F,startDate,rng){
   const fsp=lq.estimate?(lq.spread!=null?lq.spread:.7):Math.max(0,Math.min(3,kr0-lq.yield));
   const fundRate=k=>(!lq.estimate&&k<2&&!rng)?lq.yield:Math.max(key(k)-fsp,.1);
   const dsp=F.depSpread!=null?+F.depSpread:(P.deposit?P.deposit.spread:1.5);
+  const depFix=F.depFixed!==''&&F.depFixed!=null&&isFinite(+F.depFixed)?Math.max(+F.depFixed,.1):null;   /* своя ставка вклада, % годовых, вместо «ключевая − спред» */
   const st=P.stocks||{div:8,growth:6,sigma:22},sg=(+F.stkSig||st.sigma||22)/100,gr=F.stkGrow!==''&&F.stkGrow!=null?+F.stkGrow:st.growth;
   const fxs=P.fx_bonds||{yield:6,fx:5,sigma:12};
   /* индексы накопления: фонд ликвидности, цена акций (с шоками, коррелированными с ключевой), курс валюты */
@@ -39721,7 +39731,16 @@ function clEnv(P,F,startDate,rng){
   for(let k=0;k<M-1;k++){G.push(G[k]*(1+fundRate(k)/1200));
     let ze=0,zf=0;if(rng){ze=-.3*zq[k+1]+.954*rng.n();zf=.4*ze+.917*rng.n()}
     E.push(E[k]*Math.exp(mu-(rng?sm*sm/2:0)+sm*ze));X.push(X[k]*Math.exp(fxm-(rng?fsm*fsm/2:0)+fsm*zf))}
-  return{key,kr0,D,fundRate,depRate:k=>Math.max(key(k)-dsp,.1),y0,m0,infl:io!=null?io:last+ish,iy,G,E,X,stDiv:(F.stkDiv!==''&&F.stkDiv!=null?+F.stkDiv:st.div),rng};
+  return{key,kr0,D,fundRate,depRate:k=>depFix!=null?depFix:Math.max(key(k)-dsp,.1),y0,m0,infl:io!=null?io:last+ish,iy,G,E,X,stDiv:(F.stkDiv!==''&&F.stkDiv!=null?+F.stkDiv:st.div),rng};
+}
+/* точка обгона вклада: первый месяц k ≥ 1, начиная с которого капитал бумаги после налогов выше капитала вклада до конца срока.
+   cur, dep — массивы cap (по месяцам 0..N). {beats:false, ever} — до конца срока обгона нет (ever: на каком-то отрезке бумага всё же была впереди) */
+function clOvertake(cur,dep){
+  const N=Math.min(cur.length,dep.length)-1;if(!(N>=1))return{beats:false,ever:false};
+  let ever=false;for(let k=1;k<=N;k++)if(cur[k]>dep[k]){ever=true;break}
+  if(!(cur[N]>dep[N]))return{beats:false,ever};
+  let k=N;while(k>1&&cur[k-1]>dep[k-1])k--;
+  return{beats:true,month:k,ever:true,gap:cur[N]-dep[N]};
 }
 function clContrib(p,k){return k===0?p.start:(k<=p.months?p.monthly*Math.pow(1+p.idx/100,Math.floor((k-1)/12)):0)}
 /* счёт: вычет ИИС-3 (ставка и потолок по зарплатному НДФЛ), срок по году открытия, освобождение дохода до 30 млн ₽ */
@@ -39988,7 +40007,7 @@ function clLifeMC(F,P,id,runs,seed,startDate){
 /* калькулятор инвестиций: интерфейс (слева параметры, справа результат; три вкладки: накопить, жить с капитала, подбор под цель) */
 /* ── Состояние ── */
 const CL_DEF={start:500000,monthly:20000,idx:5,idxMode:'own',years:10,strat:{dep:1,fund:1,ofz:1,aa:1,a:1},ownRate:15,reinvest:true,freq:4,lot:1000,lotFund:'fund',scn:'cbr',ownKey:12,
-  acct:'plain',reinvDed:true,ldv:true,defaults:true,real:true,depSpread:1.5,adv:false,view:'',iisYear:new Date().getFullYear(),salRate:13,salary:0,
+  acct:'plain',reinvDed:true,ldv:true,defaults:true,real:true,depSpread:1.5,depFixed:'',adv:false,view:'',iisYear:new Date().getFullYear(),salRate:13,salary:0,
   mixStk:50,mixBond:'ofz',stkGrow:'',stkDiv:'',fxWeak:'',inflOvr:'',
   spend:80000,spendYears:30,goalAmt:100000,goalMode:'contrib',goalStrat:'ofz',cmpA:'ofz',cmpB:'mix',lifeView:''};
 let CL_F=null;
@@ -40049,7 +40068,7 @@ function clSegTable(P,F,env){
   const at=k=>pctp(env.key(k),1);
   rows.push(['Ключевая через 1 / 2 / 3 года (выбранный сценарий)',at(12)+' / '+at(24)+' / '+at(36),'']);
   rows.push(['Инфляция (по годам)',(F.inflOvr!==''?pctp(+F.inflOvr,1)+' в год (своя)':P.inflation.yearly&&P.inflation.yearly.length?P.inflation.yearly.map(y=>y.year+': '+pctp(y.mid,1)).join('; '):pctp(P.inflation.default,1)+' в год'),P.inflation.estimate?'оценка':'прогноз Банка России']);
-  rows.push(['Вклад: ставка',pctp(env.depRate(0),2),'ключевая − '+f2(F.depSpread)+' п.п.']);
+  rows.push(['Вклад: ставка',pctp(env.depRate(0),2),F.depFixed!==''&&isFinite(+F.depFixed)?'задана вручную':'ключевая − '+f2(F.depSpread)+' п.п.']);
   rows.push(['Фонд ликвидности: доходность',pctp(env.fundRate(0),2),P.lqdt.estimate?'оценка: ключевая − '+f2(P.lqdt.spread)+' п.п.':'по данным фонда']);
   ['ofz','aaa','aa','a','hy'].forEach(id=>{const s=P.segments[id];if(!s)return;
     rows.push([s.name+': доходность / срок',pctp(s.yield,2)+' / '+f2(s.dur)+' г.','потери от дефолтов '+f2(s.loss)+' % в год'+(s.estimate?' · оценка':'')])});
@@ -40090,12 +40109,11 @@ function clTile(lbl,val,sub,dot,cls){
 }
 function clBeatDeposit(cur,p,P,env,F){
   if(cur.id==='dep')return{isDep:true};
-  const dep=clSim('dep',p,P,env,F),N=p.months;
-  if(!(cur.cap[N]>dep.cap[N]))return{beats:false};
-  let k=N;
-  while(k>1&&cur.cap[k-1]>dep.cap[k-1])k--;
-  return{beats:true,month:k};
+  const dep=clSim('dep',p,P,env,F);
+  return Object.assign({dep},clOvertake(cur.cap,dep.cap));
 }
+/* ставка вклада для подписей: своя или «ключевая − спред» */
+const clDepLbl=(F,env)=>F.depFixed!==''&&F.depFixed!=null&&isFinite(+F.depFixed)?'ставка вклада '+f2(+F.depFixed)+' % годовых':'вклад по ставке «ключевая − '+f2(F.depSpread)+' п.п.» (сейчас '+pctp(env.depRate(0),1)+')';
 function clWaterfallHtml(cur){
   const gross=cur.income+cur.taxes,taxes=cur.taxes,ded=cur.deductions,net=cur.final-cur.deposited;
   const mx=Math.max(1,Math.abs(gross),Math.abs(taxes),Math.abs(ded),Math.abs(net));
@@ -40126,21 +40144,23 @@ function clOut(){
   const finSub=esc(cur.name)+' · '+(real?'в сегодняшних деньгах':'номинал')+(F.defaults?(hasMed?' · медиана с дефолтами':' · без учёта дефолтов'):'');
   const beat=clBeatDeposit(cur,p,P,env,F);
   const beatVal=beat.isDep?'сам вклад':beat.beats?clYM(beat.month):'не обгоняет';
-  const beatSub=beat.isDep?'базовая точка сравнения':beat.beats?`с ${beat.month}-го мес. обгоняет вклад после налогов`:`уступает вкладу на горизонте ${clYM(N)}`;
+  const beatSub=beat.isDep?'базовая точка сравнения':beat.beats?`с ${beat.month}-го мес. обгоняет вклад после налогов, к концу срока впереди на ${clRub(beat.gap)}`:(beat.ever?`обгон был на части срока, но к концу срока (${clYM(N)}) вклад снова впереди`:`уступает вкладу на всём горизонте ${clYM(N)}`);
   const pick=res.length>1?`<div class="cl-view"><span>Итоги и график для</span><select class="in" id="cl-view"><option value="">лучшей стратегии (${esc(best.name)})</option>${
     res.map(r=>`<option value="${r.id}" ${r.id===F.view?'selected':''}>${esc(r.name)}</option>`).join('')}</select></div>`:'';
   const kp=`${pick}<div class="st-tiles cl-tiles">${clTile('Итоговый капитал',clRub(fin),finSub,'pos','pos')}
     ${clTile('Чистый доход',clRub(inc),'после налогов, сверх внесённого'+(cd>0?' и вычетов':'')+(hasMed?' · без дефолтов':''),inc>=0?'pos':'neg',cls(inc))}
     ${clTile('Уплачено налогов',clRub(cur.taxes),'НДФЛ за '+clYM(N)+', номинал',cur.taxes>0?'warn':'pos')}
     ${clTile('Пассивный доход в месяц',clRub(pas),'после налога, '+(real?'в сегодняшних деньгах':'номинал')+(F.defaults?' · без дефолтов':''),'mu')}</div>
-    <div class="st-callout"><b>Точка обгона вклада:</b> <span class="num ${beat.beats?'pos':''}">${esc(beatVal)}</span> — ${esc(beatSub)}.</div>`;
+    <div class="st-callout"><b>Точка обгона вклада:</b> <span class="num ${beat.beats?'pos':''}">${esc(beatVal)}</span> — ${esc(beatSub)}. Сравнение: ${esc(clDepLbl(F,env))}, обе суммы после налогов.</div>`;
   const wf=clWaterfallHtml(cur);
   const stk=`<div class="card"><h2>Из чего состоит капитал<span class="sp">${esc(cur.name)} · ${mode}</span></h2><div id="cl-stack" class="chart"></div>
     <div class="note" style="margin-top:10px">Цены за ${clYM(N)} вырастут в ×${f2(defl)} по прогнозу инфляции: 1 ₽ в конце срока ≈ ${f2(1/defl)} ₽ сегодня.${real?' Взносы, вычеты и доход пересчитаны в сегодняшние деньги на дату поступления.':''} Слои — без случайных событий.</div></div>`;
-  const th=['Стратегия','Итоговый капитал','Внесено','Получено дохода','Уплачено налогов','Вычеты и возвраты ИИС','Капитал в сегодняшних деньгах','Пассивный доход в месяц (после налога)','Годовая доходность после налогов, номинал / реальная'].concat(F.defaults?['Медиана с дефолтами и шоками ставки']:[]);
+  const th=['Стратегия','Итоговый капитал','Внесено','Получено дохода','Уплачено налогов','Вычеты и возвраты ИИС','Капитал в сегодняшних деньгах','Пассивный доход в месяц (после налога)','Обгон вклада','Годовая доходность после налогов, номинал / реальная'].concat(F.defaults?['Медиана с дефолтами и шоками ставки']:[]);
+  const depRes=res.find(r=>r.id==='dep')||clSim('dep',p,P,env,F);
+  const ovr=r=>{if(r.id==='dep')return'—';const o=clOvertake(r.cap,depRes.cap);return o.beats?'с '+clYM(o.month):(o.ever?'не к концу срока':'нет')};
   const rows=res.map(r=>`<tr data-s="${r.id}" class="${r===cur?'cl-cur':''}"><td class="l"><i class="cl-dot" style="background:${r.color}"></i>${esc(r.name)}${r===best?' <small class="mu">лучшая</small>':''}</td><td class="num"><b>${clRub(r.final)}</b></td><td class="num">${clRub(r.deposited)}</td>
     <td class="num ${cls(r.income)}">${clRub(r.income)}</td><td class="num">${clRub(r.taxes)}</td><td class="num">${r.deductions>0?clRub(r.deductions):'—'}</td><td class="num"><b>${clRub(r.finalReal)}</b></td>
-    <td class="num">${clRub(r.passive)}<br><small class="mu">${clRub(r.passiveReal)} сегодня</small></td><td class="num">${r.xirr==null?'—':pctp(r.xirr,1)}<br><small class="mu">${r.xirrReal==null?'—':pctp(r.xirrReal,1)} реальная</small></td>${F.defaults?`<td class="num" data-mc="${r.id}">${r.med?clMedCell(r.med,real?env.D[N]:1):'<small class="mu">считаю…</small>'}</td>`:''}</tr>`).join('');
+    <td class="num">${clRub(r.passive)}<br><small class="mu">${clRub(r.passiveReal)} сегодня</small></td><td class="num">${ovr(r)}</td><td class="num">${r.xirr==null?'—':pctp(r.xirr,1)}<br><small class="mu">${r.xirrReal==null?'—':pctp(r.xirrReal,1)} реальная</small></td>${F.defaults?`<td class="num" data-mc="${r.id}">${r.med?clMedCell(r.med,real?env.D[N]:1):'<small class="mu">считаю…</small>'}</td>`:''}</tr>`).join('');
   const warn=[],ai=clAccInfo(p);
   if(F.acct!=='plain'){
     if(res.some(r=>r.id==='dep'))warn.push('Вклад лежит в банке, а не на ИИС: вычет и льготы ИИС к нему не применяются, налог считается как на обычном счёте.');
@@ -40160,8 +40180,9 @@ function clOut(){
     const cdl=[];let a=0;for(let k=0;k<=N;k++){a+=clContrib(p,k)/dv(k);cdl.push(a)}
     const series=res.map(r=>({n:r.name,c:r.color,v:r.cap.map((v,k)=>v/dv(k))}));
     series.push({n:'Внесено своих денег',c:'#9aa3b5',dash:1,w:1.6,v:cdl});
-    chart('cl-chart',line,{h:300,series,labels,tipLabels:tips,fa:short,ft:v=>clRub(v),empty:'Нет данных'});
-    cmp=`<div class="card"><h2>Рост капитала по стратегиям<span class="sp">${mode}</span></h2><div id="cl-chart" class="chart"></div></div>`;
+    const marks=beat.beats?[{i:beat.month,t:'обгон вклада: '+clYM(beat.month),c:cur.color}]:[];
+    chart('cl-chart',line,{h:300,series,labels,tipLabels:tips,fa:short,ft:v=>clRub(v),empty:'Нет данных',marks});
+    cmp=`<div class="card"><h2>Рост капитала по стратегиям<span class="sp">${mode}${beat.beats?' · отметка: '+esc(cur.name):''}</span></h2><div id="cl-chart" class="chart"></div></div>`;
   }
   const deep=typeof clDeepHtml==='function'?clDeepHtml(F,P,run,cur):'';
   return`${kp}${wf}${stk}${deep}${tbl}${cmp}<div class="card"><h2>Что заложено в расчёт</h2>${clSegTable(P,F,env)}</div>`;
@@ -40298,7 +40319,7 @@ function clForm(F,P){
     <div class="cl-grid cl-g2">${num('stkDiv','Акции: дивиденды, % в год',F.stkDiv,'step="0.5" min="0" max="50" placeholder="'+st.div+'"')}${num('stkGrow','Акции: рост цены, % в год',F.stkGrow,'step="0.5" min="-20" max="50" placeholder="'+st.growth+'"')}
      ${num('fxWeak','Ослабление рубля, % в год',F.fxWeak,'step="0.5" min="-20" max="50" placeholder="'+fx.fx+'"')}${num('inflOvr','Инфляция, % в год',F.inflOvr,'step="0.5" min="0" max="50" placeholder="прогноз ЦБ"')}</div>
     <div class="cl-sec">Вклад, купоны, покупка бумаг</div>
-    <div class="cl-grid cl-g2">${num('depSpread','Вклад: ключевая минус, п.п.',F.depSpread,'step="0.1" min="0" max="10"')}${sw('reinvest','Реинвестировать купоны','иначе копятся без дохода',F.reinvest)}
+    <div class="cl-grid cl-g2">${num('depSpread','Вклад: ключевая минус, п.п.',F.depSpread,'step="0.1" min="0" max="10"')}${num('depFixed','Вклад: своя ставка, % годовых',F.depFixed,'step="0.1" min="0" max="60" placeholder="по ключевой"')}${sw('reinvest','Реинвестировать купоны','иначе копятся без дохода',F.reinvest)}
      ${sel('freq','Выплаты купонов',[[12,'раз в месяц'],[4,'раз в квартал'],[2,'раз в полгода']],F.freq)}${num('lot','Цена лота, ₽',F.lot,'min="0" step="100"')}
      ${sel('lotFund','Остаток, не хватающий на бумагу',[['fund','лежит в фонде ликвидности'],['wait','ждёт следующей покупки']],F.lotFund)}</div>
    </details>
@@ -40316,7 +40337,7 @@ function pCalcPage(){
   <div class="note cl-disc">Модель упрощённая. Результаты — не прогноз и не индивидуальная инвестиционная рекомендация: реальные ставки, цены, налоги и дефолты будут отличаться.</div></div></div></div>`;
 }
 function clHowNote(F){return`Один движок на всех вкладках: шаг расчёта — месяц; взносы вносятся в конце месяца; налоговый год — календарный. Шкала НДФЛ для инвестиционных доходов (купоны, продажа бумаг, проценты по вкладам, дивиденды): 13 % до 2,4 млн ₽ дохода в год, 15 % с превышения.
-   <b>Вклад</b>: ежемесячная капитализация по ставке «ключевая − ${f2(F.depSpread)} п.п.» по пути выбранного сценария. НДФЛ — с процентов за год сверх необлагаемой суммы (1 млн ₽ × максимальная ключевая ставка года); начисляется в конце года, а платится 1 декабря следующего года. Необлагаемая сумма общая на все вклады человека: если есть другие вклады, налог будет больше.
+   <b>Вклад</b>: ежемесячная капитализация по ставке ${F.depFixed!==''&&isFinite(+F.depFixed)?f2(+F.depFixed)+' % годовых (задана вручную)':'«ключевая − '+f2(F.depSpread)+' п.п.» по пути выбранного сценария'}. НДФЛ — с процентов за год сверх необлагаемой суммы (1 млн ₽ × максимальная ключевая ставка года); начисляется в конце года, а платится 1 декабря следующего года. Необлагаемая сумма общая на все вклады человека: если есть другие вклады, налог будет больше.
    <b>Фонд ликвидности</b>: ежедневное начисление приближено месячным по «ключевая − спред к ключевой»; налог только при продаже в конце срока. ЛДВ: паи старше 3 лет, лимит 3 млн ₽ × средневзвешенный срок владения этих паёв (при продаже ради налога самые старые паи уходят первыми); налог с прироста паёв, проданных ради уплаты налога, не считается.
    <b>Акции</b>: цена растёт на допущение «рост цены», дивиденды начисляются ежемесячно (налог раз в год, на ИИС — при закрытии) и реинвестируются; рост цены облагается при продаже, ЛДВ — как у паёв. <b>Флоатеры</b>: купон = ключевая + спред, цена около номинала. <b>Замещающие облигации</b>: купон в валюте, рубль слабеет на заданный процент в год, курсовая прибыль облагается при погашении или продаже.
    <b>ОФЗ, корпоративные, ВДО</b>: покупаем по текущей медианной доходности сегмента (без флоатеров, линкеров, бессрочных и субординированных выпусков), держим до погашения (срок ≈ медианная дюрация); погашенный номинал и купоны вкладываются по будущей доходности ≈ текущая + β × (ключевая в тот момент − ключевая сейчас), β = 0,6 для ОФЗ и 0,7 для остальных. Рыночная цена выпуска меняется с дюрацией: 1 − дюрация × (доходность сейчас − доходность покупки); к погашению она сходится к номиналу. Налог на брокерском счёте удерживается раз в год и при выводе денег в конце срока; берётся из свободных денег, а если их не хватает — продаётся часть облигаций по рыночной цене. На ИИС налог удерживается только при закрытии счёта.
@@ -40333,7 +40354,7 @@ function bindCalcInv(){
   const read=()=>{
     F.start=rn('start',0,0);F.monthly=rn('monthly',0,0);F.idx=rn('idx',0,0,50);F.years=Math.round(rn('years',10,1,30));F.ownRate=rn('ownRate',15,0,100);
     F.reinvest=ck('reinvest');F.freq=+vl('freq')||4;F.lot=rn('lot',0,0);F.lotFund=vl('lotFund')||'fund';F.ownKey=rn('ownKey',12,1,50);
-    F.iisYear=Math.round(rn('iisYear',yr,2024,yr));F.salRate=+vl('salRate');F.salary=rn('salary',0,0);F.reinvDed=ck('reinvDed');F.ldv=ck('ldv');F.defaults=ck('defaults');F.depSpread=rn('depSpread',1.5,0,10);
+    F.iisYear=Math.round(rn('iisYear',yr,2024,yr));F.salRate=+vl('salRate');F.salary=rn('salary',0,0);F.reinvDed=ck('reinvDed');F.ldv=ck('ldv');F.defaults=ck('defaults');F.depSpread=rn('depSpread',1.5,0,10);F.depFixed=rs('depFixed',0);
     F.mixStk=Math.round(rn('mixStk',50,0,100));F.mixBond=vl('mixBond')||'ofz';F.stkDiv=rs('stkDiv',0);F.stkGrow=rs('stkGrow',0);F.fxWeak=rs('fxWeak',0);F.inflOvr=rs('inflOvr',0);
     if(m==='life'){F.spend=rn('spend',0,0);F.spendYears=Math.round(rn('spendYears',30,1,50))}
     if(m==='goal'){F.goalAmt=rn('goalAmt',0,0);F.goalMode=vl('goalMode')==='years'?'years':'contrib';F.goalStrat=vl('goalStrat')||'ofz'}
@@ -45660,6 +45681,67 @@ if(typeof bcIssuerCurve==='function'&&typeof chartEnhanceIssuerCurve==='function
     mountTitlebar();
   }
 })();
+/* ── Скачать CSV у любой таблицы данных, локальный переключатель периода, запоминание вкладки карточки ──
+   taCsvText: разделитель «;», перевод строки CRLF, в начале BOM (UTF-8), чтобы Excel на Windows открыл кириллицу. Без DOM — проверяется через jsc. */
+function taCsvText(headers,rows){
+  const escCell=v=>{let s=v==null?'':String(v);if(/^[=@\t\r]/.test(s))s="'"+s;return/[;"\r\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
+  return'﻿'+[headers].concat(rows).map(r=>r.map(escCell).join(';')).join('\r\n');
+}
+/* текст ячейки для выгрузки: без неразрывных пробелов и значков, минус как «-» */
+function taCsvCell(td){
+  const c=td.cloneNode(true);
+  c.querySelectorAll('svg,script,style,button,.noprint,[hidden]').forEach(x=>x.remove());
+  return(c.textContent||'').replace(/[   ]/g,' ').replace(/−/g,'-').replace(/\s+/g,' ').trim();
+}
+function taTableCsvData(table){
+  const head=[...table.querySelectorAll('thead tr:last-child th')].map(taCsvCell);
+  const rows=[...table.querySelectorAll('tbody tr')].filter(tr=>tr.style.display!=='none'&&!tr.hidden&&!tr.querySelector('td[colspan]'))
+    .map(tr=>[...tr.children].map(taCsvCell));
+  return{head:head.length?head:(rows[0]||[]).map((_,i)=>'Колонка '+(i+1)),rows};
+}
+function taTableCsvDownload(table,name){
+  const d=taTableCsvData(table);
+  taCsvDownload((name||'table')+'.csv',d.head,d.rows);
+}
+function taCsvFileName(card){
+  const h=card&&card.querySelector('h2'),t=h?(h.firstChild&&h.firstChild.textContent||h.textContent):'';
+  const s=String(t||'').trim().replace(/[\\/:*?"<>|]+/g,' ').replace(/\s+/g,'_').slice(0,50);
+  return(s||'tanalytic')+'_'+localIso();
+}
+/* кнопка «Скачать CSV» над каждой таблицей данных (от 3 строк), если в карточке её ещё нет */
+function taCsvAttach(root){
+  root.querySelectorAll('table').forEach(t=>{
+    if(t.closest('[data-nocsv],.noprint,.tbl-auto'))return;
+    if(!t.querySelector('thead th')||t.querySelectorAll('tbody tr').length<3)return;
+    const box=t.closest('.tbl')||t,card=t.closest('.card')||box.parentElement;
+    if(!card||card.querySelector('.tbl-csv'))return;
+    if(box.previousElementSibling&&box.previousElementSibling.classList.contains('tbl-auto'))return;
+    const hd=document.createElement('div');hd.className='tbl-head tbl-auto noprint';
+    hd.innerHTML=taCsvBtn('tbl-auto-'+(++_csvN),'Скачать таблицу в CSV (разделитель «;», кодировка UTF-8)');
+    box.parentNode.insertBefore(hd,box);
+  });
+}
+let _csvN=0,_csvT=0;
+if(typeof document!=='undefined'&&typeof MutationObserver!=='undefined'){
+  document.addEventListener('click',e=>{
+    const b=e.target.closest&&e.target.closest('.tbl-auto .tbl-csv');if(!b)return;
+    const hd=b.closest('.tbl-auto'),nx=hd.nextElementSibling,t=nx&&(nx.tagName==='TABLE'?nx:nx.querySelector('table'));
+    if(t)taTableCsvDownload(t,taCsvFileName(hd.closest('.card')));
+  });
+  const csvScan=()=>{_csvT=0;['#view','#bc-ov'].forEach(s=>{const r=document.querySelector(s);if(r)try{taCsvAttach(r)}catch(e){}})};
+  new MutationObserver(()=>{if(!_csvT)_csvT=setTimeout(csvScan,250)}).observe(document.body,{childList:true,subtree:true});
+}
+/* локальный переключатель периода в карточке графика: меняет тот же период, что и верхний (одно состояние, две кнопки) */
+function periodSegLocal(){
+  if(!PERIOD_PAGES.includes(S.page)||!S.data)return'';
+  return`<span class="seg per-local noprint" role="group" aria-label="Период графика">${PERIODS.map(([k,t])=>`<button type="button" class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('')}</span>`;
+}
+if(typeof document!=='undefined')document.addEventListener('click',e=>{
+  const b=e.target.closest&&e.target.closest('.per-local [data-k]');if(!b||b.dataset.k===S.period)return;
+  S.period=b.dataset.k;persist();renderNav();load(false,true);
+});
+/* вкладка карточки облигации запоминается между открытиями */
+function bcSavedTab(){const t=typeof lsGet==='function'?lsGet('ta_bc_tab'):null;return typeof BC_TABS!=='undefined'&&BC_TABS.some(x=>x[0]===t)?t:'overview'}
 </script></body></html>
 '''
 

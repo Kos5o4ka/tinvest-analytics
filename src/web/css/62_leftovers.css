@@ -1,0 +1,6 @@
+/* ── Остатки ревью интерфейса: локальный период в карточке графика, автокнопка «Скачать CSV» ── */
+.card h2 .per-local{margin:0 0 0 10px;font-weight:500}
+.card h2 .per-local button{padding:4px 9px;font-size:12px}
+.tbl-auto{padding:0 0 8px}
+.tbl-auto .tbl-csv{margin-left:auto}
+@media(max-width:560px){.card h2 .per-local{margin:6px 0 0;order:5}.card h2{flex-wrap:wrap}}

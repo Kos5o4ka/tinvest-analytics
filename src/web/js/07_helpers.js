@@ -12,6 +12,7 @@ const SECT={financial:'Финансы',it:'IT',telecom:'Телеком',energy:'
 function kpi(k,v,s,c,dot,go){return`<div class="card kpi${go?' kpi-go':''}"${go?` data-go="${go}" role="link" tabindex="0" title="Открыть раздел"`:''}><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}"${/<|\n/.test(String(v))?'':` data-tick="kpi-${S.page}-${k}"`}>${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
 const periodName=()=>PERIODS.find(p=>p[0]===S.period)[1].toLowerCase();
 const waitBox=t=>`<div class="wait">${t||'Считаю…'}</div>`;
+const waitChart=(t,h)=>typeof chartSkeletonHtml==='function'?chartSkeletonHtml(h||300,t):waitBox(t);   /* серый мерцающий плейсхолдер графика вместо надписи */
 function monthsSeries(n=36){
   let ms=S.data.months;if(ms.length>n)ms=ms.slice(-n);
   return{labels:ms.map(m=>mlabel(m[0])),tips:ms.map(m=>{const[y,mm]=m[0].split('-');return MONF[+mm-1]+' '+y}),rows:ms.map(m=>m[1])};
