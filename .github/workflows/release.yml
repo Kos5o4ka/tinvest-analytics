@@ -89,9 +89,9 @@ jobs:
       - name: Inno Setup (Windows)
         if: runner.os == 'Windows'
         run: |
-          # на раннере Inno Setup может быть не установлен — ставим сами, если ISCC.exe не найден
+          # Inno Setup на раннере может отсутствовать или быть старым (нужен 6.3+ для x64compatible) — upgrade ставит и в том, и в другом случае
           ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
-          if [ ! -f "$ISCC" ]; then choco install innosetup -y --no-progress; fi
+          choco upgrade innosetup -y --no-progress
           test -f "$ISCC" || { echo "::error::не найден ISCC.exe"; exit 1; }
       - name: Сборка установщика (Windows)
         if: runner.os == 'Windows'

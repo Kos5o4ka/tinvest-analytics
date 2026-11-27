@@ -1825,6 +1825,15 @@ class Tray:
             self.keep.append(on_end)
         except Exception:
             pass
+        try:                                                     # наш обработчик FormClosing стоит после обработчика pywebview и решает последним
+            def on_form_closing(s, e):
+                if "Shut" in str(e.CloseReason) or "TaskManager" in str(e.CloseReason):   # WindowsShutDown, TaskManagerClosing
+                    QUITTING.set()
+                    e.Cancel = False
+            self.win.native.FormClosing += on_form_closing
+            self.keep.append(on_form_closing)
+        except Exception:
+            pass
 
     def start(self, force=False):
         """Создаёт значок. True — значок есть. force — держать его, даже если настройка выключена (запуск с --tray)."""

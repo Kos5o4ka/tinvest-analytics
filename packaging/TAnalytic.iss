@@ -53,9 +53,15 @@ Source: "..\build_out\dist\TAnalytic\*"; DestDir: "{app}"; Flags: ignoreversion 
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
 
+[InstallDelete]
+; onedir: при обновлении убираем прежнюю папку библиотек, чтобы в ней не копились лишние файлы старых версий
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Registry]
+; Автозапуск пишем только при ручной установке: тихое обновление из программы повторяет прежние галочки
+; (UsePreviousTasks), и выключенный в Настройках автозапуск иначе включался бы заново
 ; То же имя значения и та же команда, что у переключателя «Запускать вместе с Windows» в Настройках программы
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExe}"" --tray"; Flags: uninsdeletevalue; Tasks: autostart
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExe}"" --tray"; Flags: uninsdeletevalue; Tasks: autostart; Check: InteractiveInstall
 
 [Run]
 Filename: "{app}\{#MyAppExe}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifsilent
@@ -67,6 +73,11 @@ Filename: "{app}\{#MyAppExe}"; Flags: nowait; Check: RelaunchAfterUpdate
 var
   DownloadPage: TDownloadWizardPage;
   WebView2File: String;
+
+function InteractiveInstall(): Boolean;
+begin
+  Result := not WizardSilent;
+end;
 
 function RelaunchAfterUpdate(): Boolean;
 begin
