@@ -107,7 +107,7 @@ function bindPage(){
   document.querySelectorAll('#view [data-go]').forEach(b=>b.onclick=()=>{if(b.classList.contains('td-mv'))S.scrTab='mv';go(b.dataset.go)});
   const sortable=(id,key)=>{const t=$(id);if(t)t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;
     S[key]={k,d:S[key].k===k?-S[key].d:(['name','type','risk','maturity','next'].includes(k)?1:-1)};render()}};
-  if(S.page==='pos'){sortable('#ptab','sort');const pt=$('#ptype');if(pt)pt.onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;S.posType=b.dataset.t;render()}}
+  if(S.page==='pos'){sortable('#ptab','sort');const pt=$('#ptype');if(pt)pt.onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;S.posType=b.dataset.t;render()}};const pq=$('#pq');if(pq){pq.oninput=()=>{S.posQ=pq.value;posFilterApply()};posFilterApply()}
   if(S.page==='bonds')sortable('#btab','bsort');
   if(S.page==='ops'){let to;$('#oq').oninput=e=>{clearTimeout(to);to=setTimeout(()=>{S.opsQ=e.target.value;S.opsN=200;drawOps()},150)};
     $('#ok').onclick=e=>{const b=e.target.closest('[data-k]');if(!b)return;S.opsK=b.dataset.k;S.opsN=200;$('#ok').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));drawOps()};drawOps()}

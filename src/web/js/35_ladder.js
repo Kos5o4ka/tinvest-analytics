@@ -63,7 +63,8 @@ function ladMy(){
   const ctl=`<div class="ld-ctl noprint">${seg('gran',[['year','По годам'],['quarter','Кварталы, затем годы']],O.gran)}${seg('mode',[['sum','Суммы'],['pct','% портфеля']],O.mode)}
     ${d.has_offers?`<label class="sw"><input type="checkbox" id="ld-offs" ${O.offers?'checked':''}><i></i><div><b>Считать пут-оферты как погашение</b><small>по бумагам с пут-офертой срок — до её даты; колл срок не меняет</small></div></label>`:''}</div>`;
   const leg=Object.keys(LAD_TY).filter(k=>ps.some(p=>p.by_type[k]>0)).map(k=>`<span><i style="background:${LAD_TY[k][1]}"></i>${LAD_TY[k][0]}</span>`).join('');
-  const how=`<details class="ld-how" ${O.how?'open':''}><summary>Как читать</summary><ul>
+  const howOpen=O.how||!!S._ladHowOpen;if(O.how){S._ladHowOpen=true;O.how=false;ladSaveO()}   /* памятка открыта только при первом знакомстве, дальше свёрнута */
+  const how=`<details class="ld-how" ${howOpen?'open':''}><summary>Как читать</summary><ul>
     <li><b>Лесенка</b> — это облигации с разными датами погашения: каждый период часть денег возвращается, и её можно вложить заново или потратить.</li>
     <li><b>Ровные ступени</b> означают, что в каждый период возвращается примерно одинаковая сумма. Так проще реинвестировать: часть денег попадает на рынок и при высоких, и при низких ставках, и риск одного неудачного момента меньше.</li>
     <li><b>Пут-оферта</b> — право держателя предъявить бумагу к выкупу: при включённом переключателе ступень стоит на её дате. <b>Колл</b> — право эмитента погасить выпуск досрочно: решает он, поэтому ступень остаётся на погашении, а бумага помечена «возможен колл».</li>
@@ -144,7 +145,7 @@ function bindLad(){
   document.querySelectorAll('[data-ldtab]').forEach(b=>b.onclick=()=>{S.ladTab=b.dataset.ldtab;lsSet('ta_ladtab',S.ladTab);render()});
   document.querySelectorAll('[data-ld]').forEach(b=>b.onclick=()=>{const[k,v]=b.dataset.ld.split(':');S.ladO[k]=v;ladSaveO();render()});
   const of=$('#ld-offs');if(of)of.onchange=()=>{S.ladO.offers=of.checked;ladSaveO();render()};
-  const hw=document.querySelector('.ld-how');if(hw)hw.ontoggle=()=>{S.ladO.how=hw.open;ladSaveO()};
+  const hw=document.querySelector('.ld-how');if(hw)hw.ontoggle=()=>{S._ladHowOpen=hw.open;S.ladO.how=false;ladSaveO()};
   const bars=$('#ld-bars');if(bars){const d=S.ladP&&S.ladP.data,O=S.ladO;if(d&&!d.empty){const V=d.variants[O.offers&&d.has_offers?'offer':'maturity']||d.variants.offer;bindTip(bars,ladTip(O.gran==='quarter'?V.quarter:V.year))}}
   const det=$('#ld-det');if(det)det.onclick=e=>{const h=e.target.closest('[data-g]');if(!h)return;const k=h.dataset.g;S.ladO.col[k]=!S.ladO.col[k];render()};
   const setAll=v=>{const d=S.ladP&&S.ladP.data;if(!d||d.empty)return;const V=d.variants[S.ladO.offers&&d.has_offers?'offer':'maturity']||d.variants.offer;(S.ladO.gran==='quarter'?V.quarter:V.year).forEach(p=>{S.ladO.col[p.key]=v});render()};

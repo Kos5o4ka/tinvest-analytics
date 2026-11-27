@@ -15,6 +15,23 @@ function opsFiltered(){
   const q=S.opsQ.toLowerCase(),ks=KMAP[S.opsK];
   return S.data.ops.filter(o=>(!ks||ks.includes(o[2]))&&(!q||(o[1]+' '+(OPN[o[1]]||'')+' '+o[3]+' '+o[4]+' '+o[12]).toLowerCase().includes(q)));
 }
+/* итоги по отфильтрованным операциям (только рублёвые) */
+function opsTotals(all){
+  const t={buy:0,sell:0,inc:0,fee:0,tax:0,net:0};let other=0;
+  all.forEach(o=>{
+    if(o[8]&&o[8]!=='rub'){other++;return}
+    const v=+o[7]||0,k=o[2];
+    if(k==='buy')t.buy+=Math.abs(v);else if(k==='sell')t.sell+=Math.abs(v);
+    else if(KMAP.income.includes(k))t.inc+=v;
+    else if(KMAP.fees.includes(k))t.fee+=Math.abs(v);
+    else if(TAXK.includes(k))t.tax+=v;
+    t.net+=v;
+  });
+  const it=[['Куплено',t.buy],['Продано',t.sell],['Получено выплат',t.inc],['Комиссии',t.fee],['Налоги',Math.abs(t.tax)]].filter(x=>x[1]>0.5)
+    .map(([n,v])=>`<span>${n}: <b class="num">${M(v,'rub',0)}</b></span>`);
+  if(!it.length)return'';
+  return`<div class="ops-sum">${it.join('')}<span>Чистый поток: <b class="num ${cls(t.net)}">${SM(t.net)}</b></span>${other?`<span class="mu">без ${f0(other)} операций в других валютах</span>`:''}</div>`;
+}
 function pOps(){
   return`<div class="card"><div class="row" style="margin-bottom:14px">
     <input class="in" id="oq" placeholder="Поиск: название, тикер, тип операции…" value="${esc(S.opsQ)}" style="flex:1;min-width:240px">
@@ -26,7 +43,7 @@ function drawOps(){
   const all=opsFiltered(),rows=all.slice(0,S.opsN),el=$('#otab');if(!el)return;
   if(!all.length){el.innerHTML=S.opsQ||S.opsK?'<div class="empty">Ничего не найдено. <button class="btn ghost" id="ops-reset">Сбросить фильтры</button></div>':emptyHint('Операций за этот период нет. Выберите период «Всё время» сверху или загрузите отчёт брокера.',[['imp','Импорт отчёта',1]]);const rb=$('#ops-reset');if(rb)rb.onclick=()=>{S.opsQ='';S.opsK='';render()};el.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   const multi=S.account==='all';
-  el.innerHTML=`<p class="note" style="margin-bottom:8px">Найдено: ${f0(all.length)}</p><div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
+  el.innerHTML=`<p class="note" style="margin-bottom:8px">Найдено: ${f0(all.length)}</p>${opsTotals(all)}<div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
     <th>Дата</th><th class="l">Операция</th><th class="l">Инструмент</th>${multi?'<th class="l">Счёт</th>':''}<th>Кол-во</th><th>Цена</th><th>Сумма</th><th>Комиссия</th><th>Результат</th></tr></thead><tbody>`+
     rows.map(o=>`<tr><td class="num t2">${esc(o[0])}</td><td class="l"><span class="tag">${esc(OPN[o[1]]||o[1])}</span></td>
     <td class="l" style="max-width:380px">${o[3]||o[4]?`<div class="tk"${opsStk(o)}>${logo({name:o[3],ticker:o[4],logo:o[11]},24)}<div><b style="font-weight:550">${esc(o[3]||o[4])}</b></div></div>`:''}</td>

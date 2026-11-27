@@ -29385,6 +29385,8 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 /* Горизонтальный скролл страниц (налоги, сигналы): колонка сетки может сжиматься, широкие таблицы прокручиваются внутри себя */
 .wrap{grid-template-columns:minmax(0,1fr)}
 .txo,.sg-g2,.sg-t{min-width:0;max-width:100%}
+.sg-g2{grid-template-columns:minmax(0,1fr)}
+.sg-g2>*{min-width:0}
 .txo .tbl,.sg-g2 .tbl{max-width:100%}
 
 /* Карточки бумаг: верхняя панель закреплена, кнопки не обрезаются справа */
@@ -29441,6 +29443,11 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 
 /* Панель навигации Настроек — тоже <aside>: общие стили сайдбара (ширина 252px, рамка, отступы) на неё не действуют */
 .st aside.st-side{width:auto;padding:2px 0 0;border:0;overflow:visible;flex:none}
+
+/* Обзор: быстрые задачи одной строкой; Операции: итоги по фильтру; Ребалансировка: быстрые цели */
+.ux-chips{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12.5px}
+.ops-sum{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 10px;padding:9px 12px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;color:var(--tx2)}
+.reb-pre{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
 
 /* Онбординг внутри Настроек: карточка не шире колонки */
 #ob-host{min-width:0}
@@ -30273,12 +30280,19 @@ function pPos(){
     ${kpi('Топ-5 позиций',pctp(top5),'доля в портфеле — концентрация',top5>60?'neg':'')}</div>
     <div class="g c-1-2"><div class="card"><h2>Секторы</h2><div id="c-sect" class="chart"></div></div>
     <div class="card"><h2>Крупнейшие доли</h2>${hbars(nonCur.slice().sort((a,b)=>(b.value_rub||0)-(a.value_rub||0)).slice(0,10).map(x=>({n:x.name,v:x.share||0})),S1,x=>pctp(x.v),1)}</div></div>
-    <div class="card" style="padding:12px 10px 6px"><div class="row" style="padding:0 6px 10px"><div class="seg" id="ptype"><button class="${!S.posType?'on':''}" data-t="">Все · ${all.length}</button>${typesHere.map(t=>`<button class="${S.posType===t?'on':''}" data-t="${t}">${TYPES[t]||t} · ${all.filter(x=>x.type===t).length}</button>`).join('')}</div></div>
+    <div class="card" style="padding:12px 10px 6px"><div class="row" style="padding:0 6px 10px"><div class="seg" id="ptype"><button class="${!S.posType?'on':''}" data-t="">Все · ${all.length}</button>${typesHere.map(t=>`<button class="${S.posType===t?'on':''}" data-t="${t}">${TYPES[t]||t} · ${all.filter(x=>x.type===t).length}</button>`).join('')}</div><input class="in" id="pq" type="search" placeholder="Поиск по названию, тикеру, ISIN…" value="${esc(S.posQ||'')}" aria-label="Поиск по позициям" style="flex:1;min-width:200px;max-width:340px;margin-left:auto"></div>
     ${ps.length?`<div class="tbl" style="max-height:calc(100vh - 220px)"><table id="ptab"><thead><tr>${th}</tr></thead><tbody>${rows}</tbody></table></div>`:emptyHint('Открытых позиций нет в выбранном счёте. Выберите другой счёт слева или добавьте сделки отчётом брокера.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']])}</div>
     <p class="note">P&amp;L по счетам Т-Инвестиций — по данным брокера (FIFO), для облигаций без НКД. По импортированным счетам — расчёт по сделкам из отчёта и текущим ценам биржи.</p>`;
 }
 
 
+
+/* живой поиск по таблице позиций: скрываем строки, не меняя сортировку и остальной экран */
+function posFilterApply(){
+  const t=document.getElementById('ptab');if(!t)return;
+  const q=String(S.posQ||'').trim().toLowerCase();
+  t.querySelectorAll('tbody tr').forEach(tr=>{tr.style.display=!q||tr.textContent.toLowerCase().includes(q)||(tr.dataset.isin||'').toLowerCase().includes(q)||(tr.dataset.stk||'').toLowerCase().includes(q)?'':'none'});
+}
 /* ── кредитные рейтинги ── */
 const RSC=['AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-','BB+','BB','BB-','B+','B','B-','CCC','CC','C','D'];
 const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i<0?'нет рейтинга':i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
@@ -31409,6 +31423,23 @@ function opsFiltered(){
   const q=S.opsQ.toLowerCase(),ks=KMAP[S.opsK];
   return S.data.ops.filter(o=>(!ks||ks.includes(o[2]))&&(!q||(o[1]+' '+(OPN[o[1]]||'')+' '+o[3]+' '+o[4]+' '+o[12]).toLowerCase().includes(q)));
 }
+/* итоги по отфильтрованным операциям (только рублёвые) */
+function opsTotals(all){
+  const t={buy:0,sell:0,inc:0,fee:0,tax:0,net:0};let other=0;
+  all.forEach(o=>{
+    if(o[8]&&o[8]!=='rub'){other++;return}
+    const v=+o[7]||0,k=o[2];
+    if(k==='buy')t.buy+=Math.abs(v);else if(k==='sell')t.sell+=Math.abs(v);
+    else if(KMAP.income.includes(k))t.inc+=v;
+    else if(KMAP.fees.includes(k))t.fee+=Math.abs(v);
+    else if(TAXK.includes(k))t.tax+=v;
+    t.net+=v;
+  });
+  const it=[['Куплено',t.buy],['Продано',t.sell],['Получено выплат',t.inc],['Комиссии',t.fee],['Налоги',Math.abs(t.tax)]].filter(x=>x[1]>0.5)
+    .map(([n,v])=>`<span>${n}: <b class="num">${M(v,'rub',0)}</b></span>`);
+  if(!it.length)return'';
+  return`<div class="ops-sum">${it.join('')}<span>Чистый поток: <b class="num ${cls(t.net)}">${SM(t.net)}</b></span>${other?`<span class="mu">без ${f0(other)} операций в других валютах</span>`:''}</div>`;
+}
 function pOps(){
   return`<div class="card"><div class="row" style="margin-bottom:14px">
     <input class="in" id="oq" placeholder="Поиск: название, тикер, тип операции…" value="${esc(S.opsQ)}" style="flex:1;min-width:240px">
@@ -31420,7 +31451,7 @@ function drawOps(){
   const all=opsFiltered(),rows=all.slice(0,S.opsN),el=$('#otab');if(!el)return;
   if(!all.length){el.innerHTML=S.opsQ||S.opsK?'<div class="empty">Ничего не найдено. <button class="btn ghost" id="ops-reset">Сбросить фильтры</button></div>':emptyHint('Операций за этот период нет. Выберите период «Всё время» сверху или загрузите отчёт брокера.',[['imp','Импорт отчёта',1]]);const rb=$('#ops-reset');if(rb)rb.onclick=()=>{S.opsQ='';S.opsK='';render()};el.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   const multi=S.account==='all';
-  el.innerHTML=`<p class="note" style="margin-bottom:8px">Найдено: ${f0(all.length)}</p><div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
+  el.innerHTML=`<p class="note" style="margin-bottom:8px">Найдено: ${f0(all.length)}</p>${opsTotals(all)}<div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
     <th>Дата</th><th class="l">Операция</th><th class="l">Инструмент</th>${multi?'<th class="l">Счёт</th>':''}<th>Кол-во</th><th>Цена</th><th>Сумма</th><th>Комиссия</th><th>Результат</th></tr></thead><tbody>`+
     rows.map(o=>`<tr><td class="num t2">${esc(o[0])}</td><td class="l"><span class="tag">${esc(OPN[o[1]]||o[1])}</span></td>
     <td class="l" style="max-width:380px">${o[3]||o[4]?`<div class="tk"${opsStk(o)}>${logo({name:o[3],ticker:o[4],logo:o[11]},24)}<div><b style="font-weight:550">${esc(o[3]||o[4])}</b></div></div>`:''}</td>
@@ -32725,6 +32756,7 @@ function pReb(){
   <div class="card"><h2>Целевая структура по классам активов</h2>
     <div class="row" style="margin-bottom:14px;gap:18px;flex-wrap:wrap"><label class="field" style="max-width:240px"><span>Новый взнос, ₽ (необязательно)</span><input class="in num" id="rb-c" type="number" min="0" step="1000" value="${S.reb.contrib}" placeholder="0"></label>
       <label class="sw"><input type="checkbox" id="rb-b" ${buyOnly?'checked':''}><i></i><div><b>Только докупать</b><small>Ничего не продавать, распределить взнос</small></div></label></div>
+    <div class="scr-presets reb-pre noprint" style="margin-bottom:12px"><span class="mu" style="font-size:12.5px">Быстрые цели:</span>${[['6040','Акции 60 / Облигации 40'],['5050','50 / 50'],['8020','Акции 80 / Облигации 20'],['eq','Равные доли']].map(([k,t])=>`<button type="button" class="scr-chip" data-rbp="${k}">${t}</button>`).join('')}</div>
     <div class="tbl"><table><thead><tr><th class="l">Класс</th><th>Сейчас, ₽</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>Действие</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="row" style="margin-top:14px"><button class="btn" id="rb-s">Сохранить цели</button><button class="btn ghost" id="rb-r">Сбросить</button><span class="reb-sum" id="rb-sum"></span></div></div>
   ${rebTaxHtml(act,keys)}
@@ -32734,6 +32766,13 @@ function pReb(){
 function bindReb(){
   const d=S.reb.draft;
   $('#view').querySelectorAll('.reb-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)d[i.dataset.k]=Math.min(100,v);else delete d[i.dataset.k];render()});
+  $('#view').querySelectorAll('[data-rbp]').forEach(btn=>btn.onclick=()=>{
+    const k=btn.dataset.rbp,pr={'6040':[60,40],'5050':[50,50],'8020':[80,20]}[k];
+    Object.keys(d).forEach(x=>delete d[x]);
+    if(pr){d.share=pr[0];d.bond=pr[1]}
+    else{const ks=[...$('#view').querySelectorAll('.reb-in')].map(i=>i.dataset.k).filter(x=>!['currency','other'].includes(x));const v=ks.length?Math.round(1000/ks.length)/10:0;ks.forEach(x=>d[x]=v)}
+    render();
+  });
   $('#rb-c').onchange=e=>{S.reb.contrib=e.target.value;render()};
   const rm=$('#rb-m');if(rm)rm.onchange=e=>{S.reb.monthly=e.target.value;render()};
   $('#rb-b').onchange=e=>{S.reb.buyOnly=e.target.checked;render()};
@@ -32850,7 +32889,7 @@ function bindPage(){
   document.querySelectorAll('#view [data-go]').forEach(b=>b.onclick=()=>{if(b.classList.contains('td-mv'))S.scrTab='mv';go(b.dataset.go)});
   const sortable=(id,key)=>{const t=$(id);if(t)t.querySelector('thead').onclick=e=>{const h=e.target.closest('[data-s]');if(!h)return;const k=h.dataset.s;
     S[key]={k,d:S[key].k===k?-S[key].d:(['name','type','risk','maturity','next'].includes(k)?1:-1)};render()}};
-  if(S.page==='pos'){sortable('#ptab','sort');const pt=$('#ptype');if(pt)pt.onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;S.posType=b.dataset.t;render()}}
+  if(S.page==='pos'){sortable('#ptab','sort');const pt=$('#ptype');if(pt)pt.onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;S.posType=b.dataset.t;render()}};const pq=$('#pq');if(pq){pq.oninput=()=>{S.posQ=pq.value;posFilterApply()};posFilterApply()}
   if(S.page==='bonds')sortable('#btab','bsort');
   if(S.page==='ops'){let to;$('#oq').oninput=e=>{clearTimeout(to);to=setTimeout(()=>{S.opsQ=e.target.value;S.opsN=200;drawOps()},150)};
     $('#ok').onclick=e=>{const b=e.target.closest('[data-k]');if(!b)return;S.opsK=b.dataset.k;S.opsN=200;$('#ok').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));drawOps()};drawOps()}
@@ -34429,7 +34468,8 @@ function ladMy(){
   const ctl=`<div class="ld-ctl noprint">${seg('gran',[['year','По годам'],['quarter','Кварталы, затем годы']],O.gran)}${seg('mode',[['sum','Суммы'],['pct','% портфеля']],O.mode)}
     ${d.has_offers?`<label class="sw"><input type="checkbox" id="ld-offs" ${O.offers?'checked':''}><i></i><div><b>Считать пут-оферты как погашение</b><small>по бумагам с пут-офертой срок — до её даты; колл срок не меняет</small></div></label>`:''}</div>`;
   const leg=Object.keys(LAD_TY).filter(k=>ps.some(p=>p.by_type[k]>0)).map(k=>`<span><i style="background:${LAD_TY[k][1]}"></i>${LAD_TY[k][0]}</span>`).join('');
-  const how=`<details class="ld-how" ${O.how?'open':''}><summary>Как читать</summary><ul>
+  const howOpen=O.how||!!S._ladHowOpen;if(O.how){S._ladHowOpen=true;O.how=false;ladSaveO()}   /* памятка открыта только при первом знакомстве, дальше свёрнута */
+  const how=`<details class="ld-how" ${howOpen?'open':''}><summary>Как читать</summary><ul>
     <li><b>Лесенка</b> — это облигации с разными датами погашения: каждый период часть денег возвращается, и её можно вложить заново или потратить.</li>
     <li><b>Ровные ступени</b> означают, что в каждый период возвращается примерно одинаковая сумма. Так проще реинвестировать: часть денег попадает на рынок и при высоких, и при низких ставках, и риск одного неудачного момента меньше.</li>
     <li><b>Пут-оферта</b> — право держателя предъявить бумагу к выкупу: при включённом переключателе ступень стоит на её дате. <b>Колл</b> — право эмитента погасить выпуск досрочно: решает он, поэтому ступень остаётся на погашении, а бумага помечена «возможен колл».</li>
@@ -34510,7 +34550,7 @@ function bindLad(){
   document.querySelectorAll('[data-ldtab]').forEach(b=>b.onclick=()=>{S.ladTab=b.dataset.ldtab;lsSet('ta_ladtab',S.ladTab);render()});
   document.querySelectorAll('[data-ld]').forEach(b=>b.onclick=()=>{const[k,v]=b.dataset.ld.split(':');S.ladO[k]=v;ladSaveO();render()});
   const of=$('#ld-offs');if(of)of.onchange=()=>{S.ladO.offers=of.checked;ladSaveO();render()};
-  const hw=document.querySelector('.ld-how');if(hw)hw.ontoggle=()=>{S.ladO.how=hw.open;ladSaveO()};
+  const hw=document.querySelector('.ld-how');if(hw)hw.ontoggle=()=>{S._ladHowOpen=hw.open;S.ladO.how=false;ladSaveO()};
   const bars=$('#ld-bars');if(bars){const d=S.ladP&&S.ladP.data,O=S.ladO;if(d&&!d.empty){const V=d.variants[O.offers&&d.has_offers?'offer':'maturity']||d.variants.offer;bindTip(bars,ladTip(O.gran==='quarter'?V.quarter:V.year))}}
   const det=$('#ld-det');if(det)det.onclick=e=>{const h=e.target.closest('[data-g]');if(!h)return;const k=h.dataset.g;S.ladO.col[k]=!S.ladO.col[k];render()};
   const setAll=v=>{const d=S.ladP&&S.ladP.data;if(!d||d.empty)return;const V=d.variants[S.ladO.offers&&d.has_offers?'offer':'maturity']||d.variants.offer;(S.ladO.gran==='quarter'?V.quarter:V.year).forEach(p=>{S.ladO.col[p.key]=v});render()};
@@ -37704,6 +37744,12 @@ function uxDashBlocks(){
       <div class="row" style="gap:8px"><button class="btn ghost" id="ux-tour-go" style="padding:5px 10px;font-size:12px">Тур по интерфейсу</button>
       <button class="lnk" id="ux-chk-hide" style="font-size:12px">Скрыть</button></div></div>
       <div class="ux-chk-l">${steps.map(([k,t,act])=>`<button class="ux-chk-i${UX.checks[k]?' done':''}" data-ux-step="${esc(act)}"><i>${UX.checks[k]?'✓':'○'}</i><span>${esc(t)}</span></button>`).join('')}</div></div>`;
+  }
+  /* реальный портфель уже подключён: обучающие блоки сворачиваются в одну строку, график и позиции выше */
+  const real=!(typeof DEMO!=='undefined'&&DEMO.on)&&S.data&&S.data.portfolio&&(S.data.portfolio.positions||[]).length>0;
+  if(real){
+    const chips=[['ofz','Подобрать облигации'],['rot','Флоатеры или фиксы?'],['calc','Сколько накоплю'],['tax','Налоги за год']];
+    return`<div class="ux-chips noprint"><span class="mu">Быстрые задачи:</span>${chips.map(([k,t])=>`<button type="button" class="scr-chip" data-ux-task="${k}">${t}</button>`).join('')}${!UX.checkOff&&doneCnt<steps.length?`<button type="button" class="scr-chip" id="ux-tour-go">Тур по интерфейсу</button>`:''}</div>`;
   }
   return chk+tasks;
 }

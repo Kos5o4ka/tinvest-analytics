@@ -152,6 +152,12 @@ function uxDashBlocks(){
       <button class="lnk" id="ux-chk-hide" style="font-size:12px">Скрыть</button></div></div>
       <div class="ux-chk-l">${steps.map(([k,t,act])=>`<button class="ux-chk-i${UX.checks[k]?' done':''}" data-ux-step="${esc(act)}"><i>${UX.checks[k]?'✓':'○'}</i><span>${esc(t)}</span></button>`).join('')}</div></div>`;
   }
+  /* реальный портфель уже подключён: обучающие блоки сворачиваются в одну строку, график и позиции выше */
+  const real=!(typeof DEMO!=='undefined'&&DEMO.on)&&S.data&&S.data.portfolio&&(S.data.portfolio.positions||[]).length>0;
+  if(real){
+    const chips=[['ofz','Подобрать облигации'],['rot','Флоатеры или фиксы?'],['calc','Сколько накоплю'],['tax','Налоги за год']];
+    return`<div class="ux-chips noprint"><span class="mu">Быстрые задачи:</span>${chips.map(([k,t])=>`<button type="button" class="scr-chip" data-ux-task="${k}">${t}</button>`).join('')}${!UX.checkOff&&doneCnt<steps.length?`<button type="button" class="scr-chip" id="ux-tour-go">Тур по интерфейсу</button>`:''}</div>`;
+  }
   return chk+tasks;
 }
 

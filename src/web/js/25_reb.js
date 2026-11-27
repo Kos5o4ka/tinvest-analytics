@@ -94,6 +94,7 @@ function pReb(){
   <div class="card"><h2>Целевая структура по классам активов</h2>
     <div class="row" style="margin-bottom:14px;gap:18px;flex-wrap:wrap"><label class="field" style="max-width:240px"><span>Новый взнос, ₽ (необязательно)</span><input class="in num" id="rb-c" type="number" min="0" step="1000" value="${S.reb.contrib}" placeholder="0"></label>
       <label class="sw"><input type="checkbox" id="rb-b" ${buyOnly?'checked':''}><i></i><div><b>Только докупать</b><small>Ничего не продавать, распределить взнос</small></div></label></div>
+    <div class="scr-presets reb-pre noprint" style="margin-bottom:12px"><span class="mu" style="font-size:12.5px">Быстрые цели:</span>${[['6040','Акции 60 / Облигации 40'],['5050','50 / 50'],['8020','Акции 80 / Облигации 20'],['eq','Равные доли']].map(([k,t])=>`<button type="button" class="scr-chip" data-rbp="${k}">${t}</button>`).join('')}</div>
     <div class="tbl"><table><thead><tr><th class="l">Класс</th><th>Сейчас, ₽</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>Действие</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="row" style="margin-top:14px"><button class="btn" id="rb-s">Сохранить цели</button><button class="btn ghost" id="rb-r">Сбросить</button><span class="reb-sum" id="rb-sum"></span></div></div>
   ${rebTaxHtml(act,keys)}
@@ -103,6 +104,13 @@ function pReb(){
 function bindReb(){
   const d=S.reb.draft;
   $('#view').querySelectorAll('.reb-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)d[i.dataset.k]=Math.min(100,v);else delete d[i.dataset.k];render()});
+  $('#view').querySelectorAll('[data-rbp]').forEach(btn=>btn.onclick=()=>{
+    const k=btn.dataset.rbp,pr={'6040':[60,40],'5050':[50,50],'8020':[80,20]}[k];
+    Object.keys(d).forEach(x=>delete d[x]);
+    if(pr){d.share=pr[0];d.bond=pr[1]}
+    else{const ks=[...$('#view').querySelectorAll('.reb-in')].map(i=>i.dataset.k).filter(x=>!['currency','other'].includes(x));const v=ks.length?Math.round(1000/ks.length)/10:0;ks.forEach(x=>d[x]=v)}
+    render();
+  });
   $('#rb-c').onchange=e=>{S.reb.contrib=e.target.value;render()};
   const rm=$('#rb-m');if(rm)rm.onchange=e=>{S.reb.monthly=e.target.value;render()};
   $('#rb-b').onchange=e=>{S.reb.buyOnly=e.target.checked;render()};

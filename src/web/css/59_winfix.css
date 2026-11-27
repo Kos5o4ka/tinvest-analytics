@@ -16,6 +16,8 @@
 /* Горизонтальный скролл страниц (налоги, сигналы): колонка сетки может сжиматься, широкие таблицы прокручиваются внутри себя */
 .wrap{grid-template-columns:minmax(0,1fr)}
 .txo,.sg-g2,.sg-t{min-width:0;max-width:100%}
+.sg-g2{grid-template-columns:minmax(0,1fr)}
+.sg-g2>*{min-width:0}
 .txo .tbl,.sg-g2 .tbl{max-width:100%}
 
 /* Карточки бумаг: верхняя панель закреплена, кнопки не обрезаются справа */
@@ -72,6 +74,11 @@
 
 /* Панель навигации Настроек — тоже <aside>: общие стили сайдбара (ширина 252px, рамка, отступы) на неё не действуют */
 .st aside.st-side{width:auto;padding:2px 0 0;border:0;overflow:visible;flex:none}
+
+/* Обзор: быстрые задачи одной строкой; Операции: итоги по фильтру; Ребалансировка: быстрые цели */
+.ux-chips{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12.5px}
+.ops-sum{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 10px;padding:9px 12px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;color:var(--tx2)}
+.reb-pre{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
 
 /* Онбординг внутри Настроек: карточка не шире колонки */
 #ob-host{min-width:0}
