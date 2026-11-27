@@ -42,13 +42,14 @@ BOND_BOARDS = ("TQCB", "TQOB", "TQOD", "TQOY")
 BOND_URL = (
     ISS + "engines/stock/markets/bonds/boards/%s/securities.json?iss.meta=off"
     "&iss.only=securities,marketdata"
-    "&securities.columns=SECID,ISIN,SHORTNAME,SECNAME,MATDATE,COUPONPERCENT,COUPONPERIOD,NEXTCOUPON,PREVLEGALCLOSEPRICE,YIELDATPREVWAPRICE,FACEVALUE,CURRENCYID"
-    "&marketdata.columns=SECID,WAPRICE,LAST,YIELD,YIELDATWAPRICE,DURATION,VALTODAY,VALTODAY_RUR"
+    "&securities.columns=SECID,ISIN,SHORTNAME,SECNAME,MATDATE,COUPONPERCENT,COUPONPERIOD,NEXTCOUPON,PREVLEGALCLOSEPRICE,YIELDATPREVWAPRICE,FACEVALUE,CURRENCYID,"
+    "FACEUNIT,OFFERDATE,LISTLEVEL,BONDSUBTYPE,ISSUESIZE,ACCRUEDINT,COUPONVALUE,PREVPRICE,BONDTYPE,COUPON_DETAILS"
+    "&marketdata.columns=SECID,WAPRICE,LAST,YIELD,YIELDATWAPRICE,DURATION,VALTODAY,VALTODAY_RUR,NUMTRADES,ZSPREAD,LASTCHANGEPRCNT"
 )
 STOCK_URL = (
     ISS + "engines/stock/markets/shares/boards/TQBR/securities.json?iss.meta=off"
     "&iss.only=securities,marketdata"
-    "&securities.columns=SECID,ISIN,SHORTNAME,SECNAME,PREVPRICE,PREVLEGALCLOSEPRICE,ISSUESIZE,LOTSIZE"
+    "&securities.columns=SECID,ISIN,SHORTNAME,SECNAME,PREVPRICE,PREVLEGALCLOSEPRICE,ISSUESIZE,LOTSIZE,INSTRID,SECTYPE"
     "&marketdata.columns=SECID,LAST,WAPRICE,OPEN,VALTODAY,VALTODAY_RUR,ISSUECAPITALIZATION,LASTTOPREVPRICE"
 )
 IMOEX_URL = ISS + "statistics/engines/stock/markets/index/analytics/IMOEX.json?iss.meta=off&limit=100"
@@ -132,6 +133,38 @@ def _rating_bucket(rating):
     return "без рейтинга"
 
 
+def _bond_extra(s, m, price, cpn):  # cpn — COUPONPERCENT без округления
+    """Поля для скринера и карты облигаций на клиенте (только добавляются к строке; формат прежних полей не меняется)."""
+    def num(x):
+        try:
+            return None if x is None else float(x)
+        except (TypeError, ValueError):
+            return None
+    dur = m.get("DURATION")
+    lastchg = m.get("LASTCHANGEPRCNT")
+    prev = s.get("PREVPRICE") or s.get("PREVLEGALCLOSEPRICE")
+    last = m.get("LAST")
+    if lastchg:
+        chg = round(float(lastchg), 2)
+    elif prev and last:
+        chg = round((float(last) / float(prev) - 1) * 100, 2)
+    else:
+        chg = 0.0
+    cy = None
+    try:
+        cv, per, face, px = s.get("COUPONVALUE"), s.get("COUPONPERIOD"), s.get("FACEVALUE"), last or price
+        if cv and per and face and px:
+            cy = round(float(cv) * (365.0 / float(per)) / float(face) * 100.0 / float(px) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        cy = None
+    of = s.get("OFFERDATE")
+    return {"chg": chg, "level": s.get("LISTLEVEL"), "trades": m.get("NUMTRADES") or 0, "zs": m.get("ZSPREAD"), "cy": cy,
+            "sub": s.get("BONDSUBTYPE"), "size": s.get("ISSUESIZE"), "nkd": s.get("ACCRUEDINT"), "btype": s.get("BONDTYPE"),
+            "cpn_det": s.get("COUPON_DETAILS"), "offer": of if of and not str(of).startswith("0000") else None,
+            "cur": (s.get("FACEUNIT") or "SUR").replace("SUR", "RUB"), "turn": round(num(m.get("VALTODAY")) or 0),
+            "macdur": round(float(dur) / 365.0, 2) if dur else None, "coupon_raw": cpn}
+
+
 def parse_moex_bonds(boards_json):
     """boards_json: dict {board: iss_json} -> список облигаций."""
     out, seen = [], set()
@@ -179,6 +212,7 @@ def parse_moex_bonds(boards_json):
                 "floater": False,
                 "floater_formula": None,
             }
+            row.update(_bond_extra(s, m, price, cpn))
             ff = parse_floater_formula(name)
             if ff:
                 row["floater"] = True
@@ -239,6 +273,10 @@ def parse_moex_stocks(tqbr_json, imoex_json=None, candles_by_secid=None):
             "chg_w": chg_w,
             "chg_m": chg_m,
             "turnover": round(float(turn or 0), 0),
+            "lot": int(s.get("LOTSIZE") or 1),
+            "instrid": s.get("INSTRID") or "",
+            "sectype": str(s.get("SECTYPE") or ""),
+            "is_fund": str(s.get("INSTRID") or "").startswith("IF"),
             "cap": round(float(cap), 0) if cap else None,
             "sector": SECTORS.get(secid, "Прочее"),
             "imoex": secid in imoex_weights,
