@@ -1,0 +1,63 @@
+/* ── Единые токены оформления ──
+   Здесь живут все базовые переменные: цвета тёмной и светлой темы, радиусы, тени, слои, шрифт.
+   Остальные файлы переменные не переопределяют, а только используют (исключение — акцент и плотность ниже,
+   они переключаются атрибутами data-accent / data-density на <html>). Контраст подобран по разделу 18 ревью. */
+@font-face{font-family:"Inter";font-style:normal;font-weight:100 900;font-display:swap;src:url(/fonts/InterVariable.woff2) format("woff2")}
+
+:root{
+  /* поверхности: фон → карточка → вложенный блок */
+  --bg:#07090e;--side:#0a0d14;--card:#111622;--card2:#182030;--card-hover:#1d2638;
+  --line:#ffffff1a;--line2:#ffffff2b;
+  /* текст */
+  --tx:#f1f5f9;--tx2:#b4c0d0;--mu:#8794a8;--lbl:#97a3b6;
+  /* акцент и смысловые цвета */
+  --ac:#3b82f6;--ac2:#2f6fe0;--ac-tx:#7aa8f8;--ac-glow:rgba(59,130,246,.22);--ac-rgb:59,130,246;
+  --pos:#2bc48a;--neg:#f0626a;--warn:#d97706;--fl:#7c3aed;--fix:#10b981;--lnk:#0ea5e9;--sub:#c026d3;
+  --err-tx:#ff9a9a;--info-tx:#93c5fd;
+  /* скелетоны, нулевая линия, подсветка/тень поверхностей */
+  --sk-1:#111622;--sk-2:#1a2233;--zero-line:#ffffff2e;
+  --hl:inset 0 1px 0 #ffffff0d;
+  --elev:0 1px 2px #00000066,0 8px 24px -12px #00000080;
+  --glass:rgba(7,9,13,.72);--glass-solid:rgba(11,14,20,.97);
+  /* три уровня глубины: 0 — фон и меню, 1 — карточки, 2 — главные блоки, выезжающие панели и окна */
+  --d0:var(--bg);--d1:var(--card);--d2:#161d2c;
+  --d2-hl:inset 0 1px 0 #ffffff12;
+  --d2-shadow:0 1px 2px #00000080,0 18px 44px -14px #000000b3;
+  /* серии графиков */
+  --s1:#4f8ef7;--s2:#4cc3ec;--s3:#2bbf9a;--s4:#e3a540;--s5:#ec6f91;--s6:#a7c35a;--s7:#9b87f5;--s8:#f08a5d;
+  /* радиусы, слои, шрифт, плотность */
+  --r:16px;--r-sm:10px;--r-lg:20px;
+  --z-sticky:20;--z-drawer:60;--z-modal:200;--z-toast:300;
+  --font:"Inter",-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text","Segoe UI",Roboto,"Helvetica Neue",system-ui,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --pad-card:20px 22px;--pad-td:11px 10px;--gap:18px;
+  --sw-off:#2d3441;--st-warn:#e5a63a;
+  color-scheme:dark;
+}
+:root[data-theme=light]{
+  --bg:#f2f4f8;--side:#ffffff;--card:#ffffff;--card2:#eef2f7;--card-hover:#f7f8fa;
+  --line:#0f172a1c;--line2:#0f172a2e;
+  --tx:#0b1220;--tx2:#3b4658;--mu:#566173;--lbl:#4d5768;
+  --ac:#2563eb;--ac2:#1d4fd7;--ac-tx:#1d4ed8;--ac-glow:rgba(37,99,235,.18);--ac-rgb:37,99,235;
+  --pos:#0f8f5c;--neg:#d23b3b;--warn:#b45309;
+  --err-tx:#b82828;--info-tx:#1d5cb8;
+  --sk-1:#e9eef5;--sk-2:#f5f7fa;--zero-line:#0f172a3d;
+  --hl:inset 0 1px 0 #ffffff;
+  --elev:0 1px 2px #0f172a0d,0 8px 24px -14px #0f172a26;
+  --glass:rgba(245,246,248,.78);--glass-solid:rgba(250,251,252,.97);
+  --d2:#ffffff;--d2-hl:inset 0 1px 0 #ffffff;--d2-shadow:0 1px 2px #0f172a14,0 18px 40px -16px #0f172a40;
+  --s1:#3b78e6;--s2:#1fa3d4;--s3:#12a383;--s4:#d08c1c;--s5:#d94f78;--s6:#86a63a;--s7:#7f6ae0;--s8:#e2703a;
+  --sw-off:#cdd3de;--st-warn:#c98500;
+  color-scheme:light;
+}
+
+/* ── акцентный цвет (Настройки → Внешний вид) ── */
+:root[data-accent=emerald]{--ac:#10b981;--ac2:#0d9f6e;--ac-tx:#34d399;--ac-glow:rgba(16,185,129,.22);--ac-rgb:16,185,129}
+:root[data-accent=violet]{--ac:#8b5cf6;--ac2:#7444e8;--ac-tx:#a78bfa;--ac-glow:rgba(139,92,246,.24);--ac-rgb:139,92,246}
+:root[data-accent=graphite]{--ac:#64748b;--ac2:#52627a;--ac-tx:#a3b0c2;--ac-glow:rgba(100,116,139,.26);--ac-rgb:100,116,139}
+:root[data-theme=light][data-accent=emerald]{--ac:#0f9a6b;--ac2:#0b8059;--ac-tx:#0b7a55;--ac-glow:rgba(15,154,107,.18);--ac-rgb:15,154,107}
+:root[data-theme=light][data-accent=violet]{--ac:#7c3aed;--ac2:#6a2bd6;--ac-tx:#6d28d9;--ac-glow:rgba(124,58,237,.18);--ac-rgb:124,58,237}
+:root[data-theme=light][data-accent=graphite]{--ac:#475569;--ac2:#334155;--ac-tx:#334155;--ac-glow:rgba(71,85,105,.18);--ac-rgb:71,85,105}
+
+/* ── плотность интерфейса ── */
+:root[data-density=compact]{--pad-card:14px 16px;--pad-td:6px 8px;--gap:12px;--r:13px}

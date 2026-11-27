@@ -1,9 +1,4 @@
 /* ── светлая тема ── */
-:root[data-theme=light]{--bg:#f8fafc;--side:#ffffff;--card:#ffffff;--card2:#f1f5f9;--line:#e2e8f0;--line2:#cbd5e1;
-  --tx:#0f172a;--tx2:#475569;--mu:#64748b;--ac:#2563eb;--ac2:#3b82f6;--ac-tx:#1d4ed8;--pos:#0f8f5c;--neg:#d23b3b;
-  --card-hover:#f8fafc;--ac-glow:rgba(37,99,235,.18);--fl:#7c3aed;--fix:#10b981;--lnk:#0ea5e9;--sub:#c026d3;--warn:#d97706;
-  --sk-1:#e9eef5;--sk-2:#f5f7fa;--zero-line:#00000033;--err-tx:#b82828;--info-tx:#1d5cb8;color-scheme:light}
-[data-theme=light] ::-webkit-scrollbar-thumb{background:#cdd2dc}
 [data-theme=light] .nav button:hover,[data-theme=light] .acl button:hover{background:#eff1f5}
 [data-theme=light] .nav button.on,[data-theme=light] .acl button.on,[data-theme=light] .seg button.on{background:#eceff4}
 [data-theme=light] .msw i,[data-theme=light] .av{background:#cdd2dc}
@@ -11,8 +6,7 @@
 [data-theme=light] .pill{background:#0000000a}
 [data-theme=light] .grid-l{stroke:#0000001a}
 [data-theme=light] .hb .tr,[data-theme=light] .li .bar{background:#0000000d}
-[data-theme=light] .li .it:hover,[data-theme=light] tr:hover td{background:#00000006}
-[data-theme=light] td{border-bottom-color:#0000000d}
+[data-theme=light] .li .it:hover{background:#00000006}
 [data-theme=light] .tag,[data-theme=light] .acl small em,[data-theme=light] .rm .s-later{background:#0000000d}
 [data-theme=light] .rm div{background:#00000005}
 [data-theme=light] .rm .s-next{color:#2a6fc4}

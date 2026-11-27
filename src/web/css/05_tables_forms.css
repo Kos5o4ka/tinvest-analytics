@@ -3,7 +3,7 @@
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{position:sticky;top:0;background:var(--card);color:var(--mu);font-weight:500;font-size:12px;text-align:right;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap;user-select:none;z-index:2}
 th.s{cursor:pointer}th.s:hover{color:var(--tx)}
-td{padding:9px 10px;border-bottom:1px solid #ffffff08;text-align:right;white-space:nowrap}
+td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
 tr:hover td{background:#ffffff04}
 th:first-child,td:first-child,.l{text-align:left!important}
 .tbl table th:first-child,.tbl table td:first-child{position:sticky;left:0;background:var(--card);z-index:1}

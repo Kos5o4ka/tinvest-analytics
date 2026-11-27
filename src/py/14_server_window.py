@@ -1,6 +1,14 @@
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
+_font_cache = []
+
+
+def font_inter_bytes():
+    """Встроенный шрифт Inter (variable woff2) для интерфейса: работает без сети и одинаково на Windows, macOS и Linux."""
+    if not _font_cache:
+        _font_cache.append(base64.b64decode(FONT_INTER_B64))
+    return _font_cache[0]
 # секреты, которые окно настроек может показать по кнопке «глаз» (GET /api/config/secret)
 UI_SECRET_NAMES = ("token", "data_key", "backup_password")
 
@@ -23,7 +31,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "max-age=604800" if ctype == "image/png" else "no-store")
+        self.send_header("Cache-Control", "max-age=604800" if ctype in ("image/png", "font/woff2") else "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:")
@@ -71,6 +79,8 @@ class Handler(BaseHTTPRequestHandler):
         def run():
             if u.path == "/":
                 return self.send(200, PAGE, "text/html; charset=utf-8")
+            if u.path == "/fonts/InterVariable.woff2":
+                return self.send(200, font_inter_bytes(), "font/woff2")
             if u.path.startswith("/logo/"):
                 data = logo_bytes(unquote(u.path[6:]))
                 return self.send(200, data, "image/png") if data else self.send(404, {"error": "no logo"})
