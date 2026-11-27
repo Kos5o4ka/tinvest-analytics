@@ -23,6 +23,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -30,6 +31,7 @@ UA = "TAnalytic-market/1.0 (+https://github.com/Kos5o4ka/tinvest-analytics)"
 ISS = "https://iss.moex.com/iss/"
 MSK = timezone(timedelta(hours=3))
 log = logging.getLogger("market")
+MAX_WORKERS = 4      # вежливо к MOEX ISS: не больше 4 запросов одновременно
 
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS snapshots(kind TEXT PRIMARY KEY, updated_at REAL NOT NULL, data_json TEXT NOT NULL)",
@@ -308,27 +310,39 @@ def _http_json(url, timeout=30):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
-def collect_once(db, fetch_json=_http_json, now=None, fetch_candles=True, candle_limit=100):
-    """Один цикл сбора среза рынка -> {bonds_n, stocks_n, updated_at}."""
-    ts = time.time() if now is None else float(now)
-    boards_json = {}
-    for b in BOND_BOARDS:
+def _pmap(fn, items, workers):
+    """Параллельный map с сохранением порядка; ошибка отдельного элемента -> (None, исключение)."""
+    def one(x):
         try:
-            boards_json[b] = fetch_json(BOND_URL % b)
+            return fn(x), None
         except Exception as e:  # noqa: BLE001
+            return None, e
+    workers = max(1, min(int(workers or 1), MAX_WORKERS, len(items) or 1))
+    if workers == 1:
+        return [one(x) for x in items]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="market") as ex:
+        return list(ex.map(one, items))
+
+
+def collect_once(db, fetch_json=_http_json, now=None, fetch_candles=True, candle_limit=100, workers=MAX_WORKERS):
+    """Один цикл сбора среза рынка -> {bonds_n, stocks_n, updated_at, build_sec}. Запросы к ISS идут параллельно (<=MAX_WORKERS)."""
+    t_start = time.time()
+    ts = t_start if now is None else float(now)
+    urls = [BOND_URL % b for b in BOND_BOARDS] + [STOCK_URL, IMOEX_URL]
+    res = _pmap(fetch_json, urls, workers)
+    boards_json = {}
+    for b, (j, e) in zip(BOND_BOARDS, res[:len(BOND_BOARDS)]):
+        if e:
             log.warning("bonds %s: %s", b, e)
-            boards_json[b] = None
+        boards_json[b] = None if e else j
     bonds = parse_moex_bonds(boards_json)
 
-    try:
-        tqbr_json = fetch_json(STOCK_URL)
-    except Exception as e:  # noqa: BLE001
-        log.warning("stocks TQBR: %s", e)
+    (tqbr_json, e1), (imoex_json, e2) = res[len(BOND_BOARDS)], res[len(BOND_BOARDS) + 1]
+    if e1:
+        log.warning("stocks TQBR: %s", e1)
         tqbr_json = None
-    try:
-        imoex_json = fetch_json(IMOEX_URL)
-    except Exception as e:  # noqa: BLE001
-        log.warning("IMOEX: %s", e)
+    if e2:
+        log.warning("IMOEX: %s", e2)
         imoex_json = None
 
     candles_by_secid = {}
@@ -336,15 +350,13 @@ def collect_once(db, fetch_json=_http_json, now=None, fetch_candles=True, candle
         since = (datetime.fromtimestamp(ts, MSK) - timedelta(days=45)).strftime("%Y-%m-%d")
         prelim = parse_moex_stocks(tqbr_json, imoex_json)
         targets = [s["secid"] for s in prelim if s["imoex"] or s["turnover"] > 0][:candle_limit]
-        for secid in targets:
-            try:
-                cj = fetch_json(CANDLES_URL % (secid, since))
-                candles_by_secid[secid] = [
-                    {"begin": r["begin"], "close": r["close"]}
-                    for r in _table(cj, "candles") if r.get("close")
-                ]
-            except Exception:  # noqa: BLE001
-                pass
+        for secid, (cj, err) in zip(targets, _pmap(lambda x: fetch_json(CANDLES_URL % (x, since)), targets, workers)):
+            if err or cj is None:
+                continue
+            candles_by_secid[secid] = [
+                {"begin": r["begin"], "close": r["close"]}
+                for r in _table(cj, "candles") if r.get("close")
+            ]
 
     stocks = parse_moex_stocks(tqbr_json, imoex_json, candles_by_secid)
     heatmap = build_heatmap_aggregates(bonds, stocks)
@@ -361,6 +373,7 @@ def collect_once(db, fetch_json=_http_json, now=None, fetch_candles=True, candle
             ("last_run", str(ts)),
             ("bonds_n", str(len(bonds))),
             ("stocks_n", str(len(stocks))),
+            ("build_sec", "%.2f" % (time.time() - t_start)),
         ):
             db.execute(
                 "INSERT INTO meta(k, v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
@@ -370,7 +383,7 @@ def collect_once(db, fetch_json=_http_json, now=None, fetch_candles=True, candle
     except BaseException:
         db.execute("ROLLBACK")
         raise
-    return {"bonds_n": len(bonds), "stocks_n": len(stocks), "updated_at": ts}
+    return {"bonds_n": len(bonds), "stocks_n": len(stocks), "updated_at": ts, "build_sec": round(time.time() - t_start, 2)}
 
 
 def query_snapshot(db, kind="all"):
@@ -404,13 +417,13 @@ def stats(db):
     }
 
 
-def loop(data_dir, interval, stop, once=False):
+def loop(data_dir, interval, stop, once=False, workers=MAX_WORKERS):
     db = open_db(os.path.join(data_dir, "market.sqlite"))
     try:
         while not stop.is_set():
             t0 = time.time()
             try:
-                res = collect_once(db)
+                res = collect_once(db, workers=workers)
                 log.info("срез собран: %d облигаций, %d акций (%.1f с)", res["bonds_n"], res["stocks_n"], time.time() - t0)
             except Exception as e:  # noqa: BLE001
                 log.warning("ошибка сбора среза: %s", e)
@@ -425,6 +438,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Сборщик рыночного среза для сервера данных TAnalytic")
     ap.add_argument("--data", required=True, help="каталог данных (market.sqlite)")
     ap.add_argument("--interval", type=int, default=900, help="пауза между обновлениями, сек")
+    ap.add_argument("--loop", action="store_true", help="работать циклом (по умолчанию так и есть; флаг нужен для systemd-юнита)")
+    ap.add_argument("--workers", type=int, default=MAX_WORKERS, help="параллельных запросов к ISS (не больше %d)" % MAX_WORKERS)
     ap.add_argument("--once", action="store_true", help="один проход и выход")
     ap.add_argument("--stats", action="store_true", help="показать статистику market.sqlite и выйти")
     ap.add_argument("--verbose", action="store_true")
@@ -444,7 +459,7 @@ def main(argv=None):
     stop = threading.Event()
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: stop.set())
-    loop(a.data, a.interval, stop, a.once)
+    loop(a.data, a.interval, stop, a.once, a.workers)
     return 0
 
 

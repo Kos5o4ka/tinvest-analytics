@@ -1,0 +1,23 @@
+# Пример. Не развёрнуто, применять при >50-100 пользователях.
+[Unit]
+Description=TAnalytic data server (HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tinvest
+Group=tinvest
+EnvironmentFile=-/etc/tinvest-server.env
+ExecStart=/usr/bin/python3 /opt/tinvest-analytics/server/tinvest_server.py --host 127.0.0.1 --port 8780 --data /var/lib/tinvest-server --keys-db /var/lib/tinvest-bot/keys.sqlite
+Restart=always
+RestartSec=5
+# HTTP на своём ядре, воркеры на другом (номера подберите под машину)
+CPUAffinity=0
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tinvest-server /var/lib/tinvest-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -9,6 +9,7 @@
     python3 tinvest_server.py [--host 127.0.0.1] [--port 8780] [--data DIR] [--key KEY] [--keys-db PATH --bot NAME] [--verbose]
 """
 import argparse
+import gzip
 import hashlib
 import hmac
 import html as html_mod
@@ -21,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
@@ -294,6 +296,70 @@ def flows_query(data_dir, name, params):
     return 200, {"ok": True, "v": PARSED_V, "data": data}
 
 
+SQLITE_MMAP = 134217728      # 128 МБ mmap-чтения
+SQLITE_CACHE_KB = 32768      # 32 МБ page cache
+GZIP_MIN = 1024              # меньше этого размера тело не сжимаем
+PCACHE_MAX = 500             # ёмкость кэша разбора (LRU)
+LAT_WINDOW = 500             # сколько последних запросов учитывается в p50/p95
+
+
+class LRU:
+    """Потокобезопасный LRU-словарь: при переполнении вытесняется самая давняя запись (а не сбрасывается всё)."""
+
+    def __init__(self, maxsize=PCACHE_MAX):
+        self.maxsize = maxsize
+        self._d = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key, default=None):
+        with self._lock:
+            if key in self._d:
+                self._d.move_to_end(key)
+                return self._d[key]
+        return default
+
+    def set(self, key, val):
+        with self._lock:
+            self._d[key] = val
+            self._d.move_to_end(key)
+            while len(self._d) > self.maxsize:
+                self._d.popitem(last=False)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._d)
+
+    def __contains__(self, key):
+        with self._lock:
+            return key in self._d
+
+
+def etag_of(body):
+    return '"%s"' % hashlib.md5(bytes(body)).hexdigest()[:16]
+
+
+def etag_matches(header, etag):
+    """If-None-Match: список тегов (возможно со слабым префиксом W/) или '*'."""
+    if not header:
+        return False
+    if header.strip() == "*":
+        return True
+    for t in header.split(","):
+        t = t.strip()
+        if t.startswith("W/"):
+            t = t[2:]
+        if t == etag:
+            return True
+    return False
+
+
+def _percentile(sorted_vals, q):
+    if not sorted_vals:
+        return 0
+    i = min(len(sorted_vals) - 1, int(round(q * (len(sorted_vals) - 1))))
+    return sorted_vals[i]
+
+
 def market_snapshot_query(data_dir, params):
     """/v1/market/snapshot?kind=all|bonds|stocks|heatmap|status -> (http-код, json). Только чтение, без кэша."""
     try:
@@ -308,6 +374,19 @@ def market_snapshot_query(data_dir, params):
     db = None
     try:
         db = sqlite3.connect("file:%s?mode=ro" % quote(path.replace("\\", "/"), safe="/:"), uri=True, timeout=5)
+        db.execute("PRAGMA mmap_size=%d" % SQLITE_MMAP)
+        since = (params.get("since") or [""])[0]
+        if since and kind != "status":
+            # Инкрементальный режим (дёшево): since = updated_at из прошлого ответа; срез не менялся -> ответ без данных.
+            try:
+                since_v = float(since)
+            except ValueError:
+                return 400, {"ok": False, "error": "bad since"}
+            row = db.execute("SELECT MAX(updated_at) FROM snapshots" + ("" if kind == "all" else " WHERE kind=?"),
+                             () if kind == "all" else (kind,)).fetchone()
+            if row and row[0] is not None and since_v >= row[0]:
+                return 200, {"ok": True, "v": PARSED_V, "data": {"empty": False, "unchanged": True, "kind": kind,
+                                                                  "updated_at": row[0]}}
         data = market_worker.query_snapshot(db, kind)
     except (sqlite3.Error, ValueError):
         return 200, {"ok": True, "v": PARSED_V, "data": empty}
@@ -745,6 +824,8 @@ class Cache:
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute("PRAGMA mmap_size=%d" % SQLITE_MMAP)
+        self.db.execute("PRAGMA cache_size=-%d" % SQLITE_CACHE_KB)
         self.db.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, status INTEGER, ctype TEXT, "
                         "body BLOB, fetched REAL, expires REAL, accessed REAL, size INTEGER)")
         self.db.execute("CREATE INDEX IF NOT EXISTS cache_acc ON cache(accessed)")
@@ -755,6 +836,13 @@ class Cache:
     def count(self):
         with self.lock:
             return self.db.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+
+    def prewarm(self, limit=300):
+        """Читает самые недавно запрошенные записи (подтягивает страницы в page cache/mmap), поле accessed не меняет."""
+        with self.lock:
+            r = self.db.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(body)),0) FROM "
+                                "(SELECT body FROM cache ORDER BY accessed DESC LIMIT ?)", (limit,)).fetchone()
+        return r[0], r[1]
 
     def get(self, key, now):
         with self.lock:
@@ -894,7 +982,10 @@ class DataServer:
         self._rate_lock, self._next_slot = threading.Lock(), {}
         self._stats_lock, self._stats = threading.Lock(), {}
         self._blk_lock, self._blk = threading.Lock(), {}      # host -> {"until", "n" (подряд блокировок), "s403" (времена 403)}
-        self._plock, self._pcache = threading.Lock(), {}
+        self._pcache = LRU(PCACHE_MAX)
+        self._lat, self._lat_lock = deque(maxlen=LAT_WINDOW), threading.Lock()
+        self._pc_hit = self._pc_miss = 0
+        self.prewarm_last = None
         # Токен владельца (только чтение, только рыночные данные): credentials -> env -> файл. Нет токена — функции T-Invest выключены.
         if md is None:
             tok, _how = tinvest_md.load_token(token_file)
@@ -1133,19 +1224,17 @@ class DataServer:
             return 200, {"ok": False, "error": "upstream status %d" % r.status}
         h = hashlib.sha256(r.body).hexdigest()
         ck = (name, url)
-        with self._plock:
-            c = self._pcache.get(ck)
+        c = self._pcache.get(ck)
         if c and c[0] == h:
             data = c[1]
+            self._pc_hit += 1
         else:
+            self._pc_miss += 1
             try:
                 data = fn(r.body.decode("utf-8", "replace"))
             except Exception:  # noqa: BLE001
                 data = None
-            with self._plock:
-                if len(self._pcache) > 500:
-                    self._pcache.clear()
-                self._pcache[ck] = (h, data)
+            self._pcache.set(ck, (h, data))
         if not data:
             return 200, {"ok": False, "error": "parse failed"}
         return 200, {"ok": True, "v": PARSED_V, "data": data}
@@ -1212,6 +1301,59 @@ class DataServer:
         self.warm_last = dict(st, at=t0)
         return st
 
+    def record_latency(self, ms):
+        with self._lat_lock:
+            self._lat.append(ms)
+
+    def perf(self):
+        """Метрики для /v1/health: попадания в кэш, задержки p50/p95 по последним запросам, размер pcache, возраст среза."""
+        with self._stats_lock:
+            hit = sum(v["hit"] for v in self._stats.values())
+            miss = sum(v["miss"] for v in self._stats.values())
+        with self._lat_lock:
+            lat = sorted(self._lat)
+        pc = self._pc_hit + self._pc_miss
+        out = {"cache_hit_rate": round(hit / (hit + miss), 4) if hit + miss else 0.0,
+               "pcache_size": len(self._pcache),
+               "pcache_hit_rate": round(self._pc_hit / pc, 4) if pc else 0.0,
+               "latency_n": len(lat), "latency_p50_ms": round(_percentile(lat, 0.5), 1),
+               "latency_p95_ms": round(_percentile(lat, 0.95), 1),
+               "snapshot_last_run": None, "snapshot_age_sec": None, "snapshot_build_sec": None}
+        path = os.path.join(self.data_dir, "market.sqlite")
+        if os.path.exists(path):
+            db = None
+            try:
+                db = sqlite3.connect("file:%s?mode=ro" % quote(path.replace("\\", "/"), safe="/:"), uri=True, timeout=2)
+                meta = dict(db.execute("SELECT k, v FROM meta").fetchall())
+                if meta.get("last_run"):
+                    out["snapshot_last_run"] = float(meta["last_run"])
+                    out["snapshot_age_sec"] = max(0, int(self.clock() - float(meta["last_run"])))
+                if meta.get("build_sec"):
+                    out["snapshot_build_sec"] = float(meta["build_sec"])
+            except (sqlite3.Error, ValueError):
+                pass
+            finally:
+                if db:
+                    db.close()
+        return out
+
+    def prewarm(self):
+        """Прогрев при старте: срез рынка (bonds/stocks/heatmap) и горячие записи кэша. Ошибки глушатся."""
+        st = {"snapshots": 0, "cache_rows": 0}
+        try:
+            for kind in ("bonds", "stocks", "heatmap"):
+                code, obj = market_snapshot_query(self.data_dir, {"kind": [kind]})
+                if code == 200 and not (obj.get("data") or {}).get("empty"):
+                    st["snapshots"] += 1
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            st["cache_rows"] = self.cache.prewarm()[0]
+        except Exception:  # noqa: BLE001
+            pass
+        self.prewarm_last = dict(st, at=time.time())
+        return st
+
     def warm_loop(self, stop, period=None):
         while not stop.is_set():
             try:
@@ -1270,13 +1412,33 @@ class Handler(BaseHTTPRequestHandler):
         if self.app.verbose:
             sys.stderr.write("%s %s\n" % (self.command, self.path))
 
-    def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
+    def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None, etag=False):
+        """Ответ. gzip — только по явному Accept-Encoding: gzip, для json/text и тел больше GZIP_MIN.
+        etag=True: для 200 добавляется ETag, а при совпадении If-None-Match отдаётся 304 без тела."""
         if not isinstance(body, (bytes, bytearray)):
             body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = list(extra or [])
+        if etag and code == 200:
+            tag = etag_of(body)
+            headers.append(("ETag", tag))
+            headers.append(("Cache-Control", "no-cache"))      # клиент перепроверяет, а 304 экономит тело
+            if etag_matches(self.headers.get("If-None-Match"), tag):
+                self.send_response(304)
+                for k, v in headers:
+                    self.send_header(k, v)
+                self.send_header("Vary", "Accept-Encoding")
+                self.end_headers()
+                return
+        compressible = ctype.startswith(("application/json", "text/"))
+        if compressible:
+            headers.append(("Vary", "Accept-Encoding"))
+            if len(body) > GZIP_MIN and "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
+                body = gzip.compress(bytes(body), compresslevel=5)
+                headers.append(("Content-Encoding", "gzip"))
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra or []):
+        for k, v in headers:
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
@@ -1295,6 +1457,9 @@ class Handler(BaseHTTPRequestHandler):
             h = {"ok": True, "version": VERSION, "uptime": int(time.time() - app.started),
                  "cache_items": app.cache.count(), "auth": auth_mode(app), "bot": app.bot,
                  "alerts": bool(app.alerts)}
+            h.update(app.perf())
+            if app.prewarm_last:
+                h["prewarm"] = app.prewarm_last
             if app.warm_last:
                 h["warm"] = {k: app.warm_last[k] for k in ("at", "refreshed", "failed", "purged", "seconds")}
             if app.alerts:
@@ -1342,21 +1507,21 @@ class Handler(BaseHTTPRequestHandler):
             if r.error:
                 return self._send(502, {"error": "upstream failed"}, extra=[("X-Upstream-Error", "1")])
             extra = [("X-Cache", r.xcache), ("X-Age", str(r.age))] + [("X-Set-Cookie", c) for c in r.cookies]
-            return self._send(r.status, r.body, r.ctype, extra)
+            return self._send(r.status, r.body, r.ctype, extra, etag=(self.command == "GET"))
         if u.path.startswith("/v1/crowd/"):
             return self._crowd(u, client, body)
         if u.path == "/v1/market/snapshot":
             if self.command != "GET":
                 return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", "GET")])
             code, obj = market_snapshot_query(app.data_dir, parse_qs(u.query))
-            return self._send(code, obj)
+            return self._send(code, obj, etag=True)
         if u.path.startswith("/v1/parsed/"):
             if self.command != "GET":
                 return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", "GET")])
             code, obj = app.parsed(u.path[len("/v1/parsed/"):], parse_qs(u.query))
             if code == 502 and obj.get("error") == "upstream blocked":
                 return self._send(code, obj, extra=[("X-Upstream-Blocked", str(obj.get("retry_in", 0)))])
-            return self._send(code, obj)
+            return self._send(code, obj, etag=True)
         self._send(404, {"error": "not found"})
 
     def _crowd(self, u, client, body):
@@ -1529,11 +1694,19 @@ class Handler(BaseHTTPRequestHandler):
         except sqlite3.Error:
             return self._send(503, {"ok": False, "error": "unavailable"})
 
+    def _timed(self):
+        t0 = time.perf_counter()
+        try:
+            self._handle()
+        finally:
+            if not self.path.startswith("/v1/health"):
+                self.app.record_latency((time.perf_counter() - t0) * 1000.0)
+
     def do_GET(self):
-        self._handle()
+        self._timed()
 
     def do_POST(self):
-        self._handle()
+        self._timed()
 
 
 def _quiet_env():
@@ -1579,6 +1752,8 @@ def main(argv=None):
     if os.environ.get("TINVEST_WARM", "1") != "0":
         period = max(300, int(os.environ.get("TINVEST_WARM_PERIOD") or WARM_PERIOD))
         threading.Thread(target=app.warm_loop, args=(threading.Event(), period), daemon=True, name="warm").start()
+    if os.environ.get("TINVEST_PREWARM", "1") != "0":
+        threading.Thread(target=app.prewarm, daemon=True, name="prewarm").start()
     print("tinvest-data %s: http://%s:%d, кэш %s%s" % (VERSION, a.host, a.port, a.data, (", ключ включён" if a.key else "") + (", вход по ключам бота @%s" % app.bot if app.keystore else "")), flush=True)
     try:
         srv.serve_forever()
