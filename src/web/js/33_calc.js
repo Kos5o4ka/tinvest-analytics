@@ -263,7 +263,7 @@ function clRet(parts,P,F,env,k){
   let ic=0,gd=0,v=0;const sg=[];
   for(const pt of parts){const sp=pt.sp,w=pt.w;let a=0,b=0;
     if(sp.t==='dep')a=env.depRate(k);
-    else if(sp.t==='lots'){if(sp.A===clStk){a=env.stDiv;b=(env.E[k+1]/env.E[k]-1)*1200}else if(sp.A===clFundA)b=env.fundRate(k)}
+    else if(sp.t==='lots'){if(sp.A===clStk){a=env.stDiv;b=F.stkGrow!==''&&F.stkGrow!=null?+F.stkGrow:((P.stocks&&P.stocks.growth)||6)}   /* ожидаемый рост цены, без случайных шоков: их добавляет сам расчёт */else if(sp.A===clFundA)b=env.fundRate(k)}
     else{const s=sp.seg;a=s.fl?env.key(k)+((s.yield||0)-env.kr0):Math.max(.5,s.yield+(s.beta||0)*(env.key(k)-env.kr0));if(s.fx)b=s.fxv}
     ic+=w*a;gd+=w*b;sg.push([w,clSigOf(sp,F,P)])}
   for(let i=0;i<sg.length;i++)for(let j=0;j<sg.length;j++)v+=sg[i][0]*sg[j][0]*sg[i][1]*sg[j][1]*(i===j?1:.3);

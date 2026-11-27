@@ -205,5 +205,27 @@ class Life(unittest.TestCase):
         self.assertGreater(o["iis"], o["plain"])                    # налог на купоны уменьшает безопасное снятие
 
 
+class Scenarios(unittest.TestCase):
+    def test_life_monte_carlo_is_finite_and_monotone_in_spend(self):
+        o = js("""
+        const f=sp=>{const q=clLifeMC(mkF({acct:'iis3',iisYear:2026,years:10,spend:sp,spendYears:30,ldv:true}),P,'stk',60,1,SD);
+          return{s:q.success,bad:q.p50.concat(q.p10,q.p90).some(isNaN),ord:q.p10.every((v,i)=>v<=q.p50[i]+1e-6&&q.p50[i]<=q.p90[i]+1e-6)}};
+        out.lo=f(20000);out.hi=f(200000);""")
+        self.assertFalse(o["lo"]["bad"] or o["hi"]["bad"])
+        self.assertTrue(o["lo"]["ord"] and o["hi"]["ord"])
+        self.assertGreater(o["lo"]["s"], o["hi"]["s"])           # чем больше трат, тем реже капитала хватает
+
+    def test_fan_quantiles_ordered_and_sensitivity_shifts(self):
+        o = js("""
+        const mc=clMC(mkF({years:8}),P,'mix',80,5,SD);out.ord=mc.p10[96]<mc.p50[96]&&mc.p50[96]<mc.p90[96];
+        const g=(dk,di)=>run('flt',{years:8,keyShift:dk,inflShift:di});
+        const a=g(0,0),b=g(4,0),c=g(0,2);out.keyUp=b.final>a.final;out.inflDown=c.finalReal<a.finalReal;
+        out.xr=a.xirrReal<a.xirr;""")
+        self.assertTrue(o["ord"])
+        self.assertTrue(o["keyUp"])       # выше ключевая — выше доход флоатера
+        self.assertTrue(o["inflDown"])    # выше инфляция — ниже итог в сегодняшних деньгах
+        self.assertTrue(o["xr"])          # реальная доходность ниже номинальной
+
+
 if __name__ == "__main__":
     unittest.main()

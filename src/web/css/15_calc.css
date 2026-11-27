@@ -50,3 +50,7 @@
 .cl-mixbox{margin-top:12px;display:grid;gap:8px}.cl-mixbox input[type=range]{width:100%;accent-color:var(--ac)}
 @media(max-width:1100px){.cl-split{grid-template-columns:1fr}.cl-side{position:static;max-height:none}}
 @media(max-width:560px){.cl-pre{grid-template-columns:1fr}}
+.cl-fan3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px;text-align:center}
+.cl-mx td,.cl-mx th{text-align:center}.cl-mx td.l,.cl-mx th.l{text-align:left}
+.cl-main .g.g2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.cl-main .g.g2>*{min-width:0}
+@media(max-width:1500px){.cl-main .g.g2{grid-template-columns:1fr}}
