@@ -3,6 +3,10 @@ name: release-binaries
 # Ассет tinvest_analytics.py и его строку в SHA256SUMS не трогает: на них опирается лаунчер.
 # Windows: onedir-сборка PyInstaller упаковывается установщиком Inno Setup (packaging/TAnalytic.iss) — TAnalytic-Setup-win.exe.
 # Этот же файл программа скачивает сама при обновлении оболочки и сверяет с SHA256SUMS (tinvest.py, prepare_installer).
+# macOS: onedir-сборка .app упаковывается в образ диска .dmg (packaging/make_dmg.sh: приложение и ярлык «Программы»);
+# по одному образу на архитектуру (arm64 и x86_64). Прежние zip больше не публикуются: на них не ссылается ни программа, ни README.
+# Подпись и нотаризация необязательны — включаются секретами APPLE_DEVELOPER_ID_CERT, APPLE_CERT_PASSWORD, APPLE_ID,
+# APPLE_TEAM_ID, APPLE_APP_PASSWORD (packaging/mac_codesign.sh, описание — в packaging/README.md); без них образ с ad-hoc подписью.
 # Прежний одиночный TAnalytic-win.exe больше не публикуется: на него не ссылается ни одна версия лаунчера.
 #
 # Подпись и репутация (настраиваются вне этого файла, здесь только заметка):
@@ -34,9 +38,9 @@ jobs:
       matrix:
         include:
           - os: macos-latest        # Apple Silicon (arm64)
-            asset: TAnalytic-mac-arm64.zip
+            asset: TAnalytic-mac-arm64.dmg
           - os: macos-15-intel      # Intel; метка раннера может измениться — при необходимости обновите
-            asset: TAnalytic-mac-x64.zip
+            asset: TAnalytic-mac-x64.dmg
           - os: windows-latest
             asset: TAnalytic-Setup-win.exe
     runs-on: ${{ matrix.os }}
@@ -70,7 +74,7 @@ jobs:
           TINVEST_APP_SRC: release_app/tinvest_analytics.py
           TINVEST_ICON_DIR: build_icons
         run: pyinstaller --noconfirm --distpath build_out/dist --workpath build_out/work packaging/tinvest.spec
-      - name: Проверка архитектуры и подпись (macOS)
+      - name: Проверка архитектуры (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
@@ -79,13 +83,31 @@ jobs:
           info="$(file "$APP/Contents/MacOS/TAnalytic")"
           echo "$info"
           echo "$info" | grep -q "$want" || { echo "::error::ожидалась архитектура $want"; exit 1; }
-          # arm64-бинарники без подписи macOS не запускает («повреждён»): подписываем ad-hoc явно
-          codesign --force --deep -s - "$APP"
-          codesign --verify --deep --strict "$APP"
-          codesign -dv "$APP" 2>&1 | head -5
-      - name: Упаковка (macOS)
+      - name: Подпись приложения (macOS; Developer ID, если заданы секреты, иначе ad-hoc)
         if: runner.os == 'macOS'
-        run: ditto -c -k --keepParent "build_out/dist/TAnalytic.app" "${{ matrix.asset }}"
+        env:
+          APPLE_DEVELOPER_ID_CERT: ${{ secrets.APPLE_DEVELOPER_ID_CERT }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          packaging/mac_codesign.sh setup
+          packaging/mac_codesign.sh app build_out/dist/TAnalytic.app
+      - name: Образ диска (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # без раскладки Finder (нет графического сеанса) скрипт сам собирает образ без неё и не падает
+          packaging/make_dmg.sh build_out/dist/TAnalytic.app "${{ matrix.asset }}" TAnalytic
+      - name: Подпись образа и нотаризация (macOS; пропускается без секретов Apple)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          packaging/mac_codesign.sh dmg "${{ matrix.asset }}"
+          packaging/mac_codesign.sh notarize "${{ matrix.asset }}"
+      - name: Убрать временную связку ключей (macOS)
+        if: always() && runner.os == 'macOS'
+        run: packaging/mac_codesign.sh cleanup
       - name: Inno Setup (Windows)
         if: runner.os == 'Windows'
         run: |
