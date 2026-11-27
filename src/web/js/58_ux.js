@@ -119,14 +119,14 @@ function uxSubTabs(){
   const tabs=uxVisTabs(sec);
   if(tabs.length<=1)return'';
   const pgName=k=>UX_TAB_SHORT[k]||(PAGES.find(p=>p&&p[0]===k)||[k,k])[1];
-  return`<div class="ux-subwrap"><div class="seg ux-sub" id="ux-sub">${tabs.map(k=>`<button class="${k===S.page?'on':''}" data-p="${esc(k)}">${esc(pgName(k))}${typeof proNavBadge==='function'?proNavBadge(k):''}</button>`).join('')}</div></div>`;
+  return`<div class="ux-subwrap"><div class="seg ux-sub" id="ux-sub" role="tablist">${tabs.map(k=>`<button role="tab" aria-selected="${k===S.page}" class="${k===S.page?'on':''}" data-p="${esc(k)}">${esc(pgName(k))}${typeof proNavBadge==='function'?proNavBadge(k):''}</button>`).join('')}</div></div>`;
 }
 
 /* ── 1-строчная подсказка «Зачем этот экран» ── */
 function uxWhyBanner(page){
   const t=UX_WHY[page];
   if(!t||UX.whyOff[page])return'';
-  return`<div class="ux-why"><span>${esc(t)}</span><button type="button" class="ux-why-x" data-why-off="${esc(page)}" title="Скрыть подсказку">Понятно ×</button></div>`;
+  return`<div class="ux-why"><span title="${esc(t)}">${esc(t)}</span><button type="button" class="ux-why-x" data-why-off="${esc(page)}" title="Скрыть подсказку">Понятно ×</button></div>`;
 }
 
 /* ── Блоки Главной: «Быстрые задачи» и Чек-лист «С чего начать» ── */

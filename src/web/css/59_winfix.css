@@ -13,6 +13,37 @@
 /* Полоса прокрутки не сдвигает вёрстку при появлении */
 #view{scrollbar-gutter:stable}
 
+/* Горизонтальный скролл страниц (налоги, сигналы): колонка сетки может сжиматься, широкие таблицы прокручиваются внутри себя */
+.wrap{grid-template-columns:minmax(0,1fr)}
+.txo,.sg-g2,.sg-t{min-width:0;max-width:100%}
+.txo .tbl,.sg-g2 .tbl{max-width:100%}
+
+/* Карточки бумаг: верхняя панель закреплена, кнопки не обрезаются справа */
+#bc-ov .bc-bar{position:sticky;top:-18px;z-index:5;margin:-18px -20px 14px;padding:18px 20px 10px;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line);flex-wrap:wrap}
+#bc-ov .bc-bar .btn,#sk-ov .sk-bar .btn{white-space:nowrap;flex:none}
+#sk-ov .sk-bar{position:sticky;top:0;z-index:5;flex-wrap:wrap}
+@media(max-width:760px){#bc-ov .bc-bar{top:-14px;margin:-14px -14px 12px;padding:14px 14px 10px}}
+
+/* Внутренние вкладки без лишнего зазора при переносе; подсказка «Зачем этот экран» — компактная одна строка */
+.ux-sub{row-gap:0}
+.ux-why{padding:5px 12px;font-size:12.5px;border-radius:9px;gap:10px}
+.ux-why span{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ux-why-x{flex:none;padding:2px 7px}
+
+/* Бегущая строка: кнопка закрытия не наезжает на текст */
+.tkr .tk-x{position:relative;z-index:1;background:var(--card2);border-left:1px solid var(--line);margin-left:4px}
+.tkr.off .tk-x{background:transparent;border-left:0}
+
+/* Настройки: кнопки не наезжают на описание, при нехватке места уходят под текст */
+.st-row{flex-wrap:wrap}
+.st-t{flex:1 1 240px;min-width:min(240px,100%)}
+.st-c{flex:0 1 auto;min-width:min-content;margin-left:auto}
+.st-row.stack{flex-wrap:nowrap}
+.st-tl{gap:10px}
+.st-tl>span,.st-tl>b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.st-dot{margin-left:auto;flex:none}
+.st-tl>.st-dot{margin-left:auto}
+
 /* Шапка: заголовок не сжимается до пары букв, период не переносится по строкам */
 .top h1{display:block;flex:1 1 150px;min-width:110px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .top #period{flex:none;flex-wrap:nowrap}

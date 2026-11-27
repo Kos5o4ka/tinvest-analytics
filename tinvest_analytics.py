@@ -28509,7 +28509,7 @@ tr.scr-low td{opacity:.5}
 .nav .nav-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* Свёрнутый сайдбар (icon rail 62px) */
-body.side-mini aside{width:64px;padding:14px 8px 12px;overflow:visible}
+body.side-mini aside{width:64px;padding:14px 8px 12px}
 body.side-mini .logo{justify-content:center;padding:2px 0 12px;flex-direction:column;gap:6px}
 body.side-mini .logo-tx,body.side-mini .ux-mode,body.side-mini .nav-t,body.side-mini .ux-cnt,body.side-mini .accs,body.side-mini .badge{display:none}
 body.side-mini .side-tog{margin-left:0}
@@ -28660,7 +28660,7 @@ body.sk-open{overflow:hidden}
 .tour-dim{fill:rgba(7,11,20,.72)}
 #tour-hole{transition:x .35s cubic-bezier(.25,1,.5,1),y .35s cubic-bezier(.25,1,.5,1),width .35s cubic-bezier(.25,1,.5,1),height .35s cubic-bezier(.25,1,.5,1)}
 .tour-bk,.tour-ring{position:absolute;left:0;top:0;width:0;height:0;transition:left .35s cubic-bezier(.25,1,.5,1),top .35s cubic-bezier(.25,1,.5,1),width .35s cubic-bezier(.25,1,.5,1),height .35s cubic-bezier(.25,1,.5,1)}
-.tour-bk{pointer-events:auto}
+.tour-bk{pointer-events:none}
 .tour-ring{border-radius:10px;box-shadow:0 0 0 2px var(--ac),0 0 32px var(--ac-glow);animation:tourPulse 2.2s ease-in-out infinite}
 @keyframes tourPulse{50%{box-shadow:0 0 0 2px var(--ac),0 0 44px var(--ac-glow)}}
 .tour-pop{position:fixed;z-index:9999;width:min(360px,calc(100vw - 24px));background:var(--card2);background-color:var(--card2);backdrop-filter:none;-webkit-backdrop-filter:none;opacity:1;border:1px solid var(--line2);border-radius:14px;padding:16px 18px;box-shadow:0 0 0 1px #00000040,0 24px 60px -8px #000000d0,0 8px 20px #00000080;color:var(--tx);transition:left .35s cubic-bezier(.25,1,.5,1),top .35s cubic-bezier(.25,1,.5,1)}
@@ -29367,6 +29367,59 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 @keyframes drFade{to{background-color:transparent;-webkit-backdrop-filter:none;backdrop-filter:none}}
 @keyframes drOut{from{transform:translateX(0)}to{transform:translateX(100%)}}
 @media(prefers-reduced-motion:reduce){.closing,.closing>:first-child{animation:none!important}}
+/* ── Исправления вёрстки по ревью (Windows, узкие окна) ── */
+
+/* Сайдбар: прокручивается только основной список, служебные пункты закреплены внизу */
+@media(min-width:761px){
+  aside{overflow:hidden}
+  aside .nav-main{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
+  aside .nav-fix{flex:none;border-top:1px solid var(--line);margin-top:6px;padding-top:6px}
+  aside .side-foot{margin-top:0;flex:none}
+}
+@media(max-width:760px){.nav-fix{flex-direction:row;overflow-x:auto;border-top:0;padding:0}}
+.nav-tip{position:fixed;z-index:3000;pointer-events:none;background:var(--card2);color:var(--tx);border:1px solid var(--line2);border-radius:8px;padding:5px 10px;font-size:12.5px;font-weight:550;white-space:nowrap;box-shadow:0 8px 22px #00000066}
+
+/* Полоса прокрутки не сдвигает вёрстку при появлении */
+#view{scrollbar-gutter:stable}
+
+/* Горизонтальный скролл страниц (налоги, сигналы): колонка сетки может сжиматься, широкие таблицы прокручиваются внутри себя */
+.wrap{grid-template-columns:minmax(0,1fr)}
+.txo,.sg-g2,.sg-t{min-width:0;max-width:100%}
+.txo .tbl,.sg-g2 .tbl{max-width:100%}
+
+/* Карточки бумаг: верхняя панель закреплена, кнопки не обрезаются справа */
+#bc-ov .bc-bar{position:sticky;top:-18px;z-index:5;margin:-18px -20px 14px;padding:18px 20px 10px;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line);flex-wrap:wrap}
+#bc-ov .bc-bar .btn,#sk-ov .sk-bar .btn{white-space:nowrap;flex:none}
+#sk-ov .sk-bar{position:sticky;top:0;z-index:5;flex-wrap:wrap}
+@media(max-width:760px){#bc-ov .bc-bar{top:-14px;margin:-14px -14px 12px;padding:14px 14px 10px}}
+
+/* Внутренние вкладки без лишнего зазора при переносе; подсказка «Зачем этот экран» — компактная одна строка */
+.ux-sub{row-gap:0}
+.ux-why{padding:5px 12px;font-size:12.5px;border-radius:9px;gap:10px}
+.ux-why span{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ux-why-x{flex:none;padding:2px 7px}
+
+/* Бегущая строка: кнопка закрытия не наезжает на текст */
+.tkr .tk-x{position:relative;z-index:1;background:var(--card2);border-left:1px solid var(--line);margin-left:4px}
+.tkr.off .tk-x{background:transparent;border-left:0}
+
+/* Настройки: кнопки не наезжают на описание, при нехватке места уходят под текст */
+.st-row{flex-wrap:wrap}
+.st-t{flex:1 1 240px;min-width:min(240px,100%)}
+.st-c{flex:0 1 auto;min-width:min-content;margin-left:auto}
+.st-row.stack{flex-wrap:nowrap}
+.st-tl{gap:10px}
+.st-tl>span,.st-tl>b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.st-dot{margin-left:auto;flex:none}
+.st-tl>.st-dot{margin-left:auto}
+
+/* Шапка: заголовок не сжимается до пары букв, период не переносится по строкам */
+.top h1{display:block;flex:1 1 150px;min-width:110px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.top #period{flex:none;flex-wrap:nowrap}
+.top #period button{white-space:nowrap}
+@media(min-width:761px) and (max-width:1100px){
+  .top{flex-wrap:wrap;row-gap:8px}
+}
 </style></head>
 <body>
 <div id="boot-splash" class="boot-splash" aria-hidden="true"><div class="boot-box"><div class="boot-logo"><svg width="64" height="64" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bsg" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#2563eb"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient><linearGradient id="bsa" x1="12" y1="6" x2="26" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.08)"/><path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="url(#bsg)"/><path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="url(#bsg)"/><path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="url(#bsa)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="boot-title">TAnalytic <span class="boot-ver">Pro</span></div><div class="boot-bar"><div class="boot-bar-fill"></div></div><div class="boot-status" id="boot-status">Загружаю портфель…</div></div></div>
@@ -29375,7 +29428,8 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
     <div class="logo-tx">TAnalytic<small>аналитика портфеля</small></div>
     <button class="side-tog" id="side-tog" title="Свернуть / развернуть меню" aria-label="Свернуть меню">«</button></div>
   <div class="ux-mode" id="ux-mode"></div>
-  <nav class="nav" id="nav"></nav>
+  <nav class="nav nav-main" id="nav"></nav>
+  <nav class="nav nav-fix" id="nav-fix" aria-label="Служебные разделы"></nav>
   <div class="accs">
     <div class="acc-h">Счета <label class="msw" title="Скрыть счета без активов"><input type="checkbox" id="hideEmpty"><i></i>скрыть пустые</label></div>
     <div class="acl" id="acl"></div>
@@ -29854,7 +29908,7 @@ function renderNav(){
   h+='<div class="sep"></div>'+NAV_FIXED.map(k=>pg(k)).filter(Boolean).map(navBtn).join('');
   $('#nav').innerHTML=h;
   $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
-  $('#period').style.visibility=PERIOD_PAGES.includes(S.page)?'visible':'hidden';
+  $('#period').style.display=PERIOD_PAGES.includes(S.page)?'':'none';
   const a=S.accounts.find(x=>x.id===S.account);
   const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
   if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}
@@ -29871,6 +29925,7 @@ function renderAccounts(){
     (S.hideEmpty&&vis.length<accs.length?`<div class="note" style="padding:4px 10px">Скрыто пустых: ${accs.length-vis.length}</div>`:'');
 }
 $('#nav').onclick=e=>{const g=e.target.closest('[data-g]');if(g){const n=g.dataset.g;S.navShut[n]=!S.navShut[n];lsSet('ta_nav_shut',JSON.stringify(S.navShut));renderNav();return}const b=e.target.closest('[data-p]');if(!b)return;go(b.dataset.p)};
+$('#nav-fix').onclick=e=>{const b=e.target.closest('[data-p]');if(b)go(b.dataset.p)};
 $('#period').onclick=e=>{const b=e.target.closest('[data-k]');if(!b||b.dataset.k===S.period)return;S.period=b.dataset.k;persist();renderNav();load(false,true)};
 $('#acl').onclick=e=>{const b=e.target.closest('[data-a]');if(!b||b.dataset.a===S.account)return;S.account=b.dataset.a;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
 $('#hideEmpty').onchange=e=>{S.hideEmpty=e.target.checked;persist();renderAccounts()};
@@ -33172,14 +33227,14 @@ function mpScatter(el){
   const kb=((S.scr.kbd)||[]).filter(p=>p[0]<=X1+1);
   if(kb.length>1)s+=`<polyline class="mp-kbd" fill="none" points="${kb.map(p=>X(Math.min(p[0],X1)).toFixed(1)+','+Y(Math.min(p[1],Y1)).toFixed(1)).join(' ')}"/>`;
   const fl=S.scr.floor&&S.scr.floor.lqdt;
-  if(fl>0&&fl<=Y1)s+=`<line class="mp-fl" x1="${pl}" x2="${W-pr}" y1="${Y(fl).toFixed(1)}" y2="${Y(fl).toFixed(1)}"/><text class="ax mp-flt" x="${W-pr-4}" y="${(Y(fl)-5).toFixed(1)}" text-anchor="end">Фонд ликвидности LQDT ≈ ${f2(fl)} %</text>`;
+  if(fl>0&&fl<=Y1)s+=`<line class="mp-fl" x1="${pl}" x2="${W-pr}" y1="${Y(fl).toFixed(1)}" y2="${Y(fl).toFixed(1)}"/>`;
   const rad=t=>t>0?Math.max(2.5,Math.min(9,2.5+(Math.log10(t)-5)*1.6)):2.5;
   rs.sort((a,b)=>b.r.turn-a.r.turn);
   let dots='',rings='';
   rs.forEach(p=>{const r=p.r,c=MP_COL[rBucket(r.rating)],rd=rad(r.turn),cx=X(p.x).toFixed(1),cy=Y(r.yield).toFixed(1),id=r.isin||r.id;
     dots+=`<circle class="mp-d" data-isin="${esc(id)}" data-k="${esc(r.id)}" cx="${cx}" cy="${cy}" r="${rd.toFixed(1)}" fill="${c}" fill-opacity=".72" stroke="${c}"/>`;
     if(mine.has(r.isin)||mine.has(r.id))rings+=`<circle class="mp-ring" cx="${cx}" cy="${cy}" r="${(rd+4.5).toFixed(1)}"/>`});
-  el.innerHTML=`<div class="legend">${MP_BK.map(b=>`<span><i style="background:${MP_COL[b]}"></i>${b}</span>`).join('')}<span><i class="mp-lk"></i>КБД</span>${fl>0?'<span><i class="mp-lf"></i>фонд ликвидности</span>':''}<span class="mu">ось X — дюрация, лет; ось Y — доходность</span>${mine.size?'<span><i class="mp-lr"></i>мой портфель</span>':''}</div><svg width="${W}" height="${H}">${s}<g>${dots}</g><g style="pointer-events:none">${rings}</g></svg>`;
+  el.innerHTML=`<div class="legend">${MP_BK.map(b=>`<span><i style="background:${MP_COL[b]}"></i>${b}</span>`).join('')}<span><i class="mp-lk"></i>КБД</span>${fl>0?`<span><i class="mp-lf"></i>фонд ликвидности LQDT ≈ ${f2(fl)} %</span>`:''}<span class="mu">ось X — дюрация, лет; ось Y — доходность</span>${mine.size?'<span><i class="mp-lr"></i>мой портфель</span>':''}</div><svg width="${W}" height="${H}">${s}<g>${dots}</g><g style="pointer-events:none">${rings}</g></svg>`;
   const byK={};rs.forEach(p=>byK[p.r.id]=p);
   el.onmousemove=e=>{const t=e.target.closest('circle[data-k]');if(!t||!el.contains(t)){hideTip();return}
     const p=byK[t.dataset.k];if(!p)return;const r=p.r,c=MP_COL[rBucket(r.rating)];
@@ -35466,16 +35521,26 @@ const _renderSettingsOrig=renderSettings;
 renderSettings=async function(){
   let c=S.cfg;
   try{c=await api('/api/config');S.cfg=c}catch(e){}
-  if(c&&!c.token_set&&!(c.imports||[]).length&&!ob.skip){ob.done=false;ob.err='';return obRender()}
-  return _renderSettingsOrig();
+  const r=await _renderSettingsOrig();
+  /* онбординг — карточка сверху внутри настроек, а не вместо них */
+  if(c&&!c.token_set&&!(c.imports||[]).length&&!ob.skip){
+    const m=document.getElementById('st-main');
+    if(m&&!document.getElementById('ob-host')){
+      ob.done=false;ob.err='';
+      const w=document.getElementById('st-welcome');if(w)w.remove();
+      m.insertAdjacentHTML('afterbegin','<div id="ob-host"></div>');
+      obRender();
+    }
+  }
+  return r;
 };
 function obStep(n,state,title,body){
   return`<div class="ob-step ${state}"><div class="ob-n">${state==='done'?'✓':n}</div><div class="ob-b"><h3>${title}</h3>${body||''}</div></div>`;
 }
 function obRender(){
-  const v=$('#view');if(!v)return;
+  const v=document.getElementById('ob-host');if(!v)return;
   const tokDone=ob.done;
-  v.innerHTML=`<div class="wrap fade" style="max-width:960px"><div class="card ob-card">
+  v.innerHTML=`<div class="card ob-card fade">
     <div class="ob-hd"><div class="ob-t">Добро пожаловать в TAnalytic</div>
       <p class="t2">Выберите удобный способ начать — это займёт меньше минуты. Все данные хранятся только на вашем компьютере.</p></div>
     <div class="ob-cards">
@@ -35509,14 +35574,14 @@ function obRender(){
       <span>Хотите просто изучить рынок без портфеля?</span>
       <button class="lnk" id="ob-mkt">Скринер облигаций →</button>
       <span class="mu"> · </span><button class="lnk" id="ob-calc">Калькулятор →</button>
-      <span class="mu"> · </span><button class="lnk" id="ob-all">Все настройки</button>
+      <span class="mu"> · </span><button class="lnk" id="ob-all">Скрыть это приветствие</button>
     </div>
-  </div></div>`;
+  </div>`;
   const dm=$('#ob-demo');if(dm)dm.onclick=()=>demoEnter(dm);
   const imp=$('#ob-imp');if(imp)imp.onclick=()=>go('imp');
   const mkt=$('#ob-mkt');if(mkt)mkt.onclick=()=>go('scr');
   const clc=$('#ob-calc');if(clc)clc.onclick=()=>go('calc');
-  const all=$('#ob-all');if(all)all.onclick=()=>{ob.skip=true;renderSettings()};
+  const all=$('#ob-all');if(all)all.onclick=()=>{ob.skip=true;const h=document.getElementById('ob-host');if(h)h.remove()};
   const b=$('#ob-save');if(!b)return;
   const input=$('#ob-tok'),sb=$('#ob-sb');
   if(sb)sb.onchange=()=>{ob.sb=sb.checked};
@@ -37446,6 +37511,24 @@ function uxSyncMode(){
 }
 uxSyncMode();
 
+/* Мгновенные подсказки справа от значков в свёрнутом сайдбаре (родные подсказки браузера появляются с задержкой) */
+{
+  let navTip=null;
+  const hide=()=>{if(navTip){navTip.remove();navTip=null}};
+  document.addEventListener('mouseover',e=>{
+    const b=e.target.closest&&e.target.closest('aside .nav button[data-tip]');
+    if(!b||!document.body.classList.contains('side-mini')){hide();return}
+    hide();
+    const r=b.getBoundingClientRect();
+    navTip=document.createElement('div');navTip.className='nav-tip';navTip.textContent=b.dataset.tip;
+    document.body.appendChild(navTip);
+    navTip.style.left=(r.right+8)+'px';
+    navTip.style.top=(r.top+r.height/2-navTip.offsetHeight/2)+'px';
+  });
+  document.addEventListener('mouseout',e=>{if(e.target.closest&&e.target.closest('aside .nav button[data-tip]'))hide()});
+  document.addEventListener('click',hide,true);
+}
+
 function uxSetMode(m){
   UX.mode=m==='pro'?'pro':'basic';
   lsSet('ta_ux_mode',UX.mode);
@@ -37482,14 +37565,14 @@ function uxSubTabs(){
   const tabs=uxVisTabs(sec);
   if(tabs.length<=1)return'';
   const pgName=k=>UX_TAB_SHORT[k]||(PAGES.find(p=>p&&p[0]===k)||[k,k])[1];
-  return`<div class="ux-subwrap"><div class="seg ux-sub" id="ux-sub">${tabs.map(k=>`<button class="${k===S.page?'on':''}" data-p="${esc(k)}">${esc(pgName(k))}${typeof proNavBadge==='function'?proNavBadge(k):''}</button>`).join('')}</div></div>`;
+  return`<div class="ux-subwrap"><div class="seg ux-sub" id="ux-sub" role="tablist">${tabs.map(k=>`<button role="tab" aria-selected="${k===S.page}" class="${k===S.page?'on':''}" data-p="${esc(k)}">${esc(pgName(k))}${typeof proNavBadge==='function'?proNavBadge(k):''}</button>`).join('')}</div></div>`;
 }
 
 /* ── 1-строчная подсказка «Зачем этот экран» ── */
 function uxWhyBanner(page){
   const t=UX_WHY[page];
   if(!t||UX.whyOff[page])return'';
-  return`<div class="ux-why"><span>${esc(t)}</span><button type="button" class="ux-why-x" data-why-off="${esc(page)}" title="Скрыть подсказку">Понятно ×</button></div>`;
+  return`<div class="ux-why"><span title="${esc(t)}">${esc(t)}</span><button type="button" class="ux-why-x" data-why-off="${esc(page)}" title="Скрыть подсказку">Понятно ×</button></div>`;
 }
 
 /* ── Блоки Главной: «Быстрые задачи» и Чек-лист «С чего начать» ── */
@@ -37535,15 +37618,16 @@ renderNav=function(){
     const act=curSec&&curSec.id===s.id;
     const target=(UX.lastTab[s.id]&&tabs.includes(UX.lastTab[s.id]))?UX.lastTab[s.id]:tabs[0];
     const cnt=tabs.length>1?`<span class="ux-cnt">${tabs.length}</span>`:'';
-    return`<button class="${act?'on':''}" data-p="${esc(target)}" title="${esc(s.title)}">${svgI(IC[s.icon]||IC.dash)}<span class="nav-t">${esc(s.title)}</span>${cnt}</button>`;
+    return`<button class="${act?'on':''}" data-p="${esc(target)}" title="${esc(s.title)}" data-tip="${esc(s.title)}">${svgI(IC[s.icon]||IC.dash)}<span class="nav-t">${esc(s.title)}</span>${cnt}</button>`;
   }).join('');
   if(extra.length){
-    h+='<div class="sep"></div>'+extra.map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}">${svgI(IC[p[0]]||IC.dash)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
+    h+='<div class="sep"></div>'+extra.map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}" data-tip="${esc(p[1])}">${svgI(IC[p[0]]||IC.dash)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
   }
-  h+='<div class="sep"></div>'+NAV_FIXED.map(k=>PAGES.find(p=>p&&p[0]===k)).filter(Boolean).map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}">${svgI(IC[p[0]]||IC.set)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
+  const fx=NAV_FIXED.map(k=>PAGES.find(p=>p&&p[0]===k)).filter(Boolean).map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}" data-tip="${esc(p[1])}">${svgI(IC[p[0]]||IC.set)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
   $('#nav').innerHTML=h;
+  const nf=$('#nav-fix');if(nf)nf.innerHTML=fx;
   $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
-  $('#period').style.visibility=PERIOD_PAGES.includes(S.page)&&S.data?'visible':'hidden';
+  $('#period').style.display=PERIOD_PAGES.includes(S.page)&&S.data?'':'none';
   const a=S.accounts.find(x=>x.id===S.account);
   const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
   if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}
@@ -37771,6 +37855,8 @@ function tourClick(e){
     if(k==='x')tourStop();else if(k==='prev')tourNext(-1);else tourNext(1);
     return;
   }
+  /* клик по сайдбару не блокируется: тур закрывается, а переход выполняется как обычно */
+  if(e.target.closest&&e.target.closest('aside')&&!(TOUR.tgt&&TOUR.tgt.contains(e.target))){tourStop();return}
   /* микро-задача: клик по подсвеченному элементу проходит насквозь и переводит на следующий шаг */
   const st=TOUR.list[TOUR.i];
   if(st&&st.task&&TOUR.tgt&&TOUR.tgt.contains(e.target)){
