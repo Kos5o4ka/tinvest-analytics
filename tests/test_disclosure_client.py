@@ -211,11 +211,7 @@ class Defaults(Patch):
 
 class Routes(Patch):
     def test_routes(self):
-        self.patch(ds_parsed=lambda *a, **k: None, _disc_issue_desc=lambda isin: {"issue_size": 100, "placed": 80})
-        self.assertIn("/api/disclosure", T.API_GET)
-        d = T.API_GET["/api/disclosure"]({}, None, {"isin": "RU000A0AAAA1"}, True)
-        self.assertEqual((d["outstanding"]["qty"], d["facts"], d["isin"]), (80, [], "RU000A0AAAA1"))
-        self.assertIn("error", T.API_GET["/api/disclosure"]({}, None, {"isin": "x"}, True))
+        self.assertNotIn("/api/disclosure", T.API_GET)
         self.patch(issuer_cashflows=lambda inn, h=25, today=None: {"inn": inn, "months": [], "h": h})
         self.assertEqual(T.API_GET["/api/issuer_flows"]({}, None, {"inn": "7700000000", "months": "12"}, True)["h"], 12)
         self.assertIn("error", T.API_GET["/api/issuer_flows"]({}, None, {"inn": "abc"}, True))

@@ -144,7 +144,7 @@ function stkDivHist(d){
   const ys=new Set(d.items.map(r=>String(r.record).slice(0,4)));
   const span=ys.size?Math.max(...ys)-Math.min(...ys)+1:0;
   const parts=[d.items.length+' '+(d.items.length===1?'выплата':'выплат')+(span>1?' за '+span+' '+(span%10===1&&span%100!==11?'год':span%10>=2&&span%10<=4&&(span%100<10||span%100>=20)?'года':'лет'):'')];
-  if(h.added)parts.push('до '+String(h.from).slice(0,4)+' г. — по данным <a href="'+esc(h.url||'https://www.dohod.ru')+'" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет)');
+  if(h.added)parts.push('до '+String(h.from).slice(0,4)+' г. — по данным <a href="'+esc(safeUrl(h.url)||'https://www.dohod.ru')+'" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет)');
   else if(h.status==='err')parts.push('длинная история с dohod.ru сейчас недоступна');
   return`<p class="note" style="margin-top:8px">${parts.join('. ')}. Доходность — к текущей цене.</p>`;
 }
@@ -158,7 +158,7 @@ function stkDivCard(c,p){
 }
 function stkRepCard(c){
   const r=c.report||{};let v;
-  if(r.date){const dd=Math.ceil((new Date(r.date)-new Date(new Date().toISOString().slice(0,10)))/864e5);
+  if(r.date){const dd=Math.ceil((new Date(r.date)-new Date(localIso()))/864e5);
     v=`<div class="v num" style="font-size:22px;font-weight:700">${ddm(r.date)}</div><div class="s mu">${dd>0?'через '+dd+' дн.':dd===0?'сегодня':''}${r.year?' · отчёт за '+(r.num?r.num+' кв. ':'')+r.year:''}</div>`}
   else v=`<div class="mu" style="padding:6px 0">${esc(r.note||'Дата неизвестна')}</div>`;
   return`<div class="card"><h2>Следующая отчётность</h2>${v}</div>`;
@@ -178,7 +178,7 @@ function stkFundInfo(c){
   const f=c.fund||{},q=c.quote,h=(S.fh[c.secid]||{}).data,d=c.dividends||{items:[]},n=f.nav||{};
   const mgr=f.manager||n.manager,murl=f.manager_url||n.manager_url;
   const url=murl?(/^https?:/i.test(murl)?murl:'https://'+murl):'';
-  const lnk=(u,t)=>`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`;
+  const lnk=(u,t)=>{const s=safeUrl(u);return s?`<a href="${esc(s)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`:esc(t)};
   const start=fiDate(f.issue_date||n.issue_date);
   let nav;
   if(n.nav)nav=`${fhMoney(n.nav,n.nav_cur)}<small class="mu">${n.nav_date?'на '+fiDate(n.nav_date)+', ':''}${lnk(n.source_url,'Мосбиржа')}</small>`;
@@ -217,7 +217,7 @@ function stkFundHold(c,p){
     sp=it.length+' '+(it.length%10===1&&it.length%100!==11?'позиция':it.length%10>=2&&it.length%10<=4&&(it.length%100<10||it.length%100>=20)?'позиции':'позиций')+(it.length>10?' · первые 10 — '+stkN(top,1)+' %':'');
     const rows=it.slice(0,n).map(r=>`<tr${r.stock?` data-fh="${esc(r.ticker)}" class="fh-lnk" title="Открыть карточку ${esc(r.ticker)}"`:''}><td class="l"><b>${esc(r.name)}</b>${r.ticker?` <small class="mu">${esc(r.ticker)}</small>`:''}</td>
       <td class="l mu">${esc(r.type_ru||'')}</td><td class="num fh-w"><span class="fh-bar"><i style="width:${Math.max(.5,(r.weight||0)/mx*100).toFixed(1)}%"></i></span><b>${stkN(r.weight,2)} %</b></td></tr>`).join('');
-    const src=d.source||{},a=src.url?`<a href="${esc(src.url)}" target="_blank" rel="noopener noreferrer">${esc(src.name)}</a>`:esc(src.name||'');
+    const src=d.source||{},su=safeUrl(src.url),a=su?`<a href="${esc(su)}" target="_blank" rel="noopener noreferrer">${esc(src.name)}</a>`:esc(src.name||'');
     const line=d.basis==='index'?`Фонд следует за индексом «${esc((d.index||{}).name||'')}»; веса бумаг в индексе — по данным ${a} на ${ddm(d.as_of)}. Фактический портфель фонда может немного отличаться от индекса.`
       :`Источник: ${a}, данные получены ${ddm(d.as_of)}.${d.nav?' Стоимость чистых активов: '+fhMoney(d.nav,d.nav_cur)+'.':''}`;
     body=`<div class="tbl"><table class="fh-t"><thead><tr><th class="l">Бумага</th><th class="l">Тип</th><th>Доля</th></tr></thead><tbody id="${p}fh">${rows}</tbody></table></div>
@@ -231,16 +231,19 @@ function pStk(){
   return S.stk.secid?head+stkCardHtml('stk-'):head+stkHome();
 }
 /* Карточка акции без строки поиска. prefix даёт ids: 'stk-' на странице, 'skd-' в панели — они не пересекаются. */
+function stkTile(lbl,val,sub,dot){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
+}
 function stkCardHtml(p){
   const st=S.stk,drw=p!=='stk-';
-  if(st.err)return`<div class="msg err">${esc(st.err)} <button class="btn ghost" id="${p}r">Повторить</button></div>`;
+  if(st.err)return`<div class="st-callout warn">${esc(st.err)} <button class="btn ghost" id="${p}r">Повторить</button></div>`;
   const c=st.card;
   if(!c||c.secid!==st.secid||st.cardTf!==st.tf){loadStk();return`<div class="card">${waitBox('Загружаю '+esc(st.secid)+'…')}</div>`}
   const q=c.quote,fund=c.kind==='fund',fm=c.fund||{};
   const hasDiv=!fund||(c.dividends||{items:[]}).items.length||st.tab==='div';
   const tab=hasDiv&&st.tab==='div'?'div':'main';
   const tabs=hasDiv?`<div class="seg stk-tabs" id="${p}tabs" role="tablist"><button data-t="main" class="${tab==='main'?'on':''}" role="tab" aria-selected="${tab==='main'}">Обзор</button><button data-t="div" class="${tab==='div'?'on':''}" role="tab" aria-selected="${tab==='div'}">Дивиденды</button></div>`:'';
-  const head=`<div class="card stk-hd"><div><h1 class="stk-nm">${fund?'<span class="stk-kind">Фонд</span> ':''}${esc(q.shortname)} <span class="mu">${esc(q.secid)}</span></h1><div class="note">${esc(fund&&fm.full_name?fm.full_name:q.name)} · ${esc(q.sector)} · ${esc(q.isin)}</div></div>
+  const head=`<div class="card stk-hd st-ver"><div><h1 class="stk-nm">${fund?'<span class="stk-kind">Фонд</span> ':''}${esc(q.shortname)} <span class="mu">${esc(q.secid)}</span></h1><div class="note">${esc(fund&&fm.full_name?fm.full_name:q.name)} · ${esc(q.sector)} · ${esc(q.isin)}</div></div>
       <div class="stk-px"><span class="num">${stkPrice(q.price)} ₽</span> <span class="num">${stkPc(q.chg_d)}</span></div></div>${tabs}`;
   if(tab==='div')return head+stkDivTab(c,p);
   const cs=c.candles,sr=c.series||{},ind=st.ind,lab=stkLabel(st.tf);
@@ -254,12 +257,13 @@ function stkCardHtml(p){
   const tg=(id,t,on)=>`<label class="sw"><input type="checkbox" id="${p}${id}" ${on?'checked':''}><i></i><div><b>${t}</b></div></label>`;
   const tfs=[['D','День'],['W','Неделя'],['H','Час']];
   const tfSeg=drw?`<div class="seg" id="${p}tf" title="Таймфрейм свечей">${tfs.map(([k,t])=>`<button data-t="${k}" class="${st.tf===k?'on':''}">${t}</button>`).join('')}</div>`:'';
-  const kpis=fund?kpi('За неделю',stkPc(q.chg_w,1),'5 торговых дней')+kpi('За месяц',stkPc(q.chg_m,1),'21 торговый день')+kpi('Оборот за день',stkCap(q.value_today),'Мосбиржа')+kpi('Управляющая компания',`<span style="font-size:15px">${esc(fm.manager||'—')}</span>`,esc(fm.category||q.sector||''))
-    :kpi('За неделю',stkPc(q.chg_w,1),'5 торговых дней')+kpi('За месяц',stkPc(q.chg_m,1),'21 торговый день')+kpi('Капитализация',stkCap(q.cap),'лот: '+q.lot+' шт.')+kpi('Оборот за день',stkCap(q.value_today),'Мосбиржа, TQBR');
+  const dotW=q.chg_w>0?'pos':q.chg_w<0?'neg':'mu',dotM=q.chg_m>0?'pos':q.chg_m<0?'neg':'mu';
+  const kpis=fund?stkTile('За неделю',stkPc(q.chg_w,1),'5 торговых дней',dotW)+stkTile('За месяц',stkPc(q.chg_m,1),'21 торговый день',dotM)+stkTile('Оборот за день',stkCap(q.value_today),'Мосбиржа','mu')+stkTile('Управляющая компания',esc(fm.manager||'—'),esc(fm.category||q.sector||''),'mu')
+    :stkTile('За неделю',stkPc(q.chg_w,1),'5 торговых дней',dotW)+stkTile('За месяц',stkPc(q.chg_m,1),'21 торговый день',dotM)+stkTile('Капитализация',stkCap(q.cap),'лот: '+q.lot+' шт.','mu')+stkTile('Оборот за день',stkCap(q.value_today),'Мосбиржа, TQBR','mu');
   const lower=fund?`<div class="g g2" style="margin-top:16px">${stkTaCard(c)}${stkFundInfo(c)}</div>${stkFundHold(c,p)}${(c.dividends||{items:[]}).items.length?`<div style="margin-top:16px">${stkDivCard(c,p)}</div>`:''}`
     :`<div class="g g2" style="margin-top:16px">${stkTaCard(c)}${stkMulCard(c)}</div>
     <div class="g c-2-1" style="margin-top:16px">${stkDivCard(c,p)}${stkRepCard(c)}</div>`;
-  return head+`<div class="g g4">${kpis}</div>
+  return head+`<div class="st-tiles stk-tiles">${kpis}</div>
     <div class="card" style="margin-top:16px"><div class="row" style="margin-bottom:8px">${tfSeg}${tg('s50','SMA 50',ind.s50)}${tg('s200','SMA 200',ind.s200)}${tg('bb','Боллинджер',ind.bb)}${tg('lv','Уровни',ind.lv)}
         <button class="btn ghost" id="${p}r" style="margin-left:auto">Обновить</button></div>
       <div id="c-${p}chart" class="chart"></div><div id="c-${p}rsi" class="chart"></div><div id="c-${p}macd" class="chart"></div></div>

@@ -1,0 +1,163 @@
+/* ── Исправления вёрстки по ревью (Windows, узкие окна) ── */
+
+/* Сайдбар: прокручивается только основной список, служебные пункты закреплены внизу */
+@media(min-width:761px){
+  body>aside{overflow:hidden}
+  body>aside .nav-main{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
+  body>aside .nav-fix{flex:none;border-top:1px solid var(--line);margin-top:6px;padding-top:6px}
+  body>aside .side-foot{margin-top:0;flex:none}
+}
+@media(max-width:760px){.nav-fix{flex-direction:row;overflow-x:auto;border-top:0;padding:0}}
+.nav-tip{position:fixed;z-index:3000;pointer-events:none;background:var(--card2);color:var(--tx);border:1px solid var(--line2);border-radius:8px;padding:5px 10px;font-size:12.5px;font-weight:550;white-space:nowrap;box-shadow:0 8px 22px #00000066}
+
+/* Полоса прокрутки не сдвигает вёрстку при появлении */
+#view{scrollbar-gutter:stable}
+
+/* Горизонтальный скролл страниц (налоги, сигналы): колонка сетки может сжиматься, широкие таблицы прокручиваются внутри себя */
+.wrap{grid-template-columns:minmax(0,1fr)}
+.txo,.sg-g2,.sg-t{min-width:0;max-width:100%}
+.sg-g2{grid-template-columns:minmax(0,1fr)}
+.sg-g2>*{min-width:0}
+.txo .tbl,.sg-g2 .tbl{max-width:100%}
+
+/* Карточки бумаг: верхняя панель закреплена, кнопки не обрезаются справа */
+#bc-ov .bc-bar{position:sticky;top:-18px;z-index:5;margin:-18px -20px 14px;padding:18px 20px 10px;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line);flex-wrap:wrap}
+#bc-ov .bc-bar .btn,#sk-ov .sk-bar .btn{white-space:nowrap;flex:none}
+#sk-ov .sk-bar{position:sticky;top:0;z-index:5;flex-wrap:wrap}
+@media(max-width:760px){#bc-ov .bc-bar{top:-14px;margin:-14px -14px 12px;padding:14px 14px 10px}}
+
+/* Внутренние вкладки без лишнего зазора при переносе; подсказка «Зачем этот экран» — компактная одна строка */
+.ux-sub{row-gap:0}
+.ux-why{padding:5px 12px;font-size:12.5px;border-radius:9px;gap:10px}
+.ux-why span{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ux-why-x{flex:none;padding:2px 7px}
+
+/* Бегущая строка: кнопка закрытия не наезжает на текст */
+.tkr .tk-x{position:relative;z-index:1;background:var(--card2);border-left:1px solid var(--line);margin-left:4px}
+.tkr.off .tk-x{background:transparent;border-left:0}
+
+/* Таблицы: залипающая первая колонка при наведении того же тона, что и остальные ячейки строки */
+.tbl table tr:hover td:first-child{background:linear-gradient(#ffffff05,#ffffff05),var(--card)}
+
+/* Кликабельные карточки показателей на «Обзоре» */
+.kpi.kpi-go{cursor:pointer;position:relative;transition:transform .15s,border-color .15s,background-color .15s}
+.kpi.kpi-go::after{content:"→";position:absolute;right:14px;top:12px;color:var(--mu);opacity:0;transform:translateX(-4px);transition:.15s}
+.kpi.kpi-go:hover,.kpi.kpi-go:focus-visible{transform:translateY(-1px);border-color:var(--ac);outline:none}
+.kpi.kpi-go:hover::after,.kpi.kpi-go:focus-visible::after{opacity:1;transform:none;color:var(--ac-tx)}
+
+/* Скринер: свои фильтры и отметка «в портфеле» */
+.scr-sv{display:inline-flex;align-items:center;padding:0;overflow:hidden}
+.scr-sv button{all:unset;cursor:pointer;padding:6px 8px;font-size:12px}
+.scr-sv .scr-sv-b{padding:6px 4px 6px 11px}
+.scr-sv .scr-sv-x{color:var(--mu);padding:6px 10px 6px 6px}
+.scr-sv .scr-sv-x:hover{color:var(--neg)}
+.scr-sv-new{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}
+.scr-sv-new .in{width:170px;padding:5px 10px}
+.scr-sv-new .btn{padding:5px 11px;font-size:12.5px}
+.tag.scr-own{background:#3b82f61f;color:var(--ac-tx);font-weight:600;font-size:10.5px;margin-left:6px;vertical-align:1px}
+
+/* Колокольчик уведомлений */
+#bell{position:relative;padding:7px 10px}
+#bell svg{width:17px;height:17px}
+#bell .bell-n{position:absolute;top:-5px;right:-5px;min-width:17px;height:17px;padding:0 4px;border-radius:99px;background:var(--neg);color:#fff;font-size:10.5px;font-weight:700;line-height:17px;text-align:center;display:none}
+#bell.has .bell-n{display:block}
+.bell-dd{width:min(420px,calc(100vw - 32px));max-height:min(70vh,520px);overflow:auto;gap:4px}
+.bell-h{padding:6px 10px 4px;font-size:11.5px;font-weight:650;text-transform:uppercase;letter-spacing:.05em;color:var(--mu)}
+.bell-row{all:unset;box-sizing:border-box;cursor:pointer;display:block;width:100%;padding:6px 8px;border-radius:9px}
+.bell-row:hover,.bell-row:focus-visible{background:var(--card2)}
+.bell-row .mon-al{pointer-events:none}
+.bell-it{font-size:13px;line-height:1.45;color:var(--tx2);padding:4px 2px}
+.bell-empty{padding:10px;font-size:12.5px}
+.bell-f{display:flex;gap:8px;flex-wrap:wrap;padding:8px 6px 4px;border-top:1px solid var(--line);margin-top:4px}
+.bell-f .btn{padding:5px 11px;font-size:12.5px}
+@media(min-width:761px) and (max-width:1100px){.top #bell{width:36px;height:36px;padding:0;border-radius:50%;justify-content:center;flex:none}}
+
+/* Панель навигации Настроек — тоже <aside>: общие стили сайдбара (ширина 252px, рамка, отступы) на неё не действуют */
+.st aside.st-side{width:auto;padding:2px 0 0;border:0;overflow:visible;flex:none}
+
+/* Обзор: быстрые задачи одной строкой; Операции: итоги по фильтру; Ребалансировка: быстрые цели */
+.ux-chips{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12.5px}
+.ops-sum{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 10px;padding:9px 12px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px;color:var(--tx2)}
+.reb-pre{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+
+/* Онбординг внутри Настроек: карточка не шире колонки */
+#ob-host{min-width:0}
+#ob-host .ob-card{min-width:0;max-width:100%}
+.ob-cards{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr)}
+@media(max-width:1180px){.ob-cards{grid-template-columns:minmax(0,1fr)}}
+
+/* Настройки: кнопки не наезжают на описание, при нехватке места уходят под текст */
+.st-row{flex-wrap:wrap}
+.st-t{flex:1 1 240px;min-width:min(240px,100%)}
+.st-c{flex:0 1 auto;min-width:min-content;margin-left:auto}
+.st-row.stack{flex-wrap:nowrap}
+.st-tl{gap:10px}
+.st-tl>span,.st-tl>b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.st-dot{margin-left:auto;flex:none}
+.st-tl>.st-dot{margin-left:auto}
+
+/* Шапка: заголовок не сжимается до пары букв, кнопка поиска остаётся компактной пилюлей */
+.top h1{display:block;flex:1 1 150px;min-width:110px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.top #period{flex:none;flex-wrap:nowrap}
+.top #period button{white-space:nowrap}
+.top .srch-pill{border-radius:999px;padding:6px 12px;gap:8px;min-height:34px}
+.top .srch-pill .srch-tx{display:inline;color:var(--tx2);white-space:nowrap}
+@media(max-width:1240px){.top .srch-pill .srch-tx{display:none}}
+@media(min-width:761px) and (max-width:1100px){
+  .top{flex-wrap:wrap;row-gap:8px}
+}
+
+/* Переключатель периода внутри #view на 5 аналитических экранах */
+.per-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:-2px 0 2px}
+.per-lbl{font-size:12px;color:var(--mu);font-weight:500}
+.per-bar .seg{flex:0 1 auto}
+.per-bar .seg button{padding:5px 11px;font-size:12.5px}
+
+/* Индикатор связи в нижней части сайдбара */
+.side-foot{flex-wrap:wrap;gap:6px 10px}
+.conn-st{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--mu);margin-right:auto}
+.conn-dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--pos);box-shadow:0 0 0 3px #2bc48a22}
+.conn-st.busy .conn-dot{background:var(--ac);box-shadow:0 0 0 3px var(--ac-glow);animation:connPulse 1.1s ease-in-out infinite}
+.conn-st.err .conn-dot{background:var(--st-warn);box-shadow:0 0 0 3px #e5a63a28}
+.conn-st.err .conn-tx{color:var(--st-warn)}
+body.side-mini .conn-tx{display:none}
+body.side-mini .conn-st{margin-right:0}
+@keyframes connPulse{0%,100%{opacity:1}50%{opacity:.4}}
+@media(prefers-reduced-motion:reduce){.conn-st.busy .conn-dot{animation:none}}
+
+/* Обзор: мини-спарклайн в hero, бейдж дельты периода, переключатель Топ-8 / Все */
+.hero{position:relative;overflow:hidden}
+.hero-spark{position:absolute;right:0;top:0;bottom:0;width:min(48%,460px);pointer-events:none;opacity:.42;z-index:0}
+.hero-spark svg{width:100%;height:100%;display:block}
+.dash-delta{font-size:12px;padding:2px 9px}
+.dash-top-seg{margin-left:8px;padding:2px;border-radius:9px}
+.dash-top-seg button{padding:3px 9px;font-size:11.5px}
+
+/* Скелетон загрузки графика */
+.chart-sk{display:flex;flex-direction:column;justify-content:flex-end;gap:12px;padding:18px 16px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line)}
+.chart-sk-bars{display:flex;align-items:flex-end;gap:10px;height:110px;flex:1}
+.chart-sk-bars i{flex:1;display:block;border-radius:6px 6px 2px 2px;background:linear-gradient(180deg,var(--sk-2),var(--sk-1));animation:skShim 1.4s linear infinite;background-size:200% 100%}
+.chart-sk-tx{font-size:12px;color:var(--mu);text-align:center}
+@media(prefers-reduced-motion:reduce){.chart-sk-bars i{animation:none}}
+
+/* Экран блокировки (#lock-ov) */
+#lock-ov{position:fixed;inset:0;z-index:2000;background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2);display:grid;place-items:center;padding:24px}
+.lock-box{width:min(400px,100%);background:var(--d2);border:1px solid var(--line2);border-radius:var(--r-lg);padding:28px 26px 24px;display:grid;gap:14px;box-shadow:var(--d2-hl),0 28px 70px #00000099}
+.lock-box .logo{padding:0;margin:0}
+.lock-sub{margin:0;font-size:13.5px;color:var(--tx2);line-height:1.45}
+.lock-bio{justify-content:center;padding:11px 16px}
+.lock-bio svg{width:18px;height:18px}
+#lock-form{display:grid;gap:10px}
+#lock-pin{text-align:center;letter-spacing:.14em;font-size:15px}
+.lock-go{justify-content:center;padding:10px 16px}
+.lock-err{font-size:12.5px;color:var(--neg);text-align:center}
+.lock-err[hidden]{display:none}
+body.lock-open{overflow:hidden}
+
+/* Глобальный оверлей переноса файла отчёта (#drop-ov) */
+#drop-ov{position:fixed;inset:0;z-index:1900;background:rgba(7,9,14,.76);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);display:grid;place-items:center;padding:24px;pointer-events:none}
+[data-theme=light] #drop-ov{background:rgba(242,244,248,.82)}
+.drop-box{width:min(480px,100%);padding:36px 28px;border-radius:var(--r-lg);background:var(--d2);border:2px dashed var(--ac);box-shadow:var(--d2-hl),0 24px 60px #00000080;display:grid;gap:10px;justify-items:center;text-align:center}
+.drop-box svg{width:42px;height:42px;color:var(--ac-tx)}
+.drop-box b{font-size:16px;font-weight:650;color:var(--tx)}
+.drop-box span{font-size:13px;color:var(--mu)}

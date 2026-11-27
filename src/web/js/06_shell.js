@@ -14,8 +14,11 @@ function renderNav(){
   }
   h+='<div class="sep"></div>'+NAV_FIXED.map(k=>pg(k)).filter(Boolean).map(navBtn).join('');
   $('#nav').innerHTML=h;
-  $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
-  $('#period').style.visibility=PERIOD_PAGES.includes(S.page)?'visible':'hidden';
+  const pe=$('#period');
+  if(pe){
+    pe.innerHTML=PERIODS.map(([k,t])=>`<button type="button" class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
+    pe.style.display=PERIOD_PAGES.includes(S.page)&&S.data?'':'none';
+  }
   const a=S.accounts.find(x=>x.id===S.account);
   const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
   if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}
@@ -32,15 +35,21 @@ function renderAccounts(){
     (S.hideEmpty&&vis.length<accs.length?`<div class="note" style="padding:4px 10px">Скрыто пустых: ${accs.length-vis.length}</div>`:'');
 }
 $('#nav').onclick=e=>{const g=e.target.closest('[data-g]');if(g){const n=g.dataset.g;S.navShut[n]=!S.navShut[n];lsSet('ta_nav_shut',JSON.stringify(S.navShut));renderNav();return}const b=e.target.closest('[data-p]');if(!b)return;go(b.dataset.p)};
-$('#period').onclick=e=>{const b=e.target.closest('[data-k]');if(!b||b.dataset.k===S.period)return;S.period=b.dataset.k;persist();renderNav();load(false,true)};
+$('#nav-fix').onclick=e=>{const b=e.target.closest('[data-p]');if(b)go(b.dataset.p)};
+document.addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('#period [data-k]');if(!b||b.dataset.k===S.period)return;S.period=b.dataset.k;persist();renderNav();load(false,true)});
 $('#acl').onclick=e=>{const b=e.target.closest('[data-a]');if(!b||b.dataset.a===S.account)return;S.account=b.dataset.a;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
 $('#hideEmpty').onchange=e=>{S.hideEmpty=e.target.checked;persist();renderAccounts()};
 $('#refresh').onclick=()=>load(true);
+function periodBarHtml(){
+  if(!PERIOD_PAGES.includes(S.page)||!S.data)return'';
+  return`<div class="per-bar noprint"><span class="per-lbl">Период:</span><div class="seg" id="period" role="group" aria-label="Период">${PERIODS.map(([k,t])=>`<button type="button" class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('')}</div></div>`;
+}
 function go(p){if(typeof skClose==='function')skClose();const prev=S.page;if(typeof dlScrSave==='function')dlScrSave(prev);S.page=p;S.opsN=200;persist();renderNav();render();if(prev!==p&&typeof dlScrRestore==='function')dlScrRestore(p)}
 
 let reqId=0;
 async function load(force,periodOnly){
   const my=++reqId;S.loading=true;S.err=null;
+  if(typeof connSet==='function')connSet('busy');
   $('#refresh').classList.add('spin');$('#refresh').disabled=true;
   if(!S.data&&!['set','imp','kb'].includes(S.page))skeleton();
   try{
@@ -50,9 +59,10 @@ async function load(force,periodOnly){
     S.data=d;S.accounts=d.accounts;if(S.account!==d.account){S.account=d.account}persist();
     $('#upd').textContent='обновлено в '+d.updated;
     {const rf=$('#refresh');if(rf)rf.title='Обновить данные · обновлено в '+d.updated}
+    if(typeof connSet==='function')connSet('ok');
     renderAccounts();renderNav();
     if(!periodOnly||force||!S.bonds||!S.hist)loadExtra(force);
-  }catch(e){if(my!==reqId)return;S.err=e.message}
+  }catch(e){if(my!==reqId)return;S.err=e.message;if(typeof connSet==='function'){const net=/^Программа не отвечает/.test(e.message||'');connSet(net?'err':'ok',e.message)}}
   finally{if(my===reqId){S.loading=false;$('#refresh').classList.remove('spin');$('#refresh').disabled=false}}
   if(my===reqId&&!['set','imp','kb'].includes(S.page))render();
 }
@@ -78,7 +88,7 @@ function typingInView(){
 function render(){renderNow()}
 function renderSoon(){if(typingInView()){_rPend=true;return}renderNow()}
 document.addEventListener('focusout',()=>{if(_rPend)setTimeout(()=>{if(_rPend&&!typingInView())renderNow()},400)});
-const NO_PORTFOLIO_PAGES=new Set(['scr','cmp','map','hm','mkt','fng','pri','cal','dfl','flw','iss','watch','stk','sst','calc','lad','rot','dbx','mm','crp','mic','sig','mon','arb','dgap']);
+const NO_PORTFOLIO_PAGES=new Set(['scr','cmp','map','hm','mkt','fng','pri','cal','dfl','flw','iss','watch','stk','sst','calc','lad','rot','dbx','mm','crp','mic','sig','mon','arb','dgap','ofz']);
 function renderNow(){
   _rPend=false;
   S.charts=[];hideTip();prInfo();
@@ -109,6 +119,7 @@ function renderNow(){
   const fn=views[S.page]||(PAGE_EXT[S.page]&&PAGE_EXT[S.page].render)||(()=>{S.page='dash';persist();renderNav();return pDash()});
   const topUx=(typeof uxGuestBar==='function'&&!S.data?uxGuestBar():'')
     +(typeof uxSubTabs==='function'?uxSubTabs():'')
+    +periodBarHtml()
     +(typeof uxWhyBanner==='function'?uxWhyBanner(S.page):'');
   v.innerHTML=`<div class="wrap fade">${topUx}${S.err&&S.data?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)&&S.data?remindHtml():''}${S.page==='dash'&&S.data?proBanner():''}${fn()}</div>`;
   v.scrollTop=sc;

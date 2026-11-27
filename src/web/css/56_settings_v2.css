@@ -1,6 +1,4 @@
 /* ── Настройки v2: две панели, панель состояния, строки-настройки, единые переключатели ── */
-:root{--sw-off:#2d3441;--st-warn:#e5a63a}
-:root[data-theme=light]{--sw-off:#cdd3de;--st-warn:#c98500}
 
 /* единый переключатель 34×20 (настройки, фильтры, калькуляторы) */
 .sw i,.msw i,.st-sw i{width:34px;height:20px;border-radius:999px;background:var(--sw-off);position:relative;flex:none;transition:background-color .2s,box-shadow .2s;box-shadow:inset 0 0 0 1px var(--line)}
@@ -86,7 +84,7 @@
 .st-row.stack .st-c{justify-content:flex-start;flex-wrap:nowrap}
 .st-row.stack .st-wide{flex:1}
 .st-row.stack .ld-path{flex:1}
-.st-row.hit{background:#3b82f60d;box-shadow:inset 2px 0 0 var(--ac)}
+.st-row.st-hit,.st-row.hit{background:#3b82f60d;box-shadow:inset 2px 0 0 var(--ac)}
 .st-pad{padding:4px 20px 18px}
 .st-line{margin:0;padding:12px 20px;border-top:1px solid var(--line);font-size:12.5px;color:var(--mu);line-height:1.5}
 .st-line:empty{display:none}
@@ -198,3 +196,22 @@
 /* адаптация под узкое окно ПК */
 @media(max-width:1380px){.st-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:1100px){.st{grid-template-columns:190px minmax(0,1fr);gap:26px}.st-c .st-wide,.st-secret .in{width:240px}.st-sel{min-width:220px}}
+
+/* выбор акцентного цвета и плотности */
+.st-acc{display:inline-flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.st-acc>button{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;border:1px solid var(--line2);background:var(--card2);font-size:12.5px;color:var(--tx2);transition:border-color .15s,box-shadow .15s,color .15s}
+.st-acc>button i{width:14px;height:14px;border-radius:50%;background:var(--sw);box-shadow:inset 0 1px 0 #ffffff55,0 0 0 1px #00000033}
+.st-acc>button:hover{border-color:var(--ac);color:var(--tx)}
+.st-acc>button.on{border-color:var(--ac);box-shadow:0 0 0 3px var(--ac-glow);color:var(--tx)}
+.st-acc>button:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+
+/* PIN-код, журнал раскрытий и плавающая панель несохранённых изменений */
+.st-lock-pin{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.crowd-log{display:grid;gap:6px;max-height:220px;overflow:auto;margin-top:4px}
+.crowd-log-r{display:grid;grid-template-columns:68px 72px minmax(0,1fr);gap:10px;font-size:12px;padding:4px 0;border-bottom:1px solid var(--line)}
+.crowd-log-r:last-child{border-bottom:0}
+.st-dirty-bar{position:sticky;bottom:14px;z-index:30;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 18px;border-radius:14px;background:var(--d2);border:1px solid var(--ac);box-shadow:var(--d2-hl),0 18px 42px -10px #00000099;animation:stUp .2s ease}
+.st-dirty-bar[hidden]{display:none}
+.st-dirty-bar>span{font-size:13.5px;font-weight:600;color:var(--tx)}
+.st-dirty-bar .row{gap:8px}
+@media(prefers-reduced-motion:reduce){.st-dirty-bar{animation:none}}

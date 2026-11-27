@@ -1,9 +1,9 @@
 # ═══════════════ единая точка исходящих запросов за ПУБЛИЧНЫМИ данными (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО, логотипы) ═══════════════
-# Если задан «сервер данных» (настройки или TINVEST_DATA_SERVER / TINVEST_DATA_KEY), запрос идёт через него:
+# Публичные данные идут через сервер данных (DS_DEFAULT; для разработки и тестов — TINVEST_DATA_SERVER / TINVEST_DATA_KEY):
 # GET|POST {сервер}/v1/fetch?url=... Сервер кэширует ответы и сам ходит к источникам. При любой неудаче сервера
 # (нет связи, таймаут, 5xx, 401/403) запрос выполняется напрямую, а сервер на 5 минут считается недоступным.
 # Сервер по умолчанию — DS_DEFAULT; он требует личный ключ из Telegram-бота (7 дней), см. «вход по ключу» ниже
-# (/api/auth/*). «off» в настройках или в TINVEST_DATA_SERVER отключает сервер совсем (запросы идут напрямую).
+# (/api/auth/*). В интерфейсе адрес не меняется; «off» в TINVEST_DATA_SERVER (разработка) отключает сервер совсем.
 # API Т-Инвестиций сюда НЕ входит: он всегда идёт напрямую, токен на сервер данных не передаётся. Уведомления Telegram — отдельный вызов POST /v1/notify (13j_watch.py).
 
 EXT_UA = {"User-Agent": "Mozilla/5.0 (compatible; tinvest-analytics)"}
@@ -34,7 +34,11 @@ def ds_conf():
         cfg = load_config()
     except Exception:  # noqa: BLE001
         cfg = {}
-    url = str(cfg.get("data_server") or os.environ.get("TINVEST_DATA_SERVER") or DS_DEFAULT).strip().rstrip("/")
+    # адрес в config.json учитывается, только если это URL (ручная правка для своего сервера); старое «off» из прежних
+    # версий настроек больше не отключает сервер — данные рынка всегда берутся с сервера по умолчанию
+    own = str(cfg.get("data_server") or "").strip()
+    url = (own if re.match(r"https?://[^/\s]+", own) else
+           os.environ.get("TINVEST_DATA_SERVER") or DS_DEFAULT).strip().rstrip("/")
     key = str(cfg.get("data_key") or os.environ.get("TINVEST_DATA_KEY") or "").strip()
     if not re.match(r"https?://[^/\s]+", url):          # в т.ч. «off»: сервер отключён
         url = ""
@@ -301,10 +305,10 @@ def ds_get(cfg, acc, q, force):
 
 def ds_test(cfg, body):
     """Проверка сервера: GET /v1/health. Поля url/key из формы; пустой ключ = сохранённый."""
-    url = str(body.get("url") or "").strip().rstrip("/") or ds_conf()[0]
+    url = ds_conf()[0]
     key = str(body.get("key") or "").strip() or ds_conf()[1]
     if not re.match(r"https?://[^/\s]+", url):
-        raise ApiError("Укажите адрес сервера, например https://data.example.ru", 400)
+        raise ApiError("Сервер данных отключён (TINVEST_DATA_SERVER=off).", 400)
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key

@@ -2,6 +2,9 @@
 
 CALC_TTL = 3600
 CALC_LOSS_GIVEN_DEFAULT = 0.75      # потери при дефолте: 1 − ставка возмещения 25 %
+CALC_STOCKS = {"div": 8.0, "growth": 6.0, "sigma": 22.0, "estimate": True}     # акции РФ: дивидендная доходность, рост цены, годовой разброс, %
+CALC_FX_BONDS = {"yield": 6.0, "fx": 5.0, "sigma": 12.0, "estimate": True}     # замещающие облигации: купон в валюте, ослабление рубля %/год, разброс курса
+CALC_FLT_SPREAD = 1.5               # запасной спред флоатеров к ключевой ставке, п.п.
 _calc_mem = {}
 
 
@@ -13,31 +16,56 @@ def _calc_med(xs):
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
 
 
+def _calc_plain_bond(r, ti=None):
+    """Обычный выпуск с постоянным купоном: без флоатеров, линкеров, бессрочных и субординированных (их доходность и дюрация искажают медианы)."""
+    if r.get("floating") or r.get("linker"):
+        return False
+    sub = str(r.get("sub") or "").lower()
+    if "floater" in sub or "linker" in sub or "суборд" in sub:
+        return False
+    if ti and r.get("isin"):
+        try:
+            ci = ti(r["isin"]) or {}
+        except Exception:  # noqa: BLE001
+            ci = {}
+        if ci.get("perpetual") or ci.get("subordinated"):
+            return False
+    return True
+
+
 def _calc_segments(key_rate):
-    """Сегменты рынка: ОФЗ, AAA, AA, A, ВДО — текущая медианная доходность и дюрация. Что не нашли — запасной вариант с флагом."""
+    """Сегменты рынка: ОФЗ, AAA, AA, A, ВДО (с постоянным купоном) и флоатеры (ключевая + спред): текущая медианная доходность и дюрация.
+    Что не нашли — запасной вариант с флагом."""
     pd = RISK_PD_HIST
     loss = lambda *ks: sum(pd[k] for k in ks) / len(ks) / 100.0 * CALC_LOSS_GIVEN_DEFAULT
     # ожидаемые годовые потери: средняя вероятность дефолта по рейтингам сегмента × (1 − 0,25)
     meta = {"ofz": ("ОФЗ", 0.0), "aaa": ("Корпоративные AAA", loss("AAA")),
             "aa": ("Корпоративные AA", loss("AA+", "AA", "AA-")),
             "a": ("Корпоративные A", loss("A+", "A", "A-")),
-            "hy": ("ВДО (BB и ниже)", loss("BB+", "BB", "BB-", "B+"))}
+            "hy": ("ВДО (BB и ниже)", loss("BB+", "BB", "BB-", "B+")),
+            "flt": ("Флоатеры (ключевая + спред)", loss("AA+", "AA", "AA-"))}
     fb = {"ofz": (key_rate - 0.5, 4.0), "aaa": (key_rate + 0.5, 2.5), "aa": (key_rate + 1.5, 2.5),
-          "a": (key_rate + 3.0, 2.0), "hy": (key_rate + 8.0, 1.5)}
+          "a": (key_rate + 3.0, 2.0), "hy": (key_rate + 8.0, 1.5), "flt": (key_rate + CALC_FLT_SPREAD, 0.25)}
     got = {}
     try:
         sp = screener_payload()
         rows = sp.get("rows") or []
+        ti = globals().get("tcat_info")
+        plain = [r for r in rows if _calc_plain_bond(r, ti)]
         buckets = {"aaa": "AAA", "aa": "AA", "a": "A", "hy": "BB и ниже"}
         for k, b in buckets.items():
-            sel = [r for r in rows if r.get("kind") == "corp" and r.get("cur") == "RUB" and r.get("rating")
+            sel = [r for r in plain if r.get("kind") == "corp" and r.get("cur") == "RUB" and r.get("rating")
                    and rating_bucket(r["rating"]) == b and 0 < r["yield"] < 60 and (r.get("dur") or 0) > 0.1]
             if len(sel) >= 3:
                 got[k] = (_calc_med([r["yield"] for r in sel]), _calc_med([r["dur"] for r in sel]), len(sel))
-        sel = [r for r in rows if r.get("kind") == "ofz" and r.get("cur") == "RUB" and 0 < r["yield"] < 60
-               and (r.get("dur") or 0) > 0.1 and not r.get("floating") and r.get("sub") != "ofz_floater"]
+        sel = [r for r in plain if r.get("kind") == "ofz" and r.get("cur") == "RUB" and 0 < r["yield"] < 60 and (r.get("dur") or 0) > 0.1]
         if len(sel) >= 3:
             got["ofz"] = (_calc_med([r["yield"] for r in sel]), _calc_med([r["dur"] for r in sel]), len(sel))
+        fl = [r for r in rows if r.get("floating") and not r.get("linker") and r.get("cur") == "RUB" and r.get("kind") in ("corp", "ofz")
+              and 0 < (r.get("yield") or 0) < 60]
+        if len(fl) >= 3:
+            spr = max(-1.0, min(8.0, _calc_med([r["yield"] for r in fl]) - key_rate))
+            got["flt"] = (key_rate + spr, _calc_med([r.get("dur") or 0.25 for r in fl]), len(fl))
     except Exception:  # noqa: BLE001
         pass
     out = {}
@@ -45,18 +73,58 @@ def _calc_segments(key_rate):
         g = got.get(k)
         out[k] = {"name": name, "yield": round(g[0] if g else fb[k][0], 2), "dur": round(g[1] if g else fb[k][1], 2),
                   "loss": round(ls * 100, 3), "n": g[2] if g else 0, "estimate": g is None}
+    out["flt"]["spread"] = round(out["flt"]["yield"] - key_rate, 2)
     return out
 
 
+def _calc_shares(positions):
+    """Доли классов активов портфеля по стоимости: облигации, акции, прочие фонды, фонды ликвидности, деньги (валюта), остальное."""
+    mm = set(globals().get("MM_FUND_SEED") or ())
+    w = {"bonds": 0.0, "stocks": 0.0, "funds": 0.0, "lqdt": 0.0, "cash": 0.0, "other": 0.0}
+    for r in positions or []:
+        v = r.get("value_rub") or 0.0
+        t = r.get("type")
+        if v <= 0 or t == "futures":
+            continue
+        if t == "bond":
+            w["bonds"] += v
+        elif t == "share":
+            w["stocks"] += v
+        elif t == "etf":
+            w["lqdt" if (r.get("ticker") or "").upper() in mm else "funds"] += v
+        elif t == "currency":
+            w["cash"] += v
+        else:
+            w["other"] += v
+    tot = sum(w.values())
+    return {k: round(v / tot, 4) for k, v in w.items()} if tot > 0 else None
+
+
+def _calc_income_month(cfg, acc):
+    """Доход портфеля в месяц до налога: купоны и дивиденды по графику на 12 месяцев вперёд; None, если графика нет."""
+    try:
+        end = (date.today() + timedelta(days=365)).isoformat()
+        pays = [p for p in (build_bonds(cfg, acc).get("payments") or []) if p.get("kind") in ("coupon", "dividend") and p.get("date", "") <= end]
+        if pays:
+            return round(sum(p["amount"] for p in pays) / 12.0, 2)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _calc_portfolio(cfg, acc):
+    """Портфель целиком: стоимость, доли классов активов, доходность и дюрация облигационной части, купоны. Калькулятор считает «Мой портфель»
+    как смесь частей (облигации с их дюрацией, акции, фонды ликвидности, деньги), а не как одну облигацию на весь капитал."""
     if not (cfg.get("token") or "").strip() and not imports_list():
         return None
-    pf = {"value": None, "bonds_value": None, "irr": None, "irr_tax": None, "monthly": None, "coupons_12m": None}
+    pf = {"value": None, "bonds_value": None, "irr": None, "irr_tax": None, "monthly": None, "coupons_12m": None,
+          "shares": None, "dur_bonds": None, "income_month": None}
     s = None
     try:
         s = build_summary(cfg, acc, "all")
         pf["value"] = round(s["portfolio"]["total"], 2)
         pf["bonds_value"] = round(s["portfolio"]["bonds"], 2)
+        pf["shares"] = _calc_shares(s["portfolio"].get("positions"))
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -70,7 +138,8 @@ def _calc_portfolio(cfg, acc):
     except Exception:  # noqa: BLE001
         pass
     try:
-        m = build_bonds(cfg, acc).get("metrics") or {}
+        bd = build_bonds(cfg, acc)
+        m = bd.get("metrics") or {}
         irr = m.get("irr") if m.get("irr") is not None else m.get("ytm")
         if irr is not None:
             pf["irr"] = round(irr, 2)
@@ -78,8 +147,12 @@ def _calc_portfolio(cfg, acc):
         if irt is not None:
             pf["irr_tax"] = round(irt, 2)
         pf["coupons_12m"] = round(m.get("coupons_12m") or 0.0, 2)
+        dv = [(r["dur"], r.get("value_rub") or 0.0) for r in bd.get("rows") or [] if r.get("dur") and not r.get("floating") and (r.get("value_rub") or 0) > 0]
+        if dv and sum(v for _, v in dv) > 0:
+            pf["dur_bonds"] = round(sum(d * v for d, v in dv) / sum(v for _, v in dv), 2)
     except Exception:  # noqa: BLE001
         pass
+    pf["income_month"] = _calc_income_month(cfg, acc)
     if all(pf[k] is None for k in ("value", "irr")):
         return None
     return pf
@@ -135,6 +208,8 @@ def calc_params(cfg, acc):
         ly = round(kr - 0.7, 2)
     res["lqdt"] = {"yield": ly, "estimate": lest, "spread": 0.7}
     res["deposit"] = {"spread": 1.5, "rate": round(max(kr - 1.5, 0.1), 2)}
+    res["stocks"] = dict(CALC_STOCKS)
+    res["fx_bonds"] = dict(CALC_FX_BONDS)
     res["portfolio"] = pf
     res["updated"] = datetime.now().strftime("%H:%M")
     _calc_mem[key] = (time.time(), res)
@@ -142,8 +217,8 @@ def calc_params(cfg, acc):
 
 
 # ═══════════════════ цель по пассивному доходу: сколько капитала и какое пополнение нужны ═══════════════════
-# Упрощённая модель: весь капитал приносит доход по одной ставке, налог 13 % удерживается с дохода (реинвестируется остаток),
-# взносы вносятся в конце каждого месяца и не индексируются. Не прогноз и не рекомендация.
+# Упрощённая запасная модель (экран калькулятора её больше не использует: цель считается единым клиентским движком вместе со счётом, ИИС-3 и шкалой НДФЛ):
+# весь капитал приносит доход по одной ставке, налог 13 % удерживается с дохода (реинвестируется остаток), взносы не индексируются. Не прогноз и не рекомендация.
 
 GOAL_TAX = 0.13
 GOAL_MAX_YEARS = 50
@@ -241,20 +316,30 @@ def goal_defaults(cfg, acc):
         d["yield"] = pf.get("irr")
         if pf.get("coupons_12m"):
             d["income_month"], d["income_src"] = round(pf["coupons_12m"] / 12.0, 2), "купоны облигаций за 12 месяцев"
-    try:
-        end = (date.today() + timedelta(days=365)).isoformat()
-        pays = [p for p in (build_bonds(cfg, acc).get("payments") or []) if p.get("kind") in ("coupon", "dividend") and p.get("date", "") <= end]
-        if pays:
-            d["income_month"], d["income_src"] = round(sum(p["amount"] for p in pays) / 12.0, 2), "купоны и дивиденды по графику на 12 месяцев"
-    except Exception:  # noqa: BLE001
-        pass
+    inc = _calc_income_month(cfg, acc)
+    if inc is not None:
+        d["income_month"], d["income_src"] = inc, "купоны и дивиденды по графику на 12 месяцев"
     _calc_mem[key] = (time.time(), d)
     return d
 
 
 def calc_goal_get(cfg, acc, q, force=False):
     """GET /api/calc/goal?monthly=&years=|date=&yield=&value=&real=1&infl=  Ручные значения важнее данных портфеля; без токена работают только они."""
-    out = {"defaults": goal_defaults(cfg, acc), "infl": _goal_infl(), "tax": GOAL_TAX, "result": None, "error": None}
+    real = (q.get("real") or "1") not in ("0", "false", "")
+    i_param, i_err = None, None
+    try:
+        i_param = _goal_float(q, "infl")
+    except (ValueError, TypeError) as e:
+        i_err = str(e)
+    infl_info = _goal_infl() if (real and i_param is None and i_err is None) else {
+        "value": i_param if i_param is not None else 4.0,
+        "estimate": i_param is None,
+        "source": "ручной ввод" if i_param is not None else "условное значение",
+    }
+    out = {"defaults": goal_defaults(cfg, acc), "infl": infl_info, "tax": GOAL_TAX, "result": None, "error": None}
+    if i_err is not None:
+        out["error"] = i_err
+        return out
     try:
         monthly = _goal_float(q, "monthly")
         if monthly is None or monthly <= 0:
@@ -267,12 +352,10 @@ def calc_goal_get(cfg, acc, q, force=False):
             return out
         v = _goal_float(q, "value")
         v = (dfl["value"] or 0.0) if v is None else v
-        i = _goal_float(q, "infl")
-        i = out["infl"]["value"] if i is None else i
+        i = infl_info["value"] if i_param is None else i_param
         inc = _goal_float(q, "income")
         if inc is None:
             inc = dfl["income_month"] if dfl["income_month"] is not None else (v * y / 100.0 * (1 - GOAL_TAX) / 12.0 if v else None)
-        real = (q.get("real") or "1") not in ("0", "false", "")
         out["result"] = goal_calc(monthly, goal_months(q), y, v, i, real, inc)
         out["result"].update(yield_pct=y, infl_pct=i, real=real, monthly=monthly)
     except (ValueError, TypeError) as e:

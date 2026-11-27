@@ -302,7 +302,7 @@ def bond_card(isin):
             fsp = fl_spread_cached([isin]).get(isin)
             if fsp is None:
                 face2 = (desc or {}).get("FACEVALUE") or (me or {}).get("nominal")
-                fsp = fl_spread_put(isin, (me or {}).get("full") or (desc or {}).get("NAME") or card.get("name"),
+                fsp = fl_spread_put(isin, (me or {}).get("full") or (desc or {}).get("ISSUENAME") or card.get("name"),
                                     moex_bondization(isin), float(face2) if face2 else None, (me or {}).get("kind"))
             card["fl_spread"] = fsp
             card["fl_label"] = fl_label(fsp, True)

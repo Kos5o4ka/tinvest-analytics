@@ -138,5 +138,164 @@ class DefaultAlerts(Patch):
         self.assertEqual(T.defaults_alerts({}, {}, rows=[self.ROW], isins=[]), [])
 
 
+class PortfolioConcentration(Patch):
+    def test_empty_and_futures_only(self):
+        c = T.portfolio_concentration([])
+        self.assertEqual(c["total"], 0.0)
+        self.assertEqual(c["warnings"], [])
+        c2 = T.portfolio_concentration([{"type": "futures", "value_rub": 50000.0, "cur": "rub"}])
+        self.assertEqual(c2["total"], 0.0)
+
+    def test_issuers_sectors_currencies_ratings_and_warnings(self):
+        self.patch(tcat_info=lambda isin: None, best_rating=lambda isin, name: None)
+        rows = [
+            {"type": "bond", "uid": "u1", "isin": "SU26238RMFS4", "name": "ОФЗ 26238", "sector": "gov",
+             "cur": "rub", "value_rub": 20000.0, "rating": {"v": "AAA"}},
+            {"type": "bond", "uid": "u2", "isin": "SU26240RMFS0", "name": "ОФЗ 26240", "sector": "gov",
+             "cur": "rub", "value_rub": 10000.0, "rating": {"v": "AAA"}},
+            {"type": "bond", "uid": "u3", "isin": "RU000A100001", "name": "Альфа БО-П01", "sector": "financial",
+             "cur": "usd", "value_rub": 40000.0, "rating": {"v": "BBB+"}},
+            {"type": "bond", "uid": "u4", "isin": "RU000A100002", "name": "Бета БО-01", "sector": "financial",
+             "cur": "rub", "value_rub": 15000.0, "rating": None},
+            {"type": "bond", "uid": "u5", "isin": "RU000A100003", "name": "Гамма БО-01", "sector": "energy",
+             "cur": "rub", "value_rub": 5000.0, "rating": {"v": "A-"}},
+            {"type": "currency", "uid": "cash:rub", "ticker": "RUB", "name": "Рубли", "cur": "rub", "value_rub": 10000.0},
+        ]
+        c = T.portfolio_concentration(rows)
+        self.assertAlmostEqual(c["total"], 100000.0)
+        self.assertEqual(c["issuers_count"], 4)
+        self.assertAlmostEqual(c["max_issuer_share"], 40.0)
+        # top-3: Альфа (40%) + Минфин (30%) + Бета (15%) = 85%
+        self.assertAlmostEqual(c["top3_share"], 85.0)
+        self.assertEqual(c["issuers"][0]["share"], 40.0)
+        self.assertEqual(c["issuers"][1]["key"], "минфин")
+        self.assertAlmostEqual(c["issuers"][1]["share"], 30.0)
+        # sectors: financial = 55%, gov = 30%, energy = 5%
+        sec_map = {s["key"]: s["share"] for s in c["sectors"]}
+        self.assertAlmostEqual(sec_map["financial"], 55.0)
+        self.assertAlmostEqual(sec_map["gov"], 30.0)
+        # currencies: rub = 60%, usd = 40%
+        cur_map = {x["cur"]: x["share"] for x in c["currencies"]}
+        self.assertAlmostEqual(cur_map["rub"], 60.0)
+        self.assertAlmostEqual(cur_map["usd"], 40.0)
+        # ratings: BBB+ (40%) is below A-; A- (5%) is not; Бета (15%) is unrated bond
+        self.assertAlmostEqual(c["below_a_minus"]["share"], 40.0)
+        self.assertEqual(c["below_a_minus"]["count"], 1)
+        self.assertAlmostEqual(c["unrated_bonds"]["share"], 15.0)
+        self.assertEqual(c["unrated_bonds"]["count"], 1)
+        # all 3 warnings triggered: issuer 40%>15%, sector 55%>35%, rating 40%>30%
+        self.assertEqual({w["kind"] for w in c["warnings"]}, {"issuer", "sector", "rating"})
+
+    def test_no_warnings_when_diversified(self):
+        self.patch(tcat_info=lambda isin: None, best_rating=lambda isin, name: None)
+        names = ["Газпром", "Лукойл", "Сбербанк", "Яндекс", "Магнит", "Новатэк", "Полюс", "Роснефть", "Татнефть", "МТС"]
+        rows = [
+            {"type": "share", "uid": f"s{i}", "name": nm, "sector": f"sec{i % 4}",
+             "cur": "rub", "value_rub": 10000.0}
+            for i, nm in enumerate(names)
+        ]
+        c = T.portfolio_concentration(rows)
+        self.assertAlmostEqual(c["max_issuer_share"], 10.0)
+        self.assertEqual(c["warnings"], [])
+
+    def test_share_and_bond_of_one_issuer_merge_and_ofz_not_warned(self):
+        self.patch(tcat_info=lambda isin: None, best_rating=lambda isin, name: None)
+        rows = [
+            {"type": "bond", "uid": "b1", "isin": "SU26238RMFS4", "name": "ОФЗ 26238", "cur": "rub", "value_rub": 60000.0},
+            {"type": "bond", "uid": "b2", "isin": "RU000A10SB51", "name": "Сбербанк Sb51R", "cur": "rub", "value_rub": 10000.0},
+            {"type": "share", "uid": "s1", "name": "Сбербанк России ПАО ао", "cur": "rub", "value_rub": 8000.0},
+            {"type": "share", "uid": "s2", "name": "НК ЛУКОЙЛ (ПАО) - ао", "cur": "rub", "value_rub": 11000.0},
+            {"type": "bond", "uid": "b3", "isin": "RU000A10LK01", "name": "ЛУКОЙЛ БО-1", "cur": "rub", "value_rub": 11000.0},
+        ]
+        c = T.portfolio_concentration(rows)
+        names = {x["name"]: round(x["share"], 1) for x in c["issuers"]}
+        self.assertEqual(names, {"Минфин (ОФЗ)": 60.0, "ЛУКОЙЛ": 22.0, "Сбербанк": 18.0})
+        self.assertAlmostEqual(c["max_issuer_share"], 22.0)           # без ОФЗ
+        self.assertEqual(c["max_issuer"], "ЛУКОЙЛ")
+        iw = [w for w in c["warnings"] if w["kind"] == "issuer"]
+        self.assertEqual(len(iw), 1)
+        self.assertIn("ЛУКОЙЛ", iw[0]["detail"])
+
+
+class OfferAmortRadar(Patch):
+    TODAY = "2026-11-01"
+
+    def test_blind_put_coupon_cut_and_partial_amort(self):
+        bz_map = {
+            "RU000BLIND01": {
+                "coupons": [
+                    {"coupondate": "2026-11-20", "value": 45.0, "valueprc": 18.0},
+                    {"coupondate": "2027-02-20", "value": 0.0, "valueprc": None},
+                ],
+                "amort": [],
+                "offers": [{"offerdate": "2026-11-20", "offertype": "Оферта put"}],
+            },
+            "RU000CUT0002": {
+                "coupons": [
+                    {"coupondate": "2026-12-01", "value": 45.0, "valueprc": 18.0},
+                    {"coupondate": "2027-03-01", "value": 30.0, "valueprc": 12.0},
+                ],
+                "amort": [],
+                "offers": [{"offerdate": "2026-12-01", "offertype": "Оферта put"}],
+            },
+            "RU000AMORT03": {
+                "coupons": [{"coupondate": "2026-12-15", "value": 35.0, "valueprc": 14.0}],
+                "amort": [
+                    {"amortdate": "2026-12-15", "value": 250.0, "valueprc": 25.0},
+                    {"amortdate": "2027-12-15", "value": 750.0, "valueprc": 75.0},
+                ],
+                "offers": [],
+            },
+            "RU000SAFE004": {
+                "coupons": [
+                    {"coupondate": "2026-11-25", "value": 35.0, "valueprc": 14.0},
+                    {"coupondate": "2027-02-25", "value": 40.0, "valueprc": 16.0},
+                ],
+                "amort": [{"amortdate": "2026-11-25", "value": 1000.0, "valueprc": 100.0}],
+                "offers": [
+                    {"offerdate": "2026-11-25", "offertype": "Оферта put"},
+                    {"offerdate": "2027-06-01", "offertype": "Оферта put"},
+                ],
+            },
+        }
+        infos = {
+            "u1": {"maturity": "2028-01-01", "cur": "rub"},
+            "u2": {"maturity": "2028-01-01", "cur": "rub"},
+            "u3": {"maturity": "2027-12-15", "cur": "rub"},
+            "u4": {"maturity": "2026-11-25", "cur": "rub"},
+        }
+        self.patch(
+            moex_bondization=lambda isin: bz_map.get(isin),
+            moex_bond_options=lambda isin: None,
+            moex_coupon_schedule=lambda isin: [],
+        )
+        rows = [
+            {"type": "bond", "uid": "u1", "isin": "RU000BLIND01", "name": "Слепой Пут", "qty": 10, "cur": "rub", "value_rub": 10000.0},
+            {"type": "bond", "uid": "u2", "isin": "RU000CUT0002", "name": "Снижение Купона", "qty": 5, "cur": "rub", "value_rub": 5000.0},
+            {"type": "bond", "uid": "u3", "isin": "RU000AMORT03", "name": "Амортизация", "qty": 4, "cur": "rub", "value_rub": 4000.0},
+            {"type": "bond", "uid": "u4", "isin": "RU000SAFE004", "name": "Погашение", "qty": 2, "cur": "rub", "value_rub": 2000.0},
+        ]
+        rad = T.offer_amort_radar(None, rows, today=self.TODAY, horizon_days=60, infos=infos)
+        self.assertEqual(rad["counts"], {"blind_put": 1, "coupon_cut": 1, "amort": 1, "total": 3})
+        by_isin = {x["isin"]: x for x in rad["items"]}
+        self.assertEqual(by_isin["RU000BLIND01"]["kind"], "blind_put")
+        self.assertEqual(by_isin["RU000BLIND01"]["days_left"], 19)
+        self.assertEqual(by_isin["RU000CUT0002"]["kind"], "coupon_cut")
+        self.assertEqual(by_isin["RU000CUT0002"]["cur_rate"], 18.0)
+        self.assertEqual(by_isin["RU000CUT0002"]["next_rate"], 12.0)
+        self.assertEqual(by_isin["RU000AMORT03"]["kind"], "amort")
+        self.assertAlmostEqual(by_isin["RU000AMORT03"]["amount_rub"], 1000.0)
+        self.assertNotIn("RU000SAFE004", by_isin)
+
+    def test_offline_missing_data_safe(self):
+        def boom(_):
+            raise RuntimeError("offline")
+        self.patch(moex_bondization=boom, moex_bond_options=boom, moex_coupon_schedule=boom)
+        rows = [{"type": "bond", "uid": "u1", "isin": "RU000OFFLINE", "name": "Офлайн", "qty": 1, "cur": "rub", "value_rub": 1000.0}]
+        rad = T.offer_amort_radar(None, rows, today=self.TODAY, horizon_days=60, infos={"u1": {"maturity": "2028-01-01"}})
+        self.assertEqual(rad["items"], [])
+        self.assertEqual(rad["counts"]["total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

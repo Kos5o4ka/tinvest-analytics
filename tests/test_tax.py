@@ -205,21 +205,39 @@ class Netting(unittest.TestCase):
         self.assertAlmostEqual(M.tx_iis_table(st2, {})[0]["deduct_total"], 400000 * 0.13)
 
     def test_iis3_exempt_limit_single_year(self):
-        rows, _ = M.tax_group_years([], {2025: {"div": 35e6}}, None, True)
+        rows, _ = M.tax_group_years([], {2025: {"coupon": 35e6}}, None, True)
         r = rows[0]
         self.assertAlmostEqual(r["iis_exempt_used"], 30e6)
         self.assertAlmostEqual(r["tax"], M.tx_ndfl(5e6, 2025)[0])
 
     def test_iis3_exempt_limit_cumulative(self):
-        rows, _ = M.tax_group_years([], {2024: {"div": 20e6}, 2025: {"div": 15e6}}, None, True)
+        rows, _ = M.tax_group_years([], {2024: {"coupon": 20e6}, 2025: {"coupon": 15e6}}, None, True)
         self.assertAlmostEqual(rows[0]["tax"], 0)
         self.assertAlmostEqual(rows[1]["iis_exempt_used"], 10e6)
         self.assertAlmostEqual(rows[1]["tax"], M.tx_ndfl(5e6, 2025)[0])
 
     def test_iis3_small_profit_untaxed(self):
-        rows, _ = M.tax_group_years([], {2025: {"div": 1e6}}, None, True)
+        rows, _ = M.tax_group_years([], {2025: {"coupon": 1e6}}, None, True)
         self.assertAlmostEqual(rows[0]["tax"], 0)
         self.assertAlmostEqual(rows[0]["iis_exempt_used"], 1e6)
+
+    def test_iis_dividends_taxed_and_iis_b_unlimited(self):
+        rows, _ = M.tax_group_years([], {2025: {"div": 1e6, "coupon": 1e6}}, None, True)
+        self.assertAlmostEqual(rows[0]["iis_exempt_used"], 1e6)
+        self.assertAlmostEqual(rows[0]["tax"], M.tx_ndfl(1e6, 2025)[0])
+
+        sel = [{"id": "I", "name": "ИИС", "type": "ИИС", "opened": "2018-01-01T00:00:00Z"}]
+        ops = [buy("2024-01-10", 1000, 10000, acc="I"), sell("2024-02-10", 1000, 60000, acc="I"),
+               op("2024-03-01", "DIVIDEND", 100000, acc="I")]
+        st_b = M.tax_compute(ops, {}, None, sel, {"iis": {"I": {"type": "B", "opened": "2018-01-01"}}, "loss_carry": {}}, today=date(2025, 1, 10))
+        r_b = [g for g in st_b["groups"] if g["kind"] == "iis"][0]["rows"][0]
+        self.assertAlmostEqual(r_b["iis_exempt_used"], 50e6)
+        self.assertAlmostEqual(r_b["tax"], M.tx_ndfl(100000, 2024)[0])
+
+        st_3 = M.tax_compute(ops, {}, None, sel, {"iis": {"I": {"type": "3", "opened": "2018-01-01"}}, "loss_carry": {}}, today=date(2025, 1, 10))
+        r_3 = [g for g in st_3["groups"] if g["kind"] == "iis"][0]["rows"][0]
+        self.assertAlmostEqual(r_3["iis_exempt_used"], 30e6)
+        self.assertAlmostEqual(r_3["tax"], M.tx_ndfl(20e6 + 100000, 2024)[0])
 
     def test_iis_deduct_rate_15(self):
         sel = [{"id": "I", "name": "I", "type": "ИИС", "opened": "2019-01-01T00:00:00Z"}]
@@ -415,3 +433,205 @@ class Forecast(unittest.TestCase):
         self.assertEqual(sk[0]["ldv_days"], 11)
         self.assertIn("ЛДВ", sk[0]["reason"])
         self.assertNotIn("w", [c["uid"] for c in f["harvest"]])
+
+
+class FeeKeyAllocation(unittest.TestCase):
+    def test_same_second_fees_not_multiplied_n_squared(self):
+        # Две покупки в одну секунду без parentOperationId + две комиссии -5 и -5 -> суммарная комиссия 10, а не 20
+        ts = "2025-01-10T12:00:00Z"
+        b1 = buy("2025-01-10", 1, 1000)
+        b2 = buy("2025-01-10", 1, 1000)
+        f1 = op("2025-01-10", "BROKER_FEE", -5)
+        f2 = op("2025-01-10", "BROKER_FEE", -5)
+        for o in (b1, b2, f1, f2):
+            o["date"] = ts
+        s = sell("2025-02-10", 2, 1100)
+        eng = M.tax_engine([b1, b2, f1, f2, s], None, None)
+        self.assertAlmostEqual(sum(r["cost"] for r in eng["sales"]), 2010.0, places=6)
+
+    def test_fee_key_proportional_partial_coverage_and_zero_turnover(self):
+        # t1 имеет собственную commission=-3; t4 привязана через parentOperationId (-7 не должна утечь в fee_key);
+        # t2 (оборот 1000) и t3 (оборот 2000) делят общую комиссию 12 пропорционально 1:2 -> 4 и 8
+        ts = "2025-01-10T12:00:00Z"
+        t1 = buy("2025-01-10", 1, 1000, comm=3)
+        t2 = buy("2025-01-10", 1, 1000)
+        t3 = buy("2025-01-10", 1, 2000)
+        t4 = buy("2025-01-10", 1, 500)
+        f_parent = op("2025-01-10", "BROKER_FEE", -7)
+        f_parent["parentOperationId"] = t4["id"]
+        f_shared = op("2025-01-10", "BROKER_FEE", -12)
+        for o in (t1, t2, t3, t4, f_parent, f_shared):
+            o["date"] = ts
+        eng = M.tax_engine([t1, t2, t3, t4, f_parent, f_shared], None, None)
+        units = [round(l["unit"], 6) for l in eng["open"]]
+        self.assertEqual(units, [1003.0, 1004.0, 2008.0, 507.0])
+
+        # Нулевой оборот у трёх сделок в одну секунду -> равное деление с остатком на последнюю сделку, сумма строго 10.0
+        z1 = op("2025-01-11", "BUY", 0.0, qty=1, uid="uz")
+        z2 = op("2025-01-11", "BUY", 0.0, qty=1, uid="uz")
+        z3 = op("2025-01-11", "BUY", 0.0, qty=1, uid="uz")
+        fz = op("2025-01-11", "BROKER_FEE", -10, uid="uz")
+        for o in (z1, z2, z3, fz):
+            o["date"] = "2025-01-11T12:00:00Z"
+        eng_z = M.tax_engine([z1, z2, z3, fz], None, None)
+        self.assertAlmostEqual(sum(l["qty"] * l["unit"] for l in eng_z["open"]), 10.0, places=9)
+
+    def test_finalize_import_preserves_imp_uid_on_fee_and_tax(self):
+        class Offline:
+            ready = False
+
+        raw_ops = [
+            {"id": "imp-1", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_BUY",
+             "payment": money(-1000), "quantity": "1", "quantityDone": "1", "price": money(1000),
+             "name": "Unknown", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-1-f", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_BROKER_FEE",
+             "payment": money(-5), "name": "Комиссия: Unknown", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-1-t", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_TAX",
+             "payment": money(-13), "name": "Налог", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-1-dt", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_DIVIDEND_TAX",
+             "payment": money(-2), "name": "Налог див", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-1-ct", "date": "2025-01-10T12:00:00Z", "type": "OPERATION_TYPE_BOND_TAX",
+             "payment": money(-1), "name": "Налог куп", "_ident": "UNKNOWNISIN"},
+            {"id": "imp-2", "date": "2025-02-10T12:00:00Z", "type": "OPERATION_TYPE_SELL",
+             "payment": money(1200), "quantity": "1", "quantityDone": "1", "price": money(1200),
+             "name": "Unknown", "_ident": "UNKNOWNISIN"},
+        ]
+        finalized, _ = M.finalize_import(Offline(), raw_ops, keep_demo=True, synth=False)
+        by_id = {o["id"]: o for o in finalized}
+        self.assertEqual(by_id["imp-1-f"].get("instrumentUid"), "imp:UNKNOWNISIN")
+        self.assertEqual(by_id["imp-1-t"].get("instrumentUid"), "imp:UNKNOWNISIN")
+        self.assertEqual(by_id["imp-1-dt"].get("instrumentUid"), "imp:UNKNOWNISIN")
+        self.assertEqual(by_id["imp-1-ct"].get("instrumentUid"), "imp:UNKNOWNISIN")
+        eng = M.tax_engine(finalized, None, None)
+        self.assertEqual(len(eng["sales"]), 1)
+        self.assertAlmostEqual(eng["sales"][0]["cost"], 1005.0, places=6)
+
+
+class FifoShortsAndEpsilon(unittest.TestCase):
+    def test_float_epsilon_closes_position(self):
+        ops = [buy("2025-01-10", 0.1, 100), buy("2025-01-11", 0.2, 100), sell("2025-01-12", 0.3, 100)]
+        self.assertEqual(M.fifo(ops), {})
+
+    def test_uncovered_short_sell_does_not_fabricate_100pct_yield(self):
+        s = sell("2025-01-10", 10, 1000)
+        res = M.fifo([s])
+        self.assertEqual(res, {})
+        self.assertAlmostEqual(s["_yield"], 0.0, places=9)
+
+    def test_short_then_cover_realizes_profit_in_fifo_and_analyze(self):
+        s = sell("2025-01-10", 10, 100)
+        b = buy("2025-02-10", 10, 90)
+        res = M.fifo([s, b])
+        self.assertEqual(res, {})
+        self.assertAlmostEqual(s["_yield"], 0.0, places=9)
+        self.assertAlmostEqual(b["_yield"], 100.0, places=9)
+        an = M.analyze([s, b], {}, "all", 0)
+        self.assertAlmostEqual(an["life"].get("realized", 0.0), 100.0, places=6)
+
+    def test_short_covered_by_securities_input_realizes_result(self):
+        s = sell("2025-01-10", 10, 100)
+        si = op("2025-02-10", "INPUT_SECURITIES", 0.0, 10, price=90)
+        self.assertEqual(M.fifo([s, si]), {})
+        self.assertAlmostEqual(si["_yield"], 100.0, places=9)
+        an = M.analyze([s, si], {}, "all", 0)
+        self.assertAlmostEqual(an["life"].get("realized", 0.0), 100.0, places=6)
+
+
+class NdflDeclarationPackage(unittest.TestCase):
+    def test_decl_fx_payouts_and_cbr_conversion(self):
+        rates = {"2024-03-15": 92.0, "2024-06-20": 12.5}
+        fx = lambda cur, day: rates.get(day) if cur in ("usd", "cny") else 1.0
+        div_usd = op("2024-03-15", "DIVIDEND", pay=100.0, uid="u_aapl", cur="usd", name="Apple")
+        tax_usd = op("2024-03-15", "DIVIDEND_TAX", pay=-10.0, uid="u_aapl", cur="usd", name="Apple")
+        tax_usd["parentOperationId"] = div_usd["id"]
+        cpn_cny = op("2024-06-20", "COUPON", pay=200.0, uid="u_cny", itype="bond", cur="cny", name="Юань Бонд")
+        div_rub = op("2024-07-01", "DIVIDEND", pay=500.0, uid="u_sber", cur="rub", name="Сбер")
+        sel = [{"id": "A", "name": "Основной", "type": ""}]
+        st = M.tax_compute([div_usd, tax_usd, cpn_cny, div_rub], {}, [], sel, {"iis": {}, "loss_carry": {}}, fx=fx)
+        decl = M.tx_decl(st)
+        self.assertIn(2024, decl)
+        fxp = decl[2024]["fx_payouts"]
+        self.assertEqual(len(fxp), 2)
+        self.assertEqual(fxp[0]["cur"], "USD")
+        self.assertAlmostEqual(fxp[0]["amount"], 100.0)
+        self.assertAlmostEqual(fxp[0]["rate"], 92.0)
+        self.assertAlmostEqual(fxp[0]["amount_rub"], 9200.0)
+        self.assertAlmostEqual(fxp[0]["tax_orig"], 10.0)
+        self.assertAlmostEqual(fxp[0]["tax_rub"], 920.0)
+        self.assertIn("ЦБ РФ", fxp[0]["source"])
+        self.assertEqual(fxp[1]["cur"], "CNY")
+        self.assertAlmostEqual(fxp[1]["amount_rub"], 2500.0)
+
+    def test_decl_sales_and_loss_carry_breakdown(self):
+        ops = [
+            buy("2023-01-10", 10, 100, uid="u1", name="Бумага 1"),
+            sell("2023-06-01", 10, 60, uid="u1", name="Бумага 1"),
+            buy("2024-01-10", 10, 100, uid="u2", name="Бумага 2"),
+            sell("2024-06-01", 10, 130, uid="u2", name="Бумага 2"),
+        ]
+        sel = [{"id": "A", "name": "Основной", "type": ""}]
+        st = M.tax_compute(ops, {}, [], sel, {"iis": {}, "loss_carry": {}})
+        decl = M.tx_decl(st)
+        g23 = decl[2023]["groups"][0]
+        self.assertAlmostEqual(g23["loss_new"], 400.0)
+        self.assertEqual(g23["carry_pool"], [{"year": 2023, "amount": 400.0}])
+        self.assertEqual(len(g23["sales"]), 1)
+        self.assertEqual(g23["sales"][0]["bdate"], "2023-01-10")
+        self.assertEqual(g23["sales"][0]["sdate"], "2023-06-01")
+        g24 = decl[2024]["groups"][0]
+        self.assertAlmostEqual(g24["carry_used"], 300.0)
+        self.assertAlmostEqual(g24["trade_base"], 0.0)
+        self.assertEqual(g24["carry_pool"], [{"year": 2023, "amount": 100.0}])
+        self.assertAlmostEqual(decl[2024]["loss_carry"]["carry_used"], 300.0)
+        self.assertEqual(decl[2024]["loss_carry"]["pool"], [{"year": 2023, "amount": 100.0}])
+
+    def test_decl_csv_endpoint_and_bom(self):
+        rates = {"2024-03-15": 90.0}
+        fx = lambda cur, day: rates.get(day) if cur == "usd" else 1.0
+        ops = [
+            buy("2024-01-10", 10, 100, uid="u1", name="Акция А"),
+            sell("2024-05-10", 10, 150, uid="u1", name="Акция А"),
+            op("2024-03-15", "DIVIDEND", pay=50.0, uid="u2", cur="usd", name="Microsoft"),
+        ]
+        sel = [{"id": "A", "name": "Основной", "type": ""}]
+        st = M.tax_compute(ops, {}, [], sel, {"iis": {}, "loss_carry": {"2022": 200.0}}, fx=fx)
+        old_state = M.tax_state
+        M.tax_state = lambda cfg, acc, force=False: (st, {"iis": {}, "loss_carry": {"2022": 200.0}})
+        try:
+            code, body, ctype, headers = M.API_GET["/api/tax/decl.csv"]({}, "all", {"year": "2024"}, False)
+        finally:
+            M.tax_state = old_state
+        self.assertEqual(code, 200)
+        self.assertIn("text/csv", ctype)
+        self.assertEqual(headers["Content-Disposition"], 'attachment; filename="3ndfl_2024.csv"')
+        self.assertTrue(body.startswith(b"\xef\xbb\xbf"))
+        text = body.decode("utf-8-sig")
+        self.assertIn(";", text)
+        self.assertIn("Сделка;Основной;2024-05-10;2024-01-10;Акция А", text)
+        self.assertIn("Валютная выплата;Основной;2024-03-15;;Microsoft", text)
+        self.assertIn(";USD;50,0;90,0;4500,0;", text)
+        with self.assertRaises(M.ApiError):
+            M.tax_decl_csv_get({}, "all", {"year": "bad"}, False)
+
+    def test_tx_cur_tax_iis_type_b_unlimited_and_sur_as_rub(self):
+        # BUG #23: ИИС-Б освобождён без лимита 30 млн (iis_limit=None), ИИС-3 ограничен TAX_IIS3_EXEMPT_LIMIT
+        sale = {"sdate": date(2025, 6, 1), "bdate": date(2024, 1, 1), "qty": 1.0, "type": "share",
+                "proceeds": 35_000_000.0, "cost": 0.0, "fee": 0.0,
+                "bucket": "sec", "result": 35_000_000.0, "income": 35_000_000.0, "ldv": False, "blind": False}
+        g_b = {"kind": "iis", "iis": {"exempt": True, "type": "B"}, "sales": [sale], "inc": {}}
+        g_3 = {"kind": "iis", "iis": {"exempt": True, "type": "3"}, "sales": [sale], "inc": {}}
+        settings = {"loss_carry": {}, "offset_coupons": False}
+        tax_b, _ = M.tx_cur_tax(g_b, [], 2025, settings)
+        tax_3, _ = M.tx_cur_tax(g_3, [], 2025, settings)
+        self.assertEqual(tax_b, 0.0)
+        self.assertGreater(tax_3, 0.0)
+
+        # BUG #23: валюта "sur" считается как "rub" (курс 1.0, без предупреждения fx_sur)
+        ops = [
+            op("2025-04-01", "COUPON", pay=100.0, uid="u1", cur="sur", name="ОФЗ"),
+        ]
+        eng = M.tax_engine(ops, {"u1": {"type": "bond"}}, fx=lambda c, d: 99.0 if c != "rub" else 1.0)
+        self.assertEqual(eng["payouts"][0]["rate"], 1.0)
+        self.assertAlmostEqual(eng["payouts"][0]["amount_rub"], 100.0, places=2)
+        self.assertEqual(eng["warnings"], [])
+

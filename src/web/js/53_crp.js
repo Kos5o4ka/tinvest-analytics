@@ -59,8 +59,9 @@ function crpDilution(c){
   let h='';
   if(!d.n_scanned)h+=`<div class="mu">Данных для проверки нет: в приложении нет потока раскрытий по акциям этого эмитента (покрытие — только выпуски облигаций, и то не для всех).</div>`;
   else if(!m.length)h+=`<div class="mu">Проверено заголовков раскрытий: ${d.n_scanned}. Упоминаний допэмиссии, конвертируемых облигаций, опционных программ, выкупа акций и lock-up не найдено.</div>`;
-  else h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Признак</th><th class="l">Раскрытие</th></tr></thead><tbody>${m.map(x=>`<tr><td class="l">${crpFmtDate(x.date)}</td><td class="l"><span class="tag">${esc(x.label)}</span></td><td class="l">${x.url?`<a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.title)}</a>`:esc(x.title)}</td></tr>`).join('')}</tbody></table></div>`;
-  h+=`<p class="note">Поиск по ключевым словам в заголовках — это грубый признак, а не оценка вероятности размытия. `+((lk.skrin||lk.edisclosure)?`Первоисточник: <a href="${esc(lk.skrin||lk.edisclosure)}" target="_blank" rel="noopener">раскрытие информации эмитента</a>.`:'')+`</p>`;
+  else h+=`<div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Признак</th><th class="l">Раскрытие</th></tr></thead><tbody>${m.map(x=>{const xu=safeUrl(x.url);return`<tr><td class="l">${crpFmtDate(x.date)}</td><td class="l"><span class="tag">${esc(x.label)}</span></td><td class="l">${xu?`<a href="${esc(xu)}" target="_blank" rel="noopener">${esc(x.title)}</a>`:esc(x.title)}</td></tr>`}).join('')}</tbody></table></div>`;
+  const lu=safeUrl(lk.skrin||lk.edisclosure);
+  h+=`<p class="note">Поиск по ключевым словам в заголовках — это грубый признак, а не оценка вероятности размытия. `+(lu?`Первоисточник: <a href="${esc(lu)}" target="_blank" rel="noopener">раскрытие информации эмитента</a>.`:'')+`</p>`;
   return h;
 }
 function crpCard(c){
@@ -106,6 +107,6 @@ function bindCrp(){
   const b=document.getElementById('crp-go');if(b)b.onclick=go;
   const i=document.getElementById('crp-q');if(i){i.onkeydown=e=>{if(e.key==='Enter')go()};i.oninput=()=>{S.crp.q=i.value}}
   const m=document.getElementById('crp-my');if(m)m.onclick=()=>{loadCrpBatch(!!S.crp.batch);renderSoon()};
-  document.querySelectorAll('tr[data-crp]').forEach(tr=>{tr.style.cursor='pointer';tr.onclick=()=>{const q=tr.dataset.crp;if(q){loadCrp(q,false);renderSoon();window.scrollTo(0,0)}}});
+  document.querySelectorAll('tr[data-crp]').forEach(tr=>{tr.style.cursor='pointer';tr.onclick=()=>{const q=tr.dataset.crp;if(q){loadCrp(q,false);renderSoon();const v=$('#view');if(v)v.scrollTop=0}}});
 }
 regPage('crp',{title:'Устойчивость эмитентов',group:'Риски и контроль',icon:'<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/>',render:pCrp,bind:bindCrp,pro:true});

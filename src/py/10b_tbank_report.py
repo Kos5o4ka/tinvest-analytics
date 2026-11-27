@@ -411,7 +411,7 @@ def tbank_parse(table, splits=None):
     for key, p in sorted(meta_pos.items()):
         nm = p["name"] or name_of.get(key) or key
         unit = first_unit.get(key, 0.0)
-        if p["econ_open"] > 0.5:
+        if p["econ_open"] > 1e-6:
             q = p["econ_open"]
             ops.append(dict({"id": "tb-open-sec-%s-%s" % (key, period["from"]), "date": open_iso,
                              "type": "OPERATION_TYPE_INPUT_SECURITIES", "payment": to_money(0, "rub"),   # деньги не двигаются: оценка — в price
@@ -422,7 +422,7 @@ def tbank_parse(table, splits=None):
         r = p["resid"]
         if key in redeemed and p["econ_close"] < 0.5 and r < -0.5:
             r = 0.0  # списание бумаг — это погашение, его уже учтёл денежный раздел
-        if abs(r) <= 0.5:
+        if abs(r) <= 1e-6:
             r = 0.0
         # FIFO не знает коротких позиций: если продаж больше, чем бумаг на руках (продажа «с плеча» с покрытием через
         # секунды), недостающее довносим входящей операцией перед продажей и снимаем после покупки-покрытия
@@ -435,16 +435,16 @@ def tbank_parse(table, splits=None):
             if dq < 0:
                 take = min(run, -dq)
                 run -= take
-                if -dq - take > 0.5:
+                if -dq - take > 1e-6:
                     extra.append((True, -dq - take, t - timedelta(seconds=1), u))
                     short += -dq - take
             else:
                 c = min(short, dq)
-                if c > 0.5:
+                if c > 1e-6:
                     extra.append((False, c, t + timedelta(seconds=1), u))
                     short -= c
                 run += dq - c
-        if short > 0.5:
+        if short > 1e-6:
             extra.append((False, short, end_dt, unit))
         if r > 0:
             extra.append((True, r, start.replace(second=1), unit))
@@ -517,7 +517,7 @@ def tbank_preview(ops, meta):
     bad_cash = {c: [a, b] for c, (a, b) in rec["cash"].items() if abs(a - b) >= 1.0}
     bad_pos = sorted(((abs(a - b), k, a, b) for k, (a, b) in rec["pos"].items() if abs(a - b) >= 0.5), reverse=True)
     st = meta["stat"]
-    mine = [x for x in imports_list() if x.get("format") == meta["format"]]  # добавлять предлагаем только к счетам того же брокера
+    mine = [x for x in imports_list() if (x.get("format") == meta["format"] or x.get("manual")) and not x.get("sync_src")]  # добавлять предлагаем только к счетам того же брокера
     return {"format": meta["format"], "title": meta["title"], "period": meta["period"], "count": len(ops),
             "kinds": dict(kinds), "kinds_ru": TB_KIND_RU, "repo_skipped": st.get("repo", 0), "mirror_skipped": st.get("mirror", 0),
             "opening_sec": st.get("opening_sec", 0), "xfer": st.get("xfer_in", 0) + st.get("xfer_out", 0),
@@ -525,12 +525,17 @@ def tbank_preview(ops, meta):
             "pos_worst": [[k, a, b] for _, k, a, b in bad_pos[:5]],
             "sample": [[o["date"][:10], op_type(o), o.get("name") or "", op_qty(o), qf(o["payment"]), cur_of(o["payment"])]
                        for o in ops if not o.get("_opening") and classify(o["type"]) != "other"][:12],
-            "targets": [{"id": x["id"], "name": x.get("name") or ""} for x in mine]}
+            "targets": [{"id": x["id"], "name": x.get("name") or ""} for x in mine],
+            "manual_matches": manual_matches_preview(ops, None)}
 
 
 def import_preview_any(filename, raw):
     hit = broker_try(filename, raw)
-    return tbank_preview(*hit) if hit else import_preview(filename, raw)
+    res = tbank_preview(*hit) if hit else import_preview(filename, raw)
+    dup = find_duplicate_import(raw, hit[0] if hit else None)
+    if dup:
+        res["duplicate_of"] = dup
+    return res
 
 
 def import_ops_any(filename, raw, table, header_row, mapping):

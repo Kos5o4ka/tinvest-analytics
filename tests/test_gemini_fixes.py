@@ -252,6 +252,379 @@ class GeminiFixesTests(unittest.TestCase):
         self.assertAlmostEqual(by_c["LQDT"]["ghost_val"], 202000.0, places=1)
         self.assertAlmostEqual(by_c["LQDT"]["diff_rub"], 18000.0, places=1)
 
+    def test_bug_sec02_safe_url(self):
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        core_js = open(os.path.join(root, "src/web/js/01_core.js"), encoding="utf-8").read()
+        self.assertIn("function safeUrl(", core_js)
+        self.assertIn("https:", core_js)
+        self.assertIn("http:", core_js)
+
+        # Все внешние динамические href в JS должны проходить через safeUrl / rtSafeUrl
+        bad = []
+        pat = re.compile(r"""href=(?:"\$\{esc\(([^)]+)\)\}"|'\+esc\(([^)]+)\)\+')""")
+        for path in sorted(glob.glob(os.path.join(root, "src/web/js/*.js"))):
+            fname = os.path.basename(path)
+            txt = open(path, encoding="utf-8").read()
+            for idx, line in enumerate(txt.splitlines(), 1):
+                for m in pat.finditer(line):
+                    expr = m.group(1) or m.group(2)
+                    # Константные/внутренние URL и уже отфильтрованные переменные (rtSafeUrl/safeUrl) допустимы
+                    if expr in ("u", "su", "eu", "fu", "bu", "iu", "au", "ru", "xu", "lu", "s", "href", "proUrl()"):
+                        continue
+                    if "safeUrl(" in expr or "rtSafeUrl(" in expr:
+                        continue
+                    bad.append(f"{fname}:{idx}: {expr}")
+        self.assertEqual(bad, [], f"Найдены непроверенные внешние href: {bad}")
+
+    def test_bug_ui01_pro_features(self):
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        pro_js = open(os.path.join(root, "src/web/js/43_pro.js"), encoding="utf-8").read()
+        # Собираем все страницы из PRO_PAGES и regPage(..., {..., pro:true})
+        m_pages = re.search(r"const PRO_PAGES=\[([^\]]+)\]", pro_js)
+        self.assertIsNotNone(m_pages)
+        pro_pages = set(re.findall(r"'([^']+)'", m_pages.group(1)))
+        feat_keys = set()
+        # Ключи из PRO_FEATURES={...}
+        m_feat = re.search(r"const PRO_FEATURES=\{([\s\S]*?)\n\};", pro_js)
+        self.assertIsNotNone(m_feat)
+        feat_keys.update(re.findall(r"^\s*([a-z0-9_]+):\{", m_feat.group(1), re.M))
+        for path in sorted(glob.glob(os.path.join(root, "src/web/js/*.js"))):
+            txt = open(path, encoding="utf-8").read()
+            for m in re.finditer(r"regPage\('([^']+)',\{[^}]*\bpro:true\b", txt):
+                pro_pages.add(m.group(1))
+            feat_keys.update(re.findall(r"PRO_FEATURES\.([a-z0-9_]+)\s*=", txt))
+        missing = sorted(pro_pages - feat_keys)
+        self.assertEqual(missing, [], f"Отсутствуют в PRO_FEATURES: {missing}")
+        # В proAbout() должна быть защита от undefined
+        m_about = re.search(r"function proAbout\(\)\{([\s\S]*?)\n\}", pro_js)
+        self.assertIsNotNone(m_about)
+        self.assertTrue(".filter(Boolean)" in m_about.group(1) or "if(!f)return''" in m_about.group(1))
+
+    def test_bug_ui02_ofz_no_portfolio(self):
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        shell_js = open(os.path.join(root, "src/web/js/06_shell.js"), encoding="utf-8").read()
+        m = re.search(r"NO_PORTFOLIO_PAGES=new Set\(\[([^\]]+)\]\)", shell_js)
+        self.assertIsNotNone(m)
+        pages = set(re.findall(r"'([^']+)'", m.group(1)))
+        for p in ("ofz", "arb", "dgap", "rot", "dbx", "mm", "crp", "mic"):
+            self.assertIn(p, pages)
+
+    def test_bug_ui03_no_emoji_and_ru_terms(self):
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        em_pat = re.compile(r"[\U0001F300-\U0001FAFF]")
+        hits = []
+        for p in sorted(glob.glob(os.path.join(root, "src/web/**/*"), recursive=True)):
+            if not p.endswith((".js", ".html", ".css")):
+                continue
+            txt = open(p, encoding="utf-8").read()
+            if em_pat.search(txt):
+                hits.append(os.path.relpath(p, root))
+        taxopt = open(os.path.join(root, "src/py/13x5_taxopt.py"), encoding="utf-8").read()
+        if em_pat.search(taxopt) or "\U0001f6e1" in taxopt:
+            hits.append("src/py/13x5_taxopt.py")
+        self.assertEqual(hits, [], f"Найдены эмодзи в UI: {hits}")
+
+        for rel, bad_terms in (
+            ("src/web/js/14_scr.js", ["'Scatter'", "'CY, %'", "'MacDur, лет'"]),
+            ("src/web/js/65_delight.js", ["Scatter"]),
+            ("src/web/js/60_pm.js", ["Trade Post-Mortem", "Win Rate", "Profit Factor", "cashflow-matched"]),
+        ):
+            txt = open(os.path.join(root, rel), encoding="utf-8").read()
+            for term in bad_terms:
+                self.assertNotIn(term, txt, f"{term} найден в {rel}")
+
+    def test_bug_ui04_local_iso(self):
+        import glob
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        core_js = open(os.path.join(root, "src/web/js/01_core.js"), encoding="utf-8").read()
+        self.assertIn("localIso", core_js)
+        self.assertIn("getFullYear()", core_js)
+        bad = []
+        for p in sorted(glob.glob(os.path.join(root, "src/web/js/*.js"))):
+            txt = open(p, encoding="utf-8").read()
+            if "toISOString().slice(0,10)" in txt or "toISOString().slice(0, 10)" in txt:
+                bad.append(os.path.basename(p))
+        self.assertEqual(bad, [], f"Найдено UTC toISOString().slice(0,10) в: {bad}")
+
+    def test_bug_ui05_misc_fixes(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        crp = open(os.path.join(root, "src/web/js/53_crp.js"), encoding="utf-8").read()
+        self.assertNotIn("window.scrollTo(0,0)", crp)
+        self.assertIn("scrollTop=0", crp)
+
+        pm = open(os.path.join(root, "src/web/js/60_pm.js"), encoding="utf-8").read()
+        self.assertGreaterEqual(pm.count('id="pm-r"'), 2)
+
+        rt = open(os.path.join(root, "src/web/js/11_ratings.js"), encoding="utf-8").read()
+        self.assertIn("i<0?'нет рейтинга'", rt)
+
+        iss = open(os.path.join(root, "src/web/js/36_issuers.js"), encoding="utf-8").read()
+        self.assertNotIn("r.rating?RSC.indexOf(r.rating):null", iss)
+
+        bc = open(os.path.join(root, "src/py/13a_bondcard.py"), encoding="utf-8").read()
+        self.assertNotIn('.get("NAME")', bc)
+
+
+class TestCurToRub(unittest.TestCase):
+    def test_cur_to_rub_variants(self):
+        self.assertIsNone(M.cur_to_rub(None, "usd", {"usd": 90.0}))
+        self.assertEqual(M.cur_to_rub(100, "rub", {"usd": 90.0}), 100.0)
+        self.assertEqual(M.cur_to_rub(100, "SUR", {"usd": 90.0}), 100.0)
+        self.assertEqual(M.cur_to_rub(100, None, {"usd": 90.0}), 100.0)
+        self.assertAlmostEqual(M.cur_to_rub(10, "USD", {"usd": 92.5}), 925.0)
+        self.assertAlmostEqual(M.cur_to_rub(10, "cny", {"CNY": 12.5}), 125.0)
+        self.assertEqual(M.cur_to_rub(50, "eur", {}), 50.0)
+        self.assertIsNone(M.cur_to_rub(50, "eur", {}, default=None))
+
+
+def _check_js_delimiters(code):
+    """Verify balanced (), [], {} across JS code, skipping strings, templates, comments, and regexes."""
+    stack, tpl_brace_stack = [], []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closing = {v: k for k, v in pairs.items()}
+    i, n, line, prev_tok = 0, len(code), 1, ""
+    regex_prev = frozenset((
+        "", "(", "[", "{", ",", ";", ":", "=", "!", "&", "|", "?", "+", "-", "*", "%", "^", "~", "<", ">",
+        "return", "case", "throw", "typeof", "void", "delete", "in", "of", "else",
+    ))
+
+    def skip_line_comment(pos):
+        while pos < n and code[pos] != "\n":
+            pos += 1
+        return pos
+
+    def skip_block_comment(pos):
+        nonlocal line
+        pos += 2
+        while pos < n - 1 and not (code[pos] == "*" and code[pos + 1] == "/"):
+            if code[pos] == "\n":
+                line += 1
+            pos += 1
+        return pos + 2
+
+    def skip_string(pos, quote):
+        nonlocal line
+        pos += 1
+        while pos < n:
+            ch = code[pos]
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == "\n":
+                line += 1
+            if ch == quote:
+                return pos + 1
+            pos += 1
+        raise AssertionError(f"Unclosed string {quote} at line {line}")
+
+    def scan_template(pos):
+        nonlocal line
+        pos += 1
+        while pos < n:
+            ch = code[pos]
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == "\n":
+                line += 1
+            if ch == "`":
+                return pos + 1
+            if ch == "$" and pos + 1 < n and code[pos + 1] == "{":
+                stack.append(("{", line))
+                tpl_brace_stack.append(len(stack))
+                return pos + 2
+            pos += 1
+        raise AssertionError(f"Unclosed template literal at line {line}")
+
+    def skip_regex(pos):
+        pos += 1
+        in_class = False
+        while pos < n:
+            ch = code[pos]
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == "[":
+                in_class = True
+            elif ch == "]":
+                in_class = False
+            elif ch == "/" and not in_class:
+                pos += 1
+                while pos < n and code[pos].isalpha():
+                    pos += 1
+                return pos
+            elif ch == "\n":
+                raise AssertionError(f"Unclosed regex at line {line}")
+            pos += 1
+        raise AssertionError(f"Unclosed regex at line {line}")
+
+    while i < n:
+        ch = code[i]
+        if ch == "\n":
+            line += 1
+            i += 1
+            continue
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            if code[i + 1] == "/":
+                i = skip_line_comment(i)
+                continue
+            if code[i + 1] == "*":
+                i = skip_block_comment(i)
+                continue
+            if prev_tok in regex_prev:
+                i = skip_regex(i)
+                prev_tok = "regex"
+                continue
+        if ch in ('"', "'"):
+            i = skip_string(i, ch)
+            prev_tok = "str"
+            continue
+        if ch == "`":
+            i = scan_template(i)
+            prev_tok = "`"
+            continue
+        if ch in pairs:
+            stack.append((ch, line))
+            prev_tok = ch
+            i += 1
+            continue
+        if ch in closing:
+            if not stack or stack[-1][0] != closing[ch]:
+                raise AssertionError(f"Mismatched {ch} at line {line}, stack={stack[-3:]}")
+            stack.pop()
+            if ch == "}" and tpl_brace_stack and len(stack) == tpl_brace_stack[-1] - 1:
+                tpl_brace_stack.pop()
+                i = scan_template(i)
+                prev_tok = "`"
+                continue
+            prev_tok = ch
+            i += 1
+            continue
+        if ch.isalpha() or ch in "_$":
+            j = i + 1
+            while j < n and (code[j].isalnum() or code[j] in "_$"):
+                j += 1
+            prev_tok = code[i:j]
+            i = j
+            continue
+        if ch.isdigit():
+            j = i + 1
+            while j < n and (code[j].isalnum() or code[j] in "._"):
+                j += 1
+            prev_tok = "num"
+            i = j
+            continue
+        prev_tok = ch
+        i += 1
+    if stack:
+        raise AssertionError(f"Unclosed delimiters: {stack[-5:]}")
+
+
+class TestJsSmoke(unittest.TestCase):
+    def test_js_concat_delimiters_and_symbols(self):
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        js_files = sorted(glob.glob(os.path.join(root, "src/web/js/*.js")))
+        self.assertGreater(len(js_files), 60)
+        names = [os.path.basename(p) for p in js_files]
+        for expected in ("21_set.js", "21a_set_parts.js", "21b_set_ui.js", "33_calc.js", "33a_calc_ui.js"):
+            self.assertIn(expected, names)
+        self.assertLess(names.index("21_set.js"), names.index("21a_set_parts.js"))
+        self.assertLess(names.index("21a_set_parts.js"), names.index("21b_set_ui.js"))
+        self.assertLess(names.index("33_calc.js"), names.index("33a_calc_ui.js"))
+
+        joined = "\n".join(open(p, encoding="utf-8").read() for p in js_files)
+        _check_js_delimiters(joined)
+
+        for sym in ("function renderSettings", "function pCalc", "function bindCalc", "function clNdfl", "function clSim",
+                    "PRO_FEATURES", "PRO_PAGES", "function crowdInviteHtml"):
+            self.assertIn(sym, joined, f"Missing JS symbol: {sym}")
+
+        for route in ("/api/calc", "/api/config", "/api/crowd/status", "/api/flows_instruments"):
+            self.assertIn(route, joined, f"Missing JS API route reference: {route}")
+
+        for dead_route in ("/api/crp/batch/status", "/api/disclosure", "/api/flows_instrument'"):
+            self.assertNotIn(dead_route, joined, f"Dead route still referenced in JS: {dead_route}")
+
+        emoji_rx = re.compile(r"[\U0001F300-\U0001FAFF]")
+        self.assertEqual(emoji_rx.findall(joined), [], "Color emojis found in src/web/js/*.js")
+
+
+class TestFrontendBugfixes(unittest.TestCase):
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _read(self, rel):
+        with open(os.path.join(self.ROOT, rel), encoding="utf-8") as f:
+            return f.read()
+
+    def test_bug1_no_returnemptyHint(self):
+        import glob
+        import re
+        for p in glob.glob(os.path.join(self.ROOT, "src/web/js/*.js")):
+            txt = open(p, encoding="utf-8").read()
+            self.assertIsNone(re.search(r"\breturnemptyHint\s*\(", txt), f"returnemptyHint in {p}")
+        for rel in ("src/web/js/09_ret.js", "src/web/js/12_bonds.js", "src/web/js/25_reb.js"):
+            self.assertIn("return emptyHint(", self._read(rel))
+
+    def test_bug2_no_undefined_css_vars(self):
+        import glob
+        import re
+        for ext in ("src/web/js/*.js", "src/web/css/*.css"):
+            for p in glob.glob(os.path.join(self.ROOT, ext)):
+                txt = open(p, encoding="utf-8").read()
+                self.assertIsNone(re.search(r"var\(--(?:bg2|text)\)", txt), f"Undefined CSS var in {p}")
+        self.assertIn("var(--card2)", self._read("src/web/js/08_dash.js"))
+        self.assertIn("var(--card2)", self._read("src/web/js/12_bonds.js"))
+        self.assertIn("var(--tx)", self._read("src/web/css/39_txo.css"))
+
+    def test_bug3_print_css_and_tax_decl_breaks(self):
+        pcss = self._read("src/web/css/08_print.css")
+        for v in ("--bg:", "--card:", "--card2:", "--tx:", "--tx2:", "--mu:", "--line:", "--line2:"):
+            self.assertIn(v, pcss, f"Missing print theme reset {v}")
+        self.assertIn("#tkr", pcss)
+        self.assertNotIn("position:fixed", pcss)
+        self.assertIn("tx-decl-card", pcss)
+        self.assertIn('class="tkr noprint" id="tkr"', self._read("src/web/shell.html"))
+        self.assertIn(".tx-decl-card{break-inside:auto}", self._read("src/web/css/20_tax.css"))
+        self.assertIn('class="card tx-decl-card"', self._read("src/web/js/19_tax.js"))
+
+    def test_bug6_boot_waits_for_late_pages(self):
+        boot = self._read("src/web/js/26_changelog_boot.js")
+        self.assertIn("async function boot()", boot)
+        idx_await = boot.index("await Promise.resolve()")
+        idx_check = boot.index("if(!PAGES.some(")
+        self.assertLess(idx_await, idx_check)
+
+    def test_bug7_9_10_pay_and_txo(self):
+        pay = self._read("src/web/js/16_pay.js")
+        self.assertIn("PAY_J.acc===acc", pay)
+        self.assertIn("CF36.acc===acc", pay)
+        self.assertIn("if(S.account!==acc){PAY_J.st='idle'", pay)
+        self.assertIn("if(S.account!==acc){CF36.st='idle'", pay)
+        self.assertNotIn("if(tab==='cf36'){CF36.open=true;", pay)
+        self.assertIn("mr.by.redemption!=null?mr.by.redemption:(mr.total||0)", pay)
+
+        txo = self._read("src/web/js/54_txo.js")
+        self.assertIn("S.txo.hBusyAcc===acc", txo)
+        self.assertIn("if(S.account!==acc){if(S.page==='txo')renderSoon();return}", txo)
+
+    def test_bug12_settings_mode_badge_and_hit_selector(self):
+        sui = self._read("src/web/js/21b_set_ui.js")
+        self.assertGreaterEqual(sui.count("updateModeBadge("), 3)
+        scss = self._read("src/web/css/56_settings_v2.css")
+        self.assertIn(".st-row.st-hit", scss)
+
 
 if __name__ == "__main__":
     unittest.main()

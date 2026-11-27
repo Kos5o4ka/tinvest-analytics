@@ -286,6 +286,17 @@ def _bk_suggest():
         cands.append(("Яндекс Диск" if "andex" in base or "Яндекс" in base else
                       "Google Drive" if "Google" in base else "iCloud Drive" if "iCloud" in base or "CloudDocs" in base else base,
                       os.path.join(home, base)))
+    if platform.system() == "Windows":           # OneDrive из переменных окружения, Google Drive — отдельный диск «G:\Мой диск»
+        for env, lab in (("OneDrive", "OneDrive"), ("OneDriveConsumer", "OneDrive"), ("OneDriveCommercial", "OneDrive (работа)")):
+            v = os.environ.get(env)
+            if v:
+                cands.append((lab, v))
+        for drv in "GHIJ":
+            for n in ("Мой диск", "My Drive"):
+                cands.append(("Google Drive", "%s:\\%s" % (drv, n)))
+        for v in (os.environ.get("YANDEX_DISK"), os.path.join(os.environ.get("USERPROFILE", home), "YandexDisk")):
+            if v:
+                cands.append(("Яндекс Диск", v))
     cs = os.path.join(home, "Library", "CloudStorage")
     try:
         for n in sorted(os.listdir(cs)):
@@ -294,7 +305,13 @@ def _bk_suggest():
             cands.append((lab, os.path.join(cs, n)))
     except OSError:
         pass
-    return [{"label": a, "path": b} for a, b in cands if os.path.isdir(b)]
+    out, seen = [], set()
+    for a, b in cands:
+        k = os.path.normcase(os.path.normpath(b))
+        if k not in seen and os.path.isdir(b):
+            seen.add(k)
+            out.append({"label": a, "path": b, "sep": os.sep})
+    return out
 
 
 def api_backup_status(cfg, acc, q, force):

@@ -34,7 +34,19 @@ function kpCommands(){
     {g:'Команды',t:'Сменить тему',k:'тема оформление светлая тёмная',run:()=>$('#thm').click()},
     {g:'Команды',t:'Экспорт операций (CSV)',k:'экспорт операции csv скачать выгрузка',run:()=>{location.href='/api/operations.csv?'+new URLSearchParams({period:S.period,account:S.account});toast('Загрузка CSV…','info')}},
     {g:'Команды',t:'Горячие клавиши',k:'горячие клавиши шпаргалка помощь hotkeys shortcuts',run:()=>{if(typeof ksToggle==='function')ksToggle()}},
-    {g:'Команды',t:'Перейти в настройки',k:'настройки конфигурация токен settings',run:()=>go('set')}];
+    {g:'Команды',t:'Перейти в настройки',k:'настройки конфигурация токен settings',run:()=>go('set')}]
+    .concat(kpAccountCmds(),typeof uxSetMode==='function'&&typeof UX!=='undefined'?[
+      {g:'Команды',t:'Режим: Базовый',k:'режим базовый простой mode basic',run:()=>uxSetMode('basic')},
+      {g:'Команды',t:'Режим: Профи',k:'режим профи полный все разделы mode pro',run:()=>uxSetMode('pro')}]:[]);
+}
+/* переключение активного счёта прямо из палитры */
+function kpAccountCmds(){
+  const accs=(S.accounts||[]).filter(a=>!a.empty);
+  if(!accs.length||!S.data)return[];
+  const pick=id=>()=>{if(id===S.account)return;S.account=id;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
+  const out=accs.length>1?[{g:'Команды',t:'Счёт: Все счета',k:'счёт все счета account',run:pick('all')}]:[];
+  accs.forEach(a=>out.push({g:'Команды',t:'Счёт: '+a.name,k:'счёт переключить account '+(a.id||''),run:pick(a.id)}));
+  return out;
 }
 function kpSecurities(q){
   const out=[],seen=new Set();
@@ -61,6 +73,12 @@ function kpBuild(raw){
   PAGES.filter(Boolean).forEach(p=>{const sc=kpScore(p[1],q);if(sc)res.push({g:'Разделы',t:p[1],sc,s:S.navHidden.includes(p[0])&&!NAV_PINNED.includes(p[0])?'скрыт в меню':'',run:()=>go(p[0])})});
   if(q)KB.forEach((a,i)=>{const tk=kpNorm(a.t+' '+a.k),sc=q.split(/\s+/).filter(Boolean).every(w=>tk.includes(w))?kpScore(a.t+' '+a.k,q):0;if(sc)res.push({g:'База знаний',t:a.t,s:a.c,sc,run:()=>kbOpen(a.id)})});
   if(q)res.push(...kpSecurities(q));
+  const im=raw.trim().toUpperCase().match(/^[A-Z]{2}[A-Z0-9]{9}[0-9]$/);
+  if(im){
+    const isin=im[0];
+    if(typeof watchToggle==='function')res.push({g:'Команды',t:'В наблюдение / из наблюдения: '+isin,sc:50,run:()=>{watchToggle(isin).then(on=>toast(on?'Добавлено в наблюдение':'Убрано из наблюдения')).catch(()=>toast('Не удалось изменить наблюдение'))}});
+    if(typeof cmpAdd==='function')res.push({g:'Команды',t:'В сравнение: '+isin,sc:50,run:()=>cmpAdd(isin)});
+  }
   const order={'Калькулятор':-1,'Команды':q?1:0,'Разделы':q?0:1,'База знаний':2,'Бумаги':3};
   const calc=typeof calcEval==='function'?calcEval(raw):null;
   if(calc!==null)res.push({g:'Калькулятор',t:'= '+calcFmt(calc),s:'Enter — скопировать',sc:99,run:()=>copyText(calcRaw(calc),'Скопировано: '+calcFmt(calc))});

@@ -29,7 +29,7 @@ function feeTariffOptimizer(){
 }
 /* Счета других брокеров (импорт отчётов): свои тарифы, модель Т-Инвестиций к ним не применяется */
 async function feeSetTariff(id,v){
-  try{await post('/api/config',{broker_tariffs:{[id]:v}});load(false,true)}catch(e){alert(e.message)}
+  try{await post('/api/config',{broker_tariffs:{[id]:v}});load(false,true)}catch(e){uiErr(e)}
 }
 function feeOtherBrokers(){
   const rows=(S.data||{}).broker_fees||[];

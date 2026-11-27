@@ -1,33 +1,9 @@
 /* ── Премиальный слой оформления: спокойная палитра, тонкие линии, глубина, строгая типографика ──
    Загружается последним и переопределяет базовые стили; светлая тема получает свои токены ниже. */
-:root{
-  --bg:#07090d;--side:#090c12;--card:#0c1017;--card2:#131923;--card-hover:#171e2a;
-  --line:#ffffff0f;--line2:#ffffff1c;
-  --tx:#edf1f7;--tx2:#9aa5b6;--mu:#6b7688;
-  --ac:#3b82f6;--ac2:#2f6fe0;--ac-tx:#7aa8f8;--ac-glow:rgba(59,130,246,.22);
-  --pos:#2bc48a;--neg:#f0626a;
-  --sk-1:#0c1017;--sk-2:#151b26;
-  --hl:inset 0 1px 0 #ffffff08;
-  --elev:0 1px 2px #00000066,0 8px 24px -12px #00000080;
-  --glass:rgba(7,9,13,.72);--glass-solid:rgba(11,14,20,.97);
-  --lbl:#7d889a;
-  --r:16px;
-}
-:root[data-theme=light]{
-  --bg:#f5f6f8;--side:#fbfbfc;--card:#ffffff;--card2:#f3f5f8;--card-hover:#f7f8fa;
-  --line:#0f172a12;--line2:#0f172a21;
-  --tx:#0b1220;--tx2:#4a5568;--mu:#6b7486;
-  --ac:#2563eb;--ac2:#1d4fd7;--ac-tx:#1d4ed8;
-  --hl:inset 0 1px 0 #ffffff;
-  --elev:0 1px 2px #0f172a0d,0 8px 24px -14px #0f172a26;
-  --glass:rgba(245,246,248,.78);--glass-solid:rgba(250,251,252,.97);
-  --lbl:#6b7486;
-}
-
-body{font-feature-settings:"cv11","ss01","ss03";letter-spacing:-.008em}
+body{font-feature-settings:"cv11","ss01","calt";letter-spacing:-.008em}
 ::-webkit-scrollbar{width:8px;height:8px}
-::-webkit-scrollbar-thumb{background:#ffffff14;border:2px solid transparent;background-clip:padding-box;border-radius:8px}
-::-webkit-scrollbar-thumb:hover{background:#ffffff26;background-clip:padding-box}
+::-webkit-scrollbar-thumb{background:#ffffff24;border:2px solid transparent;background-clip:padding-box;border-radius:8px}
+::-webkit-scrollbar-thumb:hover{background:#ffffff40;background-clip:padding-box}
 [data-theme=light] ::-webkit-scrollbar-thumb{background:#0f172a1f;background-clip:padding-box}
 
 /* ── боковая панель ── */
@@ -68,18 +44,19 @@ aside{background:var(--side);border-right:1px solid var(--line)}
 
 /* ── поверхности ── */
 .card{background:linear-gradient(180deg,#ffffff05,#ffffff00 120px),var(--card);border:1px solid var(--line);border-radius:var(--r);
-  box-shadow:var(--hl),var(--elev);padding:20px 22px}
+  box-shadow:var(--hl),var(--elev);padding:var(--pad-card)}
 [data-theme=light] .card{background:var(--card)}
-.card h2{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em;margin-bottom:16px}
+/* заголовки карточек — обычным регистром; капсом остаются только мелкие надзаголовки (.st-gh h3, .kpi .k, .hero .lbl) */
+.card h2{font-size:14.5px;font-weight:620;color:var(--tx);letter-spacing:-.012em;margin-bottom:14px}
 .card h2 .sp{text-transform:none;letter-spacing:0;font-size:12px}
 .card h2 .btn,.card h2 button,.card h2 a{text-transform:none;letter-spacing:0}
-.wrap{gap:18px}
-.g{gap:18px}
+.wrap{gap:var(--gap)}
+.g{gap:var(--gap)}
 
 /* ── главный блок «Стоимость портфеля» ── */
-.hero{background:radial-gradient(90% 140% at 100% 0%,#3b82f61f 0%,transparent 55%),radial-gradient(60% 90% at 0% 100%,#2bc48a0d 0%,transparent 60%),linear-gradient(180deg,#ffffff06,#ffffff00),var(--card);padding:26px 28px}
+.hero{background:radial-gradient(90% 140% at 100% 0%,rgba(var(--ac-rgb),.12) 0%,transparent 55%),radial-gradient(60% 90% at 0% 100%,#2bc48a0d 0%,transparent 60%),linear-gradient(180deg,#ffffff06,#ffffff00),var(--d2);padding:26px 28px;box-shadow:var(--d2-hl),var(--d2-shadow)}
 .hero:after{display:none}
-[data-theme=light] .hero{background:radial-gradient(90% 140% at 100% 0%,#2563eb14 0%,transparent 55%),var(--card)}
+[data-theme=light] .hero{background:radial-gradient(90% 140% at 100% 0%,rgba(var(--ac-rgb),.08) 0%,transparent 55%),var(--d2)}
 .hero .lbl{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em}
 .hero .val{font-size:46px;font-weight:600;letter-spacing:-.04em;margin-top:8px}
 .hero .val small{font-size:26px;font-weight:500;color:var(--mu)}
@@ -145,11 +122,9 @@ input.in,.in,select.in,textarea.in{background:#ffffff05;border:1px solid var(--l
 
 /* ── таблицы ── */
 th{background:var(--card);color:var(--lbl);font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.06em;padding:10px 10px;border-bottom:1px solid var(--line)}
-td{padding:11px 10px;border-bottom:1px solid #ffffff08}
-[data-theme=light] td{border-bottom-color:#0f172a0b}
-tr:hover td{background:#ffffff05}
-.tbl table tr:hover td:first-child{background:#141a24}
-[data-theme=light] .tbl table tr:hover td:first-child{background:#f7f8fa}
+td{padding:var(--pad-td);border-bottom:1px solid var(--line)}
+tr:hover td,.tbl table tr:hover td:first-child{background:var(--card-hover)}
+[data-theme=light] tr:hover td,[data-theme=light] .tbl table tr:hover td:first-child{background:var(--card2)}
 .tk b{font-weight:600;letter-spacing:-.01em}
 
 /* ── аватары бумаг: приглушённый тон вместо «радуги» ── */
@@ -169,3 +144,30 @@ tr:hover td{background:#ffffff05}
 .ov-leave>div{animation:ovOut .22s cubic-bezier(.4,0,1,1) forwards!important}
 @keyframes ovFade{to{opacity:0}}
 @keyframes ovOut{to{transform:translateX(100%)}}
+
+/* ── Уровни глубины: 0 — фон и меню, 1 — карточки, 2 — главные блоки, всплывающие меню, окна и панели ── */
+.more-dd,.tour-pop,#ks{background:var(--d2);box-shadow:var(--d2-hl),var(--d2-shadow)}
+#bc-ov .bc-dr,#sk-ov .sk-dr{box-shadow:var(--d2-hl),-24px 0 64px -12px #000000a6}
+
+/* ── Иконки duotone: подложка .ic-d внутри svg.ic; в покое спокойная, при наведении и в активном пункте горит акцентом ── */
+svg.ic{transition:transform .18s cubic-bezier(.3,1.35,.5,1)}
+svg.ic .ic-d{fill:currentColor;fill-opacity:.14;stroke:none;transition:fill-opacity .18s ease,fill .18s ease}
+.nav button:hover svg.ic .ic-d,.st-sh>i svg.ic .ic-d,.empty svg.ic .ic-d{fill-opacity:.24}
+.nav button.on svg.ic{color:var(--ac-tx)}
+.nav button.on svg.ic .ic-d{fill:var(--ac);fill-opacity:.34}
+.nav button:hover svg.ic{transform:scale(1.06)}
+@media(prefers-reduced-motion:reduce){svg.ic,svg.ic .ic-d{transition:none}.nav button:hover svg.ic{transform:none}}
+/* стеклянные капсулы для иконок в заголовках разделов и пустых экранов */
+.st-sh>i{background:radial-gradient(120% 120% at 20% 0%,rgba(var(--ac-rgb),.22),transparent 70%),var(--card2);box-shadow:inset 0 1px 0 #ffffff1c,0 0 0 1px var(--line2),0 4px 12px -4px #00000066}
+[data-theme=light] .st-sh>i{box-shadow:inset 0 1px 0 #ffffff,0 0 0 1px var(--line2),0 4px 12px -6px #0f172a33}
+.empty svg.ic{opacity:.7;color:var(--ac-tx)}
+
+/* ── Плотность интерфейса (Настройки → Внешний вид) ── */
+:root[data-density=compact] body{font-size:13.5px}
+:root[data-density=compact] .card h2{margin-bottom:10px}
+:root[data-density=compact] .hero{padding:18px 20px}
+:root[data-density=compact] .nav button{padding:6px 10px}
+:root[data-density=compact] #view{padding:16px 22px 40px}
+/* цифры: табличные, знак валюты приглушён (не только в Hero, но и в крупных показателях) */
+.kpi .v,.hero .val,.hero .meta b,.pill,.num{font-variant-numeric:tabular-nums lining-nums}
+.kpi .v small,.kpi .v .cur{opacity:.65;font-weight:500}

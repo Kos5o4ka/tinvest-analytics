@@ -159,18 +159,74 @@ class Parity(unittest.TestCase):
             M.http_text, M.kbd_at = orig
             M._scr.update(t=0, rows=[])
         srv = {}
-        for b in SA.BOARDS:
+        for b in ("TQCB", "TQOB"):
             SA.quotes_from_iss(boards[b], srv)
         self.assertEqual(sorted(app), sorted(srv))
         for k in app:
             self.assertEqual((app[k]["price"], app[k]["yield"], app[k]["name"]), (srv[k]["price"], srv[k]["yield"], srv[k]["name"]))
+
+    def test_floater_and_currency_boards(self):
+        self.assertIn("TQOD", SA.BOARDS)
+        self.assertIn("TQOY", SA.BOARDS)
+        iss_floater = {
+            "securities": {"columns": ["SECID", "ISIN", "SHORTNAME", "MATDATE", "PREVLEGALCLOSEPRICE", "YIELDATPREVWAPRICE"],
+                           "data": [["FLT1", "RU000A10FLT1", "Флоатер 1", d(365), 99.0, None]]},
+            "marketdata": {"columns": ["SECID", "WAPRICE", "LAST", "YIELD", "YIELDATWAPRICE"],
+                           "data": [["FLT1", 99.2, 99.3, None, None]]},
+        }
+        q = SA.quotes_from_iss(iss_floater)
+        self.assertIn("RU000A10FLT1", q)
+        self.assertEqual(q["RU000A10FLT1"]["price"], 99.2)
+        self.assertIsNone(q["RU000A10FLT1"]["yield"])
+        al = SA.goal_alerts({"isin": "RU000A10FLT1", "name": "Флоатер 1", "target_price": 100.0, "target_yield": 20.0},
+                            q["RU000A10FLT1"], TODAY)
+        self.assertEqual([a["id"] for a in al], ["gp|RU000A10FLT1|100.0"])
+
+    def test_contract_boards_and_prefixes(self):
+        """Контракт между приложением и сервером: площадки ISS, префиксы тревог и пороги оферт."""
+        self.assertEqual(SA.BOARDS, ("TQCB", "TQOB", "TQOD", "TQOY"))
+        self.assertEqual(SA.SENT_PREFIXES, M.TG_SRV_PREFIX)
+        self.assertEqual(set(SA.SENT_PREFIXES), {"gy|", "gp|", "rm|", "ofr|", "pay|"})
+        self.assertEqual(SA.TG_OFR_CALL_DAYS, M.TG_OFR_CALL_DAYS)
+        self.assertEqual(SA.TG_OFR_CLOSE_DAYS, M.TG_OFR_CLOSE_DAYS)
+        self.assertEqual(SA.EV, M._TG_EV)
+        # validate сохраняет серверные префиксы и отбрасывает локальные (price|, mon|, offer|)
+        sent_in = ["gp|RU000A1|99.0", "gy|RU000A1|15.0", "rm|n1", "ofr|RU000A1|2026-12-01|put",
+                   "pay|2026-12-01|coupon|A", "mon|RU000A1", "offer|RU000A1", "price|RU000A1"]
+        v = SA.validate({"v": 1, "sent": sent_in})
+        self.assertEqual(v["sent"], ["gp|RU000A1|99.0", "gy|RU000A1|15.0", "rm|n1",
+                                      "ofr|RU000A1|2026-12-01|put", "pay|2026-12-01|coupon|A"])
+
+    def test_iss_quote_parity_currency_boards_and_floater(self):
+        """Паритет разбора ISS для валютных площадок (TQOD/TQOY) и флоатеров без YIELD."""
+        sec_cols = ["SECID", "ISIN", "SHORTNAME", "MATDATE", "PREVLEGALCLOSEPRICE", "YIELDATPREVWAPRICE"]
+        md_cols = ["SECID", "WAPRICE", "LAST", "YIELD", "YIELDATWAPRICE"]
+        tqod = {
+            "securities": {"columns": sec_cols, "data": [["USD1", "RU000A10USD1", "Замещ USD", d(700), 94.5, 7.2]]},
+            "marketdata": {"columns": md_cols, "data": [["USD1", 95.125, 95.2, 7.15, None]]},
+        }
+        tqoy = {
+            "securities": {"columns": sec_cols, "data": [["CNY1", "RU000A10CNY1", "Юань 1", d(500), 98.0, None]]},
+            "marketdata": {"columns": md_cols, "data": [["CNY1", None, 98.4, None, None]]},
+        }
+        q = {}
+        SA.quotes_from_iss(tqod, q)
+        SA.quotes_from_iss(tqoy, q)
+        self.assertEqual(q["RU000A10USD1"], {"price": 95.125, "yield": 7.15, "name": "Замещ USD"})
+        self.assertEqual(q["RU000A10CNY1"], {"price": 98.4, "yield": None, "name": "Юань 1"})
+        for isin, ty, tp in [("RU000A10USD1", 7.0, 96.0), ("RU000A10CNY1", 10.0, 99.0)]:
+            app_al = M.watch_goal_alerts(isin, q[isin]["name"], q[isin], ty, tp, TODAY)
+            srv_al = SA.goal_alerts({"isin": isin, "name": q[isin]["name"], "target_yield": ty, "target_price": tp},
+                                    q[isin], TODAY)
+            self.assertEqual([(x["id"], x["message"]) for x in app_al], [(x["id"], x["message"]) for x in srv_al])
 
 
 class Payload(unittest.TestCase):
     """Подписка из приложения: только разрешённые поля, без токена, счетов и текста заметок; сервер её принимает."""
 
     def setUp(self):
-        self.saved = {k: getattr(M, k) for k in ("load_config", "_tg_offer_items", "_tg_payments", "_scr_by_isin", "tcat_info", "watch_items", "notes_all")}
+        self.saved = {k: getattr(M, k) for k in ("load_config", "imports_list", "_tg_offer_items", "_tg_payments", "_scr_by_isin", "tcat_info", "watch_items", "notes_all")}
+        M.imports_list = lambda: []
         M._tg_offer_items = lambda cfg, today: [dict(o) for o in OFFERS]
         M._tg_payments = lambda cfg, days: list(PAYS)
         M._scr_by_isin = lambda: {"RU000A100001": {"name": "Выпуск 1"}}
@@ -216,6 +272,25 @@ class Payload(unittest.TestCase):
         self.assertEqual((p["offers"], p["pays"]), ([], []))                         # без токена портфеля нет
         self.assertEqual(len(p["goals"]), 1)
 
+    def test_imported_portfolio_without_token(self):
+        extra = ("imports_list", "build_summary", "build_monitor", "watch_payload")
+        saved_extra = {k: getattr(M, k) for k in extra}
+        try:
+            M.imports_list = lambda: [{"id": "imp-demo", "name": "Демо"}]
+            M.build_summary = lambda cfg, a, b: {"portfolio": {"total": 123456.0, "daily": 100.0}}
+            M.build_monitor = lambda cfg, a: {"summary": {"high": 1, "medium": 0}, "alerts": []}
+            M.watch_payload = lambda cfg: {"items": [], "alerts": []}
+            p = M.tg_srv_payload(self.cfg(token=""), {})
+            self.assertEqual(len(p["offers"]), len(OFFERS))
+            self.assertEqual(len(p["pays"]), len(PAYS))
+            txt = M.tg_digest_text(self.cfg(token=""))
+            self.assertIn("Портфель", txt)
+            self.assertIn("Ближайшие 7 дней", txt)
+            self.assertIn("Мониторинг", txt)
+        finally:
+            for k, v in saved_extra.items():
+                setattr(M, k, v)
+
 
 class Validation(unittest.TestCase):
     def test_rejects(self):
@@ -239,16 +314,24 @@ class Validation(unittest.TestCase):
         v = SA.validate({"v": 1, "goals": [{"isin": "RU000A100001", "name": "a\x00b" + "я" * 500}], "sent": ["gy|x", "price|y", 5]})
         self.assertEqual(v["goals"], [])                                         # без порогов цель не хранится
         self.assertEqual(v["sent"], ["gy|x"])
+        self.assertFalse(v["weekly_digest"])
+        self.assertTrue(SA.validate({"v": 1, "weekly_digest": True})["weekly_digest"])
+        for bad_opt in ({"v": 1, "weekly_digest": "yes"}, {"v": 1, "weekly_digest": 1},
+                        {"v": 1, "bot_goals_rev": "1"}, {"v": 1, "bot_goals_rev": -1}, {"v": 1, "bot_goals_rev": True}):
+            with self.assertRaises(SA.AlertError) as cm:
+                SA.validate(bad_opt)
+            self.assertEqual(cm.exception.code, 400)
 
 
 class FakeNotifier:
     def __init__(self):
-        self.msgs, self.fail = [], None
+        self.msgs, self.sevs, self.fail = [], [], None
 
-    def enqueue(self, uid, text):
+    def enqueue(self, uid, text, severity=0):
         if self.fail:
             raise ts.NotifyError(429, self.fail)
         self.msgs.append((uid, text))
+        self.sevs.append(severity)
         return len(self.msgs)
 
 
@@ -344,6 +427,24 @@ class Server(unittest.TestCase):
         self.assertIsNone(self.st.get(1))
         self.assertEqual(self.st.delete(1), (False, []))
 
+    def test_delete_during_quotes_race(self):
+        self.st.put(1, self.sub())
+        orig_fetch = self.ck.fetch_json
+        deleted = [False]
+
+        def racing_fetch(url):
+            if not deleted[0]:
+                deleted[0] = True
+                self.st.delete(1)
+            return orig_fetch(url)
+
+        self.ck.fetch_json = racing_fetch
+        self.ck.run_once()
+        self.assertEqual(self.nt.msgs, [])
+        self.assertEqual(self.st.sent_keys(1), [])
+        self.st.mark_sent(1, ["gy|RU000A100001|20.0"])
+        self.assertEqual(self.st.sent_keys(1), [])
+
     def test_stopped_in_bot(self):
         self.st.put(1, self.sub())
         self.db.execute("INSERT INTO meta(k, v) VALUES('alerts_stop:1', '1')")
@@ -359,6 +460,72 @@ class Server(unittest.TestCase):
         self.st.put(1, self.sub(goals=[]))
         self.ck.run_once()
         self.assertEqual(self.fetches, [])
+
+    def test_bot_goals_rev_not_clobbered(self):
+        self.st.put(1, self.sub())
+        rev = self.st.upsert_bot_goal(1, {"isin": "RU000A10BOT1", "name": "Бот-цель", "target_price": 95.0})
+        self.assertEqual(rev, 1)
+        # Десктоп без bot_goals_rev (или со старой ревизией 0) не затирает цель из бота
+        self.st.put(1, self.sub(bot_goals_rev=0))
+        cur = self.st.get(1)["sub"]
+        self.assertEqual(cur["bot_goals_rev"], 1)
+        self.assertEqual({g["isin"] for g in cur["goals"]}, {"RU000A100001", "RU000A10BOT1"})
+        # После подтверждения ревизии bot_goals_rev=1 список десктопа становится авторитетным
+        self.st.put(1, self.sub(bot_goals_rev=1))
+        cur2 = self.st.get(1)["sub"]
+        self.assertEqual(cur2["bot_goals_rev"], 1)
+        self.assertEqual([g["isin"] for g in cur2["goals"]], ["RU000A100001"])
+
+    def test_bot_goal_seen_by_app_not_resurrected(self):
+        self.st.put(1, self.sub(goals=[]))
+        self.st.upsert_bot_goal(1, {"isin": "RU000A10BOT1", "name": "Бот", "target_price": 95.0})       # rev 1
+        self.st.upsert_bot_goal(1, {"isin": "RU000A10BOT2", "name": "Бот 2", "target_price": 96.0})   # rev 2
+        # программа уже получила rev 1 и удалила BOT1 у себя: синхронизация с rev 1 не воскрешает BOT1
+        self.st.put(1, self.sub(goals=[], bot_goals_rev=1))
+        cur = self.st.get(1)["sub"]
+        self.assertEqual({g["isin"] for g in cur["goals"]}, {"RU000A10BOT2"})
+        self.st.delete_bot_goal(1, "RU000A10BOT2")                   # rev 3
+        self.assertEqual(SA.fresh_bot_deleted(self.st.get(1)["sub"], 2), ["RU000A10BOT2"])
+        self.assertEqual(SA.fresh_bot_deleted(self.st.get(1)["sub"], 3), [])
+
+    def test_bot_goal_deletion_not_clobbered_and_watch_only(self):
+        self.st.put(1, self.sub())
+        rev = self.st.delete_bot_goal(1, "RU000A100001")
+        self.assertEqual(rev, 1)
+        # Устаревший sync (bot_goals_rev=0) не должен воскрешать удалённую ботом цель
+        self.st.put(1, self.sub(bot_goals_rev=0))
+        self.assertEqual(self.st.get(1)["sub"]["goals"], [])
+        # Подтверждение ревизии bot_goals_rev=1 позволяет десктопу снова добавить цель
+        self.st.put(1, self.sub(bot_goals_rev=1))
+        self.assertEqual([g["isin"] for g in self.st.get(1)["sub"]["goals"]], ["RU000A100001"])
+
+        # watch_only цели без порогов валидируются и не запрашивают котировки
+        wo = SA.validate({"v": 1, "goals": [{"isin": "RU000A100002", "name": "w", "watch_only": True}]})
+        self.assertEqual(wo["goals"], [{"isin": "RU000A100002", "name": "w", "watch_only": True}])
+        rev2 = self.st.upsert_bot_goal(1, {"isin": "RU000A10BOT3", "name": "Watch", "watch_only": True})
+        self.assertEqual(rev2, 2)
+        self.st.put(1, SA.validate({"v": 1, "goals": [{"isin": "RU000A100002", "name": "w", "watch_only": True}], "bot_goals_rev": 2}))
+        self.fetches.clear()
+        self.ck.run_once()
+        self.assertEqual(self.fetches, [])
+
+    def test_high_severity_offer_close_marks_severity_2(self):
+        self.st.put(1, self.sub(
+            goals=[], reminders=[], pay_days=0, pays=[],
+            offers=[{"isin": "RU000A100002", "name": "Пут", "kind": "put", "date": "2026-11-30",
+                     "period_start": "2026-11-20", "period_end": "2026-11-25"}],
+        ))
+        self.ck.run_once()
+        self.assertEqual(self.nt.sevs, [2])
+
+    def test_stats_counts_and_max_checked(self):
+        self.assertEqual(self.st.stats(), {"subs": 0, "last_checked": None})
+        self.st.put(1, self.sub(weekly_digest=True))
+        self.assertTrue(self.st.get(1)["sub"]["weekly_digest"])
+        self.ck.run_once()
+        st = self.st.stats()
+        self.assertEqual(st["subs"], 1)
+        self.assertEqual(st["last_checked"], self.NOW)
 
 
 class EndToEnd(unittest.TestCase):
@@ -468,6 +635,72 @@ class EndToEnd(unittest.TestCase):
             for k, v in saved.items():
                 setattr(M, k, v)
             M.store().put(M.TG_SENT_KEY, {})
+
+    def test_health_and_sync_bot_goals(self):
+        import urllib.request
+        st = SA.AlertStore(self.dbp)
+        rev = st.upsert_bot_goal(1, {"isin": "RU000A10BOT2", "name": "Бот 2", "target_yield": 18.5})
+        self.assertEqual(rev, 1)
+        code, j = M.tg_srv_req("sync", {"v": 1, "goals": [{"isin": "RU000A100001", "name": "x", "target_price": 99.0}],
+                                        "weekly_digest": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(j["bot_goals_rev"], 1)
+        self.assertEqual({g["isin"] for g in j["goals"]}, {"RU000A100001", "RU000A10BOT2"})
+        st.checked(1)
+        with urllib.request.urlopen(self.url + "/v1/health", timeout=5) as r:
+            h = json.loads(r.read().decode("utf-8"))
+        self.assertEqual(h["alerts_subs"], 1)
+        self.assertIsNotNone(h["alerts_last_checked"])
+
+    def test_notify_optional_severity_and_alerts_value_error(self):
+        import sqlite3
+        import urllib.error
+        import urllib.request
+
+        def post_notify(payload):
+            req = urllib.request.Request(
+                self.url + "/v1/notify",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json", "X-Client-Key": "TIA-AAAA-AAAA-AAAA"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read().decode("utf-8"))
+
+        self.assertEqual(post_notify({"text": "срочно", "severity": 2})[0], 200)
+        self.assertEqual(post_notify({"text": "тоже срочно", "severity": "high"})[0], 200)
+        self.assertEqual(post_notify({"text": "плохо", "severity": 9})[0], 400)
+        self.assertEqual(post_notify({"text": "плохо", "severity": True})[0], 400)
+        db = sqlite3.connect(self.dbp)
+        sevs = [r[0] for r in db.execute("SELECT severity FROM outbox ORDER BY id")]
+        self.assertEqual(sevs, [2, 2])
+        SA.AlertStore(self.dbp).conn().close()
+        db.execute("INSERT OR REPLACE INTO alert_subs(tg_id, data, created, updated) VALUES(1, '{bad_json', 1, 1)")
+        db.commit()
+        db.close()
+        code, j = M.tg_srv_req("status")
+        self.assertEqual(code, 500)
+        self.assertEqual(j.get("error"), "internal_error")
+
+    def test_offer_items_filters_non_isin_tickers(self):
+        saved = {k: getattr(M, k) for k in ("build_bonds", "moex_bondization", "moex_bond_options")}
+        queried = []
+        try:
+            M.build_bonds = lambda cfg, acc: {"rows": [
+                {"isin": "SBER", "qty": 1, "name": "Short"},
+                {"isin": "СБЕР", "qty": 1, "name": "Cyrillic"},
+                {"isin": "RU000A100001", "qty": 1, "name": "Valid"},
+            ]}
+            M.moex_bondization = lambda isin: (queried.append(isin), {"coupons": [], "offers": []})[1]
+            M.moex_bond_options = lambda isin: []
+            M._tg_offer_items({}, "2026-11-24")
+            self.assertEqual(queried, ["RU000A100001"])
+        finally:
+            for k, v in saved.items():
+                setattr(M, k, v)
 
 
 if __name__ == "__main__":

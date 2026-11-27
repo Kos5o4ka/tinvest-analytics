@@ -51,12 +51,17 @@ const UX={
   checkOff:lsGet('ta_ux_chk_off')==='1',
   ddOpen:false
 };
-/* после загрузки конфига: подтягиваем «уже показано» из ui_seen (localStorage окна может быть пустым) */
+/* после загрузки конфига: подтягиваем «уже показано» из ui_seen и ui_prefs (localStorage окна может быть пустым) */
 function uxSeenSync(){
+  if(typeof uiPrefsHydrate==='function'&&S.cfg)uiPrefsHydrate(S.cfg);
   const w=uiGet('ux_why_off'),c=uiGet('ux_checks'),o=uiGet('ux_chk_off');
   if(w&&typeof w==='object')Object.assign(UX.whyOff,w);
   if(c&&typeof c==='object')Object.assign(UX.checks,c);
   if(o===true||o===1)UX.checkOff=true;
+  if(typeof _hadInitialPage!=='undefined'&&!_hadInitialPage&&S.cfg&&S.cfg.start_page&&PAGES.some(p=>p&&p[0]===S.cfg.start_page)){
+    S.page=S.cfg.start_page;
+  }
+  if(typeof renderNav==='function')try{renderNav()}catch(e){}
 }
 function uxSyncMode(){
   document.documentElement.dataset.uxMode=UX.mode;
@@ -64,6 +69,24 @@ function uxSyncMode(){
   const tg=$('#side-tog');if(tg)tg.textContent=UX.mini?'»':'«';
 }
 uxSyncMode();
+
+/* Мгновенные подсказки справа от значков в свёрнутом сайдбаре (родные подсказки браузера появляются с задержкой) */
+{
+  let navTip=null;
+  const hide=()=>{if(navTip){navTip.remove();navTip=null}};
+  document.addEventListener('mouseover',e=>{
+    const b=e.target.closest&&e.target.closest('aside .nav button[data-tip]');
+    if(!b||!document.body.classList.contains('side-mini')){hide();return}
+    hide();
+    const r=b.getBoundingClientRect();
+    navTip=document.createElement('div');navTip.className='nav-tip';navTip.textContent=b.dataset.tip;
+    document.body.appendChild(navTip);
+    navTip.style.left=(r.right+8)+'px';
+    navTip.style.top=(r.top+r.height/2-navTip.offsetHeight/2)+'px';
+  });
+  document.addEventListener('mouseout',e=>{if(e.target.closest&&e.target.closest('aside .nav button[data-tip]'))hide()});
+  document.addEventListener('click',hide,true);
+}
 
 function uxSetMode(m){
   UX.mode=m==='pro'?'pro':'basic';
@@ -101,14 +124,14 @@ function uxSubTabs(){
   const tabs=uxVisTabs(sec);
   if(tabs.length<=1)return'';
   const pgName=k=>UX_TAB_SHORT[k]||(PAGES.find(p=>p&&p[0]===k)||[k,k])[1];
-  return`<div class="ux-subwrap"><div class="seg ux-sub" id="ux-sub">${tabs.map(k=>`<button class="${k===S.page?'on':''}" data-p="${esc(k)}">${esc(pgName(k))}${typeof proNavBadge==='function'?proNavBadge(k):''}</button>`).join('')}</div></div>`;
+  return`<div class="ux-subwrap"><div class="seg ux-sub" id="ux-sub" role="tablist">${tabs.map(k=>`<button role="tab" aria-selected="${k===S.page}" class="${k===S.page?'on':''}" data-p="${esc(k)}">${esc(pgName(k))}${typeof proNavBadge==='function'?proNavBadge(k):''}</button>`).join('')}</div></div>`;
 }
 
 /* ── 1-строчная подсказка «Зачем этот экран» ── */
 function uxWhyBanner(page){
   const t=UX_WHY[page];
   if(!t||UX.whyOff[page])return'';
-  return`<div class="ux-why"><span>${esc(t)}</span><button type="button" class="ux-why-x" data-why-off="${esc(page)}" title="Скрыть подсказку">Понятно ×</button></div>`;
+  return`<div class="ux-why"><span title="${esc(t)}">${esc(t)}</span><button type="button" class="ux-why-x" data-why-off="${esc(page)}" title="Скрыть подсказку">Понятно ×</button></div>`;
 }
 
 /* ── Блоки Главной: «Быстрые задачи» и Чек-лист «С чего начать» ── */
@@ -124,7 +147,7 @@ function uxDashBlocks(){
     ['acc','Подключите счёт или откройте демо-портфель','set'],
     ['pay','Проверьте ближайшие выплаты и оферты','pay'],
     ['bond','Откройте карточку любой облигации в портфеле или скринере','scr'],
-    ['srch','Попробуйте быстрый поиск по тикерам и экранам (⌘K / Ctrl+K)','__srch']
+    ['srch','Попробуйте быстрый поиск по тикерам и экранам ('+MOD+'K)','__srch']
   ];
   const doneCnt=steps.filter(([k])=>UX.checks[k]).length;
   let chk='';
@@ -133,6 +156,12 @@ function uxDashBlocks(){
       <div class="row" style="gap:8px"><button class="btn ghost" id="ux-tour-go" style="padding:5px 10px;font-size:12px">Тур по интерфейсу</button>
       <button class="lnk" id="ux-chk-hide" style="font-size:12px">Скрыть</button></div></div>
       <div class="ux-chk-l">${steps.map(([k,t,act])=>`<button class="ux-chk-i${UX.checks[k]?' done':''}" data-ux-step="${esc(act)}"><i>${UX.checks[k]?'✓':'○'}</i><span>${esc(t)}</span></button>`).join('')}</div></div>`;
+  }
+  /* реальный портфель уже подключён: обучающие блоки сворачиваются в одну строку, график и позиции выше */
+  const real=!(typeof DEMO!=='undefined'&&DEMO.on)&&S.data&&S.data.portfolio&&(S.data.portfolio.positions||[]).length>0;
+  if(real){
+    const chips=[['ofz','Подобрать облигации'],['rot','Флоатеры или фиксы?'],['calc','Сколько накоплю'],['tax','Налоги за год']];
+    return`<div class="ux-chips noprint"><span class="mu">Быстрые задачи:</span>${chips.map(([k,t])=>`<button type="button" class="scr-chip" data-ux-task="${k}">${t}</button>`).join('')}${!UX.checkOff&&doneCnt<steps.length?`<button type="button" class="scr-chip" id="ux-tour-go">Тур по интерфейсу</button>`:''}</div>`;
   }
   return chk+tasks;
 }
@@ -154,15 +183,19 @@ renderNav=function(){
     const act=curSec&&curSec.id===s.id;
     const target=(UX.lastTab[s.id]&&tabs.includes(UX.lastTab[s.id]))?UX.lastTab[s.id]:tabs[0];
     const cnt=tabs.length>1?`<span class="ux-cnt">${tabs.length}</span>`:'';
-    return`<button class="${act?'on':''}" data-p="${esc(target)}" title="${esc(s.title)}">${svgI(IC[s.icon]||IC.dash)}<span class="nav-t">${esc(s.title)}</span>${cnt}</button>`;
+    return`<button class="${act?'on':''}" data-p="${esc(target)}" title="${esc(s.title)}" data-tip="${esc(s.title)}">${svgI(IC[s.icon]||IC.dash)}<span class="nav-t">${esc(s.title)}</span>${cnt}</button>`;
   }).join('');
   if(extra.length){
-    h+='<div class="sep"></div>'+extra.map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}">${svgI(IC[p[0]]||IC.dash)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
+    h+='<div class="sep"></div>'+extra.map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}" data-tip="${esc(p[1])}">${svgI(IC[p[0]]||IC.dash)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
   }
-  h+='<div class="sep"></div>'+NAV_FIXED.map(k=>PAGES.find(p=>p&&p[0]===k)).filter(Boolean).map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}">${svgI(IC[p[0]]||IC.set)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
+  const fx=NAV_FIXED.map(k=>PAGES.find(p=>p&&p[0]===k)).filter(Boolean).map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}" data-tip="${esc(p[1])}">${svgI(IC[p[0]]||IC.set)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
   $('#nav').innerHTML=h;
-  $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
-  $('#period').style.visibility=PERIOD_PAGES.includes(S.page)&&S.data?'visible':'hidden';
+  const nf=$('#nav-fix');if(nf)nf.innerHTML=fx;
+  const pe=$('#period');
+  if(pe){
+    pe.innerHTML=PERIODS.map(([k,t])=>`<button type="button" class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
+    pe.style.display=PERIOD_PAGES.includes(S.page)&&S.data?'':'none';
+  }
   const a=S.accounts.find(x=>x.id===S.account);
   const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
   if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}

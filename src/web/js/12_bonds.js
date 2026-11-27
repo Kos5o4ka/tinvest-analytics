@@ -1,6 +1,10 @@
 /* ── Облигации ── */
-/* интенсивность показана лёгким «бейджем» вокруг значения, а не заливкой всей ячейки */
-function heatCell(v,mx,rgb,txt){if(bad(v))return'<td class="num mu">—</td>';const a=Math.max(0,Math.min(1,v/(mx||1)));return`<td class="num"><span class="hv" style="background:rgba(${rgb},${(0.05+a*0.15).toFixed(3)})">${txt}</span></td>`}
+/* интенсивность показана лёгким «бейджем» вокруг значения и тонкой 2px полосой прогресса под числом */
+function heatCell(v,mx,rgb,txt){
+  if(bad(v))return'<td class="num mu">—</td>';
+  const a=Math.max(0,Math.min(1,v/(mx||1)));
+  return`<td class="num"><div class="hb-cell"><span class="hv" style="background:rgba(${rgb},${(0.05+a*0.15).toFixed(3)})">${txt}</span><i class="hb-bar" aria-hidden="true"><b style="width:${(a*100).toFixed(1)}%;background:rgb(${rgb})"></b></i></div></td>`;
+}
 S.bpre=lsGet('ta_bpre')||'main';
 function bondsPreset(k){S.bpre=k;lsSet('ta_bpre',k);render()}
 /* Пометка к доходности по типу оферты: пут — к пут-оферте; колл — худшая из «к погашению» и «к колл» (YTW); тип не указан — к дате оферты */
@@ -8,7 +12,7 @@ function ytmSuffix(r){
   const k=r.ybasis,y=r.yk,P=v=>v!=null?pctp(v,2):'—',tag=(t,tip)=>` <small class="mu" title="${esc(tip)}">${t}</small>`;
   if(k==='put')return tag('к пут',`Доходность к пут-оферте ${r.put_date?ddm(r.put_date):''}: держатель сам решает, предъявить ли бумагу к выкупу по цене оферты`+(r.call_dates&&r.call_dates.length?`. Есть и колл ${r.call_dates.map(ddm).join(', ')}`+(y&&y.ytw!=null?`, доходность к худшему по колл/погашению ${P(y.ytw)}`:''):''));
   if(k==='call'){
-    const lines=['Колл — право эмитента: досрочное погашение может случиться, а может нет. Показана доходность к худшему (YTW) из погашения и колл-дат.'];
+    const lines=['Колл — право эмитента: досрочное погашение может случиться, а может нет. Показана доходность к худшему (YTW) из погашения и колл-датам.'];
     if(y){lines.push('К погашению: '+P(y.ytm));(y.ytc||[]).forEach(c=>lines.push('К колл '+ddm(c[0])+': '+P(c[1])))}
     else lines.push('Расчёт приблизительный: показана доходность к погашению.');
     return tag(y&&y.ytw_kind==='call'?'к колл':'к погаш.',lines.join('\n'));
@@ -18,17 +22,48 @@ function ytmSuffix(r){
     return tag('оф.?',`Тип оферты не указан${d?' ('+ddm(d)+')':''}: показана доходность к этой дате`+(y&&y.ytm!=null?`; к погашению ${P(y.ytm)}`:'')+'. Если это колл эмитента, ориентируйтесь на доходность к погашению.');
   }
   return''}
+function bondsSortedRows(){
+  const b=S.bonds;if(!b||!b.rows)return[];
+  const rows=b.rows.slice();
+  rows.forEach(r=>{r.rk=r.rating?RSC.indexOf(r.rating.v):null;r.next_d=r.next?r.next[0]:null;r.next_sum=r.next&&r.next[1]!=null?r.next[1]*(r.qty||0):null});
+  const{k,d}=S.bsort;
+  rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
+  return rows;
+}
+function bondRowActions(isin){
+  if(!isin)return'';
+  const w=typeof watchHas==='function'&&watchHas(isin);
+  const c=typeof cmpHas==='function'&&cmpHas(isin);
+  return`<span class="row-act${w||c?' has-on':''}">
+    <button type="button" class="ra-btn${w?' on':''}" data-wstar="${esc(isin)}" title="${w?'Убрать из наблюдения':'Добавить в наблюдение'}" aria-label="Наблюдение">${w?'★':'☆'}</button>
+    <button type="button" class="ra-btn${c?' on':''}" data-bcmp="${esc(isin)}" title="${c?'Убрать из сравнения':'Добавить в сравнение'}" aria-label="Сравнить">⇄</button>
+    <button type="button" class="ra-btn" data-bopen="${esc(isin)}" title="Открыть карточку выпуска" aria-label="Открыть карточку">↗</button>
+  </span>`;
+}
+function cmpDockRender(){
+  let el=document.getElementById('cmp-dock');
+  const list=(typeof S!=='undefined'&&Array.isArray(S.cmp))?S.cmp:[];
+  if(!list.length||S.page==='cmp'){if(el)el.remove();return}
+  if(!el){el=document.createElement('div');el.id='cmp-dock';el.className='cmp-dock noprint';document.body.appendChild(el)}
+  const names=list.map(i=>{
+    const c=typeof CMP!=='undefined'&&CMP.d&&CMP.d[i]&&CMP.d[i].c;
+    const b=(S.bonds&&S.bonds.rows||[]).find(r=>(r.isin||'').toUpperCase()===i);
+    const sc=(S.scr&&S.scr.rows||[]).find(r=>(r.isin||r.id||'').toUpperCase()===i);
+    return (c&&(c.short||c.name))||(b&&b.name)||(sc&&sc.name)||i;
+  });
+  el.innerHTML=`<span class="cmp-dock-n">В сравнении: ${list.length}</span><span class="cmp-dock-list" title="${esc(names.join(', '))}">${esc(names.join(' · '))}</span>
+    <button type="button" class="btn" id="cmp-dock-go">Открыть сравнение</button><button type="button" class="btn ghost" id="cmp-dock-clr">Очистить</button>`;
+}
 function pBonds(){
   const b=S.bonds;
   if(!b)return`<div class="card">${waitBox('Загружаю параметры облигаций и графики купонов…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   const m=b.metrics,tot=S.data.portfolio.total||1;
-  if(!m.count)returnemptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);
-  let rows=b.rows.slice();rows.forEach(r=>{r.rk=r.rating?RSC.indexOf(r.rating.v):null;r.next_d=r.next?r.next[0]:null;r.next_sum=r.next&&r.next[1]!=null?r.next[1]*(r.qty||0):null});const{k,d}=S.bsort;
-  rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
+  if(!m.count)return emptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);
+  const rows=bondsSortedRows(),{k,d}=S.bsort;
   const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(1,...rows.map(r=>Math.min(r.ytm||0,60))),mxD=Math.max(...rows.map(r=>r.dur||0));
   const BC_COLS={
-    name:['Облигация','l',r=>`<td>${ident(r,[r.ticker,r.floating?(r.est_coupons?'флоатер · прогноз купонов':'флоатер'):'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>`],
+    name:['Облигация','l',r=>{const id=r.isin||r.ticker||'';return`<td><div class="b-name-cell">${ident(r,[r.ticker,r.floating?(r.est_coupons?'флоатер · прогноз купонов':'флоатер'):'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}${bondRowActions(id)}</div></td>`}],
     qty:['Кол-во','',r=>`<td class="num">${f0(r.qty)}</td>`],
     buy_pct:['Покупка, %','',r=>`<td class="num">${r.buy_pct!=null?f2(r.buy_pct):'—'}</td>`],
     price_pct:['Цена, %','',r=>`<td class="num">${r.price_pct!=null?f2(r.price_pct):'—'}</td>`],
@@ -54,7 +89,7 @@ function pBonds(){
   const pre=BC_PRE[S.bpre]?S.bpre:'main',cols=BC_PRE[pre][1];
   const th=cols.map(kk=>{const[t,c]=BC_COLS[kk];const sk=kk==='next'?'next_d':kk==='ctype'?'floating':kk;return`<th class="s ${c||''}" data-s="${sk}">${t} <span>${k===sk?(d>0?'↑':'↓'):''}</span></th>`}).join('');
   const body=rows.map(r=>`<tr data-isin="${esc(r.isin||r.ticker||'')}">${cols.map(kk=>BC_COLS[kk][2](r)).join('')}</tr>`).join('');
-  const presetBar=`<div class="seg noprint" style="margin:0 0 10px">${Object.entries(BC_PRE).map(([k2,v])=>`<button class="${k2===pre?'on':''}" onclick="bondsPreset('${k2}')">${v[0]}</button>`).join('')}</div>`;
+  const presetBar=`<div class="seg noprint">${Object.entries(BC_PRE).map(([k2,v])=>`<button class="${k2===pre?'on':''}" onclick="bondsPreset('${k2}')">${v[0]}</button>`).join('')}</div>`;
   const sk=['-3','-2','-1','1','2','3'],st=m.stress||{};
   chart('c-stress',bars,{h:220,labels:sk.map(x=>(x>0?'+':'−')+Math.abs(x)+' п.п.'),series:[{n:'Изменение стоимости',c:S3,v:sk.map(x=>(st[x]||{}).rub||0)}],legend:false,
     colorOf:v=>v>=0?'var(--pos)':'var(--neg)',empty:'Нет данных для стресс-теста'});
@@ -68,7 +103,7 @@ function pBonds(){
     ${kpi('Дюрация',m.dur!=null?m.dur.toFixed(2).replace('.',',')+' года':'—','средневзвешенная, по Маколею',null,S5)}
     ${kpi('Текущая купонная доходность',pctp(m.cur_yield,2),'годовой купон / цена',null,S4)}
     ${kpi('Купоны за 12 месяцев',M(m.coupons_12m,'rub',0),'по графику выплат, до налога','pos',S7)}</div>
-    <div class="card" style="padding:12px 10px 6px">${presetBar}<div class="tbl" style="max-height:calc(100vh - 240px)"><table id="btab" class="bt"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div></div>
+    <div class="card" style="padding:12px 10px 6px"><div class="tbl-head">${presetBar}${typeof taCsvBtn==='function'?taCsvBtn('b-csv','Выгрузить облигации в CSV'):''}</div><div class="tbl"><table id="btab" class="bt"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div></div>
     <div class="g g3"><div class="card"><h2>Лестница погашений и пут-оферт, ₽</h2><div id="c-ladder" class="chart"></div></div>
     <div class="card"><h2>Кредитный риск (оценка брокера)</h2>${hbars(b.risk.map(([n,v])=>({n,v,c:n==='высокий'?S8:n==='низкий'?S3:n==='средний'?S4:'#6f7686',s:pctp(v/(m.value||1)*100)})),S1,null,0)}</div>
     <div class="card"><h2>Тип купона, выпусков</h2>${hbars(b.kinds.map(([n,v],i)=>({n,v,c:PAL[i]})),S1,x=>f0(x.v),1)}</div></div>
@@ -78,9 +113,58 @@ function pBonds(){
       <tr><td class="l">Изменение, %</td>${sk.map(x=>`<td class="num ${cls((st[x]||{}).pct)}">${(st[x]||{}).pct!=null?pct((st[x]||{}).pct,2):'—'}</td>`).join('')}</tr></tbody></table></div>
       <p class="note">Параллельный сдвиг доходностей всех выпусков с полной переоценкой по графику выплат (для выпусков без данных MOEX, помечены ≈, — по модиф. дюрации). Не учитывает изменения кредитных спредов.</p></div>
     ${ratingsCard(b)}
+    ${typeof concCard==='function'?concCard((S.data&&S.data.concentration)||b.concentration):''}
+    ${radarCard(b.radar,false)}
     ${insightsCard(b)}
     <p class="note">Доходность — эффективная годовая по текущей цене с НКД. Если у выпуска есть пут-оферта, это доходность к ней (пометка «к пут»: держатель сам решает, предъявлять ли бумагу). Если есть колл эмитента, показана доходность к худшему (YTW) — меньшая из доходности к погашению и к колл-датам («к погаш.» или «к колл»): эмитент может погасить выпуск досрочно, рассчитывать на дату колла нельзя, подробности — во всплывающей подсказке. Если тип оферты не указан, показана доходность к её дате («оф.?»). Для флоатеров ещё не объявленные купоны оценены как ключевая ставка по прогнозу + спред эмитента (спред взят по последним известным купонам); MOEX считает по неизменному купону, поэтому доходности флоатеров здесь могут отличаться от биржевых. Дюрация — по Маколею, в годах. «После НДФЛ» — упрощённо: 13% с купонов и с положительной разницы между погашением и ценой покупки (без прогрессивной ставки 15% и ЛДВ). Пометка ≈ — график выплат MOEX недоступен, расчёт приблизительный.<br>IRR портфеля — единая ставка дисконтирования всех будущих выплат (купоны, амортизации, погашения и оферты, валютные выпуски по текущему курсу) к стоимости портфеля с НКД; по нему видно, сколько в итоге заработает вся «корзина». Средневзвешенная — просто среднее по выпускам. В обе цифры входят все выпуски без исключений.${hy.length?` Высокий риск дефолта (доходность выше 100%, ${M(m.high_yield_value,'rub',0)}): ${hy.map(o=>esc(o.name)+' '+pctp(o.ytm,0)).join(', ')} — такая ставка показывает цену риска, а не обещанный доход.`:''}${kr&&kr.source!=='none'?`<br>Прогноз ключевой ставки для флоатеров: ${esc(kr.name)}${kr.as_of?`, на ${esc(kr.as_of)}`:''}; сейчас ${kr.key_rate!=null?pctp(kr.key_rate,2):'—'}${(kr.yearly||[]).length?`, средняя по годам: ${kr.yearly.slice(0,4).map(y=>y.year+' — '+pctp(y.mid,1)).join(', ')}`:''}. Источник меняется в «Настройках».`:''}</p>`;
 }
 
+function radarCard(rad,compact){
+  const items=(rad&&rad.items)||[];
+  if(!items.length)return'';
+  const KIND={
+    blind_put:{l:'Пут-оферта без купона',c:'var(--neg)'},
+    coupon_cut:{l:'Снижение купона после оферты',c:'var(--warn)'},
+    amort:{l:'Частичная амортизация',c:'var(--s1)'}
+  };
+  const show=compact?items.slice(0,5):items;
+  const rows=show.map(x=>{
+    const k=KIND[x.kind]||{l:x.kind,c:'var(--mu)'};
+    let det='';
+    if(x.kind==='blind_put')det='купон после оферты не объявлен';
+    else if(x.kind==='coupon_cut'){
+      det=x.cur_rate!=null&&x.next_rate!=null?`ставка ${pctp(x.cur_rate,2)} -> ${pctp(x.next_rate,2)}`:(x.cur_val!=null&&x.next_val!=null?`купон ${M(x.cur_val)} -> ${M(x.next_val)}`:'купон снижен');
+    }else if(x.kind==='amort'){
+      det=`выплата ${M(x.amount_rub,'rub',0)}${x.valueprc!=null?' ('+pctp(x.valueprc,1)+' номинала)':''}`;
+    }
+    const attr=x.isin?` data-isin="${esc(x.isin)}" style="cursor:pointer;border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--card2);border-radius:6px;font-size:13px"`:` style="border-left:3px solid ${k.c};padding:7px 12px;margin-bottom:6px;background:var(--card2);border-radius:6px;font-size:13px"`;
+    return`<div${attr}><div class="row" style="justify-content:space-between;gap:8px;flex-wrap:wrap"><span><b>${esc(x.name)}</b> <span class="tag" style="color:${k.c}">${k.l}</span></span><span class="num mu">${ddm(x.date)} (через ${x.days_left} дн.)</span></div><div class="t2" style="margin-top:3px;font-size:12.5px">${det}</div></div>`;
+  }).join('');
+  const more=compact&&items.length>5?`<div class="mu" style="font-size:12px;margin-top:4px">И ещё ${items.length-5} во вкладке «Облигации».</div>`:'';
+  return`<div class="card"><h2>Радар оферт и амортизаций<span class="sp">ближайшие ${rad.horizon_days||60} дней · событий: ${items.length}</span></h2>${rows}${more}</div>`;
+}
 
-
+document.addEventListener('click',e=>{
+  const t=e.target;if(!t.closest)return;
+  const cm=t.closest('[data-bcmp]');
+  if(cm){
+    e.stopPropagation();
+    const isin=String(cm.dataset.bcmp||'').toUpperCase();
+    if(typeof cmpHas==='function'&&cmpHas(isin)){cmpDel(isin);toast('Убрано из сравнения');if(S.page==='bonds')render();cmpDockRender()}
+    else if(typeof cmpAdd==='function'&&cmpAdd(isin)){if(S.page==='bonds')render();cmpDockRender()}
+    return;
+  }
+  const bo=t.closest('[data-bopen]');
+  if(bo){e.stopPropagation();if(typeof openBond==='function')openBond(bo.dataset.bopen);return}
+  if(t.closest('#cmp-dock-go')){go('cmp');return}
+  if(t.closest('#cmp-dock-clr')){S.cmp=[];if(typeof cmpSave==='function')cmpSave();cmpDockRender();if(S.page==='bonds')render();return}
+  if(t.closest('#b-csv')){
+    const rows=bondsSortedRows();
+    if(typeof taCsvDownload==='function')taCsvDownload('bonds.csv',['Название','Тикер','ISIN','Кол-во','Цена, %','Доходность, %','После НДФЛ, %','Спред к КБД, п.п.','Дюрация, лет','Купон, %','След. купон','Погашение','Рейтинг','Риск','Стоимость, ₽','Доля, %','P&L, %'],
+      rows.map(r=>[r.name||'',r.ticker||'',r.isin||'',r.qty??'',r.price_pct!=null?r.price_pct.toFixed(2):'',r.ytm!=null?r.ytm.toFixed(2):'',r.ytm_tax!=null?r.ytm_tax.toFixed(2):'',r.spread!=null?r.spread.toFixed(2):'',r.dur!=null?r.dur.toFixed(2):'',r.coupon!=null?r.coupon.toFixed(2):'',r.next?r.next[0]:'',r.maturity||'',r.rating?r.rating.v:'',r.risk||'',r.value_rub!=null?Math.round(r.value_rub):'',r.share!=null?r.share.toFixed(2):'',r.pnl_pct!=null?r.pnl_pct.toFixed(2):'']));
+  }
+});
+if(typeof renderNow==='function'){
+  const _rnB=renderNow;
+  renderNow=function(){const r=_rnB.apply(this,arguments);try{cmpDockRender()}catch(e){}return r};
+}

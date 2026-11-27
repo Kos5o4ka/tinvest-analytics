@@ -229,17 +229,6 @@ def flows_get(cfg, acc, q, force):
     return dict(d, configured=True, **_flw_src_label(d))
 
 
-def flows_instrument_get(cfg, acc, q, force):
-    secid = _flw_secid(q)
-    if not secid:
-        raise ApiError("Не указана бумага.", 400)
-    period = q.get("period") if q.get("period") in FLW_PERIODS else "5m"
-    d = _flw_ds("flows/instrument", {"secid": secid, "period": period}, 0 if force else FLW_TTL)
-    if d is None:
-        return {"configured": False, "series": []}
-    return dict(d, configured=True)
-
-
 def _flw_since_arg(q):
     s = str(q.get("since") or "").strip()
     return s if re.fullmatch(r"\d{4}-\d{2}-\d{2}|\d{9,11}(\.\d+)?", s) else ""
@@ -321,7 +310,6 @@ def orderbook_get(cfg, acc, q, force):
 
 
 API_GET["/api/flows"] = flows_get
-API_GET["/api/flows_instrument"] = flows_instrument_get
 API_GET["/api/flows_instruments"] = flows_instruments_get
 API_GET["/api/large_trades"] = large_trades_get
 API_GET["/api/spikes"] = spikes_get

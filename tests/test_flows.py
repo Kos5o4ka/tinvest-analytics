@@ -230,6 +230,18 @@ class TestWorker(unittest.TestCase):
         self.eng.iss_trades("shares")
         self.assertEqual(self.db.execute("SELECT SUM(buy) FROM agg WHERE secid='SBER'").fetchone()[0], 6e6)
 
+    def test_tinvest_polling_fx_bond(self):
+        fmd = FakeMD()
+        self.eng.md = fmd
+        self.eng.fx_get = lambda: {"USD": 90.0}
+        self.db.execute("UPDATE instruments SET uid='u-usd', lot=1, face=1000 WHERE secid='RU000A0CORP1'")
+        self.eng.load_inst()
+        self.eng.inst["RU000A0CORP1"]["face_cur"] = "usd"
+        fmd.trades["u-usd"] = [{"ts": NOW - 60, "side": "buy", "price": 98.5, "qty": 10}]
+        self.eng.poll_tinvest(5)
+        val = self.db.execute("SELECT buy FROM agg WHERE secid='RU000A0CORP1'").fetchone()[0]
+        self.assertAlmostEqual(val, 98.5 / 100 * 1000 * 10 * 90.0)
+
     def test_spikes(self):
         for d in range(1, 8):
             self.db.execute("INSERT INTO slot VALUES('SBER',?,66,1000000)", ("2026-11-%02d" % (d + 5 if d + 5 < 17 else 5),))
@@ -357,8 +369,9 @@ class TestServerEndpoints(unittest.TestCase):
             app = ts.DataServer(d, token_file=f)
             self.assertTrue(app.md and app.md.enabled)
             self.assertFalse(ts.DataServer(tempfile.mkdtemp(), token_file=os.path.join(d, "none")).md)
+            app.cache.db.close()                            # Windows не удаляет открытый cache.sqlite (WinError 32)
         finally:
-            shutil.rmtree(d)
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class TestClient(unittest.TestCase):
@@ -440,8 +453,9 @@ class TestClient(unittest.TestCase):
         self.assertEqual(T.large_trades_get({}, None, {}, False), {"configured": False, "rows": []})
         with self.assertRaises(T.ApiError):
             T.orderbook_get({}, None, {"secid": "bad secid!"}, False)
-        for p in ("/api/flows", "/api/flows_instrument", "/api/large_trades", "/api/spikes", "/api/orderbook"):
+        for p in ("/api/flows", "/api/flows_instruments", "/api/large_trades", "/api/spikes", "/api/orderbook"):
             self.assertIn(p, T.API_GET)
+        self.assertNotIn("/api/flows_instrument", T.API_GET)
 
     def test_watch_alerts(self):
         al = T.flows_alerts_from([{"secid": "SBER", "ts": 1700000000, "side": "buy", "value": 12e6, "price": 300, "isin": "RU0009029540", "name": "Сбер"}],

@@ -1,36 +1,40 @@
+/* Иконки: единая duotone-система на сетке 24×24. Замкнутые фигуры, помеченные D(…), получают мягкую заливку (класс ic-d, цвет — currentColor),
+   поверх идёт ровный контур. Заливка усиливается у активного пункта меню и в заголовках разделов (см. 52_premium.css). */
+const D=s=>s.replace(/<(rect|path|circle|ellipse)\b([^>]*?)\/>/g,'<$1 class="ic-d"$2/><$1$2/>');
 const IC={
- dash:'<path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"/>',
- ret:'<path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
- pos:'<path d="M21 12A9 9 0 1 1 12 3v9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/>',
- bonds:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h6M7 13h10M7 16h4"/>',
- pay:'<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M8 14h2M14 14h2M8 17h2"/>',
- ops:'<path d="M4 6h16M4 12h16M4 18h10"/>',
- fees:'<path d="M12 2v20M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>',
- tax:'<path d="M9 14l6-6M9.5 8.5h.01M14.5 13.5h.01"/><path d="M5 3h14v18l-3.5-2-3.5 2-3.5-2L5 21z"/>',
- imp:'<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
- cmp:'<path d="M8 4v16M16 4v16M4 8h8M12 16h8"/>',
- scr:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/>',
- risk:'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
- hm:'<rect x="3" y="3" width="10" height="11"/><rect x="13" y="3" width="8" height="6"/><rect x="13" y="9" width="8" height="5"/><rect x="3" y="14" width="18" height="7"/>',
+ dash:D('<rect x="3" y="3" width="8" height="10" rx="2"/>')+'<rect x="13" y="3" width="8" height="6" rx="2"/>'+D('<rect x="13" y="11" width="8" height="10" rx="2"/>')+'<rect x="3" y="15" width="8" height="6" rx="2"/>',
+ ret:'<path class="ic-d" d="M3 21v-4l6-6 4 4 8-8v14z"/><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
+ pos:D('<path d="M21 12A9 9 0 1 1 12 3v9z"/>')+'<path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/>',
+ bonds:D('<rect x="3" y="5" width="18" height="14" rx="2.5"/>')+'<path d="M7 9.5h6M7 13.5h4"/>'+D('<circle cx="16.5" cy="13" r="2.2"/>'),
+ pay:'<path class="ic-d" d="M3 9.5h18V6.5a2.5 2.5 0 0 0-2.5-2.5h-13A2.5 2.5 0 0 0 3 6.5z"/><rect x="3" y="4" width="18" height="17" rx="2.5"/><path d="M8 2v4M16 2v4M3 9.5h18"/>'+D('<circle cx="15.5" cy="15" r="2.2"/>'),
+ ops:D('<rect x="3.5" y="4" width="17" height="16" rx="2.5"/>')+'<path d="M8 9h8M8 13h8M8 17h5"/>',
+ fees:D('<circle cx="12" cy="12" r="9"/>')+'<path d="M9 15l6-6"/><circle cx="9.3" cy="9.3" r=".9" fill="currentColor"/><circle cx="14.7" cy="14.7" r=".9" fill="currentColor"/>',
+ tax:D('<path d="M5 3h14v18l-3.5-2-3.5 2-3.5-2L5 21z"/>')+'<path d="M9 14l6-6"/><circle cx="9.5" cy="8.5" r=".8" fill="currentColor"/><circle cx="14.5" cy="13.5" r=".8" fill="currentColor"/>',
+ imp:D('<path d="M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3"/>')+'<path d="M12 3v12M7 10l5 5 5-5"/>',
+ cmp:D('<rect x="4" y="9" width="7" height="11" rx="1.6"/>')+D('<rect x="13" y="4" width="7" height="16" rx="1.6"/>'),
+ scr:D('<circle cx="10.5" cy="10.5" r="7.5"/>')+'<path d="M21 21l-5.2-5.2M7.5 12l2-2 1.8 1.5 2.5-3"/>',
+ risk:D('<path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.7-7.5 9.8-4.3-1.1-7.5-5.2-7.5-9.8V6z"/>')+'<path d="M12 8.5v4.5M12 16h.01"/>',
+ hm:D('<rect x="3" y="3" width="10" height="11" rx="2"/>')+'<rect x="15" y="3" width="6" height="6" rx="1.5"/>'+D('<rect x="15" y="11" width="6" height="10" rx="1.5"/>')+'<rect x="3" y="16" width="10" height="5" rx="1.5"/>',
  sig:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
- flw:'<path d="M3 20V10M9 20V4M15 20v-7M21 20V8"/>',
- dfl:'<path d="M12 3l9 16H3z"/><path d="M9 15l6-5M9 10l6 5"/>',
- mon:'<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/>',
- map:'<circle cx="7" cy="16" r="2"/><circle cx="12" cy="9" r="2.5"/><circle cx="18" cy="13" r="1.6"/><path d="M3 3v18h18"/>',
- pri:'<path d="M12 2l2.6 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.4 6.1 20.1l1.6-6.7L2.5 8.9l6.9-.6z"/>',
- mkt:'<path d="M3 4v16h18"/><path d="M7 14l4-4 3 3 5-6"/>',
- reb:'<path d="M12 3v18M5 7h14M5 7l-2 6a3 3 0 0 0 6 0zM19 7l-2 6a3 3 0 0 0 6 0z"/>',
- bench:'<path d="M3 20h18"/><path d="M6 16V9M11 16V5M16 16v-5M20 16v-8"/>',
- calc:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2M12 11h2M16 11h0M8 15h2M12 15h2M8 18h2M12 18h4"/>',
+ flw:D('<rect x="3.5" y="11" width="3.5" height="9" rx="1"/>')+D('<rect x="10.25" y="4" width="3.5" height="16" rx="1"/>')+D('<rect x="17" y="8" width="3.5" height="12" rx="1"/>'),
+ dfl:D('<path d="M12 3l9 16H3z"/>')+'<path d="M9 15l6-5M9 10l6 5"/>',
+ mon:D('<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>')+'<path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
+ map:D('<circle cx="7" cy="16" r="2"/>')+D('<circle cx="12" cy="9" r="2.5"/>')+D('<circle cx="18" cy="13" r="1.8"/>')+'<path d="M3 3v18h18"/>',
+ pri:D('<path d="M12 2l2.6 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.4 6.1 20.1l1.6-6.7L2.5 8.9l6.9-.6z"/>'),
+ mkt:'<path d="M3 4v16h18"/><path class="ic-d" d="M7 14l4-4 3 3 5-6v10H7z"/><path d="M7 14l4-4 3 3 5-6"/>',
+ reb:'<path d="M12 3v18M5 7h14M8 21h8"/>'+D('<path d="M5 7l-2 6a3 3 0 0 0 6 0z"/>')+D('<path d="M19 7l-2 6a3 3 0 0 0 6 0z"/>'),
+ bench:'<path d="M3 20h18"/>'+D('<rect x="5" y="9" width="3" height="8" rx=".8"/>')+D('<rect x="10.5" y="5" width="3" height="12" rx=".8"/>')+D('<rect x="16" y="11" width="3" height="6" rx=".8"/>'),
+ calc:'<rect x="4" y="2.5" width="16" height="19" rx="2.5"/>'+D('<rect x="7.5" y="5.5" width="9" height="4" rx="1"/>')+'<path d="M8 13h.01M12 13h.01M16 13h.01M8 16.5h.01M12 16.5h.01M16 16.5h.01"/>',
  off:'<path d="M4 12h12M12 7l5 5-5 5"/><path d="M20 4v16"/>',
- lad:'<path d="M7 3v18M17 3v18M7 7h10M7 12h10M7 17h10"/>',
- iss:'<path d="M4 21V8l8-5 8 5v13"/><path d="M9 21v-6h6v6M8 11h.01M12 11h.01M16 11h.01"/>',
- cal:'<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M12 14l1.2 2.4 2.6.4-1.9 1.8.5 2.6-2.4-1.3-2.4 1.3.5-2.6-1.9-1.8 2.6-.4z"/>',
- watch:'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
- kb:'<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5M9 8h6M9 12h4"/>',
- fng:'<path d="M4 17a8 8 0 0 1 16 0"/><path d="M12 17l4-5"/><circle cx="12" cy="17" r="1.2"/>',
- set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
-const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+ lad:D('<rect x="3" y="15" width="5" height="6" rx="1.2"/>')+D('<rect x="9.5" y="10" width="5" height="11" rx="1.2"/>')+D('<rect x="16" y="4" width="5" height="17" rx="1.2"/>'),
+ iss:D('<path d="M4 21V8l8-5 8 5v13z"/>')+'<path d="M9 21v-6h6v6M8 11h.01M12 11h.01M16 11h.01"/>',
+ cal:'<path class="ic-d" d="M3 9.5h18V6.5a2.5 2.5 0 0 0-2.5-2.5h-13A2.5 2.5 0 0 0 3 6.5z"/><rect x="3" y="4" width="18" height="17" rx="2.5"/><path d="M8 2v4M16 2v4M3 9.5h18"/><path d="M12 13.5l1.1 2.2 2.4.35-1.75 1.7.4 2.4-2.15-1.15-2.15 1.15.4-2.4-1.75-1.7 2.4-.35z"/>',
+ watch:D('<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/>')+'<circle cx="12" cy="12" r="3"/>',
+ kb:D('<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/>')+'<path d="M4 21V5M9 8h6M9 12h4"/>',
+ fng:D('<path d="M4 17a8 8 0 0 1 16 0z"/>')+'<path d="M12 17l4-5"/><circle cx="12" cy="17" r="1.2"/>',
+ set:D('<circle cx="12" cy="12" r="3.5"/>')+'<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>'};
+/* единый рендерер: класс ic включает duotone-слой и анимацию, штрих 1.7, скруглённые концы */
+const svgI=(p,sw=1.7)=>`<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${p}</svg>`;
 const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['cmp','Сравнение облигаций'],['map','Карта рынка'],['hm','Тепловая карта'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['dfl','Техдефолты'],['flw','Кто покупает'],['pri','Первичка'],['fng','Страх и жадность'],['cal','Календарь событий'],null,['kb','База знаний'],['imp','Импорт отчётов'],['set','Настройки']];
 /* группы меню: ключи страниц остаются прежними, PAGES — плоский список для поиска названий */
 const NAV_GROUPS=[['Портфель',['dash','ret','bench','pos','bonds','pay','off','ops','fees']],['Учёт и планы',['tax','reb','calc','lad']],
@@ -45,23 +49,85 @@ function regPage(id,o){
 }
 const NAV_FIXED=['imp','kb','set'],NAV_PINNED=['dash','set'];
 function lsJson(k,d){try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}}
-function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}
+let _uiHydrating=false,_uiPrefsT=0;
+const UI_PREF_LS=new Set(['ta_ux_mode','ta_side_mini','ta_nav_hidden','ta_ticker_off','ta_incog','ta_theme','ta_accent','ta_density']);
+function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}if(!_uiHydrating&&UI_PREF_LS.has(k))uiPrefsSaveSoon()}
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
 const PERIOD_PAGES=['dash','ret','bench','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
 let st={};try{st=JSON.parse(lsGet('ta_state')||'{}')||{}}catch(e){}
-const S={navHidden:lsJson('ta_nav_hidden',[]),navShut:lsJson('ta_nav_shut',{}),page:st.page||'dash',period:st.period||'all',account:st.account||'all',hideEmpty:st.hideEmpty!==false,
+const _hashPage=(typeof location!=='undefined'&&/^#[a-z0-9_-]+$/i.test(location.hash||''))?location.hash.slice(1):'';
+const _hadInitialPage=Boolean((st&&st.page)||(_hashPage&&PAGES.some(p=>p&&p[0]===_hashPage)));
+const S={navHidden:lsJson('ta_nav_hidden',[]),navShut:lsJson('ta_nav_shut',{}),page:(_hashPage&&PAGES.some(p=>p&&p[0]===_hashPage)?_hashPage:st.page)||'dash',period:st.period||'all',account:st.account||'all',hideEmpty:st.hideEmpty!==false,
   data:null,bonds:null,hist:null,cfg:null,loading:false,err:null,accounts:[],
   sort:{k:'value_rub',d:-1},bsort:{k:'value_rub',d:-1},posType:'',opsN:200,opsQ:'',opsK:'',charts:[],imp:null};
 function persist(){try{localStorage.setItem('ta_state',JSON.stringify({page:S.page,period:S.period,account:S.account,hideEmpty:S.hideEmpty}))}catch(e){}}
 
+function uiPrefsCollect(){
+  return{
+    theme:typeof curTheme==='function'?curTheme():(lsGet('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'),
+    ux_mode:typeof UX!=='undefined'&&UX.mode?UX.mode:(lsGet('ta_ux_mode')==='pro'?'pro':'basic'),
+    side_mini:typeof UX!=='undefined'?!!UX.mini:lsGet('ta_side_mini')==='1',
+    nav_hidden:Array.isArray(S.navHidden)?S.navHidden.slice():lsJson('ta_nav_hidden',[]),
+    ticker_off:lsGet('ta_ticker_off')==='1',
+    incog:!!INCOG.on,
+    accent:typeof curAccent==='function'?curAccent():(lsGet('ta_accent')||'blue'),
+    density:typeof curDensity==='function'?curDensity():(lsGet('ta_density')||'comfort')
+  };
+}
+function uiPrefsSaveSoon(){
+  if(_uiHydrating)return;
+  clearTimeout(_uiPrefsT);
+  _uiPrefsT=setTimeout(()=>{
+    const prefs=uiPrefsCollect();
+    if(S.cfg)S.cfg.ui_prefs=Object.assign({},S.cfg.ui_prefs,prefs);
+    post('/api/config',{ui_prefs:prefs}).catch(()=>{});
+  },350);
+}
+function uiPrefsHydrate(cfg){
+  if(!cfg)return;
+  const p=(cfg.ui_prefs&&typeof cfg.ui_prefs==='object')?cfg.ui_prefs:{};
+  _uiHydrating=true;
+  try{
+    const th=p.theme||(cfg.theme&&cfg.theme!=='auto'?cfg.theme:null);
+    if(lsGet('ta_theme')==null&&th&&typeof applyTheme==='function')applyTheme(th);
+    if(lsGet('ta_accent')==null&&p.accent&&typeof applyAccent==='function')applyAccent(p.accent);
+    if(lsGet('ta_density')==null&&p.density&&typeof applyDensity==='function')applyDensity(p.density);
+    if(lsGet('ta_ux_mode')==null&&(p.ux_mode==='basic'||p.ux_mode==='pro')&&typeof UX!=='undefined'){
+      UX.mode=p.ux_mode;try{localStorage.setItem('ta_ux_mode',UX.mode)}catch(e){}if(typeof uxSyncMode==='function')uxSyncMode();
+    }
+    if(lsGet('ta_side_mini')==null&&p.side_mini!=null&&typeof UX!=='undefined'){
+      UX.mini=!!p.side_mini;try{localStorage.setItem('ta_side_mini',UX.mini?'1':'0')}catch(e){}if(typeof uxSyncMode==='function')uxSyncMode();
+    }
+    if(lsGet('ta_nav_hidden')==null&&Array.isArray(p.nav_hidden)){
+      S.navHidden=p.nav_hidden.slice();try{localStorage.setItem('ta_nav_hidden',JSON.stringify(S.navHidden))}catch(e){}
+    }
+    if(lsGet('ta_ticker_off')==null&&p.ticker_off!=null){
+      try{localStorage.setItem('ta_ticker_off',p.ticker_off?'1':'0')}catch(e){}
+      if(typeof tkrBuild==='function')try{tkrBuild()}catch(e){}
+    }
+    if(lsGet('ta_incog')==null&&p.incog!=null){
+      INCOG.on=!!p.incog;try{localStorage.setItem('ta_incog',INCOG.on?'1':'0')}catch(e){}
+      const e=$('#eye');if(e){e.classList.toggle('on',INCOG.on);const lt=e.querySelector('.mi-t');if(lt)lt.textContent=INCOG.on?'Показать суммы':'Скрыть суммы'}
+    }
+  }finally{_uiHydrating=false}
+}
+
 async function api(path,opt){
   let r;
   try{r=await fetch(path,opt)}
-  catch(e){throw new Error('Программа не отвечает: похоже, её локальный сервер остановлен. Закройте окно программы и откройте её снова.')}
+  catch(e){
+    if(typeof connSet==='function')connSet('err','Сервер не отвечает');
+    throw new Error('Программа не отвечает: похоже, её локальный сервер остановлен. Закройте окно программы и откройте её снова.');
+  }
   let j={};
   try{j=await r.json()}catch(e){}
+  if(r.status===423){
+    if(typeof lockShow==='function')lockShow(j);
+    throw new Error(j.error||'Доступ заблокирован');
+  }
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  if(!S.loading&&typeof connSet==='function')connSet('ok');
   if(j&&j.stale&&/^\/api\/(bonds|history)\?/.test(path))staleRefresh(path,j);
   return j;
 }

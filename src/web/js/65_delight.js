@@ -6,20 +6,22 @@ var TOAST_IC={
   info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
   err:'<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16h.01"/>'
 };
-function toast(msg,a,b){
-  let kind='info',ms=2500;
+function toast(msg,a,b,act){
+  let kind='info',ms=act?7000:2500;
   if(typeof a==='number')ms=a;else if(typeof a==='string'){kind=TOAST_IC[a]?a:'info';if(typeof b==='number')ms=b}
+  if(a&&typeof a==='object'&&!act){act=a;a=undefined;ms=7000}
   if(kind==='info'&&typeof a!=='string'&&/^(не удалось|ошибка)/i.test(String(msg)))kind='err';
   else if(kind==='info'&&typeof a!=='string'&&/(скопирован|добавлен|сохран|показан|скрыт)/i.test(String(msg)))kind='ok';
   let box=document.getElementById('toasts');
   if(!box){box=document.createElement('div');box.id='toasts';box.setAttribute('role','status');box.setAttribute('aria-live','polite');document.body.appendChild(box)}
   msg=String(msg);
-  const same=[...box.children].find(x=>x._msg===msg&&!x._gone);
+  const same=act?null:[...box.children].find(x=>x._msg===msg&&!x._gone);
   if(same){clearTimeout(same._t);same._t=setTimeout(same._close,ms);return}
   const el=document.createElement('div');
   el.className='toast-i k-'+kind;el._msg=msg;
   el.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+TOAST_IC[kind]+'</svg><span></span>';
   el.lastChild.textContent=msg;
+  if(act&&act.text){const ab=document.createElement('button');ab.type='button';ab.className='toast-act';ab.textContent=act.text;ab.onclick=ev=>{ev.stopPropagation();el._close();try{act.fn&&act.fn()}catch(e){}};el.appendChild(ab)}
   el._close=()=>{if(el._gone)return;el._gone=true;clearTimeout(el._t);el.classList.remove('is-in');el.classList.add('out');setTimeout(()=>el.remove(),260)};
   el.onclick=el._close;
   box.appendChild(el);
@@ -121,7 +123,7 @@ const KS_GROUPS=[
   ['Навигация',[[['g','h'],'Главная'],[['g','p'],'Портфель'],[['g','v'],'Выплаты'],[['g','b'],'Облигации'],[['g','t'],'Налоги'],[['g','c'],'Калькулятор'],[['g','s'],'Настройки']]],
   ['Действия',[[['/'],'Поиск'],[['Ctrl','K'],'Палитра команд и калькулятор'],[['r'],'Обновить данные'],[['h'],'Скрыть / показать суммы'],[['t'],'Тёмная / светлая тема'],[['?'],'Эта шпаргалка'],[['Esc'],'Закрыть окно']]],
   ['Таблицы',[[['j','k'],'Строка вниз / вверх'],[['↓','↑'],'То же, когда строка выбрана'],[['Пробел'],'★ в список наблюдения'],[['Enter'],'Открыть карточку строки']]],
-  ['Скринер',[[['f'],'Тип: Все → Флоатеры → Фиксы → ОФЗ'],[['v'],'Плотность: Комфорт → Компакт → Scatter']]]
+  ['Скринер',[[['f'],'Тип: Все → Флоатеры → Фиксы → ОФЗ'],[['v'],'Плотность: Комфорт → Компакт → Точечная']]]
 ];
 function ksToggle(){
   const o=document.getElementById('ks-ov');

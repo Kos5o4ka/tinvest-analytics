@@ -53,7 +53,7 @@ function issOpen(isin){
   S.iss.sel=isin;S.iss.scroll=1;go('iss');
 }
 function issRows(d){
-  const k=S.iss.sort.k,g={name:r=>r.title,share:r=>r.share,rating:r=>r.rating?RSC.indexOf(r.rating):null,score:r=>r.score,nd_ebit:r=>r.nd_ebit,cover:r=>r.cover,eq_ratio:r=>r.eq_ratio,
+  const k=S.iss.sort.k,g={name:r=>r.title,share:r=>r.share,rating:r=>{const i=r.rating?RSC.indexOf(r.rating):-1;return i<0?null:i},score:r=>r.score,nd_ebit:r=>r.nd_ebit,cover:r=>r.cover,eq_ratio:r=>r.eq_ratio,
     signal:r=>r.market&&r.market.key?['mkt_lower','match','mkt_higher'].indexOf(r.market.key):null}[k]||(r=>r.share);
   return d.rows.slice().sort((a,b)=>{const x=g(a),y=g(b);if(typeof x==='string'||typeof y==='string')return S.iss.sort.d*String(x||'').localeCompare(String(y||''));
     if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;return S.iss.sort.d*(x-y)});
@@ -143,8 +143,8 @@ function issIfrsBlock(ib){
     if(s.year<new Date().getFullYear()-2)h+=`<div class="bc-warn">Последний годовой отчёт — за ${s.year} г.: оценка устарела.</div>`;
     h+=`<h3 class="iss-h">За что баллы</h3>${issPartsHtml(s,ISS_HINT_I)}`;
   }else h+=`<div class="msg" style="margin:6px 0 12px">${esc(s.reason||f.note||'Нет данных МСФО.')}</div>`;
-  if(f.years&&f.years.length)h+=`<h3 class="iss-h">Динамика по годам</h3><div id="iss-ch" class="bc-ch"></div>${issIfrsTable(f)}
-    <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. LTM — последние 12 месяцев по квартальной отчётности (если новее годовой). Рост выручки считается по годовым данным. <a href="${esc(ib.url)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a> — данные агрегатора, могут отличаться от официальной отчётности.</p>`;
+  if(f.years&&f.years.length){const iu=safeUrl(ib.url);h+=`<h3 class="iss-h">Динамика по годам</h3><div id="iss-ch" class="bc-ch"></div>${issIfrsTable(f)}
+    <p class="note" style="margin-top:8px">Суммы в миллионах рублей, показаны в сокращённом виде. LTM — последние 12 месяцев по квартальной отчётности (если новее годовой). Рост выручки считается по годовым данным. ${iu?`<a href="${esc(iu)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a>`:'Источник: smart-lab'} — данные агрегатора, могут отличаться от официальной отчётности.</p>`;}
   return h;
 }
 /* ── Выплаты эмитента по месяцам: «Рублёвый эквивалент» (число бумаг в рынке x выплата на бумагу, по всем торгуемым выпускам) ── */

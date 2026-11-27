@@ -700,15 +700,6 @@ def _disc_own_isins(cfg, acc):
 
 # ───────────────────────── маршруты ─────────────────────────
 
-def disclosure_get(cfg, acc, q, force):
-    isin = (q.get("isin") or "").strip().upper()
-    if not re.fullmatch(r"[A-Z0-9]{6,14}", isin):
-        return {"error": "некорректный ISIN"}
-    d = disclosure_for_bond(isin, n=20)
-    d.update(isin=isin, configured=bool(ds_conf()[0]))
-    return d
-
-
 def issuer_flows_get(cfg, acc, q, force):
     inn = (q.get("inn") or "").strip()
     if not re.fullmatch(r"\d{10,12}", inn):
@@ -764,6 +755,5 @@ def defaults_get(cfg, acc, q, force):
     return mem_put(key, out)
 
 
-API_GET["/api/disclosure"] = disclosure_get
 API_GET["/api/issuer_flows"] = issuer_flows_get
 API_GET["/api/defaults"] = defaults_get

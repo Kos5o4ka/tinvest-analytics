@@ -9,14 +9,14 @@ const TYPES={share:'Акции',bond:'Облигации',etf:'Фонды',curre
 const SECT={financial:'Финансы',it:'IT',telecom:'Телеком',energy:'Энергетика',utilities:'Электроэнергетика',materials:'Сырьё и материалы',industrials:'Промышленность',
   consumer:'Потребительский',health_care:'Здравоохранение',real_estate:'Недвижимость',government:'Государство',municipal:'Муниципальные',ecomaterials:'Экология',
   green_energy:'Зелёная энергетика',green_buildings:'Зелёное строительство',electrocars:'Электромобили',other:'Прочее'};
-function kpi(k,v,s,c,dot){return`<div class="card kpi"><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}">${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
+function kpi(k,v,s,c,dot,go){return`<div class="card kpi${go?' kpi-go':''}"${go?` data-go="${go}" role="link" tabindex="0" title="Открыть раздел"`:''}><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}"${/<|\n/.test(String(v))?'':` data-tick="kpi-${S.page}-${k}"`}>${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
 const periodName=()=>PERIODS.find(p=>p[0]===S.period)[1].toLowerCase();
 const waitBox=t=>`<div class="wait">${t||'Считаю…'}</div>`;
 function monthsSeries(n=36){
   let ms=S.data.months;if(ms.length>n)ms=ms.slice(-n);
   return{labels:ms.map(m=>mlabel(m[0])),tips:ms.map(m=>{const[y,mm]=m[0].split('-');return MONF[+mm-1]+' '+y}),rows:ms.map(m=>m[1])};
 }
-function periodStart(){const d=new Date();const iso=x=>x.toISOString().slice(0,10);
+function periodStart(){const d=new Date();const iso=localIso;
   switch(S.period){case'1m':d.setDate(d.getDate()-30);return iso(d);case'3m':d.setDate(d.getDate()-91);return iso(d);
   case'12m':d.setDate(d.getDate()-365);return iso(d);case'ytd':return d.getFullYear()+'-01-01';case'py':return(d.getFullYear()-1)+'-01-01';default:return null}}
 function periodEnd(){return S.period==='py'?(new Date().getFullYear()-1)+'-12-31':null}

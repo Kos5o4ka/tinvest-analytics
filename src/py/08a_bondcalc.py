@@ -299,38 +299,39 @@ def _bc_t(d, settle):
     return (datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(settle, "%Y-%m-%d")).days / 365.0
 
 
-def _bc_pv(flows, settle, y, tax=False, basis=0.0):
-    tl = [(_bc_t(d, settle), c, p) for d, c, p in flows]
-    tot = 0.0
-    for i, (t, c, p) in enumerate(tl):
-        a = c + p
-        if tax:
-            a = c * (1 - BC_TAX) + p
-            if i == len(tl) - 1:
-                a -= BC_TAX * max(0.0, sum(x[2] for x in tl) - basis)
-        tot += a / (1 + y) ** t
-    return tot
-
-
-def net_flows(flows, settle, basis=0.0):
-    """Потоки после НДФЛ тем же способом, что в _bc_pv(tax=True): [(дата, сумма)]. Налог на разницу погашение - basis
-    берётся в дату последнего потока."""
-    fl = [f for f in flows if f[0] > settle]
-    out = [(d, c * (1 - BC_TAX) + p) for d, c, p in fl]
-    if out:
-        out[-1] = (out[-1][0], out[-1][1] - BC_TAX * max(0.0, sum(x[2] for x in fl) - basis))
+def _bc_tax_flows(fl, basis=0.0, aci=0.0):
+    """[(дата, сумма после НДФЛ 13%)]: уплаченный НКД уменьшает базу купонов (остаток — погашения)."""
+    out, aci_left = [], max(0.0, aci or 0.0)
+    for i, (d, c, p) in enumerate(fl):
+        used = min(aci_left, max(0.0, c))
+        aci_left -= used
+        a = c - BC_TAX * max(0.0, c - used) + p
+        if i == len(fl) - 1:
+            a -= BC_TAX * max(0.0, sum(x[2] for x in fl) - basis - aci_left)
+        out.append((d, a))
     return out
 
 
-def cf_ytm(dirty, flows, settle, tax=False, basis=0.0):
+def _bc_pv(flows, settle, y, tax=False, basis=0.0, aci=0.0):
+    items = _bc_tax_flows(flows, basis, aci) if tax else [(d, c + p) for d, c, p in flows]
+    return sum(a / (1 + y) ** _bc_t(d, settle) for d, a in items)
+
+
+def net_flows(flows, settle, basis=0.0, aci=0.0):
+    """Потоки после НДФЛ тем же способом, что в _bc_pv(tax=True): [(дата, сумма)]. Налог на разницу погашение - basis
+    берётся в дату последнего потока."""
+    return _bc_tax_flows([f for f in flows if f[0] > settle], basis, aci)
+
+
+def cf_ytm(dirty, flows, settle, tax=False, basis=0.0, aci=0.0):
     """Эффективная годовая доходность (дробью, 0.12 = 12%) по потокам; None, если корня нет.
-    tax=True: после НДФЛ 13% — на купоны и на положительную разницу (погашение - basis) в дату последнего потока."""
+    tax=True: после НДФЛ 13% — на купоны (за вычетом aci) и на положительную разницу (погашение - basis)."""
     if not flows or not dirty or dirty <= 0:
         return None
     fl = [f for f in flows if f[0] > settle]
     if not fl:
         return None
-    f = lambda y: _bc_pv(fl, settle, y, tax, basis) - dirty
+    f = lambda y: _bc_pv(fl, settle, y, tax, basis, aci) - dirty
     lo, hi = -0.95, 50.0
     flo, fhi = f(lo), f(hi)
     if flo != flo or fhi != fhi or flo * fhi > 0:

@@ -209,6 +209,19 @@ class VtbEntry(unittest.TestCase):
         generic = make_xlsx([["Дата", "Операция", "ISIN", "Количество", "Сумма", "Валюта"], ["01.02.2025", "Покупка", ISIN, "10", "1000", "RUB"]])
         self.assertIn("mapping", M.import_preview_any("g.xlsx", generic))
 
+    def test_fractional_opening_and_short_cover(self):
+        # входящий остаток 0.25 шт. и внутридневной шорт 0.4 шт. не должны отбрасываться порогом 0.5
+        t = report("01.01.2025", "30.06.2025",
+                   [deal("V1", xl(2025, 2, 3, 0.4), "Продажа", 0.4, "400.0"),
+                    deal("V2", xl(2025, 2, 3, 0.5), "Покупка", 0.4, "400.0")],
+                   [], [], (0.0, 0.0, 0.0), [(0.25, 0.25, 0.25)], [])
+        ops, _meta = parse(t)
+        opening = [o for o in ops if o["id"].startswith("vtb-open-sec-%s" % ISIN)]
+        self.assertEqual(len(opening), 1)
+        self.assertEqual(opening[0]["quantity"], "0.25")
+        xfers = [o for o in ops if o["id"].startswith("vtb-xfer-")]
+        self.assertEqual(len(xfers), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

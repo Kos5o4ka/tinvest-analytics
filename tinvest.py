@@ -7,7 +7,7 @@
                                        (=net — ошибка сети с автозапуском, =checksum — неверная контрольная сумма)
 Токен лаунчер не читает и никуда не отправляет: он лежит только в папке данных на этом компьютере.
 """
-import hashlib, json, os, queue, re, socket, ssl, subprocess, sys, threading, time, urllib.request
+import hashlib, json, os, platform, queue, re, shutil, socket, ssl, subprocess, sys, threading, time, urllib.request
 from urllib.parse import urlparse
 
 REPO = "Kos5o4ka/tinvest-analytics"
@@ -18,8 +18,9 @@ HOME = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), "
 APP_DIR = os.path.join(HOME, "app")
 APP, VER = os.path.join(APP_DIR, FILE), os.path.join(APP_DIR, "version.txt")
 OK_HOSTS = ("api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com")
-SHELL_REV = 3                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
+SHELL_REV = 4                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
                                          # 3 — заставка на pywebview и бесшовный переход в окно программы
+                                         # 4 — установщик (onedir), трей, автозапуск и обновление оболочки из программы
 os.environ["TINVEST_SHELL_REV"] = str(SHELL_REV)
 FROZEN = bool(getattr(sys, "frozen", False))      # собрано PyInstaller: sys.executable — сам лаунчер, не Python
 
@@ -129,15 +130,240 @@ def update(report=lambda *a: None, cancel=None, fetch=fetch):
     if cancel is not None and cancel.is_set():
         raise Cancelled()                                      # до этой точки APP не тронут
     os.makedirs(APP_DIR, mode=0o700, exist_ok=True)
-    if os.path.exists(APP):
-        os.replace(APP, APP + ".bak")                          # предыдущая версия остаётся как запасная
-    tmp = APP + ".tmp"
+    tmp, bak = APP + ".tmp", APP + ".bak"
     with open(tmp, "wb") as f:
         f.write(code)
-    os.replace(tmp, APP)                                       # атомарная подмена
+    moved = False
+    try:
+        if os.path.exists(APP):
+            os.replace(APP, bak)                              # предыдущая версия остаётся как запасная
+            moved = True
+        os.replace(tmp, APP)                                   # атомарная подмена
+    except Exception:
+        if moved and not os.path.exists(APP) and os.path.exists(bak):
+            try:
+                os.replace(bak, APP)                           # откат рабочей версии при сбое замены
+            except OSError:
+                pass
+        raise
     with open(VER, "w") as f:
         f.write(tag)
     return "updated"
+
+
+# ───────────────────────────── обновление оболочки: установщик с GitHub ─────────────────────────────
+
+SETUP_ASSET = "TAnalytic-Setup-win.exe"          # установщик Inno Setup (packaging/TAnalytic.iss), публикуется в релизе
+MAC_ASSETS = {"arm64": "TAnalytic-mac-arm64.dmg", "x86_64": "TAnalytic-mac-x64.dmg"}   # образы macOS (packaging/make_dmg.sh)
+MAC_APP_NAME = "TAnalytic.app"                   # так называется приложение внутри образа и на диске
+SETUP_LIMIT = 300_000_000                        # установщик заметно больше одного .py (по умолчанию fetch берёт до 20 МБ)
+UPDATE_DIR = os.path.join(HOME, "update")
+SETUP_ARGS = ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/RELAUNCH=1")   # /RELAUNCH — свой параметр .iss
+
+
+def shell_asset(plat=None, machine=None):
+    """Файл оболочки в релизе для этой системы и архитектуры (или None, если для неё установщика нет)."""
+    plat = sys.platform if plat is None else plat
+    if plat == "win32":
+        return SETUP_ASSET
+    if plat == "darwin":
+        m = (platform.machine() if machine is None else machine).lower()
+        return MAC_ASSETS["arm64" if m in ("arm64", "aarch64") else "x86_64"]
+    return None
+
+
+def mac_app_path(executable=None):
+    """Путь к «TAnalytic.app», из которого запущена оболочка: .../TAnalytic.app/Contents/MacOS/TAnalytic. Иначе None."""
+    parts = os.path.abspath(executable or sys.executable).split(os.sep)
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i].endswith(".app") and parts[i + 1:i + 3] == ["Contents", "MacOS"]:
+            return os.sep.join(parts[:i + 1]) or os.sep
+    return None
+
+
+def mac_update_blocker(app, access=os.access):
+    """Почему на macOS нельзя заменить приложение на месте (текст для пользователя), или None, если можно.
+    Нельзя: приложение запущено не из .app, из временной копии App Translocation (карантин, запуск из образа
+    или загрузок без переноса) либо из места, куда пользователь не может писать (образ диска, чужая папка)."""
+    if not app:
+        return "Приложение запущено не из «%s»." % MAC_APP_NAME
+    if "/AppTranslocation/" in app or app.startswith("/private/var/folders/"):
+        return "macOS запустила приложение из временной копии. Перенесите «%s» в «Программы» и откройте оттуда." % MAC_APP_NAME
+    parent = os.path.dirname(app)
+    if not (access(app, os.W_OK) and access(parent, os.W_OK)):
+        return "Приложение лежит там, где его нельзя заменить (например, в открытом образе диска)."
+    return None
+
+
+def shell_update_supported():
+    """Самообновление оболочки — только у собранного приложения: .exe на Windows и .app на macOS."""
+    return sys.platform in ("win32", "darwin") and FROZEN
+
+
+def pick_setup(rel, name=SETUP_ASSET):
+    """Из описания релиза GitHub: (адрес установщика, адрес SHA256SUMS). Оба — только домены GitHub."""
+    urls = {a.get("name"): a.get("browser_download_url") for a in rel.get("assets", []) if isinstance(a, dict)}
+    if not urls.get(name) or not urls.get(SUMS):
+        raise ValueError("в релизе %s нет установщика или контрольных сумм" % rel.get("tag_name", "?"))
+    return check_url(urls[name]), check_url(urls[SUMS])
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def prepare_installer(dest_dir=None, report=lambda *a: None, cancel=None, fetch=fetch, asset=SETUP_ASSET):
+    """Скачивает установщик (asset — файл оболочки: .exe или .dmg, см. shell_asset) последнего релиза и сверяет SHA256 с SHA256SUMS из того же релиза.
+    Возвращает {"path", "tag", "sha"}; при несовпадении суммы файл не сохраняется."""
+    rel = json.loads(fetch("https://api.github.com/repos/%s/releases/latest" % REPO, cancel=cancel))
+    tag = rel["tag_name"]
+    url, sums_url = pick_setup(rel, asset)
+    want = parse_sums(fetch(sums_url, cancel=cancel).decode(), asset)
+    dest_dir = dest_dir or UPDATE_DIR
+    path = os.path.join(dest_dir, asset)
+    try:
+        if os.path.exists(path) and sha256_file(path) == want:       # уже скачан и цел
+            return {"path": path, "tag": tag, "sha": want}
+    except OSError:
+        pass
+    data = fetch(url, limit=SETUP_LIMIT, progress=lambda d, t, s: report("progress", d, t, s), cancel=cancel)
+    if hashlib.sha256(data).hexdigest() != want:
+        raise ValueError("не совпала контрольная сумма SHA256 — установщик отклонён")
+    os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return {"path": path, "tag": tag, "sha": want}
+
+
+def start_installer(info, popen=None):
+    """Запускает скачанный установщик тихо; процесс не привязан к лаунчеру и переживает его выход.
+    Перед запуском сумма файла проверяется ещё раз (между скачиванием и согласием пользователя он мог измениться)."""
+    path = info["path"]
+    if sha256_file(path) != info["sha"]:
+        raise ValueError("файл установщика изменился после проверки — обновление отклонено")
+    popen = popen or subprocess.Popen
+    kw = {"close_fds": True}
+    if sys.platform == "win32":
+        kw["creationflags"] = 0x00000008 | 0x00000200            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    return popen([path] + list(SETUP_ARGS), **kw)
+
+
+class MacUpdateError(Exception):
+    pass
+
+
+def _run_checked(run, cmd, what, timeout=300):
+    """Запускает служебную команду macOS; при ошибке — MacUpdateError с понятным текстом."""
+    try:
+        r = run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except Exception as e:
+        raise MacUpdateError("%s: %s" % (what, e))
+    if r.returncode != 0:
+        tail = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+        raise MacUpdateError("%s не удалось (код %s) %s" % (what, r.returncode, tail[0]))
+    return r
+
+
+def mac_replace_app(info, app, run=None, workdir=None, pid=None):
+    """Заменяет приложение app на копию из скачанного образа .dmg. Возвращает {"app", "old"}: old — прежняя
+    копия, которую удалит перезапуск после выхода. Порядок: образ монтируется только для чтения, приложение
+    копируется во временную папку рядом с прежним (ditto сохраняет подпись), с копии снимается карантин,
+    подпись проверяется, затем два переименования: прежнее → «.old», новое → на место. Любая ошибка —
+    прежнее приложение остаётся нетронутым (если упало второе переименование, оно возвращается на место)."""
+    run = run or subprocess.run
+    if sha256_file(info["path"]) != info["sha"]:
+        raise MacUpdateError("файл образа изменился после проверки — обновление отклонено")
+    pid = os.getpid() if pid is None else pid
+    parent = os.path.dirname(app)
+    new, old = os.path.join(parent, ".%s.new-%s" % (MAC_APP_NAME, pid)), os.path.join(parent, ".%s.old-%s" % (MAC_APP_NAME, pid))
+    work = workdir or os.path.join(UPDATE_DIR, "mnt")
+    mnt = os.path.join(work, "mount-%s" % pid)
+    os.makedirs(mnt, mode=0o700, exist_ok=True)
+    mounted = False
+    try:
+        _run_checked(run, ["hdiutil", "attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mnt, info["path"]],
+                     "Не удалось открыть образ диска")
+        mounted = True
+        src = os.path.join(mnt, MAC_APP_NAME)
+        if not os.path.isdir(src):
+            raise MacUpdateError("в образе нет «%s»" % MAC_APP_NAME)
+        _run_checked(run, ["ditto", src, new], "Не удалось скопировать приложение")
+        _run_checked(run, ["xattr", "-dr", "com.apple.quarantine", new], "Не удалось снять карантинную метку", 60)
+        _run_checked(run, ["codesign", "--verify", "--deep", "--strict", new], "Проверка подписи новой копии", 120)
+        os.rename(app, old)
+        try:
+            os.rename(new, app)
+        except OSError:
+            os.rename(old, app)                                      # новую копию на место не поставить — возвращаем прежнюю
+            raise
+    except Exception as e:
+        shutil.rmtree(new, ignore_errors=True)
+        if isinstance(e, MacUpdateError):
+            raise
+        raise MacUpdateError("Не удалось заменить приложение: %s" % e)
+    finally:
+        if mounted:
+            try:
+                _run_checked(run, ["hdiutil", "detach", mnt], "Не удалось закрыть образ", 60)
+            except MacUpdateError:
+                try:
+                    run(["hdiutil", "detach", "-force", mnt], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                except Exception:
+                    pass
+        try:
+            os.rmdir(mnt)
+        except OSError:
+            pass
+    return {"app": app, "old": old}
+
+
+def mac_rollback(res):
+    """Возвращает прежнее приложение на место (если перезапуск не удалось подготовить)."""
+    shutil.rmtree(res["app"], ignore_errors=True)
+    os.rename(res["old"], res["app"])
+
+
+MAC_RELAUNCH = ('i=0; while kill -0 "$1" 2>/dev/null && [ $i -lt 150 ]; do sleep 0.2; i=$((i+1)); done; '
+                'open -n "$2"; rm -rf "$3"')
+
+
+def mac_spawn_relaunch(res, popen=None, pid=None):
+    """Отдельный короткий процесс: ждёт выхода текущего (до 30 секунд), открывает новое приложение через
+    «open -n» и стирает прежнюю копию. Он не привязан к лаунчеру и переживает его выход."""
+    popen = popen or subprocess.Popen
+    return popen(["/bin/sh", "-c", MAC_RELAUNCH, "sh", str(os.getpid() if pid is None else pid), res["app"], res["old"]],
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                 close_fds=True, start_new_session=True)
+
+
+def install_mac_and_exit(info, app=None, run=None, popen=None, exit_fn=None):
+    """macOS: заменяет приложение (mac_replace_app), запускает перезапуск и выходит. Не удалось — остаёмся в прежнем."""
+    app = app or mac_app_path()
+    QUITTING.set()
+    res = None
+    try:
+        why = mac_update_blocker(app)
+        if why:
+            raise MacUpdateError(why)
+        res = mac_replace_app(info, app, run=run)
+        mac_spawn_relaunch(res, popen)
+    except Exception as e:
+        if res is not None:
+            try:
+                mac_rollback(res)
+            except OSError as e2:
+                sys.stderr.write("Не удалось вернуть прежнее приложение: %s\n" % e2)
+        QUITTING.clear()
+        sys.stderr.write("Не удалось обновить приложение: %s\n" % e)
+        return False
+    (exit_fn or graceful_exit)(0)
+    return True
 
 
 def worker(q, cancel):
@@ -175,7 +401,7 @@ def console_bar(done, total, speed, width=28):
 
 
 def have_app():
-    return os.path.exists(APP)
+    return os.path.exists(APP) or os.path.exists(APP + ".bak")
 
 
 # ───────────────────────────── интерфейс: консоль ─────────────────────────────
@@ -656,9 +882,13 @@ def want_native(frozen, no_gui, env=None):
     return bool(frozen) and not no_gui and env.get("TINVEST_NO_WEBVIEW") != "1"
 
 
+FRAME_SLACK = 16      # Windows держит невидимую рамку ресайза ~8 px: развёрнутое окно стоит в (-8, -8), это не «за экраном»
+
+
 def window_geometry(saved, screen, want=(WIN_W, WIN_H), min_size=(MIN_W, MIN_H)):
     """(ширина, высота, x, y) окна. saved — dict из window.json (или None); screen — (ширина, высота) или None.
-    Размер не больше экрана (с полями) и не меньше min_size, если экран позволяет; x/y — только если окно видно на экране."""
+    Размер не больше экрана (с полями) и не меньше min_size, если экран позволяет. Позиция — сохранённая, если окно
+    видно на экране, иначе по центру экрана (Windows без явных x/y ставит окно в левый верхний угол)."""
     def num(k, d=None):
         v = (saved or {}).get(k)
         return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else d
@@ -668,11 +898,25 @@ def window_geometry(saved, screen, want=(WIN_W, WIN_H), min_size=(MIN_W, MIN_H))
         sw, sh = screen
         w = min(w, max(sw - 40, 1)); h = min(h, max(sh - 80, 1))
         w = max(w, min(min_size[0], sw)); h = max(h, min(min_size[1], sh))
-        if x is None or y is None or x < -w + 100 or y < 0 or x > sw - 100 or y > sh - 100:
-            x = y = None
+        if x is None or y is None or x < -w + 100 or y < -FRAME_SLACK or x > sw - 100 or y > sh - 100:
+            x, y = center(w, h, screen)
+        else:
+            y = max(y, 0)
     elif w < min_size[0] or h < min_size[1]:
         w, h = max(w, min_size[0]), max(h, min_size[1])
     return w, h, x, y
+
+
+def center(w, h, screen):
+    """Левый верхний угол окна w×h по центру экрана (чуть выше середины — так окно смотрится ровнее)."""
+    if not screen:
+        return None, None
+    sw, sh = screen
+    return max(0, (sw - w) // 2), max(0, (sh - h) * 2 // 5)
+
+
+def was_maximized(saved):
+    return bool((saved or {}).get("maximized"))
 
 
 def load_state():
@@ -684,13 +928,24 @@ def load_state():
         return None
 
 
-def save_state(w, h, x, y):
+def save_state(w, h, x, y, maximized=False):
     try:
         os.makedirs(HOME, mode=0o700, exist_ok=True)
+        d = {"w": int(w), "h": int(h), "x": int(x), "y": int(y)}
+        if maximized:
+            d["maximized"] = True
         with open(STATE, "w") as f:
-            json.dump({"w": int(w), "h": int(h), "x": int(x), "y": int(y)}, f)
+            json.dump(d, f)
     except Exception:
         pass
+
+
+def looks_maximized(w, h, x, y, screen):
+    """Окно занимает весь экран с отрицательной рамкой Windows (-8, -8) — значит, оно было развёрнуто."""
+    if not screen:
+        return False
+    sw, sh = screen
+    return x <= 0 and y <= 0 and w >= sw - 2 * FRAME_SLACK and h >= sh - 160
 
 
 def wait_ping(get_url, thread, timeout=90):
@@ -709,35 +964,391 @@ def wait_ping(get_url, thread, timeout=90):
     return False
 
 
-def webview_setup(webview):
-    """Общие настройки pywebview и геометрия окна программы (по window.json)."""
-    webview.settings["ALLOW_DOWNLOADS"] = True                  # выгрузки CSV/ICS по ссылкам
-    webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True   # t.me, MOEX и прочие target=_blank — в обычный браузер
-    screen = None
+def read_app_config(path=None):
+    """Читает пользовательский config.json программы; при отсутствии/ошибке возвращает {}."""
+    p = path or os.path.join(HOME, "config.json")
     try:
-        sc = webview.screens[0]
-        screen = (sc.width, sc.height)
+        with open(p, encoding="utf-8-sig") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def bio_verify(reason="Разблокируйте TAnalytic"):
+    """Нативная проверка биометрии/пароля ОС (Touch ID на macOS, Windows Hello на Windows)."""
+    if sys.platform == "darwin":
+        try:
+            import objc  # noqa: F401
+            from Foundation import NSBundle
+            bundle = NSBundle.bundleWithPath_("/System/Library/Frameworks/LocalAuthentication.framework")
+            if bundle and bundle.load():
+                LAContext = objc.lookUpClass("LAContext")
+                ctx = LAContext.alloc().init()
+                ok_can, _ = ctx.canEvaluatePolicy_error_(2, None)  # LAPolicyDeviceOwnerAuthentication
+                if ok_can:
+                    ev, res = threading.Event(), [False]
+
+                    def reply(success, _err):
+                        res[0] = bool(success)
+                        ev.set()
+
+                    ctx.evaluatePolicy_localizedReason_reply_(2, str(reason), reply)
+                    ev.wait(60)
+                    return bool(res[0])
+        except Exception:
+            pass
+        try:
+            swift_code = (
+                "import Foundation\nimport LocalAuthentication\n"
+                "let ctx = LAContext()\n"
+                "let reason = ProcessInfo.processInfo.environment[\"TA_BIO_REASON\"] ?? \"Unlock TAnalytic\"\n"
+                "var err: NSError?\n"
+                "if !ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) { exit(2) }\n"
+                "let sem = DispatchSemaphore(value: 0)\nvar ok = false\n"
+                "ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { s, _ in ok = s; sem.signal() }\n"
+                "sem.wait()\nexit(ok ? 0 : 1)\n"
+            )
+            env = dict(os.environ, TA_BIO_REASON=str(reason))
+            r = subprocess.run(["swift", "-e", swift_code], env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            return r.returncode == 0
+        except Exception:
+            return False
+    if sys.platform == "win32":
+        try:
+            ps = (
+                "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+                "$null = [Windows.Security.Credentials.UI.UserConsentVerifier,"
+                "Windows.Security.Credentials.UI,ContentType=WindowsRuntime]; "
+                "$op = [Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync($env:TA_BIO_REASON); "
+                "$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { "
+                "$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethod })[0]"
+                ".MakeGenericMethod([Windows.Security.Credentials.UI.UserConsentVerificationResult]); "
+                "$res = $asTask.Invoke($null, @($op)).GetAwaiter().GetResult(); "
+                "if ($res -eq [Windows.Security.Credentials.UI.UserConsentVerificationResult]::Verified) { exit 0 } else { exit 1 }"
+            )
+            env = dict(os.environ, TA_BIO_REASON=str(reason))
+            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                               env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, creationflags=0x08000000, timeout=60)
+            return r.returncode == 0
+        except Exception:
+            return False
+    return False
+
+
+def fetch_lock_status(url, timeout=2.0):
+    """Запрашивает GET /api/lock/status. Если маршрут отсутствует, считает блокировку выключенной."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/lock/status", timeout=timeout) as r:
+            if r.status == 200:
+                d = json.loads(r.read().decode("utf-8") or "{}")
+                if isinstance(d, dict):
+                    d.setdefault("_ok", True)
+                    return d
     except Exception:
         pass
-    return window_geometry(load_state(), screen)
+    return {"enabled": False, "unlocked": True, "_ok": False}
+
+
+def post_lock_unlock(url, timeout=2.0):
+    """Разблокирует сессию после успешной нативной биометрии (POST /api/lock/unlock)."""
+    try:
+        req = urllib.request.Request(
+            url.rstrip("/") + "/api/lock/unlock",
+            data=b'{"biometric":true}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if r.status == 200:
+                d = json.loads(r.read().decode("utf-8") or "{}")
+                return bool(d.get("unlocked", True))
+    except Exception:
+        pass
+    return False
+
+
+def check_lock_gate(url, cfg=None, get_status=None, verify_fn=None, unlock_fn=None):
+    """Предварительная проверка блокировки перед показом окна.
+    Если включена защита (cfg.get('lock_enabled') или /api/lock/status -> enabled=True, unlocked=False),
+    пробует нативную биометрию; при успехе автоматически разблокирует сессию, при отказе — оставляет веб-экран PIN."""
+    cfg = read_app_config() if cfg is None else cfg
+    cfg_enabled = bool(cfg.get("lock_enabled", False))
+    status = (get_status or fetch_lock_status)(url) if url else {"enabled": False, "unlocked": True, "_ok": False}
+    if status.get("_ok"):
+        enabled = bool(status.get("enabled", cfg_enabled))
+        unlocked = bool(status.get("unlocked", not enabled))
+    else:
+        enabled = cfg_enabled
+        unlocked = not cfg_enabled
+    if not enabled or unlocked:
+        return {"locked": False, "unlocked": True, "method": "none"}
+    allow_bio = bool(cfg.get("lock_bio", True)) and bool(status.get("biometric", True))
+    if allow_bio and (verify_fn or bio_verify)():
+        ok = (unlock_fn or post_lock_unlock)(url) if url else True
+        return {"locked": True, "unlocked": bool(ok), "method": "biometric"}
+    return {"locked": True, "unlocked": False, "method": "web"}
+
+
+WEBVIEW_DIR = os.path.join(HOME, "webview")      # постоянный профиль WebView: тема, режим, меню переживают перезапуск
+
+
+def start_kwargs():
+    """Аргументы webview.start(): постоянный профиль вместо одноразового %TEMP%\\tmp*\\EBWebView
+    (иначе localStorage — тема, режим «Профи», свёрнутое меню — стирается при каждом запуске)."""
+    try:
+        os.makedirs(WEBVIEW_DIR, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    return {"private_mode": False, "storage_path": WEBVIEW_DIR}
+
+
+def screen_size(webview):
+    """Рабочая область основного экрана (без панели задач Windows), иначе размер экрана pywebview."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            r = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):   # SPI_GETWORKAREA
+                return (r.right - r.left, r.bottom - r.top)
+        except Exception:
+            pass
+    try:
+        sc = webview.screens[0]
+        return (sc.width, sc.height)
+    except Exception:
+        return None
+
+
+def webview_setup(webview):
+    """Общие настройки pywebview и геометрия окна программы (по window.json): (w, h, x, y, развёрнуто, экран)."""
+    webview.settings["ALLOW_DOWNLOADS"] = True                  # выгрузки CSV/ICS по ссылкам
+    webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True   # t.me, MOEX и прочие target=_blank — в обычный браузер
+    screen = screen_size(webview)
+    saved = load_state()
+    return window_geometry(saved, screen) + (was_maximized(saved), screen)
+
+
+# ── Windows: тёмная системная шапка в цвет программы (DWM) ──
+DWM_DARK, DWM_DARK_OLD, DWM_BORDER, DWM_CAPTION, DWM_TEXT, DWM_CORNER = 20, 19, 34, 35, 36, 33
+THEMES = {"dark": {"caption": "#090c12", "text": "#edf1f7", "border": "#1e293b"},
+          "light": {"caption": "#f6f7f9", "text": "#0f172a", "border": "#d8dde6"}}
+
+
+def win_build():
+    """Номер сборки Windows (22000+ — Windows 11), 0 — не Windows."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        return sys.getwindowsversion().build
+    except Exception:
+        return 0
+
+
+def colorref(hex_color):
+    """#rrggbb → COLORREF (0x00bbggrr) для DwmSetWindowAttribute."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return r | (g << 8) | (b << 16)
+
+
+def native_hwnd(win):
+    nat = getattr(win, "native", None)
+    try:
+        return int(nat.Handle.ToInt64()) if nat is not None else 0
+    except Exception:
+        return 0
+
+
+def dwm_theme(hwnd, theme="dark", build=None):
+    """Шапка окна Windows в тон теме программы: тёмный режим (Windows 10 1809+), а на Windows 11 — точные цвета
+    фона, текста и рамки. Возвращает список выставленных атрибутов (для проверки)."""
+    if not hwnd or sys.platform != "win32":
+        return []
+    import ctypes
+    build = win_build() if build is None else build
+    t = THEMES.get(theme) or THEMES["dark"]
+    done = []
+
+    def put(attr, v):
+        val = ctypes.c_int(v)
+        if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), 4) == 0:
+            done.append(attr)
+    try:
+        put(DWM_DARK if build >= 18985 else DWM_DARK_OLD, 1 if theme != "light" else 0)
+        if build >= 22000:
+            put(DWM_CAPTION, colorref(t["caption"]))
+            put(DWM_TEXT, colorref(t["text"]))
+            put(DWM_BORDER, colorref(t["border"]))
+        # Windows 10 перерисовывает заголовок только при смене активности окна
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)   # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+    except Exception:
+        pass
+    return done
+
+
+class MainApi:
+    """Мост окна программы (window.pywebview.api.*): тема шапки, управление окном, выбор файла."""
+    def __init__(self):
+        self._win = None
+        self._setup = None
+        self._upd_lock = threading.Lock()
+
+    def set_theme(self, theme):
+        if sys.platform == "win32" and self._win is not None:
+            dwm_theme(native_hwnd(self._win), "light" if theme == "light" else "dark")
+        return True
+
+    def platform(self):
+        return {"win32": "win", "darwin": "mac"}.get(sys.platform, "linux")
+
+    def minimize(self):
+        self._win and self._win.minimize()
+
+    def win_minimize(self):
+        return self.minimize()
+
+    def toggle_maximize(self):
+        w = self._win
+        if w is None:
+            return
+        if getattr(w, "_ta_max", False):
+            w.restore()
+        else:
+            w.maximize()
+
+    def win_toggle_max(self):
+        return self.toggle_maximize()
+
+    def toggle_fullscreen(self):
+        self._win and self._win.toggle_fullscreen()
+
+    def close(self):
+        self._win and self._win.destroy()
+
+    def win_close(self):
+        return self.close()
+
+    def shell_update_prepare(self):
+        """Скачивает и проверяет установщик новой оболочки (Windows — .exe, macOS — .dmg). → {ok, tag} или {error}.
+        Сеть — здесь, не в браузере. На macOS заранее проверяет, что приложение можно заменить на месте."""
+        if not shell_update_supported():
+            return {"error": "Обновление оболочки из программы доступно только в установленной версии для Windows и macOS"}
+        if sys.platform == "darwin":
+            why = mac_update_blocker(mac_app_path())
+            if why:
+                return {"error": why}
+        with self._upd_lock:
+            try:
+                self._setup = prepare_installer(asset=shell_asset())
+                return {"ok": True, "tag": self._setup["tag"]}
+            except Exception as e:
+                self._setup = None
+                return {"error": str(getattr(e, "reason", None) or e)}
+
+    def shell_update_run(self):
+        """«Обновить и перезапустить»: запускает проверенный установщик (Windows) или заменяет .app (macOS) и закрывает программу."""
+        info = self._setup
+        if not info or not shell_update_supported():
+            return {"error": "Установщик не подготовлен"}
+        if sys.platform == "darwin":
+            res = {}
+
+            def go():
+                res["ok"] = install_mac_and_exit(info)
+            t = threading.Thread(target=go, daemon=True)
+            t.start()
+            t.join(120)                  # при удаче процесс завершится внутри; при ошибке страница получит причину
+            return {"error": "Не удалось заменить приложение (подробности в журнале запуска)"} if res.get("ok") is False else {"ok": True}
+        threading.Thread(target=install_and_exit, args=(info,), daemon=True).start()   # ответ страница получит до выхода
+        return {"ok": True}
+
+    def pick_file(self, kinds="Отчёты брокера (*.xlsx;*.xls;*.csv;*.html;*.htm;*.xml)"):
+        """Системный диалог выбора файла (запасной путь, если <input type=file> не открылся). → {name, b64} или None."""
+        import base64
+        try:
+            import webview
+            res = self._win.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=False, file_types=(kinds, "Все файлы (*.*)"))
+        except Exception:
+            return None
+        if not res:
+            return None
+        p = res[0] if isinstance(res, (list, tuple)) else res
+        try:
+            if os.path.getsize(p) > 50_000_000:
+                return {"error": "Файл больше 50 МБ"}
+            with open(p, "rb") as f:
+                return {"name": os.path.basename(p), "b64": base64.b64encode(f.read()).decode("ascii")}
+        except OSError as e:
+            return {"error": str(e)}
 
 
 def app_window(webview, url, thread, geom, hidden=False, html=None, remember_geometry=True):
-    """Окно программы. thread — поток программы: когда он завершается, окно закрывается."""
-    w, h, x, y = geom
+    """Окно программы. thread — поток программы: когда он завершается, окно закрывается.
+    geom — (w, h, x, y[, развёрнуто, экран]) из webview_setup()."""
+    w, h, x, y = geom[:4]
+    maximized = len(geom) > 4 and bool(geom[4])
+    screen = geom[5] if len(geom) > 5 else None
+    api = MainApi()
     win = webview.create_window(TITLE, url, html=html, width=w, height=h, x=x, y=y, min_size=(MIN_W, MIN_H),
-                                background_color=BG, text_select=True, hidden=hidden)
+                                background_color=BG, text_select=True, hidden=hidden, js_api=api)
+    api._win = win
+    win._ta_max = False
+    normal = {"w": w, "h": h, "x": x if x is not None else 0, "y": y if y is not None else 0}
 
     def remember(*_):
         try:
-            save_state(win.width, win.height, win.x, win.y)
+            cw, ch, cx, cy = win.width, win.height, win.x, win.y
+            if cx is None or cx <= -30000:                       # свёрнуто в панель задач: Windows ставит (-32000, -32000)
+                return
+            if win._ta_max or looks_maximized(cw, ch, cx, cy, screen):
+                save_state(normal["w"], normal["h"], normal["x"], normal["y"], maximized=True)
+            else:
+                normal.update(w=cw, h=ch, x=cx, y=cy)
+                save_state(cw, ch, cx, cy)
         except Exception:
             pass
+
+    def on_max(*_):
+        win._ta_max = True
+        remember()
+
+    def on_restore(*_):
+        win._ta_max = False
+    for name, fn in (("maximized", on_max), ("restored", on_restore)):
+        ev = getattr(win.events, name, None)
+        if ev is not None:
+            ev += fn
     if remember_geometry:
         for ev in (win.events.closing, win.events.resized, win.events.moved):   # closing не вызывается при выходе по Cmd+Q
             ev += remember
+    if sys.platform == "win32":
+        global TRAY
+        tray = win._ta_tray = TRAY = Tray(win)
+        sys.tanalytic_tray_sync = tray_sync                      # программа сообщает, что настройку трея изменили
+
+        def on_closing(*_):
+            if should_hide_on_close(QUITTING.is_set(), tray.ready, tray_wanted()):
+                threading.Thread(target=tray.hide_window, daemon=True).start()   # прячем уже после ответа: окно из обработчика не трогаем
+                return False                                     # закрытие отменено
+        win.events.closing += on_closing
+
+    def shown(*_):
+        if sys.platform == "win32":
+            dwm_theme(native_hwnd(win), "dark")                  # страница уточнит тему через api.set_theme()
+        if maximized:
+            try:
+                win.maximize()
+            except Exception:
+                pass
+    win._ta_shown = shown
+    if not hidden:
+        win.events.shown += shown
     if thread is not None:
-        threading.Thread(target=lambda: (thread.join(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
+        threading.Thread(target=lambda: (thread.join(), QUITTING.set(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
     return win
 
 
@@ -745,8 +1356,14 @@ def open_native(url, thread):
     """Окно программы на pywebview (WKWebView / Edge WebView2). Возвращает управление после закрытия окна;
     бросает исключение, если окно показать не удалось (тогда запускается запасное окно tk)."""
     import webview
-    app_window(webview, url, thread, webview_setup(webview))
-    webview.start()
+    win = app_window(webview, url, thread, webview_setup(webview))
+
+    def boot():
+        tray = getattr(win, "_ta_tray", None)
+        if tray is not None and tray_wanted():
+            win.events.loaded.wait(10)
+            tray.start()
+    webview.start(boot, **start_kwargs())
 
 
 # ───────────────────────────── заставка на pywebview (оболочка ревизии 3) ─────────────────────────────
@@ -782,6 +1399,7 @@ html.win,html.win body{background:var(--bg)}
   border:1px solid var(--line2);box-shadow:inset 0 1px 0 #ffffff0a;
   animation:in .42s cubic-bezier(.16,1,.3,1) both;transition:opacity .2s ease,transform .2s ease}
 html.win .card{border-radius:0;border-color:transparent}
+html.win10 .card{border-color:#26314b;box-shadow:inset 0 1px 0 #ffffff0a,inset 0 0 0 1px #00000066}
 body.bye .card{opacity:0;transform:scale(.985)}
 @keyframes in{from{opacity:0;transform:translateY(6px) scale(.985)}to{opacity:1;transform:none}}
 .hd{display:flex;align-items:center;gap:14px}
@@ -797,6 +1415,8 @@ body[data-stage=check] .lg,body[data-stage=launch] .lg{animation:pulse 1.8s ease
 .x{margin-left:auto;align-self:flex-start;width:28px;height:28px;border-radius:8px;border:0;background:transparent;color:var(--mu);
   display:grid;place-items:center;cursor:pointer;transition:background .15s,color .15s}
 .x:hover{background:#ffffff0d;color:var(--tx)}
+.x.mn{margin-left:auto;margin-right:-8px}.x.mn+.x{margin-left:0}
+.x#x:hover{background:#e81123;color:#fff}
 .x svg{width:12px;height:12px}
 .steps{display:flex;gap:18px;margin:24px 0 0;font-size:12px;color:var(--mu)}
 .steps span{display:flex;align-items:center;gap:7px;transition:color .2s}
@@ -828,6 +1448,7 @@ body[data-stage=error] .st{color:#ff8a90}
 <body data-stage="check"><div class="card">
   <div class="hd"><div class="lg">__LOGO__</div>
     <div class="nm">TAnalytic<span class="ver" id="ver"></span><small>аналитика портфеля</small></div>
+    <button class="x mn" id="mn" title="Свернуть" aria-label="Свернуть"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 6h8"/></svg></button>
     <button class="x" id="x" title="Закрыть" aria-label="Закрыть"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 2l8 8M10 2l-8 8"/></svg></button></div>
   <div class="steps" id="steps"></div>
   <div class="st" id="st">Проверяю обновления</div>
@@ -842,6 +1463,7 @@ body[data-stage=error] .st{color:#ff8a90}
   function call(n){try{if(window.pywebview&&pywebview.api&&pywebview.api[n])pywebview.api[n]()}catch(e){}}
   $('steps').innerHTML=STEPS.map(function(s){return '<span><i></i>'+s+'</span>'}).join('');
   $('x').onclick=function(){call('close')};
+  $('mn').onclick=function(){call('minimize')};
   document.addEventListener('keydown',function(e){if(e.key==='Escape')call('close')});
   window.splash={set:function(s){
     if(s.bye){document.body.classList.add('bye');return}
@@ -867,10 +1489,14 @@ body[data-stage=error] .st{color:#ff8a90}
 </script></body></html>"""
 
 
-def splash_html(platform=None):
+def splash_html(platform=None, build=None):
     """Страница заставки. На macOS окно прозрачное, скругление и обводка рисуются карточкой; на Windows окно
-    непрозрачное, а углы скругляет сама система (Windows 11)."""
-    plat = "win" if (platform or sys.platform) == "win32" else "mac"
+    непрозрачное: на Windows 11 углы скругляет система, на Windows 10 остаётся чёткая обводка карточки."""
+    if (platform or sys.platform) == "win32":
+        build = win_build() if build is None else build
+        plat = "win" if build >= 22000 else "win win10"
+    else:
+        plat = "mac"
     return (SPLASH_HTML.replace("__PLAT__", plat).replace("__LOGO__", LOGO_SVG)
             .replace("__STEPS__", json.dumps(list(SPLASH_STEPS), ensure_ascii=False)))
 
@@ -913,6 +1539,12 @@ class SplashApi:
     def browser(self):
         self._shell.ui("browser")
 
+    def minimize(self):
+        try:
+            self._shell.splash.minimize()
+        except Exception:
+            pass
+
 
 def demo_worker(kind):
     """TINVEST_SPLASH_DEMO: имитация обновления без сети и без записи файлов (для просмотра заставки)."""
@@ -950,8 +1582,9 @@ DEMO_PAGE = ("<!doctype html><html><body style='margin:0;height:100vh;display:gr
 class WebShell:
     """Заставка обновления и запуск программы в одном цикле pywebview (главный поток занят GUI)."""
 
-    def __init__(self, webview, args, no_update=False, demo=""):
+    def __init__(self, webview, args, no_update=False, demo="", tray_start=False):
         self.wv, self.args, self.no_update, self.demo = webview, args, no_update, demo
+        self.tray_start = tray_start                             # запуск с --tray (автозапуск Windows): окно не показываем, если есть значок
         self.q = queue.Queue()
         self.splash = self.main = None
         self.flow_started = False
@@ -969,6 +1602,12 @@ class WebShell:
     def push(self, **s):
         if self.splash is None:
             return
+        quiet = s.pop("quiet", False)
+        if self.tray_start and s.get("stage") == "error" and not quiet:
+            try:
+                self.splash.show()                               # скрытая заставка: ошибку пользователь должен увидеть
+            except Exception:
+                pass
         if "ver" not in s and not s.get("bye"):
             s["ver"] = ver(self.tag) if self.tag else ""
         try:
@@ -985,10 +1624,11 @@ class WebShell:
         wv = self.wv
         self.geom = webview_setup(wv)
         mac = sys.platform == "darwin"
+        sx, sy = center(SPLASH_W, SPLASH_H, self.geom[5])
         self.splash = wv.create_window(TITLE, html=splash_html(), js_api=SplashApi(self), width=SPLASH_W, height=SPLASH_H,
-                                       resizable=False, frameless=True, easy_drag=True, transparent=mac,
-                                       background_color=BG, min_size=(SPLASH_W, SPLASH_H))
-        wv.start(self.flow)
+                                       x=sx, y=sy, resizable=False, frameless=True, easy_drag=True, transparent=mac,
+                                       background_color=BG, min_size=(SPLASH_W, SPLASH_H), hidden=self.tray_start)
+        wv.start(self.flow, **start_kwargs())
         return self.result.get("code") or self.code
 
     def decorate(self):
@@ -1004,10 +1644,10 @@ class WebShell:
                     nat.setHasShadow_(True)
                     nat.invalidateShadow()
                 AppHelper.callAfter(shadow)
-            elif sys.platform == "win32":
+            elif sys.platform == "win32" and win_build() >= 22000:
                 import ctypes
-                pref = ctypes.c_int(2)                           # DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(int(nat.Handle.ToInt64()), 33, ctypes.byref(pref), 4)
+                pref = ctypes.c_int(2)                           # DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND (только Windows 11)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(int(nat.Handle.ToInt64()), DWM_CORNER, ctypes.byref(pref), 4)
         except Exception:
             pass
 
@@ -1096,7 +1736,7 @@ class WebShell:
                         btns.insert(0, ["close", "Закрыть", ""])
                     self.push(stage="error", step=last_step,
                               title="Нет связи с GitHub" if net else "Обновление не установлено",
-                              detail=msg[:1].upper() + msg[1:], pct=False, buttons=btns,
+                              detail=msg[:1].upper() + msg[1:], pct=False, buttons=btns, quiet=bool(net and self.have()),
                               hint="" if not (net and self.have()) else "Автозапуск через 6 с")
                     if not self.have():
                         self.code = 1
@@ -1165,11 +1805,27 @@ class WebShell:
                         return
                 self.push(stage="launch", step=3, title="Запускаю", detail="", pct=None, buttons=[], hint="")
             url, html = cap.url, None
+            global _ACTIVE_URL
+            _ACTIVE_URL = url or ""
+            if url and not self.tray_start:
+                if read_app_config().get("lock_enabled"):
+                    self.push(detail="Проверка доступа…")
+                check_lock_gate(url)
         self.push(detail="Открываю окно программы…")
         self.main = app_window(self.wv, url, t, self.geom, hidden=True, html=html, remember_geometry=not self.demo)
         self.main.events.loaded.wait(10)                         # показываем уже отрисованную страницу, без белого кадра
         time.sleep(0.05)
-        self.main.show()
+        tray = getattr(self.main, "_ta_tray", None)
+        in_tray = False
+        if tray is not None and (self.tray_start or tray_wanted()):
+            in_tray = tray.start(force=self.tray_start) and self.tray_start      # значок есть; окно прячем только при запуске с --tray
+        if not in_tray:                                          # значка нет — окно показываем всегда, невидимой программы не бывает
+            self.main.show()
+            try:
+                self.main._ta_shown()                            # тёмная шапка Windows и развёрнутое окно, как было
+                self.main._ta_shown_once = True
+            except Exception:
+                pass
         self.push(bye=True)                                      # заставка растворяется под окном программы
         time.sleep(0.22)
         try:
@@ -1179,13 +1835,13 @@ class WebShell:
         self.splash = None
 
 
-def run_webshell(args, no_update, demo=""):
+def run_webshell(args, no_update, demo="", tray_start=False):
     """Заставка и окно на pywebview. None — pywebview недоступен или не запустился (тогда работает прежний путь с tk)."""
     try:
         import webview
     except Exception:
         return None
-    shell = WebShell(webview, args, no_update, demo)
+    shell = WebShell(webview, args, no_update, demo, tray_start)
     try:
         return shell.run()
     except Exception as e:
@@ -1196,19 +1852,48 @@ def run_webshell(args, no_update, demo=""):
         return None
 
 
+APP_START_GRACE = 20        # сек: падение новой версии раньше этого срока считаем сбоем запуска и пробуем .bak
+
+
+def _exec_app(args, result):
+    """Выполняет APP; если новой версии нет или она упала при запуске (не Ctrl+C и не позже, после работы),
+    один раз запускает предыдущую из .bak."""
+    import runpy, traceback
+    bak = APP + ".bak"
+    path = APP if os.path.exists(APP) else bak
+    t0 = time.time()
+    sys.argv = [path] + args
+    try:
+        runpy.run_path(path, run_name="__main__")
+        return
+    except SystemExit as e:
+        result["code"] = e.code if isinstance(e.code, int) else 1
+        return
+    except KeyboardInterrupt:
+        result["code"] = 130
+        return
+    except Exception:  # noqa: BLE001
+        err = traceback.format_exc().strip().splitlines()[-1]
+        if path != APP or not os.path.exists(bak) or time.time() - t0 > APP_START_GRACE:
+            result["err"] = err
+            return
+    sys.argv = [bak] + args
+    try:
+        runpy.run_path(bak, run_name="__main__")
+    except SystemExit as e:
+        result["code"] = e.code if isinstance(e.code, int) else 1
+    except KeyboardInterrupt:
+        result["code"] = 130
+    except Exception:  # noqa: BLE001
+        result["err"] = err
+
+
 def start_app(args):
     """Запускает программу в фоновом потоке этого процесса. (поток, Capture, result)."""
-    import runpy, traceback
-    sys.argv = [APP] + args
     result = {}
 
     def target():
-        try:
-            runpy.run_path(APP, run_name="__main__")
-        except SystemExit as e:
-            result["code"] = e.code if isinstance(e.code, int) else 1
-        except BaseException:
-            result["err"] = traceback.format_exc().strip().splitlines()[-1]
+        _exec_app(args, result)
     cap = sys.stdout = sys.stderr = Capture(sys.stdout)
     t = threading.Thread(target=target, daemon=True)           # главный поток занят окном (tk или pywebview)
     t.start()
@@ -1218,15 +1903,8 @@ def start_app(args):
 def run_inprocess(args, ui, native=False):
     """Собранный лаунчер: Python-интерпретатора рядом нет, поэтому программа выполняется внутри него."""
     if isinstance(ui, Console):                                 # консоль: можно прямо в главном потоке
-        import runpy, traceback
-        sys.argv = [APP] + args
         result = {}
-        try:
-            runpy.run_path(APP, run_name="__main__")
-        except SystemExit as e:
-            result["code"] = e.code if isinstance(e.code, int) else 1
-        except BaseException:
-            result["err"] = traceback.format_exc().strip().splitlines()[-1]
+        _exec_app(args, result)
         return result.get("code", 1 if result.get("err") else 0)
     t, cap, result = start_app(args)
     if native:
@@ -1237,6 +1915,10 @@ def run_inprocess(args, ui, native=False):
     if r != "native":
         return r
     ui.close()                                                  # tk полностью разобран до Cocoa/WebView2
+    if cap.url:
+        global _ACTIVE_URL
+        _ACTIVE_URL = cap.url
+        check_lock_gate(cap.url)
     try:
         open_native(cap.url, t)
         return result.get("code") or 0
@@ -1249,6 +1931,328 @@ def run_inprocess(args, ui, native=False):
             return result.get("code") or 0
         ui2.set_version()
         return ui2.running(t, cap, result)
+
+
+# ───────────────────────────── одна копия программы и аккуратный выход ─────────────────────────────
+
+MUTEX_NAME = "TAnalyticSingleInstanceMutex"       # то же имя проверяет установщик (Inno Setup AppMutex)
+LOCK_PATH = os.path.join(HOME, "launcher.lock")
+
+
+class SingleInstance:
+    """Не даёт запустить вторую копию на ту же базу data.db: на Windows — именованный мьютекс,
+    на macOS/Linux — блокировка файла. acquire() → False, если программа уже открыта."""
+    def __init__(self, name=MUTEX_NAME, path=None):
+        self.name, self.path = name, path or LOCK_PATH
+        self.handle = self.fh = None
+
+    def acquire(self):
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                k = ctypes.windll.kernel32
+                k.CreateMutexW.restype = ctypes.c_void_p
+                self.handle = k.CreateMutexW(None, False, self.name)
+                return not (self.handle and k.GetLastError() == 183)     # ERROR_ALREADY_EXISTS
+            except Exception:
+                return True
+        try:
+            import fcntl
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            self.fh = open(self.path, "a+")
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (OSError, ImportError):
+            if self.fh is not None:
+                try:
+                    self.fh.close()
+                except OSError:
+                    pass
+                self.fh = None
+                return False
+            return True
+
+    def release(self):
+        try:
+            if self.handle and sys.platform == "win32":
+                import ctypes
+                ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
+            if self.fh is not None:
+                self.fh.close()
+        except Exception:
+            pass
+        self.handle = self.fh = None
+
+
+def activate_running():
+    """Вторая копия: вывести на передний план уже открытое окно программы (Windows), иначе — ничего."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        hwnd = u.FindWindowW(None, TITLE)
+        if not hwnd:
+            return False
+        u.ShowWindow(hwnd, 9)                                    # SW_RESTORE
+        u.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+QUITTING = threading.Event()        # настоящий выход (а не «закрыть в трей»): обработчик закрытия окна пропускает закрытие
+LOCK = None                         # SingleInstance этого процесса (создаётся в main)
+_ACTIVE_URL = ""                    # последний известный URL локального сервера программы
+
+
+def post_app_shutdown(url, timeout=1.0):
+    """Отправляет POST /api/app/shutdown локальному серверу для корректного сброса WAL и остановки."""
+    if not url:
+        return False
+    try:
+        req = urllib.request.Request(
+            url.rstrip("/") + "/api/app/shutdown",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
+def run_shutdown_hook(wait=3.0, url=None):
+    """Программа сбрасывает журнал SQLite (wal_checkpoint) и закрывает соединения."""
+    target_url = url if url is not None else _ACTIVE_URL
+    if target_url:
+        post_app_shutdown(target_url, timeout=min(1.0, wait))
+    hook = getattr(sys, "tanalytic_shutdown", None)
+    if callable(hook):
+        t = threading.Thread(target=hook, daemon=True)
+        t.start()
+        t.join(wait)
+
+
+def graceful_exit(code, wait=3.0, url=None):
+    """Выход без обрыва: сброс журнала SQLite, затем процесс завершается, не дожидаясь
+    фоновых потоков (пулы сетевых запросов)."""
+    QUITTING.set()
+    run_shutdown_hook(wait, url=url)
+    try:
+        tray_dispose()
+    except Exception:
+        pass
+    try:
+        sys.stdout and sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(code)
+
+
+def install_and_exit(info, popen=None, exit_fn=None):
+    """Запускает установщик и выходит. Мьютекс одной копии отпускаем до запуска (иначе AppMutex установщика
+    успеет увидеть его и потребует закрыть программу); если запуск не удался — берём его обратно и остаёмся."""
+    QUITTING.set()
+    held = LOCK is not None
+    if held:
+        LOCK.release()
+    try:
+        start_installer(info, popen)
+    except Exception as e:
+        QUITTING.clear()
+        if held:
+            LOCK.acquire()
+        sys.stderr.write("Не удалось запустить установщик: %s\n" % e)
+        return False
+    (exit_fn or graceful_exit)(0)
+    return True
+
+
+# ───────────────────────────── трей Windows: значок в области уведомлений ─────────────────────────────
+# WinForms NotifyIcon из pythonnet (он уже есть в сборке pywebview). macOS: трея нет, пункты в Настройках скрыты.
+# Настройка «При закрытии окна сворачивать в трей» лежит в config.json программы (sys.tanalytic_tray),
+# автозапуск — в ключе Run реестра текущего пользователя (src/py/13z_shell.py); запуск с ключом --tray открывает
+# программу сразу в трее.
+
+TRAY = None
+
+
+def tray_wanted():
+    """Включено ли в Настройках «сворачивать в трей при закрытии» (спрашиваем у программы)."""
+    hook = getattr(sys, "tanalytic_tray", None)
+    try:
+        return bool(hook()) if callable(hook) else False
+    except Exception:
+        return False
+
+
+def should_hide_on_close(quitting, icon_ready, wanted):
+    """Закрытие окна → в трей, только если выход не настоящий, значок уже есть и настройка включена."""
+    return bool(not quitting and icon_ready and wanted)
+
+
+class Tray:
+    """Значок в трее для окна программы. Весь WinForms-код — под try/except: не вышло — окно работает как раньше."""
+    def __init__(self, win):
+        self.win, self.ni, self.ready, self.force, self.told = win, None, False, False, False
+        self.keep = []                                           # ссылки на меню и обработчики, чтобы их не убрал сборщик мусора
+
+    def _ui(self, fn, wait=5):
+        """Выполняет fn в потоке интерфейса WinForms окна программы. True — выполнено."""
+        form = getattr(self.win, "native", None)
+        if form is None or sys.platform != "win32":
+            return False
+        done, res = threading.Event(), {}
+
+        def run():
+            try:
+                fn()
+                res["ok"] = True
+            except Exception as e:
+                res["err"] = e
+            finally:
+                done.set()
+        try:
+            from System import Action
+            form.BeginInvoke(Action(run))                        # не Invoke: после остановки цикла интерфейса он мог бы зависнуть
+        except Exception:
+            return False
+        done.wait(wait)
+        return bool(res.get("ok"))
+
+    def _create(self):
+        import clr
+        clr.AddReference("System.Windows.Forms")
+        clr.AddReference("System.Drawing")
+        from System.Windows.Forms import NotifyIcon, ContextMenuStrip, ToolStripMenuItem, MouseButtons
+        from System.Drawing import Icon, SystemIcons
+        ni = NotifyIcon()
+        try:
+            ni.Icon = Icon.ExtractAssociatedIcon(sys.executable)   # значок самого TAnalytic.exe
+        except Exception:
+            ni.Icon = SystemIcons.Application
+        ni.Text = TITLE
+        menu = ContextMenuStrip()
+        it_open, it_exit = ToolStripMenuItem("Открыть TAnalytic"), ToolStripMenuItem("Выход")
+        on_open = lambda s, e: threading.Thread(target=self.show, daemon=True).start()    # обработчики — не в потоке интерфейса
+        on_exit = lambda s, e: threading.Thread(target=self.quit, daemon=True).start()
+        on_click = lambda s, e: on_open(s, e) if e.Button == MouseButtons.Left else None
+        it_open.Click += on_open
+        it_exit.Click += on_exit
+        ni.MouseClick += on_click
+        menu.Items.Add(it_open)
+        menu.Items.Add(it_exit)
+        ni.ContextMenuStrip = menu
+        ni.Visible = True
+        self.ni = ni
+        self.keep = [menu, it_open, it_exit, on_open, on_exit, on_click]
+        try:                                                     # выход из Windows не должен упираться в «закрыть в трей»
+            from Microsoft.Win32 import SystemEvents
+            on_end = lambda s, e: QUITTING.set()
+            SystemEvents.SessionEnding += on_end
+            self.keep.append(on_end)
+        except Exception:
+            pass
+        try:                                                     # наш обработчик FormClosing стоит после обработчика pywebview и решает последним
+            def on_form_closing(s, e):
+                if "Shut" in str(e.CloseReason) or "TaskManager" in str(e.CloseReason):   # WindowsShutDown, TaskManagerClosing
+                    QUITTING.set()
+                    e.Cancel = False
+            self.win.native.FormClosing += on_form_closing
+            self.keep.append(on_form_closing)
+        except Exception:
+            pass
+
+    def start(self, force=False):
+        """Создаёт значок. True — значок есть. force — держать его, даже если настройка выключена (запуск с --tray)."""
+        self.force = self.force or force
+        if self.ni is None and not self._ui(self._create):
+            return False
+        if self.ni is not None:
+            self._ui(lambda: setattr(self.ni, "Visible", True))
+        self.ready = True
+        return True
+
+    def sync(self):
+        """Настройку в программе изменили: показать значок или убрать (окно при этом открыто)."""
+        want = self.force or tray_wanted()
+        if want and not self.ready:
+            self.start()
+        elif not want and self.ni is not None:
+            self._ui(lambda: setattr(self.ni, "Visible", False))
+            self.ready = False
+
+    def show(self):
+        """«Открыть»: вернуть окно из трея на передний план."""
+        try:
+            self.win.show()
+            if not getattr(self.win, "_ta_shown_once", False):
+                self.win._ta_shown_once = True
+                fn = getattr(self.win, "_ta_shown", None)
+                fn and fn()                                      # тёмная шапка и развёрнутое окно при первом показе из трея
+            self.win.restore()
+        except Exception:
+            pass
+        activate_running()
+
+    def hide_window(self):
+        try:
+            self.win.hide()
+        except Exception:
+            return
+        if self.ni is not None and not self.told:
+            self.told = True
+
+            def tip():
+                from System.Windows.Forms import ToolTipIcon
+                self.ni.ShowBalloonTip(3000, TITLE, "Программа продолжает работать в трее. Выход — в меню значка.", ToolTipIcon.Info)
+            self._ui(tip, 2)
+
+    def quit(self):
+        """«Выход»: настоящее закрытие программы."""
+        QUITTING.set()
+        self.dispose()
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+    def dispose(self):
+        ni, self.ni, self.ready = self.ni, None, False
+        if ni is None:
+            return
+
+        def kill():
+            ni.Visible = False
+            ni.Dispose()
+        if not self._ui(kill, 2):                                # цикл интерфейса уже остановлен — NotifyIcon можно убрать и отсюда
+            try:
+                kill()
+            except Exception:
+                pass
+
+
+def tray_dispose():
+    """Убирает значок из области уведомлений при выходе: иначе он остаётся до наведения мыши."""
+    if TRAY is not None:
+        TRAY.dispose()
+
+
+def tray_sync():
+    if TRAY is not None:
+        threading.Thread(target=TRAY.sync, daemon=True).start()
+
+
+def split_args(argv, env=None, plat=None):
+    """Ключи лаунчера отделяются от ключей программы: (без обновления, без окна, запуск в трее, остальные аргументы).
+    --tray ставит в автозапуск установщик и Настройки: на Windows открывает программу сразу в трее, программе он не передаётся."""
+    env = os.environ if env is None else env
+    plat = sys.platform if plat is None else plat
+    own = ("--no-update", "--no-gui", "--tray")
+    return ("--no-update" in argv, "--no-gui" in argv or env.get("TINVEST_NO_GUI") == "1",
+            "--tray" in argv and plat == "win32", [a for a in argv if a not in own])
 
 
 def webbrowser_open(url):
@@ -1264,16 +2268,19 @@ def main():
         except Exception:
             pass
     argv = sys.argv[1:]
-    no_update = "--no-update" in argv
-    no_gui = "--no-gui" in argv or os.environ.get("TINVEST_NO_GUI") == "1"
-    args = [a for a in argv if a not in ("--no-update", "--no-gui")]
+    no_update, no_gui, tray_start, args = split_args(argv)
     demo = os.environ.get("TINVEST_SPLASH_DEMO", "")            # 1 / net / checksum: показать заставку без сети и файлов
     demo = "ok" if demo == "1" else demo
+    global LOCK
+    if FROZEN and not demo:
+        lock = LOCK = SingleInstance()
+        if not lock.acquire():                                   # программа уже открыта: показать её окно и выйти
+            activate_running()
+            sys.exit(0)
     if demo or (want_native(FROZEN, no_gui) and "--no-window" not in args):
-        code = run_webshell(args + ["--no-window"], no_update, demo)     # окно открывает оболочка, не браузер программы
+        code = run_webshell(args + ["--no-window"], no_update, demo, tray_start)     # окно открывает оболочка, не браузер программы
         if code is not None:
-            sys.stdout and sys.stdout.flush()
-            os._exit(code)                                      # не ждём фоновые потоки программы
+            graceful_exit(code)                                 # не ждём фоновые потоки программы
     ui = None
     if FROZEN or not no_update:
         ui = (None if no_gui else make_window()) or Console()
@@ -1292,11 +2299,11 @@ def main():
             args.append("--no-window")                           # окно открываем сами (или показываем кнопку), не браузер программы
         code = run_inprocess(args, ui, native=want_native(FROZEN, no_gui) and not isinstance(ui, Console))
         ui.close()
-        sys.stdout and sys.stdout.flush()
-        os._exit(code)                                          # не ждём фоновые потоки программы
+        graceful_exit(code)                                     # не ждём фоновые потоки программы
     if ui:
         ui.close()                                              # окно закрыто полностью до запуска программы
-    sys.exit(subprocess.call([sys.executable, APP] + args))
+    path = APP if os.path.exists(APP) else APP + ".bak"
+    sys.exit(subprocess.call([sys.executable, path] + args))
 
 
 if __name__ == "__main__":

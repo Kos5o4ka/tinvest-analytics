@@ -134,6 +134,31 @@ class History(unittest.TestCase):
         self.assertAlmostEqual(h["value"][59], 100000, delta=1)
         self.assertAlmostEqual(h["value"][-1], 90000, delta=1)
 
+    def test_float_residual_closes_at_sell_date(self):
+        s = "h-float-close"
+        names = {s: {"type": "share", "cur": "rub"}}
+        ops = [op(0, "INPUT", pay=100000),
+               op(1, "BUY", s, qty=0.1, pay=-10),
+               op(2, "BUY", s, qty=0.2, pay=-20),
+               op(10, "SELL", s, qty=0.3, pay=30)]
+        seen_ranges = []
+        old_cs = M.candle_series
+
+        def fake_cs(client, uid, d1, d2):
+            if uid == s:
+                seen_ranges.append((d1, d2))
+                return [(day(i), 100.0) for i in range(1, 11)]
+            return []
+
+        M.candle_series = fake_cs
+        try:
+            h = M.build_history(Offline(), ops, names, 0, None, {s})
+        finally:
+            M.candle_series = old_cs
+        self.assertEqual(seen_ranges, [(day(1), day(10))])
+        self.assertAlmostEqual(h["value"][-1], 100000.0, delta=1e-6)
+
+
 
 class Helpers(unittest.TestCase):
     def test_split_scale(self):

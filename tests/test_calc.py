@@ -42,6 +42,17 @@ class Ytm(unittest.TestCase):
         self.assertAlmostEqual(yt, 0.087, places=5)       # купоны 100 -> 87, налога на погашении нет
         self.assertLess(yt, y)
 
+    def test_tax_respects_aci(self):
+        fl = [("2026-12-24", 50.0, 1000.0)]
+        y = M.cf_ytm(1045.0, fl, "2026-11-24")
+        yt = M.cf_ytm(1045.0, fl, "2026-11-24", tax=True, basis=1000.0, aci=45.0)
+        self.assertIsNotNone(yt)
+        self.assertGreater(yt, 0.04)
+        self.assertLess(yt, y)
+        self.assertAlmostEqual(yt, (1049.35 / 1045.0) ** (365.0 / 30.0) - 1, places=5)
+        nf = M.net_flows(fl, "2026-11-24", basis=1000.0, aci=45.0)
+        self.assertAlmostEqual(nf[0][1], 1049.35, places=6)
+
 
 class Risk(unittest.TestCase):
     def test_duration_formula(self):
@@ -262,10 +273,6 @@ class Compat(unittest.TestCase):
                 ast.parse(f.read(), filename=name, feature_version=(3, 8))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class IncomeGoal(unittest.TestCase):
     def test_capital_needed(self):
         r = M.goal_calc(50000, 120, 13.0, 0.0, 0.0, False)           # доходность 13 % до налога = 11,31 % после
@@ -312,3 +319,123 @@ class IncomeGoal(unittest.TestCase):
         self.assertAlmostEqual(out["result"]["capital_today"], 80000 * 12 / (0.14 * 0.87), places=3)
         self.assertEqual(M.calc_goal_get({}, "all", {"monthly": "80000", "years": "8"})["result"], None)
         self.assertIn("доходность", M.calc_goal_get({}, "all", {"monthly": "80000", "years": "8"})["error"])
+
+
+class ListAccountsImportFx(unittest.TestCase):
+    """BUG-CALC-07: _list_accounts передаёт ключи инструментов импорта в instruments(), учитывая валюту."""
+
+    def test_import_usd_total_uses_fx(self):
+        ops = [{"operationType": "OPERATION_TYPE_INPUT", "payment": 200.0, "currency": "rub"},
+               {"instrumentUid": "uid-usd-1", "figi": None, "operationType": "OPERATION_TYPE_BUY",
+                "quantity": 2, "payment": -200.0}]
+        st = type("S", (), {"ops": lambda self, i: ops})()
+        inst = lambda c, keys: (
+            {"uid-usd-1": {"name": "Apple", "ticker": "AAPL", "type": "share", "cur": "usd"}}
+            if ("uid-usd-1", None) in set(keys) else {}
+        )
+        patches = {
+            "TInvest": lambda cfg: type("C", (), {"ready": False})(),
+            "imports_list": lambda: [{"id": "imp1", "name": "Импорт", "broker": "vtb"}],
+            "broker_of_account": lambda imp: ("vtb", "ВТБ"),
+            "store": lambda: st,
+            "instruments": inst,
+            "fifo": lambda o: {"uid-usd-1": {"qty": 2.0, "cost": 200.0, "last_unit": 100.0}},
+            "fx_now": lambda c, cs: {"rub": 1.0, "usd": 80.0},
+            "moex_quotes": lambda ids: {},
+            "mem_put": lambda k, v: v,
+        }
+        saved = {k: getattr(M, k) for k in patches}
+        for k, v in patches.items():
+            setattr(M, k, v)
+        try:
+            accs = M._list_accounts({}, ("accounts", "k"))
+        finally:
+            for k, v in saved.items():
+                setattr(M, k, v)
+        self.assertEqual(len(accs), 1)
+        self.assertAlmostEqual(accs[0]["total"], 16000.0)
+        self.assertFalse(accs[0]["empty"])
+
+
+class GuestAndServerRegressions(unittest.TestCase):
+    def test_guest_empty_payloads_instead_of_404(self):
+        saved = (M.build_bonds, M.imports_list, dict(M._iss_jobs))
+        def raise_404(*a, **k):
+            raise M.ApiError("Нет счетов", 404)
+        M.build_bonds = raise_404
+        M.imports_list = lambda: []
+        M._iss_jobs.clear()
+        cfg = {"token": "", "sandbox": False}
+        try:
+            mon = M.build_monitor(cfg, "all")
+            lad = M.ladder_portfolio(cfg, "all")
+            iss = M.issuers_payload(cfg, "all", {}, False)
+        finally:
+            M.build_bonds, M.imports_list = saved[0], saved[1]
+            M._iss_jobs.clear()
+            M._iss_jobs.update(saved[2])
+        self.assertTrue(mon.get("empty"))
+        self.assertEqual(mon["rows"], [])
+        self.assertTrue(lad.get("empty"))
+        self.assertEqual(lad["variants"], {})
+        self.assertTrue(iss.get("empty"))
+        self.assertEqual(iss["rows"], [])
+
+    def test_calc_goal_get_skips_goal_infl_when_not_real_or_infl_given(self):
+        calls = []
+        saved = (M._goal_infl, M.goal_defaults)
+        M._goal_infl = lambda: (calls.append(1), {"value": 5.0, "estimate": False, "source": "ЦБ"})[1]
+        M.goal_defaults = lambda cfg, acc: {"value": 0.0, "yield": 15.0, "income_month": None, "income_src": None, "portfolio": False}
+        try:
+            M.calc_goal_get({}, "all", {"monthly": "10000", "years": "3", "yield": "15", "real": "0"})
+            self.assertEqual(len(calls), 0)
+            M.calc_goal_get({}, "all", {"monthly": "10000", "years": "3", "yield": "15", "real": "1", "infl": "7.5"})
+            self.assertEqual(len(calls), 0)
+            M.calc_goal_get({}, "all", {"monthly": "10000", "years": "3", "yield": "15", "real": "1"})
+            self.assertEqual(len(calls), 1)
+        finally:
+            M._goal_infl, M.goal_defaults = saved
+
+    def test_handler_post_400_on_bad_content_length_json_or_nondict(self):
+        import io
+        for hdr_len, raw_body in [("abc", b"{}"), ("2", b"{x"), ("2", b"[]")]:
+            sent = []
+            h = M.Handler.__new__(M.Handler)
+            h.server = type("S", (), {"server_address": ("127.0.0.1", 8765)})()
+            h.path = "/api/config"
+            h.headers = {
+                "Host": "127.0.0.1:8765",
+                "Content-Type": "application/json",
+                "Content-Length": hdr_len,
+            }
+            h.rfile = io.BytesIO(raw_body)
+            h.send = lambda code, data, *a: sent.append((code, data))
+            h.do_POST()
+            self.assertEqual(sent[0][0], 400, (hdr_len, raw_body, sent))
+
+    def test_offer_amort_radar_skips_live_moex_when_not_ready(self):
+        from datetime import date, timedelta
+        today = date(2026, 11, 25)
+        d = lambda n: (today + timedelta(days=n)).isoformat()
+        offline_client = type("C", (), {"ready": False})()
+        rows = [{"type": "bond", "uid": "u1", "isin": "RU000OFFLINE", "name": "Офлайн", "qty": 1.0, "cur": "rub", "value_rub": 1000.0}]
+        infos = {"u1": {"nominal": 1000.0, "cur": "rub", "maturity": d(900), "call": None, "coupons": []}}
+
+        def boom(*a, **k):
+            raise AssertionError("live MOEX fetch should not be called when not client.ready")
+
+        saved = (M.moex_bondization, M.moex_bond_options, M.moex_coupon_schedule, M.store)
+        M.moex_bondization = boom
+        M.moex_bond_options = boom
+        M.moex_coupon_schedule = boom
+        M.store = lambda: type("S", (), {"get": lambda self, k, ttl=0: None})()
+        try:
+            rad = M.offer_amort_radar(offline_client, rows, today=today.isoformat(), horizon_days=60, infos=infos)
+        finally:
+            M.moex_bondization, M.moex_bond_options, M.moex_coupon_schedule, M.store = saved
+        self.assertEqual(rad["items"], [])
+        self.assertEqual(rad["counts"]["total"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

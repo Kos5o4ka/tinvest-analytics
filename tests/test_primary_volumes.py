@@ -88,6 +88,14 @@ class LiveAndRow(unittest.TestCase):
         self.assertEqual([x["isin"] for x in up], ["RU000A10GJ80"])
         self.assertEqual(up[0]["status"], "upcoming")
 
+    def test_fx_applied_to_usd_size_and_placed(self):
+        desc = {"name": "USD-1", "issued": "2026-11-05", "size": 1000.0, "face": 100.0, "cur": "USD"}
+        bm = [{"b": "TQOD", "today": 0, "vol": 0, "n": 0, "placed": 400.0}]
+        r = M.pv_build_row("XS000USD", desc, None, [], bm, "2026-11-11", None, fx={"USD": 100.0})
+        self.assertEqual(r["cur"], "USD")
+        self.assertEqual(r["size_rub"], 10000000.0)
+        self.assertEqual(r["placed_rub"], 4000000.0)
+
 
 class DaysMerge(unittest.TestCase):
     def test_merge_boards_and_today(self):
@@ -164,6 +172,28 @@ class BatchAndCalendar(unittest.TestCase):
         res, _ = self.run_compute(cal=[{"isin": "RU000A10AAA1", "start": "2099-01-01", "short": "A", "issuer": "A"}])
         self.assertFalse(res["errors"])
         self.assertEqual([r["secid"] for r in res["rows"]], ["RU000A10AAA1"])
+
+    def test_other_boards_excludes_today(self):
+        today = M.pv_msk_now().date().isoformat()
+        seen_d2 = []
+        saved = (M.pv_json, M.primary_rows, M.pv_days_cached, M.pv_other_boards, M.pv_live_board, M.pv_desc, M.pv_live_secid)
+        try:
+            M.pv_json = lambda url, timeout=30: {"securities": tbl([], []), "marketdata": tbl([], [])}
+            M.primary_rows = lambda: []
+            M.pv_days_cached = lambda dates, errs: {}
+
+            def ob(d1, d2, errs):
+                seen_d2.append(d2)
+                return [{"s": "RU000ATODAY1", "b": "PUSD", "d": today, "q": 10.0, "v": 1000.0, "n": 1}]
+            M.pv_other_boards = ob
+            M.pv_live_board = lambda mk, b: {}
+            M.pv_desc = lambda s: {"issued": "2020-01-01", "name": "x", "full": "x", "isin": s, "face": 100.0, "size": 100.0}
+            M.pv_live_secid = lambda s: []
+            M._pv_mem.clear()
+            M.pv_compute()
+            self.assertEqual(seen_d2, [M._day_add(today, -1)])
+        finally:
+            (M.pv_json, M.primary_rows, M.pv_days_cached, M.pv_other_boards, M.pv_live_board, M.pv_desc, M.pv_live_secid) = saved
 
 
 class LongPlacement(unittest.TestCase):
@@ -310,3 +340,35 @@ class PrimaryCalendarUnavailable(unittest.TestCase):
             M.http_text, M.ds_parsed = saved[0], saved[1]
             M._pri.clear()
             M._pri.update(saved[2])
+
+
+class PrimaryScreenerPopulate(unittest.TestCase):
+    """BUG #22: primary_payload вызывает screener_payload(), если _scr['rows'] пуст."""
+
+    def test_primary_payload_populates_screener_when_empty(self):
+        called = []
+        fake_scr = [{"id": "RU0001", "kind": "corp", "cur": "RUB", "yield": 18.5, "rating": {"v": "A"}, "dur": 2.0}]
+
+        def fake_screener():
+            called.append(True)
+            M._scr["rows"] = list(fake_scr)
+
+        saved = (M.primary_rows, M.screener_payload, M.key_rate_series, M.primary_snapshot, dict(M._scr))
+        try:
+            M.primary_rows = lambda: []
+            M.screener_payload = fake_screener
+            M.key_rate_series = lambda: []
+            M.primary_snapshot = lambda rows: None
+            M._scr["rows"] = []
+            M._pri_scr_state.update(th=None, t=0.0)
+            first = M.primary_payload()                 # скринер грузится в фоне, ответ не ждёт
+            self.assertTrue(first["scr_loading"])
+            M._pri_scr_state["th"].join(5)
+            res = M.primary_payload()
+            self.assertFalse(res["scr_loading"])
+        finally:
+            M.primary_rows, M.screener_payload, M.key_rate_series, M.primary_snapshot = saved[:4]
+            M._scr.clear()
+            M._scr.update(saved[4])
+        self.assertEqual(len(called), 1)
+        self.assertEqual(res["peer_medians"], {"A": 18.5})

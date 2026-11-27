@@ -1,6 +1,20 @@
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
+_font_cache = []
+_active_server = [None]
+START_PAGES = {
+    "dash", "ret", "bench", "pos", "bonds", "pay", "off", "ops", "fees", "tax", "reb", "calc", "lad",
+    "mkt", "scr", "cmp", "map", "hm", "sig", "risk", "mon", "watch", "iss", "dfl", "flw", "pri", "fng",
+    "cal", "kb", "imp", "set", "stk", "sst", "crp", "mic", "ofz", "pm", "txo", "dgap", "mm", "arb", "dbx", "rot",
+}
+
+
+def font_inter_bytes():
+    """Встроенный шрифт Inter (variable woff2) для интерфейса: работает без сети и одинаково на Windows, macOS и Linux."""
+    if not _font_cache:
+        _font_cache.append(base64.b64decode(FONT_INTER_B64))
+    return _font_cache[0]
 # секреты, которые окно настроек может показать по кнопке «глаз» (GET /api/config/secret)
 UI_SECRET_NAMES = ("token", "data_key", "backup_password")
 
@@ -23,7 +37,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "max-age=604800" if ctype == "image/png" else "no-store")
+        self.send_header("Cache-Control", "max-age=604800" if ctype in ("image/png", "font/woff2") else "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:")
@@ -71,13 +85,17 @@ class Handler(BaseHTTPRequestHandler):
         def run():
             if u.path == "/":
                 return self.send(200, PAGE, "text/html; charset=utf-8")
+            if u.path == "/fonts/InterVariable.woff2":
+                return self.send(200, font_inter_bytes(), "font/woff2")
             if u.path.startswith("/logo/"):
                 data = logo_bytes(unquote(u.path[6:]))
                 return self.send(200, data, "image/png") if data else self.send(404, {"error": "no logo"})
             if u.path == "/api/ping":
                 _ping[0] = time.time()
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             cfg = load_config()
+            if u.path.startswith("/api/") and u.path not in ("/api/ping", "/api/lock/status") and lock_is_locked(cfg):
+                return self.send(423, {"error": "Программа заблокирована", "locked": True})
             f = q.get("force") == "1"
             acc = q.get("account", "all") or "all"
             if u.path == "/api/config":
@@ -158,11 +176,33 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         def run():
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > 80 * 1024 * 1024:
-                raise ApiError("Файл слишком большой (больше 60 МБ).", 400)
-            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                raise ApiError("Некорректный заголовок Content-Length.", 400)
+            if n < 0 or n > 80 * 1024 * 1024:
+                raise ApiError("Файл слишком большой (больше 60 МБ)." if n > 0 else "Некорректный заголовок Content-Length.", 400)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except (ValueError, UnicodeDecodeError):
+                raise ApiError("Некорректный JSON.", 400)
+            if not isinstance(body, dict):
+                raise ApiError("Ожидался JSON-объект.", 400)
             cfg = load_config()
+            if path.startswith("/api/") and path not in ("/api/lock/unlock", "/api/app/shutdown") and lock_is_locked(cfg):
+                return self.send(423, {"error": "Программа заблокирована", "locked": True})
+            if path == "/api/app/shutdown":
+                def _stop():
+                    time.sleep(0.05)
+                    srv = _active_server[0]
+                    if srv is not None:
+                        try:
+                            srv.shutdown()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    app_shutdown()
+                threading.Thread(target=_stop, daemon=True, name="app-shutdown").start()
+                return self.send(200, {"ok": True})
             if path == "/api/config":
                 if body.get("token"):
                     cfg["token"] = "".join(str(body["token"]).split())
@@ -175,6 +215,19 @@ class Handler(BaseHTTPRequestHandler):
                     cfg["ca_file"] = str(body["ca_file"]).strip()
                 if body.get("theme") in ("auto", "dark", "light"):
                     cfg["theme"] = body["theme"]
+                if body.get("start_page") in START_PAGES:
+                    cfg["start_page"] = body["start_page"]
+                if isinstance(body.get("ui_prefs"), dict):
+                    prefs = dict(cfg.get("ui_prefs") if isinstance(cfg.get("ui_prefs"), dict) else {})
+                    for k, v in list(body["ui_prefs"].items())[:40]:
+                        k = str(k)[:40]
+                        if v is None:
+                            prefs.pop(k, None)
+                        elif isinstance(v, (bool, int, float)) and not (isinstance(v, float) and (v != v or abs(v) >= 1e15)):
+                            prefs[k] = v
+                        elif isinstance(v, str):
+                            prefs[k] = v[:120]
+                    cfg["ui_prefs"] = dict(list(prefs.items())[:60])
                 if isinstance(body.get("targets"), dict):
                     tg = {}
                     for k, v in body["targets"].items():
@@ -224,11 +277,8 @@ class Handler(BaseHTTPRequestHandler):
                         hosts = [str(h).strip() for h in body[k] if str(h).strip()]
                         if hosts:
                             cfg[k] = hosts
-                if "data_server" in body:
-                    u = str(body["data_server"]).strip().rstrip("/")
-                    if u and u.lower() != "off" and not re.fullmatch(r"https?://[^/\s]+(/[^\s]*)?", u):
-                        raise ApiError("Адрес сервера данных должен начинаться с http:// или https://", 400)
-                    cfg["data_server"] = u
+                if str(cfg.get("data_server") or "").strip().lower() == "off":
+                    cfg["data_server"] = ""         # «off» из прежних версий: сервер данных теперь не отключается
                 if body.get("data_key"):
                     cfg["data_key"] = "".join(str(body["data_key"]).split())
                 if body.get("clear_data_key"):
@@ -237,8 +287,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError("Файл сертификата не найден: " + cfg["ca_file"], 400)
                 save_config(cfg)
                 ds_reset()
-                mem_clear()
-                return self.send(200, {"ok": True})
+                mem_clear(persist=False)        # сохранённые отчёты привязаны к токену (token_key): настройки их не портят
+                if "targets" in body or "broker_tariffs" in body:
+                    sync_kick_safe()
+                return self.send(200, {"ok": True, "app": APP_NAME})
             if path == "/api/ratings/refresh":
                 return self.send(200, {"started": ratings_start(force=True), **ratings_status()})
             client = TInvest(cfg)
@@ -251,10 +303,14 @@ class Handler(BaseHTTPRequestHandler):
                     tcli = TInvest(tcfg)
                 return self.send(200, {"ok": True, "accounts": len(tcli.accounts())})
             if path == "/api/cache/clear":
-                store().wipe_cache()
-                shutil.rmtree(LOGO_DIR, ignore_errors=True)
+                clear_local_cache()
+                st = store()
+                with st.wlock:
+                    c = st.conn()
+                    c.execute("DELETE FROM ops WHERE acc NOT LIKE 'imp-%'")
+                    c.commit()
                 mem_clear()
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             if path == "/api/import/preview":
                 raw = base64.b64decode(body.get("data") or "")
                 pv = import_preview_any(body.get("filename") or "", raw)
@@ -262,49 +318,9 @@ class Handler(BaseHTTPRequestHandler):
                 pv["broker_id"], pv["broker_name"] = bid, BROKERS[bid]
                 return self.send(200, pv)
             if path == "/api/import/parse":
-                raw = base64.b64decode(body.get("data") or "")
-                ops, skipped, _fmt, _meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
-                                                           int(body.get("header_row") or 0), body.get("mapping") or {})
-                kinds = defaultdict(int)
-                for o in ops:
-                    kinds[classify(o["type"])] += 1
-                sample = [[o["date"][:10], op_type(o), o.get("name") or "", op_qty(o), qf(o["payment"]), cur_of(o["payment"])]
-                          for o in ops[:15]]
-                return self.send(200, {"count": len(ops), "skipped": skipped, "kinds": kinds, "sample": sample,
-                                       "from": ops[0]["date"][:10] if ops else None, "to": ops[-1]["date"][:10] if ops else None})
+                return self.send(200, import_parse_info(body))
             if path == "/api/import/commit":
-                raw = base64.b64decode(body.get("data") or "")
-                ops, skipped, fmt, meta = import_ops_any(body.get("filename") or "", raw, int(body.get("table") or 0),
-                                                         int(body.get("header_row") or 0), body.get("mapping") or {})
-                if not ops:
-                    raise ApiError("В файле не нашлось операций с выбранными колонками.", 400)
-                acc_id = body.get("target") if str(body.get("target") or "").startswith("imp-") else "imp-" + uuid.uuid4().hex[:10]
-                lst = imports_list()
-                ex = next((x for x in lst if x["id"] == acc_id), None)
-                if ex is None:
-                    ex = {"id": acc_id, "name": (body.get("name") or "").strip() or "Импорт " + date.today().strftime("%d.%m.%Y"),
-                          "broker": (body.get("broker") or "").strip(), "created": utc_now_str(), "files": []}
-                    if fmt:
-                        ex["format"] = fmt
-                    ex["broker_id"] = broker_detect_import(body.get("filename") or "", raw, fmt, ex["broker"], ex["name"])
-                    lst.append(ex)
-                finfo = {"name": body.get("filename") or "", "count": len(ops), "at": utc_now_str()}
-                if meta:
-                    finfo["from"], finfo["to"] = meta["period"]["from"], meta["period"]["to"]
-                periods = [(f.get("from"), f.get("to")) for f in ex["files"] if f.get("from")] + \
-                          ([(finfo["from"], finfo["to"])] if meta else [])
-                # новый файл склеивается со всеми операциями счёта: FIFO и «досчитанные» пополнения считаются по всей истории
-                ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) if ex["files"] else None,
-                                           periods=periods, synth=not fmt)
-                ex["files"].append(finfo)
-                ex["ops"] = len(ops)
-                store().ops_clear(acc_id)
-                store().ops_put(acc_id, ops)
-                store().put("imports", lst)
-                mem_clear()
-                found = sum(1 for v in ids.values() if v.get("uid"))
-                return self.send(200, {"ok": True, "id": acc_id, "count": finfo["count"], "total": len(ops), "skipped": skipped,
-                                       "resolved": found, "idents": len(ids)})
+                return self.send(200, import_commit(client, body))
             if path == "/api/import/broker":
                 bid = str(body.get("broker_id") or "")
                 if bid not in BROKERS:
@@ -322,7 +338,8 @@ class Handler(BaseHTTPRequestHandler):
                 store().put("imports", lst)
                 store().ops_clear(body.get("id") or "")
                 mem_clear()
-                return self.send(200, {"ok": True})
+                sync_kick_safe()
+                return self.send(200, {"ok": True, "app": APP_NAME})
             if path in ("/api/sandbox/open", "/api/sandbox/payin"):
                 if not cfg["sandbox"]:
                     raise ApiError("Доступно только в режиме песочницы.", 400)
@@ -399,6 +416,33 @@ class LocalHTTPServer(ThreadingHTTPServer):
         self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
 
 
+def running_instance(url, timeout=1.5):
+    """По адресу уже отвечает эта же программа (а не чужой сервер на том же порту)."""
+    try:
+        with urllib.request.urlopen(url + "api/ping", timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8") or "{}").get("app") == APP_NAME
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def app_shutdown():
+    """Аккуратное завершение: журнал WAL сбрасывается в data.db, соединения закрываются (а не обрываются os._exit)."""
+    for hook in SHUTDOWN_HOOKS:
+        try:
+            hook()
+        except Exception:  # noqa: BLE001
+            pass
+    if STORE is None:
+        return
+    try:
+        STORE.close_all()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+sys.tanalytic_shutdown = app_shutdown        # лаунчер вызывает перед выходом (собранное приложение)
+
+
 def main():
     cfg = load_config()
     port = int(os.environ.get("TINVEST_PORT") or cfg["port"])
@@ -409,6 +453,12 @@ def main():
     try:
         srv = LocalHTTPServer(("127.0.0.1", port), Handler)
     except OSError:
+        other = "http://127.0.0.1:%d/" % port
+        if running_instance(other):                  # программа уже открыта на этой базе: вторую копию не поднимаем
+            print("%s уже запущен → %s" % (APP_NAME, other))
+            if "--no-window" not in sys.argv:
+                open_window(other)
+            return
         srv = LocalHTTPServer(("127.0.0.1", 0), Handler)
     srv.daemon_threads = True
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -440,11 +490,14 @@ def main():
                 hook()
             except Exception:  # noqa: BLE001
                 pass
+        _active_server[0] = srv
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        _active_server[0] = None
         srv.server_close()
+        app_shutdown()
     # окно закрыто или Ctrl+C: фоновые расчёты (пулы потоков) прерываем сразу, иначе они падают с трассировкой
     # «cannot schedule new futures after interpreter shutdown». База SQLite транзакционная, данные не теряются.
     if not getattr(sys, "frozen", False):        # в собранном приложении выходом управляет лаунчер

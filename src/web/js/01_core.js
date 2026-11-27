@@ -1,6 +1,15 @@
 "use strict";
 const $=s=>document.querySelector(s);
+/* платформа: подписи клавиш и путей (⌘ на macOS, Ctrl на Windows/Linux) */
+const _plat=(navigator.userAgentData&&navigator.userAgentData.platform)||navigator.platform||navigator.userAgent||'';
+const IS_MAC=/Mac|iPhone|iPad/i.test(_plat),IS_WIN=/Win/i.test(_plat);
+const MOD=IS_MAC?'⌘':'Ctrl+';
+document.documentElement.classList.add(IS_MAC?'os-mac':IS_WIN?'os-win':'os-linux');
+const _setSrchK=()=>{const k=document.getElementById('srch-k');if(k)k.textContent=MOD+'K'};
+document.addEventListener('DOMContentLoaded',_setSrchK);
+if(document.readyState!=='loading')_setSrchK();
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function safeUrl(u){try{const x=new URL(String(u||''));return(x.protocol==='https:'||x.protocol==='http:')?x.href:''}catch(e){return''}}
 const NF2=new Intl.NumberFormat('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2});
 const NF0=new Intl.NumberFormat('ru-RU',{maximumFractionDigits:0});
 const NFQ=new Intl.NumberFormat('ru-RU',{maximumFractionDigits:6});
@@ -25,6 +34,7 @@ const MONF=['Январь','Февраль','Март','Апрель','Май','
 const mlabel=m=>{if(!m||typeof m!=='string'||!m.includes('-'))return'—';const[y,mm]=m.split('-');return(MON[+mm-1]||mm)+' '+y.slice(2)};
 const dlabel=d=>{if(!d||typeof d!=='string'||!d.includes('-'))return'—';const[y,m,dd]=d.split('-');return+dd+' '+(MON[+m-1]||m)+' '+y};
 const ddm=d=>{if(!d||typeof d!=='string'||!d.includes('-'))return'—';const[y,m,dd]=d.split('-');return dd+'.'+m+'.'+y.slice(2)};
+const localIso=(d=new Date())=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 const S1='var(--s1)',S2='var(--s2)',S3='var(--s3)',S4='var(--s4)',S5='var(--s5)',S6='var(--s6)',S7='var(--s7)',S8='var(--s8)';
 /* порядок серий в диаграммах: синий, бирюзовый, янтарный, фиолетовый, розовый, голубой, оливковый, коралловый */
 const PAL=[S1,S3,S4,S7,S5,S2,S6,S8];

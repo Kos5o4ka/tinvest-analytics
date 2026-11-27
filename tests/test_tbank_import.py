@@ -307,6 +307,59 @@ class TBankEntry(unittest.TestCase):
         self.assertIsNone(M.tbank_try("g.xlsx", generic))
         self.assertIn("mapping", M.import_preview_any("g.xlsx", generic))
 
+    def test_may_1_20_and_10_30_commit_and_duplicate_reject(self):
+        import base64
+        old_imp = M.imports_list()
+        try:
+            for a in list(old_imp or []):
+                M.store().ops_clear(a["id"])
+            M.store().put("imports", [])
+
+            rep1 = report("01.05.2025", "20.05.2025",
+                          [deal("M1", "05.05.2025", "10:00:00", "Покупка", ISIN, 10, 10000.0, 0.0, 10.0),
+                           deal("M2", "15.05.2025", "12:00:00", "Покупка", ISIN, 5, 5100.0, 0.0, 5.0)],
+                          [cash("01.05.2025", "09:00:00", "01.05.2025", "Пополнение счета", cr=50000.0)],
+                          0.0, 34885.0, [(ISIN, ISIN, 0, 15, 0, 15, 15)])[0]
+            rep2 = report("10.05.2025", "30.05.2025",
+                          [deal("M2", "15.05.2025", "12:00:00", "Покупка", ISIN, 5, 5100.0, 0.0, 5.0),
+                           deal("M3", "25.05.2025", "14:00:00", "Покупка", ISIN, 8, 8200.0, 0.0, 8.0)],
+                          [], 39990.0, 26677.0, [(ISIN, ISIN, 10, 13, 0, 23, 23)])[0]
+            raw1, raw2 = make_xlsx(rep1), make_xlsx(rep2)
+
+            r1 = M.import_commit(M._NoClient(), {"filename": "tb_1_20.xlsx", "data": base64.b64encode(raw1).decode(),
+                                                 "name": "Т-Банк Май"})
+            # Повторный commit того же файла — ошибка 409
+            with self.assertRaises(M.ApiError) as cm:
+                M.import_commit(M._NoClient(), {"filename": "tb_1_20_dup.xlsx", "data": base64.b64encode(raw1).decode()})
+            self.assertEqual(cm.exception.status, 409)
+
+            # Предпросмотр второго файла сразу находит целевой счёт, а commit 10-30 мая не дублирует сделку M2 (15 мая)
+            pv2 = M.import_preview_any("tb_10_30.xlsx", raw2)
+            self.assertEqual(pv2["targets"][0]["id"], r1["id"])
+            M.import_commit(M._NoClient(), {"filename": "tb_10_30.xlsx", "data": base64.b64encode(raw2).decode(),
+                                            "target": r1["id"]})
+            ops = M.store().ops(r1["id"])
+            buys = [o for o in ops if M.classify(o["type"]) == "buy"]
+            self.assertEqual([o["id"] for o in buys], ["tb-M1", "tb-M2", "tb-M3"])
+            self.assertEqual(M.fifo(ops)["imp:" + ISIN]["qty"], 23.0)
+        finally:
+            for a in M.imports_list():
+                M.store().ops_clear(a["id"])
+            M.store().put("imports", old_imp or [])
+
+    def test_fractional_opening_and_short_cover(self):
+        # входящий остаток 0.25 шт. и внутридневной шорт 0.4 шт. не должны отбрасываться порогом 0.5
+        deals = [deal("SH1", "03.02.2025", "11:00:00", "Продажа", ISIN2, 0.4, 400.0),
+                 deal("SH2", "03.02.2025", "11:05:00", "Покупка", ISIN2, 0.4, 400.0)]
+        t = report("01.01.2025", "30.06.2025", deals, [], 0.0, 0.0,
+                   [(ISIN, ISIN, 0.25, 0, 0, 0.25, 0.25), (ISIN2, ISIN2, 0, 0.4, 0.4, 0, 0)])
+        ops, _meta = parse(t)
+        opening = [o for o in ops if o["id"].startswith("tb-open-sec-%s" % ISIN)]
+        self.assertEqual(len(opening), 1)
+        self.assertEqual(opening[0]["quantity"], "0.25")
+        xfers = [o for o in ops if o["id"].startswith("tb-xfer-") and o.get("_ident") == ISIN2]
+        self.assertEqual(len(xfers), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

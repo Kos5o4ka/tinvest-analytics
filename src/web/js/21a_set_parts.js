@@ -10,6 +10,7 @@ function setTgHtml(c){
     stRow('Наблюдение и цели','Тревоги по списку наблюдения, достигнутые цели, напоминания из дневника',stSw('tg-wat',on('tg_on_watch',true),'Наблюдение и цели'),{cls:'sub'})+
     stRow('Ближайшие выплаты','За сколько дней сообщать о выплатах (0 — выключить)',`<input class="in num st-num" id="tg-pay" type="number" min="0" max="60" value="${+c.tg_pay_days||0}" aria-label="За сколько дней сообщать о выплатах"><span class="st-unit">дн.</span>`,{cls:'sub'})+
     stRow('Ежедневная сводка','Портфель, выплаты на неделю, тревоги',`<input class="in num st-time" id="tg-time" type="time" value="${esc(c.tg_digest_time||'10:00')}" aria-label="Время сводки">${stSw('tg-dg',on('tg_digest',false),'Ежедневная сводка')}`,{cls:'sub'})+
+    stRow('Недельная сводка','По понедельникам утром от бота: итоги недели по целям и ближайшим событиям. Работает при включённой проверке на сервере',stSw('tg-wd',on('tg_weekly_digest',false),'Недельная сводка'),{cls:'sub'})+
     stRow('Проверять на сервере, когда программа закрыта','Цели по наблюдению, напоминания дневника, оферты и выплаты по портфелю проверяет сервер данных — раз в 15 минут, кроме ночи (22:00–08:00 МСК)',stSw('tg-srv',on('tg_server',false),'Проверять тревоги на сервере, когда программа закрыта'),{cls:'sub'})+
     `<p class="st-line" id="tg-srv-state"></p>`+
     stRow('Данные на сервере','Подписка удаляется и сама — когда истекает ключ из бота',`<button class="btn ghost danger" id="tg-srv-del">Удалить данные с сервера</button>`,{cls:'sub',id:'tg-srv-row',hidden:!on('tg_server',false)})+
@@ -25,7 +26,7 @@ function setTgHtml(c){
 function bindSetTg(c,msg){
   const g=id=>document.getElementById(id);if(!g('tg-card'))return;
   const body=()=>({tg_enabled:g('tg-en').checked,tg_on_mon:g('tg-mon').checked,tg_on_watch:g('tg-wat').checked,
-    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00',tg_server:g('tg-srv').checked});
+    tg_pay_days:g('tg-pay').value||0,tg_digest:g('tg-dg').checked,tg_digest_time:g('tg-time').value||'10:00',tg_weekly_digest:g('tg-wd').checked,tg_server:g('tg-srv').checked});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
   const save=async()=>{const r=await post('/api/tg/save',body());Object.assign(c,r.settings);return r};
   const dim=()=>g('tg-card').classList.toggle('st-dis',!g('tg-en').checked);
@@ -33,23 +34,23 @@ function bindSetTg(c,msg){
     g('tg-srv-row').hidden=!(s.enabled||s.ok);const n=s.counts||{};
     g('tg-srv-state').textContent=!s.enabled?'':s.error?s.error:s.active?`Сервер проверяет: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}. Обновлено ${new Date(s.ok*1000).toLocaleString('ru-RU')}.`:'Подписка ещё не отправлена на сервер.';
   }).catch(()=>{});
-  ['tg-en','tg-mon','tg-wat','tg-pay','tg-time','tg-dg'].forEach(id=>g(id).addEventListener('change',async e=>{
+  ['tg-en','tg-mon','tg-wat','tg-pay','tg-time','tg-dg','tg-wd'].forEach(id=>g(id).addEventListener('change',async e=>{
     const el=e.currentTarget;dim();
     try{const r=await save();stOk(el);if(r.warning)msg(r.warning);setTimeout(srvShow,4500)}catch(x){msg(x.message)}}));
   g('tg-srv').addEventListener('change',async e=>{
     const el=e.currentTarget;
-    if(el.checked&&!confirm('Включить проверку на сервере?\n\nНа сервер данных будут отправлены: ISIN и названия бумаг из списка наблюдения с целями, даты напоминаний дневника (без текста), даты ближайших оферт и выплат по облигациям портфеля (с суммами выплат). Токен, счета и стоимость портфеля не передаются.\n\nУдалить данные можно в любой момент кнопкой «Удалить данные с сервера» или в боте командой /alerts.')){el.checked=false;return}
+    if(el.checked&&!await uiConfirm({title:'Включить проверку на сервере?', body:'На сервер данных будут отправлены: ISIN и названия бумаг из списка наблюдения с целями, даты напоминаний дневника (без текста), даты ближайших оферт и выплат по облигациям портфеля (с суммами выплат). Токен, счета и стоимость портфеля не передаются.\n\nУдалить данные можно в любой момент кнопкой «Удалить данные с сервера» или в боте командой /alerts.', okText:'Включить'})){el.checked=false;return}
     try{const r=await save();
       if(el.checked){const s=await post('/api/tg/server',{action:'sync'});const n=s.counts||{};msg(`Сервер будет проверять: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}.`,1)}
       else msg(r.warning||'Проверка на сервере выключена, данные удалены с сервера.',!r.warning);
     }catch(x){msg(x.message)}finally{srvShow()}});
   g('tg-srv-del').onclick=e=>busy(e.currentTarget,async()=>{
-    if(!confirm('Удалить подписку на тревоги с сервера и выключить проверку на сервере?'))return;
+    if(!await uiConfirm({title:'Удалить подписку с сервера?', body:'Подписка на тревоги будет удалена с сервера, проверка на сервере выключится.', danger:true, okText:'Удалить'}))return;
     await post('/api/tg/server',{action:'delete'});g('tg-srv').checked=false;c.tg_server=false;msg('Данные удалены с сервера.',1);srvShow()});
   srvShow();
   api('/api/tg/info').then(i=>{
     g('tg-bot').textContent='@'+String(i.bot||'tanalyticbot').replace(/^@/,'');
-    g('tg-state').textContent=!i.server?'Сервер данных выключен («off»): уведомления работают через него. Включите сервер данных в разделе «Подключение».':
+    g('tg-state').textContent=!i.server?'Сервер данных недоступен: уведомления работают через него.':
       i.state==='need_login'?'Войдите по ключу из бота — иначе уведомления отправить нельзя.':i.state==='offline'?'Сервер недоступен.':'';
   }).catch(()=>{});
   g('tg-test').onclick=e=>busy(e.currentTarget,async()=>{await save();await post('/api/tg/test');msg('Тестовое сообщение отправлено — проверьте Telegram.',1)});
@@ -62,7 +63,7 @@ function setBackupHtml(c){
   const ex=(w,t)=>stRow(t,'',`<a class="btn ghost" href="/api/export?what=${w}&fmt=csv&account=${q}" download>CSV</a><a class="btn ghost" href="/api/export?what=${w}&fmt=xlsx&account=${q}" download>Excel</a>`);
   return stGroup('Резервная копия',
     `<div class="st-callout warn">Без пароля копию открыть нельзя, а пароль восстановить невозможно. Запишите его и храните отдельно от копии. Токен API и пароль в копию не входят.</div>`+
-    stRow('Папка для копий','Облачный диск или любая папка',`<input class="in st-wide" id="bkdir" placeholder="/Users/имя/Library/CloudStorage/…" spellcheck="false" aria-label="Папка для копий">`,{stack:1})+
+    stRow('Папка для копий','Облачный диск или любая папка',`<input class="in st-wide" id="bkdir" placeholder="${IS_WIN?'C:\\Users\\имя\\YandexDisk\\TInvestBackup':IS_MAC?'/Users/имя/Library/CloudStorage/…':'/home/имя/Yandex.Disk/TInvestBackup'}" spellcheck="false" aria-label="Папка для копий">`,{stack:1})+
     `<div id="bksug" class="bk-sug st-sug"></div>`+
     stRow('Пароль копии','<span id="bkpwst"></span>',stSecret('bkpw','не короче 6 символов','autocomplete="new-password"','Пароль копии'))+
     stRow('Хранить копий','Старые сверх лимита удаляются',`<input class="in num st-num" type="number" id="bkkeep" min="1" max="365" value="14" aria-label="Сколько копий хранить">`)+
@@ -87,7 +88,7 @@ function bindSetBackup(c,msg){
     if(first){first=false;$('#bkdir').value=s.dir||'';$('#bkkeep').value=s.keep;$('#bkauto').checked=s.auto;dirty.rebase();
       $('#bksug').innerHTML=s.suggest.length?'Найдены папки: '+s.suggest.map(x=>`<button class="btn ghost bk-chip" data-p="${esc(x.path)}">${esc(x.label)}</button>`).join(' '):
       `Подсказки: Яндекс Диск — ${s.windows?'C:\\Users\\имя\\Yandex.Disk':'~/Yandex.Disk'}; iCloud Drive — ${s.windows?'C:\\Users\\имя\\iCloudDrive':'~/Library/Mobile Documents/com~apple~CloudDocs'}; Google Drive — ${s.windows?'G:\\Мой диск':'~/Library/CloudStorage/GoogleDrive-…'}`;
-      $('#bksug').onclick=e=>{const b=e.target.closest('[data-p]');if(b){$('#bkdir').value=b.dataset.p+(b.dataset.p.endsWith('/')?'':'/')+'TInvestBackup';dirty.upd()}}}
+      $('#bksug').onclick=e=>{const b=e.target.closest('[data-p]');if(b){const p=b.dataset.p,sp=s.windows||/^[A-Za-z]:\\/.test(p)?'\\':'/';$('#bkdir').value=p+(/[\\/]$/.test(p)?'':sp)+'TInvestBackup';dirty.upd()}}}
     $('#bkpwst').innerHTML=s.pw_set?'<span class="pos">Пароль сохранён</span>':'<span class="mu">Пароль не сохранён</span>';
     $('#bkclr').style.display=s.pw_set?'':'none';
     restoreBar(!!s.restore_pending);
@@ -103,13 +104,13 @@ function bindSetBackup(c,msg){
   stEnter(['bkdir','bkpw','bkkeep'],'bksave');
   $('#bksave').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();dirty.rebase();stOk(b);show()}catch(x){msg(x.message);dirty.upd()}};
   $('#bkauto').onchange=async e=>{const el=e.currentTarget;try{await save();dirty.rebase();stOk(el);show()}catch(x){el.checked=!el.checked;msg(x.message)}};
-  $('#bkclr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Забыть пароль? Автоматические копии отключатся. Сами копии останутся и откроются прежним паролем.'))return;await post('/api/backup/settings',{clear_password:true});$('#bkauto').checked=false;msg('Пароль удалён из настроек.',1);show()});
+  $('#bkclr').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Забыть пароль копий?', body:'Автоматические копии отключатся. Сами копии останутся и откроются прежним паролем.', danger:true, okText:'Забыть'}))return;await post('/api/backup/settings',{clear_password:true});$('#bkauto').checked=false;msg('Пароль удалён из настроек.',1);show()});
   $('#bkrun').onclick=e=>busy(e.currentTarget,async()=>{
     const pw=$('#bkpw').value;await post('/api/backup/settings',{backup_dir:$('#bkdir').value,backup_keep:$('#bkkeep').value});
     await post('/api/backup/run',{password:pw});msg('Копия запущена, статус обновится ниже.',1);setTimeout(show,800)});
   $('#bkrest').onclick=e=>busy(e.currentTarget,async()=>{
     const f=$('#bkfile').files[0];if(!f)return msg('Выберите файл копии (.tinvbak).');
-    if(!confirm('Восстановить данные из этой копии? Текущая база будет сохранена рядом, замена произойдёт при следующем запуске.'))return;
+    if(!await uiConfirm({title:'Восстановить данные из копии?', body:'Текущая база будет сохранена рядом, замена произойдёт при следующем запуске.', okText:'Восстановить'}))return;
     msg('Расшифровываю и проверяю копию…',1);
     const b64=await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]||'');r.onerror=()=>no(new Error('Не удалось прочитать файл'));r.readAsDataURL(f)});
     await post('/api/backup/restore',{data:b64,password:$('#bkrpw').value});$('#bkrpw').value='';
@@ -122,6 +123,7 @@ function setCrowdHtml(c){
   return stGroup('Помощь в сборе раскрытий',
     stRow('Помогать собирать раскрытия эмитентов','Работает только пока программа открыта и подключён сервер данных',stSw('crowd-on',false,'Помогать собирать раскрытия эмитентов'))+
     `<p class="st-line" id="crowd-info">Загружаю…</p>`+
+    `<details class="st-more" id="crowd-log-det" data-q="журнал сбор раскрытия лог"><summary>Журнал сбора раскрытий</summary><div id="crowd-log-body"><span class="mu">Откройте, чтобы загрузить последние записи…</span></div></details>`+
     stMore('Как это работает','Включено по умолчанию. Сообщения эмитентов о купонах, выкупах и дефолтах лежат на сайте e-disclosure.azipi.ru, а наш сервер данных его открыть не может. <b>Пока программа открыта</b>, она скачивает публичные страницы этого сайта <b>с вашего интернет-подключения — примерно одну страницу раз в 15 секунд</b> — и отправляет их на сервер данных. Так все пользователи видят купоны, выкупы и дефолты по своим облигациям. Токен, портфель и другие ваши данные не отправляются; в страницах только то, что видно любому посетителю сайта. Сайт видит ваш IP-адрес, как при обычном заходе в браузере. При ошибках сайта программа делает паузу на 30 минут. Выключить можно в любой момент.'),
     {id:'crowd-card',hint:'',hintId:'crowd-sp'});
 }
@@ -133,6 +135,37 @@ async function bindSetCrowd(c,msg){
     document.getElementById('crowd-sp').textContent=s.enabled?stt:'выключено';
     document.getElementById('crowd-info').innerHTML=`Отправлено страниц, принятых сервером: <b>${s.accepted}</b>${s.fetched?` (скачано ${s.fetched})`:''}.${s.enabled?` Состояние: ${esc(stt)}${s.message?' — '+esc(s.message):''}.`:''}${!s.available?' Подключите сервер данных и войдите по ключу — без этого помощь не работает.':''}`;
     clearTimeout(CROWD.t);if(s.enabled)CROWD.t=setTimeout(show,5000)};
+  const loadLog=async()=>{
+    const body=document.getElementById('crowd-log-body');if(!body)return;
+    body.innerHTML='<span class="mu">Загружаю журнал…</span>';
+    try{
+      const r=await api('/api/crowd/log');
+      const rows=Array.isArray(r)?r:(r&&Array.isArray(r.items)?r.items:(r&&Array.isArray(r.log)?r.log:[]));
+      if(!rows.length){body.innerHTML='<span class="mu">Записей пока нет.</span>';return}
+      body.innerHTML=`<div class="crowd-log">${rows.slice(0,40).map(x=>{
+        const ts=x.ts||x.at||x.time;const tm=typeof ts==='number'?new Date(ts*1000).toLocaleTimeString('ru-RU'):esc(String(ts||''));
+        const ok=x.ok!==false&&x.status!=='err'&&x.status!=='error';
+        const txt=x.message||x.msg||x.url||x.kind||x.status||'Принято';
+        return`<div class="crowd-log-r"><span class="mono mu">${tm}</span><span class="${ok?'pos':'neg'}">${esc(String(x.status||(ok?'Готово':'Ошибка')))}</span><span>${esc(String(txt))}</span></div>`;
+      }).join('')}</div>`;
+    }catch(e){body.innerHTML=`<span class="neg">${esc(e.message)}</span>`}
+  };
+  const det=document.getElementById('crowd-log-det');
+  if(det)det.addEventListener('toggle',()=>{if(det.open)loadLog()});
   on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});stOk(on);msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
   show();
+}
+/* ── Окно программы: трей и автозапуск (только установленная версия для Windows; на macOS карточки нет) ── */
+async function bindSetShell(msg){
+  let s;try{s=await api("/api/shell")}catch(e){return}
+  const sec=document.getElementById("set-look");
+  if(!s||!s.tray||!sec||document.getElementById("shell-card"))return;
+  sec.insertAdjacentHTML("beforeend",stGroup("Окно программы",
+    stRow("При закрытии окна сворачивать в трей","Программа продолжает работать в фоне: резервные копии, проверка тревог. Выйти можно из меню значка в трее",stSw("tray-close",!!s.tray_close,"При закрытии окна сворачивать в трей"))+
+    stRow("Запускать вместе с Windows","После входа в систему программа открывается сразу в трее, без окна",stSw("tray-auto",!!s.autostart,"Запускать вместе с Windows")),
+    {id:"shell-card",hint:"Windows"}));
+  const bind=(id,key)=>{const el=document.getElementById(id);if(!el)return;
+    el.onchange=async()=>{try{const r=await post("/api/shell/tray",{[key]:el.checked});stOk(el);
+      el.checked=!!r[key];msg("Сохранено",1,true)}catch(e){msg(e.message);el.checked=!el.checked}}};
+  bind("tray-close","tray_close");bind("tray-auto","autostart");
 }

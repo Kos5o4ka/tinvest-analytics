@@ -518,8 +518,19 @@ def issuer_card(isin):
 
 # ── эмитенты портфеля ──
 
+def _iss_empty():
+    return {"empty": True, "rows": [], "n": 0, "n_scored": 0, "share_scored": 0, "share_bad": 0,
+            "avg_score": None, "dist": {k: 0 for _, k, _t in ISS_LABELS},
+            "gov_share": 0, "gov_n": 0, "updated": datetime.now().strftime("%H:%M")}
+
+
 def _iss_portfolio(cfg, acc, job):
-    rep_ = build_bonds(cfg, acc)
+    try:
+        rep_ = build_bonds(cfg, acc)
+    except ApiError as e:
+        if e.status != 404:
+            raise
+        return _iss_empty()
     rows = [r for r in rep_.get("rows", []) if r.get("isin") and r.get("value_rub")]
     gov = [r for r in rows if r.get("sector") == "government"]
     work = [r for r in rows if r.get("sector") != "government"]
@@ -614,6 +625,8 @@ def _iss_portfolio(cfg, acc, job):
 
 
 def issuers_payload(cfg, acc, q, force):
+    if not ((cfg or {}).get("token") or "").strip() and not imports_list():
+        return _iss_empty()
     key = (token_key(cfg), acc)
     with _iss_jobs_lock:
         job = _iss_jobs.get(key)

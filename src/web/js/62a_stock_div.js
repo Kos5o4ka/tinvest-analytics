@@ -88,7 +88,7 @@ function stkDvHist(d){
   const dh=d.div_hist||{};
   const body=it.map(r=>`<tr class="${r.future?'pnew':''}"><td class="l num">${ddm(r.record)}${r.future?' <small class="pos">будущая</small>':''}</td><td class="num">${r.last_buy?ddm(r.last_buy):'—'}</td><td class="num">${r.payment?ddm(r.payment):'—'}</td>
     <td class="num"><b>${stkDvRub(r.value)}</b></td><td class="num">${r.yield_pct==null?'—':stkN(r.yield_pct,2)+' %'}</td><td class="l">${stkDvSrc(r.src)}</td></tr>`).join('');
-  const note=dh.added?`Ранние годы — по данным <a href="${esc(dh.url||'https://www.dohod.ru')}" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет). `:dh.status==='err'?'Длинная история с dohod.ru сейчас недоступна. ':'';
+  const note=dh.added?`Ранние годы — по данным <a href="${esc(safeUrl(dh.url)||'https://www.dohod.ru')}" target="_blank" rel="noopener noreferrer">dohod.ru</a> (T-Invest отдаёт около 6 лет). `:dh.status==='err'?'Длинная история с dohod.ru сейчас недоступна. ':'';
   return`<div class="card"><h2>Все выплаты<span class="sp">${it.length} ${dlEv(it.length,'выплата','выплаты','выплат')}</span></h2>
     <div class="tbl" style="max-height:420px"><table><thead><tr><th class="l">Закрытие реестра</th><th title="Последний день, когда покупка давала право на дивиденд">Посл. день покупки</th><th>Выплата</th><th>На акцию</th><th title="Размер дивиденда к текущей цене акции">К текущей цене</th><th class="l">Источник</th></tr></thead><tbody>${body}</tbody></table></div>
     <p class="note" style="margin-top:8px">${note}Доходность каждой выплаты — к сегодняшней цене, а не к цене на дату выплаты.</p></div>`;

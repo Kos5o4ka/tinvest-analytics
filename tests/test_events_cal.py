@@ -129,5 +129,48 @@ class KeyRateNow(unittest.TestCase):
             self.assertEqual(T.key_rate_now(), (16.5, "2026-10-27"))
 
 
+class Calc06CalendarFxAndHorizon(unittest.TestCase):
+    def test_usd_amort_and_horizon_over_365(self):
+        today = T.date.today()
+        d380 = (today + T.timedelta(days=380)).isoformat()
+        d385 = (today + T.timedelta(days=385)).isoformat()
+        frm = today.isoformat()
+        to = (today + T.timedelta(days=395)).isoformat()
+        rep = {"rows": [{"ticker": "TK", "isin": ISIN, "name": "USD Bond", "qty": 10, "cur": "usd", "call": None}],
+               "payments": []}
+        bz = {"amort": [{"amortdate": d380, "value": 100.0, "faceunit": "USD"},
+                        {"amortdate": d385, "value": 900.0, "faceunit": "USD"}],
+              "coupons": [{"coupondate": d380, "value": 25.0, "faceunit": "USD"}],
+              "offers": []}
+        with Fake(cbr_meetings=lambda: {"dates": [], "ok": True}, build_bonds=lambda c, a: rep,
+                  moex_bondization=lambda i: bz, moex_bond_options=lambda i: None,
+                  primary_rows=lambda: [], watch_isins=lambda: [],
+                  key_rate_now=lambda: (16.5, "2026-10-27"),
+                  fx_now=lambda c, cs: {"rub": 1.0, "usd": 80.0}):
+            p = T.events_payload({}, "acc", {"from": frm, "to": to})
+        am = [e for e in p["events"] if e["kind"] == "amort"]
+        cp = [e for e in p["events"] if e["kind"] == "coupon"]
+        self.assertEqual(len(am), 1)
+        self.assertEqual(am[0]["amount"], 80000.0)
+        self.assertEqual(len(cp), 1)
+        self.assertEqual(cp[0]["date"], d380)
+        self.assertEqual(cp[0]["amount"], 20000.0)
+
+    def test_today_payment_included_in_bonds_report(self):
+        today_s = T.date.today().isoformat()
+        mat = (T.date.today() + T.timedelta(days=180)).isoformat()
+        b = {"nominal": 1000.0, "cur": "rub", "maturity": mat, "call": None, "placement": "2024-01-01", "cpy": 2,
+             "aci": 0.0, "floating": False, "amort": False, "perpetual": False, "risk": "", "sector": "", "name": "T",
+             "coupons": [[today_s, 40.0]]}
+        row = {"uid": "u1", "ticker": "T1", "name": "Тест", "logo": "", "color": "", "type": "bond", "qty": 5.0,
+               "avg": 1000.0, "price": 1000.0, "cur": "rub", "value": 5000.0, "value_rub": 5000.0, "pnl_rub": 0.0, "pnl_pct": 0.0}
+        with Fake(bond_info=lambda c, u: dict(b), fx_now=lambda c, cs: {"rub": 1.0}, bond_exact=lambda *a: None,
+                  keyrate_brief=lambda: None, apply_ratings=lambda rows: [], ratings_status=lambda: {},
+                  bond_isin=lambda r: ISIN):
+            rep = T.bonds_report(type("C", (), {"ready": False})(), [row])
+        cp = [p for p in rep["payments"] if p["kind"] == "coupon"]
+        self.assertEqual([(p["date"], p["amount"]) for p in cp], [(today_s, 200.0)])
+
+
 if __name__ == "__main__":
     unittest.main()

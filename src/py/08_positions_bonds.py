@@ -57,6 +57,21 @@ def fx_now(client, curs):
     return out
 
 
+def cur_to_rub(amount, cur, rates, default=1.0):
+    """Перевести сумму из валюты cur в рубли по словарю курсов rates."""
+    if amount is None:
+        return None
+    c = (cur or "rub").strip().lower()
+    if c in ("", "rub", "sur"):
+        return float(amount)
+    r = (rates.get(c) or rates.get(c.upper())) if rates else None
+    if not r:
+        if default is None:
+            return None
+        r = default
+    return float(amount) * float(r)
+
+
 def tinvest_positions(port, names):
     raw = port.get("positions") or []
     fx = {"rub": 1.0}
@@ -235,7 +250,7 @@ def portfolio_irr(items, today):
         for d, c, p in ex["flows"]:
             if d > today:
                 gross[d] += (c + p) * k
-        for d, a in net_flows(ex["flows"], today, ex["basis"]):
+        for d, a in net_flows(ex["flows"], today, ex["basis"], ex.get("aci", 0.0)):
             net[d] += a * k
     res = {"irr": None, "irr_tax": None, "value": dirty, "count": len(items)}
     if dirty > 0 and gross:
@@ -286,7 +301,7 @@ def bond_exact(client, r, b, today, rates):
         return None                      # график MOEX не сходится с данными брокера
     if y is None:
         return None
-    yt = cf_ytm(dirty, flows, today, tax=True, basis=price)
+    yt = cf_ytm(dirty, flows, today, tax=True, basis=price, aci=aci)
     mac, mod, conv = cf_risk(flows, today, y)
     st = stress(price / face * 100.0, flows, today, face, aci, STRESS_DY, y)
     live = [o for o in offs if o["status"] != "cancelled" and today < o["date"] < yk["maturity"]]
@@ -300,7 +315,7 @@ def bond_exact(client, r, b, today, rates):
             "call_dates": sorted({o["date"] for o in live if o["kind"] == "call"}),
             "unk_date": min([o["date"] for o in live if o["kind"] == "unknown"] or [None], key=lambda x: x or "9"),
             "stress_pct": {dy: (p / 100.0 * face + aci) / dirty * 100 - 100 for dy, p in st.items()},
-            "cf_source": "moex", "est_coupons": len(est), "est_detail": est, "bz": bz, "flows": flows, "basis": price, "dirty": dirty}
+            "cf_source": "moex", "est_coupons": len(est), "est_detail": est, "bz": bz, "flows": flows, "basis": price, "dirty": dirty, "aci": aci}
 
 
 def bond_price_face(r, b, rates):
@@ -351,7 +366,7 @@ def bonds_report(client, rows, horizon_days=365):
     for r, cp in zip(need, pool_map(lambda r: moex_coupon_schedule(bond_isin(r)), need)):
         if cp:
             infos[r["uid"]] = dict(infos[r["uid"]], coupons=cp)
-    out, pays = [], []
+    out, pays, fx_miss = [], [], set()
     tot_bonds = sum((r["value_rub"] or 0) for r in bonds) or 0.0
     rates = fx_now(client, {(infos.get(r["uid"]) or {}).get("cur", "rub") for r in bonds} | {r["cur"] for r in bonds})
     exacts = dict(zip([r["uid"] for r in bonds], pool_map(
@@ -436,10 +451,13 @@ def bonds_report(client, rows, horizon_days=365):
             kinds["С амортизацией"] += 1
         known = [p for _, p in b.get("coupons") or [] if p]
         fc_ = (b.get("cur") or "rub").lower()
-        k_ = 1.0 if fc_ == "rub" else (rates.get(fc_) or 1.0)       # выплаты считаем в рублях по текущему курсу номинала
+        k_ = cur_to_rub(1.0, fc_, rates, default=None)              # выплаты считаем в рублях по текущему курсу номинала
+        if k_ is None:                                              # без курса ЦБ валютные выплаты не считаем рублями 1:1
+            fx_miss.add(fc_.upper())
+            k_ = 0.0
         fest = (ex or {}).get("est_detail") or {}
         for d, p in b.get("coupons") or []:
-            if today < d <= horizon:
+            if today <= d <= horizon:
                 if not p and b.get("floating") and d in fest:
                     amt, est = fest[d]["amt"] * r["qty"] * k_, "forecast"      # прогноз ключевой ставки ЦБ + спред эмитента
                 else:
@@ -450,7 +468,7 @@ def bonds_report(client, rows, horizon_days=365):
         # прогнозные купоны флоатера, которых ещё нет в графике брокера
         have = {d for d, _ in b.get("coupons") or []}
         for d, e in sorted(fest.items()):
-            if d not in have and today < d <= horizon and e["amt"]:
+            if d not in have and today <= d <= horizon and e["amt"]:
                 pays.append({"date": d, "kind": "coupon", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
                              "amount": e["amt"] * r["qty"] * k_, "est": "forecast"})
         # амортизации (частичное погашение номинала) из графика MOEX; погашение в последний день — остаток номинала
@@ -458,20 +476,20 @@ def bonds_report(client, rows, horizon_days=365):
         if ex and b.get("maturity"):
             for a in sorted((ex.get("bz") or {}).get("amort") or [], key=lambda x: x.get("amortdate") or ""):
                 ad, av = a.get("amortdate"), a.get("value")
-                if not ad or not av or ad <= today or ad >= b["maturity"]:
+                if not ad or not av or ad < today or ad >= b["maturity"]:
                     continue
                 am_total += av
                 if ad <= horizon:
                     pays.append({"date": ad, "kind": "amortization", "name": r["name"], "ticker": r["ticker"],
                                  "logo": r["logo"], "amount": av * r["qty"] * k_, "est": False})
-        if b.get("maturity") and today < b["maturity"] <= horizon:
+        if b.get("maturity") and today <= b["maturity"] <= horizon:
             pays.append({"date": b["maturity"], "kind": "redemption", "name": r["name"], "ticker": r["ticker"],
                          "logo": r["logo"], "amount": max(nominal - am_total, 0.0) * r["qty"] * k_, "est": False})
     # дивиденды по акциям (объявленные)
     shares = [r for r in rows if r["type"] in ("share",) and r["uid"] and r["qty"] > 0]
 
     def srv_divs(secid):
-        """Дивиденды с сервера данных (md/dividends) -> [[дата, на акцию, валюта]] в окне (today, horizon]."""
+        """Дивиденды с сервера данных (md/dividends) -> [[дата, на акцию, валюта]] в окне [today, horizon]."""
         d = ds_parsed("md/dividends", {"secid": secid}) if secid else None
         if not isinstance(d, dict) or d.get("items") is None:
             return None
@@ -479,7 +497,7 @@ def bonds_report(client, rows, horizon_days=365):
         for x in d["items"]:
             dt = iso_date(x.get("payment")) or iso_date(x.get("record"))
             v_ = qf(x.get("value")) if not isinstance(x.get("value"), (int, float)) else float(x["value"])
-            if dt and v_ and today < dt <= horizon:
+            if dt and v_ and today <= dt <= horizon:
                 out_.append([dt, v_, str(x.get("currency") or "rub").lower()])
         return out_
 
@@ -509,11 +527,11 @@ def bonds_report(client, rows, horizon_days=365):
         for x in ds:
             d, per = x[0], x[1]
             dc = (x[2] if len(x) > 2 else r.get("cur") or "rub").lower()
-            kk = 1.0 if dc == "rub" else rates.get(dc)
-            if d and today < d <= horizon and per and kk:        # выплата в валюте — переводим в рубли по текущему курсу
+            amt = cur_to_rub(per * r["qty"], dc, rates, default=None) if per else None
+            if d and today <= d <= horizon and amt:               # выплата в валюте — переводим в рубли по текущему курсу
                 pays.append({"date": d, "kind": "dividend", "name": r["name"], "ticker": r["ticker"], "logo": r["logo"],
-                             "amount": per * r["qty"] * kk, "est": False, "cur": dc})
-    pays.sort(key=lambda p: p["date"])
+                             "amount": amt, "est": False, "cur": dc})
+    pays = sorted((p for p in pays if p["amount"]), key=lambda p: p["date"])
     irr = portfolio_irr(irr_items, today)
     metrics = {"count": len(bonds), "value": tot_bonds,
                "ytm": w["ytm"] / w["ytm_v"] if w["ytm_v"] else None,
@@ -534,7 +552,311 @@ def bonds_report(client, rows, horizon_days=365):
         if x.get("call") and x.get("call") > today and "call_kind" not in x:
             x["call_kind"] = ckind.get(x.get("uid"))
     return {"rows": out, "metrics": metrics, "ladder": sorted(ladder.items()), "risk": sorted(risk.items(), key=lambda x: -x[1]),
-            "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays,
-            "ratings": apply_ratings(out), "ratings_info": ratings_status()}
+            "kinds": sorted(kinds.items(), key=lambda x: -x[1]), "payments": pays, "fx_missing": sorted(fx_miss),
+            "ratings": apply_ratings(out), "ratings_info": ratings_status(),
+            "radar": _radar_safe(client, bonds, today, infos, exacts, rates)}
+
+
+def _radar_safe(client, bonds, today, infos, exacts, rates):
+    try:
+        return offer_amort_radar(client, bonds, today, horizon_days=60, infos=infos, exacts=exacts, rates=rates)
+    except Exception:  # noqa: BLE001
+        return {"today": today, "horizon_days": 60, "items": [], "counts": {"blind_put": 0, "coupon_cut": 0, "amort": 0, "total": 0}}
+
+
+CONC_THRESHOLDS = {"issuer": 15.0, "sector": 35.0, "below_a_minus": 30.0}
+
+
+_CONC_FORM_RX = re.compile(r"\((?:ПАО|АО|ОАО|ЗАО)\)|(?<![\w-])(?:ПАО|МКПАО|ОАО|ЗАО|АО|НК|ГК|России|ао|ап|-)(?![\w-])")
+
+
+_CONC_SERIES_RX = re.compile(r"^(?:\d+[\w-]*[PРRСC-][\w-]*|[A-Za-z]{1,3}\d[\w-]*|БО-[\w-]+|\d{3,}[\w-]*)$")
+
+
+def _conc_issuer(name):
+    """(ключ, название) эмитента для концентрации: акции «Сбербанк России ПАО ао» и облигации «Сбербанк Sb51R»
+    сходятся к одному «Сбербанк»; серии выпусков и правовые формы в названии не показываем."""
+    clean = re.sub(r"\s+", " ", _CONC_FORM_RX.sub(" ", name or "")).strip(" -")
+    key = issuer_group_key(clean or name) or (name or "").lower()
+    if key == "минфин":
+        return key, "Минфин (ОФЗ)"
+    words = []
+    for w in clean.split():
+        if w.upper() in ("БО", "ПБО", "КО", "СО") or _CONC_SERIES_RX.match(w):
+            break                                   # дальше — номер выпуска: «2P-12», «Sb51R», «БО 001P-09»
+        words.append(w)
+    return key, " ".join(words) or clean or name
+
+
+def portfolio_concentration(rows):
+    """Анализ концентрации портфеля по эмитентам, секторам, валютам и кредитному качеству (без сети)."""
+    active = [r for r in (rows or []) if r.get("type") != "futures" and (r.get("value_rub") or 0.0) > 0]
+    total = sum(r["value_rub"] for r in active)
+    if total <= 0:
+        return {"total": 0.0, "issuers": [], "issuers_count": 0, "max_issuer_share": 0.0, "top3_share": 0.0,
+                "sectors": [], "currencies": [],
+                "below_a_minus": {"value_rub": 0.0, "share": 0.0, "count": 0},
+                "unrated_bonds": {"value_rub": 0.0, "share": 0.0, "count": 0},
+                "thresholds": dict(CONC_THRESHOLDS), "warnings": []}
+
+    issuers = {}
+    sectors = defaultdict(float)
+    currencies = defaultdict(float)
+    below_rub, below_cnt = 0.0, 0
+    unrated_rub, unrated_cnt = 0.0, 0
+    a_minus_idx = RATING_SCALE.index("A-")
+
+    for r in active:
+        v = float(r["value_rub"])
+        rtype = r.get("type") or ""
+        cur = (r.get("ticker") or r.get("cur") or "rub")[:3].lower() if rtype == "currency" else (r.get("cur") or "rub").lower()
+        currencies[cur] += v
+        if rtype == "currency":
+            continue
+
+        isin = (r.get("isin") or "").upper()
+        if not isin and rtype == "bond":
+            try:
+                isin = bond_isin(r)
+            except Exception:  # noqa: BLE001
+                isin = ""
+        cat = None
+        if isin:
+            try:
+                cat = tcat_info(isin)
+            except Exception:  # noqa: BLE001
+                cat = None
+
+        name = (r.get("name") or (cat or {}).get("name") or r.get("ticker") or r.get("uid") or "").strip()
+        ikey, disp = _conc_issuer(name)
+        if ikey not in issuers:
+            issuers[ikey] = {"key": ikey, "name": disp, "value_rub": 0.0, "count": 0}
+        issuers[ikey]["value_rub"] += v
+        issuers[ikey]["count"] += 1
+
+        sec = r.get("sector") or (cat or {}).get("sector") or ("etf" if rtype == "etf" else "")
+        sectors[sec] += v
+
+        rt = r.get("rating")
+        if rt is None and rtype == "bond":
+            try:
+                rt = best_rating(isin or r.get("ticker"), name)
+            except Exception:  # noqa: BLE001
+                rt = None
+        rv = rt.get("v") if isinstance(rt, dict) else (rt if isinstance(rt, str) else None)
+        if rv and rv in RATING_SCALE:
+            if RATING_SCALE.index(rv) > a_minus_idx:
+                below_rub += v
+                below_cnt += 1
+        elif rtype == "bond":
+            unrated_rub += v
+            unrated_cnt += 1
+
+    iss_list = sorted(issuers.values(), key=lambda x: -x["value_rub"])
+    for x in iss_list:
+        x["share"] = x["value_rub"] / total * 100.0
+    corp = [x for x in iss_list if x["key"] != "минфин"]     # ОФЗ — госдолг: кредитным риском эмитента не считаем
+    max_iss = corp[0]["share"] if corp else 0.0
+    top3 = sum(x["share"] for x in iss_list[:3])
+
+    sec_list = [{"key": k, "value_rub": val, "share": val / total * 100.0}
+                for k, val in sorted(sectors.items(), key=lambda kv: -kv[1])]
+    cur_list = [{"cur": k, "value_rub": val, "share": val / total * 100.0}
+                for k, val in sorted(currencies.items(), key=lambda kv: -kv[1])]
+
+    below_pct = below_rub / total * 100.0
+    unrated_pct = unrated_rub / total * 100.0
+
+    warnings = []
+    if max_iss > CONC_THRESHOLDS["issuer"] and corp:
+        top_i = corp[0]
+        warnings.append({"kind": "issuer", "severity": "high" if max_iss > 25.0 else "warn",
+                         "title": "Концентрация на эмитенте",
+                         "detail": "%s — %.1f%% портфеля (порог %.0f%%)" % (top_i["name"], max_iss, CONC_THRESHOLDS["issuer"]),
+                         "value": max_iss, "threshold": CONC_THRESHOLDS["issuer"]})
+    known_secs = [s for s in sec_list if s["key"] and s["key"] != "etf"]
+    if known_secs and known_secs[0]["share"] > CONC_THRESHOLDS["sector"]:
+        top_s = known_secs[0]
+        warnings.append({"kind": "sector", "severity": "warn",
+                         "title": "Перекос по сектору",
+                         "detail": "%s — %.1f%% портфеля (порог %.0f%%)" % (top_s["key"], top_s["share"], CONC_THRESHOLDS["sector"]),
+                         "value": top_s["share"], "threshold": CONC_THRESHOLDS["sector"], "sector": top_s["key"]})
+    if below_pct > CONC_THRESHOLDS["below_a_minus"]:
+        warnings.append({"kind": "rating", "severity": "high" if below_pct > 50.0 else "warn",
+                         "title": "Высокая доля бумаг ниже A-",
+                         "detail": "%.1f%% портфеля с рейтингом ниже A- (порог %.0f%%)" % (below_pct, CONC_THRESHOLDS["below_a_minus"]),
+                         "value": below_pct, "threshold": CONC_THRESHOLDS["below_a_minus"]})
+
+    return {"total": total, "issuers": iss_list[:10], "issuers_count": len(iss_list),
+            "max_issuer_share": max_iss, "max_issuer": corp[0]["name"] if corp else None, "top3_share": top3,
+            "sectors": sec_list, "currencies": cur_list,
+            "below_a_minus": {"value_rub": below_rub, "share": below_pct, "count": below_cnt},
+            "unrated_bonds": {"value_rub": unrated_rub, "share": unrated_pct, "count": unrated_cnt},
+            "thresholds": dict(CONC_THRESHOLDS), "warnings": warnings}
+
+
+def offer_amort_radar(client, rows, today=None, horizon_days=60, infos=None, exacts=None, rates=None):
+    """Радар ближайших пут-оферт (без объявленного купона или со снижением ставки) и частичных амортизаций."""
+    today = (today or date.today().isoformat())[:10]
+    t_dt = datetime.strptime(today, "%Y-%m-%d").date()
+    end_date = (t_dt + timedelta(days=horizon_days)).isoformat()
+    items = []
+
+    def one(r):
+        if r.get("type") != "bond" or (r.get("qty") or 0) <= 0:
+            return []
+        its = []
+        uid = r.get("uid") or ""
+        isin = (r.get("isin") or "").upper()
+        if not isin:
+            try:
+                isin = bond_isin(r)
+            except Exception:  # noqa: BLE001
+                isin = ""
+        b = (infos or {}).get(uid)
+        if b is None and client and uid:
+            try:
+                b = bond_info(client, uid)
+            except Exception:  # noqa: BLE001
+                b = None
+        allow_net = client is None or getattr(client, "ready", False)
+        ex = (exacts or {}).get(uid)
+        bz = (ex or {}).get("bz")
+        if bz is None and isin:
+            if allow_net:
+                try:
+                    bz = moex_bondization(isin)
+                except Exception:  # noqa: BLE001
+                    bz = None
+            else:
+                try:
+                    _bv = store().get("bondiz2:" + isin, ttl=BC_TTL)
+                    bz = _bv if (_bv and _bv.get("ok")) else None
+                except Exception:  # noqa: BLE001
+                    bz = None
+        opt = None
+        if isin:
+            if allow_net:
+                try:
+                    opt = moex_bond_options(isin)
+                except Exception:  # noqa: BLE001
+                    opt = None
+            else:
+                try:
+                    _ov = store().get("bopt1:" + isin, ttl=BC_TTL)
+                    opt = _ov if (_ov and _ov.get("ok")) else None
+                except Exception:  # noqa: BLE001
+                    opt = None
+
+        mat = ((b or {}).get("maturity") or "")[:10]
+        name = r.get("name") or (b or {}).get("name") or r.get("ticker") or isin
+        ticker = r.get("ticker") or ""
+
+        try:
+            offs = offer_kinds(bz, opt, (b or {}).get("call"), today)
+        except Exception:  # noqa: BLE001
+            offs = []
+
+        raw_coupons = list((bz or {}).get("coupons") or [])
+        if not raw_coupons and isin and allow_net:
+            try:
+                sched = moex_coupon_schedule(isin)
+            except Exception:  # noqa: BLE001
+                sched = []
+            raw_coupons = [{"coupondate": d, "value": v, "valueprc": None} for d, v in sched]
+        if not raw_coupons and (b or {}).get("coupons"):
+            raw_coupons = [{"coupondate": d, "value": v, "valueprc": None} for d, v in b["coupons"]]
+
+        coupons = sorted(
+            [c for c in raw_coupons if c.get("coupondate")],
+            key=lambda c: c["coupondate"]
+        )
+
+        for o in offs:
+            if o.get("kind") != "put" or o.get("status") == "cancelled":
+                continue
+            od = (o.get("date") or "")[:10]
+            if not od or not (today <= od <= end_date):
+                continue
+            if mat and od >= mat:
+                continue
+
+            cur_c = None
+            for c in coupons:
+                cd = c["coupondate"][:10]
+                if cd <= od and ((c.get("valueprc") or 0) > 0 or (c.get("value") or 0) > 0):
+                    cur_c = c
+            post_c = [c for c in coupons if c["coupondate"][:10] > od and (not mat or c["coupondate"][:10] <= mat)]
+            nxt = post_c[0] if post_c else None
+
+            kind = None
+            cur_rate = float(cur_c["valueprc"]) if cur_c and cur_c.get("valueprc") is not None else None
+            nxt_rate = float(nxt["valueprc"]) if nxt and nxt.get("valueprc") is not None else None
+            cur_val = float(cur_c["value"]) if cur_c and cur_c.get("value") is not None else None
+            nxt_val = float(nxt["value"]) if nxt and nxt.get("value") is not None else None
+
+            if nxt is None:
+                kind = "blind_put"
+            else:
+                declared = (nxt_rate is not None and nxt_rate > 0) or (nxt_val is not None and nxt_val > 0)
+                if not declared:
+                    kind = "blind_put"
+                elif cur_c is not None:
+                    if nxt_rate is not None and cur_rate is not None and nxt_rate > 0 and cur_rate > 0:
+                        if nxt_rate < cur_rate - 1e-6:
+                            kind = "coupon_cut"
+                    elif nxt_val is not None and cur_val is not None and nxt_val > 0 and cur_val > 0:
+                        if nxt_val < cur_val - 1e-6:
+                            kind = "coupon_cut"
+
+            if kind:
+                days_left = (datetime.strptime(od, "%Y-%m-%d").date() - t_dt).days
+                its.append({
+                    "kind": kind, "date": od, "days_left": days_left,
+                    "isin": isin, "ticker": ticker, "name": name,
+                    "value_rub": r.get("value_rub"),
+                    "cur_rate": cur_rate, "next_rate": nxt_rate,
+                    "cur_val": cur_val, "next_val": nxt_val,
+                })
+
+        fc = ((b or {}).get("cur") or r.get("cur") or "rub").lower()
+        k_ = cur_to_rub(1.0, fc, rates or {}, default=None)          # без курса сумму в рублях не показываем
+        for a in (bz or {}).get("amort") or []:
+            ad = (a.get("amortdate") or "")[:10]
+            av = float(a.get("value") or 0.0)
+            aprc = a.get("valueprc")
+            if not ad or av <= 0 or not (today <= ad <= end_date):
+                continue
+            if mat and ad >= mat:
+                continue
+            if not mat and aprc is not None and float(aprc) >= 100.0 - 1e-6:
+                continue
+            days_left = (datetime.strptime(ad, "%Y-%m-%d").date() - t_dt).days
+            its.append({
+                "kind": "amort", "date": ad, "days_left": days_left,
+                "isin": isin, "ticker": ticker, "name": name,
+                "value": av, "valueprc": float(aprc) if aprc is not None else None,
+                "amount_rub": av * float(r.get("qty") or 0) * k_ if k_ is not None else None,
+                "value_rub": r.get("value_rub"),
+            })
+        return its
+
+    def safe(r):
+        try:
+            return one(r)
+        except Exception:  # noqa: BLE001   сбой данных одной бумаги не роняет весь отчёт
+            return []
+    # бумаги независимы, а без кэша по каждой идут запросы к MOEX — считаем параллельно
+    for its in pool_map(safe, list(rows or []), workers=8):
+        items.extend(its or [])
+
+    items.sort(key=lambda x: (x["date"], x["kind"], x["name"]))
+    counts = {"blind_put": 0, "coupon_cut": 0, "amort": 0}
+    for it in items:
+        counts[it["kind"]] = counts.get(it["kind"], 0) + 1
+    counts["total"] = len(items)
+    return {"today": today, "horizon_days": horizon_days, "items": items, "counts": counts}
+
+
 
 

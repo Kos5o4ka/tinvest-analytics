@@ -9,7 +9,7 @@
 .nav .nav-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* Свёрнутый сайдбар (icon rail 62px) */
-body.side-mini aside{width:64px;padding:14px 8px 12px;overflow:visible}
+body.side-mini aside{width:64px;padding:14px 8px 12px}
 body.side-mini .logo{justify-content:center;padding:2px 0 12px;flex-direction:column;gap:6px}
 body.side-mini .logo-tx,body.side-mini .ux-mode,body.side-mini .nav-t,body.side-mini .ux-cnt,body.side-mini .accs,body.side-mini .badge{display:none}
 body.side-mini .side-tog{margin-left:0}
