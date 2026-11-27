@@ -45901,15 +45901,23 @@ const GUIDE_TOURS={
     {sel:['#scr-tw'],title:'Таблица',text:'Нажмите на заголовок, чтобы отсортировать, и на строку, чтобы открыть карточку облигации с графиком и выплатами.'},
     {sel:['#scr-csv'],title:'Выгрузка',text:'Сохранить текущую подборку в CSV для Excel.'}]
 };
-const GUIDE_OPEN={};
+/* открыт ли гид — помнится только в пределах одного захода в раздел: данные догружаются и раздел перерисовывается
+   несколько раз, а при следующем заходе состояние считается заново (уже свёрнут) */
+const GUIDE_VISIT={page:null,open:{}};
+function guideOpenMap(){
+  const cur=typeof S!=='undefined'&&S?S.page:null;
+  if(cur!==GUIDE_VISIT.page){GUIDE_VISIT.page=cur;GUIDE_VISIT.open={}}
+  return GUIDE_VISIT.open;
+}
 
 function guideSeen(){const v=uiGet('guides');return v&&typeof v==='object'?v:{}}
 function guideHtml(page){
+  const om=guideOpenMap();                                  /* до выхода: заход в раздел без гида тоже сбрасывает состояние */
   const g=GUIDES[page];if(!g)return null;
-  let open=GUIDE_OPEN[page];
+  let open=om[page];
   if(open==null){
     const seen=guideSeen(),hid=typeof UX!=='undefined'&&UX.whyOff&&UX.whyOff[page];
-    open=!seen[page]&&!hid;GUIDE_OPEN[page]=open;
+    open=!seen[page]&&!hid;om[page]=open;
     if(!seen[page])uiSet('guides',Object.assign({},seen,{[page]:1}));
   }
   const sum=g.sum||(typeof UX_WHY!=='undefined'&&UX_WHY[page])||g.t;
@@ -45923,6 +45931,8 @@ function guideHtml(page){
       ${kb.length?`<div class="guide-kb">Подробнее в базе знаний: ${kb.join(' · ')}</div>`:''}</div>`:''}
   </section>`;
 }
+/* «Настройки», «База знаний», «Импорт» и закрытые Pro-разделы рисуются без строки подсказки: заход фиксируем при любой отрисовке */
+if(typeof renderNow==='function'){const _rnG=renderNow;renderNow=function(){guideOpenMap();return _rnG.apply(this,arguments)}}
 if(typeof uxWhyBanner==='function'){
   const _why=uxWhyBanner;
   uxWhyBanner=function(page){const h=guideHtml(page);return h!=null?h:_why(page)};
@@ -45931,7 +45941,7 @@ if(typeof document!=='undefined')document.addEventListener('click',e=>{
   const t=e.target.closest&&e.target.closest('[data-guide-tog],[data-guide-tour]');if(!t)return;
   const page=t.dataset.guideTog||t.dataset.guideTour;
   if(t.dataset.guideTour){if(typeof tourStart==='function')tourStart(GUIDE_TOURS[page],'Как пользоваться разделом');return}
-  GUIDE_OPEN[page]=!GUIDE_OPEN[page];
+  const om=guideOpenMap();om[page]=!om[page];
   const box=t.closest('.guide');if(!box)return;
   const w=document.createElement('div');w.innerHTML=guideHtml(page);box.replaceWith(w.firstElementChild);
 });

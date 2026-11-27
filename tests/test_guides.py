@@ -13,7 +13,7 @@ var _ui={},posted=[];
 function uiGet(k){return _ui[k]==null?null:_ui[k]}
 function uiSet(k,v){_ui[k]=v;posted.push(k)}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-var UX={whyOff:{}},UX_WHY={scr:'строка'},KB=[{id:'xirr',t:'XIRR'},{id:'yield',t:'Доходность'}];
+var S={page:'ret'},UX={whyOff:{}},UX_WHY={scr:'строка'},KB=[{id:'xirr',t:'XIRR'},{id:'yield',t:'Доходность'}];
 """
 
 
@@ -62,14 +62,16 @@ class Guides(unittest.TestCase):
     def test_open_once_then_collapsed(self):
         o = jsrun(["71_guides.js"], STUB + r"""
 out.first=guideHtml('ret');out.seen=uiGet('guides');
-for(const k in GUIDE_OPEN)delete GUIDE_OPEN[k];
+out.rerender=guideHtml('ret');                             /* догрузка данных в том же заходе: гид остаётся открытым */
+S.page='pos';guideHtml('pos');S.page='ret';               /* ушли в другой раздел и вернулись */
 out.second=guideHtml('ret');
-out.scr=guideHtml('scr');out.none=guideHtml('dash');
-UX.whyOff.reb=1;out.hid=guideHtml('reb');
+S.page='scr';out.scr=guideHtml('scr');out.none=guideHtml('dash');
+S.page='reb';UX.whyOff.reb=1;out.hid=guideHtml('reb');
 """)
         self.assertIn("guide-body", o["first"])
         self.assertIn("data-kb=\"xirr\"", o["first"])
         self.assertEqual(o["seen"], {"ret": 1})
+        self.assertIn("guide-body", o["rerender"])
         self.assertNotIn("guide-body", o["second"])
         self.assertIn("Как это работает", o["second"])
         self.assertNotIn("data-guide-tour", o["second"])            # у «Доходности» тура нет
