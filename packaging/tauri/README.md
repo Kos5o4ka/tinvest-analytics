@@ -11,7 +11,7 @@ Tauri — основная оболочка релиза. Старая обол�
 | Файл | Что это |
 |---|---|
 | `TAnalytic-Setup-win.exe` | установщик NSIS, x64, без прав администратора (`%LOCALAPPDATA%\TAnalytic`) |
-| `TAnalytic-mac-arm64.dmg`, `TAnalytic-mac-x64.dmg` | образы macOS (Apple Silicon и Intel) |
+| `TAnalytic-mac-arm64.dmg` | образ macOS (Apple Silicon; Mac на Intel не собирается) |
 | `*.sig`, `TAnalytic-mac-*.app.tar.gz`, `latest.json` | артефакты автообновления (только при подписи, см. ниже) |
 | `tinvest_analytics.py`, `SHA256SUMS` | как раньше |
 

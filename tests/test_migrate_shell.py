@@ -44,7 +44,7 @@ class Asset(unittest.TestCase):
     def test_choice(self):
         self.assertEqual(M.migrate_asset("win32"), "TAnalytic-Setup-win.exe")
         self.assertEqual(M.migrate_asset("darwin", "arm64"), "TAnalytic-mac-arm64.dmg")
-        self.assertEqual(M.migrate_asset("darwin", "x86_64"), "TAnalytic-mac-x64.dmg")
+        self.assertIsNone(M.migrate_asset("darwin", "x86_64"))            # Mac на Intel: сборки нет
         with self.assertRaises(M.MigrateError):
             M.migrate_asset("linux")
 

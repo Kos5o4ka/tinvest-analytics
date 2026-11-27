@@ -49,12 +49,12 @@ def shell_status(env=None, frozen=None, cfg=None):
     env = os.environ if env is None else env
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     rev = shell_rev(env)
-    asset = {"darwin": "TAnalytic-mac-arm64.dmg" if platform.machine() == "arm64" else "TAnalytic-mac-x64.dmg",
+    asset = {"darwin": "TAnalytic-mac-arm64.dmg" if platform.machine() == "arm64" else None,   # Intel: сборки нет с v0.31
              "win32": "TAnalytic-Setup-win.exe"}.get(sys.platform)
     tray = tray_supported(env, frozen)
     tauri = is_tauri_shell(env)
     return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "tauri": tauri,
-            "outdated": bool(frozen and not tauri and rev < SHELL_REV_LATEST),
+            "outdated": bool(frozen and not tauri and rev < SHELL_REV_LATEST and asset),
             "url": SHELL_RELEASES, "asset": asset, "migrate": migrate_old_shell(env, frozen),
             "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close"))}
 

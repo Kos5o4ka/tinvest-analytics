@@ -147,7 +147,7 @@ class TauriConfigAndFiles(unittest.TestCase):
         yml_path = os.path.join(ROOT, ".github", "workflows", "release.yml")
         self.assertTrue(os.path.isfile(yml_path))
         yml = open(yml_path, encoding="utf-8").read()
-        for runner in ("macos-latest", "macos-15-intel", "windows-latest"):
+        for runner in ("macos-latest", "windows-latest"):
             self.assertIn(runner, yml)
         self.assertIn("TAnalytic-backend", yml)
         self.assertIn("tauri-apps/tauri-action@v0", yml)
@@ -213,7 +213,7 @@ class TauriReleasePackaging(unittest.TestCase):
 
     def test_release_workflow_publishes_tauri_assets(self):
         yml = open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8").read()
-        for asset in ("TAnalytic-Setup-win.exe", "TAnalytic-mac-arm64.dmg", "TAnalytic-mac-x64.dmg", "latest.json"):
+        for asset in ("TAnalytic-Setup-win.exe", "TAnalytic-mac-arm64.dmg", "latest.json"):
             self.assertIn(asset, yml)
         self.assertIn("--onedir", yml)
         self.assertNotIn("--onefile", yml)
@@ -222,6 +222,8 @@ class TauriReleasePackaging(unittest.TestCase):
         self.assertIn("gh release upload", yml)
         self.assertIn("SHA256SUMS", yml)
         self.assertNotIn("ISCC", yml)
+        self.assertNotIn("x86_64-apple-darwin", yml)                      # Mac на Intel не собирается
+        self.assertNotIn("mac-x64", yml)
 
 
 class FrontendTauriIntegration(unittest.TestCase):

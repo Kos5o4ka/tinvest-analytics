@@ -25,6 +25,8 @@ def migrate_old_shell(env=None, frozen=None, plat=None):
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     if is_tauri_shell(env) or plat not in ("win32", "darwin"):
         return False
+    if plat == "darwin" and not migrate_asset(plat):            # Mac на Intel: переезжать некуда, остаётся старая оболочка
+        return False
     rev = shell_rev(env)
     return bool((frozen or rev > 0) and rev < SHELL_REV_LATEST)
 
@@ -35,7 +37,7 @@ def migrate_asset(plat=None, machine=None):
         return MIGRATE_WIN_ASSET
     if plat == "darwin":
         m = (platform.machine() if machine is None else machine).lower()
-        return "TAnalytic-mac-arm64.dmg" if m in ("arm64", "aarch64") else "TAnalytic-mac-x64.dmg"
+        return "TAnalytic-mac-arm64.dmg" if m in ("arm64", "aarch64") else None   # Mac на Intel: сборки нет с v0.31
     raise MigrateError("Переезд поддерживается только на Windows и macOS.")
 
 
@@ -359,6 +361,8 @@ def migrate_run(exit_fn=None, plat=None, tmp=None, sleep=time.sleep):
     work = None
     try:
         asset = migrate_asset(plat)
+        if not asset:
+            raise MigrateError("Для Mac на Intel новой версии приложения нет.")
         work = tempfile.mkdtemp(prefix="tanalytic_migrate_", dir=tmp)
         _mig_set(state="downloading", done=0, total=0, error="")
         info = migrate_download(work, asset, progress=lambda d, t: _mig_set(done=d, total=t))

@@ -1,7 +1,7 @@
 name: release-binaries
 # Собирает приложение на Tauri v2 (Rust-оболочка + Python-сервер TAnalytic-backend, PyInstaller --onedir в ресурсах бандла) и добавляет сборки к релизу.
 # Публикуются под стабильными именами (их ждут баннер обновления, README и самообновление старых оболочек pywebview):
-#   TAnalytic-Setup-win.exe (NSIS, x64), TAnalytic-mac-arm64.dmg, TAnalytic-mac-x64.dmg,
+#   TAnalytic-Setup-win.exe (NSIS, x64), TAnalytic-mac-arm64.dmg (Apple Silicon; Mac на Intel не собираем с v0.31),
 #   а для автообновления — подписи (*.sig), архивы *.app.tar.gz и latest.json.
 # Ассет tinvest_analytics.py релиза не трогаем; в SHA256SUMS заменяются только строки наших файлов.
 #
@@ -36,10 +36,6 @@ jobs:
             target: aarch64-apple-darwin
             asset: TAnalytic-mac-arm64.dmg
             platform: darwin-aarch64
-          - os: macos-15-intel      # Intel; метка раннера может измениться — при необходимости обновите
-            target: x86_64-apple-darwin
-            asset: TAnalytic-mac-x64.dmg
-            platform: darwin-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: TAnalytic-Setup-win.exe
@@ -222,7 +218,6 @@ jobs:
           items = {
               "windows-x86_64": "TAnalytic-Setup-win.exe",
               "darwin-aarch64": "TAnalytic-mac-arm64.app.tar.gz",
-              "darwin-x86_64": "TAnalytic-mac-x64.app.tar.gz",
           }
           plats = {}
           for plat, name in items.items():

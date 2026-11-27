@@ -14,7 +14,7 @@
   ```bash
   git push origin main --tags
   ```
-  *Это запустит GitHub Actions (`release.yml`), который скомпилирует Tauri (.exe NSIS, .dmg для Apple Silicon и Intel), соберёт `tinvest_analytics.py`, `SHA256SUMS`, `latest.json` и создаст релиз `v0.31`.*
+  *Это запустит GitHub Actions (`release.yml`), который скомпилирует Tauri (.exe NSIS, .dmg для Apple Silicon), соберёт `tinvest_analytics.py`, `SHA256SUMS`, `latest.json` и создаст релиз `v0.31`.*
 - [ ] Запушить репозиторий бота `tinvest-bot`:
   ```bash
   cd /Users/kos5o4ka/Downloads/tanalytic/tinvest-bot && git push origin main
@@ -30,7 +30,6 @@
 - [ ] **Windows**: SmartScreen («Подробнее → Выполнить в любом случае»)
 - [ ] **Windows**: автообновление `passive` при последующих обновлениях
 - [ ] **macOS**: замена `.app` в «Программах»
-- [ ] **macOS**: проверка сборки для Intel (`x64.dmg`) на реальном Mac с x86_64
 - [ ] **Баннер миграции**: прогресс, «Позже» (напомнит через сутки), ошибка без сети и «Скачать вручную»
 - [ ] **Windows**: фактический путь установки Tauri и имя exe (от них зависит переезд)
 - [ ] **macOS**: запуск старой версии из dmg или «Загрузок» → новая ставится в «Программы»
@@ -96,7 +95,7 @@
 
 ### Оболочка и платформа
 - ✅ **Tauri v2 Shell**: sidecar архитектура (`--parent-pid`), нативный трей, frameless заголовок, single-instance
-- ✅ **Релизный конвейер Tauri**: NSIS-инсталлятор Windows, DMG (x64 + arm64) macOS с Retina-фоном, `latest.json`, `tauri-plugin-updater`
+- ✅ **Релизный конвейер Tauri**: NSIS-инсталлятор Windows, DMG (arm64; Intel не собирается с v0.31) macOS с Retina-фоном, `latest.json`, `tauri-plugin-updater`
 - ✅ **Автопереезд (MIGRATE-1)**: миграция старых `pywebview` / Inno установок прямо из приложения с проверкой SHA256
 - ✅ **Безопасность**: защита биометрией (Touch ID / Windows Hello) и PIN-кодом (PBKDF2), DPAPI-шифрование на Windows, автоблокировка (по умолчанию отключена)
 

@@ -154,7 +154,7 @@ def update(report=lambda *a: None, cancel=None, fetch=fetch):
 # ───────────────────────────── обновление оболочки: установщик с GitHub ─────────────────────────────
 
 SETUP_ASSET = "TAnalytic-Setup-win.exe"          # установщик NSIS (оболочка Tauri, src-tauri/), публикуется в релизе
-MAC_ASSETS = {"arm64": "TAnalytic-mac-arm64.dmg", "x86_64": "TAnalytic-mac-x64.dmg"}   # образы macOS (packaging/make_dmg.sh)
+MAC_ASSETS = {"arm64": "TAnalytic-mac-arm64.dmg"}   # образ macOS (packaging/make_dmg.sh); для Mac на Intel сборки нет с v0.31
 MAC_APP_NAME = "TAnalytic.app"                   # так называется приложение внутри образа и на диске
 SETUP_LIMIT = 300_000_000                        # установщик заметно больше одного .py (по умолчанию fetch берёт до 20 МБ)
 UPDATE_DIR = os.path.join(HOME, "update")
@@ -170,7 +170,7 @@ def shell_asset(plat=None, machine=None):
         return SETUP_ASSET
     if plat == "darwin":
         m = (platform.machine() if machine is None else machine).lower()
-        return MAC_ASSETS["arm64" if m in ("arm64", "aarch64") else "x86_64"]
+        return MAC_ASSETS["arm64"] if m in ("arm64", "aarch64") else None       # Intel: оболочка не выпускается, обновляется только .py
     return None
 
 
@@ -198,8 +198,8 @@ def mac_update_blocker(app, access=os.access):
 
 
 def shell_update_supported():
-    """Самообновление оболочки — только у собранного приложения: .exe на Windows и .app на macOS."""
-    return sys.platform in ("win32", "darwin") and FROZEN
+    """Самообновление оболочки — только у собранного приложения: .exe на Windows и .app на macOS (Apple Silicon)."""
+    return sys.platform in ("win32", "darwin") and FROZEN and bool(shell_asset())
 
 
 def pick_setup(rel, name=SETUP_ASSET):

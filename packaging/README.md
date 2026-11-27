@@ -4,7 +4,7 @@
 
 | Система | Результат | Как |
 |---|---|---|
-| macOS | `TAnalytic.app` (onedir) → образ `TAnalytic-mac-arm64.dmg` / `TAnalytic-mac-x64.dmg` | PyInstaller, затем `packaging/make_dmg.sh` |
+| macOS | `TAnalytic.app` (onedir) → образ `TAnalytic-mac-arm64.dmg` (только Apple Silicon) | PyInstaller, затем `packaging/make_dmg.sh` |
 | Windows | папка `TAnalytic\` (onedir) → установщик `TAnalytic-Setup-win.exe` | PyInstaller, затем Inno Setup (`packaging/TAnalytic.iss`) |
 
 ## Установщик Windows
@@ -27,7 +27,7 @@
 `TAnalytic.app` и ярлык `Applications` (перетащить для установки), фон со стрелкой (`make_dmg_bg.py`, нужен Pillow) и раскладка
 иконок через Finder. Если Finder недоступен (нет графического сеанса, нет прав на автоматизацию) или не ответил за минуту,
 скрипт предупреждает и собирает образ без раскладки; `DMG_NO_LAYOUT=1` отключает её явно. Сборки раздельные, по архитектуре раннера:
-`macos-latest` — arm64, `macos-15-intel` — x86_64 (universal2 не нужен: зависимости собираются под архитектуру раннера).
+`macos-latest` — arm64. Mac на Intel не собирается с v0.31: пользователей нет.
 Раннеры GitHub с Finder работают, но если раскладка начнёт давать сбой, это не ломает релиз.
 Ручная сборка: `pyinstaller ... packaging/tinvest.spec`, затем `packaging/make_dmg.sh build_out/dist/TAnalytic.app TAnalytic-mac-arm64.dmg`.
 Прежние zip с `.app` не публикуются: на них ничего не ссылалось (адрес берётся из `shell_status` в `src/py/13z_shell.py`).
@@ -71,7 +71,7 @@
 Скачанное самой программой не получает метку «из интернета», поэтому SmartScreen при этом не срабатывает.
 Разрешены только адреса GitHub (`check_url`). Оболочки старше ревизии 4 этого не умеют: им в баннере показывается ссылка на установщик.
 
-**macOS.** Так же скачивается `TAnalytic-mac-<arm64|x64>.dmg` (архитектура — по `platform.machine()`) и сверяется с `SHA256SUMS`. По
+**macOS.** Так же скачивается `TAnalytic-mac-arm64.dmg` (на Mac с Intel оболочка не обновляется, только `.py`) и сверяется с `SHA256SUMS`. По
 «Обновить и перезапустить» (`install_mac_and_exit` в `tinvest.py`): образ монтируется `hdiutil attach -nobrowse -readonly`, приложение
 копируется `ditto` во временную папку рядом с текущим `.app` (путь — по `sys.executable`), с копии снимается `com.apple.quarantine`,
 `codesign --verify` проверяет целостность, затем два переименования (прежнее в `.old`, новое на место). Любая ошибка — прежнее

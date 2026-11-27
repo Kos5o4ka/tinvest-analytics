@@ -514,7 +514,7 @@ class MacShellUpdate(unittest.TestCase):
 
     def test_asset_by_platform_and_arch(self):
         self.assertEqual(L.shell_asset("darwin", "arm64"), "TAnalytic-mac-arm64.dmg")
-        self.assertEqual(L.shell_asset("darwin", "x86_64"), "TAnalytic-mac-x64.dmg")
+        self.assertIsNone(L.shell_asset("darwin", "x86_64"))              # Mac на Intel: сборки нет
         self.assertEqual(L.shell_asset("win32", "AMD64"), L.SETUP_ASSET)
         self.assertIsNone(L.shell_asset("linux", "x86_64"))
         yml = open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8").read()
@@ -542,7 +542,7 @@ class MacShellUpdate(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(d, name)))
         with tempfile.TemporaryDirectory() as d:                   # для образа x64 в релизе нет ни файла, ни суммы
             with self.assertRaises(ValueError):
-                L.prepare_installer(d, fetch=fake(self.DMG), asset=L.MAC_ASSETS["x86_64"])
+                L.prepare_installer(d, fetch=fake(self.DMG), asset="TAnalytic-mac-x64.dmg")
 
     def test_app_path_from_executable(self):
         self.assertEqual(L.mac_app_path("/Applications/TAnalytic.app/Contents/MacOS/TAnalytic"), "/Applications/TAnalytic.app")
