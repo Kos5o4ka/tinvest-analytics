@@ -19,7 +19,9 @@
     close: () => invoke("tauri_win_close"),
     pickFile: () => invoke("tauri_pick_file"),
     autostartGet: () => invoke("tauri_autostart_get"),
-    autostartSet: (enabled) => invoke("tauri_autostart_set", { enabled: !!enabled })
+    autostartSet: (enabled) => invoke("tauri_autostart_set", { enabled: !!enabled }),
+    updateCheck: () => invoke("tauri_update_check"),
+    updateInstall: () => invoke("tauri_update_install")
   };
   window.TAURI_BRIDGE = bridge;
 

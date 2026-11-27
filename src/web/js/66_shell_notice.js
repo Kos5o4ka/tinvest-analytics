@@ -31,8 +31,27 @@ function shellLinkBar(s){
     <span class="sb-b">${href?`<a class="btn" href="${esc(href)}" target="_blank" rel="noopener noreferrer">Скачать</a>`:''}${su?`<a class="btn ghost" href="${esc(su)}" target="_blank" rel="noopener noreferrer">Что нового</a>`:''}<button class="btn ghost" id="shell-later">Позже</button></span>`);
   if(bar)shellLater(bar);
 }
+/* Оболочка Tauri: проверка и установка обновления через tauri-plugin-updater, только после согласия пользователя */
+async function tauriUpdateNotice(){
+  const br=window.TAURI_BRIDGE;if(!br||!br.updateCheck)return;
+  try{if(sessionStorage.getItem('shell_later'))return}catch(e){}
+  if(document.getElementById('shell-bar'))return;
+  let u;try{u=await br.updateCheck()}catch(e){return}      /* нет сети или релиза с latest.json — молча пропускаем */
+  if(!u||!u.version||document.getElementById('shell-bar'))return;
+  const bar=shellBar(`<span><b>Доступна новая версия ${esc(String(u.version))}.</b> Обновление скачается, программа закроется, обновится и откроется снова; данные и настройки сохранятся.</span>
+    <span class="sb-b"><button class="btn" id="shell-go">Обновить и перезапустить</button><button class="btn ghost" id="shell-later">Позже</button></span>`);
+  if(!bar)return;
+  shellLater(bar);
+  bar.querySelector('#shell-go').onclick=async e=>{
+    const b=e.currentTarget;b.disabled=true;b.textContent='Скачиваю обновление…';
+    try{await br.updateInstall()}
+    catch(err){b.disabled=false;b.textContent='Повторить';
+      const sp=bar.querySelector('span');if(sp)sp.insertAdjacentHTML('beforeend',` <span class="neg">Не удалось обновить: ${esc(String(err&&err.message||err))}</span>`)}
+  };
+}
 async function shellNotice(){
   let s;try{s=await api('/api/shell')}catch(e){return}
+  if(s&&s.tauri)return tauriUpdateNotice();
   if(!s||!s.outdated)return;
   try{if(sessionStorage.getItem('shell_later'))return}catch(e){}
   if(document.getElementById('shell-bar'))return;

@@ -11,6 +11,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_updater::UpdaterExt;
 
 const MAX_PICK_BYTES: u64 = 50_000_000;
 const PING_TIMEOUT: Duration = Duration::from_secs(60);
@@ -47,6 +48,12 @@ struct BackendState {
     child: Mutex<Option<Child>>,
     shutdown_done: AtomicBool,
     attempt: AtomicU64,
+}
+
+#[derive(Serialize)]
+struct UpdateInfo {
+    version: String,
+    notes: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -485,6 +492,42 @@ fn tauri_autostart_set(app: AppHandle, enabled: bool) -> Result<bool, String> {
     mgr.is_enabled().map_err(|e| e.to_string())
 }
 
+/// Проверка обновления оболочки (tauri-plugin-updater, подпись проверяется открытым ключом из tauri.conf.json).
+#[tauri::command]
+async fn tauri_update_check(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let found = updater.check().await.map_err(|e| e.to_string())?;
+    Ok(found.map(|u| UpdateInfo {
+        version: u.version.clone(),
+        notes: u.body.clone(),
+    }))
+}
+
+/// Скачивает и ставит обновление, затем перезапускает программу. Вызывается только после согласия пользователя.
+#[tauri::command]
+async fn tauri_update_install(app: AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Err("Обновлений нет".to_string());
+    };
+    let bytes = update
+        .download(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    // сервер закрываем до замены файлов (на Windows установщик завершает программу сам)
+    if let Some(st) = app.try_state::<BackendState>() {
+        shutdown_backend(&st);
+    }
+    if let Err(e) = update.install(bytes) {
+        if let Some(st) = app.try_state::<BackendState>() {
+            st.shutdown_done.store(false, Ordering::SeqCst);
+        }
+        start_backend(&app);
+        return Err(e.to_string());
+    }
+    app.restart()
+}
+
 fn build_splash_html(message: &str, is_error: bool, retry: bool) -> String {
     let color = if is_error { "#f0626a" } else { "#94a3b8" };
     let button = if retry {
@@ -590,6 +633,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(BackendState {
             port,
             child: Mutex::new(None),
@@ -603,6 +647,8 @@ pub fn run() {
             tauri_pick_file,
             tauri_autostart_get,
             tauri_autostart_set,
+            tauri_update_check,
+            tauri_update_install,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;
