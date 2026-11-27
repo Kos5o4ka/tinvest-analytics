@@ -8517,6 +8517,7 @@ def _ds_request(srv, key, url, data, headers, timeout):
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     for k, v in (headers or {}).items():
         if k.lower() in ("referer", "cookie", "accept", "accept-language"):
             hd["X-Up-" + k.title()] = v
@@ -8565,6 +8566,7 @@ def ds_parsed(name, params=None, timeout=20):
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     try:
         req = urllib.request.Request(srv + "/v1/parsed/" + name + q, headers=hd)
         with urllib.request.urlopen(req, timeout=timeout + 5, context=_ssl()) as r:
@@ -8653,6 +8655,7 @@ def ds_test(cfg, body):
     hd = {"User-Agent": EXT_UA["User-Agent"]}
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     try:
         with urllib.request.urlopen(urllib.request.Request(url + "/v1/health", headers=hd), timeout=10, context=_ssl()) as r:
             j = json.loads(r.read().decode("utf-8", "replace"))
@@ -8715,7 +8718,9 @@ def _auth_eval(srv, key):
                     trial_blocked=bool(j.get("trial_blocked")), message=str(j.get("message") or "") if j.get("trial_blocked") else "")
     if code == 401 or code == 403:
         err = str(j.get("error") or "")
-        return dict(base, state="need_login", error=err if err in ("expired", "banned") else "invalid")
+        if err in ("devices", "device_blocked"):
+            base["max_devices"] = j.get("max_devices") or 5
+        return dict(base, state="need_login", error=err if err in ("expired", "banned", "devices", "device_blocked") else "invalid")
     if code == 404:                                    # старый сервер без /v1/auth/check: доступ не ограничен
         return base
     return dict(base, state="offline", error="сервер ответил %d" % code)
@@ -8758,7 +8763,9 @@ def auth_login(cfg, body):
         raise ApiError("Сервер данных отключён в настройках: вход не нужен.", 400)
     res = _auth_eval(srv, key)
     if res["state"] == "need_login":
-        msgs = {"expired": "Ключ истёк — получите новый в боте", "banned": "Доступ ограничен"}
+        msgs = {"expired": "Ключ истёк — получите новый в боте", "banned": "Доступ ограничен",
+                "devices": "Ключ уже работает на %s компьютерах. Отвяжите лишний в боте: /devices" % res.get("max_devices", 5),
+                "device_blocked": "Этот компьютер отвязан от ключа в боте. Выпустите новый ключ: /key"}
         err = res["error"]
         return 401, {"error": msgs.get(err, "Неверный ключ"), "code": err, "bot": res["bot"]}
     if res["state"] == "offline":
@@ -10662,6 +10669,7 @@ def _market_snap_fetch(kind="all", timeout=20):
     hd = {"User-Agent": EXT_UA["User-Agent"], "Accept-Encoding": "gzip"}   # токен Т-Инвестиций сюда не попадает никогда
     if key:
         hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     old = _mkt_snap_etag.get(kind)
     if old:
         hd["If-None-Match"] = old[0]
@@ -10737,7 +10745,8 @@ def market_snapshot_stocks(max_age=MARKET_SNAP_TTL, force=False):
 def market_snapshot_heatmap(max_age=MARKET_SNAP_TTL, force=False):
     d = market_snapshot_get("heatmap", max_age=max_age, force=force)
     return d.get("data") if isinstance(d, dict) else None
-# ═══════════════ HWID: хэш идентификатора ПК для привязки пробного периода ═══════════════
+# ═══════════════ HWID: хэш идентификатора ПК (пробный период, не больше 5 компьютеров на ключ) ═══════════════
+# Отправляется с каждым запросом к серверу данных вместе с ключом из бота (заголовок X-Hwid).
 # Наружу уходит только sha256(машинный id + соль приложения); сырой id нигде не хранится и не отправляется.
 # Токен Т-Инвестиций в этом обмене не участвует. Если машинный id получить не удалось, берётся случайный id,
 # сохранённый в папке данных (файл hwid.id).
@@ -17798,7 +17807,7 @@ def tg_post_notify(srv, key, text, timeout=15):
     """POST {srv}/v1/notify -> (код, dict). Бросает исключение при сетевой ошибке."""
     req = urllib.request.Request(srv.rstrip("/") + "/v1/notify", data=json.dumps({"text": text}).encode("utf-8"),
                                  headers={"Content-Type": "application/json", "X-Client-Key": key,
-                                          "User-Agent": EXT_UA["User-Agent"]}, method="POST")
+                                          "User-Agent": EXT_UA["User-Agent"], **hwid_headers()}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
             code, raw = r.status, r.read()
@@ -18362,7 +18371,7 @@ def tg_srv_req(path, body=None, timeout=20):
         raise ApiError("Нужен сервер данных и вход по ключу из бота.", 400)
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(srv.rstrip("/") + "/v1/alerts/" + path, data=data, method="GET" if body is None else "POST",
-                                 headers={"Content-Type": "application/json", "X-Client-Key": key, "User-Agent": EXT_UA["User-Agent"]})
+                                 headers={"Content-Type": "application/json", "X-Client-Key": key, "User-Agent": EXT_UA["User-Agent"], **hwid_headers()})
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
             code, raw = r.status, r.read()
@@ -20332,7 +20341,7 @@ def sync_req(method, path, body=None, timeout=90):
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(srv.rstrip("/") + "/v1/sync/" + path, data=data, method=method,
                                  headers={"Content-Type": "application/json", "X-Client-Key": key,
-                                          "User-Agent": EXT_UA["User-Agent"]})
+                                          "User-Agent": EXT_UA["User-Agent"], **hwid_headers()})
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
             code, raw = r.status, r.read()
@@ -22040,7 +22049,7 @@ def crowd_url_ok(url):
 def crowd_srv_call(method, path, payload=None, timeout=25):
     """Запрос к серверу данных (только он): -> (код, dict). Исключение при сетевой ошибке. Не использует ext_open."""
     srv, key = ds_conf()
-    hd = {"User-Agent": EXT_UA["User-Agent"], "X-Client-Key": key}
+    hd = {"User-Agent": EXT_UA["User-Agent"], "X-Client-Key": key, **hwid_headers()}
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
@@ -30698,6 +30707,8 @@ def migrate_old_shell(env=None, frozen=None, plat=None):
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     if is_tauri_shell(env) or plat not in ("win32", "darwin"):
         return False
+    if plat == "darwin" and not migrate_asset(plat):            # Mac на Intel: переезжать некуда, остаётся старая оболочка
+        return False
     rev = shell_rev(env)
     return bool((frozen or rev > 0) and rev < SHELL_REV_LATEST)
 
@@ -30708,7 +30719,7 @@ def migrate_asset(plat=None, machine=None):
         return MIGRATE_WIN_ASSET
     if plat == "darwin":
         m = (platform.machine() if machine is None else machine).lower()
-        return "TAnalytic-mac-arm64.dmg" if m in ("arm64", "aarch64") else "TAnalytic-mac-x64.dmg"
+        return "TAnalytic-mac-arm64.dmg" if m in ("arm64", "aarch64") else None   # Mac на Intel: сборки нет с v0.31
     raise MigrateError("Переезд поддерживается только на Windows и macOS.")
 
 
@@ -31032,6 +31043,8 @@ def migrate_run(exit_fn=None, plat=None, tmp=None, sleep=time.sleep):
     work = None
     try:
         asset = migrate_asset(plat)
+        if not asset:
+            raise MigrateError("Для Mac на Intel новой версии приложения нет.")
         work = tempfile.mkdtemp(prefix="tanalytic_migrate_", dir=tmp)
         _mig_set(state="downloading", done=0, total=0, error="")
         info = migrate_download(work, asset, progress=lambda d, t: _mig_set(done=d, total=t))
@@ -31123,12 +31136,12 @@ def shell_status(env=None, frozen=None, cfg=None):
     env = os.environ if env is None else env
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     rev = shell_rev(env)
-    asset = {"darwin": "TAnalytic-mac-arm64.dmg" if platform.machine() == "arm64" else "TAnalytic-mac-x64.dmg",
+    asset = {"darwin": "TAnalytic-mac-arm64.dmg" if platform.machine() == "arm64" else None,   # Intel: сборки нет с v0.31
              "win32": "TAnalytic-Setup-win.exe"}.get(sys.platform)
     tray = tray_supported(env, frozen)
     tauri = is_tauri_shell(env)
     return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "tauri": tauri,
-            "outdated": bool(frozen and not tauri and rev < SHELL_REV_LATEST),
+            "outdated": bool(frozen and not tauri and rev < SHELL_REV_LATEST and asset),
             "url": SHELL_RELEASES, "asset": asset, "migrate": migrate_old_shell(env, frozen),
             "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close"))}
 
@@ -33964,8 +33977,9 @@ body.side-mini .conn-st{margin-right:0}
 .dash-top-seg button{padding:3px 9px;font-size:11.5px}
 
 /* Скелетон загрузки графика */
-.chart-sk{display:flex;flex-direction:column;justify-content:flex-end;gap:12px;padding:18px 16px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line)}
-.chart-sk-bars{display:flex;align-items:flex-end;gap:10px;height:110px;flex:1}
+/* полосы фиксированной высоты по центру: при растянутой высоте проценты у <i> в WebKit схлопывались, и верх был пустым */
+.chart-sk{display:flex;flex-direction:column;justify-content:center;gap:12px;padding:18px 16px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line)}
+.chart-sk-bars{display:flex;align-items:flex-end;gap:10px;height:150px;flex:0 0 150px}
 .chart-sk-bars i{flex:1;display:block;border-radius:6px 6px 2px 2px;background:linear-gradient(180deg,var(--sk-2),var(--sk-1));animation:skShim 1.4s linear infinite;background-size:200% 100%}
 .chart-sk-tx{font-size:12px;color:var(--mu);text-align:center}
 @media(prefers-reduced-motion:reduce){.chart-sk-bars i{animation:none}}
@@ -37106,7 +37120,7 @@ async function manualOpen(row){
   const ov=document.createElement('div');ov.id='man-ov';ov.className='shr-bg';
   ov.innerHTML=`<div class="card" role="dialog" aria-modal="true" aria-label="Ручная запись" style="width:min(660px,100%);max-height:92vh;overflow:auto">
     <h2>${ed?'Изменить запись':'Добавить сделку или актив'}<span class="sp"><button class="btn ghost" id="man-x" aria-label="Закрыть">Закрыть</button></span></h2>
-    <p class="note">Запись становится обычной операцией счёта: доходность, налоги и графики считаются как по отчёту. Внебиржевые активы (вклады, наличные, недвижимость) учитываются в общем капитале.</p>
+    <p class="note">Запись становится обычной операцией счёта: доходность, налоги и графики считаются как по отчёту. Внебиржевые активы (вклады, наличные, недвижимость) учитываются в общем капитале.</p>${typeof DEMO!=='undefined'&&DEMO.on&&!ed?'<p class="note" style="color:var(--warn,#b7791f)">Сейчас включён демо-режим: первая ваша запись уберёт модельный портфель, останутся только ваши данные.</p>':''}
     <div class="seg" id="man-mode" style="margin:10px 0">
       <button data-m="op" class="${ed&&(ed.position||isExt)?'':'on'}">Операция</button>
       <button data-m="position" class="${ed&&ed.position&&!isExt?'on':''}">Позиция без истории</button>
@@ -37160,8 +37174,10 @@ async function manualOpen(row){
   ['man-qty','man-price','man-nkd'].forEach(id=>g(id).oninput=calc);
   let to;
   g('man-q').oninput=()=>{clearTimeout(to);MAN.pick=null;to=setTimeout(async()=>{
+    if(!g('man-q'))return;                                  /* окно закрыли, пока шла пауза */
     const q=g('man-q').value.trim();if(q.length<2){g('man-found').innerHTML='';return}
     try{const r=await api('/api/ops/manual/search?q='+encodeURIComponent(q));
+      if(!g('man-found'))return;                            /* окно закрыли, пока шёл поиск */
       g('man-found').innerHTML=r.rows.length?r.rows.map((x,i)=>`<div class="it" data-i="${i}" style="cursor:pointer"><div><b>${esc(x.name)}</b><small>${esc(x.ticker)}${x.ident&&x.ident!==x.ticker?' · '+esc(x.ident):''} · ${x.kind==='bond'?'облигация':x.kind==='fund'?'фонд':'акция'}${x.price?' · '+(x.price_pct?x.price+' %':f2(x.price)+' ₽'):''}</small></div></div>`).join(''):'<div class="note">Ничего не найдено: можно ввести тикер или ISIN вручную.</div>';
       g('man-found').onclick=e=>{const it=e.target.closest('[data-i]');if(!it)return;const x=r.rows[+it.dataset.i];
         MAN.pick={ident:x.ident,ticker:x.ticker,name:x.name,pct:!!x.price_pct,nominal:+x.nominal||1000};
@@ -37169,7 +37185,7 @@ async function manualOpen(row){
         if(x.price&&!g('man-price').value)g('man-price').value=x.price;
         if(x.price_pct&&x.nkd&&!g('man-nkd').value)g('man-nkd').value=x.nkd;
         showHide();calc()}}
-    catch(e){g('man-found').innerHTML=''}},250)};
+    catch(e){const f=g('man-found');if(f)f.innerHTML=''}},250)};
   g('man-x').onclick=g('man-cancel').onclick=manClose;
   ov.addEventListener('mousedown',e=>{if(e.target===ov)manClose()});
   g('man-save').onclick=async e=>{
@@ -37193,6 +37209,7 @@ async function manualOpen(row){
     }
     b.disabled=true;
     try{await post('/api/ops/manual',body);manClose();S.data=S.bonds=S.hist=null;toast('Запись сохранена.','ok');
+      if(typeof DEMO!=='undefined'&&DEMO.on){DEMO.at=0;demoSync()}      /* сервер убрал демо: плашка уходит сразу */
       if(S.page==='ops'||S.page==='imp'){S.page==='imp'?renderImport():manualDrawList()}load(true)}
     catch(x){er.textContent=x.message;er.style.display=''}finally{b.disabled=false}
   };
@@ -41558,7 +41575,9 @@ function authTime(ts){
   return d.toDateString()===new Date().toDateString()?t:d.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'})+' '+t;
 }
 function authMsg(code){
-  return code==='expired'?'Ключ истёк — получите новый в боте':code==='banned'?'Доступ ограничен':code==='invalid'?'Неверный ключ':'';
+  return code==='expired'?'Ключ истёк — получите новый в боте':code==='banned'?'Доступ ограничен':code==='invalid'?'Неверный ключ':
+    code==='devices'?'Ключ уже работает на 5 компьютерах. Отвяжите лишний в боте командой /devices':
+    code==='device_blocked'?'Этот компьютер отвязан от ключа. Выпустите новый ключ в боте: /key':'';
 }
 function authWho(){
   const el=$('#who');if(!el)return;
@@ -45745,13 +45764,18 @@ function taCsvFileName(card){
   const s=String(t||'').trim().replace(/[\\/:*?"<>|]+/g,' ').replace(/\s+/g,'_').slice(0,50);
   return(s||'tanalytic')+'_'+localIso();
 }
-/* кнопка «Скачать CSV» над каждой таблицей данных (от 3 строк), если в карточке её ещё нет */
+/* своя кнопка экрана (taCsvBtn) относится к первой таблице после неё; остальные таблицы той же карточки получают автокнопку */
+function taCsvCovered(t,card){
+  const list=Array.from(card.querySelectorAll('table,.tbl-csv')),i=list.indexOf(t),prev=i>0?list[i-1]:null;
+  return!!(prev&&prev.classList&&prev.classList.contains('tbl-csv')&&!(prev.closest&&prev.closest('.tbl-auto')));
+}
+/* кнопка «Скачать CSV» над каждой таблицей данных (от 3 строк), если у неё ещё нет своей */
 function taCsvAttach(root){
   root.querySelectorAll('table').forEach(t=>{
     if(t.closest('[data-nocsv],.noprint,.tbl-auto'))return;
     if(!t.querySelector('thead th')||t.querySelectorAll('tbody tr').length<3)return;
     const box=t.closest('.tbl')||t,card=t.closest('.card')||box.parentElement;
-    if(!card||card.querySelector('.tbl-csv'))return;
+    if(!card||taCsvCovered(t,card))return;
     if(box.previousElementSibling&&box.previousElementSibling.classList.contains('tbl-auto'))return;
     const hd=document.createElement('div');hd.className='tbl-head tbl-auto noprint';
     hd.innerHTML=taCsvBtn('tbl-auto-'+(++_csvN),'Скачать таблицу в CSV (разделитель «;», кодировка UTF-8)');

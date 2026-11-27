@@ -16,7 +16,7 @@ async function manualOpen(row){
   const ov=document.createElement('div');ov.id='man-ov';ov.className='shr-bg';
   ov.innerHTML=`<div class="card" role="dialog" aria-modal="true" aria-label="Ручная запись" style="width:min(660px,100%);max-height:92vh;overflow:auto">
     <h2>${ed?'Изменить запись':'Добавить сделку или актив'}<span class="sp"><button class="btn ghost" id="man-x" aria-label="Закрыть">Закрыть</button></span></h2>
-    <p class="note">Запись становится обычной операцией счёта: доходность, налоги и графики считаются как по отчёту. Внебиржевые активы (вклады, наличные, недвижимость) учитываются в общем капитале.</p>
+    <p class="note">Запись становится обычной операцией счёта: доходность, налоги и графики считаются как по отчёту. Внебиржевые активы (вклады, наличные, недвижимость) учитываются в общем капитале.</p>${typeof DEMO!=='undefined'&&DEMO.on&&!ed?'<p class="note" style="color:var(--warn,#b7791f)">Сейчас включён демо-режим: первая ваша запись уберёт модельный портфель, останутся только ваши данные.</p>':''}
     <div class="seg" id="man-mode" style="margin:10px 0">
       <button data-m="op" class="${ed&&(ed.position||isExt)?'':'on'}">Операция</button>
       <button data-m="position" class="${ed&&ed.position&&!isExt?'on':''}">Позиция без истории</button>
@@ -70,8 +70,10 @@ async function manualOpen(row){
   ['man-qty','man-price','man-nkd'].forEach(id=>g(id).oninput=calc);
   let to;
   g('man-q').oninput=()=>{clearTimeout(to);MAN.pick=null;to=setTimeout(async()=>{
+    if(!g('man-q'))return;                                  /* окно закрыли, пока шла пауза */
     const q=g('man-q').value.trim();if(q.length<2){g('man-found').innerHTML='';return}
     try{const r=await api('/api/ops/manual/search?q='+encodeURIComponent(q));
+      if(!g('man-found'))return;                            /* окно закрыли, пока шёл поиск */
       g('man-found').innerHTML=r.rows.length?r.rows.map((x,i)=>`<div class="it" data-i="${i}" style="cursor:pointer"><div><b>${esc(x.name)}</b><small>${esc(x.ticker)}${x.ident&&x.ident!==x.ticker?' · '+esc(x.ident):''} · ${x.kind==='bond'?'облигация':x.kind==='fund'?'фонд':'акция'}${x.price?' · '+(x.price_pct?x.price+' %':f2(x.price)+' ₽'):''}</small></div></div>`).join(''):'<div class="note">Ничего не найдено: можно ввести тикер или ISIN вручную.</div>';
       g('man-found').onclick=e=>{const it=e.target.closest('[data-i]');if(!it)return;const x=r.rows[+it.dataset.i];
         MAN.pick={ident:x.ident,ticker:x.ticker,name:x.name,pct:!!x.price_pct,nominal:+x.nominal||1000};
@@ -79,7 +81,7 @@ async function manualOpen(row){
         if(x.price&&!g('man-price').value)g('man-price').value=x.price;
         if(x.price_pct&&x.nkd&&!g('man-nkd').value)g('man-nkd').value=x.nkd;
         showHide();calc()}}
-    catch(e){g('man-found').innerHTML=''}},250)};
+    catch(e){const f=g('man-found');if(f)f.innerHTML=''}},250)};
   g('man-x').onclick=g('man-cancel').onclick=manClose;
   ov.addEventListener('mousedown',e=>{if(e.target===ov)manClose()});
   g('man-save').onclick=async e=>{
@@ -103,6 +105,7 @@ async function manualOpen(row){
     }
     b.disabled=true;
     try{await post('/api/ops/manual',body);manClose();S.data=S.bonds=S.hist=null;toast('Запись сохранена.','ok');
+      if(typeof DEMO!=='undefined'&&DEMO.on){DEMO.at=0;demoSync()}      /* сервер убрал демо: плашка уходит сразу */
       if(S.page==='ops'||S.page==='imp'){S.page==='imp'?renderImport():manualDrawList()}load(true)}
     catch(x){er.textContent=x.message;er.style.display=''}finally{b.disabled=false}
   };

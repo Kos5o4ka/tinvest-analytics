@@ -25,13 +25,18 @@ function taCsvFileName(card){
   const s=String(t||'').trim().replace(/[\\/:*?"<>|]+/g,' ').replace(/\s+/g,'_').slice(0,50);
   return(s||'tanalytic')+'_'+localIso();
 }
-/* кнопка «Скачать CSV» над каждой таблицей данных (от 3 строк), если в карточке её ещё нет */
+/* своя кнопка экрана (taCsvBtn) относится к первой таблице после неё; остальные таблицы той же карточки получают автокнопку */
+function taCsvCovered(t,card){
+  const list=Array.from(card.querySelectorAll('table,.tbl-csv')),i=list.indexOf(t),prev=i>0?list[i-1]:null;
+  return!!(prev&&prev.classList&&prev.classList.contains('tbl-csv')&&!(prev.closest&&prev.closest('.tbl-auto')));
+}
+/* кнопка «Скачать CSV» над каждой таблицей данных (от 3 строк), если у неё ещё нет своей */
 function taCsvAttach(root){
   root.querySelectorAll('table').forEach(t=>{
     if(t.closest('[data-nocsv],.noprint,.tbl-auto'))return;
     if(!t.querySelector('thead th')||t.querySelectorAll('tbody tr').length<3)return;
     const box=t.closest('.tbl')||t,card=t.closest('.card')||box.parentElement;
-    if(!card||card.querySelector('.tbl-csv'))return;
+    if(!card||taCsvCovered(t,card))return;
     if(box.previousElementSibling&&box.previousElementSibling.classList.contains('tbl-auto'))return;
     const hd=document.createElement('div');hd.className='tbl-head tbl-auto noprint';
     hd.innerHTML=taCsvBtn('tbl-auto-'+(++_csvN),'Скачать таблицу в CSV (разделитель «;», кодировка UTF-8)');

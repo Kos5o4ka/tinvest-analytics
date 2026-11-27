@@ -145,8 +145,9 @@ body.side-mini .conn-st{margin-right:0}
 .dash-top-seg button{padding:3px 9px;font-size:11.5px}
 
 /* Скелетон загрузки графика */
-.chart-sk{display:flex;flex-direction:column;justify-content:flex-end;gap:12px;padding:18px 16px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line)}
-.chart-sk-bars{display:flex;align-items:flex-end;gap:10px;height:110px;flex:1}
+/* полосы фиксированной высоты по центру: при растянутой высоте проценты у <i> в WebKit схлопывались, и верх был пустым */
+.chart-sk{display:flex;flex-direction:column;justify-content:center;gap:12px;padding:18px 16px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line)}
+.chart-sk-bars{display:flex;align-items:flex-end;gap:10px;height:150px;flex:0 0 150px}
 .chart-sk-bars i{flex:1;display:block;border-radius:6px 6px 2px 2px;background:linear-gradient(180deg,var(--sk-2),var(--sk-1));animation:skShim 1.4s linear infinite;background-size:200% 100%}
 .chart-sk-tx{font-size:12px;color:var(--mu);text-align:center}
 @media(prefers-reduced-motion:reduce){.chart-sk-bars i{animation:none}}

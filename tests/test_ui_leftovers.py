@@ -56,6 +56,21 @@ class CsvHelper(unittest.TestCase):
             self.assertIn("taCsvBtn", rd("src", "web", "js", f))
 
 
+    def test_second_table_in_card_gets_own_button(self):
+        """«ИИС-3»: своя кнопка у первой таблицы не отнимает автокнопку у второй и третьей."""
+        o = jsrun(["70_ui_leftovers.js"], r"""
+function el(cls,auto){return{classList:{contains:c=>c===cls},closest:s=>auto&&s==='.tbl-auto'?{}:null}}
+const btn=el('tbl-csv'),t1=el('table'),t2=el('table'),t3=el('table'),abtn=el('tbl-csv',true);
+const card={querySelectorAll:()=>[btn,t1,t2,abtn,t3]};
+out.r=[taCsvCovered(t1,card),taCsvCovered(t2,card),taCsvCovered(t3,card)];
+""")
+        self.assertEqual(o["r"], [True, False, False])
+
+    def test_manual_search_survives_closed_modal(self):
+        src = rd("src", "web", "js", "20a_manual.js")
+        self.assertIn("if(!g('man-found'))return;", src)
+
+
 class Overtake(unittest.TestCase):
     def test_overtake_month(self):
         o = jsrun(["33_calc.js"], """
