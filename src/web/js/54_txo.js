@@ -3,6 +3,28 @@ S.txo={h:null,hAcc:null,hBusy:0,hErr:null,fee:'',skip:(()=>{try{return localStor
 try{S.txo.F=JSON.parse(localStorage.getItem('txo_iis3')||'null')}catch(e){}
 const txoR=n=>bad(n)?'—':M(n,'rub',0),txoS=n=>bad(n)?'—':(n>0?'+':'')+M(n,'rub',0);
 const TXO_NOTE='<p class="note">Расчёт по модели и справочный: проверьте его с брокерским отчётом; налог удерживает брокер, итог за год определяется декларацией. Допущения указаны в блоках.</p>';
+function txoTile(lbl,val,sub,dot,cls){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num ${cls||''}">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
+}
+function txoLdvLabel(c){
+  if(c.ldv_cost>0||(c.ldv&&c.ldv.some(l=>l.status==='reached')))return{cls:'txo-bdg-loss',text:'Потеря ЛДВ'};
+  if(c.ldv_status==='critical'||c.ldv_status==='warn'||(c.ldv&&c.ldv.some(l=>l.days!=null&&l.days<183)))return{cls:'txo-bdg-soon',text:'До ЛДВ < 6 мес'};
+  return{cls:'txo-bdg-ok',text:'Без риска ЛДВ'};
+}
+function txoChecklistHtml(h){
+  const d=h.deadline,t=h.totals,yr=h.year;
+  const saved=lsJson('ta_txo_steps_'+yr,{});
+  const steps=[
+    ['s1',`Проверить налоговую базу и отобранные бумаги (позиций: ${t.n}, экономия ≈ ${txoR(t.saving)})`],
+    ['s2','Убедиться, что лоты со статусом «Без риска ЛДВ» или выгода перекрывает потерю льготы'],
+    ['s3',`Продать убыточные лоты не позднее ${ddm(d.last_trading_day)} (расчёты T+1 до ${ddm(d.sale_day)})`],
+    ['s4','При желании выкупить бумаги обратно после фиксации убытка'],
+    ['s5','Проверить итоговый расчёт НДФЛ в брокерском отчёте за год']
+  ];
+  return`<section class="st-card txo-steps"><header class="st-gh"><h3>Пошаговый план до ${ddm(d.sale_day)}</h3><span>${d.passed?'срок прошёл':'осталось '+d.days+' дн.'}</span></header>
+    ${steps.map(([id,txt])=>`<div class="st-row"><label class="txo-step-lb${saved[id]?' done':''}"><input type="checkbox" data-txostep="${id}" data-txoyear="${yr}" ${saved[id]?'checked':''}><span>${esc(txt)}</span></label></div>`).join('')}
+  </section>`;
+}
 function txoF(){
   return Object.assign({open_year:new Date().getFullYear(),contribution:400000,yield:12,years:10,bracket:'13',income:'',coupon_share:50,reinvest:'1',ldv:'1'},S.txo.F||{});
 }
@@ -33,36 +55,38 @@ function txoLoadP(){
 }
 function txoHarvest(){
   const h=S.txo.h;
-  if(S.txo.hErr&&S.txo.hAcc===S.account)return`<div class="msg err">${esc(S.txo.hErr)} <button class="btn ghost" onclick="S.txo.hErr=null;S.txo.hAcc=null;render()">Повторить</button></div>`;
+  if(S.txo.hErr&&S.txo.hAcc===S.account)return`<div class="st-callout warn">${esc(S.txo.hErr)} <button class="btn ghost" onclick="S.txo.hErr=null;S.txo.hAcc=null;render()">Повторить</button></div>`;
   if(!h||S.txo.hAcc!==S.account){txoLoadH();return waitBox('Считаю лоты и налог текущего года…')}
   const ex=(h.iis_excluded||[]).map(x=>`<p class="note"><b>${esc(x.name)}</b>: ${esc(x.reason)}</p>`).join('');
   if(!h.available)return`<div class="empty">${esc(h.reason||'Нет данных для расчёта')}</div>${ex}`;
   const d=h.deadline,t=h.totals;
-  let out=`<div class="g g4">${kpi('Экономия налога',txoR(t.saving),`налог ${h.year}: ${txoR(h.tax_before)} → ${txoR(t.tax_after)}`,t.saving>0?'pos':'',S3)}
-    ${kpi('Комиссии туда-обратно',txoR(t.fees),'продажа и обратная покупка',null,S4)}
-    ${kpi('Чистая выгода модели',txoR(t.net),`позиций в наборе: ${t.n}`,t.net>0?'pos':'',S1)}
-    ${kpi('Последний день сделки',ddm(d.sale_day),d.passed?'срок для этого года прошёл':`осталось ${d.days} дн. (T+1, торги до ${ddm(d.last_trading_day)})`,d.passed?'neg':'',S2)}</div>
-    <div class="row noprint" style="margin:10px 0"><label class="field"><span>Комиссия, % (пусто — по истории)</span><input class="in" id="txo-fee" type="number" step="0.01" min="0" value="${esc(S.txo.fee)}" style="width:140px"></label>
+  let out=`<div class="st-tiles">${txoTile('Экономия налога',txoR(t.saving),`налог ${h.year}: ${txoR(h.tax_before)} → ${txoR(h.tax_after)}`,t.saving>0?'pos':'mu',t.saving>0?'pos':'')}
+    ${txoTile('Комиссии туда-обратно',txoR(t.fees),'продажа и обратная покупка','mu')}
+    ${txoTile('Чистая выгода модели',txoR(t.net),`позиций в наборе: ${t.n}`,t.net>0?'pos':'mu',t.net>0?'pos':'')}
+    ${txoTile('Последний день сделки',ddm(d.sale_day),d.passed?'срок для этого года прошёл':`осталось ${d.days} дн. (T+1, торги до ${ddm(d.last_trading_day)})`,d.passed?'neg':'warn',d.passed?'neg':'')}</div>
+    <div class="row noprint" style="margin:12px 0"><label class="field"><span>Комиссия, % (пусто — по истории)</span><input class="in" id="txo-fee" type="number" step="0.01" min="0" value="${esc(S.txo.fee)}" style="width:140px"></label>
       <label class="txo-chk"><input type="checkbox" id="txo-skip2" ${S.txo.skip?'checked':''}> Не предлагать лоты со стажем ≥ 2 лет</label>
-      <button class="btn" id="txo-fee-go">Пересчитать</button></div>`;
+      <button class="btn" id="txo-fee-go">Пересчитать</button>${h.candidates.length&&typeof taCsvBtn==='function'?taCsvBtn('txo-csv','Выгрузить таблицу кандидатов в CSV'):''}</div>`;
   const sm=h.ldv_summary;
-  if(sm&&(sm.young+sm.warn+sm.critical+sm.reached>0||sm.ldv_cost>0))out+=`<div class="txo-ldvsum"><b>Стаж лотов в наборе:</b> <span class="txo-young">моложе 2 лет: ${sm.young}</span> · <span class="txo-lw">со стажем 2–3 года: ${sm.warn}</span> · <span class="txo-lc">почти ЛДВ: ${sm.critical}</span>${sm.reached?` · ЛДВ уже наступила: ${sm.reached}`:''}${sm.ldv_cost>0?` · потеря ЛДВ ≈ <b>${txoR(sm.ldv_cost)}</b>, выгода с учётом ЛДВ ${txoS(sm.net_ldv)}`:''}</div>`;
+  if(sm&&(sm.young+sm.warn+sm.critical+sm.reached>0||sm.ldv_cost>0))out+=`<div class="st-callout${sm.ldv_cost>0?' warn':''}"><b>Стаж лотов в наборе:</b> <span class="txo-young">моложе 2 лет: ${sm.young}</span> · <span class="txo-lw">со стажем 2–3 года: ${sm.warn}</span> · <span class="txo-lc">почти ЛДВ: ${sm.critical}</span>${sm.reached?` · ЛДВ уже наступила: ${sm.reached}`:''}${sm.ldv_cost>0?` · потеря ЛДВ ≈ <b>${txoR(sm.ldv_cost)}</b>, выгода с учётом ЛДВ ${txoS(sm.net_ldv)}`:''}</div>`;
   if(h.ldv_note)out+=`<p class="note">${esc(h.ldv_note)}</p>`;
   if((h.ldv_skipped||[]).length)out+=`<div class="txo-ldvsum"><b>Исключены из-за стажа ≥ 2 лет:</b><ul class="txo-ul">${h.ldv_skipped.map(x=>`<li>${esc(x.name)} (${esc(x.ticker)}), убыток ${txoR(x.loss)}: ${esc(x.reason)}</li>`).join('')}</ul></div>`;
   if(!h.candidates.length)out+='<div class="empty">Бумаг с нереализованным убытком, продажа которых снизила бы налог, модель не нашла (или налога за год пока нет).</div>';
-  else out+=`<div class="tbl"><table><thead><tr><th>Бумага</th><th>Продать (старые лоты)</th><th>Убыток</th><th>Прибыль в префиксе</th><th>Ставка</th><th>Экономия</th><th>Комиссии</th><th>Чистая выгода</th><th>Примечания</th></tr></thead><tbody>${h.candidates.map(c=>{
-      const nt=[];
+  else out+=`<div class="tbl"><table><thead><tr><th>Бумага</th><th>Продать (старые лоты)</th><th>Убыток</th><th>Прибыль в префиксе</th><th>Ставка</th><th>Экономия</th><th>Комиссии</th><th>Чистая выгода</th><th>Примечания и ЛДВ</th></tr></thead><tbody>${h.candidates.map(c=>{
+      const bdg=txoLdvLabel(c);
+      const nt=[`<span class="tag ${bdg.cls}">${bdg.text}</span>`];
       if(c.selected)nt.push('<span class="tag">в наборе</span>');
       if(c.carry_forward>1)nt.push(`<small class="mu">убыток сверх базы ${txoR(c.carry_forward)} перенесётся</small>`);
       if(c.blind)nt.push('<small class="txo-warn">лоты из перевода: стоимость могла быть неизвестна</small>');
       if(c.ldv_status==='critical')nt.push(`<span class="tag txo-bdg txo-bc">${esc(c.ldv_badge)}</span>`);
       else if(c.ldv_status==='warn')nt.push(`<span class="tag txo-bdg txo-bw">${esc(c.ldv_badge)}</span>`);
-      else if(c.ldv_status==='young')nt.push('<small class="mu">стаж &lt; 2 лет ✓</small>');
+      else if(c.ldv_status==='young')nt.push('<small class="mu">стаж &lt; 2 лет</small>');
       if(c.ldv_cost>0)nt.push(`<small class="mu">потеря ЛДВ ≈ ${txoR(c.ldv_cost)}; выгода с учётом ЛДВ <b>${txoS(c.net_ldv)}</b></small>`);
       c.ldv.forEach(l=>nt.push(`<span class="tag txo-ldv">ЛДВ ${l.status==='reached'?'наступила':`через ${l.days} дн.`}</span> <small class="mu">${ddm(l.bdate)}: прибыль ${txoR(l.gain)}${l.tax_at_stake?`, налог без ЛДВ ≈ ${txoR(l.tax_at_stake)}`:''}; после обратной покупки срок начнётся заново</small>`));
       return`<tr${stkAttrIf(c.ticker)}><td class="l"><b>${esc(c.name)}</b><br><small class="mu">${esc(c.ticker)}</small></td><td class="num">${f2(c.qty)}${c.partial?` из ${f2(c.qty_total)}`:''}<br><small class="mu">${txoR(c.value)}</small></td>
         <td class="num neg">${txoR(-c.loss)}</td><td class="num">${txoR(c.gain_in_prefix)}</td><td class="num">${c.marginal_rate==null?'—':pctp(c.marginal_rate*100,0)}</td>
         <td class="num pos">${txoR(c.saving)}</td><td class="num">${txoR(c.fees)}</td><td class="num ${c.net>0?'pos':'neg'}"><b>${txoS(c.net)}</b></td><td class="l">${nt.join('<br>')}</td></tr>`}).join('')}</tbody></table></div>`;
+  out+=txoChecklistHtml(h);
   out+=`<ul class="txo-ul"><li>${(h.assumptions||[]).map(esc).join('</li><li>')}</li></ul>${ex}`;
   if((h.warnings||[]).length)out+=`<p class="note">${h.warnings.map(esc).join('<br>')}</p>`;
   out+=`<p class="note noprint">Общая картина по налогам и простые подсказки — на странице <a href="#" onclick="go('tax');return false">«Налоги»</a>.</p>`;
@@ -82,13 +106,13 @@ function txoPlanner(){
     ${sel('ldv','ЛДВ на обычном счёте',[['1','учитывать'],['0','не учитывать']],F.ldv)}</div>
     <p class="note">Если указан доход за год, ставка (15 % выше 2,4 млн ₽) и предел вычета (не больше уплаченного НДФЛ) определяются по нему.</p>
     ${pre?`<p class="note noprint">У вас есть ИИС «${esc(pre.name)}» (открыт ${ddm(pre.opened)}, тип ${esc(pre.type)}). <a href="#" onclick="txoPrefill(${pre.open_year});return false">Подставить год открытия</a>.</p>`:''}`;
-  if(S.txo.pErr)return out+`<div class="msg err">${esc(S.txo.pErr)}</div>`;
+  if(S.txo.pErr)return out+`<div class="st-callout warn">${esc(S.txo.pErr)}</div>`;
   if(!p){txoLoadP();return out+waitBox('Считаю…')}
   const r=p.rules,i=p.iis,b=p.broker;
-  out+=`<div class="g g4">${kpi('Минимальный срок',`${r.term} лет`,`до конца ${r.term_end_year} г.; горизонт ${p.inputs.years} лет`,r.term_ok?'pos':'neg',S1)}
-    ${kpi('Вычет в год (максимум)',txoR(r.max_refund),`${pctp(r.rate*100,0)} от ${txoR(r.limit)}`,null,S2)}
-    ${kpi('ИИС-3: итог после налогов',txoR(i.net),`на ${txoR(p.own)} своих взносов`,i.net>=b.net?'pos':'',S3)}
-    ${kpi('Обычный счёт: итог',txoR(b.net),`разница ИИС-3 ${txoS(p.advantage)}`,p.advantage>=0?'pos':'neg',S4)}</div>
+  out+=`<div class="st-tiles">${txoTile('Минимальный срок',`${r.term} лет`,`до конца ${r.term_end_year} г.; горизонт ${p.inputs.years} лет`,r.term_ok?'pos':'neg',r.term_ok?'pos':'neg')}
+    ${txoTile('Вычет в год (максимум)',txoR(r.max_refund),`${pctp(r.rate*100,0)} от ${txoR(r.limit)}`,'mu')}
+    ${txoTile('ИИС-3: итог после налогов',txoR(i.net),`на ${txoR(p.own)} своих взносов`,i.net>=b.net?'pos':'mu',i.net>=b.net?'pos':'')}
+    ${txoTile('Обычный счёт: итог',txoR(b.net),`разница ИИС-3 ${txoS(p.advantage)}`,p.advantage>=0?'pos':'neg',p.advantage>=0?'pos':'neg')}</div>
     <div class="tbl" style="margin-top:12px"><table><thead><tr><th>Год</th><th>Взнос</th><th>Вычет за год</th><th>ИИС-3, капитал на конец года</th><th>Обычный счёт, капитал</th><th>Налог с купонов (обычный)</th></tr></thead><tbody>${
       p.rows.map(x=>`<tr><td><b>${x.year}</b></td><td class="num">${txoR(x.contribution)}</td><td class="num pos">${txoR(x.refund)}</td><td class="num">${txoR(x.iis_capital)}</td><td class="num">${txoR(x.broker_capital)}</td><td class="num">${txoR(x.broker_coupon_tax)}</td></tr>`).join('')}</tbody></table></div>
     <div id="txo-ch" class="chart txo-chart"></div>
@@ -102,7 +126,7 @@ function txoPlanner(){
       <tr><td class="l">Результат к своим взносам (${txoR(p.own)})</td><td class="num ${i.result_over_own>=0?'pos':'neg'}">${txoS(i.result_over_own)}</td><td class="num ${b.result_over_own>=0?'pos':'neg'}">${txoS(b.result_over_own)}</td></tr></tbody></table></div>`;
   if(p.early.length)out+=`<h3 class="txo-sub">Досрочное закрытие до истечения срока</h3>
     <div class="tbl"><table><thead><tr><th>Закрытие в году</th><th>Капитал</th><th>Вычеты вернуть</th><th>Налог с дохода</th><th>Итого после возврата и налога</th><th>Потеряно относительно срока</th></tr></thead><tbody>${p.early.map(e=>`<tr><td><b>${e.year}</b> <small class="mu">(${e.n}-й год)</small></td><td class="num">${txoR(e.capital)}</td><td class="num neg">${txoR(e.refunds_returned)}</td><td class="num neg">${txoR(e.tax)}</td><td class="num">${txoR(e.net)}</td><td class="num neg">${txoR(e.extra_cost)}</td></tr>`).join('')}</tbody></table></div>`;
-  if((p.warnings||[]).length)out+=`<p class="note txo-warn">${p.warnings.map(esc).join('<br>')}</p>`;
+  if((p.warnings||[]).length)out+=`<div class="st-callout warn">${p.warnings.map(esc).join('<br>')}</div>`;
   out+=`<ul class="txo-ul"><li>Правила (НК РФ ст. 219.1, 219.2): вычет 13 % (15 % при доходе выше 2,4 млн ₽) с взносов до 400 000 ₽ в год — не больше 52 000 / 60 000 ₽ в год и не больше уплаченного НДФЛ; при соблюдении минимального срока освобождается положительный финансовый результат до 30 млн ₽ за всё время. Минимальный срок по году открытия: 2024–2026 — 5 лет, 2027 — 6, 2028 — 7, 2029 — 8, 2030 — 9, с 2031 — 10.</li>
     <li>Допущения модели: взнос в начале года, доходность в конце года, вычет за год поступает в начале следующего (последний — после горизонта); на обычном счёте купоны облагаются налогом ежегодно, прирост цены — при продаже в конце горизонта, ЛДВ — по лотам, купленным более трёх лет назад, в пределах 3 млн ₽ × лет владения.</li>
     <li>Отличие от <a href="#" onclick="go('calc');return false">калькулятора</a>: там ИИС-3 — один из сценариев сравнения стратегий вложений; здесь отдельно учтены срок по году открытия, ставка 13/15 %, предел вычета по НДФЛ, годовая таблица и досрочное закрытие.</li></ul>`;
@@ -122,6 +146,18 @@ function bindTxo(){
   const sk=document.getElementById('txo-skip2');
   if(sk)sk.onchange=()=>{S.txo.skip=sk.checked;try{localStorage.setItem('txo_skip2',sk.checked?'1':'0')}catch(e){}S.txo.h=null;S.txo.hAcc=null;render()};
   if(g)g.onclick=()=>{S.txo.fee=(document.getElementById('txo-fee').value||'').trim();S.txo.h=null;S.txo.hAcc=null;render()};
+  const csv=document.getElementById('txo-csv');
+  if(csv&&S.txo.h&&S.txo.h.candidates){
+    csv.onclick=()=>{
+      if(typeof taCsvDownload==='function')taCsvDownload('tax_harvest.csv',['Бумага','Тикер','Продать, шт.','Стоимость, ₽','Убыток, ₽','Прибыль в префиксе, ₽','Ставка, %','Экономия, ₽','Комиссии, ₽','Чистая выгода, ₽','Статус ЛДВ'],
+        S.txo.h.candidates.map(c=>[c.name||'',c.ticker||'',c.qty??'',c.value??'',c.loss??'',c.gain_in_prefix??'',c.marginal_rate!=null?(c.marginal_rate*100).toFixed(0):'',c.saving??'',c.fees??'',c.net??'',txoLdvLabel(c).text]));
+    };
+  }
+  document.querySelectorAll('[data-txostep]').forEach(cb=>cb.onchange=()=>{
+    const yr=cb.dataset.txoyear,key='ta_txo_steps_'+yr,cur=lsJson(key,{});
+    cur[cb.dataset.txostep]=cb.checked?1:0;lsSet(key,JSON.stringify(cur));
+    const lb=cb.closest('.txo-step-lb');if(lb)lb.classList.toggle('done',cb.checked);
+  });
   document.querySelectorAll('.txo-in').forEach(el=>{el.addEventListener('change',()=>{
     const F=txoF();document.querySelectorAll('.txo-in').forEach(e=>{F[e.id.slice(4)]=e.value});
     S.txo.F=F;txoSave();S.txo.p=null;render()})});

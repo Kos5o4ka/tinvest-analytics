@@ -1,0 +1,152 @@
+/* ── Полировка экранов по ревью: быстрые действия, сравнение, карточки, раскладка ── */
+
+/* Таблицы: заголовок карточки с экспортом CSV и фильтрами */
+.tbl-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:0 6px 10px}
+.tbl-head .seg{margin:0}
+.tbl-csv{display:inline-flex;align-items:center;gap:6px;padding:6px 11px;font-size:12px;margin-left:auto;white-space:nowrap}
+.tbl-csv svg{width:14px;height:14px}
+
+/* 12_bonds.js: 2px полоса прогресса под числом в heatCell */
+.hb-cell{display:inline-flex;flex-direction:column;align-items:flex-end;gap:3px;min-width:48px}
+.hb-bar{display:block;width:100%;height:2px;border-radius:2px;background:var(--line);overflow:hidden}
+.hb-bar b{display:block;height:100%;border-radius:2px;opacity:.85}
+
+/* Быстрые действия при наведении на строку таблицы облигаций */
+.b-name-cell{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+.b-name-cell>.id{min-width:0;flex:1}
+.row-act{display:inline-flex;align-items:center;gap:3px;flex:none;opacity:0;transition:opacity .15s}
+tr:hover .row-act,tr:focus-within .row-act,.row-act.has-on{opacity:1}
+.ra-btn{all:unset;box-sizing:border-box;cursor:pointer;display:grid;place-items:center;width:24px;height:24px;border-radius:7px;font-size:13px;line-height:1;color:var(--mu);border:1px solid transparent;transition:background-color .15s,color .15s,border-color .15s}
+.ra-btn:hover,.ra-btn:focus-visible{background:var(--card2);border-color:var(--line2);color:var(--tx);outline:none}
+.ra-btn.on{color:var(--s4);opacity:1;border-color:color-mix(in srgb,var(--s4) 35%,transparent);background:color-mix(in srgb,var(--s4) 12%,transparent)}
+.ra-btn[data-bcmp].on{color:var(--ac-tx);border-color:color-mix(in srgb,var(--ac) 40%,transparent);background:color-mix(in srgb,var(--ac) 14%,transparent)}
+
+/* Плавающая панель сравнения внизу (Compare Dock) */
+.cmp-dock{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:35;display:flex;align-items:center;gap:12px;padding:8px 14px;border-radius:14px;background:var(--d2);border:1px solid var(--line2);box-shadow:var(--d2-hl),var(--d2-shadow);font-size:13px;max-width:calc(100vw - 40px);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.cmp-dock-n{font-weight:600;color:var(--tx);white-space:nowrap}
+.cmp-dock-list{color:var(--mu);font-size:12px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmp-dock .btn{padding:6px 12px;font-size:12.5px;white-space:nowrap}
+@media print{.cmp-dock{display:none!important}}
+
+/* 14_scr.js: строка быстрых чипов */
+.scr-quick{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:10px}
+.scr-quick-lbl{font-size:12px;color:var(--mu);margin-right:2px}
+
+/* 27a_compare.js: пустой слот, сумма вложения и график потоков */
+.cmp-top{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:14px}
+.cmp-top .cmp-add{margin-bottom:0;flex:1;min-width:260px}
+.cmp-amt-f{display:grid;gap:5px;min-width:190px;max-width:230px}
+.cmp-amt-f>span{font-size:12px;color:var(--tx2);font-weight:500}
+.cmp-amt-f .in{padding:8px 11px}
+table.cmp .cmp-slot{min-width:200px;vertical-align:middle;background:var(--card2)}
+.cmp-slot-wrap{position:relative;display:grid;gap:6px}
+.cmp-slot-btn{justify-content:center;width:100%;font-size:12.5px;padding:7px 10px}
+.cmp-slot-in{padding:7px 10px;font-size:12.5px}
+.cmp-cf-card{margin-top:16px}
+
+/* 27_bondcard.js и 45_stock.js: вкладки, бейдж копирования ISIN, навигация ↑/↓ и v2 оформление */
+.bc-h.st-ver{display:grid;gap:8px;padding:16px 18px;border-radius:var(--r);border:1px solid var(--line);margin-bottom:14px}
+.bc-isin-cp{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:2px 8px 2px 6px;border-radius:7px;background:var(--card2);border:1px solid var(--line2);font-size:12px;color:var(--tx2);transition:border-color .15s,color .15s}
+.bc-isin-cp:hover,.bc-isin-cp:focus-visible{border-color:var(--ac);color:var(--tx);outline:none}
+.bc-isin-cp code{background:transparent;padding:0;font-size:12px}
+.bc-cp-st{font-size:11px;color:var(--mu);font-weight:550}
+.bc-cp-st.done{color:var(--pos)}
+.bc-tabs{margin:14px 0;width:100%;display:flex;flex-wrap:wrap}
+.bc-tabs button{flex:1;white-space:nowrap;text-align:center}
+.bc-nav-btns{display:inline-flex;align-items:center;gap:4px}
+.bc-nav-pos{font-size:11.5px;color:var(--mu);padding:0 4px}
+.bc-kpis.st-tiles{margin:12px 0;gap:10px}
+.bc-kpis.st-tiles .st-tile{padding:12px 14px}
+.bc-kpis.st-tiles .st-ts{min-height:0}
+.bc-verdict.st-callout{margin:0 0 12px}
+.bc-offers-box{display:grid;gap:8px;margin-bottom:12px}
+.bc-offer-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px}
+.stk-hd.st-ver{border:1px solid var(--line);border-radius:var(--r);padding:16px 20px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.stk-tiles{margin-bottom:0}
+.stk-tiles .st-ts{min-height:0}
+#bc-ov .st-callout,#sk-ov .st-callout,.wrap .st-callout{margin:0 0 12px}
+
+/* 10_pos.js: без двойного скролла, группировка, тумблер мелочи, 2 колонки на широком экране */
+.pos-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--gap,16px);align-items:start}
+.pos-side{display:grid;gap:var(--gap,16px);min-width:0}
+.pos-main{min-width:0}
+@media(min-width:1280px){
+  .pos-layout{grid-template-columns:minmax(0,1.7fr) minmax(330px,1fr)}
+  .pos-side{position:sticky;top:12px}
+}
+.pos-ctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:0 6px 10px}
+.pos-gh td{background:var(--card2);font-size:12.5px;border-top:1px solid var(--line2)}
+.pos-gh-cnt{font-weight:500;color:var(--mu);margin-left:6px}
+
+/* 17_ops.js: фильтр дат и счёта */
+.ops-dt{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mu)}
+.ops-dt .in{width:auto;padding:6px 9px;font-size:12.5px}
+.ops-acc{width:auto;min-width:150px;max-width:220px;padding:7px 10px;font-size:12.5px}
+
+/* 25_reb.js: 3 уровня ребалансировки и кнопка скринера */
+.reb-lvl-bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:14px}
+.reb-scr-btn{margin-left:8px;padding:3px 9px;font-size:11.5px;vertical-align:1px}
+
+/* 35_ladder.js: кликабельные пустые годы и 2-колоночный конструктор */
+.ldb-row.gap.is-act{cursor:pointer;transition:border-color .15s,background-color .15s}
+.ldb-row.gap.is-act:hover,.ldb-row.gap.is-act:focus-visible{border-color:var(--ac);background:color-mix(in srgb,var(--ac) 8%,transparent);outline:none}
+.ldb-row.gap.is-act .ld-fl.gap{color:var(--ac-tx);border:1px solid color-mix(in srgb,var(--ac) 35%,transparent)}
+.ld-gap-chip{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:6px;background:var(--card2);border:1px solid var(--line2);font-size:12px;margin:1px 2px;color:var(--tx)}
+.ld-gap-chip:hover{border-color:var(--ac);color:var(--ac-tx)}
+.ld-split{display:grid;grid-template-columns:minmax(310px,360px) minmax(0,1fr);gap:16px;align-items:start}
+.ld-side{position:sticky;top:12px}
+.ld-side .ld-form{grid-template-columns:1fr}
+.ld-main{display:grid;gap:16px;min-width:0}
+@media(max-width:1100px){.ld-split{grid-template-columns:1fr}.ld-side{position:static}}
+
+/* 16_pay.js: прогресс-бар к цели из калькулятора */
+.pay-goal{display:grid;gap:10px;margin-top:0}
+.pay-goal-top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.pay-pb{height:8px;border-radius:999px;background:var(--card2);border:1px solid var(--line);overflow:hidden}
+.pay-pb i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--ac),var(--pos));transition:width .3s ease}
+
+/* 37_events.js: карточка выбранного дня */
+.cal-day-card{margin-top:16px}
+.cal-dc-h{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 20px;border-bottom:1px solid var(--line)}
+.cal-dc-h b{font-size:15px}
+.cal-dc-sum{font-size:13.5px;font-weight:600;margin-left:4px}
+.cal-dc-act{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+.cal-dc-body{padding:10px 16px 14px}
+.cal-ev-go{font-size:11.5px;color:var(--ac-tx);margin-left:8px;white-space:nowrap}
+
+/* 38_watch.js: прогресс до цели */
+.wt-prog-wrap{display:grid;gap:4px;min-width:96px}
+.wt-prog{height:4px;border-radius:999px;background:var(--line);overflow:hidden}
+.wt-prog i{display:block;height:100%;border-radius:999px;background:var(--ac)}
+.wt-prog.hit i{background:var(--pos)}
+.wt-prog-tx{font-size:10.5px;color:var(--mu);white-space:nowrap}
+.wt-prog-tx.hit{color:var(--pos);font-weight:600}
+
+/* 31_monitor.js: плотность строк и карточки v2 */
+.mon-v2-card .st-row.mon-al{margin:0;border-radius:0;background:transparent;border-left:3px solid var(--mu)}
+.mon-v2-card .st-row.mon-al.mon-h{border-left-color:var(--neg)}
+.mon-v2-card .st-row.mon-al.mon-m{border-left-color:var(--st-warn)}
+.mon-v2-card .st-row.mon-al.mon-i{border-left-color:var(--s1)}
+.mon-v2-card .st-row.mon-al:hover{background:var(--card-hover)}
+
+/* 54_txo.js: бейджи ЛДВ и чеклист до sale_day */
+.txo-bdg-ok{background:#2bc48a1f;color:var(--pos);border:1px solid #2bc48a4d}
+.txo-bdg-soon{background:#e5a63a1f;color:var(--st-warn);border:1px solid #e5a63a4d}
+.txo-bdg-loss{background:#f0626a1f;color:var(--neg);border:1px solid #f0626a4d}
+[data-theme=light] .txo-bdg-soon{color:#a86d00}
+.txo-steps{margin:14px 0}
+.txo-step-lb{display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:13px;line-height:1.45;width:100%}
+.txo-step-lb input{margin-top:3px;accent-color:var(--ac)}
+.txo-step-lb.done span{text-decoration:line-through;color:var(--mu)}
+
+/* 20_imp.js: карточки брокеров и индикатор прогресса */
+.imp-guides{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:12px}
+@media(max-width:1100px){.imp-guides{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.imp-gcard{padding:12px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line);display:grid;gap:5px;align-content:start}
+.imp-gcard b{font-size:13px;color:var(--tx)}
+.imp-gcard small{font-size:12px;color:var(--tx2);line-height:1.45}
+.imp-prog{display:grid;gap:8px;padding:12px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line2);margin-bottom:12px}
+.imp-prog-bar{height:6px;border-radius:999px;background:var(--line);overflow:hidden}
+.imp-prog-bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--ac),var(--pos));transition:width .3s ease}
+.imp-prog-bar.indet i{width:45%;animation:impSlide 1.2s ease-in-out infinite}
+@keyframes impSlide{0%{transform:translateX(-100%)}100%{transform:translateX(240%)}}

@@ -59,6 +59,16 @@ function watchMonGroup(){
     ${al.length?al.slice(0,8).map(monAlertHtml).join('')+(al.length>8?`<div class="mu" style="font-size:12px;margin-top:6px">…и ещё ${al.length-8}</div>`:''):'<div class="mon-ok">По бумагам из списка наблюдения тревог нет</div>'}</div>`;
 }
 
+function wtTile(lbl,val,sub,dot,cls){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num ${cls||''}">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
+}
+function wtTargetProg(cur,tgt,isYield){
+  if(tgt==null||cur==null||!(tgt>0))return'';
+  const hit=isYield?(cur>=tgt):(cur<=tgt);
+  const pct=hit?100:Math.max(4,Math.min(99,isYield?(cur/tgt*100):(tgt/cur*100)));
+  const txt=hit?'Цель достигнута':(isYield?`${pct.toFixed(0)}% (ещё +${f2(tgt-cur)}%)`:`ещё −${f2(cur-tgt)}%`);
+  return`<div class="wt-prog-wrap"><div class="wt-prog${hit?' hit':''}"><i style="width:${pct.toFixed(1)}%"></i></div><span class="wt-prog-tx${hit?' hit':''}">${txt}</span></div>`;
+}
 function wtRow(r){
   const th=v=>v!=null?String(v).replace('.',','):'';
   const sp=r.spark&&r.spark.length>2?monSpark(r.spark,70,22):'';
@@ -68,8 +78,8 @@ function wtRow(r){
     <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
     <td class="num ${cls(r.chg30)}">${r.chg30!=null?pct(r.chg30,1):'—'}</td><td>${sp}</td>
     <td class="num">${r.dur!=null?f2(r.dur):'—'}</td><td class="num">${r.turn?short(r.turn):'—'}</td>
-    <td><input class="in num wt-in" data-k="target_yield" data-isin="${esc(r.isin)}" value="${esc(th(r.target_yield))}" placeholder="от, %" inputmode="decimal" title="Сообщить, когда доходность станет не ниже"></td>
-    <td><input class="in num wt-in" data-k="target_price" data-isin="${esc(r.isin)}" value="${esc(th(r.target_price))}" placeholder="до, %" inputmode="decimal" title="Сообщить, когда цена станет не выше"></td>
+    <td><div class="wt-prog-wrap"><input class="in num wt-in" data-k="target_yield" data-isin="${esc(r.isin)}" value="${esc(th(r.target_yield))}" placeholder="от, %" inputmode="decimal" title="Сообщить, когда доходность станет не ниже">${wtTargetProg(r.yield_,r.target_yield,true)}</div></td>
+    <td><div class="wt-prog-wrap"><input class="in num wt-in" data-k="target_price" data-isin="${esc(r.isin)}" value="${esc(th(r.target_price))}" placeholder="до, %" inputmode="decimal" title="Сообщить, когда цена станет не выше">${wtTargetProg(r.price,r.target_price,false)}</div></td>
     <td><input class="in wt-in wt-note" data-k="note" data-isin="${esc(r.isin)}" value="${esc(r.note||'')}" placeholder="заметка" maxlength="300"></td>
     <td class="l">${(r.flags||[]).map(f=>`<span class="tag" style="color:var(--neg)">${esc(f)}</span>`).join(' ')}</td>
     <td><button class="btn ghost wt-del" data-wdel="${esc(r.isin)}" title="Убрать из наблюдения">×</button></td></tr>`;
@@ -85,15 +95,15 @@ function pWatch(){
   watchEnsure();notesEnsure();
   const w=S.watch,nt=S.wnotes;
   if(!w||w.loading)return`<div class="card">${waitBox('Проверяю бумаги из списка: цены, рейтинги, спреды и цели…')}</div>`;
-  if(w.error)return`<div class="msg err">${esc(w.error)} <button class="btn ghost" id="wt-r">Повторить</button></div>`;
+  if(w.error)return`<div class="st-callout warn">${esc(w.error)} <button class="btn ghost" id="wt-r">Повторить</button></div>`;
   const d=w.data,sm=d.summary,goals=d.alerts.filter(a=>a.kind==='goal').length;
   const hold=(S.bonds&&S.bonds.rows||[]).filter(r=>r.isin).map(r=>[r.isin,r.name,'в портфеле']);
   const opts=[...d.items.map(r=>[r.isin,r.name,'наблюдение']),...hold.filter(h=>!d.items.some(r=>r.isin===h[0]))];
   const notes=((nt&&nt.data)||[]).filter(n=>!S.wfilter||n.isin===S.wfilter);
   const nIsins=[...new Map(((nt&&nt.data)||[]).map(n=>[n.isin,n.name||n.isin])).entries()];
-  return`<div class="g g4">${kpi('Бумаг в списке',d.items.length,'облигации, за которыми вы следите',null,S1)}${kpi('Высокие тревоги',sm.high,'дефолт, понижение рейтинга, сильное падение','neg',S8)}
-    ${kpi('Средние тревоги',sm.medium,'наблюдение, оферты, напоминания','',S3)}${kpi('Цели достигнуты',goals,'доходность или цена дошли до заданной',goals?'pos':'',S2)}</div>
-  ${(d.notes||[]).filter(n=>d.items.length).map(n=>`<div class="msg">${esc(n)}</div>`).join('')}
+  return`<div class="st-tiles">${wtTile('Бумаг в списке',d.items.length,'облигации, за которыми вы следите',d.items.length?'pos':'mu')}${wtTile('Высокие тревоги',sm.high,'дефолт, понижение рейтинга, сильное падение',sm.high?'neg':'pos',sm.high?'neg':'')}
+    ${wtTile('Средние тревоги',sm.medium,'наблюдение, оферты, напоминания',sm.medium?'warn':'mu')}${wtTile('Цели достигнуты',goals,'доходность или цена дошли до заданной',goals?'pos':'mu',goals?'pos':'')}</div>
+  ${(d.notes||[]).filter(n=>d.items.length).map(n=>`<div class="st-callout">${esc(n)}</div>`).join('')}
   <div class="card"><h2>Добавить бумагу<span class="sp">по названию или ISIN, из облигаций Мосбиржи</span></h2>
     <div class="wt-add"><input class="in" id="wt-q" placeholder="например, Самолет или RU000A0JQAM6" autocomplete="off"><div id="wt-sug" class="wt-sug"></div></div>
     <p class="note" style="margin-top:8px">Можно также нажать ☆ в строке скринера или в карточке облигации. Цели задаются прямо в таблице ниже.</p></div>
