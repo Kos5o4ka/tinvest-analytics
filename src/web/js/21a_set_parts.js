@@ -159,6 +159,17 @@ async function bindSetCrowd(c,msg){
 async function bindSetShell(msg){
   let s;try{s=await api("/api/shell")}catch(e){return}
   const sec=document.getElementById("set-look");
+  if(s&&s.tauri){                                   /* оболочка Tauri: только автозапуск, через её собственные команды */
+    const br=window.TAURI_BRIDGE;
+    if(!br||!sec||document.getElementById("shell-card"))return;
+    let on;try{on=!!(await br.autostartGet())}catch(e){return}
+    sec.insertAdjacentHTML("beforeend",stGroup("Окно программы",
+      stRow("Запускать вместе с системой","После входа в систему программа запускается автоматически",stSw("tray-auto",on,"Запускать вместе с системой")),
+      {id:"shell-card"}));
+    const el=document.getElementById("tray-auto");
+    if(el)el.onchange=async()=>{try{const r=await br.autostartSet(el.checked);stOk(el);el.checked=!!r;msg("Сохранено",1,true)}catch(e){msg(e&&e.message||String(e));el.checked=!el.checked}};
+    return;
+  }
   if(!s||!s.tray||!sec||document.getElementById("shell-card"))return;
   sec.insertAdjacentHTML("beforeend",stGroup("Окно программы",
     stRow("При закрытии окна сворачивать в трей","Программа продолжает работать в фоне: резервные копии, проверка тревог. Выйти можно из меню значка в трее",stSw("tray-close",!!s.tray_close,"При закрытии окна сворачивать в трей"))+
