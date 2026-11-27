@@ -1,6 +1,15 @@
 name: release-binaries
 # Собирает нативные приложения (лаунчер в PyInstaller) и добавляет их к релизу.
 # Ассет tinvest_analytics.py и его строку в SHA256SUMS не трогает: на них опирается лаунчер.
+# Windows: onedir-сборка PyInstaller упаковывается установщиком Inno Setup (packaging/TAnalytic.iss) — TAnalytic-Setup-win.exe.
+# Этот же файл программа скачивает сама при обновлении оболочки и сверяет с SHA256SUMS (tinvest.py, prepare_installer).
+# Прежний одиночный TAnalytic-win.exe больше не публикуется: на него не ссылается ни одна версия лаунчера.
+#
+# Подпись и репутация (настраиваются вне этого файла, здесь только заметка):
+#  * SignPath Foundation (бесплатно для открытого кода): после заявки подписывать TAnalytic-Setup-win.exe и TAnalytic.exe
+#    отдельным шагом (signpath/github-action-submit-signing-request) между «Сборка установщика» и загрузкой артефакта;
+#  * сразу после релиза отправлять установщик в Microsoft Security Intelligence (Submit a file for malware analysis,
+#    «Software developer») — снимает ложные срабатывания Defender и копит репутацию SHA-256 для SmartScreen.
 on:
   release:
     types: [published]
@@ -29,7 +38,7 @@ jobs:
           - os: macos-15-intel      # Intel; метка раннера может измениться — при необходимости обновите
             asset: TAnalytic-mac-x64.zip
           - os: windows-latest
-            asset: TAnalytic-win.exe
+            asset: TAnalytic-Setup-win.exe
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -77,9 +86,21 @@ jobs:
       - name: Упаковка (macOS)
         if: runner.os == 'macOS'
         run: ditto -c -k --keepParent "build_out/dist/TAnalytic.app" "${{ matrix.asset }}"
-      - name: Упаковка (Windows)
+      - name: Inno Setup (Windows)
         if: runner.os == 'Windows'
-        run: cp build_out/dist/TAnalytic.exe "${{ matrix.asset }}"
+        run: |
+          # на раннере Inno Setup может быть не установлен — ставим сами, если ISCC.exe не найден
+          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [ ! -f "$ISCC" ]; then choco install innosetup -y --no-progress; fi
+          test -f "$ISCC" || { echo "::error::не найден ISCC.exe"; exit 1; }
+      - name: Сборка установщика (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          test -f build_out/dist/TAnalytic/TAnalytic.exe || { echo "::error::нет onedir-сборки build_out/dist/TAnalytic"; exit 1; }
+          export APP_VER="${TAG#v}"
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" packaging/TAnalytic.iss
+          cp build_out/TAnalytic-Setup-win.exe "${{ matrix.asset }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
