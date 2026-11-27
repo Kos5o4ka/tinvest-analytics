@@ -22,8 +22,17 @@ def shell_rev(env=None):
         return 0
 
 
+def is_tauri_shell(env=None):
+    """Сервер запущен как sidecar оболочки Tauri (она ставит TINVEST_SHELL=tauri)."""
+    env = os.environ if env is None else env
+    return (env.get("TINVEST_SHELL") or "").strip().lower() == "tauri"
+
+
 def tray_supported(env=None, frozen=None, plat=None):
-    """Трей и автозапуск — только у собранной оболочки ревизии 4+ на Windows (на macOS пункты скрыты)."""
+    """Трей и автозапуск — только у собранной оболочки ревизии 4+ на Windows (на macOS пункты скрыты).
+    Оболочка Tauri управляет треем и автозапуском сама (команды tauri_autostart_*), реестр Run не трогаем."""
+    if is_tauri_shell(env):
+        return False
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     return bool(frozen and (sys.platform if plat is None else plat) == "win32" and shell_rev(env) >= 4)
 
@@ -84,7 +93,9 @@ def shell_status(env=None, frozen=None, cfg=None, reg=None):
     asset = {"darwin": "TAnalytic-mac-arm64.dmg" if platform.machine() == "arm64" else "TAnalytic-mac-x64.dmg",
              "win32": "TAnalytic-Setup-win.exe"}.get(sys.platform)
     tray = tray_supported(env, frozen)
-    return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "outdated": bool(frozen and rev < SHELL_REV_LATEST),
+    tauri = is_tauri_shell(env)
+    return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "tauri": tauri,
+            "outdated": bool(frozen and not tauri and rev < SHELL_REV_LATEST),
             "url": SHELL_RELEASES, "asset": asset,
             "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close")),
             "autostart": bool(tray and autostart_get(reg))}
