@@ -204,3 +204,14 @@
 .st-acc>button:hover{border-color:var(--ac);color:var(--tx)}
 .st-acc>button.on{border-color:var(--ac);box-shadow:0 0 0 3px var(--ac-glow);color:var(--tx)}
 .st-acc>button:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+
+/* PIN-код, журнал раскрытий и плавающая панель несохранённых изменений */
+.st-lock-pin{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.crowd-log{display:grid;gap:6px;max-height:220px;overflow:auto;margin-top:4px}
+.crowd-log-r{display:grid;grid-template-columns:68px 72px minmax(0,1fr);gap:10px;font-size:12px;padding:4px 0;border-bottom:1px solid var(--line)}
+.crowd-log-r:last-child{border-bottom:0}
+.st-dirty-bar{position:sticky;bottom:14px;z-index:30;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 18px;border-radius:14px;background:var(--d2);border:1px solid var(--ac);box-shadow:var(--d2-hl),0 18px 42px -10px #00000099;animation:stUp .2s ease}
+.st-dirty-bar[hidden]{display:none}
+.st-dirty-bar>span{font-size:13.5px;font-weight:600;color:var(--tx)}
+.st-dirty-bar .row{gap:8px}
+@media(prefers-reduced-motion:reduce){.st-dirty-bar{animation:none}}

@@ -14,12 +14,14 @@ const ST_ICO={
  check:'<path d="M5 12.5l4.5 4.5L19 7.5"/>',
  srv:'<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
  tg:'<path d="M21 4L3 11l6 2.5L11.5 20l3-4.5L19 19z"/><path d="M9 13.5L21 4"/>',
+ lock:'<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
  search:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>'};
 const stIco=(k,sw)=>svgI(ST_ICO[k],sw||1.8);
 const SET_TOC=[['set-conn','Подключение','conn','Токен Т-Инвестиций и сервер данных'],
   ['set-acc','Аккаунт','acc','Вход по ключу и уведомления в Telegram'],
-  ['set-look','Внешний вид','look','Тема, напоминания и разделы меню'],
-  ['set-calc','Расчёты','calc','Прогноз ключевой ставки и сбор раскрытий'],
+  ['set-sec','Безопасность','lock','Блокировка при входе, PIN-код и биометрия'],
+  ['set-look','Внешний вид','look','Тема, запуск, напоминания и разделы меню'],
+  ['set-calc','Расчёты','calc','Прогноз ключевой ставки, мониторинг и раскрытия'],
   ['set-local','Данные','local','Хранилище, резервные копии и экспорт'],
   ['set-news','Что нового','news','Версия программы, изменения и планы'],
   ['set-danger','Опасная зона','danger','Очистка и удаление данных']];
@@ -54,14 +56,32 @@ function stMsg(t,ok,mini){
   h.innerHTML=`<div class="msg ${ok?'ok':'err'}${mini?' mini':''}" role="${ok?'status':'alert'}">${esc(t)}</div>`;
   clearTimeout(h._t);h._t=setTimeout(()=>{h.innerHTML=''},mini?1600:ok?4500:9000);
 }
-/* кнопка «Сохранить» активна, только когда поля изменились */
+/* кнопка «Сохранить» активна, только когда поля изменились; плавающая панель отслеживает все несохранённые блоки */
+const ST_DIRTY_REG=[];
+function stDirtyReset(){ST_DIRTY_REG.length=0;stDirtyBarUpdate()}
+function stDirtyBarUpdate(){
+  const bar=document.getElementById('st-dirty-bar');if(!bar)return;
+  const dirty=ST_DIRTY_REG.some(x=>x.isDirty());
+  bar.hidden=!dirty;
+}
 function stDirty(btn,ids){
   const g=id=>document.getElementById(id),b=typeof btn==='string'?g(btn):btn;
-  const els=ids.map(g).filter(Boolean);if(!b)return{rebase(){},upd(){}};
+  const els=ids.map(g).filter(Boolean);if(!b)return{rebase(){},upd(){},reset(){}};
   const snap=()=>els.map(e=>e.type==='checkbox'?e.checked:stSecVal(e)).join('\u0001');
-  let base=snap();const upd=()=>{b.disabled=snap()===base};
+  const cap=()=>els.map(e=>e.type==='checkbox'?e.checked:e.value);
+  let base=snap(),baseVals=cap();
+  const upd=()=>{b.disabled=snap()===base;stDirtyBarUpdate()};
+  const reset=()=>{
+    els.forEach((e,i)=>{
+      if(e.type==='checkbox')e.checked=!!baseVals[i];
+      else{e._stRev=null;e.value=baseVals[i]??''}
+    });
+    upd();
+  };
   els.forEach(e=>{e.addEventListener('input',upd);e.addEventListener('change',upd)});b.disabled=true;
-  return{rebase(){base=snap();upd()},upd};
+  const entry={btn:b,els,isDirty:()=>snap()!==base,reset,save(){if(!b.disabled)b.click()}};
+  ST_DIRTY_REG.push(entry);
+  return{rebase(){base=snap();baseVals=cap();upd()},upd,reset};
 }
 function stEnter(ids,btn){ids.forEach(id=>{const e=document.getElementById(id);if(e)e.addEventListener('keydown',ev=>{if(ev.key!=='Enter'||ev.isComposing)return;const b=document.getElementById(btn);if(b&&!b.disabled){ev.preventDefault();b.click()}})})}
 /* показать/скрыть и скопировать для полей с секретом.
@@ -156,6 +176,7 @@ function setLocalHtml(c){
     stRow('Папка с данными','Операции, история цен, справочник бумаг, логотипы и настройки — всё лежит здесь и в интернет не отправляется',`<span class="mono ld-path" id="ld-dir">${esc(c.data_dir)}</span><button class="btn ghost" id="ld-open">Открыть папку</button>`,{stack:1})+
     `<div class="st-pad"><div id="ld-parts" class="ld-parts"><div class="note">Считаю размер…</div></div></div>`+
     stRow('Перезагрузить данные из API','Заново загрузить операции и цены из Т-Инвестиций (может занять время)',`<button class="btn ghost" id="cache">Перезагрузить</button>`)+
+    stRow('Сжать базу данных (VACUUM)','Убирает пустое место в файле базы после очистки кэша и старых записей',`<button class="btn ghost" id="ld-vac">Сжать базу (VACUUM)</button>`)+
     stRow('Простая копия (zip)','База и настройки, токен в неё не входит. Копии по расписанию — ниже',`<a class="btn ghost" href="/api/backup" download>Скачать zip</a>`),
     {id:'ld-card',hint:'на этом компьютере'});
 }
@@ -178,6 +199,12 @@ function bindSetLocal(c,msg,busy,reset){
   const g=id=>document.getElementById(id);
   ldLoad();
   g('ld-open').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/localdata/open')});
+  if(g('ld-vac'))g('ld-vac').onclick=e=>busy(e.currentTarget,async()=>{
+    const r=await post('/api/localdata/vacuum');
+    stOk(g('ld-vac'));
+    msg('База сжата'+(r&&r.freed?', освобождено '+ldBytes(r.freed):'')+'.',1);
+    ldLoad();
+  });
   g('ld-clear').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Очистить кэш?', body:'Будут удалены логотипы и временные данные рынка — они скачаются заново. Операции, настройки, токен и список наблюдения останутся.', okText:'Очистить'}))return;
     const r=await post('/api/localdata/clear');reset();msg('Кэш очищен, освобождено '+ldBytes(r.freed)+'.',1);ldLoad()});
   g('ld-wipe').onclick=e=>busy(e.currentTarget,async()=>{
@@ -207,4 +234,88 @@ async function bindSetAcc(msg){
   const out=document.getElementById('acc-out');
   if(out&&s&&s.state==='ok'&&(s.username||s.expires)){out.style.display='';
     out.onclick=async()=>{try{if(!await uiConfirm({title:'Выйти и стереть ключ?', body:'Ключ будет удалён с этого компьютера, для нового входа понадобится ключ из бота.', danger:true, okText:'Выйти'}))return;AUTH.st=await post('/api/auth/logout');authApply()}catch(e){msg(e.message)}}}
+}
+/* ── Безопасность (блокировка входа по PIN и биометрии) ── */
+function setLockHtml(c){
+  const bioLabel=IS_MAC?'Вход по Touch ID':IS_WIN?'Вход через Windows Hello':'Вход по биометрии';
+  const bioHint=IS_MAC?'Разблокировка по отпечатку пальца на Mac':IS_WIN?'Разблокировка через Windows Hello':'Системная биометрия устройства';
+  return stGroup('Блокировка при входе',
+    stRow('Блокировка при входе (Touch ID / Windows Hello / PIN)','Запрашивать подтверждение при запуске программы и доступе к портфелю (по умолчанию выключена)',stSw('lk-en',!!c.lock_enabled,'Блокировка при входе'))+
+    stRow('PIN-код','От 4 до 12 цифр · <span id="lk-pin-st" class="mu">проверяю…</span>',`<div class="st-lock-pin"><input class="in mono st-num" type="password" inputmode="numeric" id="lk-pin" placeholder="новый PIN" autocomplete="new-password" maxlength="12" aria-label="PIN-код"><button class="btn" id="lk-pin-save" disabled>Сохранить PIN</button></div>`)+
+    stRow(bioLabel,bioHint,stSw('lk-bio',c.lock_bio!==false,'Биометрия'))+
+    stRow('Проверка и защита','',`<button class="btn ghost" id="lk-bio-test">Проверить биометрию</button><button class="btn ghost" id="lk-now">Заблокировать сейчас</button>`),
+    {id:'lk-card',hint:c.lock_enabled?'<span class="pos">включена</span>':'выключена',q:'безопасность блокировка вход pin пин touch id windows hello биометрия'});
+}
+async function bindSetLock(c,msg){
+  const g=id=>document.getElementById(id);if(!g('lk-card'))return;
+  const dPin=stDirty('lk-pin-save',['lk-pin']);
+  stEnter(['lk-pin'],'lk-pin-save');
+  const saveLock=async(payload)=>{
+    try{return await post('/api/lock/settings',payload)}
+    catch(e){
+      if(/404|not found/i.test(String(e.message||''))){
+        const cfgP={};
+        if('enabled' in payload)cfgP.lock_enabled=payload.enabled;
+        if('bio_enabled' in payload)cfgP.lock_bio=payload.bio_enabled;
+        if('pin' in payload)cfgP.lock_pin=payload.pin;
+        return await post('/api/config',cfgP);
+      }
+      throw e;
+    }
+  };
+  const applySt=s=>{
+    if(!s)return;
+    if(s.enabled!=null)g('lk-en').checked=!!s.enabled;
+    if(s.bio_enabled!=null)g('lk-bio').checked=!!s.bio_enabled;
+    const pst=g('lk-pin-st');
+    if(pst)pst.innerHTML=s.has_pin?'<span class="pos">PIN задан</span>':'PIN не задан';
+    const bioAv=s.bio_available!==false;
+    g('lk-bio').disabled=!bioAv;
+    g('lk-bio-test').disabled=!bioAv;
+    const h=g('lk-card').querySelector('.st-gh span');
+    if(h)h.innerHTML=g('lk-en').checked?'<span class="pos">включена</span>':'выключена';
+  };
+  api('/api/lock/status').then(s=>{applySt(s)}).catch(()=>{
+    const pst=g('lk-pin-st');if(pst)pst.textContent=c.secret_set&&c.secret_set.lock_pin?'PIN задан':'PIN не задан';
+  });
+  g('lk-en').onchange=async e=>{
+    const el=e.currentTarget,on=el.checked;
+    try{
+      const r=await saveLock({enabled:on});
+      c.lock_enabled=on;applySt(r);stOk(el);
+      msg(on?'Блокировка при входе включена.':'Блокировка при входе выключена.',1);
+    }catch(x){el.checked=!on;msg(x.message)}
+  };
+  g('lk-bio').onchange=async e=>{
+    const el=e.currentTarget,on=el.checked;
+    try{
+      const r=await saveLock({bio_enabled:on});
+      c.lock_bio=on;applySt(r);stOk(el);
+    }catch(x){el.checked=!on;msg(x.message)}
+  };
+  g('lk-pin-save').onclick=async e=>{
+    const b=e.currentTarget,pin=(g('lk-pin').value||'').trim();
+    if(pin.length<4){msg('PIN-код должен содержать минимум 4 символа.');return}
+    b.disabled=true;
+    try{
+      const r=await saveLock({pin});
+      g('lk-pin').value='';dPin.rebase();applySt(Object.assign({has_pin:true},r));stOk(b);msg('PIN-код сохранён.',1);
+    }catch(x){msg(x.message);dPin.upd()}
+  };
+  g('lk-bio-test').onclick=async e=>{
+    const b=e.currentTarget;b.disabled=true;
+    try{
+      let r;
+      try{r=await post('/api/lock/bio/test',{})}
+      catch(err){if(/404|not found/i.test(String(err.message||'')))r=await post('/api/lock/unlock',{method:'bio',test:true});else throw err}
+      msg(r&&r.ok===false?(r.error||'Биометрия не подтверждена.'):'Биометрия подтверждена.',r&&r.ok!==false?1:0);
+    }catch(x){msg(x.message)}finally{b.disabled=false}
+  };
+  g('lk-now').onclick=async e=>{
+    const b=e.currentTarget;b.disabled=true;
+    try{
+      try{await post('/api/lock/lock',{})}catch(err){if(!/404|not found/i.test(String(err.message||'')))throw err}
+      if(typeof lockShow==='function')lockShow({enabled:true,bio_enabled:g('lk-bio').checked});
+    }catch(x){msg(x.message)}finally{b.disabled=false}
+  };
 }

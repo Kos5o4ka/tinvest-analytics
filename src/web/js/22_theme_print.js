@@ -1,7 +1,7 @@
 /* ── тема, печать ── */
 function themeNow(t){return t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}
 let _thmT=0;
-function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}const h=document.documentElement;h.classList.add('thm-anim');clearTimeout(_thmT);_thmT=setTimeout(()=>h.classList.remove('thm-anim'),260);h.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t;thmLabel();nativeTheme()}
+function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}const h=document.documentElement;h.classList.add('thm-anim');clearTimeout(_thmT);_thmT=setTimeout(()=>h.classList.remove('thm-anim'),260);h.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t;thmLabel();nativeTheme();if(typeof uiPrefsSaveSoon==='function')uiPrefsSaveSoon()}
 /* окно программы (pywebview): системная шапка Windows в тон теме */
 function nativeTheme(){try{const a=window.pywebview&&pywebview.api;if(a&&a.set_theme)a.set_theme(document.documentElement.dataset.theme==='light'?'light':'dark')}catch(e){}}
 window.addEventListener('pywebviewready',nativeTheme);
@@ -9,10 +9,10 @@ window.addEventListener('pywebviewready',nativeTheme);
 const ACCENTS=[['blue','Синий','#3b82f6'],['emerald','Изумрудный','#10b981'],['graphite','Графит','#64748b'],['violet','Фиолетовый','#8b5cf6']];
 function curAccent(){let a='blue';try{a=localStorage.getItem('ta_accent')||'blue'}catch(e){}return ACCENTS.some(x=>x[0]===a)?a:'blue'}
 function curDensity(){let d='comfort';try{d=localStorage.getItem('ta_density')||'comfort'}catch(e){}return d==='compact'?'compact':'comfort'}
-function applyAccent(a){try{localStorage.setItem('ta_accent',a)}catch(e){}const h=document.documentElement;if(a==='blue')delete h.dataset.accent;else h.dataset.accent=a}
-function applyDensity(d){try{localStorage.setItem('ta_density',d)}catch(e){}const h=document.documentElement;if(d==='compact')h.dataset.density='compact';else delete h.dataset.density}
+function applyAccent(a){try{localStorage.setItem('ta_accent',a)}catch(e){}const h=document.documentElement;if(a==='blue')delete h.dataset.accent;else h.dataset.accent=a;if(typeof uiPrefsSaveSoon==='function')uiPrefsSaveSoon()}
+function applyDensity(d){try{localStorage.setItem('ta_density',d)}catch(e){}const h=document.documentElement;if(d==='compact')h.dataset.density='compact';else delete h.dataset.density;if(typeof uiPrefsSaveSoon==='function')uiPrefsSaveSoon()}
 function thmLabel(){const e=document.getElementById('thm-t');if(e)e.textContent=document.documentElement.dataset.theme==='light'?'Тёмная тема':'Светлая тема'}
-function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
+function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&((S.cfg.ui_prefs&&S.cfg.ui_prefs.theme)||S.cfg.theme))||'auto'}catch(e){}return t}
 // один клик = видимая смена: от того, что сейчас на экране (раньше цикл auto→light→dark→auto при тёмной системе давал «пустой» клик dark→auto)
 $('#thm').onclick=()=>{const n=document.documentElement.dataset.theme==='light'?'dark':'light';applyTheme(n);post('/api/config',{theme:n}).catch(()=>{});render()};
 thmLabel();

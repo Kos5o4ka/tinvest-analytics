@@ -5,7 +5,9 @@ const _plat=(navigator.userAgentData&&navigator.userAgentData.platform)||navigat
 const IS_MAC=/Mac|iPhone|iPad/i.test(_plat),IS_WIN=/Win/i.test(_plat);
 const MOD=IS_MAC?'⌘':'Ctrl+';
 document.documentElement.classList.add(IS_MAC?'os-mac':IS_WIN?'os-win':'os-linux');
-document.addEventListener('DOMContentLoaded',()=>{const k=document.getElementById('srch-k');if(k)k.textContent=MOD+'K'});
+const _setSrchK=()=>{const k=document.getElementById('srch-k');if(k)k.textContent=MOD+'K'};
+document.addEventListener('DOMContentLoaded',_setSrchK);
+if(document.readyState!=='loading')_setSrchK();
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function safeUrl(u){try{const x=new URL(String(u||''));return(x.protocol==='https:'||x.protocol==='http:')?x.href:''}catch(e){return''}}
 const NF2=new Intl.NumberFormat('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2});

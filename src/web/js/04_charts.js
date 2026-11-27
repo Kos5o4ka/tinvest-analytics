@@ -9,6 +9,15 @@ const rtop=(x,y,w,h,r)=>{r=Math.min(r,w/2,h);if(h<=0)return'';return`M${x},${y+h
 const rbot=(x,y,w,h,r)=>{r=Math.min(r,w/2,h);if(h<=0)return'';return`M${x},${y}H${x+w}V${y+h-r}Q${x+w},${y+h} ${x+w-r},${y+h}H${x+r}Q${x},${y+h} ${x},${y+h-r}Z`};
 const legend=ser=>ser.length>1?`<div class="legend">${ser.map(s=>`<span><i style="background:${s.c}"></i>${esc(s.n)}</span>`).join('')}</div>`:'';
 function emptyChart(el,h,t){el.innerHTML=`<div class="empty" style="min-height:${h}px;padding:20px">${svgI('<path d="M3 3v18h18M7 15l4-4 3 3 5-6"/>')}<div>${t||'Нет данных за период'}</div></div>`}
+function chartSkeletonHtml(h=240,t){
+  const bars=[38,62,48,76,56,88,64,72,50,82].map(p=>`<i style="height:${p}%"></i>`).join('');
+  return`<div class="chart-sk" style="min-height:${h}px" aria-busy="true"><div class="chart-sk-bars">${bars}</div>${t?`<div class="chart-sk-tx">${esc(t)}</div>`:''}</div>`;
+}
+function chartSkeleton(el,h=240,t){
+  const target=typeof el==='string'?document.getElementById(el):el;
+  if(!target)return;
+  target.innerHTML=chartSkeletonHtml(h,t);
+}
 
 /* мини-график цены: цвет по знаку изменения (порог 0,15 %) */
 function spark(v,w=64,h=18){
@@ -88,9 +97,15 @@ function bars(el,o){
     hits+=`<rect data-i="${i}" x="${gx}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
   }
   bt.forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
-  el.innerHTML=(o.legend===false?'':legend(ser))+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g>${marks}</g>${hits}</svg>`;
-  const mk=el.querySelectorAll('.bg');
-  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
+  el.innerHTML=(o.legend===false?'':legend(ser))+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g class="hv"></g><g>${marks}</g>${hits}</svg>`;
+  const mk=el.querySelectorAll('.bg'),hv=el.querySelector('.hv');
+  el._hl=i=>{
+    mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
+    if(!hv)return;
+    if(i<0){hv.innerHTML='';return}
+    const cx=pl+gw*i+gw/2;
+    hv.innerHTML=`<rect x="${pl+gw*i}" y="${pt}" width="${gw}" height="${ph}" rx="4" fill="var(--ac)" fill-opacity=".06"/><line x1="${cx}" x2="${cx}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`;
+  };
   bindTip(el,i=>{let h=`<b>${esc(o.tipLabels?o.tipLabels[i]:o.labels[i])}</b>`;ser.forEach(se=>{const v=se.v[i]||0;if(v||!o.skipZero)h+=tipRow(o.colorOf?o.colorOf(v,i):se.c,se.n,ft(v))});
     if(o.total){const t=ser.reduce((a,se)=>a+(se.v[i]||0),0);h+=`<div class="tot">Итого<span>${ft(t)}</span></div>`}return h});
 }
@@ -129,7 +144,7 @@ function line(el,o){
   el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${s}${ends}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
   el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`+
-    ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>`<circle cx="${X(i)}" cy="${Y(se.v[i])}" r="4.5" fill="${se.c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
+    ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>`<circle cx="${X(i)}" cy="${Y(se.v[i])}" r="8" fill="${se.c}" fill-opacity=".18"/><circle cx="${X(i)}" cy="${Y(se.v[i])}" r="4.5" fill="${se.c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
   bindTip(el,i=>{o.hover&&o.hover(i);if(o.tip)return o.tip(i);return`<b>${esc(tl[i])}</b>`+ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>tipRow(se.c,se.n,ft(se.v[i]))).join('')});
   if(o.leave){const ol=el.onmouseleave;el.onmouseleave=e=>{ol(e);o.leave()}}
 }
@@ -201,9 +216,15 @@ function stackedMonths(el,o){
   bt.forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
   let vt='';
   if(o.vl)barLabelsPick(vls,13).forEach(l=>{const x=Math.max(pl+l.w/2,Math.min(W-pr-l.w/2,l.x));vt+=`<text class="ax num vl${l.c}" x="${x}" y="${l.y}" text-anchor="middle"${l.c?' style="fill:var(--s7)"':''}>${esc(l.tx)}</text>`});
-  el.innerHTML=`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g>${marks}</g>${vt}${hits}</svg>`;
-  const mk=el.querySelectorAll('.bg');
-  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
+  el.innerHTML=`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g class="hv"></g><g>${marks}</g>${vt}${hits}</svg>`;
+  const mk=el.querySelectorAll('.bg'),hv=el.querySelector('.hv');
+  el._hl=i=>{
+    mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
+    if(!hv)return;
+    if(i<0){hv.innerHTML='';return}
+    const cx=pl+gw*i+gw/2;
+    hv.innerHTML=`<rect x="${pl+gw*i}" y="${pt}" width="${gw}" height="${ph}" rx="4" fill="var(--ac)" fill-opacity=".06"/><line x1="${cx}" x2="${cx}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`;
+  };
   bindTip(el,i=>{const m=o.months[i];let h=`<b>${esc(o.tipLabels?o.tipLabels[i]:o.labels[i])}</b>`;
     m.segs.filter(x=>x.v>0).forEach(x=>{h+=tipRow(o.colors[x.k]||'var(--s1)',(o.names[x.k]||x.k)+(x.est?' (прогноз)':''),ft(x.v))});
     if(m.call>0)h+=tipRow('var(--s4)','возможный CALL',ft(m.call));
@@ -242,9 +263,46 @@ function candles(id,data,o){
   let hits='';for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${pl+gw*i}" y="${pt}" width="${gw}" height="${H-pt-pb}" fill="transparent"/>`;
   el.innerHTML=`<svg width="${W}" height="${H}">${s}${vol}${marks}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
-  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph+vh+8}" stroke="var(--line2)" stroke-dasharray="3 3"/>`};
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}const c=data[i],col=c.c>=c.o?'var(--pos)':'var(--neg)';
+    hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph+vh+8}" stroke="var(--line2)" stroke-dasharray="3 3"/><circle cx="${X(i)}" cy="${Y(c.c)}" r="7" fill="${col}" fill-opacity=".18"/><circle cx="${X(i)}" cy="${Y(c.c)}" r="3.5" fill="${col}" stroke="var(--card)" stroke-width="1.5"/>`};
   bindTip(el,i=>{o.hover&&o.hover(i);if(o.ft)return o.ft(i);const c=data[i],up=c.c>=c.o;
     let h=`<b>${esc(lab(c.t))}</b>`+tipRow(up?'var(--pos)':'var(--neg)','Закрытие',fmt(c.c))+tipRow('var(--mu)','Открытие',fmt(c.o))+tipRow('var(--mu)','Максимум',fmt(c.h))+tipRow('var(--mu)','Минимум',fmt(c.l));
     if(c.v)h+=tipRow('var(--mu)','Объём',short(c.v));
     (o.lines||[]).forEach(L=>{if(L.v[i]!=null)h+=tipRow(L.c,L.n,fmt(L.v[i]))});return h});
+}
+
+/* ── унифицированный crosshair + подсветка точки для кривой эмитента (bcIssuerCurve) ── */
+function chartEnhanceIssuerCurve(el,ic){
+  if(!el||!ic||!ic.points||!ic.points.length)return;
+  const svg=el.querySelector('svg');if(!svg)return;
+  const W=+svg.getAttribute('width')||el.clientWidth||560,H=+svg.getAttribute('height')||250;
+  const pl=44,pr=14,pt=12,pb=30;
+  const ns='http://www.w3.org/2000/svg';
+  let hv=svg.querySelector('.hv');
+  if(!hv){hv=document.createElementNS(ns,'g');hv.setAttribute('class','hv');svg.insertBefore(hv,svg.firstChild)}
+  const pts=ic.points.slice().sort((a,b)=>a.me-b.me);
+  const circles=[...svg.querySelectorAll('.ic-pt')];
+  circles.forEach((c,idx)=>{
+    c.setAttribute('data-i',String(idx));
+    const t=c.querySelector('title');if(t)t.remove();
+  });
+  const fmtN=(n,d=2)=>n==null||isNaN(n)?'—':Number(n).toFixed(d).replace('.',',');
+  el._hl=i=>{
+    if(i<0||!circles[i]){hv.innerHTML='';return}
+    const cx=+circles[i].getAttribute('cx'),cy=+circles[i].getAttribute('cy');
+    const p=pts[i],col=p&&p.me?'var(--ac)':(p&&p.floating?'var(--s7)':'var(--s1)');
+    hv.innerHTML=`<line x1="${cx}" x2="${cx}" y1="${pt}" y2="${H-pb}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`+
+      `<line x1="${pl}" x2="${W-pr}" y1="${cy}" y2="${cy}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`+
+      `<circle cx="${cx}" cy="${cy}" r="11" fill="${col}" fill-opacity=".18"/><circle cx="${cx}" cy="${cy}" r="6.5" fill="none" stroke="${col}" stroke-width="1.5"/>`;
+  };
+  bindTip(el,i=>{
+    const p=pts[i];if(!p)return'';
+    let h=`<b>${esc(p.name||p.isin||'')}</b>`;
+    h+=tipRow(p.me?'var(--ac)':'var(--s1)','Доходность',fmtN(p.yield,2)+' %');
+    h+=tipRow('var(--mu)','Дюрация',fmtN(p.dur,2)+' г.');
+    if(p.spread!=null)h+=tipRow('var(--s3)','Спред к КБД',(p.spread>0?'+':'')+fmtN(p.spread,2)+' п.п.');
+    if(p.rating)h+=tipRow('var(--s4)','Рейтинг',esc(p.rating));
+    if(p.floating)h+=tipRow('var(--s7)','Тип купона','флоатер');
+    return h;
+  });
 }

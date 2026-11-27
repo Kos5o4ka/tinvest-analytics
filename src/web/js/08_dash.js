@@ -1,4 +1,31 @@
 /* ── Обзор ── */
+function heroSparkSvg(hs){
+  const raw=hs&&(Array.isArray(hs.value)&&hs.value.length>=2?hs.value:(Array.isArray(hs.values)&&hs.values.length>=2?hs.values:(Array.isArray(hs.twr)&&hs.twr.length>=2?hs.twr:null)));
+  if(!raw)return'';
+  const v=raw.filter(x=>x!=null&&!isNaN(x)&&isFinite(x));
+  if(v.length<2)return'';
+  const W=420,H=140,mn=Math.min(...v),mx=Math.max(...v),sp=mx-mn||Math.abs(mx)*0.02||1;
+  const pts=v.map((y,i)=>[+(i/(v.length-1)*W).toFixed(1),+(H-12-(y-mn)/sp*(H-28)).toFixed(1)]);
+  const linePts=pts.map(p=>p[0]+','+p[1]).join(' ');
+  const areaPts=`0,${H} ${linePts} ${W},${H}`;
+  const up=v[v.length-1]>=v[0],col=up?'var(--pos)':'var(--neg)';
+  const gid='hsp'+Math.random().toString(36).slice(2,7);
+  return`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:${col};stop-opacity:.28"/><stop offset="1" style="stop-color:${col};stop-opacity:0"/></linearGradient></defs><polygon points="${areaPts}" fill="url(#${gid})"/><polyline points="${linePts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity=".7"/></svg>`;
+}
+function dashDeltaBadge(hs){
+  if(!hs||!Array.isArray(hs.value)||hs.value.length<2)return'';
+  const n=hs.value.length,v0=hs.value[0],v1=hs.value[n-1];
+  const i0=Array.isArray(hs.invested)?(hs.invested[0]||0):0,i1=Array.isArray(hs.invested)?(hs.invested[n-1]||0):0;
+  const dp=(v1-i1)-(v0-i0),dpct=hs.total!=null?hs.total*100:(v0>0?(v1-v0)/v0*100:null);
+  if(bad(dp))return'';
+  return`<span class="dash-delta pill ${cls(dp)}">${SM(dp,'rub')}${dpct!=null?` (${pct(dpct,1)})`:''}</span>`;
+}
+document.addEventListener('click',e=>{
+  const b=e.target.closest&&e.target.closest('[data-dash-top]');
+  if(!b)return;
+  const v=b.dataset.dashTop==='1';
+  if(!!S.dashAllPos!==v){S.dashAllPos=v;render()}
+});
 function pDash(){
   const d=S.data,p=d.portfolio,t=T(),lf=d.life;
   if(!p.total&&!p.positions.length&&!d.ops.length&&!lf.deposits)return`<div class="card empty fade" style="min-height:420px">${svgI('<rect x="3" y="6" width="18" height="14" rx="3"/><path d="M3 10h18M16 15h2"/>')}
@@ -7,7 +34,8 @@ function pDash(){
   const income=sumK(t,['dividends','coupons','overnight']),taxes=sumK(t,TAXK);
   const profit=d.profit,ppct=d.invested>0&&profit!=null?profit/d.invested*100:null,hs=histSlice();
   const _q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
-  const hero=`<div class="card hero"><div style="position:relative;z-index:1"><div class="lbl">Стоимость портфеля</div>
+  const hSpark=heroSparkSvg(hs);
+  const hero=`<div class="card hero">${hSpark?`<div class="hero-spark" aria-hidden="true">${hSpark}</div>`:''}<div style="position:relative;z-index:1"><div class="lbl">Стоимость портфеля</div>
     <div class="val num" data-tick="dash-total">${f2m(p.total)} <small>₽</small></div>
     <div class="row" style="margin-top:10px;flex-wrap:wrap">${p.daily!=null?`<span class="pill ${cls(p.daily)}">${SM(p.daily)} · ${pct(p.daily_pct)} за день</span>`:''}
     <span class="pill ${cls(p.upnl)}">${SM(p.upnl)} · ${pct(p.yield_pct)} по открытым позициям</span>
@@ -26,24 +54,27 @@ function pDash(){
     ${kpi('Оборот',M(turn,'rub',0),`покупки ${short(t.buy_turnover||0)} · продажи ${short(t.sell_turnover||0)}`,null,S7)}</div>`;
   const alloc=[['Акции',p.shares,S1],['Облигации',p.bonds,S3],['Фонды',p.etf,S4],['Валюта и деньги',p.currencies,S7],['Фьючерсы',p.futures,S5],['Структурные',p.sp,S2],['Опционы',p.options,S6],['Прочее',p.other,S8]].map(([n,v,c])=>({n,v,c}));
   chart('c-alloc',donut,{items:alloc,cap:'Портфель'});
-  let eq=waitBox('Восстанавливаю историю стоимости по ценам закрытия…');
+  const sk=(h,tx)=>typeof chartSkeletonHtml==='function'?chartSkeletonHtml(h,tx):waitBox(tx);
+  let eq=sk(290,'Восстанавливаю историю стоимости по ценам закрытия…');
   if(S.hist&&S.hist.error)eq=`<div class="msg err">${esc(S.hist.error)}</div>`;
   else if(S.hist&&!hs)eq='<div class="empty">Недостаточно истории за период</div>';
   else if(hs){eq='<div id="c-eq" class="chart"></div>';
     chart('c-eq',line,{h:290,area:true,zero:false,labels:hs.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tipLabels:hs.days.map(dlabel),
       series:[{n:'Стоимость портфеля',c:S1,v:hs.value},{n:'Вложено',c:'#8b93a7',v:hs.invested,dash:1,w:1.6}]})}
-  let mret=waitBox();
+  let mret=sk(240);
   if(S.hist&&S.hist.monthly){const ms=Object.keys(S.hist.monthly).sort().slice(-12);mret='<div id="c-mret" class="chart"></div>';
     chart('c-mret',bars,{labels:ms.map(mlabel),tipLabels:ms.map(m=>{const[y,mm]=m.split('-');return MONF[+mm-1]+' '+y}),labelsOn:ms.length<=12,
       series:[{n:'Доходность',c:S1,v:ms.map(m=>S.hist.monthly[m]*100)}],colorOf:v=>v>=0?'var(--pos)':'var(--neg)',fa:v=>(Math.round(v*10)/10).toString().replace('.',',')+'%',ft:v=>pct(v)})}
   else if(S.hist&&S.hist.error)mret='<div class="empty">Не удалось посчитать доходность по месяцам. Нажмите «Обновить» сверху, чтобы повторить.</div>';
-  let pays=waitBox('Собираю график купонов и дивидендов…');
+  let pays=sk(190,'Собираю график купонов и дивидендов…');
   if(S.bonds&&S.bonds.payments){const pm=payMonths(S.bonds.payments,6);const tot=S.bonds.payments.reduce((a,x)=>a+x.amount,0);
     pays=`<div class="row" style="justify-content:space-between;margin:-4px 0 10px"><span class="t2" style="font-size:12.5px">За 12 месяцев ожидается</span><b class="num pos">${M(tot)}</b></div><div id="c-pay6" class="chart"></div>`;
     chart('c-pay6',bars,{h:190,labels:pm.labels,tipLabels:pm.tips,stack:true,total:true,skipZero:true,series:pm.series,empty:'Выплат не ожидается'})}
-  const top=p.positions.filter(x=>x.type!=='currency'&&x.type!=='futures').slice(0,8);
+  const allPos=p.positions.filter(x=>x.type!=='currency'&&x.type!=='futures');
+  const top=S.dashAllPos?allPos:allPos.slice(0,8);
   const mx=Math.max(1,...top.map(x=>x.value_rub||0));
   const topAttr=x=>x.type==='bond'&&x.isin?` data-isin="${esc(x.isin)}" style="cursor:pointer"`:(x.type==='share'||x.type==='etf')&&x.ticker?` data-stk="${esc(x.ticker)}" style="cursor:pointer"`:'';
+  const topSeg=allPos.length?`<div class="seg dash-top-seg" role="group" aria-label="Количество позиций"><button type="button" class="${!S.dashAllPos?'on':''}" data-dash-top="0">Топ-8</button><button type="button" class="${S.dashAllPos?'on':''}" data-dash-top="1">Все${allPos.length>8?' ('+allPos.length+')':''}</button></div>`:'';
   const topHtml=top.length?`<div class="li">${top.map(x=>`<div class="it"${topAttr(x)}>${logo(x,34)}<div><b>${esc(x.name)}</b><small>${esc(x.ticker)} · ${pctp(x.share)} портфеля</small><div class="bar"><i style="width:${(x.value_rub||0)/mx*100}%;background:${S1}"></i></div></div>
     <div class="rv num">${M(x.value_rub??x.value,'rub',0)}<small class="${cls(x.pnl)}">${x.pnl_rub!=null?SM(x.pnl_rub):''} ${x.pnl_pct!=null?'('+pct(x.pnl_pct,1)+')':''}</small></div></div>`).join('')}</div>`:'<div class="empty">Нет открытых позиций</div>';
   const inc=d.income_by.filter(x=>x[0]>0).slice(0,8),imx=Math.max(1,...inc.map(x=>x[0]));
@@ -54,11 +85,12 @@ function pDash(){
       .map(([n,k])=>`<div><div class="mu" style="font-size:12px">${n}</div><div class="num" style="font-weight:650;font-size:16px;margin-top:4px">${M(d.margin[k])}</div></div>`).join('')}
     <div><div class="mu" style="font-size:12px">Уровень достаточности</div><div class="num ${d.margin.fundsSufficiencyLevel<1.1&&d.margin.fundsSufficiencyLevel>0?'neg':''}" style="font-weight:650;font-size:16px;margin-top:4px">${f2(d.margin.fundsSufficiencyLevel)}</div></div></div></div>`:'';
   const uxBlocks=typeof uxDashBlocks==='function'?uxDashBlocks():'';
-  return hero+todayCard()+uxBlocks+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
+  const eqDelta=dashDeltaBadge(hs);
+  return hero+todayCard()+uxBlocks+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения${eqDelta}<span class="sp">${periodName()}</span></h2>${eq}</div>
     <div class="card"><h2>Структура портфеля</h2><div id="c-alloc" class="chart"></div></div></div>
     <div class="g g2"><div class="card"><h2>Доходность по месяцам<span class="sp">последние 12 мес</span></h2>${mret}</div>
     <div class="card"><h2>Ближайшие выплаты<span class="sp">купоны · дивиденды · погашения</span></h2>${pays}</div></div>
-    <div class="g g2"><div class="card"><h2>Крупнейшие позиции<span class="sp">стоимость · P&amp;L</span></h2>${topHtml}</div>
+    <div class="g g2"><div class="card"><h2>Крупнейшие позиции${topSeg}<span class="sp">стоимость · P&amp;L</span></h2>${topHtml}</div>
     <div class="card"><h2>Кто платит дивиденды и купоны<span class="sp">${periodName()}</span></h2>${incHtml}</div></div>`+(typeof radarCard==='function'?radarCard(S.bonds&&S.bonds.radar,true):'')+concCard(d.concentration)+marg;
 }
 
