@@ -160,11 +160,13 @@ def _pri_scr_kick():
 
 
 def primary_payload():
-    cal_error = None
+    cal_error, cal_fallback = None, False
     try:
         rows = primary_rows()
     except Exception as e:  # noqa: BLE001
-        rows, cal_error = [], str(e)[:200]      # без календаря экран всё равно показывает размещения Мосбиржи и калькулятор
+        cal_error = str(e)[:200]                # без календаря экран всё равно показывает размещения Мосбиржи и калькулятор
+        rows = pv_calendar_fallback()           # резерв: выпуски с площадок размещения Мосбиржи (ISS)
+        cal_fallback = bool(rows)
     scr = _scr.get("rows") or []
     scr_loading = False
     if not scr:
@@ -199,7 +201,7 @@ def primary_payload():
     except Exception:  # noqa: BLE001
         pass
     return {"rows": out_rows, "updated": _pri["t"], "rusfar": rusfar, "peer_medians": peer_med, "cal_error": cal_error,
-            "scr_loading": scr_loading}
+            "cal_fallback": cal_fallback, "scr_loading": scr_loading}
 
 
 

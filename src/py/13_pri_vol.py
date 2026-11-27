@@ -387,13 +387,33 @@ def _pv_rating(isin, name):
             return None
 
 
+def pv_calendar_fallback(res=None, today=None):
+    """Резервный календарь, когда investmint недоступен: выпуски с площадок размещения Мосбиржи (данные ISS из сводки объёмов),
+    у которых дата размещения сегодня или позже, в формате строк календаря. Заранее объявленные, но ещё не заведённые на
+    площадку выпуски здесь не видны. res — результат primary_volumes_payload (по умолчанию берётся готовый/запускается в фоне)."""
+    try:
+        res = res if res is not None else primary_volumes_payload()
+    except Exception:  # noqa: BLE001
+        return []
+    today = today or date.today().isoformat()
+    out = []
+    for r in (res or {}).get("rows") or []:
+        st = r.get("start") or ""
+        if st < today or not r.get("isin") or r.get("book"):      # book есть только у строк из календаря investmint
+            continue
+        out.append({"issuer": r.get("full") or r.get("name") or "", "short": r.get("name") or "", "desc": "", "isin": r["isin"],
+                    "start": st, "end": "", "book": "", "status": "Площадка размещения Мосбиржи", "link": ""})
+    out.sort(key=lambda x: x["start"])
+    return out
+
+
 def pv_calendar_bg(out):
     """Календарь investmint в фоновом потоке: результат кладём в out (cal/err), пока основной конвейер грузит MOEX."""
     t0 = time.time()
     try:
         out["cal"] = primary_rows() or []
     except Exception as ex:  # noqa: BLE001
-        out["err"] = "календарь: %s" % str(ex)[:100]
+        out["err"] = "календарь заранее объявленных размещений недоступен (%s); показаны выпуски с площадок размещения Мосбиржи" % str(ex)[:100]
     out["t"] = time.time() - t0
 
 
@@ -463,9 +483,9 @@ def pv_compute():
     if cal_box.get("err"):
         errs.append(cal_box["err"])
     elif "cal" not in cal_box:
-        errs.append("календарь размещений investmint: не ответил вовремя")
+        errs.append("календарь размещений investmint: не ответил вовремя; показаны выпуски с площадок размещения Мосбиржи")
     elif not cal:
-        errs.append("календарь размещений investmint: 0 строк — возможно, изменилась разметка сайта")
+        errs.append("календарь размещений investmint: 0 строк — возможно, изменилась разметка сайта; показаны выпуски с площадок размещения Мосбиржи")
     cal_isin = {r["isin"]: r for r in cal if r.get("isin")}
     cand = set(agg) | set(live)                         # всё, что сейчас открыто на площадке размещения, — независимо от даты старта
     for sid, ms in live.items():

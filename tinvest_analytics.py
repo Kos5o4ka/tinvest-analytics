@@ -10623,44 +10623,93 @@ _mkt_snap_lock = threading.Lock()
 _mkt_snap_mem = {}
 
 
+MARKET_SNAP_STALE = 3600           # срез, собранный сервером давно, не используем: экран считает рынок сам
+MARKET_SNAP_MAX_BYTES = 64 * 1024 * 1024
+_mkt_snap_etag = {}                # kind -> (etag, data): ответ 304 означает «срез не менялся»
+
+
+def snap_gunzip(body, limit=MARKET_SNAP_MAX_BYTES):
+    """Распаковка gzip-тела ответа (с защитой от «бомбы»: больше limit байт — ошибка)."""
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = d.decompress(body, limit)
+    if d.unconsumed_tail:
+        raise ValueError("ответ слишком велик после распаковки")
+    return out
+
+
+def _snap_http(url, headers, timeout):
+    """GET -> (код, тело, заголовки). 304 возвращается как обычный результат с пустым телом; gzip распаковывается."""
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+            code, body, hd = r.status, r.read(MARKET_SNAP_MAX_BYTES + 1), r.headers
+    except urllib.error.HTTPError as e:
+        if e.code != 304:
+            raise
+        return 304, b"", e.headers
+    if len(body) > MARKET_SNAP_MAX_BYTES:
+        raise ValueError("ответ слишком велик")
+    enc = str(hd.get("Content-Encoding") or "").lower()
+    if "gzip" in enc or body[:2] == b"\x1f\x8b":     # сервер без сжатия тоже подходит: просто пропускаем
+        body = snap_gunzip(body)
+    return code, body, hd
+
+
 def _market_snap_fetch(kind="all", timeout=20):
     srv, key = ds_conf()
     if not srv or _ds_bypassed(urlparse(srv).netloc):
         return None
-    hd = {"User-Agent": EXT_UA["User-Agent"]}
+    hd = {"User-Agent": EXT_UA["User-Agent"], "Accept-Encoding": "gzip"}   # токен Т-Инвестиций сюда не попадает никогда
     if key:
         hd["X-Client-Key"] = key
+    old = _mkt_snap_etag.get(kind)
+    if old:
+        hd["If-None-Match"] = old[0]
     url = "%s/v1/market/snapshot?kind=%s" % (srv.rstrip("/"), urllib.parse.quote(str(kind or "all")))
     try:
-        req = urllib.request.Request(url, headers=hd)
-        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
-            j = json.loads(r.read().decode("utf-8", "replace"))
+        code, body, rh = _snap_http(url, hd, timeout)
+        if code == 304:
+            return old[1] if old else None
+        j = json.loads(body.decode("utf-8", "replace"))
     except Exception:  # noqa: BLE001
         return None
     if not isinstance(j, dict) or not j.get("ok"):
         return None
     data = j.get("data")
     if not isinstance(data, dict) or data.get("empty"):
+        _mkt_snap_etag.pop(kind, None)
         return None
+    et = rh.get("ETag") if rh else None
+    if et:
+        _mkt_snap_etag[kind] = (et, data)
     return data
+
+
+def snap_is_fresh(data, max_age=MARKET_SNAP_STALE, now=None):
+    """Срез собран не раньше max_age секунд назад (по updated_at сервера). Нет отметки времени — считаем устаревшим."""
+    try:
+        t = float(data.get("updated_at"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (time.time() if now is None else now) - t <= max_age
 
 
 def market_snapshot_get(kind="all", max_age=MARKET_SNAP_TTL, force=False, timeout=20):
     """Получить срез рынка с сервера (all | bonds | stocks | heatmap | status) с кэшем в памяти и kv.
-    Возвращает dict или None, если сервер не ответил / срез ещё не собран."""
+    Возвращает dict или None, если сервер не ответил / срез ещё не собран / срез старше MARKET_SNAP_STALE."""
     kind = str(kind or "all")
     now = time.time()
     if not force:
         with _mkt_snap_lock:
             hit = _mkt_snap_mem.get(kind)
             if hit and now - hit[0] < max_age:
-                return hit[1]
+                return hit[1] if snap_is_fresh(hit[1]) or kind == "status" else None
         try:
             kv = store().get("market_snap_" + kind)
             if isinstance(kv, dict) and now - float(kv.get("t") or 0) < max_age and isinstance(kv.get("data"), dict):
                 with _mkt_snap_lock:
                     _mkt_snap_mem[kind] = (float(kv["t"]), kv["data"])
-                return kv["data"]
+                return kv["data"] if snap_is_fresh(kv["data"]) or kind == "status" else None
         except Exception:  # noqa: BLE001
             pass
     data = _market_snap_fetch(kind=kind, timeout=timeout)
@@ -10671,7 +10720,7 @@ def market_snapshot_get(kind="all", max_age=MARKET_SNAP_TTL, force=False, timeou
             store().put("market_snap_" + kind, {"t": now, "data": data})
         except Exception:  # noqa: BLE001
             pass
-        return data
+        return data if snap_is_fresh(data) or kind == "status" else None
     return None
 
 
@@ -11327,11 +11376,13 @@ def _pri_scr_kick():
 
 
 def primary_payload():
-    cal_error = None
+    cal_error, cal_fallback = None, False
     try:
         rows = primary_rows()
     except Exception as e:  # noqa: BLE001
-        rows, cal_error = [], str(e)[:200]      # без календаря экран всё равно показывает размещения Мосбиржи и калькулятор
+        cal_error = str(e)[:200]                # без календаря экран всё равно показывает размещения Мосбиржи и калькулятор
+        rows = pv_calendar_fallback()           # резерв: выпуски с площадок размещения Мосбиржи (ISS)
+        cal_fallback = bool(rows)
     scr = _scr.get("rows") or []
     scr_loading = False
     if not scr:
@@ -11366,7 +11417,7 @@ def primary_payload():
     except Exception:  # noqa: BLE001
         pass
     return {"rows": out_rows, "updated": _pri["t"], "rusfar": rusfar, "peer_medians": peer_med, "cal_error": cal_error,
-            "scr_loading": scr_loading}
+            "cal_fallback": cal_fallback, "scr_loading": scr_loading}
 
 
 
@@ -12405,13 +12456,33 @@ def _pv_rating(isin, name):
             return None
 
 
+def pv_calendar_fallback(res=None, today=None):
+    """Резервный календарь, когда investmint недоступен: выпуски с площадок размещения Мосбиржи (данные ISS из сводки объёмов),
+    у которых дата размещения сегодня или позже, в формате строк календаря. Заранее объявленные, но ещё не заведённые на
+    площадку выпуски здесь не видны. res — результат primary_volumes_payload (по умолчанию берётся готовый/запускается в фоне)."""
+    try:
+        res = res if res is not None else primary_volumes_payload()
+    except Exception:  # noqa: BLE001
+        return []
+    today = today or date.today().isoformat()
+    out = []
+    for r in (res or {}).get("rows") or []:
+        st = r.get("start") or ""
+        if st < today or not r.get("isin") or r.get("book"):      # book есть только у строк из календаря investmint
+            continue
+        out.append({"issuer": r.get("full") or r.get("name") or "", "short": r.get("name") or "", "desc": "", "isin": r["isin"],
+                    "start": st, "end": "", "book": "", "status": "Площадка размещения Мосбиржи", "link": ""})
+    out.sort(key=lambda x: x["start"])
+    return out
+
+
 def pv_calendar_bg(out):
     """Календарь investmint в фоновом потоке: результат кладём в out (cal/err), пока основной конвейер грузит MOEX."""
     t0 = time.time()
     try:
         out["cal"] = primary_rows() or []
     except Exception as ex:  # noqa: BLE001
-        out["err"] = "календарь: %s" % str(ex)[:100]
+        out["err"] = "календарь заранее объявленных размещений недоступен (%s); показаны выпуски с площадок размещения Мосбиржи" % str(ex)[:100]
     out["t"] = time.time() - t0
 
 
@@ -12481,9 +12552,9 @@ def pv_compute():
     if cal_box.get("err"):
         errs.append(cal_box["err"])
     elif "cal" not in cal_box:
-        errs.append("календарь размещений investmint: не ответил вовремя")
+        errs.append("календарь размещений investmint: не ответил вовремя; показаны выпуски с площадок размещения Мосбиржи")
     elif not cal:
-        errs.append("календарь размещений investmint: 0 строк — возможно, изменилась разметка сайта")
+        errs.append("календарь размещений investmint: 0 строк — возможно, изменилась разметка сайта; показаны выпуски с площадок размещения Мосбиржи")
     cal_isin = {r["isin"]: r for r in cal if r.get("isin")}
     cand = set(agg) | set(live)                         # всё, что сейчас открыто на площадке размещения, — независимо от даты старта
     for sid, ms in live.items():
@@ -22853,6 +22924,44 @@ def _dfl_schedule_row(isin, today=None):
     return dfl_last_due(bz, qty, today)
 
 
+DFL_MSG_URL = "https://e-disclosure.azipi.ru/messages/%d/"
+_DFL_URL_RX = re.compile(r"https://e-disclosure\.(?:azipi\.)?ru/[^\s\"'<>]+")
+
+
+def dfl_msg_url(f):
+    """Ссылка на первоисточник — сообщение эмитента на e-disclosure. Берём url сервера, если он ведёт на раскрытие;
+    иначе собираем по номеру сообщения (doc_id). None, если нечего показать."""
+    u = str(f.get("url") or "").strip()
+    if _DFL_URL_RX.fullmatch(u):
+        return u
+    try:
+        did = int(f.get("doc_id"))
+    except (TypeError, ValueError):
+        return None
+    return DFL_MSG_URL % did if did > 0 else None
+
+
+def _dfl_issuer_name(isin):
+    """Наименование эмитента по ISIN: карточка эмитента Мосбиржи, затем название выпуска; тему сообщения сюда не подставляем
+    (она уходит в отдельное поле subject). None, если определить не удалось."""
+    if not isin:
+        return None
+    try:
+        em = issuer_of(isin) or {}
+        n = em.get("short") or em.get("title")
+        if n and str(n).strip().upper() != str(isin).upper():
+            return str(n).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        n = (_disc_issue_desc(isin) or {}).get("name")
+        if n:
+            return str(n).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def defaults_feed(since=None, isins=None, schedule=False):
     """Лента неисполненных обязательств: сообщения эмитентов (сервер данных) + флаги Мосбиржи по бумагам из isins.
     [{date, status, issuer, inn, isin, obligation, amount, executed, basis, url, date_est}], новые сверху.
@@ -22868,12 +22977,9 @@ def defaults_feed(since=None, isins=None, schedule=False):
     def one(f):
         d = f.get("data") or {}
         isin = f.get("isin")
-        name = None
-        try:
-            em = issuer_of(isin) if isin else None
-            name = (em or {}).get("short") or (em or {}).get("title")
-        except Exception:  # noqa: BLE001
-            pass
+        name = _dfl_issuer_name(isin)
+        subject = re.sub(r"\s+", " ", str(f.get("title") or "")).strip() or None
+        url = dfl_msg_url(f)
         try:
             ex = _dfl_executed(isin, f) if isin else None
         except Exception:  # noqa: BLE001
@@ -22884,9 +22990,9 @@ def defaults_feed(since=None, isins=None, schedule=False):
             ob = DISC_OBL_RU.get(o.get("obligation"), "Обязательство")
             num = " №%s" % d["coupon_no"] if d.get("coupon_no") and o.get("obligation") == "coupon" else ""
             out.append({"date": (f.get("published") or "")[:10] or None, "due_date": d.get("due_date") or f.get("due_date"),
-                        "status": "default" if d.get("status") == "default" else "technical", "issuer": name or f.get("title") or "",
-                        "inn": f.get("inn"), "isin": isin, "obligation": ob + num,
-                        "amount": o.get("amount"), "executed": ex, "basis": "Сообщение эмитента", "url": f.get("url"), "date_est": False})
+                        "status": "default" if d.get("status") == "default" else "technical", "issuer": name or isin or "",
+                        "subject": subject, "inn": f.get("inn"), "isin": isin, "obligation": ob + num,
+                        "amount": o.get("amount"), "executed": ex, "basis": "Сообщение эмитента", "url": url, "date_est": False})
         return out
     rows = [r for part in (pool_map(one, raw[:300], workers=6) if raw else []) for r in part]
     have = {r["isin"] for r in rows if r.get("isin")}
@@ -22899,7 +23005,7 @@ def defaults_feed(since=None, isins=None, schedule=False):
                 return None
             em = issuer_of(isin) or {}
             row = {"date": None, "due_date": None, "status": "default" if fl.get("default") else "technical",
-                   "issuer": em.get("short") or em.get("title") or isin, "inn": em.get("inn"), "isin": isin, "obligation": "",
+                   "issuer": _dfl_issuer_name(isin) or isin, "subject": None, "inn": em.get("inn"), "isin": isin, "obligation": "",
                    "amount": None, "executed": None, "basis": "Флаг Мосбиржи", "url": None, "date_est": False}
             if schedule:
                 try:
@@ -23011,43 +23117,89 @@ def issuer_flows_get(cfg, acc, q, force):
     return mem_put(key, issuer_cashflows(inn, h))
 
 
-def defaults_get(cfg, acc, q, force):
-    try:
-        days = max(1, min(365, int(q.get("days") or 30)))
-    except ValueError:
-        days = 30
-    since = (q.get("since") or "").strip()
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
-        since = (date.today() - timedelta(days=days)).isoformat()
-    own = str(q.get("own", "1")) != "0"
-    scope = "market" if str(q.get("scope") or "my").strip().lower() == "market" else "my"
-    key = ("defaults", since, own, scope, bool(cfg.get("sandbox")), hash(cfg.get("token") or ""), acc)
-    scan = None
+DFL_FEED_TTL, DFL_FEED_MAXAGE = 30 * 60, 24 * 3600
+_DFL_BG, _DFL_BG_LOCK = set(), threading.Lock()
+
+
+def _dfl_compute(cfg, acc, since, own, scope, mk):
+    """Сборка ответа ленты: {since, scope, rows, configured[, scan]}. mk — результат dfl_market (для scope=market)."""
     mine = _disc_own_isins(cfg, acc) if own else []
     if scope == "market":
-        mk = dfl_market(bool(force))
-        scan = mk["scan"]
         isins = list(dict.fromkeys(mine + mk["isins"]))
-        if not scan["running"] and not force:
-            hit = mem_get(key, 900)
-            if hit:
-                return dict(hit, scan=scan)
     else:
         isins = mine
-        if not force:
-            hit = mem_get(key, 900)
-            if hit:
-                return hit
     rows = defaults_feed(since, isins if (own or scope == "market") else None, schedule=True)
     mineset = set(mine)
     for r in rows:
         r["mine"] = r.get("isin") in mineset
+    if scope == "my" and own:         # «мой портфель»: сообщения других эмитентов из общей ленты сюда не попадают
+        rows = [r for r in rows if r.get("mine")]
     out = {"since": since, "scope": scope, "rows": rows, "configured": bool(ds_conf()[0])}
-    if scan is not None:
-        out["scan"] = scan
-        if scan["running"]:           # промежуточный результат не кэшируем: он меняется по мере обхода
+    if mk is not None:
+        out["scan"] = mk["scan"]
+    return out
+
+
+def _dfl_cache_key(since_q, days, own, scope, cfg, acc):
+    tok = hashlib.sha1(((cfg.get("token") or "") + "|" + str(bool(cfg.get("sandbox")))).encode("utf-8")).hexdigest()[:10]
+    return "dfl_feed_v2:%s:%s:%d:%s:%s" % (scope, since_q or days, int(own), tok, acc)
+
+
+def _dfl_refresh_bg(ckey, cfg, acc, since, own, scope):
+    """Фоновое обновление ленты: один поток на ключ, результат пишется в kv."""
+    with _DFL_BG_LOCK:
+        if ckey in _DFL_BG:
+            return
+        _DFL_BG.add(ckey)
+
+    def run():
+        try:
+            mk = dfl_market(False) if scope == "market" else None
+            out = _dfl_compute(cfg, acc, since, own, scope, mk)
+            if not (mk and mk["scan"]["running"]):
+                store().put(ckey, {"ts": time.time(), "mk_ts": (mk or {}).get("ts"), "out": out})
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with _DFL_BG_LOCK:
+                _DFL_BG.discard(ckey)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def defaults_get(cfg, acc, q, force):
+    """Лента техдефолтов. Готовый результат хранится в kv: открытие экрана отдаёт его сразу (cached_at — время сборки),
+    а устаревший (старше 30 мин или после нового обхода рынка) обновляется в фоне (refreshing=True)."""
+    try:
+        days = max(1, min(365, int(q.get("days") or 30)))
+    except ValueError:
+        days = 30
+    since_q = (q.get("since") or "").strip()
+    since = since_q if re.fullmatch(r"\d{4}-\d{2}-\d{2}", since_q) else (date.today() - timedelta(days=days)).isoformat()
+    own = str(q.get("own", "1")) != "0"
+    scope = "market" if str(q.get("scope") or "my").strip().lower() == "market" else "my"
+    ckey = _dfl_cache_key(since_q if since_q == since else "", days, own, scope, cfg, acc)
+    mk = dfl_market(bool(force)) if scope == "market" else None
+    now = time.time()
+    if not force:
+        try:
+            hit = store().get(ckey)
+        except Exception:  # noqa: BLE001
+            hit = None
+        if isinstance(hit, dict) and isinstance(hit.get("out"), dict) and now - float(hit.get("ts") or 0) < DFL_FEED_MAXAGE:
+            scanning = bool(mk and mk["scan"]["running"])
+            stale = (now - float(hit["ts"]) > DFL_FEED_TTL or hit["out"].get("since") != since
+                     or (mk is not None and hit.get("mk_ts") != mk.get("ts")))
+            if stale and not scanning:      # пока идёт обход рынка, пересборка бессмысленна: дождёмся его конца
+                _dfl_refresh_bg(ckey, cfg, acc, since, own, scope)
+            out = dict(hit["out"], cached_at=hit["ts"], refreshing=bool(stale))
+            if mk is not None:
+                out["scan"] = mk["scan"]
             return out
-    return mem_put(key, out)
+    out = _dfl_compute(cfg, acc, since, own, scope, mk)
+    if not (mk and mk["scan"]["running"]):      # промежуточный результат не кэшируем: он меняется по мере обхода
+        store().put(ckey, {"ts": now, "mk_ts": (mk or {}).get("ts"), "out": out})
+        out = dict(out, cached_at=now)
+    return out
 
 
 API_GET["/api/issuer_flows"] = issuer_flows_get
@@ -23828,6 +23980,35 @@ def stk_api_map(cfg):
         return {}
 
 
+def stk_apply_snapshot(rows, snap):
+    """Недельное и месячное изменение из готового среза сервера (по тикеру) -> число заполненных бумаг. Не трогает уже заполненное."""
+    by = {r.get("secid"): r for r in snap or [] if isinstance(r, dict)}
+    n = 0
+    for r in rows:
+        x = by.get(r.get("secid"))
+        if not x:
+            continue
+        for f in ("chg_w", "chg_m"):
+            if r.get(f) is None and isinstance(x.get(f), (int, float)) and not isinstance(x.get(f), bool):
+                r[f] = x[f]
+        n += r.get("chg_w") is not None and r.get("chg_m") is not None
+    return n
+
+
+def _stk_fill_changes(rows):
+    """chg_w / chg_m: сначала из среза сервера (без десятков запросов за историей закрытий). Если срез недоступен, устарел или
+    не покрывает торгуемые бумаги — прежний путь (цены закрытий с Мосбиржи); при полном покрытии он не нужен."""
+    try:
+        snap = market_snapshot_stocks()
+    except Exception:  # noqa: BLE001
+        snap = None
+    if snap:
+        stk_apply_snapshot(rows, snap)
+        if all(r.get("chg_w") is not None and r.get("chg_m") is not None for r in rows if (r.get("value_today") or 0) > 0):
+            return
+    _stk_changes(rows)
+
+
 def _stk_tqbr_rows(force=False):
     """Все бумаги TQBR (акции и фонды) с chg_w/chg_m; общий кэш. Фонды помечены is_fund (INSTRID «IF…»)."""
     key = ("stk_universe",)
@@ -23837,7 +24018,7 @@ def _stk_tqbr_rows(force=False):
             rows = None if force else mem_get(key, _stk_ttl())
             if rows is None:
                 rows = stk_rows_from_iss(_stk_iss(STK_SH % "TQBR", 40), STK_SECTORS)
-                _stk_changes(rows)
+                _stk_fill_changes(rows)
                 mem_put(key, rows)
     return rows
 
@@ -35416,7 +35597,7 @@ function pPri(){
   if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="pri-r">Повторить</button></div>`;
   const today=localIso(),rows=d.rows;
   // календарь будущих размещений недоступен (investmint закрыл доступ программам): остальное на экране работает по данным Мосбиржи
-  const calNote=d.cal_error?`<div class="msg" style="margin-top:16px">Календарь будущих размещений сейчас недоступен: ${esc(d.cal_error)}. Размещения, которые уже идут на Мосбирже, показаны выше; калькулятор премии работает.</div>`:'';
+  const calNote=d.cal_error?`<div class="msg" style="margin-top:16px">Календарь заранее объявленных размещений сейчас недоступен: ${esc(d.cal_error)}. ${d.cal_fallback?'Ниже показаны выпуски с площадок размещения Мосбиржи (дата начала — по данным биржи); выпуски, объявленные, но ещё не заведённые на площадку, пока не видны.':'Размещения, которые уже идут на Мосбирже, показаны выше.'} Калькулятор премии работает.</div>`:'';
   const wk=localIso(new Date(Date.now()+7*864e5));
   const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${isinTxt(r.isin)}</small>`:''}</td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
@@ -42489,6 +42670,8 @@ function loadDfl(force,quiet){
      if(sc&&sc.running){
        if(D.chg||!$('#dfl-prog'))render();else dflProg();
        D.tm=setTimeout(()=>{if(S.page==='dfl'&&D.key===dflKey())loadDfl(false,true)},3000);
+     }else if(D.data&&D.data.refreshing){
+       render();D.tm=setTimeout(()=>{if(S.page==='dfl'&&D.key===dflKey())loadDfl(false,true)},4000);
      }else render()});
 }
 const dflPl=(n,f)=>{const a=n%10,b=n%100;return a===1&&b!==11?f[0]:a>=2&&a<=4&&(b<10||b>=20)?f[1]:f[2]};
@@ -42499,10 +42682,10 @@ function dflRows(rows,since){
     const dt=r.date?ddm(r.date)+(r.date_est?` <small class="mu dfl-est" title="Дата оценена по графику выплат Мосбиржи: последняя плановая выплата до сегодняшнего дня. Фактическую дату неисполнения эмитент мог раскрыть иначе.">по графику</small>`:''):'—';
     const ru=safeUrl(r.url);
     return`<tr${r.isin?` data-isin="${esc(r.isin)}" title="Открыть карточку выпуска"`:''}><td class="l">${dt}</td><td class="l"><span class="dfl-b ${st[1]}">${st[0]}</span></td>
-      <td class="l dfl-is"><b>${esc(r.issuer||'—')}</b>${r.mine?' <span class="tag">мой</span>':''}<br><small class="mu num">${r.isin?esc(r.isin):''}${r.isin&&r.inn?' · ':''}${r.inn?'ИНН '+esc(r.inn):''}</small></td>
+      <td class="l dfl-is"><b>${esc(r.issuer||'—')}</b>${r.mine?' <span class="tag">мой</span>':''}${r.subject?`<br><small class="mu dfl-sub" title="Тема сообщения эмитента">${esc(r.subject)}</small>`:''}<br><small class="mu num">${r.isin?esc(r.isin):''}${r.isin&&r.inn?' · ':''}${r.inn?'ИНН '+esc(r.inn):''}</small></td>
       <td class="l">${esc(r.obligation||'—')}${r.due_date&&!r.date_est?`<br><small class="mu">срок ${ddm(r.due_date)}</small>`:''}</td><td class="num">${r.amount==null?'—':short(r.amount)+' ₽'}</td>
       <td class="l">${r.executed?`<span class="pos">исполнено ${ddm(r.executed)}</span>`:'<span class="mu">нет данных</span>'}</td>
-      <td class="l dfl-bs">${ru?`<a href="${esc(ru)}" target="_blank" rel="noopener">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
+      <td class="l dfl-bs">${ru?`<a href="${esc(ru)}" target="_blank" rel="noopener" title="Открыть сообщение эмитента на сайте раскрытия информации">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
 }
 function pDfl(){
   const D=S.dfl,key=dflKey();
@@ -42521,6 +42704,8 @@ function pDfl(){
   if(!d.configured)h+=`<div class="msg" style="margin:10px 0">Сервер данных недоступен: сообщения эмитентов не загружены. Ниже только флаги Мосбиржи.</div>`;
   if(sc&&sc.running)h+=`<div class="msg" style="margin:10px 0"><span class="dfl-spin"></span> <span id="dfl-prog">Проверяю выпуски Мосбиржи: ${sc.done} из ${sc.total}</span> — список дополняется по ходу проверки.</div>`;
   else if(sc&&sc.error)h+=`<div class="msg err" style="margin:10px 0">Обход рынка не завершён: ${esc(sc.error)}</div>`;
+  if(d.cached_at){const t=new Date(d.cached_at*1000),hm=t.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+    h+=`<div class="msg" style="margin:10px 0">Показан сохранённый результат от ${hm}${d.refreshing?' — обновляю в фоне…':'.'}</div>`}
   const isn=new Set(all.map(r=>r.isin||r.issuer)),iss=new Set(all.map(r=>r.inn||r.issuer));
   h+=`<p class="mu" style="margin:0 0 8px" id="dfl-cnt">Найдено: ${isn.size} ${dflPl(isn.size,['выпуск','выпуска','выпусков'])}, эмитентов: ${iss.size}</p>`;
   if(!all.length)return h+`<div class="empty" style="padding:28px 12px">${d.configured?'Неисполненных обязательств не найдено.':'Нет данных для показа.'}</div></div>`;
