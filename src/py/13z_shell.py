@@ -55,7 +55,7 @@ def shell_status(env=None, frozen=None, cfg=None):
     tauri = is_tauri_shell(env)
     return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "tauri": tauri,
             "outdated": bool(frozen and not tauri and rev < SHELL_REV_LATEST),
-            "url": SHELL_RELEASES, "asset": asset,
+            "url": SHELL_RELEASES, "asset": asset, "migrate": migrate_old_shell(env, frozen),
             "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close"))}
 
 

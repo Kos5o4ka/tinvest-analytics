@@ -27,6 +27,7 @@ import sqlite3
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error

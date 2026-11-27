@@ -54,9 +54,67 @@ function tauriUpdateNotice(){
   };
   poll();
 }
+/* Переезд на оболочку Tauri: программа сама скачивает установщик (около 20 МБ), проверяет SHA256, ставит и перезапускается.
+   «Позже» — напомнить через сутки (localStorage, без него — до конца сессии). */
+const MIGRATE_LATER_KEY='migrate_later',MIGRATE_DELAY=24*3600*1000;
+function migrateSnoozed(){
+  try{const t=+localStorage.getItem(MIGRATE_LATER_KEY)||0;return Date.now()-t<MIGRATE_DELAY&&t>0}catch(e){}
+  try{return !!sessionStorage.getItem('shell_later')}catch(e){return false}
+}
+function migrateSnooze(bar){
+  try{localStorage.setItem(MIGRATE_LATER_KEY,String(Date.now()))}catch(e){try{sessionStorage.setItem('shell_later','1')}catch(e2){}}
+  bar.remove();
+}
+function migrateManual(s){return `<a class="btn ghost" href="${esc(safeUrl(s.url)||'https://github.com/Kos5o4ka/tinvest-analytics/releases/latest')}" target="_blank" rel="noopener noreferrer">Скачать вручную</a>`}
+function migrateBanner(s){
+  if(migrateSnoozed()||document.getElementById('shell-bar'))return;
+  const bar=shellBar('');if(!bar)return;
+  const offer=()=>{
+    bar.innerHTML=`<span><b>Доступна новая версия оболочки TAnalytic</b> — быстрее, с автообновлением. Перейти сейчас (около 20 МБ, данные сохранятся).</span>
+      <span class="sb-b"><button class="btn" id="shell-go">Перейти</button><button class="btn ghost" id="shell-later">Позже</button></span>`;
+    bar.querySelector('#shell-later').onclick=()=>migrateSnooze(bar);
+    bar.querySelector('#shell-go').onclick=start;
+  };
+  const fail=msg=>{
+    bar.innerHTML=`<span><b>Не удалось перейти на новую оболочку.</b> <span class="neg">${esc(String(msg||'Неизвестная ошибка'))}</span> Программа продолжает работать как раньше.</span>
+      <span class="sb-b">${migrateManual(s)}<button class="btn ghost" id="shell-retry">Повторить</button><button class="btn ghost" id="shell-later">Позже</button></span>`;
+    bar.querySelector('#shell-later').onclick=()=>migrateSnooze(bar);
+    bar.querySelector('#shell-retry').onclick=start;
+  };
+  const show=m=>{
+    const mb=n=>(n/1e6).toFixed(1).replace('.',',');
+    let t;
+    if(m.state==='downloading')t=m.total?`Скачиваю: ${mb(m.done)} из ${mb(m.total)} МБ…`:'Скачиваю установщик…';
+    else if(m.state==='installing')t='Проверил контрольную сумму, устанавливаю…';
+    else t='Готово. Программа закроется и откроется в новой оболочке…';
+    bar.innerHTML=`<span><b>Переход на новую оболочку.</b> ${esc(t)} Не закрывайте программу.</span>`;
+  };
+  async function start(){
+    show({state:'downloading',done:0,total:0});
+    let m;
+    try{m=await post('/api/shell/migrate',{})}catch(e){return fail(e&&e.message||e)}
+    let lost=0;
+    const tick=async()=>{
+      if(!document.getElementById('shell-bar'))return;
+      try{m=await api('/api/shell/migrate');lost=0}
+      catch(e){
+        lost++;                                   /* сервер завершился — значит, переезд дошёл до перезапуска */
+        if(lost>=3){bar.innerHTML='<span><b>Программа перезапускается в новой оболочке.</b> Если окно не открылось через минуту, откройте TAnalytic из меню «Пуск» или «Программ».</span>';return}
+        return setTimeout(tick,1500);
+      }
+      if(m.state==='error')return fail(m.error);
+      if(m.state==='idle')return fail('Задача перехода не запущена.');
+      show(m);setTimeout(tick,m.state==='downloading'?500:1000);
+    };
+    if(m&&m.state==='error')return fail(m.error);
+    tick();
+  }
+  offer();
+}
 async function shellNotice(){
   let s;try{s=await api('/api/shell')}catch(e){return}
   if(s&&s.tauri){tauriUpdateNotice();return}      /* под Tauri старый канал обновления оболочки не используется */
+  if(s&&s.migrate){migrateBanner(s);return}       /* старая оболочка: автоматический переезд на Tauri */
   if(!s||!s.outdated)return;
   try{if(sessionStorage.getItem('shell_later'))return}catch(e){}
   if(document.getElementById('shell-bar'))return;
