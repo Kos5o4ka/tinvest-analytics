@@ -31,7 +31,7 @@ class TauriConfigAndFiles(unittest.TestCase):
             conf = json.load(f)
         self.assertEqual(conf["productName"], "TAnalytic")
         self.assertEqual(conf["version"], "0.31.0")
-        self.assertEqual(conf["identifier"], "ru.tanalytic.app")
+        self.assertEqual(conf["identifier"], "ru.tanalytic.desktop")
         win = conf["app"]["windows"][0]
         self.assertEqual(win["label"], "main")
         self.assertEqual((win["width"], win["height"]), (1280, 860))
@@ -87,7 +87,6 @@ class TauriConfigAndFiles(unittest.TestCase):
         self.assertIn("main", cap["windows"])
         urls = cap["remote"]["urls"]
         self.assertIn("http://127.0.0.1:*/*", urls)
-        self.assertIn("http://localhost:*/*", urls)
         perms = set(cap["permissions"])
         for req in (
             "core:default",
@@ -116,7 +115,6 @@ class TauriConfigAndFiles(unittest.TestCase):
             "tauri_pick_file",
             "tauri_autostart_get",
             "tauri_autostart_set",
-            "tauri_bio_verify",
         ):
             self.assertRegex(lib_rs, r"#\[tauri::command\][\s\S]{0,120}\b" + cmd + r"\b")
             self.assertIn(cmd, lib_rs.split("generate_handler![", 1)[1])
@@ -133,8 +131,21 @@ class TauriConfigAndFiles(unittest.TestCase):
             "hidden_title(true)",
             "--no-window",
             "TAnalytic-backend",
+            "--parent-pid",
+            "TINVEST_SHELL",
+            "on_navigation",
+            "Повторить",
         ):
             self.assertIn(needle, lib_rs)
+        self.assertNotIn("tauri_bio_verify", lib_rs)
+        self.assertNotIn("--tray", lib_rs)
+        # single-instance — первый плагин, sidecar стартует в setup, а не до Builder
+        self.assertLess(lib_rs.index("tauri_plugin_single_instance::init"), lib_rs.index("tauri_plugin_dialog::init"))
+        self.assertNotIn("spawn_sidecar(port).ok()", lib_rs)
+        self.assertIn("start_backend(app.handle())", lib_rs.split(".setup(", 1)[1])
+        with open(os.path.join(TAURI_DIR, "capabilities", "default.json"), encoding="utf-8") as f:
+            caps = json.load(f)
+        self.assertEqual(caps["remote"]["urls"], ["http://127.0.0.1:*/*"])
 
     def test_workflows_and_docs(self):
         yml_path = os.path.join(ROOT, ".github", "workflows", "tauri.yml")
@@ -161,6 +172,8 @@ class FrontendTauriIntegration(unittest.TestCase):
         self.assertIn("tauri_win_minimize", js)
         self.assertIn("tauri_win_toggle_max", js)
         self.assertIn("tauri_win_close", js)
+        self.assertNotIn("dblclick", js)       # двойной клик по шапке обрабатывает сам Tauri (drag-region)
+        self.assertNotIn("tauri_bio_verify", js)
 
         self.assertIn("html.is-tauri .tauri-bar", css)
         self.assertIn("height:34px", css)
@@ -201,51 +214,10 @@ class LauncherTauriHooks(unittest.TestCase):
         api.win_close()
         self.assertEqual(api._win.calls, ["min", "max", "restore", "close"])
 
-    def test_check_lock_gate_default_and_biometric_flows(self):
-        # По умолчанию (lock_enabled=False) биометрия не запрашивается
-        called = []
-        r0 = L.check_lock_gate(
-            "http://127.0.0.1:9999/",
-            cfg={},
-            get_status=lambda _u: {"enabled": False, "unlocked": True, "_ok": True},
-            verify_fn=lambda: called.append("bio") or True,
-        )
-        self.assertEqual(r0["unlocked"], True)
-        self.assertEqual(called, [])
-
-        # Включено и заблокировано, биометрия прошла -> авторазблокировка
-        unlocked_urls = []
-        r1 = L.check_lock_gate(
-            "http://127.0.0.1:9999/",
-            cfg={"lock_enabled": True},
-            get_status=lambda _u: {"enabled": True, "unlocked": False, "biometric": True, "_ok": True},
-            verify_fn=lambda: True,
-            unlock_fn=lambda u: unlocked_urls.append(u) or True,
-        )
-        self.assertEqual(r1, {"locked": True, "unlocked": True, "method": "biometric"})
-        self.assertEqual(unlocked_urls, ["http://127.0.0.1:9999/"])
-
-        # Биометрия отклонена -> остаёмся на веб-экране блокировки
-        unlocked_urls.clear()
-        r2 = L.check_lock_gate(
-            "http://127.0.0.1:9999/",
-            cfg={"lock_enabled": True},
-            get_status=lambda _u: {"enabled": True, "unlocked": False, "biometric": True, "_ok": True},
-            verify_fn=lambda: False,
-            unlock_fn=lambda u: unlocked_urls.append(u) or True,
-        )
-        self.assertEqual(r2, {"locked": True, "unlocked": False, "method": "web"})
-        self.assertEqual(unlocked_urls, [])
-
-        # Уже разблокировано на сервере -> биометрия не запускается
-        r3 = L.check_lock_gate(
-            "http://127.0.0.1:9999/",
-            cfg={"lock_enabled": True},
-            get_status=lambda _u: {"enabled": True, "unlocked": True, "_ok": True},
-            verify_fn=lambda: self.fail("verify_fn must not run when already unlocked"),
-        )
-        self.assertFalse(r3["locked"])
-        self.assertTrue(r3["unlocked"])
+    def test_launcher_has_no_lock_gate(self):
+        # блокировку целиком показывает сервер (PIN обязателен); лаунчер не должен ни спрашивать биометрию, ни ждать
+        for name in ("check_lock_gate", "post_lock_unlock", "fetch_lock_status", "bio_verify"):
+            self.assertFalse(hasattr(L, name), name)
 
     def test_shutdown_posts_endpoint_and_runs_hook(self):
         hits = []
