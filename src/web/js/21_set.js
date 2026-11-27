@@ -142,7 +142,7 @@ function bindSetDs(c,msg){
   g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Ключ сохранён.',1);authCheck(true);renderSettings()}catch(x){msg(x.message);dirty.upd()}};
   g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{key:g('ds-key').value});
     msg(`Сервер работает: версия ${r.version}, записей в кэше ${r.cache_items}.`,1)}catch(x){msg(x.message)}finally{b.disabled=false}};
-  if(g('ds-clr'))g('ds-clr').onclick=async()=>{try{if(!confirm('Удалить сохранённый ключ сервера данных?'))return;await post('/api/config',{clear_data_key:true});authCheck(true);c.secret_set=Object.assign({},c.secret_set,{data_key:false});renderSettings()}catch(x){msg(x.message)}};
+  if(g('ds-clr'))g('ds-clr').onclick=async()=>{try{if(!await uiConfirm({title:'Удалить ключ сервера данных?', body:'Сохранённый ключ будет стёрт с этого компьютера.', danger:true, okText:'Удалить'}))return;await post('/api/config',{clear_data_key:true});authCheck(true);c.secret_set=Object.assign({},c.secret_set,{data_key:false});renderSettings()}catch(x){msg(x.message)}};
 }
 /* ── Данные на компьютере ── */
 function ldBytes(n){
@@ -178,11 +178,11 @@ function bindSetLocal(c,msg,busy,reset){
   const g=id=>document.getElementById(id);
   ldLoad();
   g('ld-open').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/localdata/open')});
-  g('ld-clear').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Очистить кэш?\n\nБудут удалены логотипы и временные данные рынка — они скачаются заново. Операции, настройки, токен и список наблюдения останутся.'))return;
+  g('ld-clear').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Очистить кэш?', body:'Будут удалены логотипы и временные данные рынка — они скачаются заново. Операции, настройки, токен и список наблюдения останутся.', okText:'Очистить'}))return;
     const r=await post('/api/localdata/clear');reset();msg('Кэш очищен, освобождено '+ldBytes(r.freed)+'.',1);ldLoad()});
   g('ld-wipe').onclick=e=>busy(e.currentTarget,async()=>{
-    if(!confirm('Удалить ВСЕ данные программы с этого компьютера?\n\nБудут стёрты: токен Т-Инвестиций, ключ входа, база операций (включая импорт из отчётов брокеров), история, список наблюдения, заметки и настройки.\n\nЭто нельзя отменить. Сделайте резервную копию заранее, если она нужна.'))return;
-    if(!confirm('Точно удалить всё? Программа вернётся к экрану входа, как при первом запуске.'))return;
+    if(!await uiConfirm({title:'Удалить все данные программы?', body:'Будут стёрты: токен Т-Инвестиций, ключ входа, база операций (включая импорт из отчётов брокеров), история, список наблюдения, заметки и настройки.\n\nЭто нельзя отменить. Сделайте резервную копию заранее, если она нужна.', danger:true, okText:'Продолжить'}))return;
+    if(!await uiConfirm({title:'Точно удалить всё?', body:'Программа вернётся к экрану входа, как при первом запуске.', danger:true, okText:'Да, удалить всё'}))return;
     await post('/api/localdata/wipe',{confirm:'delete-all'});
     try{localStorage.clear()}catch(x){}
     location.reload()});
@@ -206,5 +206,5 @@ async function bindSetAcc(msg){
   else el.textContent=s.server?'Вы не вошли: нужен ключ из бота.':'Сервер данных выключен — вход по ключу не нужен.';
   const out=document.getElementById('acc-out');
   if(out&&s&&s.state==='ok'&&(s.username||s.expires)){out.style.display='';
-    out.onclick=async()=>{try{if(!confirm('Выйти и стереть ключ с этого компьютера?'))return;AUTH.st=await post('/api/auth/logout');authApply()}catch(e){msg(e.message)}}}
+    out.onclick=async()=>{try{if(!await uiConfirm({title:'Выйти и стереть ключ?', body:'Ключ будет удалён с этого компьютера, для нового входа понадобится ключ из бота.', danger:true, okText:'Выйти'}))return;AUTH.st=await post('/api/auth/logout');authApply()}catch(e){msg(e.message)}}}
 }

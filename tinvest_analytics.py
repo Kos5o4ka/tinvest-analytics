@@ -30471,6 +30471,34 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
   .toast-i.out{transform:none}
 }
 @media print{#toasts,#dl-bar,#dl-chord,#ks-ov{display:none!important}}
+/* ── Диалоги подтверждения и сообщений (07a_dialog.js) ── */
+#ui-dlg-ov{position:fixed;inset:0;z-index:1400;display:grid;place-items:center;padding:16px;background:#000000a6;
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);opacity:0;transition:opacity .16s}
+#ui-dlg-ov.is-in{opacity:1}
+.ui-dlg{width:min(440px,100%);max-height:90vh;overflow:auto;padding:20px 22px 18px;border-radius:18px;background:var(--d2);color:var(--tx);
+  border:1px solid var(--line2);box-shadow:var(--d2-hl),var(--d2-shadow);transform:translateY(8px) scale(.985);transition:transform .2s cubic-bezier(.2,.8,.2,1)}
+#ui-dlg-ov.is-in .ui-dlg{transform:none}
+.ui-dlg-h{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.ui-dlg-h h3{margin:0;font-size:16.5px;font-weight:650;letter-spacing:-.015em;line-height:1.3}
+.ui-dlg-ic{flex:none;width:34px;height:34px;border-radius:10px;display:grid;place-items:center;color:var(--ac-tx);
+  background:radial-gradient(120% 120% at 20% 0%,rgba(var(--ac-rgb),.22),transparent 70%),var(--card2);box-shadow:inset 0 1px 0 #ffffff1c,0 0 0 1px var(--line2)}
+.ui-dlg-ic svg{width:19px;height:19px}
+.ui-dlg.danger .ui-dlg-ic,.ui-dlg.err .ui-dlg-ic{color:var(--neg);background:radial-gradient(120% 120% at 20% 0%,#f0626a33,transparent 70%),var(--card2)}
+.ui-dlg-b{font-size:13.5px;line-height:1.55;color:var(--tx2);padding-left:46px}
+.ui-dlg-b p{margin:0 0 9px}.ui-dlg-b p:last-child{margin-bottom:0}
+.ui-dlg-f{display:flex;justify-content:flex-end;gap:10px;margin-top:18px;flex-wrap:wrap}
+.ui-dlg-f .btn{min-width:96px;justify-content:center}
+.btn.danger.solid{background:var(--neg);color:#fff;border:0;box-shadow:none}
+.btn.danger.solid:hover{filter:brightness(1.08)}
+.btn.danger.solid:focus-visible{outline:2px solid var(--tx);outline-offset:2px}
+@media(max-width:520px){.ui-dlg-b{padding-left:0}}
+@media(prefers-reduced-motion:reduce){#ui-dlg-ov,.ui-dlg{transition:none}}
+@media print{#ui-dlg-ov{display:none!important}}
+
+/* кнопка действия в тосте (например «Отменить») */
+.toast-act{all:unset;cursor:pointer;margin-left:6px;padding:3px 9px;border-radius:8px;font-size:12.5px;font-weight:600;color:var(--ac-tx);background:rgba(var(--ac-rgb),.14)}
+.toast-act:hover{background:rgba(var(--ac-rgb),.26)}
+.toast-act:focus-visible{outline:2px solid var(--ac);outline-offset:1px}
 /* ── Настройки v2: две панели, панель состояния, строки-настройки, единые переключатели ── */
 
 /* единый переключатель 34×20 (настройки, фильтры, калькуляторы) */
@@ -31415,6 +31443,45 @@ function histSlice(){
 
 /* единая строка-дисклеймер (39-ФЗ) для страниц со сравнением бумаг, сигналами, офертами и т. п. */
 const NIR_NOTE='<p class="note nir">Не является индивидуальной инвестиционной рекомендацией. Расчёты носят информационно-справочный характер; упомянутые инструменты и операции могут не соответствовать вашему инвестиционному профилю.</p>';
+/* ── Свои диалоги вместо alert/confirm: uiConfirm({title,body,danger,okText,cancelText}) → Promise<bool>, uiAlert({title,body,okText,kind}) → Promise<void> ──
+   Тёмная и светлая тема (через токены), Esc и клик по фону — отмена, при опасном действии фокус на безопасной кнопке,
+   Tab не выходит за окно, после закрытия фокус возвращается. Несколько вызовов подряд показываются по очереди. */
+var UI_DLG_Q=[];var UI_DLG_BUSY=false;
+function uiDlgNorm(o,def){if(typeof o==='string')o={body:o};return Object.assign({},def,o||{})}
+function uiDlgOpen(o){
+  return new Promise(resolve=>{UI_DLG_Q.push({o,resolve});if(!UI_DLG_BUSY)uiDlgNext()});
+}
+function uiDlgNext(){
+  const it=UI_DLG_Q.shift();
+  if(!it){UI_DLG_BUSY=false;return}
+  UI_DLG_BUSY=true;
+  const o=it.o,prev=document.activeElement;
+  const ov=document.createElement('div');ov.id='ui-dlg-ov';
+  const ic=o.danger?'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>':o.kind==='err'?'<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16h.01"/>':'<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>';
+  const paras=String(o.body==null?'':o.body).split(/\n{2,}/).map(t=>'<p>'+esc(t).replace(/\n/g,'<br>')+'</p>').join('');
+  const id='ui-dlg-t'+Date.now();
+  ov.innerHTML=`<div class="ui-dlg${o.danger?' danger':''}${o.kind==='err'?' err':''}" role="${o.confirm?'alertdialog':'dialog'}" aria-modal="true" aria-labelledby="${id}">
+    <div class="ui-dlg-h"><i class="ui-dlg-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ic}</svg></i>
+    <h3 id="${id}">${esc(o.title||'')}</h3></div>${paras?`<div class="ui-dlg-b">${paras}</div>`:''}
+    <div class="ui-dlg-f">${o.confirm?`<button class="btn ghost" data-r="0">${esc(o.cancelText||'Отмена')}</button>`:''}<button class="btn${o.danger?' danger solid':''}" data-r="1">${esc(o.okText||(o.confirm?'Подтвердить':'Понятно'))}</button></div></div>`;
+  document.body.appendChild(ov);
+  let done=false;
+  const close=r=>{if(done)return;done=true;window.removeEventListener('keydown',key,true);ov.classList.remove('is-in');
+    setTimeout(()=>{ov.remove();try{if(prev&&prev.focus&&document.contains(prev))prev.focus()}catch(e){}it.resolve(o.confirm?!!r:undefined);uiDlgNext()},140)};
+  const btns=[...ov.querySelectorAll('button[data-r]')];
+  btns.forEach(b=>b.onclick=()=>close(b.dataset.r==='1'));
+  ov.addEventListener('mousedown',e=>{if(e.target===ov)close(false)});
+  function key(e){
+    if(e.key==='Escape'){e.preventDefault();e.stopPropagation();close(false);return}
+    if(e.key==='Tab'){e.preventDefault();e.stopPropagation();const i=btns.indexOf(document.activeElement);btns[(i+(e.shiftKey?btns.length-1:1))%btns.length].focus()}
+  }
+  window.addEventListener('keydown',key,true);
+  requestAnimationFrame(()=>{ov.classList.add('is-in');(o.danger&&o.confirm?btns[0]:btns[btns.length-1]).focus()});
+}
+function uiConfirm(o){return uiDlgOpen(uiDlgNorm(o,{confirm:true,title:'Подтвердите действие'}))}
+function uiAlert(o){return uiDlgOpen(uiDlgNorm(o,{confirm:false,title:'Сообщение'}))}
+/* ошибка запроса одним вызовом: uiErr(e) или uiErr(e,'Не удалось удалить') */
+function uiErr(e,title){return uiAlert({title:title||'Ошибка',body:(e&&e.message)||String(e||''),kind:'err'})}
 /* ── Обзор ── */
 function pDash(){
   const d=S.data,p=d.portfolio,t=T(),lf=d.life;
@@ -32806,7 +32873,7 @@ function feeTariffOptimizer(){
 }
 /* Счета других брокеров (импорт отчётов): свои тарифы, модель Т-Инвестиций к ним не применяется */
 async function feeSetTariff(id,v){
-  try{await post('/api/config',{broker_tariffs:{[id]:v}});load(false,true)}catch(e){alert(e.message)}
+  try{await post('/api/config',{broker_tariffs:{[id]:v}});load(false,true)}catch(e){uiErr(e)}
 }
 function feeOtherBrokers(){
   const rows=(S.data||{}).broker_fees||[];
@@ -33201,7 +33268,7 @@ async function renderImport(){
           catch(err){bb.disabled=false;bb.textContent='Импортировать';msg(esc(err.message))}}}
       catch(err){$('#iresult').innerHTML=`<div class="msg err">${esc(err.message)}</div>`}finally{b.disabled=false}};
   }
-  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(!confirm('Удалить импортированный счёт и его операции из локальной базы?'))return;
+  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(!await uiConfirm({title:'Удалить импортированный счёт?', body:'Счёт и его операции будут удалены из локальной базы. Исходный файл отчёта можно загрузить снова.', danger:true, okText:'Удалить'}))return;
     await post('/api/import/delete',{id:b.dataset.del});if(S.account===b.dataset.del)S.account='all';S.data=S.bonds=S.hist=null;persist();renderImport();load(true)});
   document.querySelectorAll('[data-brk]').forEach(s=>s.onchange=async()=>{
     try{await post('/api/import/broker',{id:s.dataset.brk,broker_id:s.value});S.data=null;msg('Брокер счёта сохранён.','ok');load(true)}catch(e){msg(esc(e.message))}});
@@ -33352,7 +33419,7 @@ function bindSetDs(c,msg){
   g('ds-save').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();msg('Ключ сохранён.',1);authCheck(true);renderSettings()}catch(x){msg(x.message);dirty.upd()}};
   g('ds-test').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await post('/api/dataserver/test',{key:g('ds-key').value});
     msg(`Сервер работает: версия ${r.version}, записей в кэше ${r.cache_items}.`,1)}catch(x){msg(x.message)}finally{b.disabled=false}};
-  if(g('ds-clr'))g('ds-clr').onclick=async()=>{try{if(!confirm('Удалить сохранённый ключ сервера данных?'))return;await post('/api/config',{clear_data_key:true});authCheck(true);c.secret_set=Object.assign({},c.secret_set,{data_key:false});renderSettings()}catch(x){msg(x.message)}};
+  if(g('ds-clr'))g('ds-clr').onclick=async()=>{try{if(!await uiConfirm({title:'Удалить ключ сервера данных?', body:'Сохранённый ключ будет стёрт с этого компьютера.', danger:true, okText:'Удалить'}))return;await post('/api/config',{clear_data_key:true});authCheck(true);c.secret_set=Object.assign({},c.secret_set,{data_key:false});renderSettings()}catch(x){msg(x.message)}};
 }
 /* ── Данные на компьютере ── */
 function ldBytes(n){
@@ -33388,11 +33455,11 @@ function bindSetLocal(c,msg,busy,reset){
   const g=id=>document.getElementById(id);
   ldLoad();
   g('ld-open').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/localdata/open')});
-  g('ld-clear').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Очистить кэш?\n\nБудут удалены логотипы и временные данные рынка — они скачаются заново. Операции, настройки, токен и список наблюдения останутся.'))return;
+  g('ld-clear').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Очистить кэш?', body:'Будут удалены логотипы и временные данные рынка — они скачаются заново. Операции, настройки, токен и список наблюдения останутся.', okText:'Очистить'}))return;
     const r=await post('/api/localdata/clear');reset();msg('Кэш очищен, освобождено '+ldBytes(r.freed)+'.',1);ldLoad()});
   g('ld-wipe').onclick=e=>busy(e.currentTarget,async()=>{
-    if(!confirm('Удалить ВСЕ данные программы с этого компьютера?\n\nБудут стёрты: токен Т-Инвестиций, ключ входа, база операций (включая импорт из отчётов брокеров), история, список наблюдения, заметки и настройки.\n\nЭто нельзя отменить. Сделайте резервную копию заранее, если она нужна.'))return;
-    if(!confirm('Точно удалить всё? Программа вернётся к экрану входа, как при первом запуске.'))return;
+    if(!await uiConfirm({title:'Удалить все данные программы?', body:'Будут стёрты: токен Т-Инвестиций, ключ входа, база операций (включая импорт из отчётов брокеров), история, список наблюдения, заметки и настройки.\n\nЭто нельзя отменить. Сделайте резервную копию заранее, если она нужна.', danger:true, okText:'Продолжить'}))return;
+    if(!await uiConfirm({title:'Точно удалить всё?', body:'Программа вернётся к экрану входа, как при первом запуске.', danger:true, okText:'Да, удалить всё'}))return;
     await post('/api/localdata/wipe',{confirm:'delete-all'});
     try{localStorage.clear()}catch(x){}
     location.reload()});
@@ -33416,7 +33483,7 @@ async function bindSetAcc(msg){
   else el.textContent=s.server?'Вы не вошли: нужен ключ из бота.':'Сервер данных выключен — вход по ключу не нужен.';
   const out=document.getElementById('acc-out');
   if(out&&s&&s.state==='ok'&&(s.username||s.expires)){out.style.display='';
-    out.onclick=async()=>{try{if(!confirm('Выйти и стереть ключ с этого компьютера?'))return;AUTH.st=await post('/api/auth/logout');authApply()}catch(e){msg(e.message)}}}
+    out.onclick=async()=>{try{if(!await uiConfirm({title:'Выйти и стереть ключ?', body:'Ключ будет удалён с этого компьютера, для нового входа понадобится ключ из бота.', danger:true, okText:'Выйти'}))return;AUTH.st=await post('/api/auth/logout');authApply()}catch(e){msg(e.message)}}}
 }
 /* ── Настройки: Telegram, резервная копия, экспорт, помощь с раскрытиями (строки-настройки, мгновенное сохранение) ── */
 /* ── Telegram: уведомления идут через сервер данных и общего бота ── */
@@ -33459,13 +33526,13 @@ function bindSetTg(c,msg){
     try{const r=await save();stOk(el);if(r.warning)msg(r.warning);setTimeout(srvShow,4500)}catch(x){msg(x.message)}}));
   g('tg-srv').addEventListener('change',async e=>{
     const el=e.currentTarget;
-    if(el.checked&&!confirm('Включить проверку на сервере?\n\nНа сервер данных будут отправлены: ISIN и названия бумаг из списка наблюдения с целями, даты напоминаний дневника (без текста), даты ближайших оферт и выплат по облигациям портфеля (с суммами выплат). Токен, счета и стоимость портфеля не передаются.\n\nУдалить данные можно в любой момент кнопкой «Удалить данные с сервера» или в боте командой /alerts.')){el.checked=false;return}
+    if(el.checked&&!await uiConfirm({title:'Включить проверку на сервере?', body:'На сервер данных будут отправлены: ISIN и названия бумаг из списка наблюдения с целями, даты напоминаний дневника (без текста), даты ближайших оферт и выплат по облигациям портфеля (с суммами выплат). Токен, счета и стоимость портфеля не передаются.\n\nУдалить данные можно в любой момент кнопкой «Удалить данные с сервера» или в боте командой /alerts.', okText:'Включить'})){el.checked=false;return}
     try{const r=await save();
       if(el.checked){const s=await post('/api/tg/server',{action:'sync'});const n=s.counts||{};msg(`Сервер будет проверять: целей — ${n.goals||0}, напоминаний — ${n.reminders||0}, оферт — ${n.offers||0}, выплат — ${n.pays||0}.`,1)}
       else msg(r.warning||'Проверка на сервере выключена, данные удалены с сервера.',!r.warning);
     }catch(x){msg(x.message)}finally{srvShow()}});
   g('tg-srv-del').onclick=e=>busy(e.currentTarget,async()=>{
-    if(!confirm('Удалить подписку на тревоги с сервера и выключить проверку на сервере?'))return;
+    if(!await uiConfirm({title:'Удалить подписку с сервера?', body:'Подписка на тревоги будет удалена с сервера, проверка на сервере выключится.', danger:true, okText:'Удалить'}))return;
     await post('/api/tg/server',{action:'delete'});g('tg-srv').checked=false;c.tg_server=false;msg('Данные удалены с сервера.',1);srvShow()});
   srvShow();
   api('/api/tg/info').then(i=>{
@@ -33524,13 +33591,13 @@ function bindSetBackup(c,msg){
   stEnter(['bkdir','bkpw','bkkeep'],'bksave');
   $('#bksave').onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{await save();dirty.rebase();stOk(b);show()}catch(x){msg(x.message);dirty.upd()}};
   $('#bkauto').onchange=async e=>{const el=e.currentTarget;try{await save();dirty.rebase();stOk(el);show()}catch(x){el.checked=!el.checked;msg(x.message)}};
-  $('#bkclr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Забыть пароль? Автоматические копии отключатся. Сами копии останутся и откроются прежним паролем.'))return;await post('/api/backup/settings',{clear_password:true});$('#bkauto').checked=false;msg('Пароль удалён из настроек.',1);show()});
+  $('#bkclr').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Забыть пароль копий?', body:'Автоматические копии отключатся. Сами копии останутся и откроются прежним паролем.', danger:true, okText:'Забыть'}))return;await post('/api/backup/settings',{clear_password:true});$('#bkauto').checked=false;msg('Пароль удалён из настроек.',1);show()});
   $('#bkrun').onclick=e=>busy(e.currentTarget,async()=>{
     const pw=$('#bkpw').value;await post('/api/backup/settings',{backup_dir:$('#bkdir').value,backup_keep:$('#bkkeep').value});
     await post('/api/backup/run',{password:pw});msg('Копия запущена, статус обновится ниже.',1);setTimeout(show,800)});
   $('#bkrest').onclick=e=>busy(e.currentTarget,async()=>{
     const f=$('#bkfile').files[0];if(!f)return msg('Выберите файл копии (.tinvbak).');
-    if(!confirm('Восстановить данные из этой копии? Текущая база будет сохранена рядом, замена произойдёт при следующем запуске.'))return;
+    if(!await uiConfirm({title:'Восстановить данные из копии?', body:'Текущая база будет сохранена рядом, замена произойдёт при следующем запуске.', okText:'Восстановить'}))return;
     msg('Расшифровываю и проверяю копию…',1);
     const b64=await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]||'');r.onerror=()=>no(new Error('Не удалось прочитать файл'));r.readAsDataURL(f)});
     await post('/api/backup/restore',{data:b64,password:$('#bkrpw').value});$('#bkrpw').value='';
@@ -33736,8 +33803,8 @@ async function renderSettings(){
   /* песочница меняет и адреса API, и нужный токен — применяется вместе с токеном по «Сохранить и подключиться», а не сразу */
   $('#sb').onchange=e=>{const el=e.currentTarget;if(el.checked===!!c.sandbox)return;
     stMsg(el.checked?'Вставьте токен песочницы и нажмите «Сохранить и подключиться».':'Вставьте боевой токен (только чтение) и нажмите «Сохранить и подключиться».',1)};
-  $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Заново загрузить все операции и цены из Т-Инвестиций? Это может занять время.'))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
-  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
+  $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Загрузить данные заново?', body:'Все операции и цены будут заново загружены из Т-Инвестиций. Это может занять время.', okText:'Загрузить'}))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
+  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Удалить токен?', body:'Сохранённый токен Т-Инвестиций будет стёрт с этого компьютера.', danger:true, okText:'Удалить'}))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
   if($('#sbpay'))$('#sbpay').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sandbox/payin',{accountId:S.account,amount:$('#amt').value});S.data=S.bonds=S.hist=null;msg('Счёт пополнен на '+M(+$('#amt').value,'rub',0),1);load(true)});
 }
@@ -36396,13 +36463,16 @@ function bindWatch(){
   }
   const sug=$('#wt-sug');
   if(sug)sug.onclick=async e=>{const b=e.target.closest('[data-wadd]');if(!b)return;e.stopPropagation();b.disabled=true;
-    try{await watchToggle(b.dataset.wadd);S.wsug=[]}catch(er){alert(er.message)}};
+    try{await watchToggle(b.dataset.wadd);S.wsug=[]}catch(er){uiErr(er)}};
   const tab=$('#wt-tab');
   if(tab){
     tab.onclick=async e=>{const b=e.target.closest('[data-wdel]');if(!b)return;e.stopPropagation();
-      try{await post('/api/watch',{action:'remove',isin:b.dataset.wdel});S.wset.delete(b.dataset.wdel);S.watch=null;render()}catch(er){alert(er.message)}};
+      const isin=b.dataset.wdel,keep={action:'add',isin};
+      b.closest('tr').querySelectorAll('.wt-in').forEach(i=>{if(i.value)keep[i.dataset.k]=i.value});
+      try{await post('/api/watch',{action:'remove',isin});S.wset.delete(isin);S.watch=null;render();
+        toast('Бумага убрана из наблюдения',{text:'Отменить',fn:async()=>{try{const r=await post('/api/watch',keep);S.wset=new Set(r.isins||[]);S.watch=null;watchRefreshView();render()}catch(er){uiErr(er)}}})}catch(er){uiErr(er)}};
     tab.onchange=async e=>{const i=e.target.closest('.wt-in');if(!i)return;
-      try{await post('/api/watch',{action:'update',isin:i.dataset.isin,[i.dataset.k]:i.value});if(i.dataset.k!=='note'){S.watch=null;render()}}catch(er){alert(er.message)}};
+      try{await post('/api/watch',{action:'update',isin:i.dataset.isin,[i.dataset.k]:i.value});if(i.dataset.k!=='note'){S.watch=null;render()}}catch(er){uiErr(er)}};
   }
   const sel=$('#nt-sel');
   if(sel)sel.onchange=()=>{$('#nt-isin').style.display=sel.value==='_other'?'':'none'};
@@ -36418,16 +36488,16 @@ function bindWatch(){
     catch(er){m(er.message);add.disabled=false}};
   const fl=$('#nt-flt');if(fl)fl.onchange=()=>{S.wfilter=fl.value;render()};
   const view=$('#view');
-  if(view)view.querySelectorAll('[data-ndel]').forEach(b=>b.onclick=async e=>{e.stopPropagation();if(!confirm('Удалить заметку?'))return;
-    try{await post('/api/notes',{action:'delete',id:b.dataset.ndel});S.wnotes=null;S.watch=null;render()}catch(er){alert(er.message)}});
+  if(view)view.querySelectorAll('[data-ndel]').forEach(b=>b.onclick=async e=>{e.stopPropagation();if(!await uiConfirm({title:'Удалить заметку?', danger:true, okText:'Удалить'}))return;
+    try{await post('/api/notes',{action:'delete',id:b.dataset.ndel});S.wnotes=null;S.watch=null;render()}catch(er){uiErr(er)}});
   if(view)view.querySelectorAll('[data-ndone]').forEach(b=>b.onclick=async e=>{e.stopPropagation();
-    try{await post('/api/notes',{action:'done',id:b.dataset.ndone});S.wnotes=null;S.watch=null;render()}catch(er){alert(er.message)}});
+    try{await post('/api/notes',{action:'done',id:b.dataset.ndone});S.wnotes=null;S.watch=null;render()}catch(er){uiErr(er)}});
 }
 /* звёздочки (скринер, карточка и др.): клик не открывает карточку выпуска */
 document.addEventListener('click',async e=>{
   const b=e.target.closest('[data-wstar]');if(!b)return;
   e.stopPropagation();b.disabled=true;
-  try{await watchToggle(b.dataset.wstar)}catch(er){alert(er.message)}finally{b.disabled=false}
+  try{await watchToggle(b.dataset.wstar)}catch(er){uiErr(er)}finally{b.disabled=false}
 },true);
 /* ── Зашифрованная резервная копия и экспорт ── */
 /* постоянная плашка: копия принята, но применится только при следующем запуске */
@@ -37135,7 +37205,7 @@ async function demoEnter(btn){
     DEMO.on=true;DEMO.at=Date.now();demoReset();S.page='dash';persist();
     try{S.cfg=await api('/api/config')}catch(e){}
     renderNav();demoBar();load(true);
-  }catch(e){if(btn){btn.disabled=false;btn.textContent='Посмотреть демо-портфель'}alert('Не удалось включить демо: '+(e&&e.message||e))}
+  }catch(e){if(btn){btn.disabled=false;btn.textContent='Посмотреть демо-портфель'}uiErr(e,'Не удалось включить демо')}
   finally{DEMO.busy=false}
 }
 async function demoExit(){
@@ -37145,7 +37215,7 @@ async function demoExit(){
     DEMO.on=false;demoReset();ob.skip=false;ob.done=false;
     try{S.cfg=await api('/api/config')}catch(e){}
     S.accounts=[];S.page='set';persist();demoBar();renderAccounts();renderNav();renderSettings();
-  }catch(e){alert('Не удалось выйти из демо: '+(e&&e.message||e))}
+  }catch(e){uiErr(e,'Не удалось выйти из демо')}
   finally{DEMO.busy=false}
 }
 function demoBar(){
@@ -38670,7 +38740,7 @@ function tkrLoad(){
 /* ── Карточка портфеля для шаринга (PNG 1200×630, строго без сумм в рублях) ── */
 const SHR={open:false,theme:'',bench:'both'};
 function shareOpen(){
-  if(!S.data||!S.data.portfolio){alert('Сначала откройте портфель или демо-режим.');return}
+  if(!S.data||!S.data.portfolio){uiAlert({title:'Нечего показывать',body:'Сначала откройте портфель или демо-режим.'});return}
   SHR.open=true;
   if(!SHR.theme)SHR.theme=document.documentElement.dataset.theme==='light'?'light':'dark';
   shareMount();
@@ -39916,20 +39986,22 @@ var TOAST_IC={
   info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
   err:'<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16h.01"/>'
 };
-function toast(msg,a,b){
-  let kind='info',ms=2500;
+function toast(msg,a,b,act){
+  let kind='info',ms=act?7000:2500;
   if(typeof a==='number')ms=a;else if(typeof a==='string'){kind=TOAST_IC[a]?a:'info';if(typeof b==='number')ms=b}
+  if(a&&typeof a==='object'&&!act){act=a;a=undefined;ms=7000}
   if(kind==='info'&&typeof a!=='string'&&/^(не удалось|ошибка)/i.test(String(msg)))kind='err';
   else if(kind==='info'&&typeof a!=='string'&&/(скопирован|добавлен|сохран|показан|скрыт)/i.test(String(msg)))kind='ok';
   let box=document.getElementById('toasts');
   if(!box){box=document.createElement('div');box.id='toasts';box.setAttribute('role','status');box.setAttribute('aria-live','polite');document.body.appendChild(box)}
   msg=String(msg);
-  const same=[...box.children].find(x=>x._msg===msg&&!x._gone);
+  const same=act?null:[...box.children].find(x=>x._msg===msg&&!x._gone);
   if(same){clearTimeout(same._t);same._t=setTimeout(same._close,ms);return}
   const el=document.createElement('div');
   el.className='toast-i k-'+kind;el._msg=msg;
   el.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+TOAST_IC[kind]+'</svg><span></span>';
   el.lastChild.textContent=msg;
+  if(act&&act.text){const ab=document.createElement('button');ab.type='button';ab.className='toast-act';ab.textContent=act.text;ab.onclick=ev=>{ev.stopPropagation();el._close();try{act.fn&&act.fn()}catch(e){}};el.appendChild(ab)}
   el._close=()=>{if(el._gone)return;el._gone=true;clearTimeout(el._t);el.classList.remove('is-in');el.classList.add('out');setTimeout(()=>el.remove(),260)};
   el.onclick=el._close;
   box.appendChild(el);

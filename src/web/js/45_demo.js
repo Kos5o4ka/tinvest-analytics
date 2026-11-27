@@ -8,7 +8,7 @@ async function demoEnter(btn){
     DEMO.on=true;DEMO.at=Date.now();demoReset();S.page='dash';persist();
     try{S.cfg=await api('/api/config')}catch(e){}
     renderNav();demoBar();load(true);
-  }catch(e){if(btn){btn.disabled=false;btn.textContent='Посмотреть демо-портфель'}alert('Не удалось включить демо: '+(e&&e.message||e))}
+  }catch(e){if(btn){btn.disabled=false;btn.textContent='Посмотреть демо-портфель'}uiErr(e,'Не удалось включить демо')}
   finally{DEMO.busy=false}
 }
 async function demoExit(){
@@ -18,7 +18,7 @@ async function demoExit(){
     DEMO.on=false;demoReset();ob.skip=false;ob.done=false;
     try{S.cfg=await api('/api/config')}catch(e){}
     S.accounts=[];S.page='set';persist();demoBar();renderAccounts();renderNav();renderSettings();
-  }catch(e){alert('Не удалось выйти из демо: '+(e&&e.message||e))}
+  }catch(e){uiErr(e,'Не удалось выйти из демо')}
   finally{DEMO.busy=false}
 }
 function demoBar(){

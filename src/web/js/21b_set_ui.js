@@ -177,8 +177,8 @@ async function renderSettings(){
   /* песочница меняет и адреса API, и нужный токен — применяется вместе с токеном по «Сохранить и подключиться», а не сразу */
   $('#sb').onchange=e=>{const el=e.currentTarget;if(el.checked===!!c.sandbox)return;
     stMsg(el.checked?'Вставьте токен песочницы и нажмите «Сохранить и подключиться».':'Вставьте боевой токен (только чтение) и нажмите «Сохранить и подключиться».',1)};
-  $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Заново загрузить все операции и цены из Т-Инвестиций? Это может занять время.'))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
-  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!confirm('Удалить сохранённый токен?'))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
+  $('#cache').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Загрузить данные заново?', body:'Все операции и цены будут заново загружены из Т-Инвестиций. Это может занять время.', okText:'Загрузить'}))return;await post('/api/cache/clear');reset();msg('Локальный кэш очищен, данные загрузятся заново.',1);load(true)});
+  if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Удалить токен?', body:'Сохранённый токен Т-Инвестиций будет стёрт с этого компьютера.', danger:true, okText:'Удалить'}))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
   if($('#sbpay'))$('#sbpay').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sandbox/payin',{accountId:S.account,amount:$('#amt').value});S.data=S.bonds=S.hist=null;msg('Счёт пополнен на '+M(+$('#amt').value,'rub',0),1);load(true)});
 }

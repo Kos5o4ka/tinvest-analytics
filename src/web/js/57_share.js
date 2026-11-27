@@ -1,7 +1,7 @@
 /* ── Карточка портфеля для шаринга (PNG 1200×630, строго без сумм в рублях) ── */
 const SHR={open:false,theme:'',bench:'both'};
 function shareOpen(){
-  if(!S.data||!S.data.portfolio){alert('Сначала откройте портфель или демо-режим.');return}
+  if(!S.data||!S.data.portfolio){uiAlert({title:'Нечего показывать',body:'Сначала откройте портфель или демо-режим.'});return}
   SHR.open=true;
   if(!SHR.theme)SHR.theme=document.documentElement.dataset.theme==='light'?'light':'dark';
   shareMount();

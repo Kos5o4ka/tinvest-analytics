@@ -131,13 +131,16 @@ function bindWatch(){
   }
   const sug=$('#wt-sug');
   if(sug)sug.onclick=async e=>{const b=e.target.closest('[data-wadd]');if(!b)return;e.stopPropagation();b.disabled=true;
-    try{await watchToggle(b.dataset.wadd);S.wsug=[]}catch(er){alert(er.message)}};
+    try{await watchToggle(b.dataset.wadd);S.wsug=[]}catch(er){uiErr(er)}};
   const tab=$('#wt-tab');
   if(tab){
     tab.onclick=async e=>{const b=e.target.closest('[data-wdel]');if(!b)return;e.stopPropagation();
-      try{await post('/api/watch',{action:'remove',isin:b.dataset.wdel});S.wset.delete(b.dataset.wdel);S.watch=null;render()}catch(er){alert(er.message)}};
+      const isin=b.dataset.wdel,keep={action:'add',isin};
+      b.closest('tr').querySelectorAll('.wt-in').forEach(i=>{if(i.value)keep[i.dataset.k]=i.value});
+      try{await post('/api/watch',{action:'remove',isin});S.wset.delete(isin);S.watch=null;render();
+        toast('Бумага убрана из наблюдения',{text:'Отменить',fn:async()=>{try{const r=await post('/api/watch',keep);S.wset=new Set(r.isins||[]);S.watch=null;watchRefreshView();render()}catch(er){uiErr(er)}}})}catch(er){uiErr(er)}};
     tab.onchange=async e=>{const i=e.target.closest('.wt-in');if(!i)return;
-      try{await post('/api/watch',{action:'update',isin:i.dataset.isin,[i.dataset.k]:i.value});if(i.dataset.k!=='note'){S.watch=null;render()}}catch(er){alert(er.message)}};
+      try{await post('/api/watch',{action:'update',isin:i.dataset.isin,[i.dataset.k]:i.value});if(i.dataset.k!=='note'){S.watch=null;render()}}catch(er){uiErr(er)}};
   }
   const sel=$('#nt-sel');
   if(sel)sel.onchange=()=>{$('#nt-isin').style.display=sel.value==='_other'?'':'none'};
@@ -153,14 +156,14 @@ function bindWatch(){
     catch(er){m(er.message);add.disabled=false}};
   const fl=$('#nt-flt');if(fl)fl.onchange=()=>{S.wfilter=fl.value;render()};
   const view=$('#view');
-  if(view)view.querySelectorAll('[data-ndel]').forEach(b=>b.onclick=async e=>{e.stopPropagation();if(!confirm('Удалить заметку?'))return;
-    try{await post('/api/notes',{action:'delete',id:b.dataset.ndel});S.wnotes=null;S.watch=null;render()}catch(er){alert(er.message)}});
+  if(view)view.querySelectorAll('[data-ndel]').forEach(b=>b.onclick=async e=>{e.stopPropagation();if(!await uiConfirm({title:'Удалить заметку?', danger:true, okText:'Удалить'}))return;
+    try{await post('/api/notes',{action:'delete',id:b.dataset.ndel});S.wnotes=null;S.watch=null;render()}catch(er){uiErr(er)}});
   if(view)view.querySelectorAll('[data-ndone]').forEach(b=>b.onclick=async e=>{e.stopPropagation();
-    try{await post('/api/notes',{action:'done',id:b.dataset.ndone});S.wnotes=null;S.watch=null;render()}catch(er){alert(er.message)}});
+    try{await post('/api/notes',{action:'done',id:b.dataset.ndone});S.wnotes=null;S.watch=null;render()}catch(er){uiErr(er)}});
 }
 /* звёздочки (скринер, карточка и др.): клик не открывает карточку выпуска */
 document.addEventListener('click',async e=>{
   const b=e.target.closest('[data-wstar]');if(!b)return;
   e.stopPropagation();b.disabled=true;
-  try{await watchToggle(b.dataset.wstar)}catch(er){alert(er.message)}finally{b.disabled=false}
+  try{await watchToggle(b.dataset.wstar)}catch(er){uiErr(er)}finally{b.disabled=false}
 },true);

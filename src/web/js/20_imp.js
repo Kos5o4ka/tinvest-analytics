@@ -94,7 +94,7 @@ async function renderImport(){
           catch(err){bb.disabled=false;bb.textContent='Импортировать';msg(esc(err.message))}}}
       catch(err){$('#iresult').innerHTML=`<div class="msg err">${esc(err.message)}</div>`}finally{b.disabled=false}};
   }
-  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(!confirm('Удалить импортированный счёт и его операции из локальной базы?'))return;
+  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(!await uiConfirm({title:'Удалить импортированный счёт?', body:'Счёт и его операции будут удалены из локальной базы. Исходный файл отчёта можно загрузить снова.', danger:true, okText:'Удалить'}))return;
     await post('/api/import/delete',{id:b.dataset.del});if(S.account===b.dataset.del)S.account='all';S.data=S.bonds=S.hist=null;persist();renderImport();load(true)});
   document.querySelectorAll('[data-brk]').forEach(s=>s.onchange=async()=>{
     try{await post('/api/import/broker',{id:s.dataset.brk,broker_id:s.value});S.data=null;msg('Брокер счёта сохранён.','ok');load(true)}catch(e){msg(esc(e.message))}});
