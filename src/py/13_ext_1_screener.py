@@ -77,11 +77,48 @@ def liq_tiers(rows):
     return rows
 
 
+SCR_SNAP_KEYS = ("chg", "level", "trades", "zs", "cy", "sub", "size", "nkd", "btype", "cpn_det", "offer", "cur", "turn", "coupon_raw")
+
+
+def screener_rows_from_snapshot(snap):
+    """Готовый срез сервера (список облигаций market_worker) -> строки скринера в том же составе полей, что и screener_rows.
+    None, если срез пуст или сервер старый и не отдаёт нужные поля (тогда экран считает рынок сам)."""
+    if not isinstance(snap, list) or not snap or not isinstance(snap[0], dict):
+        return None
+    if any(k not in snap[0] for k in SCR_SNAP_KEYS):
+        return None
+    out = {}
+    for b in snap:
+        if b.get("board") not in ("TQCB", "TQOB") or not b.get("price") or not b.get("ytm") or not b.get("matdate") \
+                or str(b["matdate"]).startswith("0000"):
+            continue
+        dur = b.get("macdur")
+        out[b["secid"]] = {
+            "id": b["secid"], "isin": b.get("isin"), "name": b.get("name"), "full": b.get("full_name"),
+            "kind": "ofz" if b["board"] == "TQOB" else "corp", "cur": b["cur"], "nominal": b.get("face"),
+            "price": b["price"], "yield": b["ytm"], "dur": dur, "coupon": b.get("coupon_raw"), "next": b.get("next_coupon"),
+            "mat": b["matdate"], "offer": b.get("offer"), "level": b.get("level"), "turn": b.get("turn") or 0,
+            "trades": b.get("trades") or 0, "zs": b.get("zs"), "cy": b.get("cy"), "macdur": dur, "chg": b.get("chg") or 0.0,
+            "sub": b.get("sub"), "size": b.get("size"), "nkd": b.get("nkd"), "btype": b.get("btype"), "cpn_det": b.get("cpn_det")}
+    return list(out.values()) or None
+
+
+def _screener_fetch_rows():
+    try:
+        rows = screener_rows_from_snapshot(market_snapshot_bonds())
+    except Exception:  # noqa: BLE001
+        rows = None
+    if rows:
+        return rows
+    return None
+
+
 def screener_rows():
     if time.time() - _scr["t"] < 600 and _scr["rows"]:
         return _scr["rows"]
+    snap_rows = _screener_fetch_rows()
     out = {}
-    for board, kind in (("TQCB", "corp"), ("TQOB", "ofz")):
+    for board, kind in (() if snap_rows else (("TQCB", "corp"), ("TQOB", "ofz"))):
         j = json.loads(http_text(
             "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/%s/securities.json?iss.meta=off"
             "&iss.only=securities,marketdata&securities.columns=%s&marketdata.columns=%s" % (board, SCR_COLS_S, SCR_COLS_M),
@@ -106,7 +143,7 @@ def screener_rows():
                 "zs": m.get("ZSPREAD"), "cy": bond_cy(s.get("COUPONVALUE"), s.get("COUPONPERIOD"), s.get("FACEVALUE"), m.get("LAST") or price),
                 "macdur": round(dur, 2) if dur else None, "chg": bond_chg(m, s, price), "sub": s.get("BONDSUBTYPE"), "size": s.get("ISSUESIZE"), "nkd": s.get("ACCRUEDINT"),
                 "btype": s.get("BONDTYPE"), "cpn_det": s.get("COUPON_DETAILS")}
-    rows = list(out.values())
+    rows = snap_rows or list(out.values())
     for r in rows:
         k = kbd_at(r["dur"]) if r["dur"] else None
         r["spread"] = round(r["yield"] - k, 2) if k is not None and r["cur"] == "RUB" else None
