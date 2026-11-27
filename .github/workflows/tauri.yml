@@ -4,10 +4,6 @@ on:
   release:
     types: [published]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Версия / тег сборки (например v0.31.0)"
-        required: false
 
 permissions:
   contents: write
@@ -47,12 +43,13 @@ jobs:
           workspaces: src-tauri
 
       - name: Сборка tinvest_analytics.py из src/
-        run: python3 build.py
+        run: python build.py
 
       - name: Зависимости и скрытые импорты для sidecar
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller==6.22.3 certifi pillow
+          PYINSTALLER_COMPILE_BOOTLOADER=1 pip install --no-binary pyinstaller pyinstaller==6.22.3
+          pip install certifi pillow
           python packaging/vendor_lock.py --download vendor_wheels
           python packaging/gen_hidden_imports.py tinvest_analytics.py --wheels vendor_wheels -o packaging/hidden_imports.txt
 
@@ -62,7 +59,6 @@ jobs:
           mkdir -p src-tauri/binaries
           ARGS=(
             --onefile
-            --noconsole
             --noconfirm
             --name TAnalytic-backend
             --collect-data certifi
@@ -77,9 +73,9 @@ jobs:
               ARGS+=(--hidden-import "$mod")
             fi
           done < packaging/hidden_imports.txt
-          pyinstaller "${ARGS[@]}" tinvest_analytics.py
           EXT=""
-          if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then ARGS+=(--noconsole); EXT=".exe"; fi
+          pyinstaller "${ARGS[@]}" tinvest_analytics.py
           cp "build_tauri_sidecar/dist/TAnalytic-backend${EXT}" "src-tauri/binaries/TAnalytic-backend-${{ matrix.target }}${EXT}"
 
       - name: Генерация иконок Tauri
@@ -107,7 +103,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: src-tauri
-          args: --target ${{ matrix.target }} --config '{"bundle":{"externalBin":["binaries/TAnalytic-backend"]}}'
+          args: --target ${{ matrix.target }}
           uploadPlainBinary: false
 
       - name: Загрузка артефактов Tauri
