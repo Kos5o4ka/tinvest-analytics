@@ -15,7 +15,7 @@ def _private_write(path, data_bytes):
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8-sig") as f:   # utf-8-sig: Блокнот Windows пишет BOM
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
@@ -56,7 +56,7 @@ def save_config(cfg):
         if env_tok and out.get("token") == env_tok:
             disk_tok = ""
             try:
-                with open(CONFIG_PATH, encoding="utf-8") as f:
+                with open(CONFIG_PATH, encoding="utf-8-sig") as f:   # utf-8-sig: Блокнот Windows пишет BOM
                     disk_tok = (json.load(f) or {}).get("token", "")
             except (OSError, ValueError, AttributeError):
                 pass

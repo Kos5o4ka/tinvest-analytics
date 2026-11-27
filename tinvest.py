@@ -666,9 +666,13 @@ def want_native(frozen, no_gui, env=None):
     return bool(frozen) and not no_gui and env.get("TINVEST_NO_WEBVIEW") != "1"
 
 
+FRAME_SLACK = 16      # Windows держит невидимую рамку ресайза ~8 px: развёрнутое окно стоит в (-8, -8), это не «за экраном»
+
+
 def window_geometry(saved, screen, want=(WIN_W, WIN_H), min_size=(MIN_W, MIN_H)):
     """(ширина, высота, x, y) окна. saved — dict из window.json (или None); screen — (ширина, высота) или None.
-    Размер не больше экрана (с полями) и не меньше min_size, если экран позволяет; x/y — только если окно видно на экране."""
+    Размер не больше экрана (с полями) и не меньше min_size, если экран позволяет. Позиция — сохранённая, если окно
+    видно на экране, иначе по центру экрана (Windows без явных x/y ставит окно в левый верхний угол)."""
     def num(k, d=None):
         v = (saved or {}).get(k)
         return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else d
@@ -678,11 +682,25 @@ def window_geometry(saved, screen, want=(WIN_W, WIN_H), min_size=(MIN_W, MIN_H))
         sw, sh = screen
         w = min(w, max(sw - 40, 1)); h = min(h, max(sh - 80, 1))
         w = max(w, min(min_size[0], sw)); h = max(h, min(min_size[1], sh))
-        if x is None or y is None or x < -w + 100 or y < 0 or x > sw - 100 or y > sh - 100:
-            x = y = None
+        if x is None or y is None or x < -w + 100 or y < -FRAME_SLACK or x > sw - 100 or y > sh - 100:
+            x, y = center(w, h, screen)
+        else:
+            y = max(y, 0)
     elif w < min_size[0] or h < min_size[1]:
         w, h = max(w, min_size[0]), max(h, min_size[1])
     return w, h, x, y
+
+
+def center(w, h, screen):
+    """Левый верхний угол окна w×h по центру экрана (чуть выше середины — так окно смотрится ровнее)."""
+    if not screen:
+        return None, None
+    sw, sh = screen
+    return max(0, (sw - w) // 2), max(0, (sh - h) * 2 // 5)
+
+
+def was_maximized(saved):
+    return bool((saved or {}).get("maximized"))
 
 
 def load_state():
@@ -694,13 +712,24 @@ def load_state():
         return None
 
 
-def save_state(w, h, x, y):
+def save_state(w, h, x, y, maximized=False):
     try:
         os.makedirs(HOME, mode=0o700, exist_ok=True)
+        d = {"w": int(w), "h": int(h), "x": int(x), "y": int(y)}
+        if maximized:
+            d["maximized"] = True
         with open(STATE, "w") as f:
-            json.dump({"w": int(w), "h": int(h), "x": int(x), "y": int(y)}, f)
+            json.dump(d, f)
     except Exception:
         pass
+
+
+def looks_maximized(w, h, x, y, screen):
+    """Окно занимает весь экран с отрицательной рамкой Windows (-8, -8) — значит, оно было развёрнуто."""
+    if not screen:
+        return False
+    sw, sh = screen
+    return x <= 0 and y <= 0 and w >= sw - 2 * FRAME_SLACK and h >= sh - 160
 
 
 def wait_ping(get_url, thread, timeout=90):
@@ -719,33 +748,206 @@ def wait_ping(get_url, thread, timeout=90):
     return False
 
 
-def webview_setup(webview):
-    """Общие настройки pywebview и геометрия окна программы (по window.json)."""
-    webview.settings["ALLOW_DOWNLOADS"] = True                  # выгрузки CSV/ICS по ссылкам
-    webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True   # t.me, MOEX и прочие target=_blank — в обычный браузер
-    screen = None
+WEBVIEW_DIR = os.path.join(HOME, "webview")      # постоянный профиль WebView: тема, режим, меню переживают перезапуск
+
+
+def start_kwargs():
+    """Аргументы webview.start(): постоянный профиль вместо одноразового %TEMP%\\tmp*\\EBWebView
+    (иначе localStorage — тема, режим «Профи», свёрнутое меню — стирается при каждом запуске)."""
+    try:
+        os.makedirs(WEBVIEW_DIR, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    return {"private_mode": False, "storage_path": WEBVIEW_DIR}
+
+
+def screen_size(webview):
+    """Рабочая область основного экрана (без панели задач Windows), иначе размер экрана pywebview."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            r = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):   # SPI_GETWORKAREA
+                return (r.right - r.left, r.bottom - r.top)
+        except Exception:
+            pass
     try:
         sc = webview.screens[0]
-        screen = (sc.width, sc.height)
+        return (sc.width, sc.height)
+    except Exception:
+        return None
+
+
+def webview_setup(webview):
+    """Общие настройки pywebview и геометрия окна программы (по window.json): (w, h, x, y, развёрнуто, экран)."""
+    webview.settings["ALLOW_DOWNLOADS"] = True                  # выгрузки CSV/ICS по ссылкам
+    webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True   # t.me, MOEX и прочие target=_blank — в обычный браузер
+    screen = screen_size(webview)
+    saved = load_state()
+    return window_geometry(saved, screen) + (was_maximized(saved), screen)
+
+
+# ── Windows: тёмная системная шапка в цвет программы (DWM) ──
+DWM_DARK, DWM_DARK_OLD, DWM_BORDER, DWM_CAPTION, DWM_TEXT, DWM_CORNER = 20, 19, 34, 35, 36, 33
+THEMES = {"dark": {"caption": "#090c12", "text": "#edf1f7", "border": "#1e293b"},
+          "light": {"caption": "#f6f7f9", "text": "#0f172a", "border": "#d8dde6"}}
+
+
+def win_build():
+    """Номер сборки Windows (22000+ — Windows 11), 0 — не Windows."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        return sys.getwindowsversion().build
+    except Exception:
+        return 0
+
+
+def colorref(hex_color):
+    """#rrggbb → COLORREF (0x00bbggrr) для DwmSetWindowAttribute."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return r | (g << 8) | (b << 16)
+
+
+def native_hwnd(win):
+    nat = getattr(win, "native", None)
+    try:
+        return int(nat.Handle.ToInt64()) if nat is not None else 0
+    except Exception:
+        return 0
+
+
+def dwm_theme(hwnd, theme="dark", build=None):
+    """Шапка окна Windows в тон теме программы: тёмный режим (Windows 10 1809+), а на Windows 11 — точные цвета
+    фона, текста и рамки. Возвращает список выставленных атрибутов (для проверки)."""
+    if not hwnd or sys.platform != "win32":
+        return []
+    import ctypes
+    build = win_build() if build is None else build
+    t = THEMES.get(theme) or THEMES["dark"]
+    done = []
+
+    def put(attr, v):
+        val = ctypes.c_int(v)
+        if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), 4) == 0:
+            done.append(attr)
+    try:
+        put(DWM_DARK if build >= 18985 else DWM_DARK_OLD, 1 if theme != "light" else 0)
+        if build >= 22000:
+            put(DWM_CAPTION, colorref(t["caption"]))
+            put(DWM_TEXT, colorref(t["text"]))
+            put(DWM_BORDER, colorref(t["border"]))
+        # Windows 10 перерисовывает заголовок только при смене активности окна
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)   # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
     except Exception:
         pass
-    return window_geometry(load_state(), screen)
+    return done
+
+
+class MainApi:
+    """Мост окна программы (window.pywebview.api.*): тема шапки, управление окном, выбор файла."""
+    def __init__(self):
+        self._win = None
+
+    def set_theme(self, theme):
+        if sys.platform == "win32" and self._win is not None:
+            dwm_theme(native_hwnd(self._win), "light" if theme == "light" else "dark")
+        return True
+
+    def platform(self):
+        return {"win32": "win", "darwin": "mac"}.get(sys.platform, "linux")
+
+    def minimize(self):
+        self._win and self._win.minimize()
+
+    def toggle_maximize(self):
+        w = self._win
+        if w is None:
+            return
+        if getattr(w, "_ta_max", False):
+            w.restore()
+        else:
+            w.maximize()
+
+    def toggle_fullscreen(self):
+        self._win and self._win.toggle_fullscreen()
+
+    def close(self):
+        self._win and self._win.destroy()
+
+    def pick_file(self, kinds="Отчёты брокера (*.xlsx;*.xls;*.csv;*.html;*.htm;*.xml)"):
+        """Системный диалог выбора файла (запасной путь, если <input type=file> не открылся). → {name, b64} или None."""
+        import base64
+        try:
+            import webview
+            res = self._win.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=False, file_types=(kinds, "Все файлы (*.*)"))
+        except Exception:
+            return None
+        if not res:
+            return None
+        p = res[0] if isinstance(res, (list, tuple)) else res
+        try:
+            if os.path.getsize(p) > 50_000_000:
+                return {"error": "Файл больше 50 МБ"}
+            with open(p, "rb") as f:
+                return {"name": os.path.basename(p), "b64": base64.b64encode(f.read()).decode("ascii")}
+        except OSError as e:
+            return {"error": str(e)}
 
 
 def app_window(webview, url, thread, geom, hidden=False, html=None, remember_geometry=True):
-    """Окно программы. thread — поток программы: когда он завершается, окно закрывается."""
-    w, h, x, y = geom
+    """Окно программы. thread — поток программы: когда он завершается, окно закрывается.
+    geom — (w, h, x, y[, развёрнуто, экран]) из webview_setup()."""
+    w, h, x, y = geom[:4]
+    maximized = len(geom) > 4 and bool(geom[4])
+    screen = geom[5] if len(geom) > 5 else None
+    api = MainApi()
     win = webview.create_window(TITLE, url, html=html, width=w, height=h, x=x, y=y, min_size=(MIN_W, MIN_H),
-                                background_color=BG, text_select=True, hidden=hidden)
+                                background_color=BG, text_select=True, hidden=hidden, js_api=api)
+    api._win = win
+    win._ta_max = False
+    normal = {"w": w, "h": h, "x": x if x is not None else 0, "y": y if y is not None else 0}
 
     def remember(*_):
         try:
-            save_state(win.width, win.height, win.x, win.y)
+            cw, ch, cx, cy = win.width, win.height, win.x, win.y
+            if cx is None or cx <= -30000:                       # свёрнуто в панель задач: Windows ставит (-32000, -32000)
+                return
+            if win._ta_max or looks_maximized(cw, ch, cx, cy, screen):
+                save_state(normal["w"], normal["h"], normal["x"], normal["y"], maximized=True)
+            else:
+                normal.update(w=cw, h=ch, x=cx, y=cy)
+                save_state(cw, ch, cx, cy)
         except Exception:
             pass
+
+    def on_max(*_):
+        win._ta_max = True
+        remember()
+
+    def on_restore(*_):
+        win._ta_max = False
+    for name, fn in (("maximized", on_max), ("restored", on_restore)):
+        ev = getattr(win.events, name, None)
+        if ev is not None:
+            ev += fn
     if remember_geometry:
         for ev in (win.events.closing, win.events.resized, win.events.moved):   # closing не вызывается при выходе по Cmd+Q
             ev += remember
+
+    def shown(*_):
+        if sys.platform == "win32":
+            dwm_theme(native_hwnd(win), "dark")                  # страница уточнит тему через api.set_theme()
+        if maximized:
+            try:
+                win.maximize()
+            except Exception:
+                pass
+    win._ta_shown = shown
+    if not hidden:
+        win.events.shown += shown
     if thread is not None:
         threading.Thread(target=lambda: (thread.join(), win.destroy()), daemon=True).start()   # программа остановилась — закрыть окно
     return win
@@ -756,7 +958,7 @@ def open_native(url, thread):
     бросает исключение, если окно показать не удалось (тогда запускается запасное окно tk)."""
     import webview
     app_window(webview, url, thread, webview_setup(webview))
-    webview.start()
+    webview.start(**start_kwargs())
 
 
 # ───────────────────────────── заставка на pywebview (оболочка ревизии 3) ─────────────────────────────
@@ -792,6 +994,7 @@ html.win,html.win body{background:var(--bg)}
   border:1px solid var(--line2);box-shadow:inset 0 1px 0 #ffffff0a;
   animation:in .42s cubic-bezier(.16,1,.3,1) both;transition:opacity .2s ease,transform .2s ease}
 html.win .card{border-radius:0;border-color:transparent}
+html.win10 .card{border-color:#26314b;box-shadow:inset 0 1px 0 #ffffff0a,inset 0 0 0 1px #00000066}
 body.bye .card{opacity:0;transform:scale(.985)}
 @keyframes in{from{opacity:0;transform:translateY(6px) scale(.985)}to{opacity:1;transform:none}}
 .hd{display:flex;align-items:center;gap:14px}
@@ -807,6 +1010,8 @@ body[data-stage=check] .lg,body[data-stage=launch] .lg{animation:pulse 1.8s ease
 .x{margin-left:auto;align-self:flex-start;width:28px;height:28px;border-radius:8px;border:0;background:transparent;color:var(--mu);
   display:grid;place-items:center;cursor:pointer;transition:background .15s,color .15s}
 .x:hover{background:#ffffff0d;color:var(--tx)}
+.x.mn{margin-left:auto;margin-right:-8px}.x.mn+.x{margin-left:0}
+.x#x:hover{background:#e81123;color:#fff}
 .x svg{width:12px;height:12px}
 .steps{display:flex;gap:18px;margin:24px 0 0;font-size:12px;color:var(--mu)}
 .steps span{display:flex;align-items:center;gap:7px;transition:color .2s}
@@ -838,6 +1043,7 @@ body[data-stage=error] .st{color:#ff8a90}
 <body data-stage="check"><div class="card">
   <div class="hd"><div class="lg">__LOGO__</div>
     <div class="nm">TAnalytic<span class="ver" id="ver"></span><small>аналитика портфеля</small></div>
+    <button class="x mn" id="mn" title="Свернуть" aria-label="Свернуть"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 6h8"/></svg></button>
     <button class="x" id="x" title="Закрыть" aria-label="Закрыть"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 2l8 8M10 2l-8 8"/></svg></button></div>
   <div class="steps" id="steps"></div>
   <div class="st" id="st">Проверяю обновления</div>
@@ -852,6 +1058,7 @@ body[data-stage=error] .st{color:#ff8a90}
   function call(n){try{if(window.pywebview&&pywebview.api&&pywebview.api[n])pywebview.api[n]()}catch(e){}}
   $('steps').innerHTML=STEPS.map(function(s){return '<span><i></i>'+s+'</span>'}).join('');
   $('x').onclick=function(){call('close')};
+  $('mn').onclick=function(){call('minimize')};
   document.addEventListener('keydown',function(e){if(e.key==='Escape')call('close')});
   window.splash={set:function(s){
     if(s.bye){document.body.classList.add('bye');return}
@@ -877,10 +1084,14 @@ body[data-stage=error] .st{color:#ff8a90}
 </script></body></html>"""
 
 
-def splash_html(platform=None):
+def splash_html(platform=None, build=None):
     """Страница заставки. На macOS окно прозрачное, скругление и обводка рисуются карточкой; на Windows окно
-    непрозрачное, а углы скругляет сама система (Windows 11)."""
-    plat = "win" if (platform or sys.platform) == "win32" else "mac"
+    непрозрачное: на Windows 11 углы скругляет система, на Windows 10 остаётся чёткая обводка карточки."""
+    if (platform or sys.platform) == "win32":
+        build = win_build() if build is None else build
+        plat = "win" if build >= 22000 else "win win10"
+    else:
+        plat = "mac"
     return (SPLASH_HTML.replace("__PLAT__", plat).replace("__LOGO__", LOGO_SVG)
             .replace("__STEPS__", json.dumps(list(SPLASH_STEPS), ensure_ascii=False)))
 
@@ -922,6 +1133,12 @@ class SplashApi:
 
     def browser(self):
         self._shell.ui("browser")
+
+    def minimize(self):
+        try:
+            self._shell.splash.minimize()
+        except Exception:
+            pass
 
 
 def demo_worker(kind):
@@ -995,10 +1212,11 @@ class WebShell:
         wv = self.wv
         self.geom = webview_setup(wv)
         mac = sys.platform == "darwin"
+        sx, sy = center(SPLASH_W, SPLASH_H, self.geom[5])
         self.splash = wv.create_window(TITLE, html=splash_html(), js_api=SplashApi(self), width=SPLASH_W, height=SPLASH_H,
-                                       resizable=False, frameless=True, easy_drag=True, transparent=mac,
+                                       x=sx, y=sy, resizable=False, frameless=True, easy_drag=True, transparent=mac,
                                        background_color=BG, min_size=(SPLASH_W, SPLASH_H))
-        wv.start(self.flow)
+        wv.start(self.flow, **start_kwargs())
         return self.result.get("code") or self.code
 
     def decorate(self):
@@ -1014,10 +1232,10 @@ class WebShell:
                     nat.setHasShadow_(True)
                     nat.invalidateShadow()
                 AppHelper.callAfter(shadow)
-            elif sys.platform == "win32":
+            elif sys.platform == "win32" and win_build() >= 22000:
                 import ctypes
-                pref = ctypes.c_int(2)                           # DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(int(nat.Handle.ToInt64()), 33, ctypes.byref(pref), 4)
+                pref = ctypes.c_int(2)                           # DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND (только Windows 11)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(int(nat.Handle.ToInt64()), DWM_CORNER, ctypes.byref(pref), 4)
         except Exception:
             pass
 
@@ -1180,6 +1398,10 @@ class WebShell:
         self.main.events.loaded.wait(10)                         # показываем уже отрисованную страницу, без белого кадра
         time.sleep(0.05)
         self.main.show()
+        try:
+            self.main._ta_shown()                                # тёмная шапка Windows и развёрнутое окно, как было
+        except Exception:
+            pass
         self.push(bye=True)                                      # заставка растворяется под окном программы
         time.sleep(0.22)
         try:
@@ -1283,6 +1505,89 @@ def run_inprocess(args, ui, native=False):
         return ui2.running(t, cap, result)
 
 
+# ───────────────────────────── одна копия программы и аккуратный выход ─────────────────────────────
+
+MUTEX_NAME = "TAnalyticSingleInstanceMutex"       # то же имя проверяет установщик (Inno Setup AppMutex)
+LOCK_PATH = os.path.join(HOME, "launcher.lock")
+
+
+class SingleInstance:
+    """Не даёт запустить вторую копию на ту же базу data.db: на Windows — именованный мьютекс,
+    на macOS/Linux — блокировка файла. acquire() → False, если программа уже открыта."""
+    def __init__(self, name=MUTEX_NAME, path=None):
+        self.name, self.path = name, path or LOCK_PATH
+        self.handle = self.fh = None
+
+    def acquire(self):
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                k = ctypes.windll.kernel32
+                k.CreateMutexW.restype = ctypes.c_void_p
+                self.handle = k.CreateMutexW(None, False, self.name)
+                return not (self.handle and k.GetLastError() == 183)     # ERROR_ALREADY_EXISTS
+            except Exception:
+                return True
+        try:
+            import fcntl
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            self.fh = open(self.path, "a+")
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (OSError, ImportError):
+            if self.fh is not None:
+                try:
+                    self.fh.close()
+                except OSError:
+                    pass
+                self.fh = None
+                return False
+            return True
+
+    def release(self):
+        try:
+            if self.handle and sys.platform == "win32":
+                import ctypes
+                ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
+            if self.fh is not None:
+                self.fh.close()
+        except Exception:
+            pass
+        self.handle = self.fh = None
+
+
+def activate_running():
+    """Вторая копия: вывести на передний план уже открытое окно программы (Windows), иначе — ничего."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        hwnd = u.FindWindowW(None, TITLE)
+        if not hwnd:
+            return False
+        u.ShowWindow(hwnd, 9)                                    # SW_RESTORE
+        u.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def graceful_exit(code, wait=3.0):
+    """Выход без обрыва: программа сбрасывает журнал SQLite (wal_checkpoint) и закрывает соединения,
+    затем процесс завершается, не дожидаясь фоновых потоков (пулы сетевых запросов)."""
+    hook = getattr(sys, "tanalytic_shutdown", None)
+    if callable(hook):
+        t = threading.Thread(target=hook, daemon=True)
+        t.start()
+        t.join(wait)
+    try:
+        sys.stdout and sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(code)
+
+
 def webbrowser_open(url):
     import webbrowser
     webbrowser.open(url)
@@ -1301,11 +1606,15 @@ def main():
     args = [a for a in argv if a not in ("--no-update", "--no-gui")]
     demo = os.environ.get("TINVEST_SPLASH_DEMO", "")            # 1 / net / checksum: показать заставку без сети и файлов
     demo = "ok" if demo == "1" else demo
+    if FROZEN and not demo:
+        lock = SingleInstance()
+        if not lock.acquire():                                   # программа уже открыта: показать её окно и выйти
+            activate_running()
+            sys.exit(0)
     if demo or (want_native(FROZEN, no_gui) and "--no-window" not in args):
         code = run_webshell(args + ["--no-window"], no_update, demo)     # окно открывает оболочка, не браузер программы
         if code is not None:
-            sys.stdout and sys.stdout.flush()
-            os._exit(code)                                      # не ждём фоновые потоки программы
+            graceful_exit(code)                                 # не ждём фоновые потоки программы
     ui = None
     if FROZEN or not no_update:
         ui = (None if no_gui else make_window()) or Console()
@@ -1324,8 +1633,7 @@ def main():
             args.append("--no-window")                           # окно открываем сами (или показываем кнопку), не браузер программы
         code = run_inprocess(args, ui, native=want_native(FROZEN, no_gui) and not isinstance(ui, Console))
         ui.close()
-        sys.stdout and sys.stdout.flush()
-        os._exit(code)                                          # не ждём фоновые потоки программы
+        graceful_exit(code)                                     # не ждём фоновые потоки программы
     if ui:
         ui.close()                                              # окно закрыто полностью до запуска программы
     path = APP if os.path.exists(APP) else APP + ".bak"

@@ -63,7 +63,7 @@ function setBackupHtml(c){
   const ex=(w,t)=>stRow(t,'',`<a class="btn ghost" href="/api/export?what=${w}&fmt=csv&account=${q}" download>CSV</a><a class="btn ghost" href="/api/export?what=${w}&fmt=xlsx&account=${q}" download>Excel</a>`);
   return stGroup('Резервная копия',
     `<div class="st-callout warn">Без пароля копию открыть нельзя, а пароль восстановить невозможно. Запишите его и храните отдельно от копии. Токен API и пароль в копию не входят.</div>`+
-    stRow('Папка для копий','Облачный диск или любая папка',`<input class="in st-wide" id="bkdir" placeholder="/Users/имя/Library/CloudStorage/…" spellcheck="false" aria-label="Папка для копий">`,{stack:1})+
+    stRow('Папка для копий','Облачный диск или любая папка',`<input class="in st-wide" id="bkdir" placeholder="${IS_WIN?'C:\\Users\\имя\\YandexDisk\\TInvestBackup':IS_MAC?'/Users/имя/Library/CloudStorage/…':'/home/имя/Yandex.Disk/TInvestBackup'}" spellcheck="false" aria-label="Папка для копий">`,{stack:1})+
     `<div id="bksug" class="bk-sug st-sug"></div>`+
     stRow('Пароль копии','<span id="bkpwst"></span>',stSecret('bkpw','не короче 6 символов','autocomplete="new-password"','Пароль копии'))+
     stRow('Хранить копий','Старые сверх лимита удаляются',`<input class="in num st-num" type="number" id="bkkeep" min="1" max="365" value="14" aria-label="Сколько копий хранить">`)+
@@ -88,7 +88,7 @@ function bindSetBackup(c,msg){
     if(first){first=false;$('#bkdir').value=s.dir||'';$('#bkkeep').value=s.keep;$('#bkauto').checked=s.auto;dirty.rebase();
       $('#bksug').innerHTML=s.suggest.length?'Найдены папки: '+s.suggest.map(x=>`<button class="btn ghost bk-chip" data-p="${esc(x.path)}">${esc(x.label)}</button>`).join(' '):
       `Подсказки: Яндекс Диск — ${s.windows?'C:\\Users\\имя\\Yandex.Disk':'~/Yandex.Disk'}; iCloud Drive — ${s.windows?'C:\\Users\\имя\\iCloudDrive':'~/Library/Mobile Documents/com~apple~CloudDocs'}; Google Drive — ${s.windows?'G:\\Мой диск':'~/Library/CloudStorage/GoogleDrive-…'}`;
-      $('#bksug').onclick=e=>{const b=e.target.closest('[data-p]');if(b){$('#bkdir').value=b.dataset.p+(b.dataset.p.endsWith('/')?'':'/')+'TInvestBackup';dirty.upd()}}}
+      $('#bksug').onclick=e=>{const b=e.target.closest('[data-p]');if(b){const p=b.dataset.p,sp=s.windows||/^[A-Za-z]:\\/.test(p)?'\\':'/';$('#bkdir').value=p+(/[\\/]$/.test(p)?'':sp)+'TInvestBackup';dirty.upd()}}}
     $('#bkpwst').innerHTML=s.pw_set?'<span class="pos">Пароль сохранён</span>':'<span class="mu">Пароль не сохранён</span>';
     $('#bkclr').style.display=s.pw_set?'':'none';
     restoreBar(!!s.restore_pending);

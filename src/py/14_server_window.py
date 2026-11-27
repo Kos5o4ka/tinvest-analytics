@@ -76,7 +76,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, data, "image/png") if data else self.send(404, {"error": "no logo"})
             if u.path == "/api/ping":
                 _ping[0] = time.time()
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             cfg = load_config()
             f = q.get("force") == "1"
             acc = q.get("account", "all") or "all"
@@ -243,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
                 save_config(cfg)
                 ds_reset()
                 mem_clear(persist=False)        # сохранённые отчёты привязаны к токену (token_key): настройки их не портят
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             if path == "/api/ratings/refresh":
                 return self.send(200, {"started": ratings_start(force=True), **ratings_status()})
             client = TInvest(cfg)
@@ -263,7 +263,7 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute("DELETE FROM ops WHERE acc NOT LIKE 'imp-%'")
                     c.commit()
                 mem_clear()
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             if path == "/api/import/preview":
                 raw = base64.b64decode(body.get("data") or "")
                 pv = import_preview_any(body.get("filename") or "", raw)
@@ -291,7 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                 store().put("imports", lst)
                 store().ops_clear(body.get("id") or "")
                 mem_clear()
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             if path in ("/api/sandbox/open", "/api/sandbox/payin"):
                 if not cfg["sandbox"]:
                     raise ApiError("Доступно только в режиме песочницы.", 400)
@@ -368,6 +368,36 @@ class LocalHTTPServer(ThreadingHTTPServer):
         self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
 
 
+def running_instance(url, timeout=1.5):
+    """По адресу уже отвечает эта же программа (а не чужой сервер на том же порту)."""
+    try:
+        with urllib.request.urlopen(url + "api/ping", timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8") or "{}").get("app") == APP_NAME
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def app_shutdown():
+    """Аккуратное завершение: журнал WAL сбрасывается в data.db, соединения закрываются (а не обрываются os._exit)."""
+    for hook in SHUTDOWN_HOOKS:
+        try:
+            hook()
+        except Exception:  # noqa: BLE001
+            pass
+    if STORE is None:
+        return
+    try:
+        st = STORE
+        st.conn().execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        st.conn().close()
+        st.local.c = None
+    except Exception:  # noqa: BLE001
+        pass
+
+
+sys.tanalytic_shutdown = app_shutdown        # лаунчер вызывает перед выходом (собранное приложение)
+
+
 def main():
     cfg = load_config()
     port = int(os.environ.get("TINVEST_PORT") or cfg["port"])
@@ -378,6 +408,12 @@ def main():
     try:
         srv = LocalHTTPServer(("127.0.0.1", port), Handler)
     except OSError:
+        other = "http://127.0.0.1:%d/" % port
+        if running_instance(other):                  # программа уже открыта на этой базе: вторую копию не поднимаем
+            print("%s уже запущен → %s" % (APP_NAME, other))
+            if "--no-window" not in sys.argv:
+                open_window(other)
+            return
         srv = LocalHTTPServer(("127.0.0.1", 0), Handler)
     srv.daemon_threads = True
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -414,6 +450,7 @@ def main():
         pass
     finally:
         srv.server_close()
+        app_shutdown()
     # окно закрыто или Ctrl+C: фоновые расчёты (пулы потоков) прерываем сразу, иначе они падают с трассировкой
     # «cannot schedule new futures after interpreter shutdown». База SQLite транзакционная, данные не теряются.
     if not getattr(sys, "frozen", False):        # в собранном приложении выходом управляет лаунчер

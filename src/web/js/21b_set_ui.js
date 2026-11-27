@@ -22,6 +22,7 @@ async function stTiles(c){
   const loggedIn=au&&au.state==='ok'&&(au.username||au.expires);
   const tgOn=!!c.tg_enabled;
   if(!isPro())stTileSet('st-t3','mu','Доступно в Pro','Уведомления в Telegram','Подробнее');
+  else if(au&&au.state==='ok'&&!au.server)stTileSet('st-t3','mu','Без сервера данных','Вход по ключу не нужен','Настроить');
   else if(au&&au.state==='offline')stTileSet('st-t3','warn','Сервер недоступен','Вход проверить не удалось');
   else if(!loggedIn)stTileSet('st-t3','warn','Вход не выполнен','Нужен ключ из бота');
   else stTileSet('st-t3',tgOn?'pos':'mu','Вход выполнен'+(au.username?' · @'+au.username:''),`${au.expires?'ключ до '+authTime(au.expires)+' · ':''}уведомления ${tgOn?'включены':'выключены'}`,'Настроить');

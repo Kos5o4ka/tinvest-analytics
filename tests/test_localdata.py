@@ -45,7 +45,10 @@ class LocalData(unittest.TestCase):
         base = tempfile.mkdtemp(prefix="ld_link_")
         outside = tempfile.mkdtemp(prefix="ld_out_")
         put(outside, "big.bin", 100000)
-        os.symlink(outside, os.path.join(base, "logos"))
+        try:
+            os.symlink(outside, os.path.join(base, "logos"))
+        except OSError as e:                                 # Windows без прав администратора / режима разработчика
+            self.skipTest("символические ссылки недоступны: %s" % e)
         self.assertLess(M.local_data_info(base)["total"], 5000)
         M._ld_empty_dir(os.path.join(base, "logos"))        # ссылка на папку — не трогаем содержимое цели
         M._ld_remove(os.path.join(base, "logos"))           # удаляется только сама ссылка

@@ -1,5 +1,5 @@
 """Тесты лаунчера tinvest.py: без сети, без окна, в временной папке данных."""
-import hashlib, importlib.util, io, json, os, queue, tempfile, threading, unittest, urllib.request
+import sys, hashlib, importlib.util, io, json, os, queue, tempfile, threading, unittest, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -240,7 +240,7 @@ class NativeWindow(unittest.TestCase):
 
     def test_geometry_default_and_clamp(self):
         self.assertEqual(L.window_geometry(None, None), (1440, 900, None, None))
-        self.assertEqual(L.window_geometry(None, (1512, 982)), (1440, 900, None, None))
+        self.assertEqual(L.window_geometry(None, (1512, 982)), (1440, 900, 36, 32))      # по центру экрана
         w, h, _, _ = L.window_geometry(None, (1280, 720))
         self.assertEqual((w, h), (1240, 680))                                   # 720-80=640 < min 680 -> 680
         w, h, _, _ = L.window_geometry({"w": 300, "h": 200}, (1920, 1080))
@@ -252,8 +252,40 @@ class NativeWindow(unittest.TestCase):
 
     def test_geometry_position(self):
         self.assertEqual(L.window_geometry({"w": 1200, "h": 800, "x": 50, "y": 40}, (1920, 1080)), (1200, 800, 50, 40))
-        self.assertEqual(L.window_geometry({"w": 1200, "h": 800, "x": 5000, "y": 40}, (1920, 1080))[2:], (None, None))
-        self.assertEqual(L.window_geometry({"w": "x", "h": None, "x": True}, (1920, 1080)), (1440, 900, None, None))
+        self.assertEqual(L.window_geometry({"w": 1200, "h": 800, "x": 5000, "y": 40}, (1920, 1080))[2:], (360, 112))
+        self.assertEqual(L.window_geometry({"w": "x", "h": None, "x": True}, (1920, 1080)), (1440, 900, 240, 72))
+
+    def test_geometry_windows_maximized_frame(self):
+        # развёрнутое окно Windows закрывается в (-8, -8): это не «за экраном», позиция сохраняется
+        self.assertEqual(L.window_geometry({"w": 1300, "h": 800, "x": -8, "y": -8}, (1920, 1040))[2:], (-8, 0))
+        self.assertTrue(L.looks_maximized(1936, 1056, -8, -8, (1920, 1040)))
+        self.assertFalse(L.looks_maximized(1200, 800, 10, 10, (1920, 1040)))
+        self.assertTrue(L.was_maximized({"maximized": True}))
+        self.assertFalse(L.was_maximized(None))
+
+    def test_center(self):
+        self.assertEqual(L.center(520, 330, (1920, 1080)), (700, 300))
+        self.assertEqual(L.center(520, 330, None), (None, None))
+
+    def test_colorref(self):
+        self.assertEqual(L.colorref("#090c12"), 0x120c09)
+
+    def test_start_kwargs_persistent_profile(self):
+        kw = L.start_kwargs()
+        self.assertFalse(kw["private_mode"])
+        self.assertTrue(kw["storage_path"].endswith("webview"))
+
+    def test_single_instance_lock(self):
+        if sys.platform == "win32":
+            self.skipTest("мьютекс проверяется на Windows вручную")
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "l.lock")
+            a, b = L.SingleInstance(path=p), L.SingleInstance(path=p)
+            self.assertTrue(a.acquire())
+            self.assertFalse(b.acquire())
+            a.release()
+            self.assertTrue(b.acquire())
+            b.release()
 
     def test_state_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
@@ -263,6 +295,8 @@ class NativeWindow(unittest.TestCase):
                 self.assertIsNone(L.load_state())
                 L.save_state(1300, 800, 10, 20)
                 self.assertEqual(L.load_state(), {"w": 1300, "h": 800, "x": 10, "y": 20})
+                L.save_state(1300, 800, 10, 20, maximized=True)
+                self.assertTrue(L.load_state()["maximized"])
                 with open(L.STATE, "w") as f:
                     f.write("[1")
                 self.assertIsNone(L.load_state())
@@ -278,10 +312,10 @@ class NativeWindow(unittest.TestCase):
 
 class Splash(unittest.TestCase):
     def test_html_filled(self):
-        for plat in ("darwin", "win32"):
-            h = L.splash_html(plat)
+        for plat, build, cls in (("darwin", 0, "mac"), ("win32", 22631, "win"), ("win32", 19045, "win win10")):
+            h = L.splash_html(plat, build)
             self.assertNotIn("__", h.replace("__main__", ""))               # все подстановки сделаны
-            self.assertIn('class="%s"' % ("win" if plat == "win32" else "mac"), h)
+            self.assertIn('class="%s"' % cls, h)
             self.assertIn("<svg", h)
 
     def test_states(self):
@@ -300,7 +334,7 @@ class Splash(unittest.TestCase):
         api = L.SplashApi(Sh())
         api.retry(); api.run(); api.close(); api.browser()
         self.assertEqual(Sh.got, ["retry", "run", "close", "browser"])
-        self.assertEqual([n for n in dir(api) if not n.startswith("_")], ["browser", "close", "retry", "run"])
+        self.assertEqual([n for n in dir(api) if not n.startswith("_")], ["browser", "close", "minimize", "retry", "run"])
 
 
 if __name__ == "__main__":

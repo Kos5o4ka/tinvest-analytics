@@ -25,11 +25,11 @@ def concat(pattern):
     files = sorted(glob.glob(os.path.join(ROOT, pattern)))
     if not files:
         sys.exit("build: не найдены файлы " + pattern)
-    return b"".join(open(p, "rb").read() for p in files)
+    return b"".join(open(p, "rb").read().replace(b"\r\n", b"\n") for p in files)
 
 
 def build():
-    page = read("src", "web", "shell.html")
+    page = read("src", "web", "shell.html").replace(b"\r\n", b"\n")   # git с autocrlf=true на Windows отдаёт CRLF
     for token, data in ((b"{{CSS}}\n", concat("src/web/css/*.css")),
                         (b"{{JS}}\n", concat("src/web/js/*.js"))):
         if page.count(token) != 1:

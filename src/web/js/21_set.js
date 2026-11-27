@@ -105,7 +105,7 @@ function setMenuHtml(){
   const grp=NAV_GROUPS.map(([g,keys])=>`<div class="st-mg"><div class="st-ml">${esc(g)}</div><div class="st-chips">${keys.map(k=>{const t=(PAGES.find(p=>p&&p[0]===k)||[])[1];if(!t)return'';names.push(t);
     const lock=NAV_PINNED.includes(k);return`<label class="st-chip${lock?' lock':''}"><input type="checkbox" ${hid.includes(k)?'':'checked'} ${lock?'disabled':''} onchange="navToggle('${k}',this.checked,this)"><span>${esc(t)}</span></label>`}).join('')}</div></div>`).join('');
   return stGroup('Разделы меню',`<div class="st-pad st-menu">${grp}</div>
-    <div class="st-foot"><span>Скрытый раздел по-прежнему открывается через поиск (Ctrl+K / Cmd+K). «Обзор» и «Настройки» скрыть нельзя.</span><button class="btn ghost" onclick="navShowAll()">Показать все</button></div>`,{hint:'скрывайте то, чем не пользуетесь',q:names.join(' ')});
+    <div class="st-foot"><span>Скрытый раздел по-прежнему открывается через поиск (${MOD}K). «Обзор» и «Настройки» скрыть нельзя.</span><button class="btn ghost" onclick="navShowAll()">Показать все</button></div>`,{hint:'скрывайте то, чем не пользуетесь',q:names.join(' ')});
 }
 function navToggle(k,on,el){
   if(NAV_PINNED.includes(k))return;
@@ -199,6 +199,7 @@ async function bindSetAcc(msg){
   try{AUTH.st=await api('/api/auth/status')}catch(e){}
   const s=AUTH.st;
   if(!s)el.textContent='Нет данных о входе.';
+  else if(s.state==='ok'&&!s.server&&!s.username&&!s.expires)el.textContent='Сервер данных выключен — вход по ключу не нужен.';
   else if(s.state==='ok'&&(s.username||s.expires))el.innerHTML=`Вы вошли${s.username?' как <b>@'+esc(s.username)+'</b>':''}${s.expires?`, ключ действует до <b>${esc(authTime(s.expires))}</b>`:''}.`;
   else if(s.state==='ok')el.textContent='Вход выполнен.';
   else if(s.state==='offline')el.textContent='Сервер входа недоступен — программа работает напрямую с источниками.';

@@ -369,8 +369,9 @@ class TestServerEndpoints(unittest.TestCase):
             app = ts.DataServer(d, token_file=f)
             self.assertTrue(app.md and app.md.enabled)
             self.assertFalse(ts.DataServer(tempfile.mkdtemp(), token_file=os.path.join(d, "none")).md)
+            app.cache.db.close()                            # Windows не удаляет открытый cache.sqlite (WinError 32)
         finally:
-            shutil.rmtree(d)
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class TestClient(unittest.TestCase):

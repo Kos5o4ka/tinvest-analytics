@@ -62,6 +62,7 @@ DAY = 86400
 API_GET, API_POST = {}, {}
 # Функции без аргументов, которые сервер вызывает один раз при запуске (фоновые потоки модулей).
 STARTUP_HOOKS = []
+SHUTDOWN_HOOKS = []          # вызываются при закрытии программы (app_shutdown)
 # Ключи настроек, которые никогда не отдаются в интерфейс через /api/config (секреты).
 SECRET_KEYS = {"token"}
 
@@ -339,7 +340,7 @@ def _private_write(path, data_bytes):
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8-sig") as f:   # utf-8-sig: Блокнот Windows пишет BOM
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
@@ -380,7 +381,7 @@ def save_config(cfg):
         if env_tok and out.get("token") == env_tok:
             disk_tok = ""
             try:
-                with open(CONFIG_PATH, encoding="utf-8") as f:
+                with open(CONFIG_PATH, encoding="utf-8-sig") as f:   # utf-8-sig: Блокнот Windows пишет BOM
                     disk_tok = (json.load(f) or {}).get("token", "")
             except (OSError, ValueError, AttributeError):
                 pass
@@ -17828,6 +17829,17 @@ def _bk_suggest():
         cands.append(("Яндекс Диск" if "andex" in base or "Яндекс" in base else
                       "Google Drive" if "Google" in base else "iCloud Drive" if "iCloud" in base or "CloudDocs" in base else base,
                       os.path.join(home, base)))
+    if platform.system() == "Windows":           # OneDrive из переменных окружения, Google Drive — отдельный диск «G:\Мой диск»
+        for env, lab in (("OneDrive", "OneDrive"), ("OneDriveConsumer", "OneDrive"), ("OneDriveCommercial", "OneDrive (работа)")):
+            v = os.environ.get(env)
+            if v:
+                cands.append((lab, v))
+        for drv in "GHIJ":
+            for n in ("Мой диск", "My Drive"):
+                cands.append(("Google Drive", "%s:\\%s" % (drv, n)))
+        for v in (os.environ.get("YANDEX_DISK"), os.path.join(os.environ.get("USERPROFILE", home), "YandexDisk")):
+            if v:
+                cands.append(("Яндекс Диск", v))
     cs = os.path.join(home, "Library", "CloudStorage")
     try:
         for n in sorted(os.listdir(cs)):
@@ -17836,7 +17848,13 @@ def _bk_suggest():
             cands.append((lab, os.path.join(cs, n)))
     except OSError:
         pass
-    return [{"label": a, "path": b} for a, b in cands if os.path.isdir(b)]
+    out, seen = [], set()
+    for a, b in cands:
+        k = os.path.normcase(os.path.normpath(b))
+        if k not in seen and os.path.isdir(b):
+            seen.add(k)
+            out.append({"label": a, "path": b, "sep": os.sep})
+    return out
 
 
 def api_backup_status(cfg, acc, q, force):
@@ -27038,7 +27056,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, data, "image/png") if data else self.send(404, {"error": "no logo"})
             if u.path == "/api/ping":
                 _ping[0] = time.time()
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             cfg = load_config()
             f = q.get("force") == "1"
             acc = q.get("account", "all") or "all"
@@ -27205,7 +27223,7 @@ class Handler(BaseHTTPRequestHandler):
                 save_config(cfg)
                 ds_reset()
                 mem_clear(persist=False)        # сохранённые отчёты привязаны к токену (token_key): настройки их не портят
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             if path == "/api/ratings/refresh":
                 return self.send(200, {"started": ratings_start(force=True), **ratings_status()})
             client = TInvest(cfg)
@@ -27225,7 +27243,7 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute("DELETE FROM ops WHERE acc NOT LIKE 'imp-%'")
                     c.commit()
                 mem_clear()
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             if path == "/api/import/preview":
                 raw = base64.b64decode(body.get("data") or "")
                 pv = import_preview_any(body.get("filename") or "", raw)
@@ -27253,7 +27271,7 @@ class Handler(BaseHTTPRequestHandler):
                 store().put("imports", lst)
                 store().ops_clear(body.get("id") or "")
                 mem_clear()
-                return self.send(200, {"ok": True})
+                return self.send(200, {"ok": True, "app": APP_NAME})
             if path in ("/api/sandbox/open", "/api/sandbox/payin"):
                 if not cfg["sandbox"]:
                     raise ApiError("Доступно только в режиме песочницы.", 400)
@@ -27330,6 +27348,36 @@ class LocalHTTPServer(ThreadingHTTPServer):
         self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
 
 
+def running_instance(url, timeout=1.5):
+    """По адресу уже отвечает эта же программа (а не чужой сервер на том же порту)."""
+    try:
+        with urllib.request.urlopen(url + "api/ping", timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8") or "{}").get("app") == APP_NAME
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def app_shutdown():
+    """Аккуратное завершение: журнал WAL сбрасывается в data.db, соединения закрываются (а не обрываются os._exit)."""
+    for hook in SHUTDOWN_HOOKS:
+        try:
+            hook()
+        except Exception:  # noqa: BLE001
+            pass
+    if STORE is None:
+        return
+    try:
+        st = STORE
+        st.conn().execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        st.conn().close()
+        st.local.c = None
+    except Exception:  # noqa: BLE001
+        pass
+
+
+sys.tanalytic_shutdown = app_shutdown        # лаунчер вызывает перед выходом (собранное приложение)
+
+
 def main():
     cfg = load_config()
     port = int(os.environ.get("TINVEST_PORT") or cfg["port"])
@@ -27340,6 +27388,12 @@ def main():
     try:
         srv = LocalHTTPServer(("127.0.0.1", port), Handler)
     except OSError:
+        other = "http://127.0.0.1:%d/" % port
+        if running_instance(other):                  # программа уже открыта на этой базе: вторую копию не поднимаем
+            print("%s уже запущен → %s" % (APP_NAME, other))
+            if "--no-window" not in sys.argv:
+                open_window(other)
+            return
         srv = LocalHTTPServer(("127.0.0.1", 0), Handler)
     srv.daemon_threads = True
     url = "http://127.0.0.1:%d/" % srv.server_address[1]
@@ -27376,6 +27430,7 @@ def main():
         pass
     finally:
         srv.server_close()
+        app_shutdown()
     # окно закрыто или Ctrl+C: фоновые расчёты (пулы потоков) прерываем сразу, иначе они падают с трассировкой
     # «cannot schedule new futures after interpreter shutdown». База SQLite транзакционная, данные не теряются.
     if not getattr(sys, "frozen", False):        # в собранном приложении выходом управляет лаунчер
@@ -29336,7 +29391,7 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
     <span class="upd" id="upd"></span>
     <span class="pronly" id="prinfo"></span>
     <span class="who" id="who" style="display:none"></span>
-    <button class="btn ghost srch-pill" id="srch" title="Поиск и команды (Ctrl+K / Cmd+K)" aria-label="Поиск"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><span class="srch-tx">Поиск…</span><kbd class="srch-k">⌘K</kbd></button>
+    <button class="btn ghost srch-pill" id="srch" title="Поиск и команды (Ctrl+K / Cmd+K)" aria-label="Поиск"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><span class="srch-tx">Поиск…</span><kbd class="srch-k" id="srch-k">Ctrl+K</kbd></button>
     <button class="btn ghost" id="refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></svg><span class="btn-tx">Обновить</span></button>
     <div class="more-wrap" id="more-wrap">
       <button class="btn ghost" id="more" title="Ещё: скрыть суммы, тема, PNG, PDF" aria-label="Ещё" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
@@ -29356,6 +29411,12 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
+/* платформа: подписи клавиш и путей (⌘ на macOS, Ctrl на Windows/Linux) */
+const _plat=(navigator.userAgentData&&navigator.userAgentData.platform)||navigator.platform||navigator.userAgent||'';
+const IS_MAC=/Mac|iPhone|iPad/i.test(_plat),IS_WIN=/Win/i.test(_plat);
+const MOD=IS_MAC?'⌘':'Ctrl+';
+document.documentElement.classList.add(IS_MAC?'os-mac':IS_WIN?'os-win':'os-linux');
+document.addEventListener('DOMContentLoaded',()=>{const k=document.getElementById('srch-k');if(k)k.textContent=MOD+'K'});
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function safeUrl(u){try{const x=new URL(String(u||''));return(x.protocol==='https:'||x.protocol==='http:')?x.href:''}catch(e){return''}}
 const NF2=new Intl.NumberFormat('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2});
@@ -31594,13 +31655,16 @@ async function renderImport(){
         <label class="field"><span>Куда загрузить</span><select class="in" id="itarget"><option value="">Новый счёт</option>${imps.map(x=>`<option value="${esc(x.id)}"${im&&im.target===x.id?' selected':''}>${esc(x.name)}</option>`).join('')}</select></label>
         <label class="field"><span>Название счёта</span><input class="in" id="iname" placeholder="Например: Сбер ИИС" value="${esc(im&&im.name||'')}"></label>
         <label class="field"><span>Брокер</span><input class="in" id="ibroker" placeholder="Сбер, ВТБ, БКС…" value="${esc(im&&im.broker||'')}"></label></div>
-      <p class="note" style="margin-top:12px">Лучше всего подходит выгрузка всех операций (сделки + движение денег) за всё время. Если формат не распознаётся — заполните <a href="/api/import/template.csv" style="color:var(--ac)">шаблон CSV</a>. Бумаги находятся по ISIN или тикеру через API Т-Инвестиций, чтобы подтянуть текущие цены, названия, логотипы и купоны. Данные сохраняются только в локальной базе.</p></div>
+      <p class="note" style="margin-top:12px">Лучше всего подходит выгрузка всех операций (сделки + движение денег) за всё время. Если формат не распознаётся — заполните <a href="/api/import/template.csv" download="tanalytic-template.csv" style="color:var(--ac)">шаблон CSV</a>. Бумаги находятся по ISIN или тикеру через API Т-Инвестиций, чтобы подтянуть текущие цены, названия, логотипы и купоны. Данные сохраняются только в локальной базе.</p></div>
     ${step}
     <div class="card"><h2>Импортированные счета</h2>${imps.length?`<div class="li">${imps.map(x=>{const ps=(x.files||[]).map(f=>f.from&&f.to?[f.from,f.to]:null).filter(Boolean);const span=ps.length?` · ${ddm(ps.map(p=>p[0]).sort()[0])} — ${ddm(ps.map(p=>p[1]).sort().slice(-1)[0])}`:'';return`<div class="it">${logo({name:x.name,ticker:x.name},34)}<div><b>${esc(x.name)}</b><small>${esc(x.broker||'')}${x.broker?' · ':''}файлов: ${x.files.length} · операций: ${f0(x.ops||x.files.reduce((a,f)=>a+f.count,0))}${span}</small></div>
       <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`}).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div></div>`;
   const msg=(t,k)=>{$('#imsg').innerHTML=t?`<div class="msg ${k||'err'}">${t}</div>`:'';if(t)$('#imsg').scrollIntoView({block:'nearest'})};
   const drop=$('#drop'),inp=$('#ifile');
-  drop.onclick=()=>inp.click();
+  // в окне программы — системный диалог (надёжнее скрытого <input type=file> в WebView2), в браузере — обычный выбор файла
+  drop.onclick=async()=>{const a=window.pywebview&&pywebview.api;
+    if(a&&a.pick_file){try{const r=await a.pick_file();if(r&&r.error)return msg(esc(r.error));if(r&&r.b64)return pickData(r.name,r.b64);if(r===null)return}catch(e){}}
+    inp.click()};
   drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};drop.ondragleave=()=>drop.classList.remove('over');
   drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');if(e.dataTransfer.files[0])pick(e.dataTransfer.files[0])};
   inp.onchange=()=>{if(inp.files[0])pick(inp.files[0])};
@@ -31608,6 +31672,9 @@ async function renderImport(){
     if(f.size>60*1024*1024)return msg('Файл больше 60 МБ.');
     msg('Читаю файл…','info');
     const data=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=rej;r.readAsDataURL(f)});
+    return pickData(f.name,data);
+  }
+  async function pickData(fname,data){const f={name:fname};
     try{const pv=await post('/api/import/preview',{filename:f.name,data});
       const t=!!pv.format,bn=IMP_BROKER[pv.format]||(pv.broker_id&&pv.broker_id!=='other'?pv.broker_name:'')||'';
       S.imp={filename:f.name,data,preview:pv,mapping:pv.mapping,name:$('#iname').value||(t?bn||pv.title:f.name.replace(/\.[^.]+$/,'')),broker:$('#ibroker').value||bn,
@@ -31759,7 +31826,7 @@ function setMenuHtml(){
   const grp=NAV_GROUPS.map(([g,keys])=>`<div class="st-mg"><div class="st-ml">${esc(g)}</div><div class="st-chips">${keys.map(k=>{const t=(PAGES.find(p=>p&&p[0]===k)||[])[1];if(!t)return'';names.push(t);
     const lock=NAV_PINNED.includes(k);return`<label class="st-chip${lock?' lock':''}"><input type="checkbox" ${hid.includes(k)?'':'checked'} ${lock?'disabled':''} onchange="navToggle('${k}',this.checked,this)"><span>${esc(t)}</span></label>`}).join('')}</div></div>`).join('');
   return stGroup('Разделы меню',`<div class="st-pad st-menu">${grp}</div>
-    <div class="st-foot"><span>Скрытый раздел по-прежнему открывается через поиск (Ctrl+K / Cmd+K). «Обзор» и «Настройки» скрыть нельзя.</span><button class="btn ghost" onclick="navShowAll()">Показать все</button></div>`,{hint:'скрывайте то, чем не пользуетесь',q:names.join(' ')});
+    <div class="st-foot"><span>Скрытый раздел по-прежнему открывается через поиск (${MOD}K). «Обзор» и «Настройки» скрыть нельзя.</span><button class="btn ghost" onclick="navShowAll()">Показать все</button></div>`,{hint:'скрывайте то, чем не пользуетесь',q:names.join(' ')});
 }
 function navToggle(k,on,el){
   if(NAV_PINNED.includes(k))return;
@@ -31853,6 +31920,7 @@ async function bindSetAcc(msg){
   try{AUTH.st=await api('/api/auth/status')}catch(e){}
   const s=AUTH.st;
   if(!s)el.textContent='Нет данных о входе.';
+  else if(s.state==='ok'&&!s.server&&!s.username&&!s.expires)el.textContent='Сервер данных выключен — вход по ключу не нужен.';
   else if(s.state==='ok'&&(s.username||s.expires))el.innerHTML=`Вы вошли${s.username?' как <b>@'+esc(s.username)+'</b>':''}${s.expires?`, ключ действует до <b>${esc(authTime(s.expires))}</b>`:''}.`;
   else if(s.state==='ok')el.textContent='Вход выполнен.';
   else if(s.state==='offline')el.textContent='Сервер входа недоступен — программа работает напрямую с источниками.';
@@ -31926,7 +31994,7 @@ function setBackupHtml(c){
   const ex=(w,t)=>stRow(t,'',`<a class="btn ghost" href="/api/export?what=${w}&fmt=csv&account=${q}" download>CSV</a><a class="btn ghost" href="/api/export?what=${w}&fmt=xlsx&account=${q}" download>Excel</a>`);
   return stGroup('Резервная копия',
     `<div class="st-callout warn">Без пароля копию открыть нельзя, а пароль восстановить невозможно. Запишите его и храните отдельно от копии. Токен API и пароль в копию не входят.</div>`+
-    stRow('Папка для копий','Облачный диск или любая папка',`<input class="in st-wide" id="bkdir" placeholder="/Users/имя/Library/CloudStorage/…" spellcheck="false" aria-label="Папка для копий">`,{stack:1})+
+    stRow('Папка для копий','Облачный диск или любая папка',`<input class="in st-wide" id="bkdir" placeholder="${IS_WIN?'C:\\Users\\имя\\YandexDisk\\TInvestBackup':IS_MAC?'/Users/имя/Library/CloudStorage/…':'/home/имя/Yandex.Disk/TInvestBackup'}" spellcheck="false" aria-label="Папка для копий">`,{stack:1})+
     `<div id="bksug" class="bk-sug st-sug"></div>`+
     stRow('Пароль копии','<span id="bkpwst"></span>',stSecret('bkpw','не короче 6 символов','autocomplete="new-password"','Пароль копии'))+
     stRow('Хранить копий','Старые сверх лимита удаляются',`<input class="in num st-num" type="number" id="bkkeep" min="1" max="365" value="14" aria-label="Сколько копий хранить">`)+
@@ -31951,7 +32019,7 @@ function bindSetBackup(c,msg){
     if(first){first=false;$('#bkdir').value=s.dir||'';$('#bkkeep').value=s.keep;$('#bkauto').checked=s.auto;dirty.rebase();
       $('#bksug').innerHTML=s.suggest.length?'Найдены папки: '+s.suggest.map(x=>`<button class="btn ghost bk-chip" data-p="${esc(x.path)}">${esc(x.label)}</button>`).join(' '):
       `Подсказки: Яндекс Диск — ${s.windows?'C:\\Users\\имя\\Yandex.Disk':'~/Yandex.Disk'}; iCloud Drive — ${s.windows?'C:\\Users\\имя\\iCloudDrive':'~/Library/Mobile Documents/com~apple~CloudDocs'}; Google Drive — ${s.windows?'G:\\Мой диск':'~/Library/CloudStorage/GoogleDrive-…'}`;
-      $('#bksug').onclick=e=>{const b=e.target.closest('[data-p]');if(b){$('#bkdir').value=b.dataset.p+(b.dataset.p.endsWith('/')?'':'/')+'TInvestBackup';dirty.upd()}}}
+      $('#bksug').onclick=e=>{const b=e.target.closest('[data-p]');if(b){const p=b.dataset.p,sp=s.windows||/^[A-Za-z]:\\/.test(p)?'\\':'/';$('#bkdir').value=p+(/[\\/]$/.test(p)?'':sp)+'TInvestBackup';dirty.upd()}}}
     $('#bkpwst').innerHTML=s.pw_set?'<span class="pos">Пароль сохранён</span>':'<span class="mu">Пароль не сохранён</span>';
     $('#bkclr').style.display=s.pw_set?'':'none';
     restoreBar(!!s.restore_pending);
@@ -32024,6 +32092,7 @@ async function stTiles(c){
   const loggedIn=au&&au.state==='ok'&&(au.username||au.expires);
   const tgOn=!!c.tg_enabled;
   if(!isPro())stTileSet('st-t3','mu','Доступно в Pro','Уведомления в Telegram','Подробнее');
+  else if(au&&au.state==='ok'&&!au.server)stTileSet('st-t3','mu','Без сервера данных','Вход по ключу не нужен','Настроить');
   else if(au&&au.state==='offline')stTileSet('st-t3','warn','Сервер недоступен','Вход проверить не удалось');
   else if(!loggedIn)stTileSet('st-t3','warn','Вход не выполнен','Нужен ключ из бота');
   else stTileSet('st-t3',tgOn?'pos':'mu','Вход выполнен'+(au.username?' · @'+au.username:''),`${au.expires?'ключ до '+authTime(au.expires)+' · ':''}уведомления ${tgOn?'включены':'выключены'}`,'Настроить');
@@ -32186,7 +32255,10 @@ async function renderSettings(){
 /* ── тема, печать ── */
 function themeNow(t){return t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}
 let _thmT=0;
-function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}const h=document.documentElement;h.classList.add('thm-anim');clearTimeout(_thmT);_thmT=setTimeout(()=>h.classList.remove('thm-anim'),260);h.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t;thmLabel()}
+function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}const h=document.documentElement;h.classList.add('thm-anim');clearTimeout(_thmT);_thmT=setTimeout(()=>h.classList.remove('thm-anim'),260);h.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t;thmLabel();nativeTheme()}
+/* окно программы (pywebview): системная шапка Windows в тон теме */
+function nativeTheme(){try{const a=window.pywebview&&pywebview.api;if(a&&a.set_theme)a.set_theme(document.documentElement.dataset.theme==='light'?'light':'dark')}catch(e){}}
+window.addEventListener('pywebviewready',nativeTheme);
 function thmLabel(){const e=document.getElementById('thm-t');if(e)e.textContent=document.documentElement.dataset.theme==='light'?'Тёмная тема':'Светлая тема'}
 function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
 // один клик = видимая смена: от того, что сейчас на экране (раньше цикл auto→light→dark→auto при тёмной системе давал «пустой» клик dark→auto)
@@ -37433,7 +37505,7 @@ function uxDashBlocks(){
     ['acc','Подключите счёт или откройте демо-портфель','set'],
     ['pay','Проверьте ближайшие выплаты и оферты','pay'],
     ['bond','Откройте карточку любой облигации в портфеле или скринере','scr'],
-    ['srch','Попробуйте быстрый поиск по тикерам и экранам (⌘K / Ctrl+K)','__srch']
+    ['srch','Попробуйте быстрый поиск по тикерам и экранам ('+MOD+'K)','__srch']
   ];
   const doneCnt=steps.filter(([k])=>UX.checks[k]).length;
   let chk='';
@@ -37564,7 +37636,7 @@ const TOUR_STEPS=[
   {sel:['#ux-mode','aside'],title:'Режимы «Базовый» и «Профи»',text:'«Базовый» показывает основные разделы без лишнего. «Профи» открывает все инструменты аналитики.'},
   {sel:['#nav button[title="Облигации (рынок)"]','#nav [data-p="scr"]'],title:'Скринер: фиксы и флоатеры',text:'Подбор облигаций по доходности, сроку и надёжности. Нажмите, чтобы открыть скринер.',task:true},
   {sel:['#nav [data-p="dgap"]','#nav button[title="Акции и фонды"]'],title:'Дивиденды',text:'Ближайшие дивиденды по акциям портфеля, их надёжность и поведение цены в день отсечки. Полный анализ любой акции — вкладка «Дивиденды» в её карточке. Раздел для режима «Профи».'},
-  {sel:['#srch'],title:'Быстрый поиск ⌘K / Ctrl+K',text:'Находите бумаги, эмитентов и разделы программы с клавиатуры.'}
+  {sel:['#srch'],title:'Быстрый поиск '+MOD+'K',text:'Находите бумаги, эмитентов и разделы программы с клавиатуры.'}
 ];
 const TOUR={on:false,i:0,list:[],tgt:null,raf:0,ov:null,pop:null,hole:null,ring:null,bk:[],tm:0,tm2:0,ro:null,loop:0,lr:''};
 /* слежение за целью: бегущая строка, догрузка данных и т. п. сдвигают раскладку — подсветка и подсказка едут следом.
