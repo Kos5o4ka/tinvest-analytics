@@ -1,0 +1,22 @@
+# Пример. Не развёрнуто, применять при >50-100 пользователях.
+[Unit]
+Description=TAnalytic market snapshot worker (MOEX ISS -> market.sqlite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tinvest
+Group=tinvest
+ExecStart=/usr/bin/python3 /opt/tinvest-analytics/server/market_worker.py --data /var/lib/tinvest-server --interval 900 --workers 4 --loop
+Restart=always
+RestartSec=10
+CPUAffinity=1
+Nice=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tinvest-server
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# Пример. Не развёрнуто, применять при >50-100 пользователях.
+# Скрипта бота в этом репозитории нет: подставьте путь к своему деплою.
+[Unit]
+Description=TAnalytic Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tinvest
+Group=tinvest
+EnvironmentFile=-/etc/tinvest-bot.env
+ExecStart=/usr/bin/python3 /opt/tinvest-bot/bot.py
+Restart=always
+RestartSec=5
+CPUAffinity=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tinvest-bot
+
+[Install]
+WantedBy=multi-user.target
