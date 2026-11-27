@@ -107,7 +107,7 @@ class T(unittest.TestCase):
         M.tg_tick()
         self.assertEqual(len(self.stub.posts), 1)
         self.assertIn("Сводка", self.stub.posts[0][2]["text"])
-        self.assertTrue(self.stub.posts[0][2]["text"].startswith("📈 <b>Сводка TAnalytic</b> · "))
+        self.assertTrue(self.stub.posts[0][2]["text"].startswith("<b>Сводка TAnalytic</b> · "))
 
     def test_legacy_keys_cleanup_and_save(self):
         self.conf(tg_token="123456:SECRETSECRETSECRETSECRET", tg_chat="42")
@@ -129,7 +129,7 @@ class T(unittest.TestCase):
     def test_test_message_format(self):
         M.tg_test({}, {})
         t = self.stub.posts[0][2]["text"]
-        self.assertTrue(t.startswith("🧪 <b>Тестовое сообщение</b>\n\n"))
+        self.assertTrue(t.startswith("<b>Тестовое сообщение</b>\n\n"))
         self.assertTrue(t.endswith(M.TG_DISCLAIMER))
 
 
@@ -174,10 +174,10 @@ class MessageFormat(unittest.TestCase):
     def test_alert_line(self):
         a = {"kind": "rating", "name": "Банк <X>", "message": "рейтинг понижен & отозван", "isin": "RU000A0TEST1", "url": "https://acra-ratings.ru/press/1"}
         ln = M._tg_alert_line(a)
-        self.assertTrue(ln.startswith("🏷 <b>Банк &lt;X&gt;</b> — рейтинг понижен &amp; отозван\n"))
+        self.assertTrue(ln.startswith("[рейтинг] <b>Банк &lt;X&gt;</b> — рейтинг понижен &amp; отозван\n"))
         self.assertIn('<a href="https://acra-ratings.ru/press/1">Пресс-релиз</a> · <a href="https://www.moex.com/ru/issue.aspx?code=RU000A0TEST1">на Мосбирже</a>', ln)
-        self.assertEqual(M._tg_alert_line({"kind": "price", "name": "A", "message": "m"}), "📉 <b>A</b> — m")
-        self.assertTrue(M._tg_alert_line({"kind": "goal", "name": "A", "message": "m"}).startswith("⭐"))
+        self.assertEqual(M._tg_alert_line({"kind": "price", "name": "A", "message": "m"}), "[цена] <b>A</b> — m")
+        self.assertTrue(M._tg_alert_line({"kind": "goal", "name": "A", "message": "m"}).startswith("[цель]"))
 
     def test_cap_and_fit(self):
         self.assertEqual(M._tg_cap(["a", "b", "c"], 2), "a\nb\n…и ещё 1")
@@ -201,13 +201,13 @@ class MessageFormat(unittest.TestCase):
             n = M._tg_dispatch({}, "Тревоги по портфелю", al, sent, 1000.0)
             self.assertEqual(n, len(sent))
             self.assertLessEqual(len(msgs), 3)
-            self.assertTrue(all(m.startswith("🔔 <b>Тревоги по портфелю</b>\n\n") for m in msgs))
+            self.assertTrue(all(m.startswith("<b>Тревоги по портфелю</b>\n\n") for m in msgs))
             self.assertTrue(all(len(m) + len(M.TG_DISCLAIMER) <= M.TG_LIMIT for m in msgs))
             self.assertIn("…и ещё %d — придут при следующей проверке" % (40 - n), msgs[-1])
             self.assertEqual(M._tg_dispatch({}, "t", al[:n], sent, 2000.0), 0)       # отправленные не повторяются
             msgs.clear()
-            M._tg_dispatch({}, "Наблюдение и цели", [{"id": "g1", "kind": "goal", "name": "Б", "message": "цель"}], {}, 1.0, icon="⭐")
-            self.assertTrue(msgs[0].startswith("⭐ <b>Наблюдение и цели</b>"))
+            M._tg_dispatch({}, "Наблюдение и цели", [{"id": "g1", "kind": "goal", "name": "Б", "message": "цель"}], {}, 1.0, icon="")
+            self.assertTrue(msgs[0].startswith("<b>Наблюдение и цели</b>"))
         finally:
             M.tg_send = orig
 

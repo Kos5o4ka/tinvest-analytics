@@ -72,7 +72,7 @@ def _tg_moex(isin):
 
 
 def _tg_head(icon, title, sub=""):
-    return "%s <b>%s</b>%s" % (icon, _tg_esc(title), (" · " + _tg_esc(sub)) if sub else "")
+    return "%s<b>%s</b>%s" % ((icon + " ") if icon else "", _tg_esc(title), (" · " + _tg_esc(sub)) if sub else "")
 
 
 def _tg_cap(lines, shown, more=""):
@@ -172,7 +172,7 @@ def tg_info(cfg, acc, q, force):
 
 def tg_test(cfg, body):
     tg_send(load_config(), "%s\n\nTAnalytic подключён к Telegram. Сюда будут приходить тревоги, выплаты и ежедневная сводка — "
-            "что именно, настраивается в приложении." % _tg_head("🧪", "Тестовое сообщение"))
+            "что именно, настраивается в приложении." % _tg_head("", "Тестовое сообщение"))
     return {"ok": True}
 
 

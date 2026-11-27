@@ -172,8 +172,8 @@ TG_DISCLAIMER = "\n\n<i>Не является индивидуальной ин�
 TG_LIMIT = 3500
 MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
 TG_OFR_CALL_DAYS, TG_OFR_CLOSE_DAYS = 14, 2
-KIND_ICON = {"goal": "⭐", "reminder": "📝", "default": "⛔", "default_ok": "✅", "rating": "🏷",
-             "disclosure": "📢", "coupon_declared": "🔔", "flow_large": "💰", "flow_spike": "📊"}
+KIND_ICON = {"goal": "[цель]", "reminder": "[напоминание]", "default": "[дефолт]", "default_ok": "[дефолт снят]", "rating": "[рейтинг]",
+             "disclosure": "[раскрытие]", "coupon_declared": "[купон]", "flow_large": "[крупная сделка]", "flow_spike": "[всплеск объёма]"}
 EV = {"coupon": "купон", "dividend": "дивиденд", "amortization": "амортизация", "redemption": "погашение",
       "maturity": "погашение", "offer": "оферта", "call": "оферта CALL", "put": "оферта PUT", "buyback": "выкуп"}
 
@@ -219,7 +219,7 @@ def moex(isin):
 
 
 def head(icon, title, sub=""):
-    return "%s <b>%s</b>%s" % (icon, esc(title), (" · " + esc(sub)) if sub else "")
+    return "%s<b>%s</b>%s" % ((icon + " ") if icon else "", esc(title), (" · " + esc(sub)) if sub else "")
 
 
 def cap(lines, shown, more=""):
@@ -290,7 +290,7 @@ def reminder_alerts(rems, today):
     return out
 
 
-def dispatch_plan(title, alerts, sent, icon="🔔"):
+def dispatch_plan(title, alerts, sent, icon=""):
     """Как tg_dispatch_plan в приложении: до трёх сообщений, до 10 тревог в каждом -> [(текст, [ключ, ...])]."""
     fresh = [(a["id"], a) for a in alerts if a["id"] not in sent]
     if not fresh:
@@ -328,28 +328,28 @@ def offer_due(items, today):
         base = "ofr|%s|%s|" % (isin, od)
         if kind == "put":
             if it.get("coupon_status") == "announced" and it.get("new_rate") is not None and (not pe or today <= pe):
-                out.append((base + "coupon", "🔔 <b>%s</b> — эмитент объявил купон после пут-оферты (%s): %s годовых. Приём заявок открывается в период предъявления.%s"
+                out.append((base + "coupon", "<b>%s</b> — эмитент объявил купон после пут-оферты (%s): %s годовых. Приём заявок открывается в период предъявления.%s"
                             % (nm, tdate(od, today), pct(it["new_rate"]), lk)))
             if ps and pe and ps <= today <= pe:
-                out.append((base + "open", "🔔 <b>%s</b> — открыт приём заявок по пут-оферте: с %s по %s (выкуп %s). Заявку подаёт брокер.%s"
+                out.append((base + "open", "<b>%s</b> — открыт приём заявок по пут-оферте: с %s по %s (выкуп %s). Заявку подаёт брокер.%s"
                             % (nm, tdate(ps, today), tdate(pe, today), tdate(od, today), lk)))
             if pe:
                 left = days_between(today, pe)
                 if 0 <= left <= TG_OFR_CLOSE_DAYS and (not ps or ps <= today):
                     t = ("осталось %d дня подать заявку" % left if left >= 2 else "остался 1 день, чтобы подать заявку" if left == 1
                          else "сегодня последний день подачи заявки")
-                    out.append((base + "close", "⏰ <b>%s</b> — %s на пут-оферту (последний день %s, выкуп %s).%s"
+                    out.append((base + "close", "<b>%s</b> — %s на пут-оферту (последний день %s, выкуп %s).%s"
                                 % (nm, t, tdate(pe, today), tdate(od, today), lk)))
         elif kind == "call":
             left = days_between(today, od)
             if 0 < left <= TG_OFR_CALL_DAYS:
-                out.append((base + "call", "🔔 <b>%s</b> — возможное досрочное погашение (колл) %s, через %d дн. Решает эмитент, заявку подавать не нужно.%s"
+                out.append((base + "call", "<b>%s</b> — возможное досрочное погашение (колл) %s, через %d дн. Решает эмитент, заявку подавать не нужно.%s"
                             % (nm, tdate(od, today), left, lk)))
     return out
 
 
 def offers_text(due):
-    return head("🔔", "Оферты по портфелю") + "\n\n" + "\n\n".join(t for _k, t in due)
+    return head("", "Оферты по портфелю") + "\n\n" + "\n\n".join(t for _k, t in due)
 
 
 def ev_line(e, today):
@@ -368,7 +368,7 @@ def pay_fresh(events, sent):
 
 
 def pay_text(days, fresh, today):
-    return "%s\n\n%s" % (head("💰", "Ближайшие выплаты", "%d дн." % days), cap([ev_line(e, today) for _k, e in fresh], 15))
+    return "%s\n\n%s" % (head("", "Ближайшие выплаты", "%d дн." % days), cap([ev_line(e, today) for _k, e in fresh], 15))
 
 
 def pay_events(pays, today, days):
@@ -1062,7 +1062,7 @@ def _build_messages(sub, quotes, today, sent, muted=None, disclosures=None, flow
             al += goal_alerts(g, quotes.get(g["isin"]), today)
         rems = [r for r in (sub.get("reminders") or []) if str(r.get("isin") or "").upper() not in muted_set]
         al += reminder_alerts(rems, today)
-        for text, keys in dispatch_plan("Наблюдение и цели", al, sent, icon="⭐"):
+        for text, keys in dispatch_plan("Наблюдение и цели", al, sent, icon=""):
             msgs.append((text, keys, 0))
 
     if disclosures:
@@ -1076,9 +1076,9 @@ def _build_messages(sub, quotes, today, sent, muted=None, disclosures=None, flow
         disc_all = [a for a in disclosure_alerts(sub_eff, disclosures, sent, now) if a.get("severity", 1) >= min_sev]
         crit = [a for a in disc_all if a.get("severity", 1) >= 2]
         norm = [a for a in disc_all if a.get("severity", 1) < 2]
-        for text, keys in dispatch_plan("Важные раскрытия и рейтинги", crit, sent, icon="🚨"):
+        for text, keys in dispatch_plan("Важные раскрытия и рейтинги", crit, sent, icon=""):
             msgs.append((text, keys, 2))
-        for text, keys in dispatch_plan("Раскрытия и рейтинги", norm, sent, icon="📢"):
+        for text, keys in dispatch_plan("Раскрытия и рейтинги", norm, sent, icon=""):
             msgs.append((text, keys, 0))
 
     if flows_spikes and min_sev <= 1:
@@ -1090,7 +1090,7 @@ def _build_messages(sub, quotes, today, sent, muted=None, disclosures=None, flow
             if sub.get("isins"):
                 sub_eff["isins"] = [x for x in sub["isins"] if str(x or "").upper() not in muted_set]
         fl_al = [a for a in flow_alerts(sub_eff, flows_spikes, sent, now) if a.get("severity", 1) >= min_sev]
-        for text, keys in dispatch_plan("Потоки по списку наблюдения", fl_al, sent, icon="📊"):
+        for text, keys in dispatch_plan("Потоки по списку наблюдения", fl_al, sent, icon=""):
             msgs.append((text, keys, 0))
 
     days = int(sub.get("pay_days") or 0)

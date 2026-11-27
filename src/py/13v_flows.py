@@ -317,7 +317,7 @@ API_GET["/api/orderbook"] = orderbook_get
 
 
 # ───────────────────────── тревоги по списку наблюдения ─────────────────────────
-_TG_KIND.update({"flow_large": "💰", "flow_spike": "📊"})      # значки для Telegram (_TG_KIND задан в 13j_watch)
+_TG_KIND.update({"flow_large": "[крупная сделка]", "flow_spike": "[всплеск объёма]"})      # значки для Telegram (_TG_KIND задан в 13j_watch)
 FLW_ALERT_HOURS, FLW_ALERT_MAX = 6, 10
 
 

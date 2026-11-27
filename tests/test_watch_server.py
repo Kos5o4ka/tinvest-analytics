@@ -92,8 +92,8 @@ class Parity(unittest.TestCase):
     def test_dispatch_plan(self):
         for n in (0, 1, 7, 40):
             al = self.alerts(n)
-            a = M.tg_dispatch_plan("Наблюдение и цели", al, {}, time.time(), icon="⭐")
-            b = SA.dispatch_plan("Наблюдение и цели", al, set(), icon="⭐")
+            a = M.tg_dispatch_plan("Наблюдение и цели", al, {}, time.time(), icon="")
+            b = SA.dispatch_plan("Наблюдение и цели", al, set(), icon="")
             self.assertEqual([(t, [k for k, _ in ch]) for t, ch in a], b)
         al = self.alerts(3)
         sent = {al[0]["id"]: time.time()}

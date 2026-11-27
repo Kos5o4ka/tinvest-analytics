@@ -160,6 +160,17 @@ class Checker(unittest.TestCase):
         self.assertEqual(sorted(shown), ["gy|A", "x|C"])
         self.assertNotIn("…и ещё", "".join(t for t, _k in out))
 
+    def test_no_emoji_in_telegram_texts(self):
+        """Правило проекта: без эмодзи в сообщениях (сервер тревог и клиент в приложении)."""
+        import re
+        rx = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u23E9-\u23FA\u2705\u274C\uFE0F]")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for rel in ("server/alerts.py", "src/py/13j2_watch_tg.py", "src/py/13j3_watch_dispatch.py", "src/py/13v_flows.py"):
+            with open(os.path.join(root, rel), encoding="utf-8") as f:
+                self.assertEqual([m for m in rx.findall(f.read())], [], rel)
+        self.assertEqual(SA.head("", "Заголовок"), "<b>Заголовок</b>")
+        self.assertTrue(all("[" in v for v in SA.KIND_ICON.values()))
+
     def test_disclosure_and_flow_alerts_units(self):
         sub = self.sub(
             goals=[{"isin": "RU000A100001", "name": "Эмитент А", "watch_only": True}],
