@@ -35,6 +35,21 @@ const calP2=n=>String(n).padStart(2,'0');
 const CAL_BADGE={PUT:'of-t-put','CALL':'of-t-call'};
 function calBadge(e){return e.badge?` <span class="tag ${CAL_BADGE[e.badge]||'of-t-unk'} cal-bd">${esc(e.badge)}</span>`:''}
 function calMoney(e){return e.amount!=null?M(e.amount,'rub',2):''}
+function calEvRow(e){
+  const click=e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:e.kind==='dividend'&&e.ticker?stkAttr(e.ticker,'div'):'';
+  const lnk=e.isin?`<span class="cal-ev-go">Карточка →</span>`:'';
+  return`<div class="cal-ev"${click}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}${calBadge(e)}</b><small class="mu">${esc(e.label||calName(e.kind))}${e.note&&!e.label?' · '+esc(e.note):''}</small>${e.label&&e.note?`<small class="mu">${esc(e.note)}</small>`:''}</div>
+    <span class="num cal-am">${calMoney(e)}</span>${lnk}</div>`;
+}
+function calDaySummaryCard(sel,items,today){
+  const list=items||[];
+  const dayTotal=list.reduce((a,e)=>a+(e.amount!=null&&['coupon','redemption','amort','dividend'].includes(calKind(e.kind))?+e.amount:0),0);
+  const wd=['воскресенье','понедельник','вторник','среда','четверг','пятница','суббота'][new Date(sel+'T00:00:00').getDay()];
+  return`<div class="st-card cal-day-card" id="cal-day-card"><div class="cal-dc-h">
+    <div><b>${dlabel(sel)}</b> <span class="mu">${wd}${sel===today?' · сегодня':''} · событий: ${list.length}</span>${dayTotal>0?`<span class="cal-dc-sum num pos">Выплаты: ${M(dayTotal,'rub',2)}</span>`:''}</div>
+    <div class="cal-dc-act"><a class="btn ghost" id="cal-day-ics" href="/api/events.ics?${new URLSearchParams({account:S.account,from:sel,to:sel})}" download="tinvest_events_${esc(sel)}.ics">Скачать .ics за день</a><button type="button" class="btn ghost" id="cal-all">Весь месяц</button></div></div>
+    <div class="cal-dc-body">${list.length?list.map(calEvRow).join(''):'<div class="mu" style="padding:8px 4px;font-size:13px">На выбранный день событий нет.</div>'}</div></div>`;
+}
 function calYearHtml(d,today){
   const y=S.cal.y,by={};
   (d.events||[]).filter(calVis).forEach(e=>(by[e.date]=by[e.date]||[]).push(e));
@@ -48,7 +63,7 @@ function calYearHtml(d,today){
       const ds=`${y}-${calP2(m+1)}-${calP2(dd)}`,l=by[ds]||[];cnt+=l.length;
       const gs=[...new Set(l.map(e=>calGroup(e.kind)))].slice(0,3);
       const tip=l.slice(0,5).map(e=>e.title+' — '+(e.label||calName(e.kind))).join('\n')+(l.length>5?`\n…и ещё ${l.length-5}`:'');
-      cells+=`<b class="cy-c ${ds===today?'today':''} ${l.length?'has':''}"${l.length?` data-day="${ds}" title="${esc(dlabel(ds)+'\n'+tip)}"`:''}>${dd}${gs.length?`<s>${gs.map(k=>`<i style="background:${(CAL_KINDS.find(g=>g[0]===k)||[])[2]||'#8d94a3'}"></i>`).join('')}</s>`:''}</b>`;
+      cells+=`<b class="cy-c ${ds===today?'today':''} ${l.length?'has':''}" data-day="${ds}"${l.length?` title="${esc(dlabel(ds)+'\n'+tip)}"`:''}>${dd}${gs.length?`<s>${gs.map(k=>`<i style="background:${(CAL_KINDS.find(g=>g[0]===k)||[])[2]||'#8d94a3'}"></i>`).join('')}</s>`:''}</b>`;
     }
     h+=`<div class="cy-m"><button class="cy-t" data-m="${m}">${MONF[m]}${cnt?` <small>${cnt}</small>`:''}</button><div class="cy-g">${cells}</div></div>`;
   }
@@ -88,12 +103,12 @@ function pCal(){
     <button class="btn ghost" id="cal-today">Сегодня</button><span class="cal-vw"><button id="cal-vm" class="${yr?'':'on'}">Месяц</button><button id="cal-vy" class="${yr?'on':''}">Год</button></span><a class="btn" id="cal-ics" href="/api/events.ics?${new URLSearchParams({account:S.account})}" download="tinvest_events.ics" style="margin-left:auto">Скачать .ics</a></div>`;
   const hasOther=c.data&&(c.data.events||[]).some(e=>calGroup(e.kind)==='other');
   const chips=`<div class="cal-chips">${CAL_KINDS.filter(g=>g[0]!=='other'||hasOther).map(g=>`<button class="cal-chip ${S.cal.off[g[0]]?'':'on'}" data-k="${g[0]}"><i style="background:${g[2]}"></i>${g[1]}</button>`).join('')}</div>`;
-  const help=`<p class="note" style="margin:4px 4px 12px">Кнопка «Скачать .ics» сохраняет файл с событиями на год вперёд (все типы, без учёта фильтров). Его можно импортировать в Календарь Google (Настройки → Импорт) или открыть в Календаре Apple двойным щелчком. Файл формируется на вашем компьютере и никуда не отправляется.</p>`;
+  const help=`<p class="note" style="margin:4px 4px 12px">Кнопка «Скачать .ics» сохраняет файл с событиями на год вперёд (или только за выбранный день из карточки дня). Его можно импортировать в Календарь Google (Настройки → Импорт) или открыть в Календаре Apple двойным щелчком.</p>`;
   if(c.loading)return`<div class="card">${nav}${waitBox('Собираю события: заседания ЦБ, выплаты, оферты, размещения…')}</div>`;
   if(c.error)return`<div class="card">${nav}<div class="msg err">${esc(c.error)} <button class="btn ghost" id="cal-r">Повторить</button></div></div>`;
   const d=c.data,evs=(d.events||[]).filter(calVis);
   if(yr){
-    return`${calKpis(evs,'за '+y+' год',d)}<div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${calYearHtml(d,today)}<p class="note" style="margin:10px 4px 0">Точки — типы событий в этот день (до трёх). Нажмите на день, чтобы открыть его в месячном виде, или на название месяца.</p></div>${help}`;
+    return`${calKpis(evs,'за '+y+' год',d)}<div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${calYearHtml(d,today)}<p class="note" style="margin:10px 4px 0">Точки — типы событий в этот день (до трёх). Нажмите на день, чтобы открыть карточку дня, или на название месяца.</p></div>${help}`;
   }
   const by={};evs.forEach(e=>(by[e.date]=by[e.date]||[]).push(e));
   const first=new Date(y,m,1),lead=(first.getDay()+6)%7,days=new Date(y,m+1,0).getDate();
@@ -106,13 +121,14 @@ function pCal(){
       ${l.length?`<span class="cal-dots">${kinds.slice(0,6).map(k=>`<i style="background:${(CAL_KINDS.find(g=>g[0]===k)||[])[2]||'#8d94a3'}"></i>`).join('')}</span><span class="cal-n">${l.length}</span>`:''}</div>`;
   }
   const grid=`<div class="cal-grid"><div class="cal-h">Пн</div><div class="cal-h">Вт</div><div class="cal-h">Ср</div><div class="cal-h">Чт</div><div class="cal-h">Пт</div><div class="cal-h">Сб</div><div class="cal-h">Вс</div>${cells}</div>`;
-  const ds=Object.keys(by).filter(x=>!S.cal.sel||x===S.cal.sel).sort();
+  const dayCard=S.cal.sel?calDaySummaryCard(S.cal.sel,by[S.cal.sel],today):'';
+  const ds=Object.keys(by).sort();
   const list=ds.length?ds.map(dt=>`<div class="cal-day" id="cal-d-${dt}"><div class="cal-dh"><b>${dlabel(dt)}</b><span class="mu">${['вс','пн','вт','ср','чт','пт','сб'][new Date(dt+'T00:00:00').getDay()]}${dt===today?' · сегодня':''}</span></div>
-    ${by[dt].map(e=>`<div class="cal-ev"${e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:e.kind==='dividend'&&e.ticker?stkAttr(e.ticker,'div'):''}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}${calBadge(e)}</b><small class="mu">${esc(e.label||calName(e.kind))}${e.note&&!e.label?' · '+esc(e.note):''}</small>${e.label&&e.note?`<small class="mu">${esc(e.note)}</small>`:''}</div>
-      <span class="num cal-am">${calMoney(e)}</span></div>`).join('')}</div>`).join(''):'<div class="empty" style="padding:24px">В этом месяце событий нет'+(Object.keys(S.cal.off).some(k=>S.cal.off[k])?' (часть типов скрыта фильтрами)':'')+'</div>';
+    ${by[dt].map(calEvRow).join('')}</div>`).join(''):'<div class="empty" style="padding:24px">В этом месяце событий нет'+(Object.keys(S.cal.off).some(k=>S.cal.off[k])?' (часть типов скрыта фильтрами)':'')+'</div>';
   return`${calKpis(evs,MONF[m].toLowerCase()+' '+y,d)}
-  <div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${grid}${S.cal.sel?`<div class="row" style="margin:10px 4px 0"><span class="mu">Показан день ${dlabel(S.cal.sel)}</span><button class="btn ghost" id="cal-all">Показать весь месяц</button></div>`:''}</div>
-  <div class="card" style="margin-top:16px"><h2>События ${S.cal.sel?'за день':'месяца'}</h2>${list}</div>${help}
+  <div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${grid}</div>
+  ${dayCard}
+  ${S.cal.sel?'':`<div class="card" style="margin-top:16px"><h2>События месяца</h2>${list}</div>`}${help}
   <p class="note">Источники: сайт Банка России (календарь заседаний), Московская биржа (купоны, оферты, размещения), ваш портфель${(d.sources||{}).watch!=null?', список наблюдения':''}. Даты выплат, размеры будущих купонов и оферт могут измениться — сверяйтесь с решением эмитента. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
 function bindCal(){

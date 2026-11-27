@@ -17,8 +17,16 @@ function ladCallBadge(d,k){if(!d)return'';
     :` <span class="tag ld-call" title="Колл — право эмитента досрочно погасить выпуск. Ступень поставлена на погашение, но деньги могут вернуться раньше.">возможен колл ${ddm(d)}</span>`}
 function ladPl(n,f){const a=n%100,b=n%10;return a>10&&a<20?f[2]:b===1?f[0]:b>1&&b<5?f[1]:f[2]}
 function ladYears(y){const n=Math.round(y*10)/10;return n.toFixed(1).replace('.',',')+(n>=5?' лет':n>=2?' года':' года')}
+function ladGapYear(p){const m=String((p&&(p.key||p.label))||'').match(/20\d{2}/);return m?+m[0]:null}
+function ladOpenGapYear(yr){
+  const curY=new Date().getFullYear(),yrs=Math.max(1,yr-curY+1);
+  S.sf=Object.assign({},SCR_DEF,{cur:'RUB',tmax:String(yrs),rmin:S.ladQ.rating||'A-'});
+  S.scrPreset='';S.scrOpen=true;
+  toast('Скринер: подбор облигаций до '+yr+' года');
+  go('scr');
+}
 function ladTip(ps,view){return i=>{const p=ps[i];if(!p)return'';
-  let h=`<b>${esc(p.label)}</b>`+(p.total>0?tipRow('var(--tx2)','Вернётся',M(p.total,'rub',0)+' · '+pctp(p.share,1)):`<div>Выплат нет</div>`);
+  let h=`<b>${esc(p.label)}</b>`+(p.total>0?tipRow('var(--tx2)','Вернётся',M(p.total,'rub',0)+' · '+pctp(p.share,1)):`<div>Выплат нет — нажмите, чтобы подобрать бумаги на этот год</div>`);
   Object.keys(LAD_TY).forEach(k=>{if(p.by_type[k]>0)h+=tipRow(LAD_TY[k][1],LAD_TY[k][0],M(p.by_type[k],'rub',0))});
   if(p.items.length){h+='<div style="margin-top:6px;border-top:1px solid var(--line);padding-top:4px"></div>';
     p.items.slice().sort((a,b)=>b.amount-a.amount).slice(0,8).forEach(x=>{h+=tipRow(LAD_TY[x.type][1],x.name,M(x.amount,'rub',0))});
@@ -34,8 +42,10 @@ function ladBars(ps,O){
     const w=val(p)/mx*100;
     const av=O.mode==='pct'?(avg[p.kind]/(ps.reduce((x,q)=>x+q.total,0)||1)*100):avg[p.kind];
     const seg=Object.keys(LAD_TY).filter(k=>p.by_type[k]>0).map(k=>`<i style="flex:${p.by_type[k]};background:${LAD_TY[k][1]}"></i>`).join('');
-    const tag=p.flag==='heavy'?'<span class="ld-fl heavy">тяжёлый</span>':p.flag==='gap'?'<span class="ld-fl gap">пусто</span>':'';
-    return`<div class="ldb-row ${p.flag||''} ${p.total>0?'':'z'}" data-i="${i}"><span class="ldb-l">${esc(p.label)}</span>
+    const gy=p.flag==='gap'?ladGapYear(p):null;
+    const tag=p.flag==='heavy'?'<span class="ld-fl heavy">тяжёлый</span>':p.flag==='gap'?`<span class="ld-fl gap">${gy?'пусто · подобрать →':'пусто'}</span>`:'';
+    const actAttr=gy?` data-gap-year="${gy}" role="button" tabindex="0" title="Закрыть пустой ${gy} год: подобрать облигации в Скринере"`:'';
+    return`<div class="ldb-row ${p.flag||''}${gy?' is-act':''} ${p.total>0?'':'z'}" data-i="${i}"${actAttr}><span class="ldb-l">${esc(p.label)}</span>
       <div class="ldb-tr"><div class="ldb-bar" style="width:${w.toFixed(2)}%">${seg}</div>${av>0?`<u class="ldb-avg" style="left:${Math.min(av/mx*100,100).toFixed(2)}%"></u>`:''}</div>
       <span class="ldb-v num">${p.total>0?(O.mode==='pct'?pctp(p.share,1):short(p.total)+' ₽'):'—'}${tag}</span></div>`}).join('')}</div>`}
 function ladGroups(ps,O){
@@ -55,10 +65,11 @@ function ladMy(){
   if(d.empty)return`<div class="card empty">${svgI('<path d="M3 21h4v-5h4v-5h4V6h6"/>')}<div>В портфеле нет облигаций с известной датой погашения: показывать нечего.<br><small class="mu">Лесенку из новых бумаг можно составить на вкладке «Подобрать лесенку».</small></div></div>`;
   const vk=O.offers&&d.has_offers?'offer':'maturity',V=d.variants[vk]||d.variants.offer||d.variants.maturity,sm=V.summary;
   const ps=O.gran==='quarter'?V.quarter:V.year,nx=sm.next,hv=sm.heavy;
+  const gapChips=sm.gaps.length?sm.gaps.map(g=>`<button type="button" class="ld-gap-chip" data-gap-year="${esc(g)}" title="Подобрать облигации на ${esc(g)} год в Скринере">${esc(g)} →</button>`).join(' '):'нет';
   const kp=`<div class="g g4">${kpi('Средний срок возврата',sm.avg_years!=null?ladYears(sm.avg_years):'—',vk==='offer'&&d.has_offers?'до погашения, для бумаг с пут-офертой — до оферты':'до погашения; взвешен по суммам возврата',null,S1)}
     ${kpi('Ближайший возврат',nx?M(nx.amount,'rub',0):'—',nx?`${ddm(nx.date)} · ${esc(nx.names.slice(0,2).join(', '))}${nx.names.length>2?' и ещё '+(nx.names.length-2):''}`:'нет будущих выплат',null,S3)}
     ${kpi('Самый «тяжёлый» год',hv?pctp(hv.share,0):'—',hv?`${esc(hv.label)}: ${M(hv.total,'rub',0)} — ${hv.flag==='heavy'?'заметно выше среднего':'в пределах нормы'}`:'—',hv&&hv.flag==='heavy'?'neg':null,S4)}
-    ${kpi('Пустые годы',sm.gaps.length?esc(sm.gaps.join(', ')):'нет',sm.gaps.length?'в эти годы ничего не возвращается':'между первым и последним годом пропусков нет',null,sm.gaps.length?S8:S6)}</div>`;
+    ${kpi('Пустые годы',gapChips,sm.gaps.length?'нажмите на год, чтобы подобрать бумаги в Скринере':'между первым и последним годом пропусков нет',null,sm.gaps.length?S8:S6)}</div>`;
   const seg=(k,opts,cur)=>`<div class="seg noprint">${opts.map(([v,t])=>`<button class="${cur===v?'on':''}" data-ld="${k}:${v}">${t}</button>`).join('')}</div>`;
   const ctl=`<div class="ld-ctl noprint">${seg('gran',[['year','По годам'],['quarter','Кварталы, затем годы']],O.gran)}${seg('mode',[['sum','Суммы'],['pct','% портфеля']],O.mode)}
     ${d.has_offers?`<label class="sw"><input type="checkbox" id="ld-offs" ${O.offers?'checked':''}><i></i><div><b>Считать пут-оферты как погашение</b><small>по бумагам с пут-офертой срок — до её даты; колл срок не меняет</small></div></label>`:''}</div>`;
@@ -68,7 +79,7 @@ function ladMy(){
     <li><b>Лесенка</b> — это облигации с разными датами погашения: каждый период часть денег возвращается, и её можно вложить заново или потратить.</li>
     <li><b>Ровные ступени</b> означают, что в каждый период возвращается примерно одинаковая сумма. Так проще реинвестировать: часть денег попадает на рынок и при высоких, и при низких ставках, и риск одного неудачного момента меньше.</li>
     <li><b>Пут-оферта</b> — право держателя предъявить бумагу к выкупу: при включённом переключателе ступень стоит на её дате. <b>Колл</b> — право эмитента погасить выпуск досрочно: решает он, поэтому ступень остаётся на погашении, а бумага помечена «возможен колл».</li>
-    <li><b>«Тяжёлый» период</b> (больше 1,5× среднего) — на него приходится непропорционально большая часть денег, <b>пустой</b> — денег не возвращается вовсе. Это описание структуры портфеля, а не оценка бумаг и не рекомендация.</li></ul></details>`;
+    <li><b>«Тяжёлый» период</b> (больше 1,5× среднего) — на него приходится непропорционально большая часть денег, <b>пустой</b> — денег не возвращается вовсе (нажмите на пустую строку, чтобы подобрать бумаги на этот год в Скринере).</li></ul></details>`;
   return kp+`<div class="card"><h2>Лесенка: сколько денег возвращается${O.gran==='quarter'?' по кварталам и годам':' по годам'}<span class="sp">пунктир — среднее; наведите на ступень, чтобы увидеть выпуски</span></h2>${ctl}
     <div class="ld-leg">${leg}<span class="mu">Всего к возврату: ${M(sm.total,'rub',0)}</span>${sm.callable&&sm.callable.amount>0?`<span class="ld-call-sum" title="Колл — право эмитента досрочно погасить выпуск: такие суммы стоят на дате погашения, но могут вернуться раньше">Может вернуться раньше (колл или оферта без типа): ${M(sm.callable.amount,'rub',0)} · ${pctp(sm.callable.share,1)} · ${sm.callable.count} ${ladPl(sm.callable.count,['выпуск','выпуска','выпусков'])}</span>`:''}</div>${ladBars(ps,O)}${how}</div>
     <div class="card"><h2>Состав по периодам<span class="sp">строка периода сворачивается; нажмите на выпуск — карточка</span></h2><div class="noprint ld-ctl2"><button class="btn ghost" id="ld-cl">Свернуть все</button><button class="btn ghost" id="ld-ex">Развернуть все</button></div>
@@ -127,7 +138,7 @@ function pLad(){
 }
 function pLadBuild(){
   const q=S.ladQ,l=S.lad;
-  const form=`<div class="card"><h2>Параметры лесенки<span class="sp">деньги делятся по ступеням с разными сроками погашения</span></h2><div class="flt ld-form">
+  const form=`<aside class="card ld-side"><h2>Параметры лесенки</h2><p class="note" style="margin:-6px 0 12px">Деньги делятся по ступеням с разными сроками погашения.</p><div class="flt ld-form">
     <label class="field"><span>Сумма, ₽</span><input class="in" id="ld-sum" type="text" inputmode="numeric" value="${esc(q.sum)}"></label>
     <label class="field"><span>Горизонт, лет (1–10)</span><input class="in" id="ld-years" type="number" min="1" max="10" step="1" value="${esc(q.years)}"></label>
     <label class="field"><span>Ступеней</span><input class="in" id="ld-rungs" type="number" min="1" max="12" step="1" placeholder="= лет" value="${esc(q.rungs)}"></label>
@@ -135,15 +146,21 @@ function pLadBuild(){
     <label class="sw"><input type="checkbox" id="ld-fl" ${q.floaters?'checked':''}><i></i><div><b>Флоатеры</b><small>купон плавает со ставкой</small></div></label>
     <label class="sw"><input type="checkbox" id="ld-am" ${q.amort?'checked':''}><i></i><div><b>Амортизация</b><small>долг гасится частями</small></div></label>
     <label class="sw"><input type="checkbox" id="ld-mo" ${q.monthly?'checked':''}><i></i><div><b>Ровный доход</b><small>купоны в разные месяцы</small></div></label>
-    <button class="btn" id="ld-go">Подобрать</button></div></div>`;
-  if(!l)return form+`<div class="card empty">Задайте сумму и горизонт и нажмите «Подобрать»: программа составит набор облигаций, которые гасятся по очереди.</div>`;
-  if(l.loading)return form+`<div class="card">${waitBox('Подбираю бумаги и считаю выплаты…')}</div>`;
-  if(l.error||l.data.error)return form+`<div class="msg err">${esc(l.error||l.data.error)}</div>`;
-  return form+ladResult(l.data);
+    <button class="btn" id="ld-go" style="width:100%">Подобрать</button></div></aside>`;
+  const body=!l?`<div class="card empty">Задайте сумму и горизонт слева и нажмите «Подобрать»: программа составит набор облигаций, которые гасятся по очереди.</div>`
+    :l.loading?`<div class="card">${waitBox('Подбираю бумаги и считаю выплаты…')}</div>`
+    :(l.error||l.data.error)?`<div class="msg err">${esc(l.error||l.data.error)}</div>`
+    :ladResult(l.data);
+  return`<div class="ld-split">${form}<div class="ld-main">${body}</div></div>`;
 }
 function bindLad(){
   document.querySelectorAll('[data-ldtab]').forEach(b=>b.onclick=()=>{S.ladTab=b.dataset.ldtab;lsSet('ta_ladtab',S.ladTab);render()});
   document.querySelectorAll('[data-ld]').forEach(b=>b.onclick=()=>{const[k,v]=b.dataset.ld.split(':');S.ladO[k]=v;ladSaveO();render()});
+  document.querySelectorAll('[data-gap-year]').forEach(b=>{
+    const goGap=()=>{const y=+b.dataset.gapYear;if(y)ladOpenGapYear(y)};
+    b.onclick=e=>{e.stopPropagation();goGap()};
+    b.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();goGap()}};
+  });
   const of=$('#ld-offs');if(of)of.onchange=()=>{S.ladO.offers=of.checked;ladSaveO();render()};
   const hw=document.querySelector('.ld-how');if(hw)hw.ontoggle=()=>{S._ladHowOpen=hw.open;S.ladO.how=false;ladSaveO()};
   const bars=$('#ld-bars');if(bars){const d=S.ladP&&S.ladP.data,O=S.ladO;if(d&&!d.empty){const V=d.variants[O.offers&&d.has_offers?'offer':'maturity']||d.variants.offer;bindTip(bars,ladTip(O.gran==='quarter'?V.quarter:V.year))}}

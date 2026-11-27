@@ -1,0 +1,56 @@
+/* ── Стили безрамочной шапки Tauri v2 (действуют только при html.is-tauri) ── */
+.tauri-bar{
+  display:none;
+  flex:none;
+  height:34px;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 8px 0 14px;
+  background:var(--side);
+  border-bottom:1px solid var(--line);
+  user-select:none;
+  -webkit-user-select:none;
+  -webkit-app-region:drag;
+}
+html.is-tauri .tauri-bar{display:flex}
+html.is-tauri.os-mac aside{padding-top:36px}
+html.is-tauri.os-mac .tauri-bar{background:transparent;border-bottom-color:transparent;height:30px;padding:0 12px}
+
+.tauri-brand{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:12px;
+  font-weight:600;
+  color:var(--tx2);
+  letter-spacing:-.01em;
+  min-width:0;
+}
+.tauri-brand svg{flex:none;display:block}
+
+.tauri-win-btns{
+  display:flex;
+  align-items:center;
+  gap:2px;
+  -webkit-app-region:no-drag;
+}
+.tauri-btn{
+  all:unset;
+  box-sizing:border-box;
+  width:34px;
+  height:26px;
+  border-radius:7px;
+  display:grid;
+  place-items:center;
+  color:var(--tx2);
+  cursor:pointer;
+  transition:background .14s ease,color .14s ease;
+  -webkit-app-region:no-drag;
+}
+.tauri-btn svg{width:12px;height:12px;display:block}
+.tauri-btn:hover{background:var(--card2);color:var(--tx)}
+.tauri-btn.tauri-close:hover{background:#e81123;color:#fff}
+
+@media print{
+  html.is-tauri .tauri-bar{display:none!important}
+}

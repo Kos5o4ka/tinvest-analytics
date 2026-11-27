@@ -5,6 +5,7 @@ const OPN={BUY:'Покупка',SELL:'Продажа',BUY_CARD:'Покупка',
   BOND_REPAYMENT:'Амортизация',BOND_REPAYMENT_FULL:'Погашение',BROKER_FEE:'Комиссия брокера',SERVICE_FEE:'Обслуживание',MARGIN_FEE:'Плата за маржу',TAX:'НДФЛ',
   DIVIDEND_TAX:'Налог с дивидендов',BOND_TAX:'Налог с купона',INPUT:'Пополнение',OUTPUT:'Вывод',INP_MULTI:'Перевод между счетами',OUT_MULTI:'Перевод между счетами',
   OVERNIGHT:'Доход по РЕПО',ACCRUING_VARMARGIN:'Вар. маржа',WRITING_OFF_VARMARGIN:'Вар. маржа',TAX_CORRECTION:'Возврат налога',INPUT_SECURITIES:'Зачисление бумаг',OUTPUT_SECURITIES:'Списание бумаг'};
+S.opsFrom=S.opsFrom||'';S.opsTo=S.opsTo||'';S.opsAcc=S.opsAcc||'';
 /* инструмент операции -> карточка бумаги; дивиденды и налог с них — сразу на вкладку «Дивиденды» */
 function opsStk(o){
   const dv=o[2]==='dividends'||o[2]==='tax_dividend',t=o[4]||(dv?stkByName(o[3]):'');
@@ -12,8 +13,16 @@ function opsStk(o){
   return dv?stkAttr(t,'div'):stkAttrIf(t);
 }
 function opsFiltered(){
-  const q=S.opsQ.toLowerCase(),ks=KMAP[S.opsK];
-  return S.data.ops.filter(o=>(!ks||ks.includes(o[2]))&&(!q||(o[1]+' '+(OPN[o[1]]||'')+' '+o[3]+' '+o[4]+' '+o[12]).toLowerCase().includes(q)));
+  const q=S.opsQ.toLowerCase(),ks=KMAP[S.opsK],fr=S.opsFrom||'',to=S.opsTo||'',ac=S.account==='all'?(S.opsAcc||''):'';
+  return S.data.ops.filter(o=>{
+    if(ks&&!ks.includes(o[2]))return false;
+    const d=String(o[0]||'').slice(0,10);
+    if(fr&&d<fr)return false;
+    if(to&&d>to)return false;
+    if(ac&&o[12]!==ac)return false;
+    if(q&&!(o[1]+' '+(OPN[o[1]]||'')+' '+o[3]+' '+o[4]+' '+o[12]).toLowerCase().includes(q))return false;
+    return true;
+  });
 }
 /* итоги по отфильтрованным операциям (только рублёвые) */
 function opsTotals(all){
@@ -33,18 +42,24 @@ function opsTotals(all){
   return`<div class="ops-sum">${it.join('')}<span>Чистый поток: <b class="num ${cls(t.net)}">${SM(t.net)}</b></span>${other?`<span class="mu">без ${f0(other)} операций в других валютах</span>`:''}</div>`;
 }
 function pOps(){
-  return`<div class="card"><div class="row" style="margin-bottom:14px">
-    <input class="in" id="oq" placeholder="Поиск: название, тикер, тип операции…" value="${esc(S.opsQ)}" style="flex:1;min-width:240px">
+  const accs=S.account==='all'?[...new Set((S.data.ops||[]).map(o=>o[12]).filter(Boolean))].sort():[];
+  const accSel=S.account==='all'&&accs.length>1?`<select class="in ops-acc" id="o-acc" aria-label="Фильтр по счёту"><option value="">Все счета (${accs.length})</option>${accs.map(a=>`<option value="${esc(a)}"${S.opsAcc===a?' selected':''}>${esc(a)}</option>`).join('')}</select>`:'';
+  return`<div class="card"><div class="tbl-head" style="padding:0 0 12px"><h2 style="margin:0">Журнал операций<span class="sp" id="ops-cnt"></span></h2>${typeof taCsvBtn==='function'?taCsvBtn('ops-csv','Выгрузить операции по текущему фильтру в CSV'):''}</div>
+    <div class="row" style="margin-bottom:14px">
+    <input class="in" id="oq" placeholder="Поиск: название, тикер, тип операции…" value="${esc(S.opsQ)}" style="flex:1;min-width:220px">
+    <label class="ops-dt"><span>От</span><input class="in" type="date" id="o-from" value="${esc(S.opsFrom)}"></label>
+    <label class="ops-dt"><span>До</span><input class="in" type="date" id="o-to" value="${esc(S.opsTo)}"></label>
+    ${accSel}
     <div class="seg" id="ok">${KINDS.map(([k,t])=>`<button class="${k===S.opsK?'on':''}" data-k="${k}">${t}</button>`).join('')}</div>
-    <a class="btn ghost" style="text-decoration:none" href="/api/operations.csv?${new URLSearchParams({period:S.period,account:S.account})}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',2)}CSV</a>
     <button class="btn" id="man-add" title="Внести сделку или текущую позицию вручную, без загрузки отчёта">+ Добавить сделку</button></div>
     <div id="otab"></div></div><div id="man-list"></div>`;
 }
 function drawOps(){
   const all=opsFiltered(),rows=all.slice(0,S.opsN),el=$('#otab');if(!el)return;
-  if(!all.length){el.innerHTML=S.opsQ||S.opsK?'<div class="empty">Ничего не найдено. <button class="btn ghost" id="ops-reset">Сбросить фильтры</button></div>':emptyHint('Операций за этот период нет. Выберите период «Всё время» сверху или загрузите отчёт брокера.',[['imp','Импорт отчёта',1]]);const rb=$('#ops-reset');if(rb)rb.onclick=()=>{S.opsQ='';S.opsK='';render()};el.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
+  const cnt=$('#ops-cnt');if(cnt)cnt.textContent=`Найдено: ${f0(all.length)}`;
+  if(!all.length){const hasF=S.opsQ||S.opsK||S.opsFrom||S.opsTo||S.opsAcc;el.innerHTML=hasF?'<div class="empty">Ничего не найдено. <button class="btn ghost" id="ops-reset">Сбросить фильтры</button></div>':emptyHint('Операций за этот период нет. Выберите период «Всё время» сверху или загрузите отчёт брокера.',[['imp','Импорт отчёта',1]]);const rb=$('#ops-reset');if(rb)rb.onclick=()=>{S.opsQ='';S.opsK='';S.opsFrom='';S.opsTo='';S.opsAcc='';render()};el.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   const multi=S.account==='all';
-  el.innerHTML=`<p class="note" style="margin-bottom:8px">Найдено: ${f0(all.length)}</p>${opsTotals(all)}<div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
+  el.innerHTML=`${opsTotals(all)}<div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
     <th>Дата</th><th class="l">Операция</th><th class="l">Инструмент</th>${multi?'<th class="l">Счёт</th>':''}<th>Кол-во</th><th>Цена</th><th>Сумма</th><th>Комиссия</th><th>Результат</th></tr></thead><tbody>`+
     rows.map(o=>`<tr><td class="num t2">${esc(o[0])}</td><td class="l"><span class="tag">${esc(OPN[o[1]]||o[1])}</span></td>
     <td class="l" style="max-width:380px">${o[3]||o[4]?`<div class="tk"${opsStk(o)}>${logo({name:o[3],ticker:o[4],logo:o[11]},24)}<div><b style="font-weight:550">${esc(o[3]||o[4])}</b></div></div>`:''}</td>
@@ -53,4 +68,17 @@ function drawOps(){
     `</tbody></table>${all.length>rows.length?`<div class="more"><button class="btn ghost" id="omore">Показать ещё (${f0(all.length-rows.length)})</button></div>`:''}</div>`;
   const m=$('#omore');if(m)m.onclick=()=>{S.opsN+=500;drawOps()};
 }
-
+document.addEventListener('change',e=>{
+  if(S.page!=='ops'||!e.target)return;
+  if(e.target.id==='o-from'){S.opsFrom=e.target.value;S.opsN=200;drawOps()}
+  else if(e.target.id==='o-to'){S.opsTo=e.target.value;S.opsN=200;drawOps()}
+  else if(e.target.id==='o-acc'){S.opsAcc=e.target.value;S.opsN=200;drawOps()}
+});
+document.addEventListener('click',e=>{
+  if(S.page!=='ops'||!e.target.closest)return;
+  if(e.target.closest('#ops-csv')){
+    const all=opsFiltered();
+    if(typeof taCsvDownload==='function')taCsvDownload('operations.csv',['Дата','Операция','Инструмент','Тикер','Счёт','Кол-во','Цена','Сумма','Валюта','Комиссия','Результат'],
+      all.map(o=>[o[0]||'',OPN[o[1]]||o[1]||'',o[3]||'',o[4]||'',o[12]||'',o[5]??'',o[6]??'',o[7]??'',(o[8]||'rub').toUpperCase(),o[9]??'',o[10]??'']));
+  }
+});

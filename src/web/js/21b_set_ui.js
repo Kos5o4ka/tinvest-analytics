@@ -80,6 +80,7 @@ function setNewsHtml(c){
 }
 async function renderSettings(){
   S.charts=[];
+  stDirtyReset();
   const view=$('#view'),keep=view.querySelector('.st')?view.scrollTop:0;
   try{S.cfg=await api('/api/config')}catch(e){view.innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
   const c=S.cfg;
@@ -105,21 +106,31 @@ async function renderSettings(){
   const perm=('Notification' in window)?Notification.permission:'unsupported';
   const look=stGroup('Тема оформления',
     `<div class="st-pad"><div class="st-themes" id="thsel" role="group" aria-label="Тема оформления">${themes.map(([k,t,d])=>`<button type="button" data-t="${k}" class="${th===k?'on':''}" aria-pressed="${th===k}">${k==='auto'?`<span class="th-prev th-auto">${prev('dark')}${prev('light')}</span>`:prev(k)}<span class="th-n"><b>${t}</b>${d?`<small>${d}</small>`:''}</span><em class="th-c">${stIco('check',2.6)}</em></button>`).join('')}</div></div>`,{hint:'применяется сразу',q:'светлая тёмная авто оформление'})+
-    stGroup('Акцент и плотность',
+    stGroup('Акцент, плотность и запуск',
     stRow('Акцентный цвет','Цвет кнопок, ссылок и выделений во всей программе',`<div class="st-acc" id="accsel" role="group" aria-label="Акцентный цвет">${ACCENTS.map(([k,t,c])=>`<button type="button" data-a="${k}" class="${curAccent()===k?'on':''}" aria-pressed="${curAccent()===k}" title="${t}" style="--sw:${c}"><i></i><span>${t}</span></button>`).join('')}</div>`)+
-    stRow('Плотность интерфейса','Компактная убирает лишние отступы: на экране помещается больше строк',`<div class="st-acc st-dens" id="denssel" role="group" aria-label="Плотность интерфейса">${[['comfort','Комфортная'],['compact','Компактная']].map(([k,t])=>`<button type="button" data-d="${k}" class="${curDensity()===k?'on':''}" aria-pressed="${curDensity()===k}"><span>${t}</span></button>`).join('')}</div>`),
-    {hint:'внешний вид',q:'акцент цвет плотность компактная комфортная синий изумрудный графит фиолетовый'})+
+    stRow('Плотность интерфейса','Компактная убирает лишние отступы: на экране помещается больше строк',`<div class="st-acc st-dens" id="denssel" role="group" aria-label="Плотность интерфейса">${[['comfort','Комфортная'],['compact','Компактная']].map(([k,t])=>`<button type="button" data-d="${k}" class="${curDensity()===k?'on':''}" aria-pressed="${curDensity()===k}"><span>${t}</span></button>`).join('')}</div>`)+
+    stRow('Стартовый экран при запуске','Какой раздел открывать при запуске программы, если не открыт другой экран',`<select class="in st-sel" id="start-page" aria-label="Стартовый экран при запуске">${[['dash','Обзор'],['bonds','Облигации'],['scr','Скринер'],['cal','Календарь']].map(([k,t])=>`<option value="${k}" ${(c.start_page||'dash')===k?'selected':''}>${t}</option>`).join('')}</select>`),
+    {hint:'внешний вид',q:'акцент цвет плотность компактная комфортная синий изумрудный графит фиолетовый стартовый экран запуск обзор облигации скринер календарь'})+
     stGroup('Напоминания',
     stRow('Напоминать о выплатах','За сколько дней предупреждать на «Обзоре» и в «Выплатах» (0 — выключить)',`<input class="in num st-num" id="nd" type="number" min="0" max="60" value="${c.notify_days??7}" aria-label="За сколько дней напоминать о выплатах"><span class="st-unit">дн.</span>`)+
     stRow('Системные уведомления','Приходят, пока программа открыта',`<span class="st-who" id="ntf-st">${perm==='granted'?'Разрешены':perm==='denied'?'Запрещены в браузере':perm==='unsupported'?'Не поддерживаются':'Не разрешены'}</span><button class="btn ghost" id="ntf" ${perm==='granted'||perm==='unsupported'?'disabled':''}>Разрешить</button>`)+
+    stRow('Проверка уведомлений','Покажет тестовое сообщение на экране, системное уведомление и проверку Telegram (если включён)',`<button class="btn ghost" id="ntf-test">Проверить уведомления</button>`)+
     stMore('Печать отчёта','Кнопка PDF сверху → «Сохранить как PDF»: печатается текущий раздел и период.'),{hint:'выплаты и уведомления'})+
     setMenuHtml();
   /* расчёты */
+  const monTh=stGroup('Пороги мониторинга',
+    stRow('Падение цены за 5 дней, %','Порог средней тревоги (вдвое больше — высокая)',`<input class="in num st-num" id="st-mon-drop5" type="number" min="0.1" max="50" step="0.5" value="${c.mon_drop5??3}" aria-label="Падение цены за 5 дней, %">`)+
+    stRow('Падение цены за 30 дней, %','Порог средней тревоги за месяц',`<input class="in num st-num" id="st-mon-drop30" type="number" min="0.1" max="90" step="0.5" value="${c.mon_drop30??7}" aria-label="Падение цены за 30 дней, %">`)+
+    stRow('Рост спреда за 30 дней, п.п.','Расширение спреда к КБД',`<input class="in num st-num" id="st-mon-spread30" type="number" min="0.1" max="50" step="0.5" value="${c.mon_spread30??2}" aria-label="Рост спреда за 30 дней, п.п.">`)+
+    stRow('Неликвид: дней на продажу более','Порог уведомления о низкой ликвидности',`<input class="in num st-num" id="st-mon-sell" type="number" min="0.5" max="365" step="0.5" value="${c.mon_sell_days??5}" aria-label="Дней на продажу">`)+
+    stRow('Оферта: за сколько дней предупреждать','Горизонт напоминаний по офертам',`<input class="in num st-num" id="st-mon-offer" type="number" min="1" max="365" step="1" value="${c.mon_offer_days??30}" aria-label="Дней до оферты">`)+
+    stRow('Действия','',`<button class="btn" id="mon-cfg-save" disabled>Сохранить пороги</button>`),
+    {id:'st-mon-card',hint:'тревоги по облигациям',q:'мониторинг пороги падение спред неликвид оферта'});
   const calc=stGroup('Прогноз ключевой ставки',
     stRow('Источник прогноза','Для флоатеров: ставка не объявленных купонов = ключевая на начало периода + спред эмитента',`<select class="in st-sel" id="krmode" aria-label="Источник прогноза ключевой ставки">${[['cbr','Прогноз Банка России (по умолчанию)'],['survey','Опрос аналитиков Банка России'],['market','Рынок: форварды КБД'],['flat','Без изменений (текущая ставка)']].map(([k,t])=>`<option value="${k}" ${(c.keyrate_mode||'cbr')===k?'selected':''}>${t}</option>`).join('')}</select>`)+
     `<p class="st-line" id="krinfo">Загружаю…</p>`+
     stMore('Чем отличаются источники','«Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.'),
-    {hint:'для флоатеров'})+setCrowdHtml(c);
+    {hint:'для флоатеров'})+monTh+setCrowdHtml(c);
   const sec=(i,body)=>stSec(SET_TOC[i][0],SET_TOC[i][1],SET_TOC[i][3],SET_TOC[i][2],body);
   view.innerHTML=`<div class="st fade">
   <aside class="st-side" aria-label="Навигация по настройкам">
@@ -133,8 +144,9 @@ async function renderSettings(){
     <div class="msg info" id="st-empty" hidden>Ничего не найдено. Попробуйте другое слово, например «токен», «тема» или «копия».</div>
   </div></div>`;
   const main=document.getElementById('st-main');
-  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)+setSyncHtml(c)),
-    sec(5,setNewsHtml(c)),sec(6,setDangerHtml(c))];
+  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,setLockHtml(c)),sec(3,look),sec(4,calc),sec(5,setLocalHtml(c)+setBackupHtml(c)+setSyncHtml(c)),
+    sec(6,setNewsHtml(c)),sec(7,setDangerHtml(c)),
+    `<div class="st-dirty-bar" id="st-dirty-bar" hidden role="region" aria-label="Несохранённые изменения"><span>Есть несохранённые изменения</span><div class="row"><button type="button" class="btn ghost" id="st-dirty-cancel">Отменить</button><button type="button" class="btn" id="st-dirty-save">Сохранить</button></div></div>`];
   main.insertAdjacentHTML('beforeend',html.join(''));
   if(keep){view.scrollTop=keep;const st=view.querySelector('.st');if(st)st.classList.remove('fade')}
   stSecretBind(main);
@@ -165,6 +177,33 @@ async function renderSettings(){
   $('#ntf').onclick=async()=>{try{if(!('Notification' in window))return msg('Браузер не поддерживает уведомления');const r=await Notification.requestPermission();
     $('#ntf-st').textContent=r==='granted'?'Разрешены':r==='denied'?'Запрещены в браузере':'Не разрешены';if(r==='granted')$('#ntf').disabled=true;
     msg(r==='granted'?'Уведомления разрешены':'Уведомления не разрешены',r==='granted')}catch(e){msg(e.message)}};
+  $('#start-page').onchange=async e=>{const el=e.currentTarget;try{await post('/api/config',{start_page:el.value});if(S.cfg)S.cfg.start_page=el.value;stOk(el)}catch(x){msg(x.message)}};
+  $('#ntf-test').onclick=async e=>{
+    const b=e.currentTarget;b.disabled=true;
+    try{
+      if(typeof toast==='function')toast('Тестовое уведомление работает','ok',4000);
+      else msg('Тестовое уведомление работает',1);
+      if('Notification' in window){
+        let permN=Notification.permission;
+        if(permN==='default')try{permN=await Notification.requestPermission();$('#ntf-st').textContent=permN==='granted'?'Разрешены':permN==='denied'?'Запрещены в браузере':'Не разрешены';if(permN==='granted')$('#ntf').disabled=true}catch(_){}
+        if(permN==='granted')try{new Notification('TAnalytic: проверка уведомлений',{body:'Системные уведомления работают корректно.'})}catch(_){}
+      }
+      if(typeof isPro==='function'&&isPro()&&c.tg_enabled){
+        try{await post('/api/tg/test');msg('Тестовое уведомление отправлено на экран и в Telegram.',1)}
+        catch(te){msg('Локальное уведомление работает; Telegram: '+te.message)}
+      }
+    }finally{b.disabled=false}
+  };
+  const dMon=stDirty('mon-cfg-save',['st-mon-drop5','st-mon-drop30','st-mon-spread30','st-mon-sell','st-mon-offer']);
+  stEnter(['st-mon-drop5','st-mon-drop30','st-mon-spread30','st-mon-sell','st-mon-offer'],'mon-cfg-save');
+  $('#mon-cfg-save').onclick=async e=>{
+    const b=e.currentTarget;b.disabled=true;
+    const p={mon_drop5:$('#st-mon-drop5').value,mon_drop30:$('#st-mon-drop30').value,mon_spread30:$('#st-mon-spread30').value,mon_sell_days:$('#st-mon-sell').value,mon_offer_days:$('#st-mon-offer').value};
+    try{await post('/api/config',p);Object.assign(c,p);S.mon=null;dMon.rebase();stOk(b);msg('Пороги мониторинга сохранены.',1)}
+    catch(x){msg(x.message);dMon.upd()}
+  };
+  $('#st-dirty-cancel').onclick=()=>{ST_DIRTY_REG.forEach(x=>{if(x.isDirty())x.reset()});msg('Изменения отменены',1,true)};
+  $('#st-dirty-save').onclick=()=>{ST_DIRTY_REG.forEach(x=>{if(x.isDirty())x.save()})};
   try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
@@ -172,6 +211,7 @@ async function renderSettings(){
   try{bindSetCrowd(c,msg)}catch(e){}
   try{bindSetShell(msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
+  try{bindSetLock(c,msg)}catch(e){}
   /* адреса API, сертификат и проверка SSL больше не редактируются в окне: в настройках остаются как были */
   const body=()=>({token:stSecVal('tok'),sandbox:$('#sb').checked});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};

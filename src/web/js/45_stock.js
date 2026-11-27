@@ -231,16 +231,19 @@ function pStk(){
   return S.stk.secid?head+stkCardHtml('stk-'):head+stkHome();
 }
 /* Карточка акции без строки поиска. prefix даёт ids: 'stk-' на странице, 'skd-' в панели — они не пересекаются. */
+function stkTile(lbl,val,sub,dot){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
+}
 function stkCardHtml(p){
   const st=S.stk,drw=p!=='stk-';
-  if(st.err)return`<div class="msg err">${esc(st.err)} <button class="btn ghost" id="${p}r">Повторить</button></div>`;
+  if(st.err)return`<div class="st-callout warn">${esc(st.err)} <button class="btn ghost" id="${p}r">Повторить</button></div>`;
   const c=st.card;
   if(!c||c.secid!==st.secid||st.cardTf!==st.tf){loadStk();return`<div class="card">${waitBox('Загружаю '+esc(st.secid)+'…')}</div>`}
   const q=c.quote,fund=c.kind==='fund',fm=c.fund||{};
   const hasDiv=!fund||(c.dividends||{items:[]}).items.length||st.tab==='div';
   const tab=hasDiv&&st.tab==='div'?'div':'main';
   const tabs=hasDiv?`<div class="seg stk-tabs" id="${p}tabs" role="tablist"><button data-t="main" class="${tab==='main'?'on':''}" role="tab" aria-selected="${tab==='main'}">Обзор</button><button data-t="div" class="${tab==='div'?'on':''}" role="tab" aria-selected="${tab==='div'}">Дивиденды</button></div>`:'';
-  const head=`<div class="card stk-hd"><div><h1 class="stk-nm">${fund?'<span class="stk-kind">Фонд</span> ':''}${esc(q.shortname)} <span class="mu">${esc(q.secid)}</span></h1><div class="note">${esc(fund&&fm.full_name?fm.full_name:q.name)} · ${esc(q.sector)} · ${esc(q.isin)}</div></div>
+  const head=`<div class="card stk-hd st-ver"><div><h1 class="stk-nm">${fund?'<span class="stk-kind">Фонд</span> ':''}${esc(q.shortname)} <span class="mu">${esc(q.secid)}</span></h1><div class="note">${esc(fund&&fm.full_name?fm.full_name:q.name)} · ${esc(q.sector)} · ${esc(q.isin)}</div></div>
       <div class="stk-px"><span class="num">${stkPrice(q.price)} ₽</span> <span class="num">${stkPc(q.chg_d)}</span></div></div>${tabs}`;
   if(tab==='div')return head+stkDivTab(c,p);
   const cs=c.candles,sr=c.series||{},ind=st.ind,lab=stkLabel(st.tf);
@@ -254,12 +257,13 @@ function stkCardHtml(p){
   const tg=(id,t,on)=>`<label class="sw"><input type="checkbox" id="${p}${id}" ${on?'checked':''}><i></i><div><b>${t}</b></div></label>`;
   const tfs=[['D','День'],['W','Неделя'],['H','Час']];
   const tfSeg=drw?`<div class="seg" id="${p}tf" title="Таймфрейм свечей">${tfs.map(([k,t])=>`<button data-t="${k}" class="${st.tf===k?'on':''}">${t}</button>`).join('')}</div>`:'';
-  const kpis=fund?kpi('За неделю',stkPc(q.chg_w,1),'5 торговых дней')+kpi('За месяц',stkPc(q.chg_m,1),'21 торговый день')+kpi('Оборот за день',stkCap(q.value_today),'Мосбиржа')+kpi('Управляющая компания',`<span style="font-size:15px">${esc(fm.manager||'—')}</span>`,esc(fm.category||q.sector||''))
-    :kpi('За неделю',stkPc(q.chg_w,1),'5 торговых дней')+kpi('За месяц',stkPc(q.chg_m,1),'21 торговый день')+kpi('Капитализация',stkCap(q.cap),'лот: '+q.lot+' шт.')+kpi('Оборот за день',stkCap(q.value_today),'Мосбиржа, TQBR');
+  const dotW=q.chg_w>0?'pos':q.chg_w<0?'neg':'mu',dotM=q.chg_m>0?'pos':q.chg_m<0?'neg':'mu';
+  const kpis=fund?stkTile('За неделю',stkPc(q.chg_w,1),'5 торговых дней',dotW)+stkTile('За месяц',stkPc(q.chg_m,1),'21 торговый день',dotM)+stkTile('Оборот за день',stkCap(q.value_today),'Мосбиржа','mu')+stkTile('Управляющая компания',esc(fm.manager||'—'),esc(fm.category||q.sector||''),'mu')
+    :stkTile('За неделю',stkPc(q.chg_w,1),'5 торговых дней',dotW)+stkTile('За месяц',stkPc(q.chg_m,1),'21 торговый день',dotM)+stkTile('Капитализация',stkCap(q.cap),'лот: '+q.lot+' шт.','mu')+stkTile('Оборот за день',stkCap(q.value_today),'Мосбиржа, TQBR','mu');
   const lower=fund?`<div class="g g2" style="margin-top:16px">${stkTaCard(c)}${stkFundInfo(c)}</div>${stkFundHold(c,p)}${(c.dividends||{items:[]}).items.length?`<div style="margin-top:16px">${stkDivCard(c,p)}</div>`:''}`
     :`<div class="g g2" style="margin-top:16px">${stkTaCard(c)}${stkMulCard(c)}</div>
     <div class="g c-2-1" style="margin-top:16px">${stkDivCard(c,p)}${stkRepCard(c)}</div>`;
-  return head+`<div class="g g4">${kpis}</div>
+  return head+`<div class="st-tiles stk-tiles">${kpis}</div>
     <div class="card" style="margin-top:16px"><div class="row" style="margin-bottom:8px">${tfSeg}${tg('s50','SMA 50',ind.s50)}${tg('s200','SMA 200',ind.s200)}${tg('bb','Боллинджер',ind.bb)}${tg('lv','Уровни',ind.lv)}
         <button class="btn ghost" id="${p}r" style="margin-left:auto">Обновить</button></div>
       <div id="c-${p}chart" class="chart"></div><div id="c-${p}rsi" class="chart"></div><div id="c-${p}macd" class="chart"></div></div>

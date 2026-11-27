@@ -6,6 +6,14 @@ const SCR_PRESETS=[
   ['hy20','ВДО от 20%',{cur:'RUB',kind:'corp',ymin:'20',ymax:'60',turn:'1'}],
   ['fx','Валютные',{cur:'all',kind:'corp',fl:'all',q:''}]
 ];
+const SCR_QUICK=[
+  ['ofz','ОФЗ',f=>f.kind==='ofz',f=>{f.kind=f.kind==='ofz'?'all':'ofz'}],
+  ['corp','Корпоративные',f=>f.kind==='corp',f=>{f.kind=f.kind==='corp'?'all':'corp'}],
+  ['ra','Рейтинг A+',f=>f.rmin==='A+',f=>{f.rmin=f.rmin==='A+'?'':'A+'}],
+  ['t3','До 3 лет',f=>String(f.tmax)==='3',f=>{f.tmax=String(f.tmax)==='3'?'':'3'}],
+  ['flt','Флоатеры',f=>f.fl==='float',f=>{f.fl=f.fl==='float'?'all':'float'}],
+  ['noof','Без оферты',f=>!!f.noOffer,f=>{f.noOffer=!f.noOffer}]
+];
 S.scr=null;S.sf=Object.assign({},SCR_DEF);S.scrOpen=false;S.scrPreset='';S.ssort={k:'yield',d:-1};S.sn=150;
 const SCR_DENS=[['comfort','Комфорт'],['compact','Компакт'],['scatter','Точечная']];
 S.scrDens=(d=>SCR_DENS.some(x=>x[0]===d)?d:'comfort')(lsGet('scr_dens'));      /* плотность таблицы: сохраняется в localStorage */
@@ -114,6 +122,12 @@ function scrRowHtml(r,fl){
     <td class="l">${scrCpn(r)}</td><td class="num">${yrs}</td>
     <td class="num">${r.macdur!=null?r.macdur.toFixed(2).replace('.',','):'—'}</td><td class="num"><div class="cell-stack r"><span class="num">${r.turn?short(r.turn):'—'}</span><span class="tag liq liq-${r.liq||'L3'}" title="Ликвидность по обороту за день: L1 — верхние 20%, L2 — следующие 40%, L3 — остальные">${r.liq||'L3'}</span></div></td></tr>`;
 }
+function scrSyncQuick(){
+  document.querySelectorAll('.scr-quick [data-qk]').forEach(b=>{
+    const q=SCR_QUICK.find(x=>x[0]===b.dataset.qk);
+    if(q)b.classList.toggle('on',!!q[2](S.sf));
+  });
+}
 function drawScr(){
   const rs=scrRows(),n=Math.min(rs.length,S.sn),fl=S.scr.floor&&S.scr.floor.lqdt;
   const cols=[['_w','★','l'],['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield',S.scrReal?'Реальная доходность':'Доходность'],['cy','Тек. доходн., %'],['spread','Спред к КБД'],['coupon','Купон & формула','l'],['years','До погашения'],['macdur','Дюрация, лет'],['liq','Ликвидность']];
@@ -124,7 +138,7 @@ function drawScr(){
   $('#scr-cnt').textContent=`Найдено: ${rs.length}${rs.length>n?' · показано '+n:''}${tl?' · '+tl:''}${S.scrBox?' · в выделении':''}`;
   $('#scr-more').style.display=rs.length>n?'':'none';
   const fb=$('#scr-ftog');if(fb){const ac=scrActiveCount();fb.textContent=(S.scrOpen?'Скрыть фильтры':'Фильтры')+(ac?` (${ac})`:'')}
-  scrScatter();scrSparkWatch();
+  scrSyncQuick();scrScatter();scrSparkWatch();
 }
 /* ── спарклайны: грузим только видимые строки, пачками, результат кэшируется на сессию ── */
 const SPK={map:new Map(),pend:new Set(),to:0,io:null,bad:0};
@@ -148,13 +162,14 @@ function scrSparkWatch(){
   SPK.io=new IntersectionObserver(es=>es.forEach(en=>{if(en.isIntersecting){SPK.io.unobserve(en.target);queue(en.target.dataset.spark)}}),{rootMargin:'120px 0px'});
   els.forEach(e=>{if(!SPK.map.has(e.dataset.spark))SPK.io.observe(e)});
 }
-/* ── Scatter: дюрация × доходность, выделение рамкой фильтрует таблицу ── */
+/* ── Диаграмма: дюрация × доходность, выделение рамкой фильтрует таблицу ── */
 const SC={pts:[],drag:null};
 function scrScatter(){
   const box=$('#scr-sc');if(!box)return;
   if(S.scrDens!=='scatter'){box.classList.add('hide');box.innerHTML='';return}
   box.classList.remove('hide');
-  const head=`<div class="sc-h"><b>Дюрация × доходность</b><span class="mu">рамкой выделите область, клик по точке открывает выпуск</span>${S.scrBox?'<button class="scr-chip on" id="sc-clr">сбросить выделение ✕</button>':''}<span class="sc-lg"><i class="t-fl"></i>флоатер<i class="t-fix"></i>фикс<i class="t-lnk"></i>линкер</span><button class="scr-chip" id="sc-col">${S.scrScCol?'Показать':'Свернуть'}</button></div>`;
+  const boxBtns=S.scrBox?`<button class="scr-chip on" id="sc-cmp" title="Открыть сравнение по выбранным бумагам (до 4)">Сравнить выбранные</button><button class="scr-chip on" id="sc-clr">сбросить выделение ✕</button>`:'';
+  const head=`<div class="sc-h"><b>Дюрация × доходность</b><span class="mu">рамкой выделите область, клик по точке открывает выпуск</span>${boxBtns}<span class="sc-lg"><i class="t-fl"></i>флоатер<i class="t-fix"></i>фикс<i class="t-lnk"></i>линкер</span><button class="scr-chip" id="sc-col">${S.scrScCol?'Показать':'Свернуть'}</button></div>`;
   if(S.scrScCol){box.innerHTML=head;scrScBind(box);return}
   const rs=scrRows(true).filter(r=>scrX(r)!=null&&isFinite(scrX(r))&&isFinite(r.yield)&&r.yield>0).slice(0,2500);
   const W=Math.max(280,box.clientWidth||700),H=W<760?240:300,L=42,R=12,T=10,B=28;
@@ -177,6 +192,13 @@ function scrScatter(){
 function scrScBind(box){
   const c=$('#sc-col');if(c)c.onclick=()=>{S.scrScCol=!S.scrScCol;scrScatter()};
   const x=$('#sc-clr');if(x)x.onclick=()=>{S.scrBox=null;S.sn=150;drawScr()};
+  const cm=$('#sc-cmp');if(cm)cm.onclick=()=>{
+    const picks=scrRows().slice(0,typeof CMP!=='undefined'?CMP.max:4).map(r=>String(r.isin||r.id||'').toUpperCase()).filter(Boolean);
+    if(!picks.length){toast('В выделении нет облигаций');return}
+    S.cmp=picks;if(typeof cmpSave==='function')cmpSave();
+    if(scrRows().length>picks.length)toast('Для сравнения взяты первые '+picks.length+' бумаги из выделения');
+    go('cmp');
+  };
   const svg=$('#sc-svg'),tip=$('#sc-tip');if(!svg)return;
   const pos=e=>{const r=svg.getBoundingClientRect(),k=SC.W/(r.width||SC.W);return[(e.clientX-r.left)*k,(e.clientY-r.top)*k]};
   const near=(px,py)=>{let best=null,bd=100;for(const p of SC.pts){const d=(p.x-px)*(p.x-px)+(p.y-py)*(p.y-py);if(d<bd){bd=d;best=p}}return best};
@@ -263,7 +285,9 @@ function pScr0(){
   const fl0=d.floor&&d.floor.lqdt,flN=fl0>0?`<p class="note scr-fl">Фонд ликвидности сейчас даёт ≈ ${f2(fl0)} % годовых — у бумаг ниже этой доходности нет премии за риск (такие строки приглушены). Доходность до налогов; не инвестиционная рекомендация.</p>`:'';
   const rated=d.rows.filter(r=>r.rating).length,sectors=[...new Set(d.rows.map(r=>r.sector).filter(Boolean))].sort((a,b)=>(SECT[a]||a).localeCompare(SECT[b]||b));
   const ac=scrActiveCount();
-  return`<div class="card"><h2>Подбор облигаций<span class="sp" id="scr-cnt"></span></h2>
+  const quickRow=`<div class="scr-quick" role="group" aria-label="Быстрые фильтры"><span class="scr-quick-lbl">Быстро:</span>${SCR_QUICK.map(([k,t,on])=>`<button type="button" class="scr-chip${on(f)?' on':''}" data-qk="${k}">${t}</button>`).join('')}</div>`;
+  return`<div class="card"><div class="tbl-head" style="padding:0 0 12px"><h2 style="margin:0">Подбор облигаций<span class="sp" id="scr-cnt"></span></h2>${typeof taCsvBtn==='function'?taCsvBtn('scr-csv','Выгрузить подборку в CSV'):''}</div>
+    ${quickRow}
     <div class="scr-bar">
       <input class="in" id="f-q" value="${esc(f.q)}" placeholder="Поиск по названию или ISIN…" aria-label="Поиск облигаций">
       <div class="scr-presets">${SCR_PRESETS.map(([k,t])=>`<button class="scr-chip${S.scrPreset===k?' on':''}" data-pr="${k}">${t}</button>`).join('')}${S.scrSaved.map(x=>`<span class="scr-chip scr-sv${S.scrPreset==='sv:'+x.id?' on':''}"><button class="scr-sv-b" data-sv="${esc(x.id)}" title="Мой сохранённый фильтр">${esc(x.name)}</button><button class="scr-sv-x" data-svx="${esc(x.id)}" aria-label="Удалить фильтр ${esc(x.name)}" title="Удалить">×</button></span>`).join('')}${S.scrSaving?`<span class="scr-sv-new"><input class="in" id="scr-sv-name" maxlength="40" placeholder="Название фильтра" aria-label="Название фильтра"><button class="btn" id="scr-sv-ok">Сохранить</button><button class="btn ghost" id="scr-sv-no">Отмена</button></span>`:(ac||f.q?`<button class="scr-chip" id="scr-sv-add" title="Запомнить текущие настройки фильтра">+ Сохранить фильтр</button>`:'')}</div>
@@ -296,6 +320,16 @@ function bindScr(){
   const tb=$('#scr-tabs');if(tb)tb.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===S.scrTab)return;S.scrTab=b.dataset.t;render()};
   if(S.scrTab==='mv')return bindMv();
   if(!S.scr||S.scr.error){const b=$('#scr-r');if(b)b.onclick=()=>{S.scr=null;render()};return}
+  const csv=$('#scr-csv');
+  if(csv)csv.onclick=()=>{
+    const rs=scrRows();
+    if(typeof taCsvDownload==='function')taCsvDownload('screener.csv',['Название','ISIN','Рейтинг','Сектор','Цена, %','Доходность, %','Тек. доходность, %','Спред к КБД, п.п.','Купон, %','Погашение','Дюрация, лет','Оборот, ₽','Ликвидность'],
+      rs.map(r=>[r.name||'',r.isin||r.id||'',r.rating||'',r.sector?(SECT[r.sector]||r.sector):'',r.price!=null?r.price.toFixed(2):'',scrY(r)!=null?scrY(r).toFixed(2):'',r.cy!=null?r.cy.toFixed(2):'',r.spread!=null?r.spread.toFixed(2):'',r.coupon!=null?r.coupon.toFixed(2):'',r.mat||'',r.macdur!=null?r.macdur.toFixed(2):'',r.turn!=null?Math.round(r.turn):'',r.liq||'L3']));
+  };
+  document.querySelectorAll('.scr-quick [data-qk]').forEach(b=>b.onclick=()=>{
+    const q=SCR_QUICK.find(x=>x[0]===b.dataset.qk);if(!q)return;
+    S.scrPreset='';q[3](S.sf);S.sn=150;render();
+  });
   const map={'f-q':'q','f-cur':'cur','f-kind':'kind','f-sector':'sector','f-rmin':'rmin','f-ymin':'ymin','f-ymax':'ymax','f-spmin':'spmin','f-tmax':'tmax','f-turn':'turn','f-fl':'fl','f-liq':'liq'};
   let to;Object.entries(map).forEach(([id,k])=>{const e=$('#'+id);if(!e)return;e.oninput=e.onchange=()=>{if(k!=='q')S.scrPreset='';S.sf[k]=e.value;S.sn=150;clearTimeout(to);to=setTimeout(drawScr,150)}});
   $('#f-toff').onchange=e=>{S.scrPreset='';S.sf.toOffer=e.target.checked;S.sn=150;drawScr()};

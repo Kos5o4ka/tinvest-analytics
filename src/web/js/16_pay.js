@@ -50,6 +50,23 @@ function payTabs(){
   return`<div class="row" style="margin-bottom:12px"><div class="seg" id="pay-tabs">${tabs.map(([k,t])=>`<button data-ptab="${k}" class="${PAY_UI.tab===k?'on':''}">${t}</button>`).join('')}</div></div>`;
 }
 
+function payGoalCard(tot12,inc12){
+  const avgAll=tot12/12,avgInc=inc12/12;
+  const calcCfg=lsJson('ta_calc',null);
+  const goal=calcCfg&&+calcCfg.goalAmt>0?+calcCfg.goalAmt:0;
+  const base=avgInc>0?avgInc:avgAll;
+  const subParts=[`${M(tot12,'rub',0)} / 12 = ${M(avgAll,'rub',0)}/мес`];
+  if(Math.abs(avgAll-avgInc)>1&&inc12>0)subParts.push(`купоны и дивиденды: ${M(avgInc,'rub',0)}/мес`);
+  if(!goal){
+    return`<div class="card pay-goal"><div class="pay-goal-top"><div><b>Среднемесячный доход: <span class="num pos">${M(avgAll,'rub',0)}/мес</span></b><div class="note">${subParts.join(' · ')}</div></div><button type="button" class="btn ghost" data-go="calc">Задать цель в калькуляторе →</button></div></div>`;
+  }
+  const pctRaw=(base/goal)*100,pctW=Math.max(0,Math.min(100,pctRaw));
+  return`<div class="card pay-goal"><div class="pay-goal-top"><div><b>Среднемесячный доход: <span class="num pos">${M(avgAll,'rub',0)}/мес</span></b><div class="note">${subParts.join(' · ')}</div></div>
+    <div style="text-align:right"><span class="note">Цель из калькулятора: <b>${M(goal,'rub',0)}/мес</b></span> <b class="num ${pctRaw>=100?'pos':''}">${pctp(pctRaw,1)}</b></div></div>
+    <div class="pay-pb" role="progressbar" aria-valuenow="${Math.round(pctW)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pctW.toFixed(1)}%"></i></div>
+    <div class="pay-goal-top"><span class="note">${pctRaw>=100?'Цель калькулятора по пассивному доходу достигнута':'До цели калькулятора не хватает '+M(Math.max(0,goal-base),'rub',0)+'/мес'}</span><button type="button" class="btn ghost" data-go="calc" style="padding:4px 10px;font-size:12px">Изменить цель</button></div></div>`;
+}
+
 function pPay(){
   const tab=PAY_UI.tab;
   if(tab==='journal')return payTabs()+pjRender();
@@ -59,6 +76,7 @@ function pPay(){
   if(b.error)return payTabs()+`<div class="msg err">${esc(b.error)}</div>`;
   const ps=b.payments,now=new Date(),in30=localIso(new Date(now.getTime()+30*864e5));
   const sum=f=>ps.filter(f).reduce((a,x)=>a+x.amount,0);
+  const tot12=sum(()=>1),inc12=sum(p=>p.kind==='coupon'||p.kind==='dividend');
   const pm=payMonths(ps,12);
   const pdd=payDays(ps,S.payDays);chart('c-days',dayBars,{days:pdd.days,legend:pdd.legend,h:340});
   chart('c-pay',bars,{h:260,labels:pm.labels,tipLabels:pm.tips,stack:true,total:true,skipZero:true,series:pm.series,empty:'Выплат не ожидается'});
@@ -66,10 +84,11 @@ function pPay(){
   const byM={};ps.forEach(p=>(byM[p.date.slice(0,7)]=byM[p.date.slice(0,7)]||[]).push(p));
   const list=Object.keys(byM).sort().map(m=>{const[y,mm]=m.split('-');const t=byM[m].reduce((a,x)=>a+x.amount,0);
     return`<div class="card"><h2>${MONF[+mm-1]} ${y}<span class="sp num" style="color:var(--pos);font-size:13px;font-weight:600">${M(t)}</span></h2><div class="li">`+
-    byM[m].map(p=>`<div class="it"${p.kind==='dividend'&&p.ticker?stkAttr(p.ticker,'div'):''}>${logo(p,34)}<div><b>${esc(p.name)}</b><small>${ddm(p.date)} · <span style="color:${KIND[p.kind][1]}">${KIND[p.kind][0]}</span>${p.est==='forecast'?' · прогноз по ключевой ставке':p.est?' · оценка':''}</small></div><div class="rv num">${M(p.amount)}</div></div>`).join('')+`</div></div>`}).join('');
-  const fxw=(b.fx_missing||[]).length?`<div class="msg">Нет курса ЦБ для ${esc(b.fx_missing.join(', '))}: выплаты в этой валюте не учтены.</div>`:'';
-  return payTabs()+fxw+`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(sum(()=>1)),'купоны, дивиденды, амортизации и погашения','pos',S3)}
-    ${kpi('Купоны',M(sum(p=>p.kind==='coupon')),ps.filter(p=>p.kind==='coupon').length+' выплат',null,S1)}${kpi('Дивиденды',M(sum(p=>p.kind==='dividend')),'только объявленные, до налога',null,S3)}</div>
+    byM[m].map(p=>`<div class="it"${p.kind==='dividend'&&p.ticker?stkAttr(p.ticker,'div'):p.isin?` data-isin="${esc(p.isin)}" style="cursor:pointer"`:''}>${logo(p,34)}<div><b>${esc(p.name)}</b><small>${ddm(p.date)} · <span style="color:${KIND[p.kind][1]}">${KIND[p.kind][0]}</span>${p.est==='forecast'?' · прогноз по ключевой ставке':p.est?' · оценка':''}</small></div><div class="rv num">${M(p.amount)}</div></div>`).join('')+`</div></div>`}).join('');
+  const fxw=(b.fx_missing||[]).length?`<div class="st-callout warn">Нет курса ЦБ для ${esc(b.fx_missing.join(', '))}: выплаты в этой валюте не учтены.</div>`:'';
+  return payTabs()+fxw+`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(tot12),'в среднем '+M(tot12/12,'rub',0)+'/мес','pos',S3)}
+    ${kpi('Купоны',M(sum(p=>p.kind==='coupon')),ps.filter(p=>p.kind==='coupon').length+' выплат',null,S1)}${kpi('Среднее в месяц',M(tot12/12,'rub',0),M(tot12,'rub',0)+' / 12 · див. '+M(sum(p=>p.kind==='dividend'),'rub',0),'pos',S3)}</div>
+    ${payGoalCard(tot12,inc12)}
     <div class="card"><h2>Календарь выплат по месяцам, ₽</h2><div id="c-pay" class="chart"></div></div>
     <div class="card"><h2>Выплаты по дням<span class="sp"><span class="seg" id="pdays">${[[30,'30 дней'],[90,'90 дней'],[365,'Год']].map(([d,t])=>`<button data-d="${d}" class="${d===S.payDays?'on':''}">${t}</button>`).join('')}</span></span></h2><div id="c-days" class="chart"></div></div>
     ${list?`<div class="g g2">${list}</div>`:emptyHint('В ближайший год выплат не ожидается: в портфеле нет облигаций с купонами и акций с объявленными дивидендами. Подобрать облигации с купоном можно в скринере.',[['scr','Подобрать облигации',1],['bonds','Мои облигации']])}

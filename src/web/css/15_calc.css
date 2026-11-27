@@ -57,3 +57,15 @@
 .cl-main .kpi .v{font-size:clamp(17px,1.4vw,21px);white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;line-height:1.2}
 .cl-main .kpi .s{white-space:normal;overflow:visible;text-overflow:clip}
 @media(max-width:1500px){.cl-main .g.g2{grid-template-columns:1fr}}
+/* Мост (Waterfall) доходов и налогов, точка обгона вклада, карточки v2 */
+.cl-tiles{margin-bottom:0}
+.cl-tiles .st-ts{min-height:0}
+.cl-wf{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:8px}
+@media(max-width:1100px){.cl-wf{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.cl-wf-step{padding:12px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line);display:grid;gap:6px;align-content:end}
+.cl-wf-lbl{font-size:11.5px;color:var(--mu);font-weight:550}
+.cl-wf-val{font-size:16px;font-weight:650;letter-spacing:-.02em}
+.cl-wf-track{height:6px;border-radius:999px;background:var(--line);overflow:hidden}
+.cl-wf-track i{display:block;height:100%;border-radius:999px}
+.cl-wf-step.is-net{border-color:color-mix(in srgb,var(--pos) 40%,transparent);background:color-mix(in srgb,var(--pos) 7%,var(--card2))}
+.cl-iis-cap{margin:8px 0 0!important}

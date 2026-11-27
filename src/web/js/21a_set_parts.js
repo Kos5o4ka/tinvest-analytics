@@ -123,6 +123,7 @@ function setCrowdHtml(c){
   return stGroup('Помощь в сборе раскрытий',
     stRow('Помогать собирать раскрытия эмитентов','Работает только пока программа открыта и подключён сервер данных',stSw('crowd-on',false,'Помогать собирать раскрытия эмитентов'))+
     `<p class="st-line" id="crowd-info">Загружаю…</p>`+
+    `<details class="st-more" id="crowd-log-det" data-q="журнал сбор раскрытия лог"><summary>Журнал сбора раскрытий</summary><div id="crowd-log-body"><span class="mu">Откройте, чтобы загрузить последние записи…</span></div></details>`+
     stMore('Как это работает','Включено по умолчанию. Сообщения эмитентов о купонах, выкупах и дефолтах лежат на сайте e-disclosure.azipi.ru, а наш сервер данных его открыть не может. <b>Пока программа открыта</b>, она скачивает публичные страницы этого сайта <b>с вашего интернет-подключения — примерно одну страницу раз в 15 секунд</b> — и отправляет их на сервер данных. Так все пользователи видят купоны, выкупы и дефолты по своим облигациям. Токен, портфель и другие ваши данные не отправляются; в страницах только то, что видно любому посетителю сайта. Сайт видит ваш IP-адрес, как при обычном заходе в браузере. При ошибках сайта программа делает паузу на 30 минут. Выключить можно в любой момент.'),
     {id:'crowd-card',hint:'',hintId:'crowd-sp'});
 }
@@ -134,6 +135,23 @@ async function bindSetCrowd(c,msg){
     document.getElementById('crowd-sp').textContent=s.enabled?stt:'выключено';
     document.getElementById('crowd-info').innerHTML=`Отправлено страниц, принятых сервером: <b>${s.accepted}</b>${s.fetched?` (скачано ${s.fetched})`:''}.${s.enabled?` Состояние: ${esc(stt)}${s.message?' — '+esc(s.message):''}.`:''}${!s.available?' Подключите сервер данных и войдите по ключу — без этого помощь не работает.':''}`;
     clearTimeout(CROWD.t);if(s.enabled)CROWD.t=setTimeout(show,5000)};
+  const loadLog=async()=>{
+    const body=document.getElementById('crowd-log-body');if(!body)return;
+    body.innerHTML='<span class="mu">Загружаю журнал…</span>';
+    try{
+      const r=await api('/api/crowd/log');
+      const rows=Array.isArray(r)?r:(r&&Array.isArray(r.items)?r.items:(r&&Array.isArray(r.log)?r.log:[]));
+      if(!rows.length){body.innerHTML='<span class="mu">Записей пока нет.</span>';return}
+      body.innerHTML=`<div class="crowd-log">${rows.slice(0,40).map(x=>{
+        const ts=x.ts||x.at||x.time;const tm=typeof ts==='number'?new Date(ts*1000).toLocaleTimeString('ru-RU'):esc(String(ts||''));
+        const ok=x.ok!==false&&x.status!=='err'&&x.status!=='error';
+        const txt=x.message||x.msg||x.url||x.kind||x.status||'Принято';
+        return`<div class="crowd-log-r"><span class="mono mu">${tm}</span><span class="${ok?'pos':'neg'}">${esc(String(x.status||(ok?'Готово':'Ошибка')))}</span><span>${esc(String(txt))}</span></div>`;
+      }).join('')}</div>`;
+    }catch(e){body.innerHTML=`<span class="neg">${esc(e.message)}</span>`}
+  };
+  const det=document.getElementById('crowd-log-det');
+  if(det)det.addEventListener('toggle',()=>{if(det.open)loadLog()});
   on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});stOk(on);msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
   show();
 }

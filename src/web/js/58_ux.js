@@ -51,12 +51,17 @@ const UX={
   checkOff:lsGet('ta_ux_chk_off')==='1',
   ddOpen:false
 };
-/* после загрузки конфига: подтягиваем «уже показано» из ui_seen (localStorage окна может быть пустым) */
+/* после загрузки конфига: подтягиваем «уже показано» из ui_seen и ui_prefs (localStorage окна может быть пустым) */
 function uxSeenSync(){
+  if(typeof uiPrefsHydrate==='function'&&S.cfg)uiPrefsHydrate(S.cfg);
   const w=uiGet('ux_why_off'),c=uiGet('ux_checks'),o=uiGet('ux_chk_off');
   if(w&&typeof w==='object')Object.assign(UX.whyOff,w);
   if(c&&typeof c==='object')Object.assign(UX.checks,c);
   if(o===true||o===1)UX.checkOff=true;
+  if(typeof _hadInitialPage!=='undefined'&&!_hadInitialPage&&S.cfg&&S.cfg.start_page&&PAGES.some(p=>p&&p[0]===S.cfg.start_page)){
+    S.page=S.cfg.start_page;
+  }
+  if(typeof renderNav==='function')try{renderNav()}catch(e){}
 }
 function uxSyncMode(){
   document.documentElement.dataset.uxMode=UX.mode;
@@ -186,8 +191,11 @@ renderNav=function(){
   const fx=NAV_FIXED.map(k=>PAGES.find(p=>p&&p[0]===k)).filter(Boolean).map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}" data-tip="${esc(p[1])}">${svgI(IC[p[0]]||IC.set)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
   $('#nav').innerHTML=h;
   const nf=$('#nav-fix');if(nf)nf.innerHTML=fx;
-  $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
-  $('#period').style.display=PERIOD_PAGES.includes(S.page)&&S.data?'':'none';
+  const pe=$('#period');
+  if(pe){
+    pe.innerHTML=PERIODS.map(([k,t])=>`<button type="button" class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
+    pe.style.display=PERIOD_PAGES.includes(S.page)&&S.data?'':'none';
+  }
   const a=S.accounts.find(x=>x.id===S.account);
   const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
   if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}

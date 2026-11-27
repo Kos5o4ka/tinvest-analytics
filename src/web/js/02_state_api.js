@@ -49,23 +49,85 @@ function regPage(id,o){
 }
 const NAV_FIXED=['imp','kb','set'],NAV_PINNED=['dash','set'];
 function lsJson(k,d){try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}}
-function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}
+let _uiHydrating=false,_uiPrefsT=0;
+const UI_PREF_LS=new Set(['ta_ux_mode','ta_side_mini','ta_nav_hidden','ta_ticker_off','ta_incog','ta_theme','ta_accent','ta_density']);
+function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}if(!_uiHydrating&&UI_PREF_LS.has(k))uiPrefsSaveSoon()}
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
 const PERIOD_PAGES=['dash','ret','bench','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
 let st={};try{st=JSON.parse(lsGet('ta_state')||'{}')||{}}catch(e){}
-const S={navHidden:lsJson('ta_nav_hidden',[]),navShut:lsJson('ta_nav_shut',{}),page:st.page||'dash',period:st.period||'all',account:st.account||'all',hideEmpty:st.hideEmpty!==false,
+const _hashPage=(typeof location!=='undefined'&&/^#[a-z0-9_-]+$/i.test(location.hash||''))?location.hash.slice(1):'';
+const _hadInitialPage=Boolean((st&&st.page)||(_hashPage&&PAGES.some(p=>p&&p[0]===_hashPage)));
+const S={navHidden:lsJson('ta_nav_hidden',[]),navShut:lsJson('ta_nav_shut',{}),page:(_hashPage&&PAGES.some(p=>p&&p[0]===_hashPage)?_hashPage:st.page)||'dash',period:st.period||'all',account:st.account||'all',hideEmpty:st.hideEmpty!==false,
   data:null,bonds:null,hist:null,cfg:null,loading:false,err:null,accounts:[],
   sort:{k:'value_rub',d:-1},bsort:{k:'value_rub',d:-1},posType:'',opsN:200,opsQ:'',opsK:'',charts:[],imp:null};
 function persist(){try{localStorage.setItem('ta_state',JSON.stringify({page:S.page,period:S.period,account:S.account,hideEmpty:S.hideEmpty}))}catch(e){}}
 
+function uiPrefsCollect(){
+  return{
+    theme:typeof curTheme==='function'?curTheme():(lsGet('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'),
+    ux_mode:typeof UX!=='undefined'&&UX.mode?UX.mode:(lsGet('ta_ux_mode')==='pro'?'pro':'basic'),
+    side_mini:typeof UX!=='undefined'?!!UX.mini:lsGet('ta_side_mini')==='1',
+    nav_hidden:Array.isArray(S.navHidden)?S.navHidden.slice():lsJson('ta_nav_hidden',[]),
+    ticker_off:lsGet('ta_ticker_off')==='1',
+    incog:!!INCOG.on,
+    accent:typeof curAccent==='function'?curAccent():(lsGet('ta_accent')||'blue'),
+    density:typeof curDensity==='function'?curDensity():(lsGet('ta_density')||'comfort')
+  };
+}
+function uiPrefsSaveSoon(){
+  if(_uiHydrating)return;
+  clearTimeout(_uiPrefsT);
+  _uiPrefsT=setTimeout(()=>{
+    const prefs=uiPrefsCollect();
+    if(S.cfg)S.cfg.ui_prefs=Object.assign({},S.cfg.ui_prefs,prefs);
+    post('/api/config',{ui_prefs:prefs}).catch(()=>{});
+  },350);
+}
+function uiPrefsHydrate(cfg){
+  if(!cfg)return;
+  const p=(cfg.ui_prefs&&typeof cfg.ui_prefs==='object')?cfg.ui_prefs:{};
+  _uiHydrating=true;
+  try{
+    const th=p.theme||(cfg.theme&&cfg.theme!=='auto'?cfg.theme:null);
+    if(lsGet('ta_theme')==null&&th&&typeof applyTheme==='function')applyTheme(th);
+    if(lsGet('ta_accent')==null&&p.accent&&typeof applyAccent==='function')applyAccent(p.accent);
+    if(lsGet('ta_density')==null&&p.density&&typeof applyDensity==='function')applyDensity(p.density);
+    if(lsGet('ta_ux_mode')==null&&(p.ux_mode==='basic'||p.ux_mode==='pro')&&typeof UX!=='undefined'){
+      UX.mode=p.ux_mode;try{localStorage.setItem('ta_ux_mode',UX.mode)}catch(e){}if(typeof uxSyncMode==='function')uxSyncMode();
+    }
+    if(lsGet('ta_side_mini')==null&&p.side_mini!=null&&typeof UX!=='undefined'){
+      UX.mini=!!p.side_mini;try{localStorage.setItem('ta_side_mini',UX.mini?'1':'0')}catch(e){}if(typeof uxSyncMode==='function')uxSyncMode();
+    }
+    if(lsGet('ta_nav_hidden')==null&&Array.isArray(p.nav_hidden)){
+      S.navHidden=p.nav_hidden.slice();try{localStorage.setItem('ta_nav_hidden',JSON.stringify(S.navHidden))}catch(e){}
+    }
+    if(lsGet('ta_ticker_off')==null&&p.ticker_off!=null){
+      try{localStorage.setItem('ta_ticker_off',p.ticker_off?'1':'0')}catch(e){}
+      if(typeof tkrBuild==='function')try{tkrBuild()}catch(e){}
+    }
+    if(lsGet('ta_incog')==null&&p.incog!=null){
+      INCOG.on=!!p.incog;try{localStorage.setItem('ta_incog',INCOG.on?'1':'0')}catch(e){}
+      const e=$('#eye');if(e){e.classList.toggle('on',INCOG.on);const lt=e.querySelector('.mi-t');if(lt)lt.textContent=INCOG.on?'Показать суммы':'Скрыть суммы'}
+    }
+  }finally{_uiHydrating=false}
+}
+
 async function api(path,opt){
   let r;
   try{r=await fetch(path,opt)}
-  catch(e){throw new Error('Программа не отвечает: похоже, её локальный сервер остановлен. Закройте окно программы и откройте её снова.')}
+  catch(e){
+    if(typeof connSet==='function')connSet('err','Сервер не отвечает');
+    throw new Error('Программа не отвечает: похоже, её локальный сервер остановлен. Закройте окно программы и откройте её снова.');
+  }
   let j={};
   try{j=await r.json()}catch(e){}
+  if(r.status===423){
+    if(typeof lockShow==='function')lockShow(j);
+    throw new Error(j.error||'Доступ заблокирован');
+  }
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  if(!S.loading&&typeof connSet==='function')connSet('ok');
   if(j&&j.stale&&/^\/api\/(bonds|history)\?/.test(path))staleRefresh(path,j);
   return j;
 }

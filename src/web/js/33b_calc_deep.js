@@ -54,9 +54,9 @@ function clDeepHtml(F,P,run,cur){
 function clSegFor(sid,F){return sid==='mix'?(F.mixBond||'ofz'):sid}
 function clGoToHtml(F,c){
   const sid=clSegFor(c.sid,F),s=(clMkt().segments||{})[sid],bondish=['ofz','aaa','aa','a','hy','flt','pf','mix'].includes(c.sid);
-  if(!bondish)return`<div class="card"><h2>Что делать сейчас</h2><div class="note">Для этой стратегии подбор облигаций не нужен. Лесенку погашений можно собрать для облигационной части капитала.</div><div class="row" style="margin-top:8px"><button type="button" class="btn ghost" data-clgo="lad">Собрать лестницу погашений</button></div></div>`;
+  if(!bondish)return`<div class="card"><h2>Что делать сейчас</h2><div class="st-callout">Для этой стратегии подбор облигаций не нужен. Лесенку погашений можно собрать для облигационной части капитала.</div><div class="row" style="margin-top:8px"><button type="button" class="btn ghost" data-clgo="lad">Собрать лестницу погашений</button></div></div>`;
   const name=s?s.name:(CL_STR.find(x=>x[0]===sid)||[0,'облигации'])[1],m=F.monthly>0?clRub(F.monthly)+' в месяц':'свободные деньги';
-  return`<div class="card"><h2>Что делать сейчас</h2><div class="cl-ans">Чтобы пойти по этому сценарию, ${F.acct==='iis3'?'откройте ИИС-3 и ':''}пополняйте счёт на <b>${m}</b> и докупайте <b>«${esc(name)}»</b>.</div>
+  return`<div class="card"><h2>Что делать сейчас</h2><div class="st-callout">Чтобы пойти по этому сценарию, ${F.acct==='iis3'?'откройте ИИС-3 и ':''}пополняйте счёт на <b>${m}</b> и докупайте <b>«${esc(name)}»</b>.</div>
    <div class="row" style="margin-top:10px"><button type="button" class="btn" data-clgo="scr" data-sid="${sid}">Подобрать бумаги в скринере</button><button type="button" class="btn ghost" data-clgo="lad" data-sid="${sid}">Собрать лестницу погашений</button></div>
    <div class="note" style="margin-top:8px">Фильтры скринера подставятся под выбранный сегмент (рейтинг, срок около медианной дюрации); лесенка — на ваш стартовый капитал.</div></div>`;
 }
