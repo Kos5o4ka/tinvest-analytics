@@ -61,9 +61,10 @@
     },
     "macOS": {
       "minimumSystemVersion": "11.0",
+      "signingIdentity": "-",
       "entitlements": "entitlements.plist",
       "dmg": {
-        "background": "installer/dmg-background.png",
+        "background": "installer/dmg-background.tiff",
         "windowSize": {
           "width": 660,
           "height": 400
