@@ -16,6 +16,7 @@ import bisect
 import csv
 import gzip
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -64,7 +65,7 @@ API_GET, API_POST = {}, {}
 STARTUP_HOOKS = []
 SHUTDOWN_HOOKS = []          # вызываются при закрытии программы (app_shutdown)
 # Ключи настроек, которые никогда не отдаются в интерфейс через /api/config (секреты).
-SECRET_KEYS = {"token"}
+SECRET_KEYS = {"token", "lock_pin_hash", "lock_pin_salt"}
 
 DEFAULT_CONFIG = {
     "token": "",
@@ -82,6 +83,12 @@ DEFAULT_CONFIG = {
     "ui_seen": {},          # «показано один раз»: тур, подсказки, чек-лист (не зависит от localStorage окна)
     "mon_drop5": 3.0, "mon_drop30": 7.0, "mon_spread30": 2.0, "mon_sell_days": 5.0, "mon_offer_days": 30,   # пороги тревог «Мониторинга»
     "broker_tariffs": {},   # выбранный тариф для счетов других брокеров: {id счёта: id тарифа из BROKER_TARIFFS}
+    "lock_enabled": False,
+    "lock_bio": True,
+    "lock_pin_hash": "",
+    "lock_pin_salt": "",
+    "start_page": "dash",
+    "ui_prefs": {},
 }
 
 # Корневой сертификат Минцифры (Russian Trusted Root CA, RSA, до 27.02.2032).
@@ -1629,6 +1636,61 @@ def _private_write(path, data_bytes):
     os.replace(tmp, path)
 
 
+def _dpapi_win32(protect, raw):
+    """Вызов Windows DPAPI (CryptProtectData / CryptUnprotectData) через ctypes. Возвращает bytes или None."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    buf = ctypes.create_string_buffer(raw, len(raw))
+    in_b = _BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
+    out_b = _BLOB()
+    if protect:
+        ok = crypt32.CryptProtectData(ctypes.byref(in_b), "TAnalytic", None, None, None, 0x01, ctypes.byref(out_b))
+    else:
+        ok = crypt32.CryptUnprotectData(ctypes.byref(in_b), None, None, None, None, 0x01, ctypes.byref(out_b))
+    if not ok:
+        return None
+    try:
+        return ctypes.string_at(out_b.pbData, out_b.cbData)
+    finally:
+        kernel32.LocalFree(out_b.pbData)
+
+
+def _dpapi_protect(text):
+    """На Windows шифрует секрет через DPAPI текущего пользователя; иначе или при сбое возвращает исходный текст."""
+    if not text or platform.system() != "Windows":
+        return text
+    s = str(text)
+    if s.startswith("dpapi:"):
+        return s
+    try:
+        enc = _dpapi_win32(True, s.encode("utf-8"))
+        if enc:
+            return "dpapi:" + base64.b64encode(enc).decode("ascii")
+    except Exception:  # noqa: BLE001
+        pass
+    return s
+
+
+def _dpapi_unprotect(val):
+    """Расшифровывает строку вида 'dpapi:...' на Windows; на других ОС или при ошибке возвращает ''."""
+    if not isinstance(val, str) or not val.startswith("dpapi:"):
+        return val
+    if platform.system() != "Windows":
+        return ""
+    try:
+        raw = base64.b64decode(val[6:].encode("ascii"))
+        dec = _dpapi_win32(False, raw)
+        return dec.decode("utf-8") if dec is not None else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     try:
@@ -1636,6 +1698,9 @@ def load_config():
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
+    for k in ("token", "data_key"):
+        if isinstance(cfg.get(k), str) and cfg[k].startswith("dpapi:"):
+            cfg[k] = _dpapi_unprotect(cfg[k])
     if os.environ.get("TINVEST_TOKEN"):
         cfg["token"] = os.environ["TINVEST_TOKEN"]
     return cfg
@@ -1683,6 +1748,9 @@ def save_config(cfg):
                 demo_remove()  # реальный токен заменяет демо-портфель
             except Exception:  # noqa: BLE001
                 pass
+        for k in ("token", "data_key"):
+            if out.get(k):
+                out[k] = _dpapi_protect(str(out[k]))
         _private_write(CONFIG_PATH, json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
@@ -1724,6 +1792,8 @@ class Store:
         self.path = path
         self.local = threading.local()
         self.wlock = threading.Lock()
+        self._conns = set()
+        self._conns_lock = threading.Lock()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         apply_pending_restore(path)
         if not os.path.exists(path):
@@ -1745,7 +1815,29 @@ class Store:
             c.execute("PRAGMA journal_mode=WAL")
             c.execute("PRAGMA synchronous=NORMAL")
             self.local.c = c
+            with self._conns_lock:
+                self._conns.add(c)
         return c
+
+    def close_all(self):
+        """Сбрасывает журнал WAL и закрывает все SQLite-соединения всех потоков."""
+        with self.wlock:
+            with self._conns_lock:
+                conns = list(self._conns)
+                self._conns.clear()
+            ckpt = False
+            for c in conns:
+                if not ckpt:
+                    try:
+                        c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                        ckpt = True
+                    except sqlite3.Error:
+                        pass
+                try:
+                    c.close()
+                except sqlite3.Error:
+                    pass
+            self.local = threading.local()
 
     def write(self, sql, rows=None, many=False):
         with self.wlock:
@@ -7368,9 +7460,10 @@ def split_timeline(events, splits):
 # Когда позже загружается отчёт брокера с этими же сделками, ручные дубли заменяются строками отчёта (reconcile_manual_with_report).
 
 MAN_TYPES = {"buy": "BUY", "sell": "SELL", "coupon": "COUPON", "dividend": "DIVIDEND", "deposit": "INPUT",
-             "withdraw": "OUTPUT", "fee": "SERVICE_FEE"}
+             "withdraw": "OUTPUT", "fee": "SERVICE_FEE", "asset_ext": "ASSET_EXT"}
+ASSET_EXT_KINDS = {"deposit_bank": "Банковский вклад", "cash_ext": "Наличные", "real_estate": "Недвижимость"}
 MAN_TRADE, MAN_NEED_SEC = ("buy", "sell"), ("buy", "sell", "coupon", "dividend")
-MAN_SIGN = {"buy": -1, "sell": 1, "coupon": 1, "dividend": 1, "deposit": 1, "withdraw": -1, "fee": -1}
+MAN_SIGN = {"buy": -1, "sell": 1, "coupon": 1, "dividend": 1, "deposit": 1, "withdraw": -1, "fee": -1, "asset_ext": 0}
 MAN_DAYS, MAN_QTY_EPS, MAN_PAY_ABS, MAN_PAY_REL = 2, 1e-3, 5.0, 0.01
 _man_lock = threading.Lock()
 
@@ -7529,6 +7622,40 @@ def manual_build(body, now=None):
     ident = str(body.get("ident") or "").strip().upper()[:24]
     ticker = str(body.get("ticker") or "").strip().upper()[:24]
     name = str(body.get("name") or "").strip()[:120]
+    gid = str(body.get("group") or "")
+    if gid:
+        if not re.fullmatch(r"man-[a-z0-9]{3,24}", gid):
+            raise ApiError("Неверный номер записи.", 400)
+    else:
+        gid = "man-" + uuid.uuid4().hex[:12]
+    t = (now if now is not None else time.time())
+    iso = day.strftime("%Y-%m-%dT12:00:00Z")
+    if kind == "asset_ext":
+        ak = str(body.get("asset_kind") or "").strip()
+        if ak not in ASSET_EXT_KINDS:
+            raise ApiError("Неизвестный вид неторгового актива.", 400)
+        amount = _man_num(body.get("amount"), "Сумма", 0.0, 1e12, req=True)
+        if not amount or amount <= 0:
+            raise ApiError("Укажите сумму актива.", 400)
+        rate = _man_num(body.get("rate"), "Ставка", 0.0, 1000.0)
+        end_raw = str(body.get("end_date") or "").strip()[:10]
+        end_iso = ""
+        if end_raw:
+            try:
+                end_d = datetime.strptime(end_raw, "%Y-%m-%d").date()
+            except ValueError:
+                raise ApiError("Дата окончания указана неверно.", 400)
+            if end_d.year < 1990 or end_d.year > 2100:
+                raise ApiError("Дата окончания вне допустимых границ.", 400)
+            end_iso = end_d.isoformat()
+        main = {"id": gid, "date": iso, "type": "OPERATION_TYPE_ASSET_EXT",
+                "payment": to_money(0, cur), "name": name or ASSET_EXT_KINDS[ak],
+                "_manual": True, "_asset_ext": True, "_asset_kind": ak, "_amount": round(amount, 2), "_u": t}
+        if rate is not None:
+            main["_rate"] = round(rate, 4)
+        if end_iso:
+            main["_end_date"] = end_iso
+        return [main]
     if mode == "position":
         kind = "buy"
     if kind in MAN_NEED_SEC and not ident:
@@ -7547,14 +7674,6 @@ def manual_build(body, now=None):
     if not total or total <= 0:
         raise ApiError("Укажите цену или сумму операции.", 400)
     total = round(total, 2)
-    gid = str(body.get("group") or "")
-    if gid:
-        if not re.fullmatch(r"man-[a-z0-9]{3,24}", gid):
-            raise ApiError("Неверный номер записи.", 400)
-    else:
-        gid = "man-" + uuid.uuid4().hex[:12]
-    t = (now if now is not None else time.time())
-    iso = day.strftime("%Y-%m-%dT12:00:00Z")
     main = {"id": gid, "date": iso, "type": "OPERATION_TYPE_" + MAN_TYPES[kind],
             "payment": to_money(MAN_SIGN[kind] * total, cur), "name": name or ident or ticker or "Ручная запись",
             "_manual": True, "_u": t}
@@ -7650,11 +7769,22 @@ def manual_list(cfg, acc, q, force):
             if not m:
                 continue
             fee = next((o for o in g if o["id"].endswith("-f")), None)
-            out.append({"acc": a["id"], "acc_name": a.get("name"), "group": gid, "date": (m.get("date") or "")[:10],
-                        "type": classify(m.get("type")), "name": m.get("name") or "", "ident": m.get("_sec") or m.get("_isin") or "",
-                        "qty": op_qty(m), "amount": round(abs(qf(m.get("payment"))), 2), "currency": cur_of(m.get("payment")).upper(),
-                        "commission": round(abs(qf(fee.get("payment"))), 2) if fee else 0.0,
-                        "autocash": any(o.get("_manual_autocash") for o in g), "position": bool(m.get("_position"))})
+            is_ext = bool(m.get("_asset_ext"))
+            row = {"acc": a["id"], "acc_name": a.get("name"), "group": gid, "date": (m.get("date") or "")[:10],
+                   "type": "asset_ext" if is_ext else classify(m.get("type")),
+                   "name": m.get("name") or "", "ident": m.get("_sec") or m.get("_isin") or "",
+                   "qty": op_qty(m),
+                   "amount": round(float(m.get("_amount") or 0), 2) if is_ext else round(abs(qf(m.get("payment"))), 2),
+                   "currency": cur_of(m.get("payment")).upper(),
+                   "commission": round(abs(qf(fee.get("payment"))), 2) if fee else 0.0,
+                   "autocash": any(o.get("_manual_autocash") for o in g), "position": bool(m.get("_position"))}
+            if is_ext:
+                row["asset_kind"] = m.get("_asset_kind") or ""
+                if m.get("_rate") is not None:
+                    row["rate"] = m.get("_rate")
+                if m.get("_end_date"):
+                    row["end_date"] = m.get("_end_date")
+            out.append(row)
     out.sort(key=lambda r: (r["date"], r["group"]), reverse=True)
     return {"rows": out[:500], "accounts": [{"id": a["id"], "name": a.get("name")} for a in lst
                                            if str(a["id"]).startswith("imp-") and not (a.get("sync_src") or a.get("demo") or a["id"] == DEMO_ID)]}
@@ -21192,9 +21322,7 @@ def delete_all_local_data(app_dir=None):
                 for t in ("kv", "ops", "candles", "snaps"):
                     c.execute("DELETE FROM " + t)
                 c.commit()
-                c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                c.close()
-                STORE.local.c = None
+            STORE.close_all()
         except sqlite3.Error:
             pass
         STORE = None
@@ -21247,10 +21375,40 @@ def ld_wipe_post(cfg, body):
     return delete_all_local_data()
 
 
+def ld_vacuum_post(cfg, body):
+    before = local_data_info()["total"]
+    st = store()
+    with st.wlock:
+        c = st.conn()
+        try:
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            c.execute("VACUUM")
+        except sqlite3.Error as e:
+            raise ApiError("Не удалось сжать базу: %s" % e, 500)
+    after = local_data_info()["total"]
+    return {"ok": True, "freed": max(0, before - after), "info": local_data_info()}
+
+
+def ld_crowd_log_get(cfg, acc, q, force):
+    fn = globals().get("api_crowd_status")
+    st = fn(cfg, acc, q, force) if callable(fn) else {}
+    raw = store().get("crowd_stats") or {}
+    out = dict(st) if isinstance(st, dict) else {}
+    out.setdefault("accepted", int(raw.get("accepted", 0) or 0))
+    out.setdefault("fetched", int(raw.get("fetched", 0) or 0))
+    out.setdefault("errors", int(raw.get("errors", 0) or 0))
+    out.setdefault("last", raw.get("last"))
+    out.setdefault("queue", int(raw.get("queue", 0) or 0))
+    out["stats"] = raw
+    return out
+
+
 API_GET["/api/localdata"] = ld_info_get
 API_POST["/api/localdata/open"] = ld_open_post
 API_POST["/api/localdata/clear"] = ld_clear_post
 API_POST["/api/localdata/wipe"] = ld_wipe_post
+API_POST["/api/localdata/vacuum"] = ld_vacuum_post
+API_GET["/api/crowd/log"] = ld_crowd_log_get
 # ═══════════════ помощь в сборе раскрытий эмитентов (по желанию пользователя) ═══════════════
 # Сервер данных не может открыть e-disclosure.azipi.ru (сайт блокирует его адрес), а у пользователей в России страницы открываются.
 # Если «Помогать собирать раскрытия» включено (по умолчанию включено, выключается в «Настройках»), то ПОКА ПРОГРАММА ЗАПУЩЕНА фоновый поток
@@ -29380,28 +29538,73 @@ def tk_fetch_btc():
     return it
 
 
+_tk_btc_lock = threading.Lock()
+_tk_btc_running = [False]
+
+
+def _tk_btc_async():
+    """Запускает фоновый запрос курса BTC (не чаще одного потока одновременно), возвращает Event или None."""
+    with _tk_btc_lock:
+        if _tk_btc_running[0]:
+            return None
+        _tk_btc_running[0] = True
+    ev = threading.Event()
+
+    def job():
+        try:
+            it = tk_fetch_btc()
+            if it and mem_get(("tk_btc",), 60) is None:
+                mem_put(("tk_btc",), it)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with _tk_btc_lock:
+                _tk_btc_running[0] = False
+            ev.set()
+
+    threading.Thread(target=job, daemon=True, name="tk-btc").start()
+    return ev
+
+
 def ticker_payload(force=False):
     ttl = 60 if _stk_trading() else 600
     key = ("tk_payload",)
     hit = None if force else mem_get(key, ttl)
     if hit is not None:
         res = dict(hit)
-        btc = tk_fetch_btc()      # BTC торгуется круглосуточно: свой кэш 60 с
+        btc_raw = mem_get(("tk_btc",), 60)
+        if btc_raw is None:
+            _tk_btc_async()          # не блокируем ответ: обновим BTC в фоне к следующему запросу
+            return res
+        btc = btc_raw or None
         res["items"] = [btc if i["id"] == "BTC" and btc else i for i in hit["items"]]
         if btc and not any(i["id"] == "BTC" for i in res["items"]):
             res["items"].append(btc)
         return res
+
     def _run(fn):
         try:
             return fn()
         except Exception:  # noqa: BLE001
             return None
 
-    idx_it, stk_rows, cets_raw, btc_it = pool_map(
-        _run,
-        [tk_fetch_index, lambda: tk_parse_stocks(stocks_universe(force)), tk_fetch_cets, tk_fetch_btc],
-        workers=4,
-    )
+    if force:
+        idx_it, stk_rows, cets_raw, btc_it = pool_map(
+            _run,
+            [tk_fetch_index, lambda: tk_parse_stocks(stocks_universe(force)), tk_fetch_cets, tk_fetch_btc],
+            workers=4,
+        )
+    else:
+        ev = _tk_btc_async() if mem_get(("tk_btc",), 60) is None else None
+        idx_it, stk_rows, cets_raw = pool_map(
+            _run,
+            [tk_fetch_index, lambda: tk_parse_stocks(stocks_universe(force)), tk_fetch_cets],
+            workers=3,
+        )
+        if mem_get(("tk_btc",), 60) is None and ev is not None:
+            ev.wait(0.4)
+        btc_it = mem_get(("tk_btc",), 60) or None
+
     items = []
     if idx_it:
         items.append(idx_it)
@@ -29429,6 +29632,249 @@ def _api_ticker(cfg, acc, q, force):
 
 
 API_GET["/api/ticker"] = _api_ticker
+# ═══════════════════════════════ блокировка экрана (PIN / биометрия) ═══════════════════════════════
+# По умолчанию выключена (lock_enabled=False). При включённой блокировке все /api/* (кроме /api/ping, /api/lock/status,
+# /api/lock/unlock, /api/app/shutdown) возвращают HTTP 423 до разблокировки в текущей сессии сервера.
+
+_lock_unlocked = [False]
+_lock_state_lock = threading.Lock()
+_bio_runner = None
+_LOCK_PBKDF_ROUNDS = 120000
+
+_BIO_SWIFT_SRC = (
+    'import Foundation\n'
+    'import LocalAuthentication\n'
+    'let ctx = LAContext()\n'
+    'var err: NSError?\n'
+    'let reason = ProcessInfo.processInfo.environment["TA_BIO_REASON"] ?? "Unlock TAnalytic"\n'
+    'guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) else {\n'
+    '    fputs(err?.localizedDescription ?? "unavailable", stderr)\n'
+    '    exit(2)\n'
+    '}\n'
+    'let sem = DispatchSemaphore(value: 0)\n'
+    'var ok = false\n'
+    'var msg = ""\n'
+    'ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { success, error in\n'
+    '    ok = success\n'
+    '    if let e = error { msg = e.localizedDescription }\n'
+    '    sem.signal()\n'
+    '}\n'
+    'sem.wait()\n'
+    'if !ok { fputs(msg, stderr) }\n'
+    'exit(ok ? 0 : 1)\n'
+)
+
+_BIO_WIN_PS = (
+    "$ErrorActionPreference = 'Stop'\n"
+    "[void][Windows.Security.Credentials.UI.UserConsentVerifier, Windows.Security.Credentials.UI, ContentType = WindowsRuntime]\n"
+    "Add-Type -AssemblyName System.Runtime.WindowsRuntime\n"
+    "$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { "
+    "$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]\n"
+    "function Await($WinRtTask, $ResultType) {\n"
+    "    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)\n"
+    "    $netTask = $asTask.Invoke($null, @($WinRtTask))\n"
+    "    $netTask.Wait(-1) | Out-Null\n"
+    "    $netTask.Result\n"
+    "}\n"
+    "$avail = Await ([Windows.Security.Credentials.UI.UserConsentVerifier]::CheckAvailabilityAsync()) "
+    "([Windows.Security.Credentials.UI.UserConsentVerifierAvailability])\n"
+    "if ($avail -ne 'Available') { Write-Error \"unavailable:$avail\"; exit 2 }\n"
+    "$reason = $env:TA_BIO_REASON\n"
+    "if (-not $reason) { $reason = 'Unlock TAnalytic' }\n"
+    "$res = Await ([Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync($reason)) "
+    "([Windows.Security.Credentials.UI.UserConsentVerificationResult])\n"
+    "if ($res -eq 'Verified') { exit 0 } else { Write-Error \"$res\"; exit 1 }\n"
+)
+
+
+def _lock_hash_pin(pin, salt_bytes):
+    return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt_bytes, _LOCK_PBKDF_ROUNDS).hex()
+
+
+def _lock_verify_pin(cfg, pin):
+    h, s = str(cfg.get("lock_pin_hash") or ""), str(cfg.get("lock_pin_salt") or "")
+    if not h or not s:
+        return False
+    try:
+        salt_bytes = bytes.fromhex(s)
+    except ValueError:
+        return False
+    cand = _lock_hash_pin(str(pin or ""), salt_bytes)
+    return hmac.compare_digest(cand, h)
+
+
+def _lock_configured(cfg):
+    return bool(cfg.get("lock_enabled")) and bool(cfg.get("lock_pin_hash") or cfg.get("lock_bio"))
+
+
+def lock_is_locked(cfg):
+    if not _lock_configured(cfg):
+        return False
+    return not _lock_unlocked[0]
+
+
+def bio_available():
+    if os.environ.get("TINVEST_NO_BIO") == "1":
+        return False
+    sysname = platform.system()
+    if sysname == "Darwin":
+        return os.path.exists("/System/Library/Frameworks/LocalAuthentication.framework")
+    if sysname == "Windows":
+        return bool(shutil.which("powershell"))
+    return False
+
+
+def _bio_mac_cmd():
+    """Возвращает команду запуска macOS LocalAuthentication (кэшированный бинарник в APP_DIR/cache или swift -e)."""
+    h = hashlib.sha256(_BIO_SWIFT_SRC.encode("utf-8")).hexdigest()[:12]
+    cache_dir = os.path.join(APP_DIR, "cache")
+    bin_path = os.path.join(cache_dir, "bio_helper_" + h)
+    if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
+        return [bin_path]
+    swiftc = shutil.which("swiftc")
+    if swiftc:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            src_path = bin_path + ".swift"
+            with open(src_path, "w", encoding="utf-8") as f:
+                f.write(_BIO_SWIFT_SRC)
+            r = subprocess.run([swiftc, "-O", src_path, "-o", bin_path], timeout=30, capture_output=True, text=True)
+            try:
+                os.remove(src_path)
+            except OSError:
+                pass
+            if r.returncode == 0 and os.path.isfile(bin_path):
+                return [bin_path]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return ["swift", "-e", _BIO_SWIFT_SRC]
+
+
+def bio_verify(reason="Разблокировать TAnalytic"):
+    """Нативная проверка биометрии / системного пароля -> (ok: bool, err: str)."""
+    if _bio_runner is not None:
+        return _bio_runner(reason)
+    if not bio_available():
+        return False, "Биометрия недоступна на этом устройстве"
+    env = dict(os.environ, TA_BIO_REASON=str(reason or "Разблокировать TAnalytic"))
+    sysname = platform.system()
+    kw = {"env": env, "timeout": 30, "capture_output": True, "text": True}
+    if sysname == "Darwin":
+        cmd = _bio_mac_cmd()
+    elif sysname == "Windows":
+        cmd = ["powershell", "-NoProfile", "-Command", _BIO_WIN_PS]
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    else:
+        return False, "Биометрия недоступна"
+    try:
+        proc = subprocess.run(cmd, **kw)
+    except subprocess.TimeoutExpired:
+        return False, "Время ожидания биометрии истекло"
+    except OSError as e:
+        return False, str(e)
+    if proc.returncode == 0:
+        return True, ""
+    err = (proc.stderr or proc.stdout or "Проверка отклонена").strip()
+    return False, err[:240]
+
+
+def lock_status_dict(cfg):
+    return {
+        "enabled": bool(cfg.get("lock_enabled")),
+        "unlocked": not lock_is_locked(cfg),
+        "has_pin": bool(cfg.get("lock_pin_hash")),
+        "bio": bool(cfg.get("lock_bio", True)),
+        "bio_available": bio_available(),
+    }
+
+
+def lock_status_get(cfg, acc, q, force):
+    return lock_status_dict(cfg)
+
+
+def lock_setup_post(cfg, body):
+    with _lock_state_lock:
+        was_enabled = _lock_configured(cfg)
+        if was_enabled:
+            if not _lock_unlocked[0]:
+                raise ApiError("Программа заблокирована", 423)
+            if cfg.get("lock_pin_hash") and "current_pin" in body and body.get("current_pin") is not None:
+                if not _lock_verify_pin(cfg, body.get("current_pin")):
+                    raise ApiError("Неверный текущий PIN.", 403)
+        enabled = bool(body["enabled"]) if "enabled" in body else bool(cfg.get("lock_enabled"))
+        if "bio" in body:
+            cfg["lock_bio"] = bool(body["bio"])
+        elif "lock_bio" in body:
+            cfg["lock_bio"] = bool(body["lock_bio"])
+        if body.get("clear_pin"):
+            cfg["lock_pin_hash"] = ""
+            cfg["lock_pin_salt"] = ""
+        elif "pin" in body and body["pin"] is not None:
+            pin = str(body["pin"])
+            if pin:
+                if len(pin) < 4:
+                    raise ApiError("PIN должен содержать не менее 4 символов.", 400)
+                salt = os.urandom(16)
+                cfg["lock_pin_salt"] = salt.hex()
+                cfg["lock_pin_hash"] = _lock_hash_pin(pin, salt)
+            elif not enabled:
+                cfg["lock_pin_hash"] = ""
+                cfg["lock_pin_salt"] = ""
+        if enabled and not (cfg.get("lock_pin_hash") or cfg.get("lock_bio")):
+            raise ApiError("Задайте PIN-код или включите биометрию.", 400)
+        cfg["lock_enabled"] = enabled
+        if _lock_configured(cfg):
+            _lock_unlocked[0] = True     # не блокируем текущую сессию сразу после настройки
+        else:
+            _lock_unlocked[0] = False
+        save_config(cfg)
+        return {"ok": True, **lock_status_dict(cfg)}
+
+
+def lock_unlock_post(cfg, body):
+    with _lock_state_lock:
+        if not lock_is_locked(cfg):
+            return {"ok": True, "unlocked": True}
+        method = str(body.get("method") or ("bio" if body.get("bio") else "pin"))
+        if method == "bio":
+            if not cfg.get("lock_bio"):
+                raise ApiError("Биометрическая разблокировка отключена.", 403)
+            ok, err = bio_verify(str(body.get("reason") or "Разблокировать TAnalytic"))
+            if not ok:
+                raise ApiError(err or "Биометрическая проверка не пройдена.", 403)
+            _lock_unlocked[0] = True
+            return {"ok": True, "unlocked": True}
+        pin = str(body.get("pin") or "")
+        if not cfg.get("lock_pin_hash") or not _lock_verify_pin(cfg, pin):
+            raise ApiError("Неверный PIN.", 403)
+        _lock_unlocked[0] = True
+        return {"ok": True, "unlocked": True}
+
+
+def lock_bio_post(cfg, body):
+    ok, err = bio_verify(str(body.get("reason") or "Проверка биометрии TAnalytic"))
+    return {"ok": bool(ok), "error": err or ""}
+
+
+def lock_now_post(cfg, body):
+    with _lock_state_lock:
+        if _lock_configured(cfg):
+            _lock_unlocked[0] = False
+        return {"ok": True, "locked": lock_is_locked(cfg)}
+
+
+def _lock_on_startup():
+    with _lock_state_lock:
+        _lock_unlocked[0] = False
+
+
+API_GET["/api/lock/status"] = lock_status_get
+API_POST["/api/lock/setup"] = lock_setup_post
+API_POST["/api/lock/unlock"] = lock_unlock_post
+API_POST["/api/lock/bio"] = lock_bio_post
+API_POST["/api/lock/now"] = lock_now_post
+STARTUP_HOOKS.append(_lock_on_startup)
 
 # ── оболочка (собранное приложение .app/.exe): устарела ли она ──
 # Автообновление меняет только tinvest_analytics.py; окно, иконка и экран обновления живут в самой оболочке.
@@ -29548,6 +29994,12 @@ sys.tanalytic_tray = tray_close_wanted               # лаунчер спраш
 
 _ping = [0.0]
 _font_cache = []
+_active_server = [None]
+START_PAGES = {
+    "dash", "ret", "bench", "pos", "bonds", "pay", "off", "ops", "fees", "tax", "reb", "calc", "lad",
+    "mkt", "scr", "cmp", "map", "hm", "sig", "risk", "mon", "watch", "iss", "dfl", "flw", "pri", "fng",
+    "cal", "kb", "imp", "set", "stk", "sst", "crp", "mic", "ofz", "pm", "txo", "dgap", "mm", "arb", "dbx", "rot",
+}
 
 
 def font_inter_bytes():
@@ -29634,6 +30086,8 @@ class Handler(BaseHTTPRequestHandler):
                 _ping[0] = time.time()
                 return self.send(200, {"ok": True, "app": APP_NAME})
             cfg = load_config()
+            if u.path.startswith("/api/") and u.path not in ("/api/ping", "/api/lock/status") and lock_is_locked(cfg):
+                return self.send(423, {"error": "Программа заблокирована", "locked": True})
             f = q.get("force") == "1"
             acc = q.get("account", "all") or "all"
             if u.path == "/api/config":
@@ -29727,6 +30181,20 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ApiError("Ожидался JSON-объект.", 400)
             cfg = load_config()
+            if path.startswith("/api/") and path not in ("/api/lock/unlock", "/api/app/shutdown") and lock_is_locked(cfg):
+                return self.send(423, {"error": "Программа заблокирована", "locked": True})
+            if path == "/api/app/shutdown":
+                def _stop():
+                    time.sleep(0.05)
+                    srv = _active_server[0]
+                    if srv is not None:
+                        try:
+                            srv.shutdown()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    app_shutdown()
+                threading.Thread(target=_stop, daemon=True, name="app-shutdown").start()
+                return self.send(200, {"ok": True})
             if path == "/api/config":
                 if body.get("token"):
                     cfg["token"] = "".join(str(body["token"]).split())
@@ -29739,6 +30207,19 @@ class Handler(BaseHTTPRequestHandler):
                     cfg["ca_file"] = str(body["ca_file"]).strip()
                 if body.get("theme") in ("auto", "dark", "light"):
                     cfg["theme"] = body["theme"]
+                if body.get("start_page") in START_PAGES:
+                    cfg["start_page"] = body["start_page"]
+                if isinstance(body.get("ui_prefs"), dict):
+                    prefs = dict(cfg.get("ui_prefs") if isinstance(cfg.get("ui_prefs"), dict) else {})
+                    for k, v in list(body["ui_prefs"].items())[:40]:
+                        k = str(k)[:40]
+                        if v is None:
+                            prefs.pop(k, None)
+                        elif isinstance(v, (bool, int, float)) and not (isinstance(v, float) and (v != v or abs(v) >= 1e15)):
+                            prefs[k] = v
+                        elif isinstance(v, str):
+                            prefs[k] = v[:120]
+                    cfg["ui_prefs"] = dict(list(prefs.items())[:60])
                 if isinstance(body.get("targets"), dict):
                     tg = {}
                     for k, v in body["targets"].items():
@@ -29946,10 +30427,7 @@ def app_shutdown():
     if STORE is None:
         return
     try:
-        st = STORE
-        st.conn().execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-        st.conn().close()
-        st.local.c = None
+        STORE.close_all()
     except Exception:  # noqa: BLE001
         pass
 
@@ -30004,10 +30482,12 @@ def main():
                 hook()
             except Exception:  # noqa: BLE001
                 pass
+        _active_server[0] = srv
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        _active_server[0] = None
         srv.server_close()
         app_shutdown()
     # окно закрыто или Ctrl+C: фоновые расчёты (пулы потоков) прерываем сразу, иначе они падают с трассировкой
@@ -30586,6 +31066,18 @@ tr.scr-low td{opacity:.5}
 .cl-main .kpi .v{font-size:clamp(17px,1.4vw,21px);white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;line-height:1.2}
 .cl-main .kpi .s{white-space:normal;overflow:visible;text-overflow:clip}
 @media(max-width:1500px){.cl-main .g.g2{grid-template-columns:1fr}}
+/* Мост (Waterfall) доходов и налогов, точка обгона вклада, карточки v2 */
+.cl-tiles{margin-bottom:0}
+.cl-tiles .st-ts{min-height:0}
+.cl-wf{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:8px}
+@media(max-width:1100px){.cl-wf{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.cl-wf-step{padding:12px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line);display:grid;gap:6px;align-content:end}
+.cl-wf-lbl{font-size:11.5px;color:var(--mu);font-weight:550}
+.cl-wf-val{font-size:16px;font-weight:650;letter-spacing:-.02em}
+.cl-wf-track{height:6px;border-radius:999px;background:var(--line);overflow:hidden}
+.cl-wf-track i{display:block;height:100%;border-radius:999px}
+.cl-wf-step.is-net{border-color:color-mix(in srgb,var(--pos) 40%,transparent);background:color-mix(in srgb,var(--pos) 7%,var(--card2))}
+.cl-iis-cap{margin:8px 0 0!important}
 /* оферты и лесенка */
 .of-card{margin-bottom:14px}.of-urgent{border-color:#ff6b6b55}
 .of-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;cursor:pointer;margin-bottom:12px}
@@ -32044,6 +32536,17 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 .st-acc>button:hover{border-color:var(--ac);color:var(--tx)}
 .st-acc>button.on{border-color:var(--ac);box-shadow:0 0 0 3px var(--ac-glow);color:var(--tx)}
 .st-acc>button:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+
+/* PIN-код, журнал раскрытий и плавающая панель несохранённых изменений */
+.st-lock-pin{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.crowd-log{display:grid;gap:6px;max-height:220px;overflow:auto;margin-top:4px}
+.crowd-log-r{display:grid;grid-template-columns:68px 72px minmax(0,1fr);gap:10px;font-size:12px;padding:4px 0;border-bottom:1px solid var(--line)}
+.crowd-log-r:last-child{border-bottom:0}
+.st-dirty-bar{position:sticky;bottom:14px;z-index:30;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 18px;border-radius:14px;background:var(--d2);border:1px solid var(--ac);box-shadow:var(--d2-hl),0 18px 42px -10px #00000099;animation:stUp .2s ease}
+.st-dirty-bar[hidden]{display:none}
+.st-dirty-bar>span{font-size:13.5px;font-weight:600;color:var(--tx)}
+.st-dirty-bar .row{gap:8px}
+@media(prefers-reduced-motion:reduce){.st-dirty-bar{animation:none}}
 #shell-bar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding:8px 28px;border-bottom:1px solid var(--line);
   background:linear-gradient(90deg,#2bc48a1f,#2bc48a08 60%,transparent),var(--bg);font-size:12.5px;color:var(--tx2)}
 #shell-bar b{color:var(--tx)}
@@ -32154,13 +32657,279 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 .st-dot{margin-left:auto;flex:none}
 .st-tl>.st-dot{margin-left:auto}
 
-/* Шапка: заголовок не сжимается до пары букв, период не переносится по строкам */
+/* Шапка: заголовок не сжимается до пары букв, кнопка поиска остаётся компактной пилюлей */
 .top h1{display:block;flex:1 1 150px;min-width:110px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .top #period{flex:none;flex-wrap:nowrap}
 .top #period button{white-space:nowrap}
+.top .srch-pill{border-radius:999px;padding:6px 12px;gap:8px;min-height:34px}
+.top .srch-pill .srch-tx{display:inline;color:var(--tx2);white-space:nowrap}
+@media(max-width:1240px){.top .srch-pill .srch-tx{display:none}}
 @media(min-width:761px) and (max-width:1100px){
   .top{flex-wrap:wrap;row-gap:8px}
 }
+
+/* Переключатель периода внутри #view на 5 аналитических экранах */
+.per-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:-2px 0 2px}
+.per-lbl{font-size:12px;color:var(--mu);font-weight:500}
+.per-bar .seg{flex:0 1 auto}
+.per-bar .seg button{padding:5px 11px;font-size:12.5px}
+
+/* Индикатор связи в нижней части сайдбара */
+.side-foot{flex-wrap:wrap;gap:6px 10px}
+.conn-st{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--mu);margin-right:auto}
+.conn-dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--pos);box-shadow:0 0 0 3px #2bc48a22}
+.conn-st.busy .conn-dot{background:var(--ac);box-shadow:0 0 0 3px var(--ac-glow);animation:connPulse 1.1s ease-in-out infinite}
+.conn-st.err .conn-dot{background:var(--st-warn);box-shadow:0 0 0 3px #e5a63a28}
+.conn-st.err .conn-tx{color:var(--st-warn)}
+body.side-mini .conn-tx{display:none}
+body.side-mini .conn-st{margin-right:0}
+@keyframes connPulse{0%,100%{opacity:1}50%{opacity:.4}}
+@media(prefers-reduced-motion:reduce){.conn-st.busy .conn-dot{animation:none}}
+
+/* Обзор: мини-спарклайн в hero, бейдж дельты периода, переключатель Топ-8 / Все */
+.hero{position:relative;overflow:hidden}
+.hero-spark{position:absolute;right:0;top:0;bottom:0;width:min(48%,460px);pointer-events:none;opacity:.42;z-index:0}
+.hero-spark svg{width:100%;height:100%;display:block}
+.dash-delta{font-size:12px;padding:2px 9px}
+.dash-top-seg{margin-left:8px;padding:2px;border-radius:9px}
+.dash-top-seg button{padding:3px 9px;font-size:11.5px}
+
+/* Скелетон загрузки графика */
+.chart-sk{display:flex;flex-direction:column;justify-content:flex-end;gap:12px;padding:18px 16px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line)}
+.chart-sk-bars{display:flex;align-items:flex-end;gap:10px;height:110px;flex:1}
+.chart-sk-bars i{flex:1;display:block;border-radius:6px 6px 2px 2px;background:linear-gradient(180deg,var(--sk-2),var(--sk-1));animation:skShim 1.4s linear infinite;background-size:200% 100%}
+.chart-sk-tx{font-size:12px;color:var(--mu);text-align:center}
+@media(prefers-reduced-motion:reduce){.chart-sk-bars i{animation:none}}
+
+/* Экран блокировки (#lock-ov) */
+#lock-ov{position:fixed;inset:0;z-index:2000;background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2);display:grid;place-items:center;padding:24px}
+.lock-box{width:min(400px,100%);background:var(--d2);border:1px solid var(--line2);border-radius:var(--r-lg);padding:28px 26px 24px;display:grid;gap:14px;box-shadow:var(--d2-hl),0 28px 70px #00000099}
+.lock-box .logo{padding:0;margin:0}
+.lock-sub{margin:0;font-size:13.5px;color:var(--tx2);line-height:1.45}
+.lock-bio{justify-content:center;padding:11px 16px}
+.lock-bio svg{width:18px;height:18px}
+#lock-form{display:grid;gap:10px}
+#lock-pin{text-align:center;letter-spacing:.14em;font-size:15px}
+.lock-go{justify-content:center;padding:10px 16px}
+.lock-err{font-size:12.5px;color:var(--neg);text-align:center}
+.lock-err[hidden]{display:none}
+body.lock-open{overflow:hidden}
+
+/* Глобальный оверлей переноса файла отчёта (#drop-ov) */
+#drop-ov{position:fixed;inset:0;z-index:1900;background:rgba(7,9,14,.76);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);display:grid;place-items:center;padding:24px;pointer-events:none}
+[data-theme=light] #drop-ov{background:rgba(242,244,248,.82)}
+.drop-box{width:min(480px,100%);padding:36px 28px;border-radius:var(--r-lg);background:var(--d2);border:2px dashed var(--ac);box-shadow:var(--d2-hl),0 24px 60px #00000080;display:grid;gap:10px;justify-items:center;text-align:center}
+.drop-box svg{width:42px;height:42px;color:var(--ac-tx)}
+.drop-box b{font-size:16px;font-weight:650;color:var(--tx)}
+.drop-box span{font-size:13px;color:var(--mu)}
+/* ── Стили безрамочной шапки Tauri v2 (действуют только при html.is-tauri) ── */
+.tauri-bar{
+  display:none;
+  flex:none;
+  height:34px;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 8px 0 14px;
+  background:var(--side);
+  border-bottom:1px solid var(--line);
+  user-select:none;
+  -webkit-user-select:none;
+  -webkit-app-region:drag;
+}
+html.is-tauri .tauri-bar{display:flex}
+html.is-tauri.os-mac aside{padding-top:36px}
+html.is-tauri.os-mac .tauri-bar{background:transparent;border-bottom-color:transparent;height:30px;padding:0 12px}
+
+.tauri-brand{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:12px;
+  font-weight:600;
+  color:var(--tx2);
+  letter-spacing:-.01em;
+  min-width:0;
+}
+.tauri-brand svg{flex:none;display:block}
+
+.tauri-win-btns{
+  display:flex;
+  align-items:center;
+  gap:2px;
+  -webkit-app-region:no-drag;
+}
+.tauri-btn{
+  all:unset;
+  box-sizing:border-box;
+  width:34px;
+  height:26px;
+  border-radius:7px;
+  display:grid;
+  place-items:center;
+  color:var(--tx2);
+  cursor:pointer;
+  transition:background .14s ease,color .14s ease;
+  -webkit-app-region:no-drag;
+}
+.tauri-btn svg{width:12px;height:12px;display:block}
+.tauri-btn:hover{background:var(--card2);color:var(--tx)}
+.tauri-btn.tauri-close:hover{background:#e81123;color:#fff}
+
+@media print{
+  html.is-tauri .tauri-bar{display:none!important}
+}
+/* ── Полировка экранов по ревью: быстрые действия, сравнение, карточки, раскладка ── */
+
+/* Таблицы: заголовок карточки с экспортом CSV и фильтрами */
+.tbl-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:0 6px 10px}
+.tbl-head .seg{margin:0}
+.tbl-csv{display:inline-flex;align-items:center;gap:6px;padding:6px 11px;font-size:12px;margin-left:auto;white-space:nowrap}
+.tbl-csv svg{width:14px;height:14px}
+
+/* 12_bonds.js: 2px полоса прогресса под числом в heatCell */
+.hb-cell{display:inline-flex;flex-direction:column;align-items:flex-end;gap:3px;min-width:48px}
+.hb-bar{display:block;width:100%;height:2px;border-radius:2px;background:var(--line);overflow:hidden}
+.hb-bar b{display:block;height:100%;border-radius:2px;opacity:.85}
+
+/* Быстрые действия при наведении на строку таблицы облигаций */
+.b-name-cell{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+.b-name-cell>.id{min-width:0;flex:1}
+.row-act{display:inline-flex;align-items:center;gap:3px;flex:none;opacity:0;transition:opacity .15s}
+tr:hover .row-act,tr:focus-within .row-act,.row-act.has-on{opacity:1}
+.ra-btn{all:unset;box-sizing:border-box;cursor:pointer;display:grid;place-items:center;width:24px;height:24px;border-radius:7px;font-size:13px;line-height:1;color:var(--mu);border:1px solid transparent;transition:background-color .15s,color .15s,border-color .15s}
+.ra-btn:hover,.ra-btn:focus-visible{background:var(--card2);border-color:var(--line2);color:var(--tx);outline:none}
+.ra-btn.on{color:var(--s4);opacity:1;border-color:color-mix(in srgb,var(--s4) 35%,transparent);background:color-mix(in srgb,var(--s4) 12%,transparent)}
+.ra-btn[data-bcmp].on{color:var(--ac-tx);border-color:color-mix(in srgb,var(--ac) 40%,transparent);background:color-mix(in srgb,var(--ac) 14%,transparent)}
+
+/* Плавающая панель сравнения внизу (Compare Dock) */
+.cmp-dock{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:35;display:flex;align-items:center;gap:12px;padding:8px 14px;border-radius:14px;background:var(--d2);border:1px solid var(--line2);box-shadow:var(--d2-hl),var(--d2-shadow);font-size:13px;max-width:calc(100vw - 40px);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.cmp-dock-n{font-weight:600;color:var(--tx);white-space:nowrap}
+.cmp-dock-list{color:var(--mu);font-size:12px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmp-dock .btn{padding:6px 12px;font-size:12.5px;white-space:nowrap}
+@media print{.cmp-dock{display:none!important}}
+
+/* 14_scr.js: строка быстрых чипов */
+.scr-quick{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:10px}
+.scr-quick-lbl{font-size:12px;color:var(--mu);margin-right:2px}
+
+/* 27a_compare.js: пустой слот, сумма вложения и график потоков */
+.cmp-top{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:14px}
+.cmp-top .cmp-add{margin-bottom:0;flex:1;min-width:260px}
+.cmp-amt-f{display:grid;gap:5px;min-width:190px;max-width:230px}
+.cmp-amt-f>span{font-size:12px;color:var(--tx2);font-weight:500}
+.cmp-amt-f .in{padding:8px 11px}
+table.cmp .cmp-slot{min-width:200px;vertical-align:middle;background:var(--card2)}
+.cmp-slot-wrap{position:relative;display:grid;gap:6px}
+.cmp-slot-btn{justify-content:center;width:100%;font-size:12.5px;padding:7px 10px}
+.cmp-slot-in{padding:7px 10px;font-size:12.5px}
+.cmp-cf-card{margin-top:16px}
+
+/* 27_bondcard.js и 45_stock.js: вкладки, бейдж копирования ISIN, навигация ↑/↓ и v2 оформление */
+.bc-h.st-ver{display:grid;gap:8px;padding:16px 18px;border-radius:var(--r);border:1px solid var(--line);margin-bottom:14px}
+.bc-isin-cp{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:2px 8px 2px 6px;border-radius:7px;background:var(--card2);border:1px solid var(--line2);font-size:12px;color:var(--tx2);transition:border-color .15s,color .15s}
+.bc-isin-cp:hover,.bc-isin-cp:focus-visible{border-color:var(--ac);color:var(--tx);outline:none}
+.bc-isin-cp code{background:transparent;padding:0;font-size:12px}
+.bc-cp-st{font-size:11px;color:var(--mu);font-weight:550}
+.bc-cp-st.done{color:var(--pos)}
+.bc-tabs{margin:14px 0;width:100%;display:flex;flex-wrap:wrap}
+.bc-tabs button{flex:1;white-space:nowrap;text-align:center}
+.bc-nav-btns{display:inline-flex;align-items:center;gap:4px}
+.bc-nav-pos{font-size:11.5px;color:var(--mu);padding:0 4px}
+.bc-kpis.st-tiles{margin:12px 0;gap:10px}
+.bc-kpis.st-tiles .st-tile{padding:12px 14px}
+.bc-kpis.st-tiles .st-ts{min-height:0}
+.bc-verdict.st-callout{margin:0 0 12px}
+.bc-offers-box{display:grid;gap:8px;margin-bottom:12px}
+.bc-offer-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);font-size:13px}
+.stk-hd.st-ver{border:1px solid var(--line);border-radius:var(--r);padding:16px 20px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.stk-tiles{margin-bottom:0}
+.stk-tiles .st-ts{min-height:0}
+#bc-ov .st-callout,#sk-ov .st-callout,.wrap .st-callout{margin:0 0 12px}
+
+/* 10_pos.js: без двойного скролла, группировка, тумблер мелочи, 2 колонки на широком экране */
+.pos-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--gap,16px);align-items:start}
+.pos-side{display:grid;gap:var(--gap,16px);min-width:0}
+.pos-main{min-width:0}
+@media(min-width:1280px){
+  .pos-layout{grid-template-columns:minmax(0,1.7fr) minmax(330px,1fr)}
+  .pos-side{position:sticky;top:12px}
+}
+.pos-ctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:0 6px 10px}
+.pos-gh td{background:var(--card2);font-size:12.5px;border-top:1px solid var(--line2)}
+.pos-gh-cnt{font-weight:500;color:var(--mu);margin-left:6px}
+
+/* 17_ops.js: фильтр дат и счёта */
+.ops-dt{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mu)}
+.ops-dt .in{width:auto;padding:6px 9px;font-size:12.5px}
+.ops-acc{width:auto;min-width:150px;max-width:220px;padding:7px 10px;font-size:12.5px}
+
+/* 25_reb.js: 3 уровня ребалансировки и кнопка скринера */
+.reb-lvl-bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:14px}
+.reb-scr-btn{margin-left:8px;padding:3px 9px;font-size:11.5px;vertical-align:1px}
+
+/* 35_ladder.js: кликабельные пустые годы и 2-колоночный конструктор */
+.ldb-row.gap.is-act{cursor:pointer;transition:border-color .15s,background-color .15s}
+.ldb-row.gap.is-act:hover,.ldb-row.gap.is-act:focus-visible{border-color:var(--ac);background:color-mix(in srgb,var(--ac) 8%,transparent);outline:none}
+.ldb-row.gap.is-act .ld-fl.gap{color:var(--ac-tx);border:1px solid color-mix(in srgb,var(--ac) 35%,transparent)}
+.ld-gap-chip{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:6px;background:var(--card2);border:1px solid var(--line2);font-size:12px;margin:1px 2px;color:var(--tx)}
+.ld-gap-chip:hover{border-color:var(--ac);color:var(--ac-tx)}
+.ld-split{display:grid;grid-template-columns:minmax(310px,360px) minmax(0,1fr);gap:16px;align-items:start}
+.ld-side{position:sticky;top:12px}
+.ld-side .ld-form{grid-template-columns:1fr}
+.ld-main{display:grid;gap:16px;min-width:0}
+@media(max-width:1100px){.ld-split{grid-template-columns:1fr}.ld-side{position:static}}
+
+/* 16_pay.js: прогресс-бар к цели из калькулятора */
+.pay-goal{display:grid;gap:10px;margin-top:0}
+.pay-goal-top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.pay-pb{height:8px;border-radius:999px;background:var(--card2);border:1px solid var(--line);overflow:hidden}
+.pay-pb i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--ac),var(--pos));transition:width .3s ease}
+
+/* 37_events.js: карточка выбранного дня */
+.cal-day-card{margin-top:16px}
+.cal-dc-h{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 20px;border-bottom:1px solid var(--line)}
+.cal-dc-h b{font-size:15px}
+.cal-dc-sum{font-size:13.5px;font-weight:600;margin-left:4px}
+.cal-dc-act{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+.cal-dc-body{padding:10px 16px 14px}
+.cal-ev-go{font-size:11.5px;color:var(--ac-tx);margin-left:8px;white-space:nowrap}
+
+/* 38_watch.js: прогресс до цели */
+.wt-prog-wrap{display:grid;gap:4px;min-width:96px}
+.wt-prog{height:4px;border-radius:999px;background:var(--line);overflow:hidden}
+.wt-prog i{display:block;height:100%;border-radius:999px;background:var(--ac)}
+.wt-prog.hit i{background:var(--pos)}
+.wt-prog-tx{font-size:10.5px;color:var(--mu);white-space:nowrap}
+.wt-prog-tx.hit{color:var(--pos);font-weight:600}
+
+/* 31_monitor.js: плотность строк и карточки v2 */
+.mon-v2-card .st-row.mon-al{margin:0;border-radius:0;background:transparent;border-left:3px solid var(--mu)}
+.mon-v2-card .st-row.mon-al.mon-h{border-left-color:var(--neg)}
+.mon-v2-card .st-row.mon-al.mon-m{border-left-color:var(--st-warn)}
+.mon-v2-card .st-row.mon-al.mon-i{border-left-color:var(--s1)}
+.mon-v2-card .st-row.mon-al:hover{background:var(--card-hover)}
+
+/* 54_txo.js: бейджи ЛДВ и чеклист до sale_day */
+.txo-bdg-ok{background:#2bc48a1f;color:var(--pos);border:1px solid #2bc48a4d}
+.txo-bdg-soon{background:#e5a63a1f;color:var(--st-warn);border:1px solid #e5a63a4d}
+.txo-bdg-loss{background:#f0626a1f;color:var(--neg);border:1px solid #f0626a4d}
+[data-theme=light] .txo-bdg-soon{color:#a86d00}
+.txo-steps{margin:14px 0}
+.txo-step-lb{display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:13px;line-height:1.45;width:100%}
+.txo-step-lb input{margin-top:3px;accent-color:var(--ac)}
+.txo-step-lb.done span{text-decoration:line-through;color:var(--mu)}
+
+/* 20_imp.js: карточки брокеров и индикатор прогресса */
+.imp-guides{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:12px}
+@media(max-width:1100px){.imp-guides{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.imp-gcard{padding:12px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line);display:grid;gap:5px;align-content:start}
+.imp-gcard b{font-size:13px;color:var(--tx)}
+.imp-gcard small{font-size:12px;color:var(--tx2);line-height:1.45}
+.imp-prog{display:grid;gap:8px;padding:12px 14px;border-radius:12px;background:var(--card2);border:1px solid var(--line2);margin-bottom:12px}
+.imp-prog-bar{height:6px;border-radius:999px;background:var(--line);overflow:hidden}
+.imp-prog-bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--ac),var(--pos));transition:width .3s ease}
+.imp-prog-bar.indet i{width:45%;animation:impSlide 1.2s ease-in-out infinite}
+@keyframes impSlide{0%{transform:translateX(-100%)}100%{transform:translateX(240%)}}
 </style></head>
 <body>
 <div id="boot-splash" class="boot-splash" aria-hidden="true"><div class="boot-box"><div class="boot-logo"><svg width="64" height="64" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bsg" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#2563eb"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient><linearGradient id="bsa" x1="12" y1="6" x2="26" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.08)"/><path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="url(#bsg)"/><path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="url(#bsg)"/><path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="url(#bsa)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="boot-title">TAnalytic <span class="boot-ver">Pro</span></div><div class="boot-bar"><div class="boot-bar-fill"></div></div><div class="boot-status" id="boot-status">Загружаю портфель…</div></div></div>
@@ -32175,18 +32944,17 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
     <div class="acc-h">Счета <label class="msw" title="Скрыть счета без активов"><input type="checkbox" id="hideEmpty"><i></i>скрыть пустые</label></div>
     <div class="acl" id="acl"></div>
   </div>
-  <div class="side-foot"><span class="badge" id="mode"></span><button class="ver" id="ver" title="Что нового"></button></div>
+  <div class="side-foot"><span class="badge" id="mode"></span><span class="conn-st ok" id="conn-st" title="Состояние связи с локальным сервером"><i class="conn-dot" aria-hidden="true"></i><span class="conn-tx">Подключено</span></span><button class="ver" id="ver" title="Что нового"></button></div>
 </aside>
 <main>
   <div class="tkr noprint" id="tkr" hidden></div>
   <div class="top">
     <h1 id="title">Обзор</h1>
     <div class="acc-dd" id="acc-dd"></div>
-    <div class="seg" id="period"></div>
     <span class="upd" id="upd"></span>
     <span class="pronly" id="prinfo"></span>
     <span class="who" id="who" style="display:none"></span>
-    <button class="btn ghost srch-pill" id="srch" title="Поиск и команды (Ctrl+K / Cmd+K)" aria-label="Поиск"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><span class="srch-tx">Поиск…</span><kbd class="srch-k" id="srch-k">Ctrl+K</kbd></button>
+    <button class="btn ghost srch-pill" id="srch" title="Поиск и команды (Ctrl+K / Cmd+K)" aria-label="Поиск"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><span class="srch-tx">Поиск по бумагам и разделам…</span><kbd class="srch-k" id="srch-k">Ctrl+K</kbd></button>
     <button class="btn ghost" id="refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></svg><span class="btn-tx">Обновить</span></button>
     <div class="more-wrap" id="more-wrap">
       <button class="btn ghost" id="more" title="Ещё: скрыть суммы, тема, PNG, PDF" aria-label="Ещё" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
@@ -32211,7 +32979,9 @@ const _plat=(navigator.userAgentData&&navigator.userAgentData.platform)||navigat
 const IS_MAC=/Mac|iPhone|iPad/i.test(_plat),IS_WIN=/Win/i.test(_plat);
 const MOD=IS_MAC?'⌘':'Ctrl+';
 document.documentElement.classList.add(IS_MAC?'os-mac':IS_WIN?'os-win':'os-linux');
-document.addEventListener('DOMContentLoaded',()=>{const k=document.getElementById('srch-k');if(k)k.textContent=MOD+'K'});
+const _setSrchK=()=>{const k=document.getElementById('srch-k');if(k)k.textContent=MOD+'K'};
+document.addEventListener('DOMContentLoaded',_setSrchK);
+if(document.readyState!=='loading')_setSrchK();
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function safeUrl(u){try{const x=new URL(String(u||''));return(x.protocol==='https:'||x.protocol==='http:')?x.href:''}catch(e){return''}}
 const NF2=new Intl.NumberFormat('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2});
@@ -32309,23 +33079,85 @@ function regPage(id,o){
 }
 const NAV_FIXED=['imp','kb','set'],NAV_PINNED=['dash','set'];
 function lsJson(k,d){try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}}
-function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}
+let _uiHydrating=false,_uiPrefsT=0;
+const UI_PREF_LS=new Set(['ta_ux_mode','ta_side_mini','ta_nav_hidden','ta_ticker_off','ta_incog','ta_theme','ta_accent','ta_density']);
+function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}if(!_uiHydrating&&UI_PREF_LS.has(k))uiPrefsSaveSoon()}
 const PERIODS=[['1m','Месяц'],['3m','3 мес'],['ytd','С начала года'],['12m','Год'],['py','Прошлый год'],['all','Всё время']];
 const PERIOD_PAGES=['dash','ret','bench','ops','fees'];
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
 let st={};try{st=JSON.parse(lsGet('ta_state')||'{}')||{}}catch(e){}
-const S={navHidden:lsJson('ta_nav_hidden',[]),navShut:lsJson('ta_nav_shut',{}),page:st.page||'dash',period:st.period||'all',account:st.account||'all',hideEmpty:st.hideEmpty!==false,
+const _hashPage=(typeof location!=='undefined'&&/^#[a-z0-9_-]+$/i.test(location.hash||''))?location.hash.slice(1):'';
+const _hadInitialPage=Boolean((st&&st.page)||(_hashPage&&PAGES.some(p=>p&&p[0]===_hashPage)));
+const S={navHidden:lsJson('ta_nav_hidden',[]),navShut:lsJson('ta_nav_shut',{}),page:(_hashPage&&PAGES.some(p=>p&&p[0]===_hashPage)?_hashPage:st.page)||'dash',period:st.period||'all',account:st.account||'all',hideEmpty:st.hideEmpty!==false,
   data:null,bonds:null,hist:null,cfg:null,loading:false,err:null,accounts:[],
   sort:{k:'value_rub',d:-1},bsort:{k:'value_rub',d:-1},posType:'',opsN:200,opsQ:'',opsK:'',charts:[],imp:null};
 function persist(){try{localStorage.setItem('ta_state',JSON.stringify({page:S.page,period:S.period,account:S.account,hideEmpty:S.hideEmpty}))}catch(e){}}
 
+function uiPrefsCollect(){
+  return{
+    theme:typeof curTheme==='function'?curTheme():(lsGet('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'),
+    ux_mode:typeof UX!=='undefined'&&UX.mode?UX.mode:(lsGet('ta_ux_mode')==='pro'?'pro':'basic'),
+    side_mini:typeof UX!=='undefined'?!!UX.mini:lsGet('ta_side_mini')==='1',
+    nav_hidden:Array.isArray(S.navHidden)?S.navHidden.slice():lsJson('ta_nav_hidden',[]),
+    ticker_off:lsGet('ta_ticker_off')==='1',
+    incog:!!INCOG.on,
+    accent:typeof curAccent==='function'?curAccent():(lsGet('ta_accent')||'blue'),
+    density:typeof curDensity==='function'?curDensity():(lsGet('ta_density')||'comfort')
+  };
+}
+function uiPrefsSaveSoon(){
+  if(_uiHydrating)return;
+  clearTimeout(_uiPrefsT);
+  _uiPrefsT=setTimeout(()=>{
+    const prefs=uiPrefsCollect();
+    if(S.cfg)S.cfg.ui_prefs=Object.assign({},S.cfg.ui_prefs,prefs);
+    post('/api/config',{ui_prefs:prefs}).catch(()=>{});
+  },350);
+}
+function uiPrefsHydrate(cfg){
+  if(!cfg)return;
+  const p=(cfg.ui_prefs&&typeof cfg.ui_prefs==='object')?cfg.ui_prefs:{};
+  _uiHydrating=true;
+  try{
+    const th=p.theme||(cfg.theme&&cfg.theme!=='auto'?cfg.theme:null);
+    if(lsGet('ta_theme')==null&&th&&typeof applyTheme==='function')applyTheme(th);
+    if(lsGet('ta_accent')==null&&p.accent&&typeof applyAccent==='function')applyAccent(p.accent);
+    if(lsGet('ta_density')==null&&p.density&&typeof applyDensity==='function')applyDensity(p.density);
+    if(lsGet('ta_ux_mode')==null&&(p.ux_mode==='basic'||p.ux_mode==='pro')&&typeof UX!=='undefined'){
+      UX.mode=p.ux_mode;try{localStorage.setItem('ta_ux_mode',UX.mode)}catch(e){}if(typeof uxSyncMode==='function')uxSyncMode();
+    }
+    if(lsGet('ta_side_mini')==null&&p.side_mini!=null&&typeof UX!=='undefined'){
+      UX.mini=!!p.side_mini;try{localStorage.setItem('ta_side_mini',UX.mini?'1':'0')}catch(e){}if(typeof uxSyncMode==='function')uxSyncMode();
+    }
+    if(lsGet('ta_nav_hidden')==null&&Array.isArray(p.nav_hidden)){
+      S.navHidden=p.nav_hidden.slice();try{localStorage.setItem('ta_nav_hidden',JSON.stringify(S.navHidden))}catch(e){}
+    }
+    if(lsGet('ta_ticker_off')==null&&p.ticker_off!=null){
+      try{localStorage.setItem('ta_ticker_off',p.ticker_off?'1':'0')}catch(e){}
+      if(typeof tkrBuild==='function')try{tkrBuild()}catch(e){}
+    }
+    if(lsGet('ta_incog')==null&&p.incog!=null){
+      INCOG.on=!!p.incog;try{localStorage.setItem('ta_incog',INCOG.on?'1':'0')}catch(e){}
+      const e=$('#eye');if(e){e.classList.toggle('on',INCOG.on);const lt=e.querySelector('.mi-t');if(lt)lt.textContent=INCOG.on?'Показать суммы':'Скрыть суммы'}
+    }
+  }finally{_uiHydrating=false}
+}
+
 async function api(path,opt){
   let r;
   try{r=await fetch(path,opt)}
-  catch(e){throw new Error('Программа не отвечает: похоже, её локальный сервер остановлен. Закройте окно программы и откройте её снова.')}
+  catch(e){
+    if(typeof connSet==='function')connSet('err','Сервер не отвечает');
+    throw new Error('Программа не отвечает: похоже, её локальный сервер остановлен. Закройте окно программы и откройте её снова.');
+  }
   let j={};
   try{j=await r.json()}catch(e){}
+  if(r.status===423){
+    if(typeof lockShow==='function')lockShow(j);
+    throw new Error(j.error||'Доступ заблокирован');
+  }
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  if(!S.loading&&typeof connSet==='function')connSet('ok');
   if(j&&j.stale&&/^\/api\/(bonds|history)\?/.test(path))staleRefresh(path,j);
   return j;
 }
@@ -32388,6 +33220,15 @@ const rtop=(x,y,w,h,r)=>{r=Math.min(r,w/2,h);if(h<=0)return'';return`M${x},${y+h
 const rbot=(x,y,w,h,r)=>{r=Math.min(r,w/2,h);if(h<=0)return'';return`M${x},${y}H${x+w}V${y+h-r}Q${x+w},${y+h} ${x+w-r},${y+h}H${x+r}Q${x},${y+h} ${x},${y+h-r}Z`};
 const legend=ser=>ser.length>1?`<div class="legend">${ser.map(s=>`<span><i style="background:${s.c}"></i>${esc(s.n)}</span>`).join('')}</div>`:'';
 function emptyChart(el,h,t){el.innerHTML=`<div class="empty" style="min-height:${h}px;padding:20px">${svgI('<path d="M3 3v18h18M7 15l4-4 3 3 5-6"/>')}<div>${t||'Нет данных за период'}</div></div>`}
+function chartSkeletonHtml(h=240,t){
+  const bars=[38,62,48,76,56,88,64,72,50,82].map(p=>`<i style="height:${p}%"></i>`).join('');
+  return`<div class="chart-sk" style="min-height:${h}px" aria-busy="true"><div class="chart-sk-bars">${bars}</div>${t?`<div class="chart-sk-tx">${esc(t)}</div>`:''}</div>`;
+}
+function chartSkeleton(el,h=240,t){
+  const target=typeof el==='string'?document.getElementById(el):el;
+  if(!target)return;
+  target.innerHTML=chartSkeletonHtml(h,t);
+}
 
 /* мини-график цены: цвет по знаку изменения (порог 0,15 %) */
 function spark(v,w=64,h=18){
@@ -32467,9 +33308,15 @@ function bars(el,o){
     hits+=`<rect data-i="${i}" x="${gx}" y="${pt}" width="${gw}" height="${ph}" fill="transparent"/>`;
   }
   bt.forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
-  el.innerHTML=(o.legend===false?'':legend(ser))+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g>${marks}</g>${hits}</svg>`;
-  const mk=el.querySelectorAll('.bg');
-  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
+  el.innerHTML=(o.legend===false?'':legend(ser))+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g class="hv"></g><g>${marks}</g>${hits}</svg>`;
+  const mk=el.querySelectorAll('.bg'),hv=el.querySelector('.hv');
+  el._hl=i=>{
+    mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
+    if(!hv)return;
+    if(i<0){hv.innerHTML='';return}
+    const cx=pl+gw*i+gw/2;
+    hv.innerHTML=`<rect x="${pl+gw*i}" y="${pt}" width="${gw}" height="${ph}" rx="4" fill="var(--ac)" fill-opacity=".06"/><line x1="${cx}" x2="${cx}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`;
+  };
   bindTip(el,i=>{let h=`<b>${esc(o.tipLabels?o.tipLabels[i]:o.labels[i])}</b>`;ser.forEach(se=>{const v=se.v[i]||0;if(v||!o.skipZero)h+=tipRow(o.colorOf?o.colorOf(v,i):se.c,se.n,ft(v))});
     if(o.total){const t=ser.reduce((a,se)=>a+(se.v[i]||0),0);h+=`<div class="tot">Итого<span>${ft(t)}</span></div>`}return h});
 }
@@ -32508,7 +33355,7 @@ function line(el,o){
   el.innerHTML=legend(ser)+`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${s}${ends}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
   el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`+
-    ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>`<circle cx="${X(i)}" cy="${Y(se.v[i])}" r="4.5" fill="${se.c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
+    ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>`<circle cx="${X(i)}" cy="${Y(se.v[i])}" r="8" fill="${se.c}" fill-opacity=".18"/><circle cx="${X(i)}" cy="${Y(se.v[i])}" r="4.5" fill="${se.c}" stroke="var(--card)" stroke-width="2"/>`).join('')};
   bindTip(el,i=>{o.hover&&o.hover(i);if(o.tip)return o.tip(i);return`<b>${esc(tl[i])}</b>`+ser.filter(se=>se.v[i]!=null&&!isNaN(se.v[i])).map(se=>tipRow(se.c,se.n,ft(se.v[i]))).join('')});
   if(o.leave){const ol=el.onmouseleave;el.onmouseleave=e=>{ol(e);o.leave()}}
 }
@@ -32580,9 +33427,15 @@ function stackedMonths(el,o){
   bt.forEach(([i,x])=>s+=`<text class="ax" x="${x}" y="${H-6}" text-anchor="middle">${esc(o.labels[i])}</text>`);
   let vt='';
   if(o.vl)barLabelsPick(vls,13).forEach(l=>{const x=Math.max(pl+l.w/2,Math.min(W-pr-l.w/2,l.x));vt+=`<text class="ax num vl${l.c}" x="${x}" y="${l.y}" text-anchor="middle"${l.c?' style="fill:var(--s7)"':''}>${esc(l.tx)}</text>`});
-  el.innerHTML=`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g>${marks}</g>${vt}${hits}</svg>`;
-  const mk=el.querySelectorAll('.bg');
-  el._hl=i=>mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
+  el.innerHTML=`<svg width="${W}" height="${H}"${an?' class="anim"':''}>${G.defs()}${s}<g class="hv"></g><g>${marks}</g>${vt}${hits}</svg>`;
+  const mk=el.querySelectorAll('.bg'),hv=el.querySelector('.hv');
+  el._hl=i=>{
+    mk.forEach(p=>p.style.opacity=i<0||+p.dataset.g===i?'':.45);
+    if(!hv)return;
+    if(i<0){hv.innerHTML='';return}
+    const cx=pl+gw*i+gw/2;
+    hv.innerHTML=`<rect x="${pl+gw*i}" y="${pt}" width="${gw}" height="${ph}" rx="4" fill="var(--ac)" fill-opacity=".06"/><line x1="${cx}" x2="${cx}" y1="${pt}" y2="${pt+ph}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`;
+  };
   bindTip(el,i=>{const m=o.months[i];let h=`<b>${esc(o.tipLabels?o.tipLabels[i]:o.labels[i])}</b>`;
     m.segs.filter(x=>x.v>0).forEach(x=>{h+=tipRow(o.colors[x.k]||'var(--s1)',(o.names[x.k]||x.k)+(x.est?' (прогноз)':''),ft(x.v))});
     if(m.call>0)h+=tipRow('var(--s4)','возможный CALL',ft(m.call));
@@ -32621,11 +33474,48 @@ function candles(id,data,o){
   let hits='';for(let i=0;i<n;i++)hits+=`<rect data-i="${i}" x="${pl+gw*i}" y="${pt}" width="${gw}" height="${H-pt-pb}" fill="transparent"/>`;
   el.innerHTML=`<svg width="${W}" height="${H}">${s}${vol}${marks}<g class="hv"></g>${hits}</svg>`;
   const hv=el.querySelector('.hv');
-  el._hl=i=>{if(i<0){hv.innerHTML='';return}hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph+vh+8}" stroke="var(--line2)" stroke-dasharray="3 3"/>`};
+  el._hl=i=>{if(i<0){hv.innerHTML='';return}const c=data[i],col=c.c>=c.o?'var(--pos)':'var(--neg)';
+    hv.innerHTML=`<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt+ph+vh+8}" stroke="var(--line2)" stroke-dasharray="3 3"/><circle cx="${X(i)}" cy="${Y(c.c)}" r="7" fill="${col}" fill-opacity=".18"/><circle cx="${X(i)}" cy="${Y(c.c)}" r="3.5" fill="${col}" stroke="var(--card)" stroke-width="1.5"/>`};
   bindTip(el,i=>{o.hover&&o.hover(i);if(o.ft)return o.ft(i);const c=data[i],up=c.c>=c.o;
     let h=`<b>${esc(lab(c.t))}</b>`+tipRow(up?'var(--pos)':'var(--neg)','Закрытие',fmt(c.c))+tipRow('var(--mu)','Открытие',fmt(c.o))+tipRow('var(--mu)','Максимум',fmt(c.h))+tipRow('var(--mu)','Минимум',fmt(c.l));
     if(c.v)h+=tipRow('var(--mu)','Объём',short(c.v));
     (o.lines||[]).forEach(L=>{if(L.v[i]!=null)h+=tipRow(L.c,L.n,fmt(L.v[i]))});return h});
+}
+
+/* ── унифицированный crosshair + подсветка точки для кривой эмитента (bcIssuerCurve) ── */
+function chartEnhanceIssuerCurve(el,ic){
+  if(!el||!ic||!ic.points||!ic.points.length)return;
+  const svg=el.querySelector('svg');if(!svg)return;
+  const W=+svg.getAttribute('width')||el.clientWidth||560,H=+svg.getAttribute('height')||250;
+  const pl=44,pr=14,pt=12,pb=30;
+  const ns='http://www.w3.org/2000/svg';
+  let hv=svg.querySelector('.hv');
+  if(!hv){hv=document.createElementNS(ns,'g');hv.setAttribute('class','hv');svg.insertBefore(hv,svg.firstChild)}
+  const pts=ic.points.slice().sort((a,b)=>a.me-b.me);
+  const circles=[...svg.querySelectorAll('.ic-pt')];
+  circles.forEach((c,idx)=>{
+    c.setAttribute('data-i',String(idx));
+    const t=c.querySelector('title');if(t)t.remove();
+  });
+  const fmtN=(n,d=2)=>n==null||isNaN(n)?'—':Number(n).toFixed(d).replace('.',',');
+  el._hl=i=>{
+    if(i<0||!circles[i]){hv.innerHTML='';return}
+    const cx=+circles[i].getAttribute('cx'),cy=+circles[i].getAttribute('cy');
+    const p=pts[i],col=p&&p.me?'var(--ac)':(p&&p.floating?'var(--s7)':'var(--s1)');
+    hv.innerHTML=`<line x1="${cx}" x2="${cx}" y1="${pt}" y2="${H-pb}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`+
+      `<line x1="${pl}" x2="${W-pr}" y1="${cy}" y2="${cy}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3 3"/>`+
+      `<circle cx="${cx}" cy="${cy}" r="11" fill="${col}" fill-opacity=".18"/><circle cx="${cx}" cy="${cy}" r="6.5" fill="none" stroke="${col}" stroke-width="1.5"/>`;
+  };
+  bindTip(el,i=>{
+    const p=pts[i];if(!p)return'';
+    let h=`<b>${esc(p.name||p.isin||'')}</b>`;
+    h+=tipRow(p.me?'var(--ac)':'var(--s1)','Доходность',fmtN(p.yield,2)+' %');
+    h+=tipRow('var(--mu)','Дюрация',fmtN(p.dur,2)+' г.');
+    if(p.spread!=null)h+=tipRow('var(--s3)','Спред к КБД',(p.spread>0?'+':'')+fmtN(p.spread,2)+' п.п.');
+    if(p.rating)h+=tipRow('var(--s4)','Рейтинг',esc(p.rating));
+    if(p.floating)h+=tipRow('var(--s7)','Тип купона','флоатер');
+    return h;
+  });
 }
 /* ── logos ── */
 const LOGO_BAD=new Set();
@@ -32652,8 +33542,11 @@ function renderNav(){
   }
   h+='<div class="sep"></div>'+NAV_FIXED.map(k=>pg(k)).filter(Boolean).map(navBtn).join('');
   $('#nav').innerHTML=h;
-  $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
-  $('#period').style.display=PERIOD_PAGES.includes(S.page)?'':'none';
+  const pe=$('#period');
+  if(pe){
+    pe.innerHTML=PERIODS.map(([k,t])=>`<button type="button" class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
+    pe.style.display=PERIOD_PAGES.includes(S.page)&&S.data?'':'none';
+  }
   const a=S.accounts.find(x=>x.id===S.account);
   const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
   if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}
@@ -32671,15 +33564,20 @@ function renderAccounts(){
 }
 $('#nav').onclick=e=>{const g=e.target.closest('[data-g]');if(g){const n=g.dataset.g;S.navShut[n]=!S.navShut[n];lsSet('ta_nav_shut',JSON.stringify(S.navShut));renderNav();return}const b=e.target.closest('[data-p]');if(!b)return;go(b.dataset.p)};
 $('#nav-fix').onclick=e=>{const b=e.target.closest('[data-p]');if(b)go(b.dataset.p)};
-$('#period').onclick=e=>{const b=e.target.closest('[data-k]');if(!b||b.dataset.k===S.period)return;S.period=b.dataset.k;persist();renderNav();load(false,true)};
+document.addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('#period [data-k]');if(!b||b.dataset.k===S.period)return;S.period=b.dataset.k;persist();renderNav();load(false,true)});
 $('#acl').onclick=e=>{const b=e.target.closest('[data-a]');if(!b||b.dataset.a===S.account)return;S.account=b.dataset.a;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
 $('#hideEmpty').onchange=e=>{S.hideEmpty=e.target.checked;persist();renderAccounts()};
 $('#refresh').onclick=()=>load(true);
+function periodBarHtml(){
+  if(!PERIOD_PAGES.includes(S.page)||!S.data)return'';
+  return`<div class="per-bar noprint"><span class="per-lbl">Период:</span><div class="seg" id="period" role="group" aria-label="Период">${PERIODS.map(([k,t])=>`<button type="button" class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('')}</div></div>`;
+}
 function go(p){if(typeof skClose==='function')skClose();const prev=S.page;if(typeof dlScrSave==='function')dlScrSave(prev);S.page=p;S.opsN=200;persist();renderNav();render();if(prev!==p&&typeof dlScrRestore==='function')dlScrRestore(p)}
 
 let reqId=0;
 async function load(force,periodOnly){
   const my=++reqId;S.loading=true;S.err=null;
+  if(typeof connSet==='function')connSet('busy');
   $('#refresh').classList.add('spin');$('#refresh').disabled=true;
   if(!S.data&&!['set','imp','kb'].includes(S.page))skeleton();
   try{
@@ -32689,9 +33587,10 @@ async function load(force,periodOnly){
     S.data=d;S.accounts=d.accounts;if(S.account!==d.account){S.account=d.account}persist();
     $('#upd').textContent='обновлено в '+d.updated;
     {const rf=$('#refresh');if(rf)rf.title='Обновить данные · обновлено в '+d.updated}
+    if(typeof connSet==='function')connSet('ok');
     renderAccounts();renderNav();
     if(!periodOnly||force||!S.bonds||!S.hist)loadExtra(force);
-  }catch(e){if(my!==reqId)return;S.err=e.message}
+  }catch(e){if(my!==reqId)return;S.err=e.message;if(typeof connSet==='function'){const net=/^Программа не отвечает/.test(e.message||'');connSet(net?'err':'ok',e.message)}}
   finally{if(my===reqId){S.loading=false;$('#refresh').classList.remove('spin');$('#refresh').disabled=false}}
   if(my===reqId&&!['set','imp','kb'].includes(S.page))render();
 }
@@ -32748,6 +33647,7 @@ function renderNow(){
   const fn=views[S.page]||(PAGE_EXT[S.page]&&PAGE_EXT[S.page].render)||(()=>{S.page='dash';persist();renderNav();return pDash()});
   const topUx=(typeof uxGuestBar==='function'&&!S.data?uxGuestBar():'')
     +(typeof uxSubTabs==='function'?uxSubTabs():'')
+    +periodBarHtml()
     +(typeof uxWhyBanner==='function'?uxWhyBanner(S.page):'');
   v.innerHTML=`<div class="wrap fade">${topUx}${S.err&&S.data?`<div class="msg err">${esc(S.err)}</div>`:''}${['dash','pay'].includes(S.page)&&S.data?remindHtml():''}${S.page==='dash'&&S.data?proBanner():''}${fn()}</div>`;
   v.scrollTop=sc;
@@ -32834,6 +33734,33 @@ function uiAlert(o){return uiDlgOpen(uiDlgNorm(o,{confirm:false,title:'Сооб�
 /* ошибка запроса одним вызовом: uiErr(e) или uiErr(e,'Не удалось удалить') */
 function uiErr(e,title){return uiAlert({title:title||'Ошибка',body:(e&&e.message)||String(e||''),kind:'err'})}
 /* ── Обзор ── */
+function heroSparkSvg(hs){
+  const raw=hs&&(Array.isArray(hs.value)&&hs.value.length>=2?hs.value:(Array.isArray(hs.values)&&hs.values.length>=2?hs.values:(Array.isArray(hs.twr)&&hs.twr.length>=2?hs.twr:null)));
+  if(!raw)return'';
+  const v=raw.filter(x=>x!=null&&!isNaN(x)&&isFinite(x));
+  if(v.length<2)return'';
+  const W=420,H=140,mn=Math.min(...v),mx=Math.max(...v),sp=mx-mn||Math.abs(mx)*0.02||1;
+  const pts=v.map((y,i)=>[+(i/(v.length-1)*W).toFixed(1),+(H-12-(y-mn)/sp*(H-28)).toFixed(1)]);
+  const linePts=pts.map(p=>p[0]+','+p[1]).join(' ');
+  const areaPts=`0,${H} ${linePts} ${W},${H}`;
+  const up=v[v.length-1]>=v[0],col=up?'var(--pos)':'var(--neg)';
+  const gid='hsp'+Math.random().toString(36).slice(2,7);
+  return`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:${col};stop-opacity:.28"/><stop offset="1" style="stop-color:${col};stop-opacity:0"/></linearGradient></defs><polygon points="${areaPts}" fill="url(#${gid})"/><polyline points="${linePts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity=".7"/></svg>`;
+}
+function dashDeltaBadge(hs){
+  if(!hs||!Array.isArray(hs.value)||hs.value.length<2)return'';
+  const n=hs.value.length,v0=hs.value[0],v1=hs.value[n-1];
+  const i0=Array.isArray(hs.invested)?(hs.invested[0]||0):0,i1=Array.isArray(hs.invested)?(hs.invested[n-1]||0):0;
+  const dp=(v1-i1)-(v0-i0),dpct=hs.total!=null?hs.total*100:(v0>0?(v1-v0)/v0*100:null);
+  if(bad(dp))return'';
+  return`<span class="dash-delta pill ${cls(dp)}">${SM(dp,'rub')}${dpct!=null?` (${pct(dpct,1)})`:''}</span>`;
+}
+document.addEventListener('click',e=>{
+  const b=e.target.closest&&e.target.closest('[data-dash-top]');
+  if(!b)return;
+  const v=b.dataset.dashTop==='1';
+  if(!!S.dashAllPos!==v){S.dashAllPos=v;render()}
+});
 function pDash(){
   const d=S.data,p=d.portfolio,t=T(),lf=d.life;
   if(!p.total&&!p.positions.length&&!d.ops.length&&!lf.deposits)return`<div class="card empty fade" style="min-height:420px">${svgI('<rect x="3" y="6" width="18" height="14" rx="3"/><path d="M3 10h18M16 15h2"/>')}
@@ -32842,7 +33769,8 @@ function pDash(){
   const income=sumK(t,['dividends','coupons','overnight']),taxes=sumK(t,TAXK);
   const profit=d.profit,ppct=d.invested>0&&profit!=null?profit/d.invested*100:null,hs=histSlice();
   const _q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
-  const hero=`<div class="card hero"><div style="position:relative;z-index:1"><div class="lbl">Стоимость портфеля</div>
+  const hSpark=heroSparkSvg(hs);
+  const hero=`<div class="card hero">${hSpark?`<div class="hero-spark" aria-hidden="true">${hSpark}</div>`:''}<div style="position:relative;z-index:1"><div class="lbl">Стоимость портфеля</div>
     <div class="val num" data-tick="dash-total">${f2m(p.total)} <small>₽</small></div>
     <div class="row" style="margin-top:10px;flex-wrap:wrap">${p.daily!=null?`<span class="pill ${cls(p.daily)}">${SM(p.daily)} · ${pct(p.daily_pct)} за день</span>`:''}
     <span class="pill ${cls(p.upnl)}">${SM(p.upnl)} · ${pct(p.yield_pct)} по открытым позициям</span>
@@ -32861,24 +33789,27 @@ function pDash(){
     ${kpi('Оборот',M(turn,'rub',0),`покупки ${short(t.buy_turnover||0)} · продажи ${short(t.sell_turnover||0)}`,null,S7)}</div>`;
   const alloc=[['Акции',p.shares,S1],['Облигации',p.bonds,S3],['Фонды',p.etf,S4],['Валюта и деньги',p.currencies,S7],['Фьючерсы',p.futures,S5],['Структурные',p.sp,S2],['Опционы',p.options,S6],['Прочее',p.other,S8]].map(([n,v,c])=>({n,v,c}));
   chart('c-alloc',donut,{items:alloc,cap:'Портфель'});
-  let eq=waitBox('Восстанавливаю историю стоимости по ценам закрытия…');
+  const sk=(h,tx)=>typeof chartSkeletonHtml==='function'?chartSkeletonHtml(h,tx):waitBox(tx);
+  let eq=sk(290,'Восстанавливаю историю стоимости по ценам закрытия…');
   if(S.hist&&S.hist.error)eq=`<div class="msg err">${esc(S.hist.error)}</div>`;
   else if(S.hist&&!hs)eq='<div class="empty">Недостаточно истории за период</div>';
   else if(hs){eq='<div id="c-eq" class="chart"></div>';
     chart('c-eq',line,{h:290,area:true,zero:false,labels:hs.days.map(x=>{const[y,m]=x.split('-');return MON[+m-1]+' '+y.slice(2)}),tipLabels:hs.days.map(dlabel),
       series:[{n:'Стоимость портфеля',c:S1,v:hs.value},{n:'Вложено',c:'#8b93a7',v:hs.invested,dash:1,w:1.6}]})}
-  let mret=waitBox();
+  let mret=sk(240);
   if(S.hist&&S.hist.monthly){const ms=Object.keys(S.hist.monthly).sort().slice(-12);mret='<div id="c-mret" class="chart"></div>';
     chart('c-mret',bars,{labels:ms.map(mlabel),tipLabels:ms.map(m=>{const[y,mm]=m.split('-');return MONF[+mm-1]+' '+y}),labelsOn:ms.length<=12,
       series:[{n:'Доходность',c:S1,v:ms.map(m=>S.hist.monthly[m]*100)}],colorOf:v=>v>=0?'var(--pos)':'var(--neg)',fa:v=>(Math.round(v*10)/10).toString().replace('.',',')+'%',ft:v=>pct(v)})}
   else if(S.hist&&S.hist.error)mret='<div class="empty">Не удалось посчитать доходность по месяцам. Нажмите «Обновить» сверху, чтобы повторить.</div>';
-  let pays=waitBox('Собираю график купонов и дивидендов…');
+  let pays=sk(190,'Собираю график купонов и дивидендов…');
   if(S.bonds&&S.bonds.payments){const pm=payMonths(S.bonds.payments,6);const tot=S.bonds.payments.reduce((a,x)=>a+x.amount,0);
     pays=`<div class="row" style="justify-content:space-between;margin:-4px 0 10px"><span class="t2" style="font-size:12.5px">За 12 месяцев ожидается</span><b class="num pos">${M(tot)}</b></div><div id="c-pay6" class="chart"></div>`;
     chart('c-pay6',bars,{h:190,labels:pm.labels,tipLabels:pm.tips,stack:true,total:true,skipZero:true,series:pm.series,empty:'Выплат не ожидается'})}
-  const top=p.positions.filter(x=>x.type!=='currency'&&x.type!=='futures').slice(0,8);
+  const allPos=p.positions.filter(x=>x.type!=='currency'&&x.type!=='futures');
+  const top=S.dashAllPos?allPos:allPos.slice(0,8);
   const mx=Math.max(1,...top.map(x=>x.value_rub||0));
   const topAttr=x=>x.type==='bond'&&x.isin?` data-isin="${esc(x.isin)}" style="cursor:pointer"`:(x.type==='share'||x.type==='etf')&&x.ticker?` data-stk="${esc(x.ticker)}" style="cursor:pointer"`:'';
+  const topSeg=allPos.length?`<div class="seg dash-top-seg" role="group" aria-label="Количество позиций"><button type="button" class="${!S.dashAllPos?'on':''}" data-dash-top="0">Топ-8</button><button type="button" class="${S.dashAllPos?'on':''}" data-dash-top="1">Все${allPos.length>8?' ('+allPos.length+')':''}</button></div>`:'';
   const topHtml=top.length?`<div class="li">${top.map(x=>`<div class="it"${topAttr(x)}>${logo(x,34)}<div><b>${esc(x.name)}</b><small>${esc(x.ticker)} · ${pctp(x.share)} портфеля</small><div class="bar"><i style="width:${(x.value_rub||0)/mx*100}%;background:${S1}"></i></div></div>
     <div class="rv num">${M(x.value_rub??x.value,'rub',0)}<small class="${cls(x.pnl)}">${x.pnl_rub!=null?SM(x.pnl_rub):''} ${x.pnl_pct!=null?'('+pct(x.pnl_pct,1)+')':''}</small></div></div>`).join('')}</div>`:'<div class="empty">Нет открытых позиций</div>';
   const inc=d.income_by.filter(x=>x[0]>0).slice(0,8),imx=Math.max(1,...inc.map(x=>x[0]));
@@ -32889,11 +33820,12 @@ function pDash(){
       .map(([n,k])=>`<div><div class="mu" style="font-size:12px">${n}</div><div class="num" style="font-weight:650;font-size:16px;margin-top:4px">${M(d.margin[k])}</div></div>`).join('')}
     <div><div class="mu" style="font-size:12px">Уровень достаточности</div><div class="num ${d.margin.fundsSufficiencyLevel<1.1&&d.margin.fundsSufficiencyLevel>0?'neg':''}" style="font-weight:650;font-size:16px;margin-top:4px">${f2(d.margin.fundsSufficiencyLevel)}</div></div></div></div>`:'';
   const uxBlocks=typeof uxDashBlocks==='function'?uxDashBlocks():'';
-  return hero+todayCard()+uxBlocks+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения<span class="sp">${periodName()}</span></h2>${eq}</div>
+  const eqDelta=dashDeltaBadge(hs);
+  return hero+todayCard()+uxBlocks+kpis+monCard()+`<div class="g c-2-1"><div class="card"><h2>Стоимость и вложения${eqDelta}<span class="sp">${periodName()}</span></h2>${eq}</div>
     <div class="card"><h2>Структура портфеля</h2><div id="c-alloc" class="chart"></div></div></div>
     <div class="g g2"><div class="card"><h2>Доходность по месяцам<span class="sp">последние 12 мес</span></h2>${mret}</div>
     <div class="card"><h2>Ближайшие выплаты<span class="sp">купоны · дивиденды · погашения</span></h2>${pays}</div></div>
-    <div class="g g2"><div class="card"><h2>Крупнейшие позиции<span class="sp">стоимость · P&amp;L</span></h2>${topHtml}</div>
+    <div class="g g2"><div class="card"><h2>Крупнейшие позиции${topSeg}<span class="sp">стоимость · P&amp;L</span></h2>${topHtml}</div>
     <div class="card"><h2>Кто платит дивиденды и купоны<span class="sp">${periodName()}</span></h2>${incHtml}</div></div>`+(typeof radarCard==='function'?radarCard(S.bonds&&S.bonds.radar,true):'')+concCard(d.concentration)+marg;
 }
 
@@ -32986,11 +33918,74 @@ function pRet(){
 }
 
 /* ── Позиции ── */
+function taCsvDownload(filename, headers, rows){
+  const escCell=v=>{const s=v==null?'':String(v);return/[;"\r\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
+  const lines=[headers.map(escCell).join(';')].concat(rows.map(r=>r.map(escCell).join(';')));
+  const blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8;'});
+  const url=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function taCsvBtn(id,title){
+  return`<button type="button" class="btn ghost tbl-csv noprint" id="${id}" title="${esc(title||'Скачать таблицу в CSV')}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',1.8)}Экспорт CSV</button>`;
+}
+
+S.posGroup=lsGet('ta_pos_group')||'flat';
+S.posHideSmall=lsGet('ta_pos_hsmall')==='1';
+
+function posIssuer(x){
+  if(x.type==='currency')return'Валюта и деньги';
+  const bRows=(S.bonds&&S.bonds.rows)||[];
+  const bHit=(x.isin||x.ticker)?bRows.find(b=>(x.isin&&b.isin===x.isin)||(x.ticker&&b.ticker===x.ticker)):null;
+  if(bHit&&(bHit.emitter||bHit.issuer))return bHit.emitter||bHit.issuer;
+  const nm=String(x.name||x.ticker||'Прочее').trim();
+  if(/^ОФЗ\b/i.test(nm)||/^SU[0-9A-Z]+$/i.test(String(x.isin||'')))return'Минфин России (ОФЗ)';
+  let base=nm.replace(/\s+(БО|КО|ПБО|00\d+[РP]|Р\d+|В?\d+Р[- ]\d+).*$/i,'')
+    .replace(/\s+\d{2,}$/,'')
+    .replace(/-(ао|ап|п|ao|ap)$/i,'')
+    .trim();
+  return base||nm||'Прочее';
+}
+function posFiltered(){
+  const all=(S.data&&S.data.portfolio&&S.data.portfolio.positions)||[];
+  let ps=all.filter(x=>!S.posType||x.type===S.posType);
+  if(S.posHideSmall)ps=ps.filter(x=>!(x.share!=null&&x.share<1)&&!x.blocked);
+  const{k,d}=S.sort;
+  return ps.slice().sort((a,b)=>{const x=a[k],y=b[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
+}
+function posRowHtml(x,mxs){
+  return`<tr${x.type==='bond'&&(x.isin||x.ticker)?` data-isin="${esc(x.isin||x.ticker)}" title="Открыть карточку выпуска"`:(x.type==='share'||x.type==='etf')&&x.ticker?` data-stk="${esc(x.ticker)}" style="cursor:pointer" title="Открыть карточку ${x.type==='etf'?'фонда':'акции'}"`:''}><td>${ident(x)}</td>
+    <td class="l"><span class="tag">${TYPES[x.type]||esc(x.type||'Прочее')}</span>${x.blocked?' <span class="tag" style="color:var(--neg)">блок</span>':''}</td>
+    <td class="num">${NFQ.format(x.qty)}</td><td class="num">${x.avg&&x.type!=='currency'?M(x.avg,x.cur):'—'}</td><td class="num">${M(x.price,x.cur)}</td>
+    <td class="num">${x.value_rub!=null?M(x.value_rub):M(x.value,x.cur)}</td>
+    <td class="num"><div class="share"><i style="width:${Math.max(1,(x.share||0)/mxs*60)}px"></i>${pctp(x.share)}</div></td>
+    <td class="num ${cls(x.pnl)}">${x.type==='currency'?'<span class="mu">—</span>':x.pnl_rub!=null?SM(x.pnl_rub):SM(x.pnl,x.cur)}</td><td class="num ${cls(x.pnl)}">${x.type==='currency'?'':pct(x.pnl_pct)}</td></tr>`;
+}
+function posGroupedRows(ps,mxs,mode){
+  if(mode==='flat')return ps.map(x=>posRowHtml(x,mxs)).join('');
+  const map=new Map();
+  ps.forEach(x=>{
+    const key=mode==='class'?(TYPES[x.type]||esc(x.type||'Прочее')):posIssuer(x);
+    if(!map.has(key))map.set(key,[]);
+    map.get(key).push(x);
+  });
+  const groups=[...map.entries()].sort((a,b)=>{
+    const va=a[1].reduce((s,x)=>s+(x.value_rub||0),0),vb=b[1].reduce((s,x)=>s+(x.value_rub||0),0);
+    return vb-va;
+  });
+  return groups.map(([gName,items])=>{
+    const val=items.reduce((s,x)=>s+(x.value_rub||0),0);
+    const sh=items.reduce((s,x)=>s+(x.share||0),0);
+    const pnl=items.reduce((s,x)=>s+(x.type==='currency'?0:(x.pnl_rub||0)),0);
+    const hdr=`<tr class="pos-gh"><td class="l" colspan="5"><b>${esc(gName)}</b><span class="pos-gh-cnt">${items.length}</span></td><td class="num"><b>${M(val,'rub',0)}</b></td><td class="num"><b>${pctp(sh)}</b></td><td class="num ${cls(pnl)}"><b>${SM(pnl)}</b></td><td></td></tr>`;
+    return hdr+items.map(x=>posRowHtml(x,mxs)).join('');
+  }).join('');
+}
+
 function pPos(){
   const all=S.data.portfolio.positions,typesHere=[...new Set(all.map(x=>x.type))].filter(Boolean);
-  let ps=all.filter(x=>!S.posType||x.type===S.posType);
+  const ps=posFiltered();
   const{k,d}=S.sort;
-  ps=ps.slice().sort((a,b)=>{const x=a[k],y=b[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
   const nonCur=all.filter(x=>x.type!=='currency');
   const totPnl=nonCur.reduce((a,x)=>a+(x.pnl_rub||0),0),tot=all.reduce((a,x)=>a+(x.value_rub||0),0)||1;
   const top5=nonCur.slice().sort((a,b)=>(b.value_rub||0)-(a.value_rub||0)).slice(0,5).reduce((a,x)=>a+(x.value_rub||0),0)/tot*100;
@@ -33001,30 +33996,48 @@ function pPos(){
   const cols=[['name','Инструмент','l'],['type','Тип','l'],['qty','Кол-во'],['avg','Средняя'],['price','Текущая'],['value_rub','Стоимость, ₽'],['share','Доля'],['pnl_rub','P&L, ₽'],['pnl_pct','P&L %']];
   const th=cols.map(([kk,t,c])=>`<th class="s ${c||''}" data-s="${kk}">${t} <span>${k===kk?(d>0?'↑':'↓'):''}</span></th>`).join('');
   const mxs=Math.max(1,...ps.map(x=>x.share||0));
-  const rows=ps.map(x=>`<tr${x.type==='bond'&&(x.isin||x.ticker)?` data-isin="${esc(x.isin||x.ticker)}" title="Открыть карточку выпуска"`:(x.type==='share'||x.type==='etf')&&x.ticker?` data-stk="${esc(x.ticker)}" style="cursor:pointer" title="Открыть карточку ${x.type==='etf'?'фонда':'акции'}"`:''}><td>${ident(x)}</td>
-    <td class="l"><span class="tag">${TYPES[x.type]||esc(x.type)}</span>${x.blocked?' <span class="tag" style="color:var(--neg)">блок</span>':''}</td>
-    <td class="num">${NFQ.format(x.qty)}</td><td class="num">${x.avg&&x.type!=='currency'?M(x.avg,x.cur):'—'}</td><td class="num">${M(x.price,x.cur)}</td>
-    <td class="num">${x.value_rub!=null?M(x.value_rub):M(x.value,x.cur)}</td>
-    <td class="num"><div class="share"><i style="width:${Math.max(1,(x.share||0)/mxs*60)}px"></i>${pctp(x.share)}</div></td>
-    <td class="num ${cls(x.pnl)}">${x.type==='currency'?'<span class="mu">—</span>':x.pnl_rub!=null?SM(x.pnl_rub):SM(x.pnl,x.cur)}</td><td class="num ${cls(x.pnl)}">${x.type==='currency'?'':pct(x.pnl_pct)}</td></tr>`).join('');
+  const grp=['flat','class','issuer'].includes(S.posGroup)?S.posGroup:'flat';
+  const rows=posGroupedRows(ps,mxs,grp);
+  const grpSeg=`<div class="seg" id="pos-grp" title="Группировка таблицы">${[['flat','Плоский список'],['class','По классам'],['issuer','По эмитентам']].map(([v,t])=>`<button type="button" data-pg="${v}" class="${grp===v?'on':''}">${t}</button>`).join('')}</div>`;
+  const tableCard=`<div class="card pos-main" style="padding:14px 12px 8px">
+    <div class="tbl-head"><h2 style="margin:0">Позиции портфеля<span class="sp">${ps.length} из ${all.length}</span></h2>
+      <div class="row" style="margin-left:auto;gap:8px"><button type="button" class="btn ghost" id="pos-man">+ Добавить вручную</button>${taCsvBtn('pos-csv','Выгрузить текущие позиции в CSV')}</div></div>
+    <div class="pos-ctl"><div class="seg" id="ptype"><button class="${!S.posType?'on':''}" data-t="">Все · ${all.length}</button>${typesHere.map(t=>`<button class="${S.posType===t?'on':''}" data-t="${t}">${TYPES[t]||t} · ${all.filter(x=>x.type===t).length}</button>`).join('')}</div>
+      ${grpSeg}
+      <label class="sw" title="Скрыть позиции с долей меньше 1% и заблокированные бумаги"><input type="checkbox" id="pos-hsmall" ${S.posHideSmall?'checked':''}><i></i><div><b>Скрыть мелочь (&lt;1%) и заблокированные</b></div></label>
+      <input class="in" id="pq" type="search" placeholder="Поиск по названию, тикеру, ISIN…" value="${esc(S.posQ||'')}" aria-label="Поиск по позициям" style="flex:1;min-width:200px;max-width:320px;margin-left:auto"></div>
+    ${ps.length?`<div class="tbl"><table id="ptab"><thead><tr>${th}</tr></thead><tbody>${rows}</tbody></table></div>`:emptyHint('Открытых позиций под текущие фильтры нет. Сбросьте фильтры или добавьте бумаги.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']])}</div>`;
+  const sideCards=`<div class="pos-side"><div class="card"><h2>Секторы</h2><div id="c-sect" class="chart"></div></div>
+    <div class="card"><h2>Крупнейшие доли</h2>${hbars(nonCur.slice().sort((a,b)=>(b.value_rub||0)-(a.value_rub||0)).slice(0,10).map(x=>({n:x.name,v:x.share||0})),S1,x=>pctp(x.v),1)}</div></div>`;
   return`<div class="g g4">${kpi('Позиций',nonCur.length,'без учёта валюты и денег')}${kpi('Нереализованный P&L',SM(totPnl),'по открытым позициям',cls(totPnl))}
     ${kpi('В прибыли / в убытке',`<span class="pos">${nonCur.filter(x=>x.pnl>0).length}</span> <span class="mu">/</span> <span class="neg">${nonCur.filter(x=>x.pnl<0).length}</span>`,'позиций')}
     ${kpi('Топ-5 позиций',pctp(top5),'доля в портфеле — концентрация',top5>60?'neg':'')}</div>
-    <div class="g c-1-2"><div class="card"><h2>Секторы</h2><div id="c-sect" class="chart"></div></div>
-    <div class="card"><h2>Крупнейшие доли</h2>${hbars(nonCur.slice().sort((a,b)=>(b.value_rub||0)-(a.value_rub||0)).slice(0,10).map(x=>({n:x.name,v:x.share||0})),S1,x=>pctp(x.v),1)}</div></div>
-    <div class="card" style="padding:12px 10px 6px"><div class="row" style="padding:0 6px 10px"><div class="seg" id="ptype"><button class="${!S.posType?'on':''}" data-t="">Все · ${all.length}</button>${typesHere.map(t=>`<button class="${S.posType===t?'on':''}" data-t="${t}">${TYPES[t]||t} · ${all.filter(x=>x.type===t).length}</button>`).join('')}</div><input class="in" id="pq" type="search" placeholder="Поиск по названию, тикеру, ISIN…" value="${esc(S.posQ||'')}" aria-label="Поиск по позициям" style="flex:1;min-width:200px;max-width:340px;margin-left:auto"></div>
-    ${ps.length?`<div class="tbl" style="max-height:calc(100vh - 220px)"><table id="ptab"><thead><tr>${th}</tr></thead><tbody>${rows}</tbody></table></div>`:emptyHint('Открытых позиций нет в выбранном счёте. Выберите другой счёт слева или добавьте сделки отчётом брокера.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']])}</div>
+    <div class="pos-layout">${tableCard}${sideCards}</div>
     <p class="note">P&amp;L по счетам Т-Инвестиций — по данным брокера (FIFO), для облигаций без НКД. По импортированным счетам — расчёт по сделкам из отчёта и текущим ценам биржи.</p>`;
 }
-
-
 
 /* живой поиск по таблице позиций: скрываем строки, не меняя сортировку и остальной экран */
 function posFilterApply(){
   const t=document.getElementById('ptab');if(!t)return;
   const q=String(S.posQ||'').trim().toLowerCase();
-  t.querySelectorAll('tbody tr').forEach(tr=>{tr.style.display=!q||tr.textContent.toLowerCase().includes(q)||(tr.dataset.isin||'').toLowerCase().includes(q)||(tr.dataset.stk||'').toLowerCase().includes(q)?'':'none'});
+  t.querySelectorAll('tbody tr:not(.pos-gh)').forEach(tr=>{tr.style.display=!q||tr.textContent.toLowerCase().includes(q)||(tr.dataset.isin||'').toLowerCase().includes(q)||(tr.dataset.stk||'').toLowerCase().includes(q)?'':'none'});
 }
+
+document.addEventListener('click',e=>{
+  const t=e.target;if(!t.closest)return;
+  const pg=t.closest('#pos-grp [data-pg]');
+  if(pg){S.posGroup=pg.dataset.pg;lsSet('ta_pos_group',S.posGroup);render();return}
+  if(t.closest('#pos-man')){if(typeof manualOpen==='function')manualOpen();return}
+  if(t.closest('#pos-csv')){
+    const q=String(S.posQ||'').trim().toLowerCase();
+    const rows=posFiltered().filter(x=>!q||String(x.name||'').toLowerCase().includes(q)||String(x.ticker||'').toLowerCase().includes(q)||String(x.isin||'').toLowerCase().includes(q));
+    taCsvDownload('positions.csv',['Название','Тикер','ISIN','Класс','Эмитент','Кол-во','Средняя','Текущая','Валюта','Стоимость, ₽','Доля, %','P&L, ₽','P&L, %','Блок'],
+      rows.map(x=>[x.name||'',x.ticker||'',x.isin||'',TYPES[x.type]||x.type||'',posIssuer(x),x.qty??'',x.avg??'',x.price??'',(x.cur||'rub').toUpperCase(),x.value_rub??x.value??'',x.share!=null?x.share.toFixed(2):'',x.pnl_rub??x.pnl??'',x.pnl_pct!=null?x.pnl_pct.toFixed(2):'',x.blocked?'да':'нет']));
+  }
+});
+document.addEventListener('change',e=>{
+  if(e.target&&e.target.id==='pos-hsmall'){S.posHideSmall=e.target.checked;lsSet('ta_pos_hsmall',S.posHideSmall?'1':'0');render()}
+});
 /* ── кредитные рейтинги ── */
 const RSC=['AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-','BB+','BB','BB-','B+','B','B-','CCC','CC','C','D'];
 const rBucket=v=>{if(!v)return'нет рейтинга';const i=RSC.indexOf(v);return i<0?'нет рейтинга':i===0?'AAA':i<=3?'AA':i<=6?'A':i<=9?'BBB':'BB и ниже'};
@@ -33124,8 +34137,12 @@ function insightsCard(b){
 }
 
 /* ── Облигации ── */
-/* интенсивность показана лёгким «бейджем» вокруг значения, а не заливкой всей ячейки */
-function heatCell(v,mx,rgb,txt){if(bad(v))return'<td class="num mu">—</td>';const a=Math.max(0,Math.min(1,v/(mx||1)));return`<td class="num"><span class="hv" style="background:rgba(${rgb},${(0.05+a*0.15).toFixed(3)})">${txt}</span></td>`}
+/* интенсивность показана лёгким «бейджем» вокруг значения и тонкой 2px полосой прогресса под числом */
+function heatCell(v,mx,rgb,txt){
+  if(bad(v))return'<td class="num mu">—</td>';
+  const a=Math.max(0,Math.min(1,v/(mx||1)));
+  return`<td class="num"><div class="hb-cell"><span class="hv" style="background:rgba(${rgb},${(0.05+a*0.15).toFixed(3)})">${txt}</span><i class="hb-bar" aria-hidden="true"><b style="width:${(a*100).toFixed(1)}%;background:rgb(${rgb})"></b></i></div></td>`;
+}
 S.bpre=lsGet('ta_bpre')||'main';
 function bondsPreset(k){S.bpre=k;lsSet('ta_bpre',k);render()}
 /* Пометка к доходности по типу оферты: пут — к пут-оферте; колл — худшая из «к погашению» и «к колл» (YTW); тип не указан — к дате оферты */
@@ -33133,7 +34150,7 @@ function ytmSuffix(r){
   const k=r.ybasis,y=r.yk,P=v=>v!=null?pctp(v,2):'—',tag=(t,tip)=>` <small class="mu" title="${esc(tip)}">${t}</small>`;
   if(k==='put')return tag('к пут',`Доходность к пут-оферте ${r.put_date?ddm(r.put_date):''}: держатель сам решает, предъявить ли бумагу к выкупу по цене оферты`+(r.call_dates&&r.call_dates.length?`. Есть и колл ${r.call_dates.map(ddm).join(', ')}`+(y&&y.ytw!=null?`, доходность к худшему по колл/погашению ${P(y.ytw)}`:''):''));
   if(k==='call'){
-    const lines=['Колл — право эмитента: досрочное погашение может случиться, а может нет. Показана доходность к худшему (YTW) из погашения и колл-дат.'];
+    const lines=['Колл — право эмитента: досрочное погашение может случиться, а может нет. Показана доходность к худшему (YTW) из погашения и колл-датам.'];
     if(y){lines.push('К погашению: '+P(y.ytm));(y.ytc||[]).forEach(c=>lines.push('К колл '+ddm(c[0])+': '+P(c[1])))}
     else lines.push('Расчёт приблизительный: показана доходность к погашению.');
     return tag(y&&y.ytw_kind==='call'?'к колл':'к погаш.',lines.join('\n'));
@@ -33143,17 +34160,48 @@ function ytmSuffix(r){
     return tag('оф.?',`Тип оферты не указан${d?' ('+ddm(d)+')':''}: показана доходность к этой дате`+(y&&y.ytm!=null?`; к погашению ${P(y.ytm)}`:'')+'. Если это колл эмитента, ориентируйтесь на доходность к погашению.');
   }
   return''}
+function bondsSortedRows(){
+  const b=S.bonds;if(!b||!b.rows)return[];
+  const rows=b.rows.slice();
+  rows.forEach(r=>{r.rk=r.rating?RSC.indexOf(r.rating.v):null;r.next_d=r.next?r.next[0]:null;r.next_sum=r.next&&r.next[1]!=null?r.next[1]*(r.qty||0):null});
+  const{k,d}=S.bsort;
+  rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
+  return rows;
+}
+function bondRowActions(isin){
+  if(!isin)return'';
+  const w=typeof watchHas==='function'&&watchHas(isin);
+  const c=typeof cmpHas==='function'&&cmpHas(isin);
+  return`<span class="row-act${w||c?' has-on':''}">
+    <button type="button" class="ra-btn${w?' on':''}" data-wstar="${esc(isin)}" title="${w?'Убрать из наблюдения':'Добавить в наблюдение'}" aria-label="Наблюдение">${w?'★':'☆'}</button>
+    <button type="button" class="ra-btn${c?' on':''}" data-bcmp="${esc(isin)}" title="${c?'Убрать из сравнения':'Добавить в сравнение'}" aria-label="Сравнить">⇄</button>
+    <button type="button" class="ra-btn" data-bopen="${esc(isin)}" title="Открыть карточку выпуска" aria-label="Открыть карточку">↗</button>
+  </span>`;
+}
+function cmpDockRender(){
+  let el=document.getElementById('cmp-dock');
+  const list=(typeof S!=='undefined'&&Array.isArray(S.cmp))?S.cmp:[];
+  if(!list.length||S.page==='cmp'){if(el)el.remove();return}
+  if(!el){el=document.createElement('div');el.id='cmp-dock';el.className='cmp-dock noprint';document.body.appendChild(el)}
+  const names=list.map(i=>{
+    const c=typeof CMP!=='undefined'&&CMP.d&&CMP.d[i]&&CMP.d[i].c;
+    const b=(S.bonds&&S.bonds.rows||[]).find(r=>(r.isin||'').toUpperCase()===i);
+    const sc=(S.scr&&S.scr.rows||[]).find(r=>(r.isin||r.id||'').toUpperCase()===i);
+    return (c&&(c.short||c.name))||(b&&b.name)||(sc&&sc.name)||i;
+  });
+  el.innerHTML=`<span class="cmp-dock-n">В сравнении: ${list.length}</span><span class="cmp-dock-list" title="${esc(names.join(', '))}">${esc(names.join(' · '))}</span>
+    <button type="button" class="btn" id="cmp-dock-go">Открыть сравнение</button><button type="button" class="btn ghost" id="cmp-dock-clr">Очистить</button>`;
+}
 function pBonds(){
   const b=S.bonds;
   if(!b)return`<div class="card">${waitBox('Загружаю параметры облигаций и графики купонов…')}</div>`;
   if(b.error)return`<div class="msg err">${esc(b.error)}</div>`;
   const m=b.metrics,tot=S.data.portfolio.total||1;
   if(!m.count)return emptyHint('В этом портфеле пока нет облигаций. Присмотреть выпуск можно в скринере или на странице первичных размещений.',[['scr','Подобрать облигации',1],['pri','Новые размещения']]);
-  let rows=b.rows.slice();rows.forEach(r=>{r.rk=r.rating?RSC.indexOf(r.rating.v):null;r.next_d=r.next?r.next[0]:null;r.next_sum=r.next&&r.next[1]!=null?r.next[1]*(r.qty||0):null});const{k,d}=S.bsort;
-  rows.sort((a,c)=>{const x=a[k],y=c[k];if(typeof x==='string'||typeof y==='string')return d*String(x||'').localeCompare(String(y||''));return d*((x??-Infinity)-(y??-Infinity))});
+  const rows=bondsSortedRows(),{k,d}=S.bsort;
   const mxS=Math.max(...rows.map(r=>r.share||0)),mxY=Math.max(1,...rows.map(r=>Math.min(r.ytm||0,60))),mxD=Math.max(...rows.map(r=>r.dur||0));
   const BC_COLS={
-    name:['Облигация','l',r=>`<td>${ident(r,[r.ticker,r.floating?(r.est_coupons?'флоатер · прогноз купонов':'флоатер'):'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}</td>`],
+    name:['Облигация','l',r=>{const id=r.isin||r.ticker||'';return`<td><div class="b-name-cell">${ident(r,[r.ticker,r.floating?(r.est_coupons?'флоатер · прогноз купонов':'флоатер'):'',r.amort?'амортизация':''].filter(Boolean).join(' · '))}${bondRowActions(id)}</div></td>`}],
     qty:['Кол-во','',r=>`<td class="num">${f0(r.qty)}</td>`],
     buy_pct:['Покупка, %','',r=>`<td class="num">${r.buy_pct!=null?f2(r.buy_pct):'—'}</td>`],
     price_pct:['Цена, %','',r=>`<td class="num">${r.price_pct!=null?f2(r.price_pct):'—'}</td>`],
@@ -33179,7 +34227,7 @@ function pBonds(){
   const pre=BC_PRE[S.bpre]?S.bpre:'main',cols=BC_PRE[pre][1];
   const th=cols.map(kk=>{const[t,c]=BC_COLS[kk];const sk=kk==='next'?'next_d':kk==='ctype'?'floating':kk;return`<th class="s ${c||''}" data-s="${sk}">${t} <span>${k===sk?(d>0?'↑':'↓'):''}</span></th>`}).join('');
   const body=rows.map(r=>`<tr data-isin="${esc(r.isin||r.ticker||'')}">${cols.map(kk=>BC_COLS[kk][2](r)).join('')}</tr>`).join('');
-  const presetBar=`<div class="seg noprint" style="margin:0 0 10px">${Object.entries(BC_PRE).map(([k2,v])=>`<button class="${k2===pre?'on':''}" onclick="bondsPreset('${k2}')">${v[0]}</button>`).join('')}</div>`;
+  const presetBar=`<div class="seg noprint">${Object.entries(BC_PRE).map(([k2,v])=>`<button class="${k2===pre?'on':''}" onclick="bondsPreset('${k2}')">${v[0]}</button>`).join('')}</div>`;
   const sk=['-3','-2','-1','1','2','3'],st=m.stress||{};
   chart('c-stress',bars,{h:220,labels:sk.map(x=>(x>0?'+':'−')+Math.abs(x)+' п.п.'),series:[{n:'Изменение стоимости',c:S3,v:sk.map(x=>(st[x]||{}).rub||0)}],legend:false,
     colorOf:v=>v>=0?'var(--pos)':'var(--neg)',empty:'Нет данных для стресс-теста'});
@@ -33193,7 +34241,7 @@ function pBonds(){
     ${kpi('Дюрация',m.dur!=null?m.dur.toFixed(2).replace('.',',')+' года':'—','средневзвешенная, по Маколею',null,S5)}
     ${kpi('Текущая купонная доходность',pctp(m.cur_yield,2),'годовой купон / цена',null,S4)}
     ${kpi('Купоны за 12 месяцев',M(m.coupons_12m,'rub',0),'по графику выплат, до налога','pos',S7)}</div>
-    <div class="card" style="padding:12px 10px 6px">${presetBar}<div class="tbl" style="max-height:calc(100vh - 240px)"><table id="btab" class="bt"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div></div>
+    <div class="card" style="padding:12px 10px 6px"><div class="tbl-head">${presetBar}${typeof taCsvBtn==='function'?taCsvBtn('b-csv','Выгрузить облигации в CSV'):''}</div><div class="tbl"><table id="btab" class="bt"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div></div>
     <div class="g g3"><div class="card"><h2>Лестница погашений и пут-оферт, ₽</h2><div id="c-ladder" class="chart"></div></div>
     <div class="card"><h2>Кредитный риск (оценка брокера)</h2>${hbars(b.risk.map(([n,v])=>({n,v,c:n==='высокий'?S8:n==='низкий'?S3:n==='средний'?S4:'#6f7686',s:pctp(v/(m.value||1)*100)})),S1,null,0)}</div>
     <div class="card"><h2>Тип купона, выпусков</h2>${hbars(b.kinds.map(([n,v],i)=>({n,v,c:PAL[i]})),S1,x=>f0(x.v),1)}</div></div>
@@ -33234,8 +34282,30 @@ function radarCard(rad,compact){
   return`<div class="card"><h2>Радар оферт и амортизаций<span class="sp">ближайшие ${rad.horizon_days||60} дней · событий: ${items.length}</span></h2>${rows}${more}</div>`;
 }
 
-
-
+document.addEventListener('click',e=>{
+  const t=e.target;if(!t.closest)return;
+  const cm=t.closest('[data-bcmp]');
+  if(cm){
+    e.stopPropagation();
+    const isin=String(cm.dataset.bcmp||'').toUpperCase();
+    if(typeof cmpHas==='function'&&cmpHas(isin)){cmpDel(isin);toast('Убрано из сравнения');if(S.page==='bonds')render();cmpDockRender()}
+    else if(typeof cmpAdd==='function'&&cmpAdd(isin)){if(S.page==='bonds')render();cmpDockRender()}
+    return;
+  }
+  const bo=t.closest('[data-bopen]');
+  if(bo){e.stopPropagation();if(typeof openBond==='function')openBond(bo.dataset.bopen);return}
+  if(t.closest('#cmp-dock-go')){go('cmp');return}
+  if(t.closest('#cmp-dock-clr')){S.cmp=[];if(typeof cmpSave==='function')cmpSave();cmpDockRender();if(S.page==='bonds')render();return}
+  if(t.closest('#b-csv')){
+    const rows=bondsSortedRows();
+    if(typeof taCsvDownload==='function')taCsvDownload('bonds.csv',['Название','Тикер','ISIN','Кол-во','Цена, %','Доходность, %','После НДФЛ, %','Спред к КБД, п.п.','Дюрация, лет','Купон, %','След. купон','Погашение','Рейтинг','Риск','Стоимость, ₽','Доля, %','P&L, %'],
+      rows.map(r=>[r.name||'',r.ticker||'',r.isin||'',r.qty??'',r.price_pct!=null?r.price_pct.toFixed(2):'',r.ytm!=null?r.ytm.toFixed(2):'',r.ytm_tax!=null?r.ytm_tax.toFixed(2):'',r.spread!=null?r.spread.toFixed(2):'',r.dur!=null?r.dur.toFixed(2):'',r.coupon!=null?r.coupon.toFixed(2):'',r.next?r.next[0]:'',r.maturity||'',r.rating?r.rating.v:'',r.risk||'',r.value_rub!=null?Math.round(r.value_rub):'',r.share!=null?r.share.toFixed(2):'',r.pnl_pct!=null?r.pnl_pct.toFixed(2):'']));
+  }
+});
+if(typeof renderNow==='function'){
+  const _rnB=renderNow;
+  renderNow=function(){const r=_rnB.apply(this,arguments);try{cmpDockRender()}catch(e){}return r};
+}
 /* ── Первичные размещения ── */
 S.pri=null;S.priNip={y:21,bucket:'AA',term:3,days:4};
 function loadPri(){api('/api/primary').then(j=>{S.pri=j;if(S.page==='pri')renderSoon();if(j&&j.scr_loading)setTimeout(()=>{if(S.page==='pri')loadPri()},4000)}).catch(e=>{S.pri={error:e.message,rows:[]};if(S.page==='pri')renderSoon()})}
@@ -33465,6 +34535,14 @@ const SCR_PRESETS=[
   ['hy20','ВДО от 20%',{cur:'RUB',kind:'corp',ymin:'20',ymax:'60',turn:'1'}],
   ['fx','Валютные',{cur:'all',kind:'corp',fl:'all',q:''}]
 ];
+const SCR_QUICK=[
+  ['ofz','ОФЗ',f=>f.kind==='ofz',f=>{f.kind=f.kind==='ofz'?'all':'ofz'}],
+  ['corp','Корпоративные',f=>f.kind==='corp',f=>{f.kind=f.kind==='corp'?'all':'corp'}],
+  ['ra','Рейтинг A+',f=>f.rmin==='A+',f=>{f.rmin=f.rmin==='A+'?'':'A+'}],
+  ['t3','До 3 лет',f=>String(f.tmax)==='3',f=>{f.tmax=String(f.tmax)==='3'?'':'3'}],
+  ['flt','Флоатеры',f=>f.fl==='float',f=>{f.fl=f.fl==='float'?'all':'float'}],
+  ['noof','Без оферты',f=>!!f.noOffer,f=>{f.noOffer=!f.noOffer}]
+];
 S.scr=null;S.sf=Object.assign({},SCR_DEF);S.scrOpen=false;S.scrPreset='';S.ssort={k:'yield',d:-1};S.sn=150;
 const SCR_DENS=[['comfort','Комфорт'],['compact','Компакт'],['scatter','Точечная']];
 S.scrDens=(d=>SCR_DENS.some(x=>x[0]===d)?d:'comfort')(lsGet('scr_dens'));      /* плотность таблицы: сохраняется в localStorage */
@@ -33573,6 +34651,12 @@ function scrRowHtml(r,fl){
     <td class="l">${scrCpn(r)}</td><td class="num">${yrs}</td>
     <td class="num">${r.macdur!=null?r.macdur.toFixed(2).replace('.',','):'—'}</td><td class="num"><div class="cell-stack r"><span class="num">${r.turn?short(r.turn):'—'}</span><span class="tag liq liq-${r.liq||'L3'}" title="Ликвидность по обороту за день: L1 — верхние 20%, L2 — следующие 40%, L3 — остальные">${r.liq||'L3'}</span></div></td></tr>`;
 }
+function scrSyncQuick(){
+  document.querySelectorAll('.scr-quick [data-qk]').forEach(b=>{
+    const q=SCR_QUICK.find(x=>x[0]===b.dataset.qk);
+    if(q)b.classList.toggle('on',!!q[2](S.sf));
+  });
+}
 function drawScr(){
   const rs=scrRows(),n=Math.min(rs.length,S.sn),fl=S.scr.floor&&S.scr.floor.lqdt;
   const cols=[['_w','★','l'],['name','Выпуск','l'],['rating','Рейтинг','l'],['sector','Сектор','l'],['price','Цена, %'],['yield',S.scrReal?'Реальная доходность':'Доходность'],['cy','Тек. доходн., %'],['spread','Спред к КБД'],['coupon','Купон & формула','l'],['years','До погашения'],['macdur','Дюрация, лет'],['liq','Ликвидность']];
@@ -33583,7 +34667,7 @@ function drawScr(){
   $('#scr-cnt').textContent=`Найдено: ${rs.length}${rs.length>n?' · показано '+n:''}${tl?' · '+tl:''}${S.scrBox?' · в выделении':''}`;
   $('#scr-more').style.display=rs.length>n?'':'none';
   const fb=$('#scr-ftog');if(fb){const ac=scrActiveCount();fb.textContent=(S.scrOpen?'Скрыть фильтры':'Фильтры')+(ac?` (${ac})`:'')}
-  scrScatter();scrSparkWatch();
+  scrSyncQuick();scrScatter();scrSparkWatch();
 }
 /* ── спарклайны: грузим только видимые строки, пачками, результат кэшируется на сессию ── */
 const SPK={map:new Map(),pend:new Set(),to:0,io:null,bad:0};
@@ -33607,13 +34691,14 @@ function scrSparkWatch(){
   SPK.io=new IntersectionObserver(es=>es.forEach(en=>{if(en.isIntersecting){SPK.io.unobserve(en.target);queue(en.target.dataset.spark)}}),{rootMargin:'120px 0px'});
   els.forEach(e=>{if(!SPK.map.has(e.dataset.spark))SPK.io.observe(e)});
 }
-/* ── Scatter: дюрация × доходность, выделение рамкой фильтрует таблицу ── */
+/* ── Диаграмма: дюрация × доходность, выделение рамкой фильтрует таблицу ── */
 const SC={pts:[],drag:null};
 function scrScatter(){
   const box=$('#scr-sc');if(!box)return;
   if(S.scrDens!=='scatter'){box.classList.add('hide');box.innerHTML='';return}
   box.classList.remove('hide');
-  const head=`<div class="sc-h"><b>Дюрация × доходность</b><span class="mu">рамкой выделите область, клик по точке открывает выпуск</span>${S.scrBox?'<button class="scr-chip on" id="sc-clr">сбросить выделение ✕</button>':''}<span class="sc-lg"><i class="t-fl"></i>флоатер<i class="t-fix"></i>фикс<i class="t-lnk"></i>линкер</span><button class="scr-chip" id="sc-col">${S.scrScCol?'Показать':'Свернуть'}</button></div>`;
+  const boxBtns=S.scrBox?`<button class="scr-chip on" id="sc-cmp" title="Открыть сравнение по выбранным бумагам (до 4)">Сравнить выбранные</button><button class="scr-chip on" id="sc-clr">сбросить выделение ✕</button>`:'';
+  const head=`<div class="sc-h"><b>Дюрация × доходность</b><span class="mu">рамкой выделите область, клик по точке открывает выпуск</span>${boxBtns}<span class="sc-lg"><i class="t-fl"></i>флоатер<i class="t-fix"></i>фикс<i class="t-lnk"></i>линкер</span><button class="scr-chip" id="sc-col">${S.scrScCol?'Показать':'Свернуть'}</button></div>`;
   if(S.scrScCol){box.innerHTML=head;scrScBind(box);return}
   const rs=scrRows(true).filter(r=>scrX(r)!=null&&isFinite(scrX(r))&&isFinite(r.yield)&&r.yield>0).slice(0,2500);
   const W=Math.max(280,box.clientWidth||700),H=W<760?240:300,L=42,R=12,T=10,B=28;
@@ -33636,6 +34721,13 @@ function scrScatter(){
 function scrScBind(box){
   const c=$('#sc-col');if(c)c.onclick=()=>{S.scrScCol=!S.scrScCol;scrScatter()};
   const x=$('#sc-clr');if(x)x.onclick=()=>{S.scrBox=null;S.sn=150;drawScr()};
+  const cm=$('#sc-cmp');if(cm)cm.onclick=()=>{
+    const picks=scrRows().slice(0,typeof CMP!=='undefined'?CMP.max:4).map(r=>String(r.isin||r.id||'').toUpperCase()).filter(Boolean);
+    if(!picks.length){toast('В выделении нет облигаций');return}
+    S.cmp=picks;if(typeof cmpSave==='function')cmpSave();
+    if(scrRows().length>picks.length)toast('Для сравнения взяты первые '+picks.length+' бумаги из выделения');
+    go('cmp');
+  };
   const svg=$('#sc-svg'),tip=$('#sc-tip');if(!svg)return;
   const pos=e=>{const r=svg.getBoundingClientRect(),k=SC.W/(r.width||SC.W);return[(e.clientX-r.left)*k,(e.clientY-r.top)*k]};
   const near=(px,py)=>{let best=null,bd=100;for(const p of SC.pts){const d=(p.x-px)*(p.x-px)+(p.y-py)*(p.y-py);if(d<bd){bd=d;best=p}}return best};
@@ -33722,7 +34814,9 @@ function pScr0(){
   const fl0=d.floor&&d.floor.lqdt,flN=fl0>0?`<p class="note scr-fl">Фонд ликвидности сейчас даёт ≈ ${f2(fl0)} % годовых — у бумаг ниже этой доходности нет премии за риск (такие строки приглушены). Доходность до налогов; не инвестиционная рекомендация.</p>`:'';
   const rated=d.rows.filter(r=>r.rating).length,sectors=[...new Set(d.rows.map(r=>r.sector).filter(Boolean))].sort((a,b)=>(SECT[a]||a).localeCompare(SECT[b]||b));
   const ac=scrActiveCount();
-  return`<div class="card"><h2>Подбор облигаций<span class="sp" id="scr-cnt"></span></h2>
+  const quickRow=`<div class="scr-quick" role="group" aria-label="Быстрые фильтры"><span class="scr-quick-lbl">Быстро:</span>${SCR_QUICK.map(([k,t,on])=>`<button type="button" class="scr-chip${on(f)?' on':''}" data-qk="${k}">${t}</button>`).join('')}</div>`;
+  return`<div class="card"><div class="tbl-head" style="padding:0 0 12px"><h2 style="margin:0">Подбор облигаций<span class="sp" id="scr-cnt"></span></h2>${typeof taCsvBtn==='function'?taCsvBtn('scr-csv','Выгрузить подборку в CSV'):''}</div>
+    ${quickRow}
     <div class="scr-bar">
       <input class="in" id="f-q" value="${esc(f.q)}" placeholder="Поиск по названию или ISIN…" aria-label="Поиск облигаций">
       <div class="scr-presets">${SCR_PRESETS.map(([k,t])=>`<button class="scr-chip${S.scrPreset===k?' on':''}" data-pr="${k}">${t}</button>`).join('')}${S.scrSaved.map(x=>`<span class="scr-chip scr-sv${S.scrPreset==='sv:'+x.id?' on':''}"><button class="scr-sv-b" data-sv="${esc(x.id)}" title="Мой сохранённый фильтр">${esc(x.name)}</button><button class="scr-sv-x" data-svx="${esc(x.id)}" aria-label="Удалить фильтр ${esc(x.name)}" title="Удалить">×</button></span>`).join('')}${S.scrSaving?`<span class="scr-sv-new"><input class="in" id="scr-sv-name" maxlength="40" placeholder="Название фильтра" aria-label="Название фильтра"><button class="btn" id="scr-sv-ok">Сохранить</button><button class="btn ghost" id="scr-sv-no">Отмена</button></span>`:(ac||f.q?`<button class="scr-chip" id="scr-sv-add" title="Запомнить текущие настройки фильтра">+ Сохранить фильтр</button>`:'')}</div>
@@ -33755,6 +34849,16 @@ function bindScr(){
   const tb=$('#scr-tabs');if(tb)tb.onclick=e=>{const b=e.target.closest('[data-t]');if(!b||b.dataset.t===S.scrTab)return;S.scrTab=b.dataset.t;render()};
   if(S.scrTab==='mv')return bindMv();
   if(!S.scr||S.scr.error){const b=$('#scr-r');if(b)b.onclick=()=>{S.scr=null;render()};return}
+  const csv=$('#scr-csv');
+  if(csv)csv.onclick=()=>{
+    const rs=scrRows();
+    if(typeof taCsvDownload==='function')taCsvDownload('screener.csv',['Название','ISIN','Рейтинг','Сектор','Цена, %','Доходность, %','Тек. доходность, %','Спред к КБД, п.п.','Купон, %','Погашение','Дюрация, лет','Оборот, ₽','Ликвидность'],
+      rs.map(r=>[r.name||'',r.isin||r.id||'',r.rating||'',r.sector?(SECT[r.sector]||r.sector):'',r.price!=null?r.price.toFixed(2):'',scrY(r)!=null?scrY(r).toFixed(2):'',r.cy!=null?r.cy.toFixed(2):'',r.spread!=null?r.spread.toFixed(2):'',r.coupon!=null?r.coupon.toFixed(2):'',r.mat||'',r.macdur!=null?r.macdur.toFixed(2):'',r.turn!=null?Math.round(r.turn):'',r.liq||'L3']));
+  };
+  document.querySelectorAll('.scr-quick [data-qk]').forEach(b=>b.onclick=()=>{
+    const q=SCR_QUICK.find(x=>x[0]===b.dataset.qk);if(!q)return;
+    S.scrPreset='';q[3](S.sf);S.sn=150;render();
+  });
   const map={'f-q':'q','f-cur':'cur','f-kind':'kind','f-sector':'sector','f-rmin':'rmin','f-ymin':'ymin','f-ymax':'ymax','f-spmin':'spmin','f-tmax':'tmax','f-turn':'turn','f-fl':'fl','f-liq':'liq'};
   let to;Object.entries(map).forEach(([id,k])=>{const e=$('#'+id);if(!e)return;e.oninput=e.onchange=()=>{if(k!=='q')S.scrPreset='';S.sf[k]=e.value;S.sn=150;clearTimeout(to);to=setTimeout(drawScr,150)}});
   $('#f-toff').onchange=e=>{S.scrPreset='';S.sf.toOffer=e.target.checked;S.sn=150;drawScr()};
@@ -33924,6 +35028,23 @@ function payTabs(){
   return`<div class="row" style="margin-bottom:12px"><div class="seg" id="pay-tabs">${tabs.map(([k,t])=>`<button data-ptab="${k}" class="${PAY_UI.tab===k?'on':''}">${t}</button>`).join('')}</div></div>`;
 }
 
+function payGoalCard(tot12,inc12){
+  const avgAll=tot12/12,avgInc=inc12/12;
+  const calcCfg=lsJson('ta_calc',null);
+  const goal=calcCfg&&+calcCfg.goalAmt>0?+calcCfg.goalAmt:0;
+  const base=avgInc>0?avgInc:avgAll;
+  const subParts=[`${M(tot12,'rub',0)} / 12 = ${M(avgAll,'rub',0)}/мес`];
+  if(Math.abs(avgAll-avgInc)>1&&inc12>0)subParts.push(`купоны и дивиденды: ${M(avgInc,'rub',0)}/мес`);
+  if(!goal){
+    return`<div class="card pay-goal"><div class="pay-goal-top"><div><b>Среднемесячный доход: <span class="num pos">${M(avgAll,'rub',0)}/мес</span></b><div class="note">${subParts.join(' · ')}</div></div><button type="button" class="btn ghost" data-go="calc">Задать цель в калькуляторе →</button></div></div>`;
+  }
+  const pctRaw=(base/goal)*100,pctW=Math.max(0,Math.min(100,pctRaw));
+  return`<div class="card pay-goal"><div class="pay-goal-top"><div><b>Среднемесячный доход: <span class="num pos">${M(avgAll,'rub',0)}/мес</span></b><div class="note">${subParts.join(' · ')}</div></div>
+    <div style="text-align:right"><span class="note">Цель из калькулятора: <b>${M(goal,'rub',0)}/мес</b></span> <b class="num ${pctRaw>=100?'pos':''}">${pctp(pctRaw,1)}</b></div></div>
+    <div class="pay-pb" role="progressbar" aria-valuenow="${Math.round(pctW)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pctW.toFixed(1)}%"></i></div>
+    <div class="pay-goal-top"><span class="note">${pctRaw>=100?'Цель калькулятора по пассивному доходу достигнута':'До цели калькулятора не хватает '+M(Math.max(0,goal-base),'rub',0)+'/мес'}</span><button type="button" class="btn ghost" data-go="calc" style="padding:4px 10px;font-size:12px">Изменить цель</button></div></div>`;
+}
+
 function pPay(){
   const tab=PAY_UI.tab;
   if(tab==='journal')return payTabs()+pjRender();
@@ -33933,6 +35054,7 @@ function pPay(){
   if(b.error)return payTabs()+`<div class="msg err">${esc(b.error)}</div>`;
   const ps=b.payments,now=new Date(),in30=localIso(new Date(now.getTime()+30*864e5));
   const sum=f=>ps.filter(f).reduce((a,x)=>a+x.amount,0);
+  const tot12=sum(()=>1),inc12=sum(p=>p.kind==='coupon'||p.kind==='dividend');
   const pm=payMonths(ps,12);
   const pdd=payDays(ps,S.payDays);chart('c-days',dayBars,{days:pdd.days,legend:pdd.legend,h:340});
   chart('c-pay',bars,{h:260,labels:pm.labels,tipLabels:pm.tips,stack:true,total:true,skipZero:true,series:pm.series,empty:'Выплат не ожидается'});
@@ -33940,10 +35062,11 @@ function pPay(){
   const byM={};ps.forEach(p=>(byM[p.date.slice(0,7)]=byM[p.date.slice(0,7)]||[]).push(p));
   const list=Object.keys(byM).sort().map(m=>{const[y,mm]=m.split('-');const t=byM[m].reduce((a,x)=>a+x.amount,0);
     return`<div class="card"><h2>${MONF[+mm-1]} ${y}<span class="sp num" style="color:var(--pos);font-size:13px;font-weight:600">${M(t)}</span></h2><div class="li">`+
-    byM[m].map(p=>`<div class="it"${p.kind==='dividend'&&p.ticker?stkAttr(p.ticker,'div'):''}>${logo(p,34)}<div><b>${esc(p.name)}</b><small>${ddm(p.date)} · <span style="color:${KIND[p.kind][1]}">${KIND[p.kind][0]}</span>${p.est==='forecast'?' · прогноз по ключевой ставке':p.est?' · оценка':''}</small></div><div class="rv num">${M(p.amount)}</div></div>`).join('')+`</div></div>`}).join('');
-  const fxw=(b.fx_missing||[]).length?`<div class="msg">Нет курса ЦБ для ${esc(b.fx_missing.join(', '))}: выплаты в этой валюте не учтены.</div>`:'';
-  return payTabs()+fxw+`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(sum(()=>1)),'купоны, дивиденды, амортизации и погашения','pos',S3)}
-    ${kpi('Купоны',M(sum(p=>p.kind==='coupon')),ps.filter(p=>p.kind==='coupon').length+' выплат',null,S1)}${kpi('Дивиденды',M(sum(p=>p.kind==='dividend')),'только объявленные, до налога',null,S3)}</div>
+    byM[m].map(p=>`<div class="it"${p.kind==='dividend'&&p.ticker?stkAttr(p.ticker,'div'):p.isin?` data-isin="${esc(p.isin)}" style="cursor:pointer"`:''}>${logo(p,34)}<div><b>${esc(p.name)}</b><small>${ddm(p.date)} · <span style="color:${KIND[p.kind][1]}">${KIND[p.kind][0]}</span>${p.est==='forecast'?' · прогноз по ключевой ставке':p.est?' · оценка':''}</small></div><div class="rv num">${M(p.amount)}</div></div>`).join('')+`</div></div>`}).join('');
+  const fxw=(b.fx_missing||[]).length?`<div class="st-callout warn">Нет курса ЦБ для ${esc(b.fx_missing.join(', '))}: выплаты в этой валюте не учтены.</div>`:'';
+  return payTabs()+fxw+`<div class="g g4">${kpi('Ближайшие 30 дней',M(sum(p=>p.date<=in30)),'',null,S1)}${kpi('За 12 месяцев',M(tot12),'в среднем '+M(tot12/12,'rub',0)+'/мес','pos',S3)}
+    ${kpi('Купоны',M(sum(p=>p.kind==='coupon')),ps.filter(p=>p.kind==='coupon').length+' выплат',null,S1)}${kpi('Среднее в месяц',M(tot12/12,'rub',0),M(tot12,'rub',0)+' / 12 · див. '+M(sum(p=>p.kind==='dividend'),'rub',0),'pos',S3)}</div>
+    ${payGoalCard(tot12,inc12)}
     <div class="card"><h2>Календарь выплат по месяцам, ₽</h2><div id="c-pay" class="chart"></div></div>
     <div class="card"><h2>Выплаты по дням<span class="sp"><span class="seg" id="pdays">${[[30,'30 дней'],[90,'90 дней'],[365,'Год']].map(([d,t])=>`<button data-d="${d}" class="${d===S.payDays?'on':''}">${t}</button>`).join('')}</span></span></h2><div id="c-days" class="chart"></div></div>
     ${list?`<div class="g g2">${list}</div>`:emptyHint('В ближайший год выплат не ожидается: в портфеле нет облигаций с купонами и акций с объявленными дивидендами. Подобрать облигации с купоном можно в скринере.',[['scr','Подобрать облигации',1],['bonds','Мои облигации']])}
@@ -34145,6 +35268,7 @@ const OPN={BUY:'Покупка',SELL:'Продажа',BUY_CARD:'Покупка',
   BOND_REPAYMENT:'Амортизация',BOND_REPAYMENT_FULL:'Погашение',BROKER_FEE:'Комиссия брокера',SERVICE_FEE:'Обслуживание',MARGIN_FEE:'Плата за маржу',TAX:'НДФЛ',
   DIVIDEND_TAX:'Налог с дивидендов',BOND_TAX:'Налог с купона',INPUT:'Пополнение',OUTPUT:'Вывод',INP_MULTI:'Перевод между счетами',OUT_MULTI:'Перевод между счетами',
   OVERNIGHT:'Доход по РЕПО',ACCRUING_VARMARGIN:'Вар. маржа',WRITING_OFF_VARMARGIN:'Вар. маржа',TAX_CORRECTION:'Возврат налога',INPUT_SECURITIES:'Зачисление бумаг',OUTPUT_SECURITIES:'Списание бумаг'};
+S.opsFrom=S.opsFrom||'';S.opsTo=S.opsTo||'';S.opsAcc=S.opsAcc||'';
 /* инструмент операции -> карточка бумаги; дивиденды и налог с них — сразу на вкладку «Дивиденды» */
 function opsStk(o){
   const dv=o[2]==='dividends'||o[2]==='tax_dividend',t=o[4]||(dv?stkByName(o[3]):'');
@@ -34152,8 +35276,16 @@ function opsStk(o){
   return dv?stkAttr(t,'div'):stkAttrIf(t);
 }
 function opsFiltered(){
-  const q=S.opsQ.toLowerCase(),ks=KMAP[S.opsK];
-  return S.data.ops.filter(o=>(!ks||ks.includes(o[2]))&&(!q||(o[1]+' '+(OPN[o[1]]||'')+' '+o[3]+' '+o[4]+' '+o[12]).toLowerCase().includes(q)));
+  const q=S.opsQ.toLowerCase(),ks=KMAP[S.opsK],fr=S.opsFrom||'',to=S.opsTo||'',ac=S.account==='all'?(S.opsAcc||''):'';
+  return S.data.ops.filter(o=>{
+    if(ks&&!ks.includes(o[2]))return false;
+    const d=String(o[0]||'').slice(0,10);
+    if(fr&&d<fr)return false;
+    if(to&&d>to)return false;
+    if(ac&&o[12]!==ac)return false;
+    if(q&&!(o[1]+' '+(OPN[o[1]]||'')+' '+o[3]+' '+o[4]+' '+o[12]).toLowerCase().includes(q))return false;
+    return true;
+  });
 }
 /* итоги по отфильтрованным операциям (только рублёвые) */
 function opsTotals(all){
@@ -34173,18 +35305,24 @@ function opsTotals(all){
   return`<div class="ops-sum">${it.join('')}<span>Чистый поток: <b class="num ${cls(t.net)}">${SM(t.net)}</b></span>${other?`<span class="mu">без ${f0(other)} операций в других валютах</span>`:''}</div>`;
 }
 function pOps(){
-  return`<div class="card"><div class="row" style="margin-bottom:14px">
-    <input class="in" id="oq" placeholder="Поиск: название, тикер, тип операции…" value="${esc(S.opsQ)}" style="flex:1;min-width:240px">
+  const accs=S.account==='all'?[...new Set((S.data.ops||[]).map(o=>o[12]).filter(Boolean))].sort():[];
+  const accSel=S.account==='all'&&accs.length>1?`<select class="in ops-acc" id="o-acc" aria-label="Фильтр по счёту"><option value="">Все счета (${accs.length})</option>${accs.map(a=>`<option value="${esc(a)}"${S.opsAcc===a?' selected':''}>${esc(a)}</option>`).join('')}</select>`:'';
+  return`<div class="card"><div class="tbl-head" style="padding:0 0 12px"><h2 style="margin:0">Журнал операций<span class="sp" id="ops-cnt"></span></h2>${typeof taCsvBtn==='function'?taCsvBtn('ops-csv','Выгрузить операции по текущему фильтру в CSV'):''}</div>
+    <div class="row" style="margin-bottom:14px">
+    <input class="in" id="oq" placeholder="Поиск: название, тикер, тип операции…" value="${esc(S.opsQ)}" style="flex:1;min-width:220px">
+    <label class="ops-dt"><span>От</span><input class="in" type="date" id="o-from" value="${esc(S.opsFrom)}"></label>
+    <label class="ops-dt"><span>До</span><input class="in" type="date" id="o-to" value="${esc(S.opsTo)}"></label>
+    ${accSel}
     <div class="seg" id="ok">${KINDS.map(([k,t])=>`<button class="${k===S.opsK?'on':''}" data-k="${k}">${t}</button>`).join('')}</div>
-    <a class="btn ghost" style="text-decoration:none" href="/api/operations.csv?${new URLSearchParams({period:S.period,account:S.account})}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',2)}CSV</a>
     <button class="btn" id="man-add" title="Внести сделку или текущую позицию вручную, без загрузки отчёта">+ Добавить сделку</button></div>
     <div id="otab"></div></div><div id="man-list"></div>`;
 }
 function drawOps(){
   const all=opsFiltered(),rows=all.slice(0,S.opsN),el=$('#otab');if(!el)return;
-  if(!all.length){el.innerHTML=S.opsQ||S.opsK?'<div class="empty">Ничего не найдено. <button class="btn ghost" id="ops-reset">Сбросить фильтры</button></div>':emptyHint('Операций за этот период нет. Выберите период «Всё время» сверху или загрузите отчёт брокера.',[['imp','Импорт отчёта',1]]);const rb=$('#ops-reset');if(rb)rb.onclick=()=>{S.opsQ='';S.opsK='';render()};el.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
+  const cnt=$('#ops-cnt');if(cnt)cnt.textContent=`Найдено: ${f0(all.length)}`;
+  if(!all.length){const hasF=S.opsQ||S.opsK||S.opsFrom||S.opsTo||S.opsAcc;el.innerHTML=hasF?'<div class="empty">Ничего не найдено. <button class="btn ghost" id="ops-reset">Сбросить фильтры</button></div>':emptyHint('Операций за этот период нет. Выберите период «Всё время» сверху или загрузите отчёт брокера.',[['imp','Импорт отчёта',1]]);const rb=$('#ops-reset');if(rb)rb.onclick=()=>{S.opsQ='';S.opsK='';S.opsFrom='';S.opsTo='';S.opsAcc='';render()};el.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   const multi=S.account==='all';
-  el.innerHTML=`<p class="note" style="margin-bottom:8px">Найдено: ${f0(all.length)}</p>${opsTotals(all)}<div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
+  el.innerHTML=`${opsTotals(all)}<div class="tbl" style="max-height:calc(100vh - 290px)"><table><thead><tr>
     <th>Дата</th><th class="l">Операция</th><th class="l">Инструмент</th>${multi?'<th class="l">Счёт</th>':''}<th>Кол-во</th><th>Цена</th><th>Сумма</th><th>Комиссия</th><th>Результат</th></tr></thead><tbody>`+
     rows.map(o=>`<tr><td class="num t2">${esc(o[0])}</td><td class="l"><span class="tag">${esc(OPN[o[1]]||o[1])}</span></td>
     <td class="l" style="max-width:380px">${o[3]||o[4]?`<div class="tk"${opsStk(o)}>${logo({name:o[3],ticker:o[4],logo:o[11]},24)}<div><b style="font-weight:550">${esc(o[3]||o[4])}</b></div></div>`:''}</td>
@@ -34193,7 +35331,20 @@ function drawOps(){
     `</tbody></table>${all.length>rows.length?`<div class="more"><button class="btn ghost" id="omore">Показать ещё (${f0(all.length-rows.length)})</button></div>`:''}</div>`;
   const m=$('#omore');if(m)m.onclick=()=>{S.opsN+=500;drawOps()};
 }
-
+document.addEventListener('change',e=>{
+  if(S.page!=='ops'||!e.target)return;
+  if(e.target.id==='o-from'){S.opsFrom=e.target.value;S.opsN=200;drawOps()}
+  else if(e.target.id==='o-to'){S.opsTo=e.target.value;S.opsN=200;drawOps()}
+  else if(e.target.id==='o-acc'){S.opsAcc=e.target.value;S.opsN=200;drawOps()}
+});
+document.addEventListener('click',e=>{
+  if(S.page!=='ops'||!e.target.closest)return;
+  if(e.target.closest('#ops-csv')){
+    const all=opsFiltered();
+    if(typeof taCsvDownload==='function')taCsvDownload('operations.csv',['Дата','Операция','Инструмент','Тикер','Счёт','Кол-во','Цена','Сумма','Валюта','Комиссия','Результат'],
+      all.map(o=>[o[0]||'',OPN[o[1]]||o[1]||'',o[3]||'',o[4]||'',o[12]||'',o[5]??'',o[6]??'',o[7]??'',(o[8]||'rub').toUpperCase(),o[9]??'',o[10]??'']));
+  }
+});
 /* ── Комиссии + Оптимизатор тарифа брокера (#10) ── */
 function feeTariffOptimizer(){
   const fm=(S.data||{}).fee_model;
@@ -34527,6 +35678,12 @@ function txSet(d){
 /* ── Импорт ── */
 const IMP_BROKER={tbank:'Т-Инвестиции',vtb:'ВТБ'};   // распознанные отчёты брокеров (format из /api/import/preview)
 const ROLE_RU={date:'Дата',type:'Тип операции',isin:'ISIN',ticker:'Тикер',name:'Название / описание',qty:'Количество',price:'Цена',amount:'Сумма',currency:'Валюта',commission:'Комиссия',nkd:'НКД'};
+const IMP_GUIDES=[
+  ['Т-Инвестиции','Приложение или ЛК → Настройки / Ещё → Отчёты → Брокерский отчёт (XLSX или XML) за весь период.'],
+  ['Сбер Инвестиции','СберБанк Онлайн → Инвестиции → Отчёты брокера → Ежемесячный или за период (HTML / XLSX).'],
+  ['ВТБ Мои Инвестиции','ЛК ВТБ или приложение → Профиль → Отчёты и налоги → Брокерский отчёт (XLSX / XML).'],
+  ['Альфа, БКС, Финам','Личный кабинет брокера → Отчёты по сделкам и движению денег → Выгрузка в XLSX или CSV.']
+];
 async function renderImport(){
   S.charts=[];
   let cfg;try{cfg=await api('/api/config');S.cfg=cfg}catch(e){$('#view').innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
@@ -34539,10 +35696,11 @@ async function renderImport(){
     const cash=Object.entries(pv.cash_bad||{});
     step=`<div class="card fade"><h2>2. ${esc(pv.title)}<span class="sp">${esc(im.filename)} · ${ddm(pv.period.from)} — ${ddm(pv.period.to)}</span></h2>
       <div class="msg ok">Распознан формат «${esc(pv.title)}». Операций: <b>${pv.count}</b><br>${Object.entries(bd).filter(e=>e[1]).map(([k,v])=>`${ru[k]||k}: ${v}`).join(' · ')}</div>
-      ${pv.manual_matches&&pv.manual_matches.count?`<div class="msg info">Найдено ручных сделок, уже попавших в этот отчёт: <b>${pv.manual_matches.count}</b>. При загрузке они будут заменены строками отчёта, а не задвоятся.${pv.manual_matches.sample.map(m=>`<br>${ddm(m.date)} · ${esc(m.name)} · ${m.qty} шт. · ${f2(m.amount)}`).join('')}</div>`:''}
+      ${pv.manual_matches&&pv.manual_matches.count?`<div class="st-callout">Найдено ручных сделок, уже попавших в этот отчёт: <b>${pv.manual_matches.count}</b>. При загрузке они будут заменены строками отчёта, а не задвоятся.${pv.manual_matches.sample.map(m=>`<br>${ddm(m.date)} · ${esc(m.name)} · ${m.qty} шт. · ${f2(m.amount)}`).join('')}</div>`:''}
       <p class="note" style="margin:10px 0">${pv.repo_skipped?`Сделки РЕПО (${pv.repo_skipped} строк) и строки`:'Строки'} отчёта, дублирующие сделки (${pv.mirror_skipped}), не считаются: деньги и бумаги берутся из сделок, выплат и налогов. Входящие остатки на начало периода (бумаг: ${pv.opening_sec}) добавляются служебными операциями и снимаются сами, когда загружен более ранний отчёт${pv.xfer?`; движений бумаг без сделок: ${pv.xfer}`:''}.</p>
       <div class="msg ${pv.cash_ok&&!pv.pos_bad?'ok':'err'}">Сверка с итогами отчёта: деньги ${pv.cash_ok?'сходятся':'не сходятся ('+cash.map(([c,v])=>`${c.toUpperCase()}: по отчёту ${f0(v[0])}, по операциям ${f0(v[1])}`).join('; ')+')'}; бумаги — ${pv.pos_bad?`расхождений: ${pv.pos_bad} из ${pv.pos_total}`:`все ${pv.pos_total} сходятся`}.</div>
       <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${pv.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>
+      <div id="imp-prog"></div>
       <div class="row" style="margin-top:14px">${tg.map(t=>`<button class="btn" data-tbc="${esc(t.id)}">Добавить к портфелю «${esc(t.name)}»</button>`).join('')}<button class="btn ${tg.length?'ghost':''}" data-tbc="">${tg.length?'Создать новый счёт':'Импортировать'}</button>
       <span class="note">Бумаги будут найдены через API Т-Инвестиций — это займёт несколько секунд.</span></div></div>`;
   }else if(im&&im.preview){
@@ -34553,8 +35711,13 @@ async function renderImport(){
       <div class="tbl" style="max-height:260px;border:1px solid var(--line)"><table><thead><tr>${pv.header.map(h=>`<th class="l">${esc(h)}</th>`).join('')}</tr></thead><tbody>${pv.sample.slice(0,8).map(r=>`<tr>${pv.header.map((_,i)=>`<td class="l t2">${esc(r[i]??'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <div class="row" style="margin-top:14px"><button class="btn ghost" id="iparse">Проверить разбор</button></div><div id="iresult" style="margin-top:14px"></div></div>`;
   }
+  const resDone=S.impDone;
+  const resProgHtml=resDone?`<div class="imp-prog"><div class="row" style="justify-content:space-between"><b>Результат сопоставления бумаг на бирже</b><span class="num">${resDone.resolved} из ${resDone.idents} (${resDone.idents?Math.round(resDone.resolved/resDone.idents*100):100}%)</span></div><div class="imp-prog-bar"><i style="width:${resDone.idents?Math.round(resDone.resolved/resDone.idents*100):100}%"></i></div></div>`:'';
+  const guidesHtml=`<div class="card"><h2>Где взять файл в ЛК брокера<span class="sp">поддерживаются XLSX, XLS, HTML и CSV</span></h2>
+    <div class="imp-guides">${IMP_GUIDES.map(([b,tx])=>`<div class="imp-gcard"><b>${esc(b)}</b><small>${esc(tx)}</small></div>`).join('')}</div></div>`;
   $('#view').innerHTML=`<div class="wrap fade" style="max-width:1100px">
     <div id="imsg"></div>
+    ${resProgHtml}
     <div class="card"><h2>1. Загрузите отчёт другого брокера</h2>
       <div class="drop" id="drop"><input type="file" id="ifile" accept=".csv,.txt,.xlsx,.xlsm,.html,.htm,.xls" style="display:none">
         ${svgI('<path d="M12 16V4M7 9l5-5 5 5M5 20h14"/>',1.6).replace('<svg','<svg style="width:34px;height:34px;opacity:.7"')}
@@ -34565,11 +35728,13 @@ async function renderImport(){
         <label class="field"><span>Название счёта</span><input class="in" id="iname" placeholder="Например: Сбер ИИС" value="${esc(im&&im.name||'')}"></label>
         <label class="field"><span>Брокер</span><input class="in" id="ibroker" placeholder="Сбер, ВТБ, БКС…" value="${esc(im&&im.broker||'')}"></label></div>
       <p class="note" style="margin-top:12px">Лучше всего подходит выгрузка всех операций (сделки + движение денег) за всё время. Если формат не распознаётся — заполните <a href="/api/import/template.csv" download="tanalytic-template.csv" style="color:var(--ac)">шаблон CSV</a>. Бумаги находятся по ISIN или тикеру через API Т-Инвестиций, чтобы подтянуть текущие цены, названия, логотипы и купоны. Данные сохраняются только в локальной базе.</p></div>
+    ${guidesHtml}
     ${step}
     <div class="card"><h2>Импортированные счета</h2>${imps.length?`<div class="li">${imps.map(x=>{const ps=(x.files||[]).map(f=>f.from&&f.to?[f.from,f.to]:null).filter(Boolean);const span=ps.length?` · ${ddm(ps.map(p=>p[0]).sort()[0])} — ${ddm(ps.map(p=>p[1]).sort().slice(-1)[0])}`:'';return`<div class="it">${logo({name:x.name,ticker:x.name},34)}<div><b>${esc(x.name)}</b><small>${esc(x.broker||'')}${x.broker?' · ':''}файлов: ${x.files.length} · операций: ${f0(x.ops||x.files.reduce((a,f)=>a+f.count,0))}${span}</small></div>
       <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`}).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div>
-    <div class="card"><h2>Ручной учёт</h2><p class="note">Купили бумаги у другого брокера или хотите быстро внести текущую позицию? Добавьте сделку вручную: загружать отчёт не нужно. Когда отчёт появится, совпавшие записи заменятся строками отчёта, дублей не будет.</p><div class="row" style="margin-top:10px"><button class="btn" id="man-add2">Добавить сделку или позицию</button></div></div><div id="man-list"></div></div>`;
+    <div class="card"><h2>Ручной учёт</h2><p class="note">Купили бумаги у другого брокера или хотите быстро внести текущую позицию, вклад, наличные или недвижимость? Добавьте запись вручную: загружать отчёт не нужно.</p><div class="row" style="margin-top:10px"><button class="btn" id="man-add2">Добавить сделку или актив</button></div></div><div id="man-list"></div></div>`;
   const msg=(t,k)=>{$('#imsg').innerHTML=t?`<div class="msg ${k||'err'}">${t}</div>`:'';if(t)$('#imsg').scrollIntoView({block:'nearest'})};
+  const showBusyProg=(containerId,label)=>{const el=document.getElementById(containerId);if(el)el.innerHTML=`<div class="imp-prog" style="margin-top:12px"><div><b>${esc(label||'Импортирую операции и сопоставляю бумаги…')}</b></div><div class="imp-prog-bar indet"><i></i></div></div>`};
   const drop=$('#drop'),inp=$('#ifile');
   // в окне программы — системный диалог (надёжнее скрытого <input type=file> в WebView2), в браузере — обычный выбор файла
   drop.onclick=async()=>{const a=window.pywebview&&pywebview.api;
@@ -34580,6 +35745,7 @@ async function renderImport(){
   inp.onchange=()=>{if(inp.files[0])pick(inp.files[0])};
   async function pick(f){
     if(f.size>60*1024*1024)return msg('Файл больше 60 МБ.');
+    S.impDone=null;
     msg('Читаю файл…','info');
     const data=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=rej;r.readAsDataURL(f)});
     return pickData(f.name,data);
@@ -34594,12 +35760,14 @@ async function renderImport(){
       else msg('')}
     catch(e){msg(esc(e.message))}
   }
+  if(S._pendingDropFile){const pf=S._pendingDropFile;S._pendingDropFile=null;pick(pf)}
   $('#itarget').onchange=e=>{if(S.imp)S.imp.target=e.target.value};
   if(tb){
     document.querySelectorAll('[data-tbc]').forEach(b=>b.onclick=async()=>{
       document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=true);b.textContent='Импортирую…';
+      showBusyProg('imp-prog','Сохраняю операции и ищу бумаги на бирже…');
       try{const res=await post('/api/import/commit',{filename:im.filename,data:im.data,name:$('#iname').value||im.name,broker:$('#ibroker').value,target:b.dataset.tbc});
-        S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
+        S.imp=null;S.impDone=res;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
         await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.${res.reconciled?` Ручных записей заменено строками отчёта: ${res.reconciled}.`:''}`,'ok');load(true)}
       catch(err){document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=false);await renderImport();msg(esc(err.message))}})
   }
@@ -34615,10 +35783,12 @@ async function renderImport(){
         const dupMsg=r.duplicate_of?`<div class="msg err" style="margin-top:10px">Этот отчёт уже загружен в счёт «${esc(r.duplicate_of.name)}». Повторная загрузка запрещена, чтобы сделки не задвоились.</div>`:'';
         $('#iresult').innerHTML=`<div class="msg ${r.count?'ok':'err'}">Распознано операций: <b>${r.count}</b>${r.skipped?`, пропущено строк: ${r.skipped}`:''}${r.from?` · с ${ddm(r.from)} по ${ddm(r.to)}`:''}<br>${Object.entries(r.kinds).map(([k,v])=>`${K[k]||k}: ${v}`).join(' · ')}</div>${dupMsg}${ovNote}
           <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${r.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>${mmNote}
+          <div id="imp-prog2"></div>
           ${r.count&&!r.duplicate_of?'<div class="row" style="margin-top:14px"><button class="btn" id="icommit">Импортировать</button><span class="note">Бумаги будут найдены через API Т-Инвестиций — это займёт несколько секунд.</span></div>':''}`;
         const c=$('#icommit');if(c)c.onclick=async ev=>{const bb=ev.currentTarget;bb.disabled=true;bb.textContent='Импортирую…';
+          showBusyProg('imp-prog2','Сохраняю операции и ищу бумаги на бирже…');
           try{const res=await post('/api/import/commit',{...req(),name:$('#iname').value||im.name,broker:$('#ibroker').value,target:$('#itarget').value});
-            S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
+            S.imp=null;S.impDone=res;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
             await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.${res.reconciled?` Ручных записей заменено строками отчёта: ${res.reconciled}.`:''}`,'ok');load(true)}
           catch(err){bb.disabled=false;bb.textContent='Импортировать';msg(esc(err.message))}}}
       catch(err){$('#iresult').innerHTML=`<div class="msg err">${esc(err.message)}</div>`}finally{b.disabled=false}};
@@ -34630,11 +35800,11 @@ async function renderImport(){
     try{await post('/api/import/broker',{id:s.dataset.brk,broker_id:s.value});S.data=null;msg('Брокер счёта сохранён.','ok');load(true)}catch(e){msg(esc(e.message))}});
   document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{S.account=b.dataset.open;S.bonds=S.hist=null;persist();S.page='dash';renderNav();load(false)});
 }
-
-/* ── Ручной учёт: добавить сделку или текущую позицию, не загружая отчёт ── */
+/* ── Ручной учёт: добавить сделку, позицию или внебиржевой актив (вклад / наличные / недвижимость) ── */
 const MAN={rows:[],accounts:[],pick:null};
 const MAN_KINDS=[['buy','Покупка'],['sell','Продажа'],['coupon','Купон'],['dividend','Дивиденд'],['deposit','Пополнение'],['withdraw','Вывод'],['fee','Комиссия, обслуживание']];
 const MAN_TYPE={buy:'buy',sell:'sell',coupons:'coupon',dividends:'dividend',deposits:'deposit',withdrawals:'withdraw',fee_service:'fee',fee_broker:'fee'};
+const MAN_EXT_KINDS=[['deposit','Вклад'],['cash','Наличные'],['realty','Недвижимость']];
 function manNum(v){const x=parseFloat(String(v==null?'':v).replace(/\s/g,'').replace(',','.'));return isFinite(x)?x:0}
 function manClose(){const o=document.getElementById('man-ov');if(o)o.remove()}
 async function manualOpen(row){
@@ -34642,18 +35812,29 @@ async function manualOpen(row){
   let accs=[];
   try{accs=(await api('/api/ops/manual')).accounts}catch(e){toast(e.message,'err');return}
   const ed=row||null;MAN.pick=ed?{ident:ed.ident,ticker:'',name:ed.name}:null;
+  const isExt=!!(ed&&ed.ident&&/^EXT:/i.test(ed.ident));
+  const extKindInit=isExt?(String(ed.ident).split(':')[1]||'DEPOSIT').toLowerCase():'deposit';
   const kind=ed?(MAN_TYPE[ed.type]||'buy'):'buy';
   const ov=document.createElement('div');ov.id='man-ov';ov.className='shr-bg';
-  ov.innerHTML=`<div class="card" role="dialog" aria-modal="true" aria-label="Ручная запись" style="width:min(640px,100%);max-height:92vh;overflow:auto">
-    <h2>${ed?'Изменить запись':'Добавить сделку или позицию'}<span class="sp"><button class="btn ghost" id="man-x" aria-label="Закрыть">Закрыть</button></span></h2>
-    <p class="note">Запись становится обычной операцией счёта: доходность, налоги и графики считаются как по отчёту. Когда вы позже загрузите отчёт брокера с этой сделкой, ручная запись будет заменена строкой отчёта, а не задвоится.</p>
-    <div class="seg" id="man-mode" style="margin:10px 0"><button data-m="op" class="${ed&&ed.position?'':'on'}">Операция</button><button data-m="position" class="${ed&&ed.position?'on':''}">Текущая позиция без истории</button></div>
+  ov.innerHTML=`<div class="card" role="dialog" aria-modal="true" aria-label="Ручная запись" style="width:min(660px,100%);max-height:92vh;overflow:auto">
+    <h2>${ed?'Изменить запись':'Добавить сделку или актив'}<span class="sp"><button class="btn ghost" id="man-x" aria-label="Закрыть">Закрыть</button></span></h2>
+    <p class="note">Запись становится обычной операцией счёта: доходность, налоги и графики считаются как по отчёту. Внебиржевые активы (вклады, наличные, недвижимость) учитываются в общем капитале.</p>
+    <div class="seg" id="man-mode" style="margin:10px 0">
+      <button data-m="op" class="${ed&&(ed.position||isExt)?'':'on'}">Операция</button>
+      <button data-m="position" class="${ed&&ed.position&&!isExt?'on':''}">Позиция без истории</button>
+      <button data-m="asset_ext" class="${isExt?'on':''}">Вклад / Наличные / Недвижимость</button>
+    </div>
     <div class="g g3" style="gap:12px">
       <label class="field"><span>Счёт</span><select class="in" id="man-acc">${ed?'':'<option value="">Новый ручной счёт</option>'}${accs.map(a=>`<option value="${esc(a.id)}"${ed&&ed.acc===a.id?' selected':''}>${esc(a.name)}</option>`).join('')}</select></label>
       <label class="field" id="man-newname"><span>Название нового счёта</span><input class="in" id="man-accname" placeholder="Например: Другой брокер" value="Ручной счёт"></label>
       <label class="field" id="man-kindf"><span>Тип операции</span><select class="in" id="man-kind">${MAN_KINDS.map(([k,t])=>`<option value="${k}"${k===kind?' selected':''}>${t}</option>`).join('')}</select></label>
     </div>
-    <div id="man-secbox"><label class="field" style="margin-top:12px"><span>Бумага: тикер, ISIN или название</span><input class="in" id="man-q" placeholder="Например: SBER или ОФЗ 26238" autocomplete="off" value="${esc(ed?ed.name:'')}"></label>
+    <div id="man-extbox" class="g g3" style="gap:12px;margin-top:12px;display:none">
+      <label class="field"><span>Вид актива</span><select class="in" id="man-ext-kind">${MAN_EXT_KINDS.map(([k,t])=>`<option value="${k}"${k===extKindInit?' selected':''}>${t}</option>`).join('')}</select></label>
+      <label class="field"><span>Название</span><input class="in" id="man-ext-name" placeholder="Например: Вклад в Сбере" value="${esc(isExt?ed.name:'')}"></label>
+      <label class="field"><span>Валюта</span><select class="in" id="man-ext-cur">${['rub','usd','eur','cny'].map(c=>`<option value="${c}"${ed&&String(ed.currency||'rub').toLowerCase()===c?' selected':''}>${c.toUpperCase()}</option>`).join('')}</select></label>
+    </div>
+    <div id="man-secbox"><label class="field" style="margin-top:12px"><span>Бумага: тикер, ISIN или название</span><input class="in" id="man-q" placeholder="Например: SBER или ОФЗ 26238" autocomplete="off" value="${esc(ed&&!isExt?ed.name:'')}"></label>
       <div id="man-found" class="li" style="margin-top:6px"></div></div>
     <div class="g g3" style="gap:12px;margin-top:12px">
       <label class="field"><span>Дата</span><input class="in" type="date" id="man-date" value="${esc(ed?ed.date:localIso(new Date()))}"></label>
@@ -34669,17 +35850,19 @@ async function manualOpen(row){
   document.body.appendChild(ov);
   const g=id=>document.getElementById(id),mode=()=>g('man-mode').querySelector('.on').dataset.m;
   const showHide=()=>{
-    const pos=mode()==='position',k=pos?'buy':g('man-kind').value,trade=k==='buy'||k==='sell',sec=['buy','sell','coupon','dividend'].includes(k);
+    const md=mode(),ext=md==='asset_ext',pos=md==='position',k=(pos||ext)?'buy':g('man-kind').value,trade=!ext&&(k==='buy'||k==='sell'),sec=!ext&&['buy','sell','coupon','dividend'].includes(k);
     g('man-newname').style.display=g('man-acc').value===''?'':'none';
-    g('man-kindf').style.display=pos?'none':'';
+    g('man-kindf').style.display=(pos||ext)?'none':'';
+    g('man-extbox').style.display=ext?'':'none';
     g('man-secbox').style.display=sec?'':'none';
-    g('man-qtyf').style.display=trade?'':'none';g('man-pricef').style.display=trade?'':'none';g('man-nkdf').style.display=k==='buy'&&!pos?'':'none';
-    g('man-commf').style.display=trade&&!pos?'':'none';g('man-cashf').style.display=k==='buy'?'':'none';
+    g('man-qtyf').style.display=trade?'':'none';g('man-pricef').style.display=trade?'':'none';g('man-nkdf').style.display=k==='buy'&&!pos&&!ext?'':'none';
+    g('man-commf').style.display=trade&&!pos?'':'none';g('man-cashf').style.display=!ext&&k==='buy'?'':'none';
     g('man-pricel').textContent=MAN.pick&&MAN.pick.pct?'Цена, % от номинала':'Цена за штуку, ₽';
-    g('man-amountl').textContent=trade?'Сумма сделки, ₽ (считается сама)':'Сумма, ₽';
-    g('man-date').previousElementSibling.textContent=pos?'Дата покупки (по желанию)':'Дата';
+    g('man-amountl').textContent=ext?'Текущая стоимость / остаток':trade?'Сумма сделки, ₽ (считается сама)':'Сумма, ₽';
+    g('man-date').previousElementSibling.textContent=ext?'Дата оценки':pos?'Дата покупки (по желанию)':'Дата';
   };
   const calc=()=>{
+    if(mode()==='asset_ext')return;
     const q=manNum(g('man-qty').value),p=manNum(g('man-price').value),n=manNum(g('man-nkd').value);
     const unit=MAN.pick&&MAN.pick.pct?p*(MAN.pick.nominal||1000)/100:p;
     if(q&&p)g('man-amount').value=(+(q*unit+n).toFixed(2)).toString();
@@ -34703,12 +35886,23 @@ async function manualOpen(row){
   ov.addEventListener('mousedown',e=>{if(e.target===ov)manClose()});
   g('man-save').onclick=async e=>{
     const b=e.currentTarget,er=g('man-err');er.style.display='none';
-    const pos=mode()==='position',k=pos?'buy':g('man-kind').value,typed=g('man-q').value.trim();
-    const pk=MAN.pick||{ident:typed.toUpperCase().replace(/\s+/g,''),ticker:'',name:typed};
-    const unit=MAN.pick&&MAN.pick.pct?manNum(g('man-price').value)*(MAN.pick.nominal||1000)/100:manNum(g('man-price').value);
-    const body={acc:g('man-acc').value,acc_name:g('man-accname').value,group:ed?ed.group:'',mode:pos?'position':'op',kind:k,date:g('man-date').value||undefined,
-      ident:pk.ident,ticker:pk.ticker,name:pk.name,qty:g('man-qty').value,price:unit||'',amount:g('man-amount').value,nkd:manNum(g('man-nkd').value)||'',
-      commission:g('man-comm').value,autocash:g('man-cash').checked};
+    const md=mode(),ext=md==='asset_ext',pos=md==='position';
+    let body;
+    if(ext){
+      const ek=g('man-ext-kind').value,ekLab=(MAN_EXT_KINDS.find(x=>x[0]===ek)||['','Актив'])[1];
+      const enm=g('man-ext-name').value.trim()||ekLab;
+      const amt=manNum(g('man-amount').value);
+      const ident=(ed&&ed.ident&&/^EXT:/i.test(ed.ident))?ed.ident:('EXT:'+ek.toUpperCase()+':'+Date.now().toString(36).slice(-6).toUpperCase());
+      body={acc:g('man-acc').value,acc_name:g('man-accname').value||'Внебиржевые активы',group:ed?ed.group:'',mode:'position',kind:'buy',
+        date:g('man-date').value||undefined,ident,ticker:'',name:enm,qty:'1',price:amt||'',amount:amt||'',currency:g('man-ext-cur').value||'rub',autocash:true};
+    }else{
+      const k=pos?'buy':g('man-kind').value,typed=g('man-q').value.trim();
+      const pk=MAN.pick||{ident:typed.toUpperCase().replace(/\s+/g,''),ticker:'',name:typed};
+      const unit=MAN.pick&&MAN.pick.pct?manNum(g('man-price').value)*(MAN.pick.nominal||1000)/100:manNum(g('man-price').value);
+      body={acc:g('man-acc').value,acc_name:g('man-accname').value,group:ed?ed.group:'',mode:pos?'position':'op',kind:k,date:g('man-date').value||undefined,
+        ident:pk.ident,ticker:pk.ticker,name:pk.name,qty:g('man-qty').value,price:unit||'',amount:g('man-amount').value,nkd:manNum(g('man-nkd').value)||'',
+        commission:g('man-comm').value,autocash:g('man-cash').checked};
+    }
     b.disabled=true;
     try{await post('/api/ops/manual',body);manClose();S.data=S.bonds=S.hist=null;toast('Запись сохранена.','ok');
       if(S.page==='ops'||S.page==='imp'){S.page==='imp'?renderImport():manualDrawList()}load(true)}
@@ -34721,8 +35915,8 @@ async function manualDrawList(){
   try{const r=await api('/api/ops/manual');MAN.rows=r.rows;
     if(!r.rows.length){box.innerHTML='';return}
     const T={buy:'Покупка',sell:'Продажа',coupons:'Купон',dividends:'Дивиденд',deposits:'Пополнение',withdrawals:'Вывод',fee_service:'Комиссия',fee_broker:'Комиссия'};
-    box.innerHTML=`<div class="card"><h2>Ручные записи<span class="sp">${r.rows.length}</span></h2><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Операция</th><th class="l">Бумага</th><th class="l">Счёт</th><th>Кол-во</th><th>Сумма</th><th></th></tr></thead><tbody>${
-      r.rows.slice(0,100).map((x,i)=>`<tr><td class="l num t2">${esc(x.date)}</td><td class="l"><span class="tag">${esc(x.position?'Позиция':T[x.type]||x.type)}</span></td><td class="l">${esc(x.name)}</td><td class="l t2">${esc(x.acc_name||'')}</td><td class="num">${x.qty||''}</td><td class="num">${f2(x.amount)}</td><td class="num"><button class="btn ghost" data-me="${i}">Изменить</button> <button class="btn ghost danger" data-md="${i}">Удалить</button></td></tr>`).join('')}</tbody></table></div></div>`;
+    box.innerHTML=`<div class="card"><h2>Ручные записи<span class="sp">${r.rows.length}</span></h2><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Операция</th><th class="l">Бумага / актив</th><th class="l">Счёт</th><th>Кол-во</th><th>Сумма</th><th></th></tr></thead><tbody>${
+      r.rows.slice(0,100).map((x,i)=>{const isExt=/^EXT:/i.test(x.ident||'');return`<tr><td class="l num t2">${esc(x.date)}</td><td class="l"><span class="tag">${esc(isExt?'Внебиржевой актив':x.position?'Позиция':T[x.type]||x.type)}</span></td><td class="l">${esc(x.name)}</td><td class="l t2">${esc(x.acc_name||'')}</td><td class="num">${isExt?'—':(x.qty||'')}</td><td class="num">${f2(x.amount)}</td><td class="num"><button class="btn ghost" data-me="${i}">Изменить</button> <button class="btn ghost danger" data-md="${i}">Удалить</button></td></tr>`}).join('')}</tbody></table></div></div>`;
     box.onclick=async e=>{
       const be=e.target.closest('[data-me]'),bd=e.target.closest('[data-md]');
       if(be)return manualOpen(MAN.rows[+be.dataset.me]);
@@ -34750,12 +35944,14 @@ const ST_ICO={
  check:'<path d="M5 12.5l4.5 4.5L19 7.5"/>',
  srv:'<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
  tg:'<path d="M21 4L3 11l6 2.5L11.5 20l3-4.5L19 19z"/><path d="M9 13.5L21 4"/>',
+ lock:'<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
  search:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>'};
 const stIco=(k,sw)=>svgI(ST_ICO[k],sw||1.8);
 const SET_TOC=[['set-conn','Подключение','conn','Токен Т-Инвестиций и сервер данных'],
   ['set-acc','Аккаунт','acc','Вход по ключу и уведомления в Telegram'],
-  ['set-look','Внешний вид','look','Тема, напоминания и разделы меню'],
-  ['set-calc','Расчёты','calc','Прогноз ключевой ставки и сбор раскрытий'],
+  ['set-sec','Безопасность','lock','Блокировка при входе, PIN-код и биометрия'],
+  ['set-look','Внешний вид','look','Тема, запуск, напоминания и разделы меню'],
+  ['set-calc','Расчёты','calc','Прогноз ключевой ставки, мониторинг и раскрытия'],
   ['set-local','Данные','local','Хранилище, резервные копии и экспорт'],
   ['set-news','Что нового','news','Версия программы, изменения и планы'],
   ['set-danger','Опасная зона','danger','Очистка и удаление данных']];
@@ -34790,14 +35986,32 @@ function stMsg(t,ok,mini){
   h.innerHTML=`<div class="msg ${ok?'ok':'err'}${mini?' mini':''}" role="${ok?'status':'alert'}">${esc(t)}</div>`;
   clearTimeout(h._t);h._t=setTimeout(()=>{h.innerHTML=''},mini?1600:ok?4500:9000);
 }
-/* кнопка «Сохранить» активна, только когда поля изменились */
+/* кнопка «Сохранить» активна, только когда поля изменились; плавающая панель отслеживает все несохранённые блоки */
+const ST_DIRTY_REG=[];
+function stDirtyReset(){ST_DIRTY_REG.length=0;stDirtyBarUpdate()}
+function stDirtyBarUpdate(){
+  const bar=document.getElementById('st-dirty-bar');if(!bar)return;
+  const dirty=ST_DIRTY_REG.some(x=>x.isDirty());
+  bar.hidden=!dirty;
+}
 function stDirty(btn,ids){
   const g=id=>document.getElementById(id),b=typeof btn==='string'?g(btn):btn;
-  const els=ids.map(g).filter(Boolean);if(!b)return{rebase(){},upd(){}};
+  const els=ids.map(g).filter(Boolean);if(!b)return{rebase(){},upd(){},reset(){}};
   const snap=()=>els.map(e=>e.type==='checkbox'?e.checked:stSecVal(e)).join('\u0001');
-  let base=snap();const upd=()=>{b.disabled=snap()===base};
+  const cap=()=>els.map(e=>e.type==='checkbox'?e.checked:e.value);
+  let base=snap(),baseVals=cap();
+  const upd=()=>{b.disabled=snap()===base;stDirtyBarUpdate()};
+  const reset=()=>{
+    els.forEach((e,i)=>{
+      if(e.type==='checkbox')e.checked=!!baseVals[i];
+      else{e._stRev=null;e.value=baseVals[i]??''}
+    });
+    upd();
+  };
   els.forEach(e=>{e.addEventListener('input',upd);e.addEventListener('change',upd)});b.disabled=true;
-  return{rebase(){base=snap();upd()},upd};
+  const entry={btn:b,els,isDirty:()=>snap()!==base,reset,save(){if(!b.disabled)b.click()}};
+  ST_DIRTY_REG.push(entry);
+  return{rebase(){base=snap();baseVals=cap();upd()},upd,reset};
 }
 function stEnter(ids,btn){ids.forEach(id=>{const e=document.getElementById(id);if(e)e.addEventListener('keydown',ev=>{if(ev.key!=='Enter'||ev.isComposing)return;const b=document.getElementById(btn);if(b&&!b.disabled){ev.preventDefault();b.click()}})})}
 /* показать/скрыть и скопировать для полей с секретом.
@@ -34892,6 +36106,7 @@ function setLocalHtml(c){
     stRow('Папка с данными','Операции, история цен, справочник бумаг, логотипы и настройки — всё лежит здесь и в интернет не отправляется',`<span class="mono ld-path" id="ld-dir">${esc(c.data_dir)}</span><button class="btn ghost" id="ld-open">Открыть папку</button>`,{stack:1})+
     `<div class="st-pad"><div id="ld-parts" class="ld-parts"><div class="note">Считаю размер…</div></div></div>`+
     stRow('Перезагрузить данные из API','Заново загрузить операции и цены из Т-Инвестиций (может занять время)',`<button class="btn ghost" id="cache">Перезагрузить</button>`)+
+    stRow('Сжать базу данных (VACUUM)','Убирает пустое место в файле базы после очистки кэша и старых записей',`<button class="btn ghost" id="ld-vac">Сжать базу (VACUUM)</button>`)+
     stRow('Простая копия (zip)','База и настройки, токен в неё не входит. Копии по расписанию — ниже',`<a class="btn ghost" href="/api/backup" download>Скачать zip</a>`),
     {id:'ld-card',hint:'на этом компьютере'});
 }
@@ -34914,6 +36129,12 @@ function bindSetLocal(c,msg,busy,reset){
   const g=id=>document.getElementById(id);
   ldLoad();
   g('ld-open').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/localdata/open')});
+  if(g('ld-vac'))g('ld-vac').onclick=e=>busy(e.currentTarget,async()=>{
+    const r=await post('/api/localdata/vacuum');
+    stOk(g('ld-vac'));
+    msg('База сжата'+(r&&r.freed?', освобождено '+ldBytes(r.freed):'')+'.',1);
+    ldLoad();
+  });
   g('ld-clear').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Очистить кэш?', body:'Будут удалены логотипы и временные данные рынка — они скачаются заново. Операции, настройки, токен и список наблюдения останутся.', okText:'Очистить'}))return;
     const r=await post('/api/localdata/clear');reset();msg('Кэш очищен, освобождено '+ldBytes(r.freed)+'.',1);ldLoad()});
   g('ld-wipe').onclick=e=>busy(e.currentTarget,async()=>{
@@ -34943,6 +36164,90 @@ async function bindSetAcc(msg){
   const out=document.getElementById('acc-out');
   if(out&&s&&s.state==='ok'&&(s.username||s.expires)){out.style.display='';
     out.onclick=async()=>{try{if(!await uiConfirm({title:'Выйти и стереть ключ?', body:'Ключ будет удалён с этого компьютера, для нового входа понадобится ключ из бота.', danger:true, okText:'Выйти'}))return;AUTH.st=await post('/api/auth/logout');authApply()}catch(e){msg(e.message)}}}
+}
+/* ── Безопасность (блокировка входа по PIN и биометрии) ── */
+function setLockHtml(c){
+  const bioLabel=IS_MAC?'Вход по Touch ID':IS_WIN?'Вход через Windows Hello':'Вход по биометрии';
+  const bioHint=IS_MAC?'Разблокировка по отпечатку пальца на Mac':IS_WIN?'Разблокировка через Windows Hello':'Системная биометрия устройства';
+  return stGroup('Блокировка при входе',
+    stRow('Блокировка при входе (Touch ID / Windows Hello / PIN)','Запрашивать подтверждение при запуске программы и доступе к портфелю (по умолчанию выключена)',stSw('lk-en',!!c.lock_enabled,'Блокировка при входе'))+
+    stRow('PIN-код','От 4 до 12 цифр · <span id="lk-pin-st" class="mu">проверяю…</span>',`<div class="st-lock-pin"><input class="in mono st-num" type="password" inputmode="numeric" id="lk-pin" placeholder="новый PIN" autocomplete="new-password" maxlength="12" aria-label="PIN-код"><button class="btn" id="lk-pin-save" disabled>Сохранить PIN</button></div>`)+
+    stRow(bioLabel,bioHint,stSw('lk-bio',c.lock_bio!==false,'Биометрия'))+
+    stRow('Проверка и защита','',`<button class="btn ghost" id="lk-bio-test">Проверить биометрию</button><button class="btn ghost" id="lk-now">Заблокировать сейчас</button>`),
+    {id:'lk-card',hint:c.lock_enabled?'<span class="pos">включена</span>':'выключена',q:'безопасность блокировка вход pin пин touch id windows hello биометрия'});
+}
+async function bindSetLock(c,msg){
+  const g=id=>document.getElementById(id);if(!g('lk-card'))return;
+  const dPin=stDirty('lk-pin-save',['lk-pin']);
+  stEnter(['lk-pin'],'lk-pin-save');
+  const saveLock=async(payload)=>{
+    try{return await post('/api/lock/settings',payload)}
+    catch(e){
+      if(/404|not found/i.test(String(e.message||''))){
+        const cfgP={};
+        if('enabled' in payload)cfgP.lock_enabled=payload.enabled;
+        if('bio_enabled' in payload)cfgP.lock_bio=payload.bio_enabled;
+        if('pin' in payload)cfgP.lock_pin=payload.pin;
+        return await post('/api/config',cfgP);
+      }
+      throw e;
+    }
+  };
+  const applySt=s=>{
+    if(!s)return;
+    if(s.enabled!=null)g('lk-en').checked=!!s.enabled;
+    if(s.bio_enabled!=null)g('lk-bio').checked=!!s.bio_enabled;
+    const pst=g('lk-pin-st');
+    if(pst)pst.innerHTML=s.has_pin?'<span class="pos">PIN задан</span>':'PIN не задан';
+    const bioAv=s.bio_available!==false;
+    g('lk-bio').disabled=!bioAv;
+    g('lk-bio-test').disabled=!bioAv;
+    const h=g('lk-card').querySelector('.st-gh span');
+    if(h)h.innerHTML=g('lk-en').checked?'<span class="pos">включена</span>':'выключена';
+  };
+  api('/api/lock/status').then(s=>{applySt(s)}).catch(()=>{
+    const pst=g('lk-pin-st');if(pst)pst.textContent=c.secret_set&&c.secret_set.lock_pin?'PIN задан':'PIN не задан';
+  });
+  g('lk-en').onchange=async e=>{
+    const el=e.currentTarget,on=el.checked;
+    try{
+      const r=await saveLock({enabled:on});
+      c.lock_enabled=on;applySt(r);stOk(el);
+      msg(on?'Блокировка при входе включена.':'Блокировка при входе выключена.',1);
+    }catch(x){el.checked=!on;msg(x.message)}
+  };
+  g('lk-bio').onchange=async e=>{
+    const el=e.currentTarget,on=el.checked;
+    try{
+      const r=await saveLock({bio_enabled:on});
+      c.lock_bio=on;applySt(r);stOk(el);
+    }catch(x){el.checked=!on;msg(x.message)}
+  };
+  g('lk-pin-save').onclick=async e=>{
+    const b=e.currentTarget,pin=(g('lk-pin').value||'').trim();
+    if(pin.length<4){msg('PIN-код должен содержать минимум 4 символа.');return}
+    b.disabled=true;
+    try{
+      const r=await saveLock({pin});
+      g('lk-pin').value='';dPin.rebase();applySt(Object.assign({has_pin:true},r));stOk(b);msg('PIN-код сохранён.',1);
+    }catch(x){msg(x.message);dPin.upd()}
+  };
+  g('lk-bio-test').onclick=async e=>{
+    const b=e.currentTarget;b.disabled=true;
+    try{
+      let r;
+      try{r=await post('/api/lock/bio/test',{})}
+      catch(err){if(/404|not found/i.test(String(err.message||'')))r=await post('/api/lock/unlock',{method:'bio',test:true});else throw err}
+      msg(r&&r.ok===false?(r.error||'Биометрия не подтверждена.'):'Биометрия подтверждена.',r&&r.ok!==false?1:0);
+    }catch(x){msg(x.message)}finally{b.disabled=false}
+  };
+  g('lk-now').onclick=async e=>{
+    const b=e.currentTarget;b.disabled=true;
+    try{
+      try{await post('/api/lock/lock',{})}catch(err){if(!/404|not found/i.test(String(err.message||'')))throw err}
+      if(typeof lockShow==='function')lockShow({enabled:true,bio_enabled:g('lk-bio').checked});
+    }catch(x){msg(x.message)}finally{b.disabled=false}
+  };
 }
 /* ── Настройки: Telegram, резервная копия, экспорт, помощь с раскрытиями (строки-настройки, мгновенное сохранение) ── */
 /* ── Telegram: уведомления идут через сервер данных и общего бота ── */
@@ -35069,6 +36374,7 @@ function setCrowdHtml(c){
   return stGroup('Помощь в сборе раскрытий',
     stRow('Помогать собирать раскрытия эмитентов','Работает только пока программа открыта и подключён сервер данных',stSw('crowd-on',false,'Помогать собирать раскрытия эмитентов'))+
     `<p class="st-line" id="crowd-info">Загружаю…</p>`+
+    `<details class="st-more" id="crowd-log-det" data-q="журнал сбор раскрытия лог"><summary>Журнал сбора раскрытий</summary><div id="crowd-log-body"><span class="mu">Откройте, чтобы загрузить последние записи…</span></div></details>`+
     stMore('Как это работает','Включено по умолчанию. Сообщения эмитентов о купонах, выкупах и дефолтах лежат на сайте e-disclosure.azipi.ru, а наш сервер данных его открыть не может. <b>Пока программа открыта</b>, она скачивает публичные страницы этого сайта <b>с вашего интернет-подключения — примерно одну страницу раз в 15 секунд</b> — и отправляет их на сервер данных. Так все пользователи видят купоны, выкупы и дефолты по своим облигациям. Токен, портфель и другие ваши данные не отправляются; в страницах только то, что видно любому посетителю сайта. Сайт видит ваш IP-адрес, как при обычном заходе в браузере. При ошибках сайта программа делает паузу на 30 минут. Выключить можно в любой момент.'),
     {id:'crowd-card',hint:'',hintId:'crowd-sp'});
 }
@@ -35080,6 +36386,23 @@ async function bindSetCrowd(c,msg){
     document.getElementById('crowd-sp').textContent=s.enabled?stt:'выключено';
     document.getElementById('crowd-info').innerHTML=`Отправлено страниц, принятых сервером: <b>${s.accepted}</b>${s.fetched?` (скачано ${s.fetched})`:''}.${s.enabled?` Состояние: ${esc(stt)}${s.message?' — '+esc(s.message):''}.`:''}${!s.available?' Подключите сервер данных и войдите по ключу — без этого помощь не работает.':''}`;
     clearTimeout(CROWD.t);if(s.enabled)CROWD.t=setTimeout(show,5000)};
+  const loadLog=async()=>{
+    const body=document.getElementById('crowd-log-body');if(!body)return;
+    body.innerHTML='<span class="mu">Загружаю журнал…</span>';
+    try{
+      const r=await api('/api/crowd/log');
+      const rows=Array.isArray(r)?r:(r&&Array.isArray(r.items)?r.items:(r&&Array.isArray(r.log)?r.log:[]));
+      if(!rows.length){body.innerHTML='<span class="mu">Записей пока нет.</span>';return}
+      body.innerHTML=`<div class="crowd-log">${rows.slice(0,40).map(x=>{
+        const ts=x.ts||x.at||x.time;const tm=typeof ts==='number'?new Date(ts*1000).toLocaleTimeString('ru-RU'):esc(String(ts||''));
+        const ok=x.ok!==false&&x.status!=='err'&&x.status!=='error';
+        const txt=x.message||x.msg||x.url||x.kind||x.status||'Принято';
+        return`<div class="crowd-log-r"><span class="mono mu">${tm}</span><span class="${ok?'pos':'neg'}">${esc(String(x.status||(ok?'Готово':'Ошибка')))}</span><span>${esc(String(txt))}</span></div>`;
+      }).join('')}</div>`;
+    }catch(e){body.innerHTML=`<span class="neg">${esc(e.message)}</span>`}
+  };
+  const det=document.getElementById('crowd-log-det');
+  if(det)det.addEventListener('toggle',()=>{if(det.open)loadLog()});
   on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});stOk(on);msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
   show();
 }
@@ -35179,6 +36502,7 @@ function setNewsHtml(c){
 }
 async function renderSettings(){
   S.charts=[];
+  stDirtyReset();
   const view=$('#view'),keep=view.querySelector('.st')?view.scrollTop:0;
   try{S.cfg=await api('/api/config')}catch(e){view.innerHTML=`<div class="wrap"><div class="msg err">${esc(e.message)}</div></div>`;return}
   const c=S.cfg;
@@ -35204,21 +36528,31 @@ async function renderSettings(){
   const perm=('Notification' in window)?Notification.permission:'unsupported';
   const look=stGroup('Тема оформления',
     `<div class="st-pad"><div class="st-themes" id="thsel" role="group" aria-label="Тема оформления">${themes.map(([k,t,d])=>`<button type="button" data-t="${k}" class="${th===k?'on':''}" aria-pressed="${th===k}">${k==='auto'?`<span class="th-prev th-auto">${prev('dark')}${prev('light')}</span>`:prev(k)}<span class="th-n"><b>${t}</b>${d?`<small>${d}</small>`:''}</span><em class="th-c">${stIco('check',2.6)}</em></button>`).join('')}</div></div>`,{hint:'применяется сразу',q:'светлая тёмная авто оформление'})+
-    stGroup('Акцент и плотность',
+    stGroup('Акцент, плотность и запуск',
     stRow('Акцентный цвет','Цвет кнопок, ссылок и выделений во всей программе',`<div class="st-acc" id="accsel" role="group" aria-label="Акцентный цвет">${ACCENTS.map(([k,t,c])=>`<button type="button" data-a="${k}" class="${curAccent()===k?'on':''}" aria-pressed="${curAccent()===k}" title="${t}" style="--sw:${c}"><i></i><span>${t}</span></button>`).join('')}</div>`)+
-    stRow('Плотность интерфейса','Компактная убирает лишние отступы: на экране помещается больше строк',`<div class="st-acc st-dens" id="denssel" role="group" aria-label="Плотность интерфейса">${[['comfort','Комфортная'],['compact','Компактная']].map(([k,t])=>`<button type="button" data-d="${k}" class="${curDensity()===k?'on':''}" aria-pressed="${curDensity()===k}"><span>${t}</span></button>`).join('')}</div>`),
-    {hint:'внешний вид',q:'акцент цвет плотность компактная комфортная синий изумрудный графит фиолетовый'})+
+    stRow('Плотность интерфейса','Компактная убирает лишние отступы: на экране помещается больше строк',`<div class="st-acc st-dens" id="denssel" role="group" aria-label="Плотность интерфейса">${[['comfort','Комфортная'],['compact','Компактная']].map(([k,t])=>`<button type="button" data-d="${k}" class="${curDensity()===k?'on':''}" aria-pressed="${curDensity()===k}"><span>${t}</span></button>`).join('')}</div>`)+
+    stRow('Стартовый экран при запуске','Какой раздел открывать при запуске программы, если не открыт другой экран',`<select class="in st-sel" id="start-page" aria-label="Стартовый экран при запуске">${[['dash','Обзор'],['bonds','Облигации'],['scr','Скринер'],['cal','Календарь']].map(([k,t])=>`<option value="${k}" ${(c.start_page||'dash')===k?'selected':''}>${t}</option>`).join('')}</select>`),
+    {hint:'внешний вид',q:'акцент цвет плотность компактная комфортная синий изумрудный графит фиолетовый стартовый экран запуск обзор облигации скринер календарь'})+
     stGroup('Напоминания',
     stRow('Напоминать о выплатах','За сколько дней предупреждать на «Обзоре» и в «Выплатах» (0 — выключить)',`<input class="in num st-num" id="nd" type="number" min="0" max="60" value="${c.notify_days??7}" aria-label="За сколько дней напоминать о выплатах"><span class="st-unit">дн.</span>`)+
     stRow('Системные уведомления','Приходят, пока программа открыта',`<span class="st-who" id="ntf-st">${perm==='granted'?'Разрешены':perm==='denied'?'Запрещены в браузере':perm==='unsupported'?'Не поддерживаются':'Не разрешены'}</span><button class="btn ghost" id="ntf" ${perm==='granted'||perm==='unsupported'?'disabled':''}>Разрешить</button>`)+
+    stRow('Проверка уведомлений','Покажет тестовое сообщение на экране, системное уведомление и проверку Telegram (если включён)',`<button class="btn ghost" id="ntf-test">Проверить уведомления</button>`)+
     stMore('Печать отчёта','Кнопка PDF сверху → «Сохранить как PDF»: печатается текущий раздел и период.'),{hint:'выплаты и уведомления'})+
     setMenuHtml();
   /* расчёты */
+  const monTh=stGroup('Пороги мониторинга',
+    stRow('Падение цены за 5 дней, %','Порог средней тревоги (вдвое больше — высокая)',`<input class="in num st-num" id="st-mon-drop5" type="number" min="0.1" max="50" step="0.5" value="${c.mon_drop5??3}" aria-label="Падение цены за 5 дней, %">`)+
+    stRow('Падение цены за 30 дней, %','Порог средней тревоги за месяц',`<input class="in num st-num" id="st-mon-drop30" type="number" min="0.1" max="90" step="0.5" value="${c.mon_drop30??7}" aria-label="Падение цены за 30 дней, %">`)+
+    stRow('Рост спреда за 30 дней, п.п.','Расширение спреда к КБД',`<input class="in num st-num" id="st-mon-spread30" type="number" min="0.1" max="50" step="0.5" value="${c.mon_spread30??2}" aria-label="Рост спреда за 30 дней, п.п.">`)+
+    stRow('Неликвид: дней на продажу более','Порог уведомления о низкой ликвидности',`<input class="in num st-num" id="st-mon-sell" type="number" min="0.5" max="365" step="0.5" value="${c.mon_sell_days??5}" aria-label="Дней на продажу">`)+
+    stRow('Оферта: за сколько дней предупреждать','Горизонт напоминаний по офертам',`<input class="in num st-num" id="st-mon-offer" type="number" min="1" max="365" step="1" value="${c.mon_offer_days??30}" aria-label="Дней до оферты">`)+
+    stRow('Действия','',`<button class="btn" id="mon-cfg-save" disabled>Сохранить пороги</button>`),
+    {id:'st-mon-card',hint:'тревоги по облигациям',q:'мониторинг пороги падение спред неликвид оферта'});
   const calc=stGroup('Прогноз ключевой ставки',
     stRow('Источник прогноза','Для флоатеров: ставка не объявленных купонов = ключевая на начало периода + спред эмитента',`<select class="in st-sel" id="krmode" aria-label="Источник прогноза ключевой ставки">${[['cbr','Прогноз Банка России (по умолчанию)'],['survey','Опрос аналитиков Банка России'],['market','Рынок: форварды КБД'],['flat','Без изменений (текущая ставка)']].map(([k,t])=>`<option value="${k}" ${(c.keyrate_mode||'cbr')===k?'selected':''}>${t}</option>`).join('')}</select>`)+
     `<p class="st-line" id="krinfo">Загружаю…</p>`+
     stMore('Чем отличаются источники','«Прогноз Банка России» — среднесрочный прогноз ЦБ (середина диапазона средней ставки за год), «Опрос» — медиана макроопроса аналитиков, «КБД» — форвардные ставки кривой за вычетом срочной премии (грубо), «Без изменений» — текущая ставка. Если выбранный источник недоступен, берётся следующий по списку.'),
-    {hint:'для флоатеров'})+setCrowdHtml(c);
+    {hint:'для флоатеров'})+monTh+setCrowdHtml(c);
   const sec=(i,body)=>stSec(SET_TOC[i][0],SET_TOC[i][1],SET_TOC[i][3],SET_TOC[i][2],body);
   view.innerHTML=`<div class="st fade">
   <aside class="st-side" aria-label="Навигация по настройкам">
@@ -35232,8 +36566,9 @@ async function renderSettings(){
     <div class="msg info" id="st-empty" hidden>Ничего не найдено. Попробуйте другое слово, например «токен», «тема» или «копия».</div>
   </div></div>`;
   const main=document.getElementById('st-main');
-  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)+setSyncHtml(c)),
-    sec(5,setNewsHtml(c)),sec(6,setDangerHtml(c))];
+  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,setLockHtml(c)),sec(3,look),sec(4,calc),sec(5,setLocalHtml(c)+setBackupHtml(c)+setSyncHtml(c)),
+    sec(6,setNewsHtml(c)),sec(7,setDangerHtml(c)),
+    `<div class="st-dirty-bar" id="st-dirty-bar" hidden role="region" aria-label="Несохранённые изменения"><span>Есть несохранённые изменения</span><div class="row"><button type="button" class="btn ghost" id="st-dirty-cancel">Отменить</button><button type="button" class="btn" id="st-dirty-save">Сохранить</button></div></div>`];
   main.insertAdjacentHTML('beforeend',html.join(''));
   if(keep){view.scrollTop=keep;const st=view.querySelector('.st');if(st)st.classList.remove('fade')}
   stSecretBind(main);
@@ -35264,6 +36599,33 @@ async function renderSettings(){
   $('#ntf').onclick=async()=>{try{if(!('Notification' in window))return msg('Браузер не поддерживает уведомления');const r=await Notification.requestPermission();
     $('#ntf-st').textContent=r==='granted'?'Разрешены':r==='denied'?'Запрещены в браузере':'Не разрешены';if(r==='granted')$('#ntf').disabled=true;
     msg(r==='granted'?'Уведомления разрешены':'Уведомления не разрешены',r==='granted')}catch(e){msg(e.message)}};
+  $('#start-page').onchange=async e=>{const el=e.currentTarget;try{await post('/api/config',{start_page:el.value});if(S.cfg)S.cfg.start_page=el.value;stOk(el)}catch(x){msg(x.message)}};
+  $('#ntf-test').onclick=async e=>{
+    const b=e.currentTarget;b.disabled=true;
+    try{
+      if(typeof toast==='function')toast('Тестовое уведомление работает','ok',4000);
+      else msg('Тестовое уведомление работает',1);
+      if('Notification' in window){
+        let permN=Notification.permission;
+        if(permN==='default')try{permN=await Notification.requestPermission();$('#ntf-st').textContent=permN==='granted'?'Разрешены':permN==='denied'?'Запрещены в браузере':'Не разрешены';if(permN==='granted')$('#ntf').disabled=true}catch(_){}
+        if(permN==='granted')try{new Notification('TAnalytic: проверка уведомлений',{body:'Системные уведомления работают корректно.'})}catch(_){}
+      }
+      if(typeof isPro==='function'&&isPro()&&c.tg_enabled){
+        try{await post('/api/tg/test');msg('Тестовое уведомление отправлено на экран и в Telegram.',1)}
+        catch(te){msg('Локальное уведомление работает; Telegram: '+te.message)}
+      }
+    }finally{b.disabled=false}
+  };
+  const dMon=stDirty('mon-cfg-save',['st-mon-drop5','st-mon-drop30','st-mon-spread30','st-mon-sell','st-mon-offer']);
+  stEnter(['st-mon-drop5','st-mon-drop30','st-mon-spread30','st-mon-sell','st-mon-offer'],'mon-cfg-save');
+  $('#mon-cfg-save').onclick=async e=>{
+    const b=e.currentTarget;b.disabled=true;
+    const p={mon_drop5:$('#st-mon-drop5').value,mon_drop30:$('#st-mon-drop30').value,mon_spread30:$('#st-mon-spread30').value,mon_sell_days:$('#st-mon-sell').value,mon_offer_days:$('#st-mon-offer').value};
+    try{await post('/api/config',p);Object.assign(c,p);S.mon=null;dMon.rebase();stOk(b);msg('Пороги мониторинга сохранены.',1)}
+    catch(x){msg(x.message);dMon.upd()}
+  };
+  $('#st-dirty-cancel').onclick=()=>{ST_DIRTY_REG.forEach(x=>{if(x.isDirty())x.reset()});msg('Изменения отменены',1,true)};
+  $('#st-dirty-save').onclick=()=>{ST_DIRTY_REG.forEach(x=>{if(x.isDirty())x.save()})};
   try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
@@ -35271,6 +36633,7 @@ async function renderSettings(){
   try{bindSetCrowd(c,msg)}catch(e){}
   try{bindSetShell(msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
+  try{bindSetLock(c,msg)}catch(e){}
   /* адреса API, сертификат и проверка SSL больше не редактируются в окне: в настройках остаются как были */
   const body=()=>({token:stSecVal('tok'),sandbox:$('#sb').checked});
   const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
@@ -35353,7 +36716,7 @@ function bindSetSync(c,msg){
 /* ── тема, печать ── */
 function themeNow(t){return t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}
 let _thmT=0;
-function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}const h=document.documentElement;h.classList.add('thm-anim');clearTimeout(_thmT);_thmT=setTimeout(()=>h.classList.remove('thm-anim'),260);h.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t;thmLabel();nativeTheme()}
+function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}const h=document.documentElement;h.classList.add('thm-anim');clearTimeout(_thmT);_thmT=setTimeout(()=>h.classList.remove('thm-anim'),260);h.dataset.theme=themeNow(t);if(S.cfg)S.cfg.theme=t;thmLabel();nativeTheme();if(typeof uiPrefsSaveSoon==='function')uiPrefsSaveSoon()}
 /* окно программы (pywebview): системная шапка Windows в тон теме */
 function nativeTheme(){try{const a=window.pywebview&&pywebview.api;if(a&&a.set_theme)a.set_theme(document.documentElement.dataset.theme==='light'?'light':'dark')}catch(e){}}
 window.addEventListener('pywebviewready',nativeTheme);
@@ -35361,10 +36724,10 @@ window.addEventListener('pywebviewready',nativeTheme);
 const ACCENTS=[['blue','Синий','#3b82f6'],['emerald','Изумрудный','#10b981'],['graphite','Графит','#64748b'],['violet','Фиолетовый','#8b5cf6']];
 function curAccent(){let a='blue';try{a=localStorage.getItem('ta_accent')||'blue'}catch(e){}return ACCENTS.some(x=>x[0]===a)?a:'blue'}
 function curDensity(){let d='comfort';try{d=localStorage.getItem('ta_density')||'comfort'}catch(e){}return d==='compact'?'compact':'comfort'}
-function applyAccent(a){try{localStorage.setItem('ta_accent',a)}catch(e){}const h=document.documentElement;if(a==='blue')delete h.dataset.accent;else h.dataset.accent=a}
-function applyDensity(d){try{localStorage.setItem('ta_density',d)}catch(e){}const h=document.documentElement;if(d==='compact')h.dataset.density='compact';else delete h.dataset.density}
+function applyAccent(a){try{localStorage.setItem('ta_accent',a)}catch(e){}const h=document.documentElement;if(a==='blue')delete h.dataset.accent;else h.dataset.accent=a;if(typeof uiPrefsSaveSoon==='function')uiPrefsSaveSoon()}
+function applyDensity(d){try{localStorage.setItem('ta_density',d)}catch(e){}const h=document.documentElement;if(d==='compact')h.dataset.density='compact';else delete h.dataset.density;if(typeof uiPrefsSaveSoon==='function')uiPrefsSaveSoon()}
 function thmLabel(){const e=document.getElementById('thm-t');if(e)e.textContent=document.documentElement.dataset.theme==='light'?'Тёмная тема':'Светлая тема'}
-function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
+function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&((S.cfg.ui_prefs&&S.cfg.ui_prefs.theme)||S.cfg.theme))||'auto'}catch(e){}return t}
 // один клик = видимая смена: от того, что сейчас на экране (раньше цикл auto→light→dark→auto при тёмной системе давал «пустой» клик dark→auto)
 $('#thm').onclick=()=>{const n=document.documentElement.dataset.theme==='light'?'dark':'light';applyTheme(n);post('/api/config',{theme:n}).catch(()=>{});render()};
 thmLabel();
@@ -35590,7 +36953,26 @@ function inflWeekHtml(){
     <p class="note">Росстат, оценка индекса потребительских цен за неделю (к предыдущей дате регистрации). Данные с ${x.history_from?esc(ddm(x.history_from)+' '+x.history_from.slice(0,4)):'—'}${(x.avg||[]).length?'; пунктир — среднее за '+esc(x.avg_label)+' по номеру недели':'; для среднего за 2017–2021 в архиве Росстата нет доступных заметок'}.${x.loading?' Историю ещё докачиваю…':''}</p></div>`;
 }
 /* ── Ребалансировка + Снежный ком купонов (безналоговая ребалансировка, #9) ── */
-S.reb={contrib:'',monthly:'',buyOnly:true,draft:null,tax:null};S.payDays=90;
+S.reb={contrib:'',monthly:'',buyOnly:true,draft:null,tax:null,lvl:lsGet('ta_reb_lvl')||'class',rtDraft:lsJson('ta_reb_rt',null),secDraft:lsJson('ta_reb_sec',null)};S.payDays=90;
+const REB_RT_BUCKETS=['AAA','AA','A','BBB','BB и ниже','Без рейтинга'];
+function rebRtBucket(r){
+  if(!r||!r.rating||!r.rating.v)return'Без рейтинга';
+  const bk=rBucket(r.rating.v).split(' ')[0];
+  if(bk==='AAA'||bk==='AA'||bk==='A'||bk==='BBB')return bk;
+  return'BB и ниже';
+}
+function rebGoScreener(opts){
+  const f=Object.assign({},SCR_DEF,{cur:'RUB'});
+  if(opts.rmin)f.rmin=opts.rmin;
+  if(opts.kind)f.kind=opts.kind;
+  S.sf=f;S.scrPreset='';S.scrOpen=true;
+  if(opts.amt>0)toast('Подбор облигаций на '+M(opts.amt,'rub',0));
+  go('scr');
+}
+function rebScrBtn(kindKey,amt,label){
+  if(!(amt>100))return'';
+  return` <button type="button" class="btn ghost reb-scr-btn" data-reb-scr="${esc(kindKey)}" data-amt="${Math.round(amt)}">${esc(label||'Подобрать в Скринере на '+M(amt,'rub',0)+' →')}</button>`;
+}
 function rebSnowballHtml(cur,keys,w,tot,dev0){
   const pays=(S.bonds&&S.bonds.payments)||[];
   const now=new Date(),mKeys=[],byM={};
@@ -35655,36 +37037,115 @@ function rebTaxHtml(act,keys){
         <td class="l">${why(p.why)}${p.ldv_soon?'<br><small class="neg">ЛДВ наступит меньше чем через полгода — лучше подождать</small>':''}</td></tr>`).join('')||'<tr><td colspan="4" class="l mu">Нет данных о лотах</td></tr>'}</tbody></table></div>`).join('')}
     <p class="note">Справочная оценка: порядок бумаг подбирается по ожидаемому налогу, продажа идёт по FIFO внутри каждой бумаги. Брокер как налоговый агент считает сам; это не налоговая консультация.</p></div>`;
 }
-function pReb(){
-  const ps=S.data.portfolio.positions,tot=ps.reduce((a,x)=>a+(x.value_rub||0),0);
-  if(!(tot>0))return emptyHint('Ребалансировке нужны активы в портфеле. Выберите счёт с бумагами или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']]);
-  const cur={};ps.forEach(x=>{const t=x.type||'other';cur[t]=(cur[t]||0)+(x.value_rub||0)});
-  if(!S.reb.draft)S.reb.draft=Object.assign({},(S.cfg&&S.cfg.targets)||{});
-  const tg=S.reb.draft;
-  const keys=[...new Set([...Object.keys(cur),...Object.keys(tg)])].sort((a,b)=>(cur[b]||0)-(cur[a]||0));
-  const sumT=keys.reduce((a,k)=>a+(+tg[k]||0),0),has=sumT>0;
-  const C=Math.max(0,+S.reb.contrib||0),T2=tot+C,buyOnly=S.reb.buyOnly;
-  const w=k=>has?(+tg[k]||0)/sumT:0;
-  let act={};
+function rebCalcActions(cur,tg,keys,tot,C,buyOnly){
+  const sumT=keys.reduce((a,k)=>a+(+tg[k]||0),0),has=sumT>0,T2=tot+C,w=k=>has?(+tg[k]||0)/sumT:0,act={};
   if(has){
     if(buyOnly){const need={};keys.forEach(k=>{need[k]=Math.max(0,T2*w(k)-(cur[k]||0))});const sp=keys.reduce((a,k)=>a+need[k],0);
       keys.forEach(k=>{act[k]=C>0&&sp>0?need[k]*C/sp:0})}
     else keys.forEach(k=>{act[k]=T2*w(k)-(cur[k]||0)});
   }
   const need0=has?Math.max(0,Math.max(...keys.filter(k=>w(k)>0).map(k=>(cur[k]||0)/w(k)))-tot):0;
-  const after=k=>((cur[k]||0)+(act[k]||0))/(buyOnly?T2:T2);
+  const dev=has?keys.reduce((a,k)=>a+Math.abs((cur[k]||0)/tot-w(k)),0)/2*100:0;
+  return{sumT,has,T2,w,act,need0,dev};
+}
+function rebLvlBar(lvl){
+  return`<div class="reb-lvl-bar"><div class="seg" id="rb-lvl">${[['class','По классам'],['rating','По рейтингам облигаций'],['paper','По бумагам в лотах']].map(([k,t])=>`<button type="button" data-rl="${k}" class="${lvl===k?'on':''}">${t}</button>`).join('')}</div></div>`;
+}
+function rebCtlBar(buyOnly){
+  return`<div class="row" style="margin-bottom:14px;gap:18px;flex-wrap:wrap"><label class="field" style="max-width:240px"><span>Новый взнос, ₽ (необязательно)</span><input class="in num" id="rb-c" type="number" min="0" step="1000" value="${S.reb.contrib}" placeholder="0"></label>
+    <label class="sw"><input type="checkbox" id="rb-b" ${buyOnly?'checked':''}><i></i><div><b>Только докупать</b><small>Ничего не продавать, распределить взнос</small></div></label></div>`;
+}
+function pRebRating(totAll){
+  const b=S.bonds;
+  if(!b)return rebLvlBar('rating')+`<div class="card">${waitBox('Загружаю рейтинги облигаций портфеля…')}</div>`;
+  if(b.error)return rebLvlBar('rating')+`<div class="msg err">${esc(b.error)}</div>`;
+  const bRows=b.rows||[];
+  if(!bRows.length)return rebLvlBar('rating')+emptyHint('В этом счёте нет облигаций для ребалансировки по рейтингам.',[['scr','Подобрать в Скринере',1],['bonds','Мои облигации']]);
+  const cur={};REB_RT_BUCKETS.forEach(k=>cur[k]=0);
+  bRows.forEach(r=>{const k=rebRtBucket(r);cur[k]=(cur[k]||0)+(r.value_rub||0)});
+  const tot=Object.values(cur).reduce((a,x)=>a+x,0)||1;
+  if(!S.reb.rtDraft)S.reb.rtDraft={AAA:40,AA:40,A:20};
+  const tg=S.reb.rtDraft,keys=REB_RT_BUCKETS.filter(k=>cur[k]>0||tg[k]>0||['AAA','AA','A','BBB'].includes(k));
+  const C=Math.max(0,+S.reb.contrib||0),buyOnly=S.reb.buyOnly;
+  const{sumT,has,T2,w,act,need0,dev}=rebCalcActions(cur,tg,keys,tot,C,buyOnly);
   const rows=keys.map(k=>{const cp=(cur[k]||0)/tot*100,tp=has?w(k)*100:0,dv=cp-tp,a=act[k]||0;
+    const scrBtn=a>100?rebScrBtn('rt:'+k,a):'';
+    return`<tr><td class="l"><b>${esc(k)}</b></td><td class="num">${M(cur[k]||0,'rub',0)}</td><td class="num">${pctp(cp)}</td>
+      <td class="num"><input class="in num reb-rt-in" data-k="${esc(k)}" type="number" min="0" max="100" step="1" value="${tg[k]!=null?tg[k]:''}" placeholder="0"> %</td>
+      <td class="num ${has?(Math.abs(dv)<0.5?'mu':dv>0?'neg':'pos'):'mu'}">${has?(dv>0?'+':'')+dv.toFixed(1).replace('.',',')+' п.п.':'—'}</td>
+      <td class="num ${a>0.5?'pos':a<-0.5?'neg':'mu'}">${Math.abs(a)<1?'—':(a>0?'Докупить ':'Продать ')+M(Math.abs(a),'rub',0)}${scrBtn}</td>
+      <td class="num">${has?pctp(((cur[k]||0)+a)/T2*100):'—'}</td></tr>`}).join('');
+  return rebLvlBar('rating')+`<div class="g g4">${kpi('Облигаций в портфеле',M(tot,'rub',0),`${bRows.length} выпусков · ${pctp(tot/(totAll||1)*100)} портфеля`)}${kpi('Сумма целей',`<span class="${!has?'mu':Math.abs(sumT-100)<0.05?'pos':'neg'}">${sumT.toFixed(1).replace('.',',')} %</span>`,!has?'задайте целевые доли':'к 100%')}
+    ${kpi('Отклонение от целей',has?pctp(dev):'—','по рейтингам облигаций',has&&dev>5?'neg':'')}${kpi('Без продаж нужно внести',has?M(need0,'rub',0):'—','для выравнивания облигаций')}</div>
+  <div class="card"><h2>Целевая структура облигаций по рейтингам</h2>${rebCtlBar(buyOnly)}
+    <div class="scr-presets reb-pre noprint" style="margin-bottom:12px"><span class="mu" style="font-size:12.5px">Быстрые цели:</span>
+      <button type="button" class="scr-chip" data-rtrp="cons">Консервативно (AAA 40 / AA 40 / A 20)</button>
+      <button type="button" class="scr-chip" data-rtrp="bal">Умеренно (AAA 25 / AA 35 / A 30 / BBB 10)</button>
+      <button type="button" class="scr-chip" data-rtrp="eq">Равные доли</button></div>
+    <div class="tbl"><table><thead><tr><th class="l">Рейтинг</th><th>Сейчас, ₽</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>Действие</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+function pRebPaper(ps){
+  const nonCur=ps.filter(x=>x.type!=='currency'&&x.type!=='futures'&&(x.value_rub||0)>0);
+  if(!nonCur.length)return rebLvlBar('paper')+emptyHint('Нет бумаг для расчёта лотов.',[['imp','Импорт отчёта',1]]);
+  const tot=nonCur.reduce((a,x)=>a+(x.value_rub||0),0)||1;
+  const keyOf=x=>x.isin||x.ticker||x.uid||x.name;
+  if(!S.reb.secDraft){
+    const d={};nonCur.forEach(x=>{d[keyOf(x)]=Math.round((x.value_rub||0)/tot*1000)/10});
+    S.reb.secDraft=d;
+  }
+  const tg=S.reb.secDraft,cur={},byKey=new Map();
+  nonCur.forEach(x=>{const k=keyOf(x);cur[k]=(cur[k]||0)+(x.value_rub||0);byKey.set(k,x)});
+  const keys=[...byKey.keys()].sort((a,b)=>(cur[b]||0)-(cur[a]||0));
+  const C=Math.max(0,+S.reb.contrib||0),buyOnly=S.reb.buyOnly;
+  const{sumT,has,T2,w,act,need0,dev}=rebCalcActions(cur,tg,keys,tot,C,buyOnly);
+  const bRows=(S.bonds&&S.bonds.rows)||[],stkAll=(S.stkList||[]).concat(S.stkFunds||[]);
+  const rows=keys.map(k=>{
+    const x=byKey.get(k),cp=(cur[k]||0)/tot*100,tp=has?w(k)*100:0,dv=cp-tp,a=act[k]||0;
+    const unitPx=(x.qty>0&&(x.value_rub||0)>0)?(x.value_rub/x.qty):((x.price||0)+(x.nkd||0));
+    const stInfo=x.type!=='bond'&&x.ticker?stkAll.find(s=>s.secid===x.ticker):null;
+    const lot=x.type==='bond'?1:(stInfo&&stInfo.lot>1?stInfo.lot:1);
+    const lotCost=unitPx*lot;
+    const lots=lotCost>0?Math.round(Math.abs(a)/lotCost):0;
+    const bInfo=x.type==='bond'?bRows.find(b=>(x.isin&&b.isin===x.isin)||(x.ticker&&b.ticker===x.ticker)):null;
+    const unitLbl=lot>1?`${f0(lots)} лот (${f0(lots*lot)} шт.)`:`${f0(lots)} шт.`;
+    const scrBtn=a>lotCost&&x.type==='bond'?rebScrBtn('rt:'+(bInfo?rebRtBucket(bInfo):'A'),a,'Подобрать в Скринере на '+M(a,'rub',0)+' →'):'';
+    return`<tr><td class="l">${ident(x)}</td><td class="num">${unitPx>0?M(unitPx,'rub',2):'—'}${lot>1?`<br><small class="mu">лот ${lot} шт.</small>`:''}</td>
+      <td class="num">${M(cur[k]||0,'rub',0)}<br><small class="mu">${pctp(cp)}</small></td>
+      <td class="num"><input class="in num reb-sec-in" data-k="${esc(k)}" type="number" min="0" max="100" step="0.5" value="${tg[k]!=null?tg[k]:''}" placeholder="0"> %</td>
+      <td class="num ${has?(Math.abs(dv)<0.5?'mu':dv>0?'neg':'pos'):'mu'}">${has?(dv>0?'+':'')+dv.toFixed(1).replace('.',',')+' п.п.':'—'}</td>
+      <td class="num ${a>0.5?'pos':a<-0.5?'neg':'mu'}">${Math.abs(a)<1||!lots?'—':(a>0?'Купить ':'Продать ')+unitLbl+`<br><small class="mu">${M(lots*lotCost,'rub',0)}</small>`}${scrBtn}</td>
+      <td class="num">${has?pctp(((cur[k]||0)+a)/T2*100):'—'}</td></tr>`}).join('');
+  return rebLvlBar('paper')+`<div class="g g4">${kpi('Бумаг в расчёте',nonCur.length,M(tot,'rub',0)+' по рыночным ценам')}${kpi('Сумма целей',`<span class="${!has?'mu':Math.abs(sumT-100)<0.05?'pos':'neg'}">${sumT.toFixed(1).replace('.',',')} %</span>`,!has?'задайте доли':'к 100%')}
+    ${kpi('Отклонение от целей',has?pctp(dev):'—','по отдельным бумагам',has&&dev>5?'neg':'')}${kpi('Без продаж нужно внести',has?M(need0,'rub',0):'—','по текущим ценам')}</div>
+  <div class="card"><h2>Ребалансировка по бумагам в лотах</h2>${rebCtlBar(buyOnly)}
+    <div class="scr-presets reb-pre noprint" style="margin-bottom:12px"><span class="mu" style="font-size:12.5px">Заполнить цели:</span>
+      <button type="button" class="scr-chip" data-secp="cur">По текущим долям</button>
+      <button type="button" class="scr-chip" data-secp="eq">Равные доли</button></div>
+    <div class="tbl"><table><thead><tr><th class="l">Бумага</th><th>Цена с НКД</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>В лотах по рынку</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+function pReb(){
+  const ps=S.data.portfolio.positions,tot=ps.reduce((a,x)=>a+(x.value_rub||0),0);
+  if(!(tot>0))return emptyHint('Ребалансировке нужны активы в портфеле. Выберите счёт с бумагами или загрузите отчёт брокера.',[['imp','Импорт отчёта',1],['dash','На «Обзор»']]);
+  const lvl=['class','rating','paper'].includes(S.reb.lvl)?S.reb.lvl:'class';
+  if(lvl==='rating')return pRebRating(tot);
+  if(lvl==='paper')return pRebPaper(ps);
+  const cur={};ps.forEach(x=>{const t=x.type||'other';cur[t]=(cur[t]||0)+(x.value_rub||0)});
+  if(!S.reb.draft)S.reb.draft=Object.assign({},(S.cfg&&S.cfg.targets)||{});
+  const tg=S.reb.draft;
+  const keys=[...new Set([...Object.keys(cur),...Object.keys(tg)])].sort((a,b)=>(cur[b]||0)-(cur[a]||0));
+  const C=Math.max(0,+S.reb.contrib||0),buyOnly=S.reb.buyOnly;
+  const{sumT,has,T2,w,act,need0,dev}=rebCalcActions(cur,tg,keys,tot,C,buyOnly);
+  const rows=keys.map(k=>{const cp=(cur[k]||0)/tot*100,tp=has?w(k)*100:0,dv=cp-tp,a=act[k]||0;
+    const scrBtn=(k==='bond'&&a>100)?rebScrBtn('cls:bond',a):'';
     return`<tr><td class="l"><b>${esc(TYPES[k]||(k==='other'?'Прочее':k))}</b></td><td class="num">${M(cur[k]||0)}</td><td class="num">${pctp(cp)}</td>
       <td class="num"><input class="in num reb-in" data-k="${esc(k)}" type="number" min="0" max="100" step="0.5" value="${tg[k]!=null?tg[k]:''}" placeholder="0"> %</td>
       <td class="num ${has?(Math.abs(dv)<0.5?'mu':dv>0?'neg':'pos'):'mu'}">${has?(dv>0?'+':'')+dv.toFixed(1).replace('.',',')+' п.п.':'—'}</td>
-      <td class="num ${a>0.5?'pos':a<-0.5?'neg':'mu'}">${Math.abs(a)<1?'—':(a>0?'Докупить ':'Продать ')+M(Math.abs(a))}</td>
-      <td class="num">${has?pctp(after(k)*100):'—'}</td></tr>`}).join('');
-  const dev=has?keys.reduce((a,k)=>a+Math.abs((cur[k]||0)/tot-w(k)),0)/2*100:0;
-  return`<div class="g g4">${kpi('Стоимость портфеля',M(tot),'по текущим ценам')}${kpi('Сумма целей',`<span class="${!has?'mu':Math.abs(sumT-100)<0.05?'pos':'neg'}">${sumT.toFixed(1).replace('.',',')} %</span>`,!has?'введите целевые доли ниже':Math.abs(sumT-100)<0.05?'цели заданы':'расчёт нормирован к 100%')}
+      <td class="num ${a>0.5?'pos':a<-0.5?'neg':'mu'}">${Math.abs(a)<1?'—':(a>0?'Докупить ':'Продать ')+M(Math.abs(a))}${scrBtn}</td>
+      <td class="num">${has?pctp(((cur[k]||0)+a)/T2*100):'—'}</td></tr>`}).join('');
+  return rebLvlBar('class')+`<div class="g g4">${kpi('Стоимость портфеля',M(tot),'по текущим ценам')}${kpi('Сумма целей',`<span class="${!has?'mu':Math.abs(sumT-100)<0.05?'pos':'neg'}">${sumT.toFixed(1).replace('.',',')} %</span>`,!has?'введите целевые доли ниже':Math.abs(sumT-100)<0.05?'цели заданы':'расчёт нормирован к 100%')}
     ${kpi('Отклонение от целей',has?pctp(dev):'—','сколько % портфеля стоит «не там»',has&&dev>5?'neg':'')}${kpi('Без продаж нужно внести',has?M(need0):'—','чтобы выйти на цели одними покупками')}</div>
   <div class="card"><h2>Целевая структура по классам активов</h2>
-    <div class="row" style="margin-bottom:14px;gap:18px;flex-wrap:wrap"><label class="field" style="max-width:240px"><span>Новый взнос, ₽ (необязательно)</span><input class="in num" id="rb-c" type="number" min="0" step="1000" value="${S.reb.contrib}" placeholder="0"></label>
-      <label class="sw"><input type="checkbox" id="rb-b" ${buyOnly?'checked':''}><i></i><div><b>Только докупать</b><small>Ничего не продавать, распределить взнос</small></div></label></div>
+    ${rebCtlBar(buyOnly)}
     <div class="scr-presets reb-pre noprint" style="margin-bottom:12px"><span class="mu" style="font-size:12.5px">Быстрые цели:</span>${[['6040','Акции 60 / Облигации 40'],['5050','50 / 50'],['8020','Акции 80 / Облигации 20'],['eq','Равные доли']].map(([k,t])=>`<button type="button" class="scr-chip" data-rbp="${k}">${t}</button>`).join('')}</div>
     <div class="tbl"><table><thead><tr><th class="l">Класс</th><th>Сейчас, ₽</th><th>Сейчас</th><th>Цель</th><th>Отклонение</th><th>Действие</th><th>После</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="row" style="margin-top:14px"><button class="btn" id="rb-s">Сохранить цели</button><button class="btn ghost" id="rb-r">Сбросить</button><span class="reb-sum" id="rb-sum"></span></div></div>
@@ -35693,8 +37154,32 @@ function pReb(){
   <p class="note">Расчёт по классам активов (акции, облигации, фонды, валюта…) на уровне портфеля, без учёта комиссий и лотности; налог при продаже оценивается отдельно (в режиме с продажами). Это справочный расчёт, а не инвестиционная рекомендация. Цели сохраняются локально.</p>`;
 }
 function bindReb(){
+  const lv=$('#rb-lvl');
+  if(lv)lv.onclick=e=>{const b=e.target.closest('[data-rl]');if(!b||b.dataset.rl===S.reb.lvl)return;S.reb.lvl=b.dataset.rl;lsSet('ta_reb_lvl',S.reb.lvl);render()};
+  $('#view').querySelectorAll('[data-reb-scr]').forEach(b=>b.onclick=()=>{
+    const spec=b.dataset.rebScr,amt=+b.dataset.amt||0;
+    if(spec.startsWith('rt:')){
+      const rt=spec.slice(3);
+      rebGoScreener({rmin:rt==='AAA'?'AAA':rt==='AA'?'AA-':rt==='A'?'A-':rt==='BBB'?'BBB-':'',amt});
+    }else rebGoScreener({rmin:'A-',amt});
+  });
   const d=S.reb.draft;
   $('#view').querySelectorAll('.reb-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)d[i.dataset.k]=Math.min(100,v);else delete d[i.dataset.k];render()});
+  $('#view').querySelectorAll('.reb-rt-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)S.reb.rtDraft[i.dataset.k]=Math.min(100,v);else delete S.reb.rtDraft[i.dataset.k];lsSet('ta_reb_rt',JSON.stringify(S.reb.rtDraft));render()});
+  $('#view').querySelectorAll('.reb-sec-in').forEach(i=>i.onchange=()=>{const v=parseFloat(String(i.value).replace(',','.'));if(v>0)S.reb.secDraft[i.dataset.k]=Math.min(100,v);else delete S.reb.secDraft[i.dataset.k];lsSet('ta_reb_sec',JSON.stringify(S.reb.secDraft));render()});
+  $('#view').querySelectorAll('[data-rtrp]').forEach(btn=>btn.onclick=()=>{
+    const k=btn.dataset.rtrp;
+    if(k==='cons')S.reb.rtDraft={AAA:40,AA:40,A:20};
+    else if(k==='bal')S.reb.rtDraft={AAA:25,AA:35,A:30,BBB:10};
+    else S.reb.rtDraft={AAA:25,AA:25,A:25,BBB:25};
+    lsSet('ta_reb_rt',JSON.stringify(S.reb.rtDraft));render();
+  });
+  $('#view').querySelectorAll('[data-secp]').forEach(btn=>btn.onclick=()=>{
+    const k=btn.dataset.secp,ps=(S.data.portfolio.positions||[]).filter(x=>x.type!=='currency'&&x.type!=='futures'&&(x.value_rub||0)>0);
+    const tot=ps.reduce((a,x)=>a+(x.value_rub||0),0)||1,nd={};
+    ps.forEach(x=>{const key=x.isin||x.ticker||x.uid||x.name;nd[key]=k==='cur'?Math.round((x.value_rub||0)/tot*1000)/10:Math.round(1000/ps.length)/10});
+    S.reb.secDraft=nd;lsSet('ta_reb_sec',JSON.stringify(nd));render();
+  });
   $('#view').querySelectorAll('[data-rbp]').forEach(btn=>btn.onclick=()=>{
     const k=btn.dataset.rbp,pr={'6040':[60,40],'5050':[50,50],'8020':[80,20]}[k];
     Object.keys(d).forEach(x=>delete d[x]);
@@ -35702,13 +37187,12 @@ function bindReb(){
     else{const ks=[...$('#view').querySelectorAll('.reb-in')].map(i=>i.dataset.k).filter(x=>!['currency','other'].includes(x));const v=ks.length?Math.round(1000/ks.length)/10:0;ks.forEach(x=>d[x]=v)}
     render();
   });
-  $('#rb-c').onchange=e=>{S.reb.contrib=e.target.value;render()};
+  const rbc=$('#rb-c');if(rbc)rbc.onchange=e=>{S.reb.contrib=e.target.value;render()};
   const rm=$('#rb-m');if(rm)rm.onchange=e=>{S.reb.monthly=e.target.value;render()};
-  $('#rb-b').onchange=e=>{S.reb.buyOnly=e.target.checked;render()};
-  $('#rb-r').onclick=()=>{S.reb.draft=null;S.reb.contrib='';S.reb.monthly='';render()};
-  $('#rb-s').onclick=async e=>{e.currentTarget.disabled=true;try{await post('/api/config',{targets:d});S.cfg.targets=Object.assign({},d);$('#rb-sum').textContent='Сохранено'}catch(x){$('#rb-sum').textContent=x.message}finally{e.currentTarget.disabled=false}};
+  const rbb=$('#rb-b');if(rbb)rbb.onchange=e=>{S.reb.buyOnly=e.target.checked;render()};
+  const rbr=$('#rb-r');if(rbr)rbr.onclick=()=>{S.reb.draft=null;S.reb.contrib='';S.reb.monthly='';render()};
+  const rbs=$('#rb-s');if(rbs)rbs.onclick=async e=>{e.currentTarget.disabled=true;try{await post('/api/config',{targets:d});S.cfg.targets=Object.assign({},d);$('#rb-sum').textContent='Сохранено'}catch(x){$('#rb-sum').textContent=x.message}finally{e.currentTarget.disabled=false}};
 }
-
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
   ['0.31','27.11.2026',[
@@ -35870,19 +37354,52 @@ async function boot(){
 }
 boot();
 // ── карточка облигации (боковая панель): клик по любому элементу с data-isin ──
-const BC={stack:[],tok:0,all:false,iss:{}};
+const BC={stack:[],tok:0,all:false,iss:{},tab:'overview',list:[],cur:null,card:null};
 const BC_SEC={financial:'Финансы',industrials:'Промышленность',materials:'Сырьё',energy:'Энергетика',consumer:'Потребительский',government:'Государственные',real_estate:'Недвижимость',telecom:'Телеком',municipal:'Муниципальные',utilities:'Коммунальные',it:'IT',health_care:'Здравоохранение',other:'Прочее'};
 const BC_EV={coupon:'Купон',amort:'Амортизация',offer:'Оферта',redemption:'Погашение'};
 const BC_OK={put:['PUT — право продать эмитенту','of-t-put','Право держателя: в период предъявления можно подать заявку через брокера, эмитент выкупит бумагу по цене оферты.'],call:['CALL — эмитент может погасить досрочно','of-t-call','Право эмитента: он может досрочно погасить выпуск. Заявку подавать не нужно, но возможен риск реинвестирования.'],unknown:['тип не указан','of-t-unk','Источники не сообщают, чей это выбор — держателя или эмитента. Проверьте документы выпуска.']};
 const bcOfKind=k=>{const t=BC_OK[k]||BC_OK.unknown;return`<span class="tag ${t[1]}" title="${esc(t[2])}">${esc(t[0])}</span>`};
 const BC_KR_SRC={cbr:'ключевая ставка по прогнозу ЦБ',survey:'ключевая ставка по опросу аналитиков ЦБ',market:'ключевая ставка по ожиданиям рынка (КБД)',flat:'текущая ключевая ставка'};
 const BC_RISK={RISK_LEVEL_LOW:'низкий',RISK_LEVEL_MODERATE:'средний',RISK_LEVEL_HIGH:'высокий'};
+const BC_TABS=[['overview','Обзор и параметры'],['flows','Денежный поток и оферты'],['issuer','Эмитент и рейтинги'],['analogs','Аналоги и кривая']];
+
+function bcCollectList(){
+  const seen=new Set(),out=[];
+  document.querySelectorAll('#view table tbody tr[data-isin]').forEach(tr=>{
+    if(tr.style.display==='none')return;
+    const i=String(tr.dataset.isin||'').trim().toUpperCase();
+    if(i&&!seen.has(i)){seen.add(i);out.push(i)}
+  });
+  return out;
+}
 
 document.addEventListener('click',e=>{
   const t=e.target.closest('[data-isin]');
-  if(t&&t.dataset.isin&&!e.target.closest('a,button,input,select'))openBond(t.dataset.isin);
+  if(t&&t.dataset.isin&&!e.target.closest('a,button,input,select')){
+    const inDrawer=!!t.closest('#bc-ov');
+    openBond(t.dataset.isin,inDrawer?{fromDrawer:true}:{});
+  }
 });
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.getElementById('bc-ov'))closeBond()});
+document.addEventListener('keydown',e=>{
+  const ov=document.getElementById('bc-ov');
+  if(!ov)return;
+  if(e.key==='Escape'){closeBond();return}
+  if(e.key==='ArrowUp'||e.key==='ArrowDown'){
+    const a=document.activeElement,tag=a&&a.tagName;
+    if(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||(a&&a.isContentEditable))return;
+    if(BC.list.length<2)return;
+    e.preventDefault();e.stopPropagation();
+    const cur=String(BC.stack[BC.stack.length-1]||'').toUpperCase();
+    let idx=BC.list.indexOf(cur);
+    if(idx<0)idx=0;
+    else idx=Math.max(0,Math.min(BC.list.length-1,idx+(e.key==='ArrowDown'?1:-1)));
+    const nx=BC.list[idx];
+    if(nx&&nx!==cur){
+      BC.stack[BC.stack.length-1]=nx;
+      openBond(nx,{keepTab:true,fromNav:true});
+    }
+  }
+},true);
 
 /* Плавное закрытие выезжающей панели: id снимаем сразу (для кода панель уже закрыта), узел удаляем после анимации. */
 function ovLeave(o){
@@ -35895,7 +37412,7 @@ function ovLeave(o){
   o.classList.add('ov-leave');o.style.pointerEvents='none';setTimeout(()=>o.remove(),240);
 }
 function closeBond(){
-  BC.stack=[];BC.tok++;
+  BC.stack=[];BC.list=[];BC.card=null;BC.tok++;
   ovLeave(document.getElementById('bc-ov'));
   document.body.classList.remove('bc-open');
 }
@@ -35911,35 +37428,65 @@ function bcMount(){
 }
 function bcBar(){
   const back=BC.stack.length>1?'<button class="btn ghost" id="bc-back">← Назад</button>':'';
+  const cur=String(BC.stack[BC.stack.length-1]||'').toUpperCase();
+  const idx=BC.list.indexOf(cur);
+  const nav=BC.list.length>1&&idx>=0?`<span class="bc-nav-btns"><button type="button" class="btn ghost" id="bc-prev" ${idx<=0?'disabled':''} title="Предыдущая бумага (↑)" aria-label="Предыдущая бумага">↑</button><span class="bc-nav-pos num">${idx+1} / ${BC.list.length}</span><button type="button" class="btn ghost" id="bc-next" ${idx>=BC.list.length-1?'disabled':''} title="Следующая бумага (↓)" aria-label="Следующая бумага">↓</button></span>`:'';
   const wt=typeof watchToggle==='function'?'<button class="btn ghost" id="bc-watch" title="Добавить выпуск в список наблюдения">★ В наблюдение</button>':'';
   const cm=typeof cmpHas==='function'?`<button class="btn ghost" id="bc-cmp" title="Добавить выпуск в сравнение облигаций">${cmpHas(BC.stack[BC.stack.length-1])?'✓ В сравнении':'⇄ Сравнить'}</button>`:'';
-  return`<div class="bc-bar">${back}<span class="sp"></span>${cm}${wt}<button class="btn ghost" id="bc-x" aria-label="Закрыть">✕ Закрыть</button></div>`;
+  return`<div class="bc-bar">${back}${nav}<span class="sp"></span>${cm}${wt}<button class="btn ghost" id="bc-x" aria-label="Закрыть">✕ Закрыть</button></div>`;
 }
-function bcBind(dr){
+function bcRenderCard(dr,c,tok){
+  BC.card=c;
+  dr.innerHTML=bcBar()+bcBody(c);
+  bcBind(dr,c,tok);
+  bcCharts(dr,c);
+  bcIssuer(dr,c,tok);
+}
+function bcBind(dr,c,tok){
   const x=dr.querySelector('#bc-x');if(x)x.onclick=closeBond;
   const w=dr.querySelector('#bc-watch');
   if(w)w.onclick=()=>{try{watchToggle(BC.stack[BC.stack.length-1])}catch(e){}};
   const cb=dr.querySelector('#bc-cmp');
   if(cb)cb.onclick=()=>{const i=BC.stack[BC.stack.length-1];if(cmpHas(i)){closeBond();go('cmp')}else if(cmpAdd(i))cb.textContent='✓ В сравнении'};
   const b=dr.querySelector('#bc-back');
-  if(b)b.onclick=()=>{BC.stack.pop();const p=BC.stack.pop();openBond(p)};
+  if(b)b.onclick=()=>{BC.stack.pop();const p=BC.stack.pop();openBond(p,{fromNav:true})};
+  const pv=dr.querySelector('#bc-prev'),nx=dr.querySelector('#bc-next');
+  const step=d=>{const cur=String(BC.stack[BC.stack.length-1]||'').toUpperCase(),i=BC.list.indexOf(cur);if(i<0)return;const ni=i+d;if(ni>=0&&ni<BC.list.length){BC.stack[BC.stack.length-1]=BC.list[ni];openBond(BC.list[ni],{keepTab:true,fromNav:true})}};
+  if(pv)pv.onclick=()=>step(-1);
+  if(nx)nx.onclick=()=>step(1);
+  const cp=dr.querySelector('[data-bc-copy]');
+  if(cp)cp.onclick=e=>{
+    e.stopPropagation();
+    copyText(cp.dataset.bcCopy,'ISIN скопирован');
+    const st=cp.querySelector('.bc-cp-st');
+    if(st){st.textContent='✓ Скопировано';st.classList.add('done');clearTimeout(cp._t);cp._t=setTimeout(()=>{st.textContent='Копировать';st.classList.remove('done')},1800)}
+  };
+  const tb=dr.querySelector('#bc-tabs');
+  if(tb)tb.onclick=e=>{
+    const bt=e.target.closest('[data-bct]');if(!bt||bt.dataset.bct===BC.tab||!c)return;
+    BC.tab=bt.dataset.bct;bcRenderCard(dr,c,tok);
+  };
+  const mr=dr.querySelector('#bc-more');
+  if(mr&&c)mr.onclick=()=>{BC.all=true;bcRenderCard(dr,c,tok);BC.all=false};
 }
-async function openBond(isin){
-  isin=String(isin||'').trim();if(!isin)return;
-  if(BC.stack[BC.stack.length-1]!==isin)BC.stack.push(isin);
+async function openBond(isin,opts){
+  isin=String(isin||'').trim().toUpperCase();if(!isin)return;
+  if(!opts||(!opts.fromNav&&!opts.fromDrawer)){
+    BC.list=bcCollectList();
+    BC.stack=[isin];
+  }else if(!opts.fromNav){
+    if(BC.stack[BC.stack.length-1]!==isin)BC.stack.push(isin);
+  }
+  if(!opts||!opts.keepTab)BC.tab='overview';
   const tok=++BC.tok,dr=bcMount();
-  dr.innerHTML=bcBar()+`<div class="bc-load">Загружаю данные по ${esc(isin)}…</div>`;bcBind(dr);dr.scrollTop=0;
+  dr.innerHTML=bcBar()+`<div class="bc-load">Загружаю данные по ${esc(isin)}…</div>`;bcBind(dr,null,tok);dr.scrollTop=0;
   let c;
   try{c=await api('/api/bond?isin='+encodeURIComponent(isin))}
-  catch(e){if(tok!==BC.tok)return;dr.innerHTML=bcBar()+`<div class="bc-warn">Не удалось загрузить карточку: ${esc(e.message||e)}</div>`;bcBind(dr);return}
+  catch(e){if(tok!==BC.tok)return;dr.innerHTML=bcBar()+`<div class="st-callout warn">Не удалось загрузить карточку: ${esc(e.message||e)}</div>`;bcBind(dr,null,tok);return}
   if(tok!==BC.tok)return;
-  dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);
-  const mr=dr.querySelector('#bc-more');
-  if(mr)mr.onclick=()=>{BC.all=true;dr.innerHTML=bcBar()+bcBody(c);bcBind(dr);bcCharts(dr,c);bcIssuer(dr,c,tok);BC.all=false};
+  bcRenderCard(dr,c,tok);
 }
-/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). e-disclosure закрыт для автоматических запросов, а его поиск
-   не берёт запрос из ссылки (ищет отдельным POST), поэтому основная ссылка — страница раскрытия на СКРИН по ИНН; кнопка e-disclosure
-   открывает поиск и копирует ИНН, чтобы его оставалось только вставить. */
+/* Ссылки на документы выпуска (решение о выпуске, проспект, оферты). */
 document.addEventListener('click',e=>{
   const a=e.target.closest&&e.target.closest('a[data-copy-open]');
   if(a)copyText(a.dataset.copyOpen,'ИНН '+a.dataset.copyOpen+' скопирован — вставьте его в поиск на e-disclosure');
@@ -35953,6 +37500,9 @@ function bcDocLinks(isin,inn,secid){
 }
 const bcN=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toFixed(d).replace('.',',');
 function bcKpi(k,v,s,cls){return`<div class="card"><div class="k">${k}</div><div class="v num ${cls||''}">${v}</div>${s?`<div class="s">${s}</div>`:''}</div>`}
+function bcTile(lbl,val,sub,dot,cls){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num ${cls||''}">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
+}
 /* Раскрытие информации: сколько бумаг в рынке (по последнему купону, иначе по объёму выпуска) и последние факты с сервера данных */
 const BC_DISC_KIND={coupon_paid:'Купон выплачен',coupon_declared:'Ставка купона',default:'Неисполнение',buyback_result:'Итоги выкупа',placement_result:'Размещение / доразмещение'};
 function bcOutLine(o){
@@ -35967,8 +37517,6 @@ function bcOutLine(o){
   const bb=o.buybacks_after?` · выкупов после купона: ${o.buybacks_after}`:'';
   const over=o.over_issue_size?' <span class="tag">выше ISSUESIZE (допвыпуск)</span>':'';
   const chips=[];
-  // Без сообщений эмитента известен только текущий ISSUESIZE Мосбиржи: после выкупа на оферте биржа его уменьшает,
-  // поэтому называть его «выпущено» нельзя — первоначальный объём виден только по раскрытиям.
   const msOnly=!M[o.method]&&!(o.buybacks||[]).length&&!(o.placements||[]).length;
   if(o.issue_size!=null)chips.push(msOnly?`<span>Объём выпуска по Мосбирже сейчас: <b class="num">${fmt(o.issue_size)} шт.</b>${o.issue_date?' · в обращении с '+ddm(o.issue_date):''}</span>`
     :`<span>Выпущено: <b class="num">${fmt(o.issue_size)} шт.</b>${o.issue_date?' от '+ddm(o.issue_date):''}</span>`);
@@ -36003,26 +37551,26 @@ function bcDisclosure(dc){
 function bcBody(c){
   const m=c.market,ci=c.catalog||{},d=c.desc||{},cur=(m&&m.cur||ci.currency||'RUB').toLowerCase();
   const sec=ci.sector?BC_SEC[ci.sector]||ci.sector:null;
-  let h=`<div class="bc-h"><h1>${esc(c.name||c.isin)}</h1><div class="row2"><code>${esc(c.isin)}</code>`
+  let h=`<div class="bc-h st-ver"><h1>${esc(c.name||c.isin)}</h1><div class="row2">
+    <button type="button" class="bc-isin-cp" data-bc-copy="${esc(c.isin)}" title="Нажмите, чтобы скопировать ISIN"><code>${esc(c.isin)}</code><span class="bc-cp-st">Копировать</span></button>`
     +(c.rating?ratingTag(c.rating):'<span class="tag">нет рейтинга</span>')
     +(sec?`<span class="tag">${esc(sec)}</span>`:'')
     +(ci.floating?`<span class="tag"${c.fl_label&&c.fl_label!=='ФЛОАТЕР'?' title="Спред эмитента к базе по последним купонам"':''}>${c.fl_label&&c.fl_label!=='ФЛОАТЕР'?'флоатер · '+esc(c.fl_label):'флоатер'}</span>`:'')+(ci.amort||(d.AMORTBOND==='1')?'<span class="tag">амортизация</span>':'')
     +(ci.subordinated?'<span class="tag">субординированная</span>':'')+(ci.perpetual?'<span class="tag">бессрочная</span>':'')
     +`<a href="https://www.moex.com/ru/issue.aspx?code=${encodeURIComponent(c.isin)}" target="_blank" rel="noopener" style="margin-left:auto">Страница на Мосбирже ↗</a></div></div>`;
-  if(c.errors&&c.errors.length)h+=`<div class="bc-warn">${c.errors.map(esc).join('<br>')}</div>`;
+  if(c.errors&&c.errors.length)h+=`<div class="st-callout warn">${c.errors.map(esc).join('<br>')}</div>`;
   if(m){
-    const sp=m.spread;
-    const _q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
-    h+=`<div class="bc-kpis">`
-      +bcKpi('Цена',bcN(m.price,2)+' %',m.nominal?`номинал ${bcN(m.nominal,0)}`:'')
-      +bcKpi('Доходность '+_q('yield','Доходность к погашению или ближайшей оферте (YTM)'),bcN(m.yield,2)+' %','к погашению/оферте')
-      +bcKpi('Спред к КБД '+_q('spread','Премия доходности выпуска над безрисковой кривой ОФЗ (КБД)'),sp==null?'—':(sp>0?'+':'')+bcN(sp,2)+' п.п.',c.kbd!=null?`КБД ${bcN(c.kbd,2)} % на ${bcN(m.dur,2)} г.`:'',sp==null?'':sp>0?'pos':'neg')
-      +bcKpi('Дюрация '+_q('duration','Чувствительность цены облигации к изменению ставок'),m.dur==null?'—':bcN(m.dur,2)+' г.',`оборот ${short(m.turn||0)}`)
+    const sp=m.spread,_q=(id,t)=>typeof uxTip==='function'?uxTip(id,t):'';
+    h+=`<div class="bc-kpis st-tiles">`
+      +bcTile('Цена',bcN(m.price,2)+' %',m.nominal?`номинал ${bcN(m.nominal,0)}`:'','mu')
+      +bcTile('Доходность '+_q('yield','Доходность к погашению или ближайшей оферте (YTM)'),bcN(m.yield,2)+' %','к погашению/оферте','pos')
+      +bcTile('Спред к КБД '+_q('spread','Премия доходности выпуска над безрисковой кривой ОФЗ (КБД)'),sp==null?'—':(sp>0?'+':'')+bcN(sp,2)+' п.п.',c.kbd!=null?`КБД ${bcN(c.kbd,2)} % на ${bcN(m.dur,2)} г.`:'',sp==null?'mu':sp>0?'pos':'neg',sp==null?'':sp>0?'pos':'neg')
+      +bcTile('Дюрация '+_q('duration','Чувствительность цены облигации к изменению ставок'),m.dur==null?'—':bcN(m.dur,2)+' г.',`оборот ${short(m.turn||0)}`,'mu')
       +`</div>`;
   }
-  const vBits=[];
-  if(d.HASDEFAULT==='1')vBits.push('<b class="neg">Допущен дефолт</b>');
-  else if(d.HASTECHNICALDEFAULT==='1')vBits.push('<b class="neg">Технический дефолт</b>');
+  const vBits=[];let vWarn=false;
+  if(d.HASDEFAULT==='1'){vBits.push('<b class="neg">Допущен дефолт</b>');vWarn=true}
+  else if(d.HASTECHNICALDEFAULT==='1'){vBits.push('<b class="neg">Технический дефолт</b>');vWarn=true}
   else if(c.rating&&c.rating.v){
     const bk=rBucket(c.rating.v).split(' ')[0];
     const lvl={AAA:'Надёжность максимальная',AA:'Надёжность высокая',A:'Надёжность выше средней',BBB:'Надёжность умеренная',BB:'Повышенный риск (ВДО)',B:'Высокий риск (ВДО)'}[bk]||'Спекулятивный риск';
@@ -36033,68 +37581,79 @@ function bcBody(c){
     const o0=c.offers[0];
     vBits.push(`ближайшая оферта <b>${ddm(o0.date)}</b> (${o0.kind==='put'?'PUT — право продать':o0.kind==='call'?'CALL — право эмитента погасить':'оферта'})`);
   }else if(m&&m.mat)vBits.push(`без оферт до погашения ${ddm(m.mat)}`);
-  if(vBits.length)h+=`<div class="bc-verdict">${vBits.join(' · ')}</div>`;
-  const rows=[];const add=(k,v)=>{if(v!=null&&v!=='')rows.push(`<div><span>${k}</span><span>${v}</span></div>`)};
-  add('Эмитент',esc(d.EMITTER||''));
-  add('Вид',esc(d.BOND_TYPE||d.TYPENAME||''));
-  add('Купон',m&&m.coupon!=null?bcN(m.coupon,2)+' %'+(d.COUPONFREQUENCY?` · ${esc(d.COUPONFREQUENCY)} р/год`:''):(d.COUPONFREQUENCY?`${esc(d.COUPONFREQUENCY)} р/год`:''));
-  add('Следующий купон',m&&m.next?ddm(m.next):'');
-  add('Погашение',m&&m.mat?ddm(m.mat):(ci.maturity?ddm(ci.maturity):(d.MATDATE?ddm(d.MATDATE):'')));
-  add('Оферты',(c.offers||[]).length?c.offers.map(o=>`${ddm(o.date)} ${bcOfKind(o.kind)}${o.period_start&&o.period_end?` <small class="mu">предъявление ${ddm(o.period_start)} – ${ddm(o.period_end)}</small>`:''}`).join('<br>')+' <a href="#" class="kb-a" data-kb="offers">Что такое put и call</a>':(m&&m.offer?ddm(m.offer)+' '+bcOfKind('put'):''));
-  add('Размещена',d.ISSUEDATE?ddm(d.ISSUEDATE):'');
-  add('Объём выпуска',d.ISSUESIZE?short(+d.ISSUESIZE)+' шт.':'');
-  add('Номинал',d.FACEVALUE?bcN(+d.FACEVALUE,2)+' '+esc(cur.toUpperCase())+(d.INITIALFACEVALUE&&d.INITIALFACEVALUE!==d.FACEVALUE?` (первоначально ${esc(d.INITIALFACEVALUE)})`:''):'');
-  add('Уровень листинга',m&&m.level?esc(m.level):esc(d.LISTLEVEL||''));
-  add('Уровень риска (T-Invest)',ci.risk?esc(BC_RISK[ci.risk]||ci.risk):'');
-  add('Для квалифицированных',d.ISQUALIFIEDINVESTORS==='1'?'да':d.ISQUALIFIEDINVESTORS==='0'?'нет':'');
-  add('Дефолт',d.HASDEFAULT==='1'?'<b class="neg">допущен</b>':d.HASTECHNICALDEFAULT==='1'?'<b class="neg">технический</b>':(d.HASDEFAULT==='0'?'нет':''));
-  add('Госномер выпуска',esc(d.REGNUMBER||''));
-  h+=`<div class="card bc-sec"><h2>Ключевые параметры</h2><div class="bc-par">${rows.join('')||'<span class="mu">Нет данных</span>'}</div></div>`;
-  const rk=x=>{const i=RSC.indexOf(x.rating);return i<0?99:i},ra=(c.rating&&c.rating.all||[]).slice().sort((x,y)=>rk(x)-rk(y)||String(x.agency).localeCompare(String(y.agency)));
-  h+=`<div class="card bc-sec"><h2>Кредитные рейтинги эмитента</h2>`+(ra.length?`<div class="tbl bc-rt"><table><thead><tr><th>Агентство</th><th>Рейтинг</th><th>Прогноз</th><th>Дата</th><th>Источник</th></tr></thead><tbody>`
-    +ra.map(x=>{const u=rtSafeUrl(x.url),tg=`<span class="tag rt rt-${esc(rBucket(x.rating).split(' ')[0])}${u?' rt-click':''}">${esc(x.rating)}</span>`;
-      return`<tr><td>${esc(x.agency)}${x.approx?`<div class="mu" style="font-size:11px" title="${esc(x.issuer||'')}">по названию, приблизительно</div>`:''}</td><td>${u?`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer" class="bc-rt-a" title="Открыть пресс-релиз">${tg}</a>`:tg}</td><td>${x.outlook?esc(x.outlook):'<span class="mu">—</span>'}</td><td>${x.date?ddm(x.date):'<span class="mu">—</span>'}</td><td>${u?`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">Пресс-релиз ↗</a>`:''}</td></tr>`}).join('')
-    +`</tbody></table></div>`:'<div class="mu" style="font-size:13px">Рейтинги кредитных агентств не найдены</div>')+`</div>`;
-  h+=`<div class="card bc-sec"><h2>Документы выпуска</h2>${bcDocLinks(c.isin,(c.docs||{}).inn||d.EMITTER_INN,(m&&m.id)||c.isin)}</div>`;
-  h+=bcDisclosure(c.disclosure);
-  h+=`<div class="card bc-sec" id="bc-iss"><h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2><div class="mu" style="font-size:13px">Загружаю отчётность эмитента…</div></div>`;
-  // денежный поток
-  const fl=c.flows||[],lim=BC.all?fl.length:12;
-  h+=`<div class="card bc-sec"><h2>Денежный поток<span class="sp">ближайшие выплаты на 1 облигацию</span></h2>`;
-  if(fl.length){
-    h+=`<div class="tbl"><table><thead><tr><th>Дата</th><th>Событие</th><th>Сумма</th><th>% номинала / ставка</th></tr></thead><tbody>`
-      +fl.slice(0,lim).map(e=>`<tr><td>${ddm(e.d)}</td><td>${BC_EV[e.t]||esc(e.t)}${e.t==='offer'&&e.kind&&e.kind!=='both'?' '+bcOfKind(e.kind):e.t==='offer'&&e.kind==='both'?' '+bcOfKind('put')+' '+bcOfKind('call'):''}</td><td class="num">${e.amt==null?'<span class="mu">по ставке</span>':e.est?`<span class="est" title="${esc(BC_KR_SRC[(c.keyrate||{}).source]||'ключевая ставка по прогнозу')} ${bcN(e.base,2)}% + спред ${bcN(e.spread,2)} п.п.">≈ ${M(e.amt,cur)}</span>`:M(e.amt,cur)}</td><td class="num">${e.pct==null?'—':(e.est?'≈ ':'')+bcN(e.pct,2)+' %'}</td></tr>`).join('')
-      +`</tbody></table></div>`;
-    if(c.keyrate)h+=`<p class="note" style="margin-top:8px">≈ — прогноз: ставка купона флоатера ещё не объявлена, принята равной ключевой ставке на начало купонного периода + спред эмитента к ключевой на прошлых купонах. Прогноз ключевой ставки: ${esc(c.keyrate.name)}${c.keyrate.as_of?`, на ${esc(c.keyrate.as_of)}`:''}.</p>`;
-    if(fl.length>lim)h+=`<button class="btn ghost bc-more" id="bc-more">Показать все (${fl.length})</button>`;
-  }else h+=`<div class="mu" style="font-size:13px">Данных о будущих выплатах нет.</div>`;
-  h+=`</div>`;
-  // история
-  const hs=c.history||{d:[]};
-  h+=`<div class="card bc-sec"><h2>История за год<span class="sp">Мосбиржа, основной режим торгов</span></h2>`;
-  if(hs.d&&hs.d.length>1)h+=`<div class="mu" style="font-size:12px;margin-bottom:4px">Цена, % от номинала</div><div class="bc-ch" id="bc-ch-p"></div>
-      <div class="mu" style="font-size:12px;margin:12px 0 4px">Доходность, % годовых</div><div class="bc-ch" id="bc-ch-y"></div>`;
-  else h+=`<div class="mu" style="font-size:13px">История торгов недоступна.</div>`;
-  h+=`</div>`;
-  // кривая эмитента
-  const ic=c.issuer_curve;
-  if(ic&&ic.points&&ic.points.length>1)h+=`<div class="card bc-sec"><h2>Кривая эмитента<span class="sp">${ic.points.length} выпусков в обращении: доходность по сроку</span></h2><div class="bc-ic" id="bc-ic"></div>
-    <div class="bc-ic-lg"><span><i class="lg-me"></i>этот выпуск</span><span><i class="lg-ot"></i>другие выпуски эмитента</span><span><i class="lg-fl"></i>флоатер (полая точка)</span><span><i class="lg-ln"></i>линия: выпуски с фиксированным купоном по сроку</span><span><i class="lg-kbd"></i>КБД (бескупонная доходность)</span><em>Клик по точке открывает карточку выпуска.</em></div></div>`;
-  // аналоги
-  const an=c.analogs||[];
-  h+=`<div class="card bc-sec"><h2>Аналоги<span class="sp">похожий рейтинг, срок и тип</span></h2>`;
-  if(c.rel&&c.rel.text){const ok=c.rel.diff>=0.25,bad_=c.rel.diff<=-0.25;
-    h+=`<div class="bc-rel"><b class="${ok?'pos':bad_?'neg':''}">${esc(c.rel.text)}.</b> Медианный спред аналогов: ${bcN(c.rel.median_spread,2)} п.п. «Дешевле» — выше доходность при сопоставимом риске, но это может отражать и риски, которых нет в рейтинге.</div>`}
-  if(an.length){
-    h+=`<div class="tbl"><table><thead><tr><th>Выпуск</th><th>Рейтинг</th><th>Сектор</th><th>Дюр., г.</th><th>Доходность</th><th>Спред</th><th>Δ дох.</th><th>Оборот</th></tr></thead><tbody>`
-      +an.map(a=>`<tr data-isin="${esc(a.isin)}" title="Открыть карточку"><td class="l">${esc(a.name)}${a.floating?' <span class="tag">флоат</span>':''}${a.amort?' <span class="tag">аморт</span>':''}</td>
-        <td>${a.rating?`<span class="tag rt rt-${esc(rBucket(a.rating).split(' ')[0])}">${esc(a.rating)}</span>`:'<span class="mu">—</span>'}</td>
-        <td>${esc(BC_SEC[a.sector]||a.sector||'—')}</td><td class="num">${bcN(a.dur,2)}</td><td class="num">${bcN(a.yield,2)} %</td>
-        <td class="num">${a.spread==null?'—':(a.spread>0?'+':'')+bcN(a.spread,2)}</td>
-        <td class="num ${a.dy>0?'pos':a.dy<0?'neg':''}">${a.dy==null?'—':(a.dy>0?'+':'')+bcN(a.dy,2)}</td><td class="num">${short(a.turn||0)}</td></tr>`).join('')
-      +`</tbody></table></div>`;
-  }else h+=`<div class="mu" style="font-size:13px">Подходящих аналогов не найдено${m?'':' (нет рыночных данных по выпуску)'}.</div>`;
-  h+=`</div><p class="note" style="margin-top:14px">Справочная информация на основе открытых данных Мосбиржи, каталога T-Invest и публичных рейтингов. Аналоги подобраны автоматически по рейтингу, сроку, сектору и типу выпуска; сравнение спреда не учитывает всех различий в риске и ликвидности.</p>${NIR_NOTE}`;
+  if(vBits.length)h+=`<div class="bc-verdict st-callout${vWarn?' warn':''}">${vBits.join(' · ')}</div>`;
+  const tab=BC_TABS.some(x=>x[0]===BC.tab)?BC.tab:'overview';
+  h+=`<div class="seg bc-tabs" id="bc-tabs" role="tablist">${BC_TABS.map(([k,t])=>`<button type="button" role="tab" aria-selected="${k===tab}" data-bct="${k}" class="${k===tab?'on':''}">${t}</button>`).join('')}</div>`;
+  if(tab==='overview'){
+    const rows=[];const add=(k,v)=>{if(v!=null&&v!=='')rows.push(`<div><span>${k}</span><span>${v}</span></div>`)};
+    add('Эмитент',esc(d.EMITTER||''));
+    add('Вид',esc(d.BOND_TYPE||d.TYPENAME||''));
+    add('Купон',m&&m.coupon!=null?bcN(m.coupon,2)+' %'+(d.COUPONFREQUENCY?` · ${esc(d.COUPONFREQUENCY)} р/год`:''):(d.COUPONFREQUENCY?`${esc(d.COUPONFREQUENCY)} р/год`:''));
+    add('Следующий купон',m&&m.next?ddm(m.next):'');
+    add('Погашение',m&&m.mat?ddm(m.mat):(ci.maturity?ddm(ci.maturity):(d.MATDATE?ddm(d.MATDATE):'')));
+    add('Оферты',(c.offers||[]).length?c.offers.map(o=>`${ddm(o.date)} ${bcOfKind(o.kind)}${o.period_start&&o.period_end?` <small class="mu">предъявление ${ddm(o.period_start)} – ${ddm(o.period_end)}</small>`:''}`).join('<br>')+' <a href="#" class="kb-a" data-kb="offers">Что такое put и call</a>':(m&&m.offer?ddm(m.offer)+' '+bcOfKind('put'):''));
+    add('Размещена',d.ISSUEDATE?ddm(d.ISSUEDATE):'');
+    add('Объём выпуска',d.ISSUESIZE?short(+d.ISSUESIZE)+' шт.':'');
+    add('Номинал',d.FACEVALUE?bcN(+d.FACEVALUE,2)+' '+esc(cur.toUpperCase())+(d.INITIALFACEVALUE&&d.INITIALFACEVALUE!==d.FACEVALUE?` (первоначально ${esc(d.INITIALFACEVALUE)})`:''):'');
+    add('Уровень листинга',m&&m.level?esc(m.level):esc(d.LISTLEVEL||''));
+    add('Уровень риска (T-Invest)',ci.risk?esc(BC_RISK[ci.risk]||ci.risk):'');
+    add('Для квалифицированных',d.ISQUALIFIEDINVESTORS==='1'?'да':d.ISQUALIFIEDINVESTORS==='0'?'нет':'');
+    add('Дефолт',d.HASDEFAULT==='1'?'<b class="neg">допущен</b>':d.HASTECHNICALDEFAULT==='1'?'<b class="neg">технический</b>':(d.HASDEFAULT==='0'?'нет':''));
+    add('Госномер выпуска',esc(d.REGNUMBER||''));
+    h+=`<div class="card bc-sec"><h2>Ключевые параметры</h2><div class="bc-par">${rows.join('')||'<span class="mu">Нет данных</span>'}</div></div>`;
+    const hs=c.history||{d:[]};
+    h+=`<div class="card bc-sec"><h2>История за год<span class="sp">Мосбиржа, основной режим торгов</span></h2>`;
+    if(hs.d&&hs.d.length>1)h+=`<div class="mu" style="font-size:12px;margin-bottom:4px">Цена, % от номинала</div><div class="bc-ch" id="bc-ch-p"></div>
+        <div class="mu" style="font-size:12px;margin:12px 0 4px">Доходность, % годовых</div><div class="bc-ch" id="bc-ch-y"></div>`;
+    else h+=`<div class="mu" style="font-size:13px">История торгов недоступна.</div>`;
+    h+=`</div>`;
+    h+=`<div class="card bc-sec"><h2>Документы выпуска</h2>${bcDocLinks(c.isin,(c.docs||{}).inn||d.EMITTER_INN,(m&&m.id)||c.isin)}</div>`;
+  }else if(tab==='flows'){
+    const ofs=c.offers||[];
+    if(ofs.length||(m&&m.offer)){
+      h+=`<div class="card bc-sec"><h2>График оферт<span class="sp">условия досрочного выкупа или погашения</span></h2><div class="bc-offers-box">`
+        +(ofs.length?ofs.map(o=>`<div class="bc-offer-row"><div><b>${ddm(o.date)}</b> ${bcOfKind(o.kind)}</div><div class="mu">${o.period_start&&o.period_end?`Предъявление: ${ddm(o.period_start)} – ${ddm(o.period_end)}`:'Сроки предъявления уточняйте в документах'}</div></div>`).join('')
+          :`<div class="bc-offer-row"><div><b>${ddm(m.offer)}</b> ${bcOfKind('put')}</div><div class="mu">Ближайшая дата оферты</div></div>`)
+        +`</div><a href="#" class="kb-a" data-kb="offers">Что такое put и call →</a></div>`;
+    }
+    const fl=c.flows||[],lim=BC.all?fl.length:12;
+    h+=`<div class="card bc-sec"><h2>Денежный поток<span class="sp">ближайшие выплаты на 1 облигацию</span></h2>`;
+    if(fl.length){
+      h+=`<div class="tbl"><table><thead><tr><th>Дата</th><th>Событие</th><th>Сумма</th><th>% номинала / ставка</th></tr></thead><tbody>`
+        +fl.slice(0,lim).map(e=>`<tr><td>${ddm(e.d)}</td><td>${BC_EV[e.t]||esc(e.t)}${e.t==='offer'&&e.kind&&e.kind!=='both'?' '+bcOfKind(e.kind):e.t==='offer'&&e.kind==='both'?' '+bcOfKind('put')+' '+bcOfKind('call'):''}</td><td class="num">${e.amt==null?'<span class="mu">по ставке</span>':e.est?`<span class="est" title="${esc(BC_KR_SRC[(c.keyrate||{}).source]||'ключевая ставка по прогнозу')} ${bcN(e.base,2)}% + спред ${bcN(e.spread,2)} п.п.">≈ ${M(e.amt,cur)}</span>`:M(e.amt,cur)}</td><td class="num">${e.pct==null?'—':(e.est?'≈ ':'')+bcN(e.pct,2)+' %'}</td></tr>`).join('')
+        +`</tbody></table></div>`;
+      if(c.keyrate)h+=`<p class="note" style="margin-top:8px">≈ — прогноз: ставка купона флоатера ещё не объявлена, принята равной ключевой ставке на начало купонного периода + спред эмитента к ключевой на прошлых купонах. Прогноз ключевой ставки: ${esc(c.keyrate.name)}${c.keyrate.as_of?`, на ${esc(c.keyrate.as_of)}`:''}.</p>`;
+      if(fl.length>lim)h+=`<button class="btn ghost bc-more" id="bc-more">Показать все (${fl.length})</button>`;
+    }else h+=`<div class="mu" style="font-size:13px">Данных о будущих выплатах нет.</div>`;
+    h+=`</div>`;
+  }else if(tab==='issuer'){
+    const rk=x=>{const i=RSC.indexOf(x.rating);return i<0?99:i},ra=(c.rating&&c.rating.all||[]).slice().sort((x,y)=>rk(x)-rk(y)||String(x.agency).localeCompare(String(y.agency)));
+    h+=`<div class="card bc-sec"><h2>Кредитные рейтинги эмитента</h2>`+(ra.length?`<div class="tbl bc-rt"><table><thead><tr><th>Агентство</th><th>Рейтинг</th><th>Прогноз</th><th>Дата</th><th>Источник</th></tr></thead><tbody>`
+      +ra.map(x=>{const u=rtSafeUrl(x.url),tg=`<span class="tag rt rt-${esc(rBucket(x.rating).split(' ')[0])}${u?' rt-click':''}">${esc(x.rating)}</span>`;
+        return`<tr><td>${esc(x.agency)}${x.approx?`<div class="mu" style="font-size:11px" title="${esc(x.issuer||'')}">по названию, приблизительно</div>`:''}</td><td>${u?`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer" class="bc-rt-a" title="Открыть пресс-релиз">${tg}</a>`:tg}</td><td>${x.outlook?esc(x.outlook):'<span class="mu">—</span>'}</td><td>${x.date?ddm(x.date):'<span class="mu">—</span>'}</td><td>${u?`<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">Пресс-релиз ↗</a>`:''}</td></tr>`}).join('')
+      +`</tbody></table></div>`:'<div class="mu" style="font-size:13px">Рейтинги кредитных агентств не найдены</div>')+`</div>`;
+    h+=bcDisclosure(c.disclosure);
+    h+=`<div class="card bc-sec" id="bc-iss"><h2>Финансы эмитента<span class="sp">отчётность РСБУ, ГИР БО ФНС</span></h2><div class="mu" style="font-size:13px">Загружаю отчётность эмитента…</div></div>`;
+  }else if(tab==='analogs'){
+    const ic=c.issuer_curve;
+    if(ic&&ic.points&&ic.points.length>1)h+=`<div class="card bc-sec"><h2>Кривая эмитента<span class="sp">${ic.points.length} выпусков в обращении: доходность по сроку</span></h2><div class="bc-ic" id="bc-ic"></div>
+      <div class="bc-ic-lg"><span><i class="lg-me"></i>этот выпуск</span><span><i class="lg-ot"></i>другие выпуски эмитента</span><span><i class="lg-fl"></i>флоатер (полая точка)</span><span><i class="lg-ln"></i>линия: выпуски с фиксированным купоном по сроку</span><span><i class="lg-kbd"></i>КБД (бескупонная доходность)</span><em>Клик по точке открывает карточку выпуска.</em></div></div>`;
+    const an=c.analogs||[];
+    h+=`<div class="card bc-sec"><h2>Аналоги<span class="sp">похожий рейтинг, срок и тип</span></h2>`;
+    if(c.rel&&c.rel.text){const ok=c.rel.diff>=0.25,bad_=c.rel.diff<=-0.25;
+      h+=`<div class="st-callout${bad_?' warn':''}"><b class="${ok?'pos':bad_?'neg':''}">${esc(c.rel.text)}.</b> Медианный спред аналогов: ${bcN(c.rel.median_spread,2)} п.п. «Дешевле» — выше доходность при сопоставимом риске, но это может отражать и риски, которых нет в рейтинге.</div>`}
+    if(an.length){
+      h+=`<div class="tbl"><table><thead><tr><th>Выпуск</th><th>Рейтинг</th><th>Сектор</th><th>Дюр., г.</th><th>Доходность</th><th>Спред</th><th>Δ дох.</th><th>Оборот</th></tr></thead><tbody>`
+        +an.map(a=>`<tr data-isin="${esc(a.isin)}" title="Открыть карточку"><td class="l">${esc(a.name)}${a.floating?' <span class="tag">флоат</span>':''}${a.amort?' <span class="tag">аморт</span>':''}</td>
+          <td>${a.rating?`<span class="tag rt rt-${esc(rBucket(a.rating).split(' ')[0])}">${esc(a.rating)}</span>`:'<span class="mu">—</span>'}</td>
+          <td>${esc(BC_SEC[a.sector]||a.sector||'—')}</td><td class="num">${bcN(a.dur,2)}</td><td class="num">${bcN(a.yield,2)} %</td>
+          <td class="num">${a.spread==null?'—':(a.spread>0?'+':'')+bcN(a.spread,2)}</td>
+          <td class="num ${a.dy>0?'pos':a.dy<0?'neg':''}">${a.dy==null?'—':(a.dy>0?'+':'')+bcN(a.dy,2)}</td><td class="num">${short(a.turn||0)}</td></tr>`).join('')
+        +`</tbody></table></div>`;
+    }else h+=`<div class="mu" style="font-size:13px">Подходящих аналогов не найдено${m?'':' (нет рыночных данных по выпуску)'}.</div>`;
+    h+=`</div>`;
+  }
+  h+=`<p class="note" style="margin-top:14px">Справочная информация на основе открытых данных Мосбиржи, каталога T-Invest и публичных рейтингов. Аналоги подобраны автоматически по рейтингу, сроку, сектору и типу выпуска; сравнение спреда не учитывает всех различий в риске и ликвидности.</p>${NIR_NOTE}`;
   return h;
 }
 function bcIssuerCurve(el,ic){
@@ -36122,8 +37681,8 @@ function bcIssIfrs(j){
   h+=s.bank?`<div class="bc-kpis">${bcKpi('ROE',Pc(c.roe),'рентабельность капитала')}${bcKpi('Капитал / активы',Pc(c.eq_ratio),'норма от 8–10 %')}${bcKpi('Неработающие кредиты',Pc(c.npl),'норма до 4–5 %')}${bcKpi('Достаточность капитала',Pc(c.car),'норма от 12 %')}</div>`
     :`<div class="bc-kpis">${bcKpi('Покрытие процентов',X(c.cover,1),'EBITDA / проценты; норма от 4–6')}${bcKpi('Чистый долг / EBITDA',c.net_debt!=null&&c.net_debt<=0?'нет':X(c.nd_ebitda,1),'норма до 2–3')}
     ${bcKpi('Капитал / активы',c.eq_ratio==null?'—':bcN(c.eq_ratio*100,0)+' %','норма от 25–40 %')}${bcKpi('Рентабельность EBITDA',Pc(c.margin_ebitda),'доля EBITDA в выручке')}</div>`;
-  if(m.key)h+=`<div class="bc-rel"><b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b></div>`;
-  if(j.history&&(j.history.defaults||j.history.tech))h+=`<div class="bc-warn">${esc(j.history.verdict)}</div>`;
+  if(m.key)h+=`<div class="st-callout"><b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b></div>`;
+  if(j.history&&(j.history.defaults||j.history.tech))h+=`<div class="st-callout warn">${esc(j.history.verdict)}</div>`;
   const bu=safeUrl(b.url);
   h+=`<div class="mu" style="font-size:12.5px;margin-top:6px">${rs?'Для сравнения, РСБУ отдельной компании: '+rs.score+' ('+esc(rs.label)+'). ':''}${bu?`<a href="${esc(bu)}" target="_blank" rel="noopener">Источник: smart-lab ↗</a>`:'Источник: smart-lab'}</div>
     <button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button><p class="note" style="margin-top:8px">Скоринг от 0 до 100 по консолидированной отчётности группы (МСФО). Данные агрегатора smart-lab, могут отличаться от официальной отчётности. Не инвестиционная рекомендация.</p>`;
@@ -36133,7 +37692,7 @@ function bcIssHtml(j,isin){
   const s=j.score||{},f=j.fin||{years:[]},m=j.market||{},is=j.issuer||{};
   if(!j.ok)return`<div class="mu" style="font-size:13px">${esc((j.errors||['Не удалось загрузить данные об эмитенте.'])[0])}</div>`;
   if(j.ifrs&&j.ifrs.score&&j.ifrs.score.ok&&j.ifrs.fin&&j.ifrs.fin.years&&j.ifrs.fin.years.length)return bcIssIfrs(j);
-  if(!s.ok)return`<div class="mu" style="font-size:13px">${esc(s.reason||f.note||'Нет данных по РСБУ.')}</div>${j.history?`<div class="bc-rel" style="margin-top:8px">${esc(j.history.verdict)}</div>`:''}<button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button>`;
+  if(!s.ok)return`<div class="mu" style="font-size:13px">${esc(s.reason||f.note||'Нет данных по РСБУ.')}</div>${j.history?`<div class="st-callout" style="margin-top:8px">${esc(j.history.verdict)}</div>`:''}<button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button>`;
   const y=f.years[f.years.length-1]||{},fm=s.fin_mode,X=(v,d)=>v==null?'—':bcN(v,d)+'×';
   const nd=y.net_debt!=null&&y.net_debt<=0?'нет':X(y.nd_ebit,1);
   let h=`<div class="bc-iss-top"><span class="iss-sc iss-${esc(s.key)}"><b>${s.score}</b> ${esc(s.label)}</span><span class="mu" style="font-size:12.5px">${esc(is.short||'')} · по отчётности за ${s.year} г.</span></div>
@@ -36141,8 +37700,8 @@ function bcIssHtml(j,isin){
     ${fm?bcKpi('Долг / капитал',X(y.debt_eq,1),'для лизинга до 5–8'):bcKpi('Чистый долг / EBIT',nd,'норма до 2–3 лет')}
     ${bcKpi('Капитал / активы',y.eq_ratio==null?'—':bcN(y.eq_ratio*100,0)+' %','норма от 20–30 %')}
     ${fm?bcKpi('Рентабельность EBIT',y.margin==null||y.margin>1?'—':bcN(y.margin*100,1)+' %','доля прибыли в выручке'):bcKpi('Текущая ликвидность',X(y.cur_liq,2),'норма от 1,2')}</div>`;
-  if(m.key)h+=`<div class="bc-rel"><b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b></div>`;
-  if(j.history&&(j.history.defaults||j.history.tech))h+=`<div class="bc-warn">${esc(j.history.verdict)}</div>`;
+  if(m.key)h+=`<div class="st-callout"><b class="${m.key==='mkt_higher'?'neg':m.key==='mkt_lower'?'':'pos'}">${esc(m.text)}</b></div>`;
+  if(j.history&&(j.history.defaults||j.history.tech))h+=`<div class="st-callout warn">${esc(j.history.verdict)}</div>`;
   h+=`<button class="btn ghost bc-more" id="bc-iss-more">Подробнее об эмитенте →</button><p class="note" style="margin-top:8px">Скоринг от 0 до 100 по открытой отчётности отдельной компании (РСБУ): может не отражать положение группы. Не инвестиционная рекомендация.</p>`;
   return h;
 }
@@ -36158,7 +37717,7 @@ function bcIssuer(dr,c,tok){
 function bcCharts(dr,c){
   const ice=dr.querySelector('#bc-ic');if(ice&&c.issuer_curve)try{bcIssuerCurve(ice,c.issuer_curve)}catch(e){}
   const hs=c.history;if(!hs||!hs.d||hs.d.length<2)return;
-  const labels=hs.d.map(ddm),p=document.getElementById('bc-ch-p'),y=document.getElementById('bc-ch-y');
+  const labels=hs.d.map(ddm),p=dr.querySelector('#bc-ch-p'),y=dr.querySelector('#bc-ch-y');
   {
     try{
       if(p)line(p,{h:190,labels,zero:false,fa:v=>bcN(v,1),ft:v=>bcN(v,2)+' %',series:[{n:'Цена',c:'var(--s1)',v:hs.p,w:2}]});
@@ -36168,9 +37727,9 @@ function bcCharts(dr,c){
 }
 /* ── сравнение 2–4 облигаций: данные берём из карточки выпуска (/api/bond), расчётов не дублируем ── */
 S.cmp=(lsJson('ta_cmp',[])||[]).filter(x=>typeof x==='string').slice(0,4);
-const CMP={d:{},q:'',max:4};
+const CMP={d:{},q:'',max:4,amt:+(lsJson('ta_cmp_amt',100000)||100000),cfGran:lsGet('ta_cmp_cfg')==='year'?'year':'quarter'};
 const cmpHas=i=>S.cmp.includes(String(i||'').toUpperCase());
-function cmpSave(){lsSet('ta_cmp',JSON.stringify(S.cmp))}
+function cmpSave(){lsSet('ta_cmp',JSON.stringify(S.cmp));if(typeof cmpDockRender==='function')try{cmpDockRender()}catch(e){}}
 function cmpAdd(isin){
   isin=String(isin||'').trim().toUpperCase();if(!isin)return false;
   if(S.cmp.includes(isin)){toast('Уже в сравнении');return false}
@@ -36190,14 +37749,43 @@ const cmpOffer=c=>{const t=localIso();return(c.offers||[]).filter(o=>o.date>=t).
 const cmpKindTag=k=>k==='both'?'<span class="tag of-t-put">PUT</span> <span class="tag of-t-call">CALL</span>':k==='put'?'<span class="tag of-t-put" title="Право держателя продать выпуск эмитенту">PUT</span>':k==='call'?'<span class="tag of-t-call" title="Эмитент может погасить выпуск досрочно">CALL</span>':'<span class="tag of-t-unk" title="Тип оферты не указан в источниках">оферта</span>';
 /* доходность выше CMP_ODD % или цена ниже 70 % номинала — признак проблем эмитента, такую бумагу не отмечаем «лучшей» */
 const CMP_ODD=40,cmpOdd=c=>!!c.market&&((c.market.yield||0)>CMP_ODD||(c.market.price!=null&&c.market.price<70&&(c.market.yield||0)>25));
+function cmpCalcIncome(c,amt){
+  const m=c&&c.market,d=(c&&c.desc)||{};
+  if(!m||!(amt>0))return null;
+  const cur=(m.cur||(c.catalog&&c.catalog.currency)||'RUB').toUpperCase();
+  const nom=+(m.nominal||d.FACEVALUE||1000);
+  const pxPct=m.price!=null?m.price:100;
+  const dirty=(pxPct/100)*nom+(m.nkd||0);
+  if(!(dirty>0))return null;
+  const units=amt/dirty;
+  const today=localIso(),in365=localIso(new Date(Date.now()+365*864e5));
+  const fl=(c.flows||[]).slice();
+  const off=cmpOffer(c);
+  const endDate=(m.offer)||(off&&off.date)||null;
+  let yrCpn=0,toEnd=0;
+  fl.forEach(e=>{
+    const a=e.amt!=null?+e.amt:0;
+    if(e.t==='coupon'&&e.d>=today&&e.d<=in365)yrCpn+=a;
+    if(!endDate||e.d<=endDate)toEnd+=a;
+  });
+  if(endDate&&!fl.some(e=>e.d===endDate&&(e.t==='redemption'||e.t==='offer')))toEnd+=nom;
+  if(!yrCpn&&m.coupon!=null)yrCpn=nom*(m.coupon/100);
+  const yearRub=yrCpn*units;
+  const totalOut=toEnd>0?toEnd*units:amt*(1+(m.yield||0)/100);
+  const netToMat=totalOut-amt;
+  return{cur,units,dirty,yearRub,totalOut,netToMat,endDate};
+}
 /* строки: [название, значение(c)->число/null для подсветки, вывод(c), лучше: 1 — больше, -1 — меньше, 0 — без подсветки] */
 function cmpRows(){
-  const fmtD=d=>d?ddm(d):'—',N=bcN;
+  const fmtD=d=>d?ddm(d):'—',N=bcN,amt=CMP.amt>0?CMP.amt:100000;
+  const moneyOut=(v,cur)=>cur==='RUB'?M(v,'rub',0):f0(v)+' '+esc(cur);
   return[
     ['Цена, % от номинала',c=>null,c=>c.market?N(c.market.price,2)+' %':'—',0],
     ['Доходность (к погашению или оферте)',c=>c.market&&!cmpOdd(c)?c.market.yield:null,c=>c.market?N(c.market.yield,2)+' %'+(cmpOdd(c)?'<br><small class="neg" title="Цена сильно ниже номинала: рынок закладывает серьёзный риск, что эмитент не расплатится полностью">аномально высокая — риск дефолта</small>':''):'—',1],
     ['Считается до',c=>null,c=>c.market?(c.market.offer?'оферты '+fmtD(c.market.offer):'погашения'):'—',0],
     ['Купон и тип',c=>null,c=>{const ci=c.catalog||{},m=c.market;return(m&&m.coupon!=null?N(m.coupon,2)+' %':'—')+' · '+(ci.floating?'флоатер':'фикс')},0],
+    ['Доход в год (на '+short(amt)+' ₽)',c=>{const x=cmpCalcIncome(c,amt);return x&&x.cur==='RUB'&&!cmpOdd(c)?x.yearRub:null},c=>{const x=cmpCalcIncome(c,amt);return x?`<b>${moneyOut(x.yearRub,x.cur)}</b><br><small class="mu">${f2(x.units)} шт.${x.cur!=='RUB'?' · в '+esc(x.cur):''}</small>`:'—'},1],
+    ['Доход к сроку (на '+short(amt)+' ₽)',c=>{const x=cmpCalcIncome(c,amt);return x&&x.cur==='RUB'&&!cmpOdd(c)?x.netToMat:null},c=>{const x=cmpCalcIncome(c,amt);return x?`<b class="${x.netToMat>=0?'pos':'neg'}">${x.netToMat>=0?'+':''}${moneyOut(x.netToMat,x.cur)}</b><br><small class="mu">выплат ${moneyOut(x.totalOut,x.cur)}</small>`:'—'},1],
     ['Дюрация, лет',c=>null,c=>c.market&&c.market.dur!=null?N(c.market.dur,2):'—',0],
     ['Дата погашения',c=>null,c=>fmtD((c.market&&c.market.mat)||(c.catalog||{}).maturity||(c.desc||{}).MATDATE),0],
     ['Ближайшая оферта',c=>null,c=>{const o=cmpOffer(c);return o?fmtD(o.date)+' '+cmpKindTag(o.kind):'нет'},0],
@@ -36207,25 +37795,72 @@ function cmpRows(){
     ['Средний оборот за 30 дней',c=>cmpAvgTurn(c),c=>{const v=cmpAvgTurn(c);return v==null?'—':short(v)+' ₽/день'},1],
     ['НКД, ₽ на облигацию',c=>null,c=>c.market&&c.market.nkd!=null?N(c.market.nkd,2):'—',0]];
 }
+function cmpSlotHtml(){
+  if(S.cmp.length>=CMP.max)return'';
+  return`<th class="cmp-h cmp-slot"><div class="cmp-slot-wrap"><input class="in cmp-slot-in" id="cmp-slot-q" placeholder="+ Добавить бумагу" autocomplete="off" aria-label="Добавить бумагу в слот сравнения"><div class="cmp-res" id="cmp-slot-res"></div></div></th>`;
+}
 function cmpTable(){
-  if(!S.cmp.length)return'<div class="mu" style="padding:14px 0;font-size:13px">Добавьте от 2 до 4 облигаций: через поиск выше или кнопкой «Сравнить» в карточке выпуска.</div>';
   const cols=S.cmp.map(i=>CMP.d[i]||{loading:true});
+  const slot=cmpSlotHtml();
+  if(!S.cmp.length){
+    return`<div class="cmp-wrap"><table class="cmp"><thead><tr><th class="l">Показатель</th>${slot}<th class="cmp-h cmp-slot"><div class="mu" style="font-size:12px">Слот 2</div></th></tr></thead><tbody><tr><td colspan="3" class="mu" style="padding:16px">Добавьте от 2 до 4 облигаций: через «+ Добавить бумагу» выше, в слот таблицы или кнопкой «Сравнить» в карточке выпуска.</td></tr></tbody></table></div>`;
+  }
   const head=S.cmp.map((i,k)=>{const x=cols[k],c=x.c;
     return`<th class="cmp-h"><div class="cmp-n">${c?`<a href="#" data-isin="${esc(i)}">${esc(c.short||c.name||i)}</a>`:esc(i)}</div><code>${esc(i)}</code><button class="cmp-x" data-del="${esc(i)}" title="Убрать из сравнения" aria-label="Убрать">✕</button></th>`}).join('');
   const body=cmpRows().map(([t,val,out,dir])=>{
     const vs=cols.map(x=>x.c?val(x.c):null),ok=vs.filter(v=>v!=null),best=dir&&ok.length>1&&Math.max(...ok)!==Math.min(...ok)?(dir>0?Math.max(...ok):Math.min(...ok)):null;
-    return`<tr><th class="l">${t}</th>${cols.map((x,k)=>`<td class="${best!=null&&vs[k]===best?'cmp-best':''}">${x.loading?'<span class="mu">…</span>':x.err?'<span class="mu">—</span>':out(x.c)}</td>`).join('')}</tr>`}).join('');
+    return`<tr><th class="l">${t}</th>${cols.map((x,k)=>`<td class="${best!=null&&vs[k]===best?'cmp-best':''}">${x.loading?'<span class="mu">…</span>':x.err?'<span class="mu">—</span>':out(x.c)}</td>`).join('')}${slot?'<td></td>':''}</tr>`}).join('');
   const errs=cols.map((x,k)=>x.err?`${esc(S.cmp[k])}: ${esc(x.err)}`:(x.c&&!x.c.found?`${esc(S.cmp[k])}: нет торгов на основных режимах Мосбиржи, часть строк пуста`:'')).filter(Boolean);
-  return`<div class="cmp-wrap"><table class="cmp"><thead><tr><th class="l"></th>${head}</tr></thead><tbody>${body}</tbody></table></div>`
+  return`<div class="cmp-wrap"><table class="cmp"><thead><tr><th class="l"></th>${head}${slot}</tr></thead><tbody>${body}</tbody></table></div>`
     +(errs.length?`<div class="bc-warn">${errs.join('<br>')}</div>`:'')
     +(S.cmp.length<2?'<p class="note">Для сравнения нужна хотя бы вторая облигация.</p>':'');
+}
+function cmpDrawFlows(){
+  const card=$('#cmp-cf-wrap');if(!card)return;
+  const loaded=S.cmp.map(i=>({isin:i,c:CMP.d[i]&&CMP.d[i].c})).filter(x=>x.c&&x.c.flows&&x.c.flows.length);
+  if(!loaded.length){card.innerHTML='';return}
+  const gran=CMP.cfGran==='year'?'year':'quarter',amt=CMP.amt>0?CMP.amt:100000;
+  const periodKey=d=>{if(!d||d.length<7)return null;const y=d.slice(0,4),m=+d.slice(5,7);return gran==='year'?y:y+'-Q'+(Math.floor((m-1)/3)+1)};
+  const pSet=new Set();
+  const seriesRaw=loaded.map((item,idx)=>{
+    const inc=cmpCalcIncome(item.c,amt),units=inc?inc.units:1,by={};
+    item.c.flows.forEach(e=>{
+      if(e.t!=='coupon'||e.amt==null)return;
+      const pk=periodKey(e.d);if(!pk)return;
+      pSet.add(pk);by[pk]=(by[pk]||0)+(+e.amt)*units;
+    });
+    return{n:item.c.short||item.c.name||item.isin,c:PAL[idx%PAL.length],by};
+  });
+  const keys=[...pSet].sort().slice(0,gran==='year'?10:16);
+  if(!keys.length){card.innerHTML='';return}
+  const labels=keys.map(k=>gran==='year'?k:k.slice(5)+' '+k.slice(2,4));
+  const series=seriesRaw.map(s=>({n:s.n,c:s.c,v:keys.map(k=>s.by[k]||0)}));
+  card.innerHTML=`<div class="card cmp-cf-card"><h2>Сравнение купонного потока (на ${short(amt)} ₽)<span class="sp"><span class="seg" id="cmp-cf-g"><button type="button" data-g="quarter" class="${gran==='quarter'?'on':''}">По кварталам</button><button type="button" data-g="year" class="${gran==='year'?'on':''}">По годам</button></span></span></h2><div id="cmp-cf-ch" class="chart"></div></div>`;
+  const gEl=$('#cmp-cf-g');
+  if(gEl)gEl.onclick=e=>{const b=e.target.closest('[data-g]');if(!b||b.dataset.g===CMP.cfGran)return;CMP.cfGran=b.dataset.g;lsSet('ta_cmp_cfg',CMP.cfGran);cmpDrawFlows()};
+  const chEl=$('#cmp-cf-ch');
+  if(chEl)bars(chEl,{h:240,labels,series,skipZero:true,empty:'Нет купонных выплат для графика'});
+}
+function cmpBindSlot(root){
+  const q=root.querySelector('#cmp-slot-q'),res=root.querySelector('#cmp-slot-res');
+  if(!q||!res)return;
+  const add=i=>{if(cmpAdd(i)){q.value='';res.innerHTML='';cmpFetch();cmpDraw()}};
+  q.oninput=()=>{
+    const v=q.value.trim(),f=cmpFind(v);
+    res.innerHTML=f.map(r=>`<button type="button" data-sa="${esc((r.isin||r.id).toUpperCase())}">${esc(r.name)} <small class="mu">${esc(r.id)}</small></button>`).join('')
+      +(!f.length&&/^[A-Za-z0-9]{10,14}$/.test(v)?`<button type="button" data-sa="${esc(v.toUpperCase())}">Добавить ${esc(v.toUpperCase())}</button>`:'');
+  };
+  q.onkeydown=e=>{if(e.key==='Enter'){const b=res.querySelector('button');if(b)add(b.dataset.sa)}};
+  res.onclick=e=>{const b=e.target.closest('[data-sa]');if(b)add(b.dataset.sa)};
 }
 function cmpDraw(){
   const t=$('#cmp-tbl');if(!t)return;
   t.innerHTML=cmpTable();
   t.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{cmpDel(b.dataset.del);cmpDraw();cmpCount()});
   t.querySelectorAll('a[data-isin]').forEach(a=>a.onclick=e=>{e.preventDefault();openBond(a.dataset.isin)});
+  cmpBindSlot(t);
   cmpCount();
+  cmpDrawFlows();
 }
 function cmpCount(){const e=$('#cmp-cnt');if(e)e.textContent=S.cmp.length+' из '+CMP.max;const i=$('#cmp-q');if(i)i.disabled=S.cmp.length>=CMP.max}
 function cmpFind(q){
@@ -36240,12 +37875,18 @@ function cmpFind(q){
 function pCmp(){
   if(!S.scr)loadScr();
   return`<div class="card"><h2>Сравнение облигаций<span class="sp" id="cmp-cnt"></span></h2>
-    <div class="cmp-add"><input class="in" id="cmp-q" placeholder="Название, тикер или ISIN выпуска" autocomplete="off"><div class="cmp-res" id="cmp-res"></div></div>
+    <div class="cmp-top">
+      <div class="cmp-add"><input class="in" id="cmp-q" placeholder="Название, тикер или ISIN выпуска" autocomplete="off"><div class="cmp-res" id="cmp-res"></div></div>
+      <label class="cmp-amt-f"><span>Сумма вложения, ₽</span><input class="in num" id="cmp-amt" type="number" min="1000" step="10000" value="${esc(CMP.amt)}"></label>
+    </div>
     <div id="cmp-tbl"></div>
-    <p class="note">Зелёным отмечено лучшее значение в строке: выше доходность, рейтинг, спред и оборот (аномально высокая доходность не отмечается). Но более высокая доходность, как правило, означает более высокий риск: смотрите на рейтинг, срок, оферты и амортизацию вместе. Доходность — к погашению или к ближайшей оферте (как считает Мосбиржа), до налогов. Подробности по каждому выпуску — в карточке (клик по названию). </p>${NIR_NOTE}</div>`;
+    <p class="note">Зелёным отмечено лучшее значение в строке: выше доходность, ожидаемый доход, рейтинг, спред и оборот (аномально высокая доходность не отмечается). Но более высокая доходность, как правило, означает более высокий риск: смотрите на рейтинг, срок, оферты и амортизацию вместе. Доходность — к погашению или к ближайшей оферте (как считает Мосбиржа), до налогов. Подробности по каждому выпуску — в карточке (клик по названию). </p>${NIR_NOTE}</div>
+    <div id="cmp-cf-wrap"></div>`;
 }
 function bindCmp(){
   cmpFetch();cmpDraw();
+  const amt=$('#cmp-amt');
+  if(amt)amt.oninput=amt.onchange=()=>{const v=parseFloat(String(amt.value).replace(',','.'));CMP.amt=isFinite(v)&&v>0?v:100000;lsSet('ta_cmp_amt',JSON.stringify(CMP.amt));cmpDraw()};
   const q=$('#cmp-q'),res=$('#cmp-res');if(!q)return;
   const add=i=>{if(cmpAdd(i)){q.value='';res.innerHTML='';cmpFetch();cmpDraw()}};
   q.oninput=()=>{
@@ -36587,7 +38228,7 @@ function bindSig(){
   document.querySelectorAll('#sg-root .sg-more').forEach(b=>b.onclick=()=>{f.more[b.dataset.m]=true;render()});
 }
 /* ── Мониторинг: тревоги по портфелю, ликвидность, спреды ── */
-const MON_SEV={high:['Высокая','mon-h'],medium:['Средняя','mon-m'],info:['Инфо','mon-i']};
+const MON_SEV={high:['Высокая','mon-h','neg'],medium:['Средняя','mon-m','warn'],info:['Инфо','mon-i','mu']};
 function monEnsure(){
   const acc=S.account,m=S.mon;
   if(m&&m.acc===acc&&(m.loading||m.error||(m.data&&Date.now()-m.t<6e5)))return;
@@ -36604,22 +38245,25 @@ function monSpark(sp,w=96,h=26){
   return`<svg class="mon-sp" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><title>Спред к КБД за ${sp.length} торг. дней: ${f2(v[0])} → ${f2(v[v.length-1])} п.п.</title><polyline fill="none" stroke="${c}" stroke-width="1.6" stroke-linejoin="round" points="${pts}"/></svg>`;
 }
 function monAlertHtml(a){
-  const[s,c]=MON_SEV[a.severity]||MON_SEV.info,n=(a.isins||[]).length;
+  const[s,c,dot]=MON_SEV[a.severity]||MON_SEV.info,n=(a.isins||[]).length;
   const nm=a.kind==='rating'?`${esc(a.name)}${n?` <small class="mu">· ${esc((a.bonds||[]).slice(0,2).join(', '))}${n>2?' и ещё '+(n-2):''}</small>`:''}`:esc(a.name||'');
   const au=safeUrl(a.url);
-  return`<div class="mon-al ${c}" ${a.isin?`data-isin="${esc(a.isin)}"`:''}><span class="mon-sev">${s}</span><span class="mon-d num"${a.asof?' title="Состояние на сегодня: дата события не публикуется"':''}>${a.asof?'сейчас':a.date?ddm(a.date):''}</span>
+  return`<div class="st-row mon-al ${c}" ${a.isin?`data-isin="${esc(a.isin)}"`:''}><span class="st-dot ${dot}"></span><span class="mon-sev">${s}</span><span class="mon-d num"${a.asof?' title="Состояние на сегодня: дата события не публикуется"':''}>${a.asof?'сейчас':a.date?ddm(a.date):''}</span>
     <div class="mon-b"><b>${nm}</b><span>${esc(a.message)}</span></div>${au?`<a href="${esc(au)}" target="_blank" rel="noopener" title="Источник">↗</a>`:''}</div>`;
+}
+function monTile(lbl,val,sub,dot,cls){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num ${cls||''}">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
 }
 function monCard(){
   if(!(S.bonds&&S.bonds.rows&&S.bonds.rows.length))return'';
   monEnsure();
   const m=S.mon;
-  if(!m||m.loading)return`<div class="card mon-card noprint"><h2>Тревоги<span class="sp">загружаю…</span></h2><div class="mu" style="font-size:12.5px">Проверяю рейтинги, цены и спреды облигаций портфеля</div></div>`;
+  if(!m||m.loading)return`<section class="st-card mon-card noprint"><header class="st-gh"><h3>Тревоги</h3><span>загружаю…</span></header><div class="st-callout">Проверяю рейтинги, цены и спреды облигаций портфеля…</div></section>`;
   if(m.error||!m.data)return'';
   const al=m.data.alerts.filter(a=>a.severity!=='info'),top=al.slice(0,3);
-  return`<div class="card mon-card noprint"><h2>Тревоги<span class="sp">${m.data.summary.high} высоких · ${m.data.summary.medium} средних</span>
-    <button class="btn ghost" data-go="mon" style="margin-left:auto;padding:4px 12px;font-size:12px">Мониторинг</button></h2>
-    ${top.length?top.map(monAlertHtml).join('')+(al.length>3?`<div class="mu" style="font-size:12px;margin-top:6px">…и ещё ${al.length-3}</div>`:''):'<div class="mon-ok">Значимых тревог по облигациям портфеля нет</div>'}</div>`;
+  return`<section class="st-card mon-card mon-v2-card noprint"><header class="st-gh"><h3>Тревоги</h3><span>${m.data.summary.high} высоких · ${m.data.summary.medium} средних</span>
+    <button class="btn ghost" data-go="mon" style="margin-left:10px;padding:4px 12px;font-size:12px">Мониторинг</button></header>
+    ${top.length?top.map(monAlertHtml).join('')+(al.length>3?`<div class="st-line">…и ещё ${al.length-3}</div>`:''):'<div class="st-callout">Значимых тревог по облигациям портфеля нет.</div>'}</section>`;
 }
 function monRatingTag(r){
   if(!r||!r.v)return'<span class="mu">—</span>';
@@ -36630,7 +38274,7 @@ function pMon(){
   monEnsure();
   const m=S.mon;
   if(!m||m.loading)return`<div class="card">${waitBox('Собираю рейтинговые события, историю цен и спредов… При первом запуске до минуты.')}</div>`;
-  if(m.error)return`<div class="msg err">${esc(m.error)} <button class="btn ghost" id="mon-r">Повторить</button></div>`;
+  if(m.error)return`<div class="st-callout warn">${esc(m.error)} <button class="btn ghost" id="mon-r">Повторить</button></div>`;
   const d=m.data,th=d.thresholds,sm=d.summary;
   const rows=d.rows.map(r=>`<tr data-isin="${esc(r.isin)}" title="Открыть карточку"><td class="l"><b style="font-weight:600">${esc(r.name)}</b><br><small class="mu">${esc(r.ticker||r.isin)}${r.call?' · оферта '+ddm(r.call):''}${r.maturity?' · погашение '+ddm(r.maturity):''}</small></td>
     <td class="num">${M(r.value_rub,'rub',0)}</td><td class="l">${monRatingTag(r.rating)}</td>
@@ -36642,29 +38286,32 @@ function pMon(){
     <td class="num">${r.turnover_avg!=null?short(r.turnover_avg)+' ₽':'—'}</td>
     <td class="num ${r.days_to_sell==null?(r.no_history?'mu':'neg'):r.days_to_sell>th.mon_sell_days?'neg':''}">${r.no_history?'—':r.days_to_sell==null?'∞':(r.days_to_sell<0.01?'<0,01':f2(r.days_to_sell))}</td>
     <td class="l">${(r.flags||[]).map(f=>`<span class="tag" style="color:var(--neg)">${esc(f)}</span>`).join(' ')}</td></tr>`).join('');
-  const fld=(k,t,min,step)=>`<label class="field"><span>${t}</span><input class="in num" id="mt-${k}" type="number" min="${min}" step="${step}" value="${th[k]}"></label>`;
-  return`<div class="g g4">${kpi('Высокие',sm.high,'понижение рейтинга, дефолт, сильное падение','neg',S8)}${kpi('Средние',sm.medium,'наблюдение, оферты, умеренное падение','',S4)}
-    ${kpi('Информационные',sm.info,'повышения, неликвидность, прогнозы',null,S1)}${kpi('Журнал рейтингов',d.log.events,d.log.since?'событий с '+ddm(d.log.since):'пока пуст',null,S2)}</div>
-  ${(d.notes||[]).map(n=>`<div class="msg">${esc(n)}</div>`).join('')}
-  <div class="card"><h2>Тревоги<span class="sp">рейтинговые действия — за 90 дней; цены и спреды — по последним торгам; погашения, амортизации и оферты — ближайшие ${Math.max(+th.mon_offer_days||30,30)} дн., даты Мосбиржи</span><button class="btn ghost" id="mon-r" style="margin-left:auto;padding:4px 12px;font-size:12px">Обновить</button></h2>
-    ${d.alerts.length?d.alerts.slice(0,S.monAll?999:12).map(monAlertHtml).join('')+(d.alerts.length>12?`<button class="btn ghost" id="mon-all" style="margin-top:6px">${S.monAll?'Свернуть':'Показать все ('+d.alerts.length+')'}</button>`:''):'<div class="mon-ok">Тревог нет</div>'}</div>
+  const thRow=(k,t,sub,min,step)=>`<div class="st-row"><div class="st-t"><b>${t}</b><small>${sub}</small></div><div class="st-c"><input class="in num st-num" id="mt-${k}" type="number" min="${min}" step="${step}" value="${th[k]}"></div></div>`;
+  return`<div class="st-tiles">${monTile('Высокие',sm.high,'понижение рейтинга, дефолт, сильное падение',sm.high?'neg':'pos',sm.high?'neg':'')}${monTile('Средние',sm.medium,'наблюдение, оферты, умеренное падение',sm.medium?'warn':'mu')}
+    ${monTile('Информационные',sm.info,'повышения, неликвидность, прогнозы','mu')}${monTile('Журнал рейтингов',d.log.events,d.log.since?'событий с '+ddm(d.log.since):'пока пуст',d.log.events?'pos':'mu')}</div>
+  ${(d.notes||[]).map(n=>`<div class="st-callout">${esc(n)}</div>`).join('')}
+  <section class="st-card mon-v2-card"><header class="st-gh"><h3>Тревоги</h3><span>рейтинги — 90 дн. · оферты — ближайшие ${Math.max(+th.mon_offer_days||30,30)} дн.</span><button class="btn ghost" id="mon-r" style="margin-left:10px;padding:4px 12px;font-size:12px">Обновить</button></header>
+    ${d.alerts.length?d.alerts.slice(0,S.monAll?999:12).map(monAlertHtml).join('')+(d.alerts.length>12?`<div class="st-foot"><button class="btn ghost" id="mon-all">${S.monAll?'Свернуть':'Показать все ('+d.alerts.length+')'}</button></div>`:''):'<div class="st-callout">Значимых тревог нет.</div>'}</section>
   ${watchMonGroup()}
   <div class="card"><h2>Облигации портфеля<span class="sp">цены Мосбиржи, спред — доходность минус КБД на дюрации бумаги</span></h2>
     <div class="tbl"><table id="mon-tab"><thead><tr><th class="l">Облигация</th><th>Стоимость</th><th class="l">Рейтинг · прогноз</th><th>Цена, %</th><th>Δ 5 дн.</th><th>Δ 30 дн.</th>
     <th>Спред, п.п.</th><th>Δ спреда 30 дн.</th><th>Спред 90 дн.</th><th>Оборот в день</th><th title="Стоимость позиции / (20 % среднего дневного оборота за 30 дней)">Дней на продажу</th><th class="l">Признаки</th></tr></thead><tbody>${rows}</tbody></table></div>
     <p class="note" style="margin-top:10px">Оборот — среднее за 30 дней по торговым дням (${d.cal_days} дн.). «Дней на продажу» — сколько дней потребуется, чтобы продать позицию, забирая не более 20 % дневного оборота. Время расчёта: ${d.timings.total} с.</p></div>
-  <details class="card"><summary style="cursor:pointer;font-weight:600;color:var(--tx2)">Пороги тревог</summary><div class="mon-th">
-    ${fld('mon_drop5','Падение цены за 5 дней, %',0.1,0.5)}${fld('mon_drop30','Падение цены за 30 дней, %',0.1,0.5)}${fld('mon_spread30','Рост спреда за 30 дней, п.п.',0.1,0.5)}
-    ${fld('mon_sell_days','Неликвид: дней на продажу более',0.5,0.5)}${fld('mon_offer_days','Оферта: за сколько дней предупреждать',1,1)}
-    <button class="btn" id="mon-save" style="align-self:flex-end">Сохранить</button></div>
-    <p class="note" style="margin-top:10px">Вдвое превышенный порог даёт высокую важность. Что программа не видит: факт оплаты купона (биржа его не публикует). Дефолт определяется по флагам Мосбиржи, дефолтному рейтингу (D, C) и остановке торгов.</p></details>${NIR_NOTE}`;
+  <details class="st-card st-more"><summary style="padding:14px 20px">Пороги тревог</summary><div>
+    ${thRow('mon_drop5','Падение цены за 5 дней, %','Порог срабатывания средней тревоги; вдвое больше — высокая',0.1,0.5)}
+    ${thRow('mon_drop30','Падение цены за 30 дней, %','Отслеживает плавное снижение цены за месяц',0.1,0.5)}
+    ${thRow('mon_spread30','Рост спреда за 30 дней, п.п.','Сигнал расширения кредитного спреда к ОФЗ',0.1,0.5)}
+    ${thRow('mon_sell_days','Неликвид: дней на продажу более','Позиция крупнее 20 % дневного оборота на это число дней',0.5,0.5)}
+    ${thRow('mon_offer_days','Оферта: за сколько дней предупреждать','Напоминание о ближайшей дате предъявления',1,1)}
+    <div class="st-foot"><span class="mu">Вдвое превышенный порог даёт высокую важность. Дефолт определяется по флагам Мосбиржи, рейтингу D/C и остановке торгов.</span><button class="btn" id="mon-save">Сохранить</button></div>
+  </div></details>${NIR_NOTE}`;
 }
 function bindMon(){
   const r=$('#mon-r');if(r)r.onclick=()=>{S.mon=null;render()};
   const al=$('#mon-all');if(al)al.onclick=()=>{S.monAll=!S.monAll;render()};
   const sv=$('#mon-save');
   if(sv)sv.onclick=async()=>{const b={};['mon_drop5','mon_drop30','mon_spread30','mon_sell_days','mon_offer_days'].forEach(k=>b[k]=$('#mt-'+k).value);
-    sv.disabled=true;try{await post('/api/config',b);S.cfg=await api('/api/config')}catch(e){}S.mon=null;render()};
+    sv.disabled=true;try{await post('/api/config',b);S.cfg=await api('/api/config');toast('Пороги сохранены','ok')}catch(e){toast(e.message,'err')}S.mon=null;render()};
 }
 /* ── Сравнение с рынком: индексы облигаций, фонды ликвидности и облигационные БПИФ ── */
 S.bn={};S.bnSel=new Set(['LQDT','RUCBTRNS']);S.bnLoad=null;
@@ -37214,6 +38861,29 @@ function clMcFill(){
     CL_MCT=setTimeout(()=>step(i+1),0)};
   CL_MCT=setTimeout(()=>step(0),did?0:200);
 }
+function clTile(lbl,val,sub,dot,cls){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num ${cls||''}">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
+}
+function clBeatDeposit(cur,p,P,env,F){
+  if(cur.id==='dep')return{isDep:true};
+  const dep=clSim('dep',p,P,env,F),N=p.months;
+  if(!(cur.cap[N]>dep.cap[N]))return{beats:false};
+  let k=N;
+  while(k>1&&cur.cap[k-1]>dep.cap[k-1])k--;
+  return{beats:true,month:k};
+}
+function clWaterfallHtml(cur){
+  const gross=cur.income+cur.taxes,taxes=cur.taxes,ded=cur.deductions,net=cur.final-cur.deposited;
+  const mx=Math.max(1,Math.abs(gross),Math.abs(taxes),Math.abs(ded),Math.abs(net));
+  const step=(lbl,val,c,isNet,sg)=>{
+    const w=Math.max(4,Math.min(100,Math.abs(val)/mx*100));
+    const txt=(sg||'')+clRub(Math.abs(val));
+    return`<div class="cl-wf-step${isNet?' is-net':''}"><span class="cl-wf-lbl">${lbl}</span><b class="cl-wf-val num ${isNet?(val>=0?'pos':'neg'):''}">${val<0&&!sg?'−':''}${txt}</b><div class="cl-wf-track"><i style="width:${w.toFixed(1)}%;background:${c}"></i></div></div>`;
+  };
+  return`<div class="card"><h2>Мост результата: доходы, налоги и вычеты<span class="sp">${esc(cur.name)} · в номинальных рублях</span></h2>
+    <div class="cl-wf">${step('+ Доход до налога',gross,'var(--s1)',false,gross>=0?'+':'−')}${step('− Налоги (НДФЛ)',taxes,'var(--neg)',false,'−')}${step('+ Вычеты ИИС',ded,'var(--s4)',false,'+')}${step('= Чистый результат',net,'var(--pos)',true,net>=0?'+':'−')}</div>
+    <p class="note" style="margin-top:8px">Вложено своих средств: <b>${clRub(cur.deposited)}</b> · итоговый капитал (номинал): <b>${clRub(cur.final)}</b> (= внесено + чистый результат).</p></div>`;
+}
 /* ── Правая часть: накопить капитал ── */
 function clOut(){
   const F=clLoadF(),P=clMkt();
@@ -37230,12 +38900,17 @@ function clOut(){
   chart('cl-stack',clStack,{h:300,series:ser,labels,tipLabels:tips,fa:short,ft:v=>clRub(v),empty:'Нет данных'});
   const hasMed=!!cur.med,fin=hasMed?cur.med.p50/dv(N):(real?cur.finalReal:cur.final),inc=sInc[N],pas=real?cur.passiveReal:cur.passive;
   const finSub=esc(cur.name)+' · '+(real?'в сегодняшних деньгах':'номинал')+(F.defaults?(hasMed?' · медиана с дефолтами':' · без учёта дефолтов'):'');
+  const beat=clBeatDeposit(cur,p,P,env,F);
+  const beatVal=beat.isDep?'сам вклад':beat.beats?clYM(beat.month):'не обгоняет';
+  const beatSub=beat.isDep?'базовая точка сравнения':beat.beats?`с ${beat.month}-го мес. обгоняет вклад после налогов`:`уступает вкладу на горизонте ${clYM(N)}`;
   const pick=res.length>1?`<div class="cl-view"><span>Итоги и график для</span><select class="in" id="cl-view"><option value="">лучшей стратегии (${esc(best.name)})</option>${
     res.map(r=>`<option value="${r.id}" ${r.id===F.view?'selected':''}>${esc(r.name)}</option>`).join('')}</select></div>`:'';
-  const kp=`${pick}<div class="g g4">${kpi('Итоговый капитал',clRub(fin),finSub,'pos',S3)}
-    ${kpi('Чистый доход',clRub(inc),'после налогов, сверх внесённого'+(cd>0?' и вычетов':'')+(hasMed?' · без дефолтов':''),cls(inc),S1)}
-    ${kpi('Уплачено налогов',clRub(cur.taxes),'НДФЛ за '+clYM(N)+', номинал',null,S8)}
-    ${kpi('Пассивный доход в месяц',clRub(pas),'после налога, '+(real?'в сегодняшних деньгах':'номинал')+(F.defaults?' · без дефолтов':''),null,S4)}</div>`;
+  const kp=`${pick}<div class="st-tiles cl-tiles">${clTile('Итоговый капитал',clRub(fin),finSub,'pos','pos')}
+    ${clTile('Чистый доход',clRub(inc),'после налогов, сверх внесённого'+(cd>0?' и вычетов':'')+(hasMed?' · без дефолтов':''),inc>=0?'pos':'neg',cls(inc))}
+    ${clTile('Уплачено налогов',clRub(cur.taxes),'НДФЛ за '+clYM(N)+', номинал',cur.taxes>0?'warn':'pos')}
+    ${clTile('Пассивный доход в месяц',clRub(pas),'после налога, '+(real?'в сегодняшних деньгах':'номинал')+(F.defaults?' · без дефолтов':''),'mu')}</div>
+    <div class="st-callout"><b>Точка обгона вклада:</b> <span class="num ${beat.beats?'pos':''}">${esc(beatVal)}</span> — ${esc(beatSub)}.</div>`;
+  const wf=clWaterfallHtml(cur);
   const stk=`<div class="card"><h2>Из чего состоит капитал<span class="sp">${esc(cur.name)} · ${mode}</span></h2><div id="cl-stack" class="chart"></div>
     <div class="note" style="margin-top:10px">Цены за ${clYM(N)} вырастут в ×${f2(defl)} по прогнозу инфляции: 1 ₽ в конце срока ≈ ${f2(1/defl)} ₽ сегодня.${real?' Взносы, вычеты и доход пересчитаны в сегодняшние деньги на дату поступления.':''} Слои — без случайных событий.</div></div>`;
   const th=['Стратегия','Итоговый капитал','Внесено','Получено дохода','Уплачено налогов','Вычеты и возвраты ИИС','Капитал в сегодняшних деньгах','Пассивный доход в месяц (после налога)','Годовая доходность после налогов, номинал / реальная'].concat(F.defaults?['Медиана с дефолтами и шоками ставки']:[]);
@@ -37246,14 +38921,14 @@ function clOut(){
   if(F.acct!=='plain'){
     if(res.some(r=>r.id==='dep'))warn.push('Вклад лежит в банке, а не на ИИС: вычет и льготы ИИС к нему не применяются, налог считается как на обычном счёте.');
     if(!ai.exempt)warn.push('ИИС-3, год открытия '+ai.openYear+': минимальный срок '+ai.term+' лет, а к концу расчёта счёт будет открыт '+clYM(ai.own)+'. При закрытии раньше срока полученные вычеты возвращаются, а весь доход облагается налогом.');
-    else warn.push('ИИС-3, год открытия '+ai.openYear+': минимальный срок '+ai.term+' лет выдержан; доход освобождён от налога до 30 млн ₽ за всё время, вычет — '+f2(ai.rate*100)+' % от взносов до 400 тыс. ₽ в год'+(F.salary>0?' (не больше уплаченного НДФЛ с дохода '+clRub(F.salary)+' в год)':'')+'.');
+    else warn.push('ИИС-3, год открытия '+ai.openYear+': минимальный срок '+ai.term+' лет выдержан; доход освобождён от налога до 30 млн ₽ за всё время, вычет — '+f2(ai.rate*100)+' % от взносов до 400 тыс. ₽ в год (52–88 тыс. ₽ в год при ставках 13–22 %'+(F.salary>0?', не больше НДФЛ с дохода '+clRub(F.salary):'')+').');
     if(!(ai.rate>0))warn.push('Ставка НДФЛ с зарплаты не указана: вычет не начисляется (ИП и самозанятые без НДФЛ с зарплаты его не получают).');
   }
   if(F.acct==='plain'&&res.some(r=>r.id==='fund'||r.id==='stk')&&F.ldv)warn.push('ЛДВ: рост пая или цены акций без налога при владении от 3 лет, лимит 3 млн ₽ × средневзвешенный срок владения; каждое пополнение учитывается отдельно по сроку владения. Дивиденды акций облагаются ежегодно.');
   if(res.some(r=>r.id==='fxb'))warn.push('Замещающие облигации: купон в валюте, рублёвая курсовая переоценка облагается налогом при погашении или продаже (на ИИС-3 с выдержанным сроком — нет).');
   if(res.some(r=>r.id==='mix'||r.id==='pf'))warn.push('Смесь частей: доли поддерживаются распределением стартовой суммы и взносов, без продаж ради ребалансировки; порог 15 % делится пропорционально долям.');
   if(P.portfolio==null&&F.strat.pf)warn.push('Нет данных о портфеле — «Мой портфель» недоступен.');
-  const wn=warn.length?`<div class="note" style="margin-top:12px">${warn.map(w=>'• '+esc(w)).join('<br>')}</div>`:'';
+  const wn=warn.length?`<div class="st-callout${F.acct!=='plain'&&!ai.exempt?' warn':''}" style="margin:12px 0 0">${warn.map(w=>'• '+esc(w)).join('<br>')}</div>`:'';
   const tbl=`<div class="card"><h2>Сравнение стратегий<span class="sp">через ${clYM(N)}</span></h2><div class="tbl cl-tbl"><table><thead><tr>${th.map((t,i)=>`<th class="${i?'':'l'}">${t}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>
     <div class="note" style="margin-top:10px">«Итоговый капитал» — если закрыть позиции и вывести деньги в конце срока: за вычетом всех налогов, включая налог последнего года, налог при закрытии ИИС и налог при продаже. «Годовая доходность» — эффективная ставка взносов против итога с учётом их дат (после налогов); реальная — за вычетом инфляции. «Получено дохода» = итог − внесено − вычеты.${res.length>1?' Нажмите на строку, чтобы показать стратегию в итогах и на графике.':''}${F.defaults?' Основной расчёт идёт без случайных событий и поэтому не учитывает дефолты; последний столбец и «лучшая» стратегия — по медиане 100 случайных траекторий с дефолтами по выпускам (редкие события, а не равномерная усушка) и шоками ключевой ставки и рынка акций, так что разница включает не только дефолты.':''}</div>${wn}</div>`;
   let cmp='';
@@ -37265,7 +38940,7 @@ function clOut(){
     cmp=`<div class="card"><h2>Рост капитала по стратегиям<span class="sp">${mode}</span></h2><div id="cl-chart" class="chart"></div></div>`;
   }
   const deep=typeof clDeepHtml==='function'?clDeepHtml(F,P,run,cur):'';
-  return`${kp}${stk}${deep}${tbl}${cmp}<div class="card"><h2>Что заложено в расчёт</h2>${clSegTable(P,F,env)}</div>`;
+  return`${kp}${wf}${stk}${deep}${tbl}${cmp}<div class="card"><h2>Что заложено в расчёт</h2>${clSegTable(P,F,env)}</div>`;
 }
 /* ── Правая часть: жизнь с капитала ── */
 function clLifeOut(){
@@ -37286,17 +38961,17 @@ function clLifeOut(){
   const years=life.dep!=null?life.dep/12:null;
   const lasts=life.dep==null?`на весь срок ${clYM(H)}`:`${clYM(life.dep)} (до ${new Date(env.y0,env.m0+N+life.dep,1).getFullYear()} года)`;
   const cover=cur.perp>0?cur.perp/F.spend*100:0;
-  const kp=`<div class="g g4">${kpi('Капитал к выходу',clRub(real?K0r:K0),esc(cur.name)+' · '+mode+(real?'':'; в сегодняшних: '+clRub(K0r)),'pos',S3)}
-    ${kpi('Вечный доход в месяц',clRub(real?cur.perp:cur.perp*env.D[N]),'сохраняет покупательную способность капитала; '+f2(cover)+' % ваших трат',cover>=100?'pos':'',S4)}
-    ${kpi('Тратите в месяц',clRub(real?F.spend:spendEnd),(real?'в сегодняшних деньгах':'к дате выхода '+clRub(spendEnd))+', растёт с инфляцией',null,S1)}
-    ${kpi('Капитала хватит',life.dep==null?'весь срок':clYM(life.dep),life.dep==null?'снятие '+clYM(H)+' без исчерпания':'исчерпается '+lasts,life.dep==null?'pos':'neg',S8)}</div>`;
+  const kp=`<div class="st-tiles cl-tiles">${clTile('Капитал к выходу',clRub(real?K0r:K0),esc(cur.name)+' · '+mode+(real?'':'; в сегодняшних: '+clRub(K0r)),'pos','pos')}
+    ${clTile('Вечный доход в месяц',clRub(real?cur.perp:cur.perp*env.D[N]),'сохраняет покупательную способность капитала; '+f2(cover)+' % ваших трат',cover>=100?'pos':'warn')}
+    ${clTile('Тратите в месяц',clRub(real?F.spend:spendEnd),(real?'в сегодняшних деньгах':'к дате выхода '+clRub(spendEnd))+', растёт с инфляцией','mu')}
+    ${clTile('Капитала хватит',life.dep==null?'весь срок':clYM(life.dep),life.dep==null?'снятие '+clYM(H)+' без исчерпания':'исчерпается '+lasts,life.dep==null?'pos':'neg',life.dep==null?'pos':'neg')}</div>`;
   const verdict=life.dep==null?`При тратах ${clRub(F.spend)} в месяц (в сегодняшних деньгах, с ростом на инфляцию) капитала <b>хватает на весь срок ${clYM(H)}</b>; к концу останется ${clRub(real?life.end/env.D[N+H]:life.end)}${real?' в сегодняшних деньгах':''}.`:
     `При тратах ${clRub(F.spend)} в месяц (в сегодняшних деньгах, с ростом на инфляцию) капитал <b>исчерпается через ${clYM(life.dep)} после выхода</b>. Безопасное снятие, не съедающее капитал, — около <b>${clRub(cur.perp)}</b> в месяц в сегодняшних деньгах.`;
   const th=['Стратегия','Капитал к выходу, сегодняшние ₽','Вечный доход в месяц, сегодняшние ₽','Покрытие трат','Хватит на'];
   const rows=runs.map(r=>`<tr data-lf="${r.id}" class="${r===cur?'cl-cur':''}"><td class="l"><i class="cl-dot" style="background:${r.color}"></i>${esc(r.name)}</td><td class="num">${clRub(r.r.final/r.env.D[r.N])}</td><td class="num"><b>${clRub(r.perp)}</b></td>
     <td class="num ${r.perp>=F.spend?'pos':'neg'}">${f2(F.spend>0?r.perp/F.spend*100:0)} %</td><td class="num">${r.life.dep==null?'весь срок':clYM(r.life.dep)}</td></tr>`).join('');
   const deep=typeof clLifeMcHtml==='function'?clLifeMcHtml(F,P,cur):'';
-  return`${kp}<div class="card cl-goal"><h2>Выход на капитал<span class="sp">${esc(cur.name)}</span></h2><div class="cl-ans">${verdict}</div>
+  return`${kp}<div class="card cl-goal"><h2>Выход на капитал<span class="sp">${esc(cur.name)}</span></h2><div class="st-callout${life.dep==null?'':' warn'}">${verdict}</div>
     <div class="note" style="margin-top:8px">Сначала копим ${clYM(N)}, затем ежемесячно снимаем ${clRub(F.spend)} (сегодняшних денег) с индексацией на инфляцию в течение ${clYM(H)}. Две цифры: <b>вечный доход</b> — сколько можно снимать, не уменьшая реальный капитал; <b>срок исчерпания</b> — на сколько лет хватит при заданных тратах. Если снимать только купоны в номинале, капитал сохранится в рублях, но потеряет покупательную способность на величину инфляции.</div></div>
    <div class="card"><h2>Капитал: накопление и снятие<span class="sp">${mode}</span></h2><div id="cl-lifech" class="chart"></div></div>
    ${deep}
@@ -37334,11 +39009,11 @@ function clGoalOut(){
   const cv=c.cov;
   const cov=cv?`<div class="card cl-goal"><h2>Где вы сейчас</h2><div class="cl-ans">Сейчас купоны и дивиденды дают около <b>${clRub(cv.gross)}</b> в месяц до налога и около <b>${clRub(cv.net)}</b> после налога. Цель — ${clRub(F.goalAmt)} после налога${cv.real?' в сегодняшних деньгах':''}: покрыто <b>${f2(cv.pctNet)} %</b> (до налога — ${f2(cv.pctGross)} %, но сравнивать нужно с целью после налога). Оценка по графику выплат на 12 месяцев, без учёта будущих изменений портфеля.</div></div>`:
     `<div class="card"><div class="note">Данных о текущем доходе нет: подключите токен или откройте вкладку при загруженном портфеле.</div></div>`;
-  const kp=`<div class="g g4">${kpi(F.goalMode==='years'?'Нужный срок':'Пополнение в месяц',F.goalMode==='years'?clYM(c.g.months):(c.g.monthly<=0?'не требуется':clRub(c.g.monthly)),esc(s[1])+(F.goalMode==='years'?' · пополнение '+clRub(F.monthly):' · срок '+clYM(N)),c.g.monthly<=0?'pos':'',S3)}
-    ${kpi('Капитал к цели',clRub(real?r.finalReal:r.final),(real?'в сегодняшних деньгах, ':'')+'номинал: '+clRub(r.final),null,S1)}
-    ${kpi('Пассивный доход в месяц',clRub(real?r.passiveReal:r.passive),'после налога, '+mode,'pos',S4)}
-    ${kpi('Уплачено налогов',clRub(r.taxes),'за '+clYM(N)+', номинал'+(r.deductions>0?'; вычеты ИИС-3: '+clRub(r.deductions):''),null,S8)}</div>`;
-  return`${kp}<div class="card cl-goal"><h2>Подбор под цель<span class="sp">${esc(s[1])}</span></h2><div class="cl-ans">${head}</div>
+  const kp=`<div class="st-tiles cl-tiles">${clTile(F.goalMode==='years'?'Нужный срок':'Пополнение в месяц',F.goalMode==='years'?clYM(c.g.months):(c.g.monthly<=0?'не требуется':clRub(c.g.monthly)),esc(s[1])+(F.goalMode==='years'?' · пополнение '+clRub(F.monthly):' · срок '+clYM(N)),c.g.monthly<=0?'pos':'mu',c.g.monthly<=0?'pos':'')}
+    ${clTile('Капитал к цели',clRub(real?r.finalReal:r.final),(real?'в сегодняшних деньгах, ':'')+'номинал: '+clRub(r.final),'mu')}
+    ${clTile('Пассивный доход в месяц',clRub(real?r.passiveReal:r.passive),'после налога, '+mode,'pos','pos')}
+    ${clTile('Уплачено налогов',clRub(r.taxes),'за '+clYM(N)+', номинал'+(r.deductions>0?'; вычеты ИИС-3: '+clRub(r.deductions):''),r.taxes>0?'warn':'pos')}</div>`;
+  return`${kp}<div class="card cl-goal"><h2>Подбор под цель<span class="sp">${esc(s[1])}</span></h2><div class="st-callout">${head}</div>
    <div class="note" style="margin-top:8px">Пассивный доход — проценты, купоны или дивиденды, которые капитал приносит в год, делённые на 12, после налога по шкале 13/15 % (на ИИС-3 при выдержанном сроке налога нет). Цель ${real?'пересчитана на инфляцию: к концу срока 1 ₽ будет стоить примерно '+f2(dv)+' сегодняшних':'задана в номинальных рублях'}. Расчёт идёт без случайных событий (дефолты не учтены).</div></div>
   ${cov}
   <div class="card"><h2>Рост капитала<span class="sp">через ${clYM(N)} · ${mode}</span></h2><div id="cg-chart" class="chart"></div></div>
@@ -37382,7 +39057,8 @@ function clForm(F,P){
    <label class="field" id="cl-idxbox" style="${F.idxMode==='own'?'':'display:none'}"><span>Индексация пополнений, % в год</span><input class="in" id="cl-idx" type="number" min="0" max="50" step="0.5" value="${esc(F.idx)}"></label>
    <div id="cl-iisbox" style="${F.acct==='iis3'?'':'display:none'}"><div class="cl-grid cl-g2">${num('iisYear','Год открытия ИИС-3',F.iisYear,'min="2024" max="'+new Date().getFullYear()+'" step="1"')}
     ${sel('salRate','Ставка НДФЛ с вашей зарплаты',[[13,'13 %'],[15,'15 %'],[18,'18 %'],[20,'20 %'],[22,'22 %'],[0,'не плачу (ИП, самозанятый)']],F.salRate)}</div>
-    ${num('salary','Официальный доход за год, ₽ (пусто — без ограничения вычета)',F.salary||'','min="0" step="10000" placeholder="не ограничивать"')}</div>
+    ${num('salary','Официальный доход за год, ₽ (пусто — без ограничения вычета)',F.salary||'','min="0" step="10000" placeholder="не ограничивать"')}
+    <div class="st-callout cl-iis-cap">Лимит вычета по ИИС-3: <b>52–88 тыс. ₽</b> в год (13–22 % от взносов до 400 тыс. ₽ в год, не больше уплаченного НДФЛ).</div></div>
    ${tab}
    <div class="cl-sec">${multi?'Во что вкладываем':'Стратегия'}</div>
    ${multi?`<div class="cl-chips" id="cl-strat">${chips}</div>`:`<div class="note">Стратегия выбирается выше, в «Цель по пассивному доходу».</div>`}
@@ -37409,7 +39085,7 @@ function pCalcPage(){
   const ld=S.calcAcc!==S.account;if(ld)clLoad();
   const P=(!ld&&S.calcP)||clDefaultParams(),fb=!ld&&!S.calcP,m=clMode();
   const tabs=`<div class="row noprint"><div class="seg cl-tabs" role="tablist">${[['inv','Накопить капитал'],['life','Жизнь с капитала'],['goal','Подбор под цель']].map(([k,t])=>`<button role="tab" aria-selected="${k===m}" class="${k===m?'on':''}" onclick="cgSetMode('${k}')">${t}</button>`).join('')}</div></div>`;
-  return`<div class="cl-page">${tabs}${ld?`<div class="card">${waitBox('Загружаю параметры рынка (ставки, доходности, ваш портфель)… пока расчёт идёт на значениях по умолчанию')}</div>`:''}${fb?`<div class="msg err">Не удалось загрузить рыночные данные (${esc(S.calcErr||'нет ответа')}). Использованы значения по умолчанию, расчёт приблизителен.</div>`:''}
+  return`<div class="cl-page">${tabs}${ld?`<div class="card">${waitBox('Загружаю параметры рынка (ставки, доходности, ваш портфель)… пока расчёт идёт на значениях по умолчанию')}</div>`:''}${fb?`<div class="st-callout warn">Не удалось загрузить рыночные данные (${esc(S.calcErr||'нет ответа')}). Использованы значения по умолчанию, расчёт приблизителен.</div>`:''}
   <div class="cl-split"><aside class="card cl-side" aria-label="Параметры расчёта">${clForm(F,P)}</aside>
   <div class="cl-main"><div id="cl-out">${clTabOut()}</div>
   <div class="card"><h2>Как это считается</h2><div class="note">${clHowNote(F)}</div></div>
@@ -37527,9 +39203,9 @@ function clDeepHtml(F,P,run,cur){
 function clSegFor(sid,F){return sid==='mix'?(F.mixBond||'ofz'):sid}
 function clGoToHtml(F,c){
   const sid=clSegFor(c.sid,F),s=(clMkt().segments||{})[sid],bondish=['ofz','aaa','aa','a','hy','flt','pf','mix'].includes(c.sid);
-  if(!bondish)return`<div class="card"><h2>Что делать сейчас</h2><div class="note">Для этой стратегии подбор облигаций не нужен. Лесенку погашений можно собрать для облигационной части капитала.</div><div class="row" style="margin-top:8px"><button type="button" class="btn ghost" data-clgo="lad">Собрать лестницу погашений</button></div></div>`;
+  if(!bondish)return`<div class="card"><h2>Что делать сейчас</h2><div class="st-callout">Для этой стратегии подбор облигаций не нужен. Лесенку погашений можно собрать для облигационной части капитала.</div><div class="row" style="margin-top:8px"><button type="button" class="btn ghost" data-clgo="lad">Собрать лестницу погашений</button></div></div>`;
   const name=s?s.name:(CL_STR.find(x=>x[0]===sid)||[0,'облигации'])[1],m=F.monthly>0?clRub(F.monthly)+' в месяц':'свободные деньги';
-  return`<div class="card"><h2>Что делать сейчас</h2><div class="cl-ans">Чтобы пойти по этому сценарию, ${F.acct==='iis3'?'откройте ИИС-3 и ':''}пополняйте счёт на <b>${m}</b> и докупайте <b>«${esc(name)}»</b>.</div>
+  return`<div class="card"><h2>Что делать сейчас</h2><div class="st-callout">Чтобы пойти по этому сценарию, ${F.acct==='iis3'?'откройте ИИС-3 и ':''}пополняйте счёт на <b>${m}</b> и докупайте <b>«${esc(name)}»</b>.</div>
    <div class="row" style="margin-top:10px"><button type="button" class="btn" data-clgo="scr" data-sid="${sid}">Подобрать бумаги в скринере</button><button type="button" class="btn ghost" data-clgo="lad" data-sid="${sid}">Собрать лестницу погашений</button></div>
    <div class="note" style="margin-top:8px">Фильтры скринера подставятся под выбранный сегмент (рейтинг, срок около медианной дюрации); лесенка — на ваш стартовый капитал.</div></div>`;
 }
@@ -37722,8 +39398,16 @@ function ladCallBadge(d,k){if(!d)return'';
     :` <span class="tag ld-call" title="Колл — право эмитента досрочно погасить выпуск. Ступень поставлена на погашение, но деньги могут вернуться раньше.">возможен колл ${ddm(d)}</span>`}
 function ladPl(n,f){const a=n%100,b=n%10;return a>10&&a<20?f[2]:b===1?f[0]:b>1&&b<5?f[1]:f[2]}
 function ladYears(y){const n=Math.round(y*10)/10;return n.toFixed(1).replace('.',',')+(n>=5?' лет':n>=2?' года':' года')}
+function ladGapYear(p){const m=String((p&&(p.key||p.label))||'').match(/20\d{2}/);return m?+m[0]:null}
+function ladOpenGapYear(yr){
+  const curY=new Date().getFullYear(),yrs=Math.max(1,yr-curY+1);
+  S.sf=Object.assign({},SCR_DEF,{cur:'RUB',tmax:String(yrs),rmin:S.ladQ.rating||'A-'});
+  S.scrPreset='';S.scrOpen=true;
+  toast('Скринер: подбор облигаций до '+yr+' года');
+  go('scr');
+}
 function ladTip(ps,view){return i=>{const p=ps[i];if(!p)return'';
-  let h=`<b>${esc(p.label)}</b>`+(p.total>0?tipRow('var(--tx2)','Вернётся',M(p.total,'rub',0)+' · '+pctp(p.share,1)):`<div>Выплат нет</div>`);
+  let h=`<b>${esc(p.label)}</b>`+(p.total>0?tipRow('var(--tx2)','Вернётся',M(p.total,'rub',0)+' · '+pctp(p.share,1)):`<div>Выплат нет — нажмите, чтобы подобрать бумаги на этот год</div>`);
   Object.keys(LAD_TY).forEach(k=>{if(p.by_type[k]>0)h+=tipRow(LAD_TY[k][1],LAD_TY[k][0],M(p.by_type[k],'rub',0))});
   if(p.items.length){h+='<div style="margin-top:6px;border-top:1px solid var(--line);padding-top:4px"></div>';
     p.items.slice().sort((a,b)=>b.amount-a.amount).slice(0,8).forEach(x=>{h+=tipRow(LAD_TY[x.type][1],x.name,M(x.amount,'rub',0))});
@@ -37739,8 +39423,10 @@ function ladBars(ps,O){
     const w=val(p)/mx*100;
     const av=O.mode==='pct'?(avg[p.kind]/(ps.reduce((x,q)=>x+q.total,0)||1)*100):avg[p.kind];
     const seg=Object.keys(LAD_TY).filter(k=>p.by_type[k]>0).map(k=>`<i style="flex:${p.by_type[k]};background:${LAD_TY[k][1]}"></i>`).join('');
-    const tag=p.flag==='heavy'?'<span class="ld-fl heavy">тяжёлый</span>':p.flag==='gap'?'<span class="ld-fl gap">пусто</span>':'';
-    return`<div class="ldb-row ${p.flag||''} ${p.total>0?'':'z'}" data-i="${i}"><span class="ldb-l">${esc(p.label)}</span>
+    const gy=p.flag==='gap'?ladGapYear(p):null;
+    const tag=p.flag==='heavy'?'<span class="ld-fl heavy">тяжёлый</span>':p.flag==='gap'?`<span class="ld-fl gap">${gy?'пусто · подобрать →':'пусто'}</span>`:'';
+    const actAttr=gy?` data-gap-year="${gy}" role="button" tabindex="0" title="Закрыть пустой ${gy} год: подобрать облигации в Скринере"`:'';
+    return`<div class="ldb-row ${p.flag||''}${gy?' is-act':''} ${p.total>0?'':'z'}" data-i="${i}"${actAttr}><span class="ldb-l">${esc(p.label)}</span>
       <div class="ldb-tr"><div class="ldb-bar" style="width:${w.toFixed(2)}%">${seg}</div>${av>0?`<u class="ldb-avg" style="left:${Math.min(av/mx*100,100).toFixed(2)}%"></u>`:''}</div>
       <span class="ldb-v num">${p.total>0?(O.mode==='pct'?pctp(p.share,1):short(p.total)+' ₽'):'—'}${tag}</span></div>`}).join('')}</div>`}
 function ladGroups(ps,O){
@@ -37760,10 +39446,11 @@ function ladMy(){
   if(d.empty)return`<div class="card empty">${svgI('<path d="M3 21h4v-5h4v-5h4V6h6"/>')}<div>В портфеле нет облигаций с известной датой погашения: показывать нечего.<br><small class="mu">Лесенку из новых бумаг можно составить на вкладке «Подобрать лесенку».</small></div></div>`;
   const vk=O.offers&&d.has_offers?'offer':'maturity',V=d.variants[vk]||d.variants.offer||d.variants.maturity,sm=V.summary;
   const ps=O.gran==='quarter'?V.quarter:V.year,nx=sm.next,hv=sm.heavy;
+  const gapChips=sm.gaps.length?sm.gaps.map(g=>`<button type="button" class="ld-gap-chip" data-gap-year="${esc(g)}" title="Подобрать облигации на ${esc(g)} год в Скринере">${esc(g)} →</button>`).join(' '):'нет';
   const kp=`<div class="g g4">${kpi('Средний срок возврата',sm.avg_years!=null?ladYears(sm.avg_years):'—',vk==='offer'&&d.has_offers?'до погашения, для бумаг с пут-офертой — до оферты':'до погашения; взвешен по суммам возврата',null,S1)}
     ${kpi('Ближайший возврат',nx?M(nx.amount,'rub',0):'—',nx?`${ddm(nx.date)} · ${esc(nx.names.slice(0,2).join(', '))}${nx.names.length>2?' и ещё '+(nx.names.length-2):''}`:'нет будущих выплат',null,S3)}
     ${kpi('Самый «тяжёлый» год',hv?pctp(hv.share,0):'—',hv?`${esc(hv.label)}: ${M(hv.total,'rub',0)} — ${hv.flag==='heavy'?'заметно выше среднего':'в пределах нормы'}`:'—',hv&&hv.flag==='heavy'?'neg':null,S4)}
-    ${kpi('Пустые годы',sm.gaps.length?esc(sm.gaps.join(', ')):'нет',sm.gaps.length?'в эти годы ничего не возвращается':'между первым и последним годом пропусков нет',null,sm.gaps.length?S8:S6)}</div>`;
+    ${kpi('Пустые годы',gapChips,sm.gaps.length?'нажмите на год, чтобы подобрать бумаги в Скринере':'между первым и последним годом пропусков нет',null,sm.gaps.length?S8:S6)}</div>`;
   const seg=(k,opts,cur)=>`<div class="seg noprint">${opts.map(([v,t])=>`<button class="${cur===v?'on':''}" data-ld="${k}:${v}">${t}</button>`).join('')}</div>`;
   const ctl=`<div class="ld-ctl noprint">${seg('gran',[['year','По годам'],['quarter','Кварталы, затем годы']],O.gran)}${seg('mode',[['sum','Суммы'],['pct','% портфеля']],O.mode)}
     ${d.has_offers?`<label class="sw"><input type="checkbox" id="ld-offs" ${O.offers?'checked':''}><i></i><div><b>Считать пут-оферты как погашение</b><small>по бумагам с пут-офертой срок — до её даты; колл срок не меняет</small></div></label>`:''}</div>`;
@@ -37773,7 +39460,7 @@ function ladMy(){
     <li><b>Лесенка</b> — это облигации с разными датами погашения: каждый период часть денег возвращается, и её можно вложить заново или потратить.</li>
     <li><b>Ровные ступени</b> означают, что в каждый период возвращается примерно одинаковая сумма. Так проще реинвестировать: часть денег попадает на рынок и при высоких, и при низких ставках, и риск одного неудачного момента меньше.</li>
     <li><b>Пут-оферта</b> — право держателя предъявить бумагу к выкупу: при включённом переключателе ступень стоит на её дате. <b>Колл</b> — право эмитента погасить выпуск досрочно: решает он, поэтому ступень остаётся на погашении, а бумага помечена «возможен колл».</li>
-    <li><b>«Тяжёлый» период</b> (больше 1,5× среднего) — на него приходится непропорционально большая часть денег, <b>пустой</b> — денег не возвращается вовсе. Это описание структуры портфеля, а не оценка бумаг и не рекомендация.</li></ul></details>`;
+    <li><b>«Тяжёлый» период</b> (больше 1,5× среднего) — на него приходится непропорционально большая часть денег, <b>пустой</b> — денег не возвращается вовсе (нажмите на пустую строку, чтобы подобрать бумаги на этот год в Скринере).</li></ul></details>`;
   return kp+`<div class="card"><h2>Лесенка: сколько денег возвращается${O.gran==='quarter'?' по кварталам и годам':' по годам'}<span class="sp">пунктир — среднее; наведите на ступень, чтобы увидеть выпуски</span></h2>${ctl}
     <div class="ld-leg">${leg}<span class="mu">Всего к возврату: ${M(sm.total,'rub',0)}</span>${sm.callable&&sm.callable.amount>0?`<span class="ld-call-sum" title="Колл — право эмитента досрочно погасить выпуск: такие суммы стоят на дате погашения, но могут вернуться раньше">Может вернуться раньше (колл или оферта без типа): ${M(sm.callable.amount,'rub',0)} · ${pctp(sm.callable.share,1)} · ${sm.callable.count} ${ladPl(sm.callable.count,['выпуск','выпуска','выпусков'])}</span>`:''}</div>${ladBars(ps,O)}${how}</div>
     <div class="card"><h2>Состав по периодам<span class="sp">строка периода сворачивается; нажмите на выпуск — карточка</span></h2><div class="noprint ld-ctl2"><button class="btn ghost" id="ld-cl">Свернуть все</button><button class="btn ghost" id="ld-ex">Развернуть все</button></div>
@@ -37832,7 +39519,7 @@ function pLad(){
 }
 function pLadBuild(){
   const q=S.ladQ,l=S.lad;
-  const form=`<div class="card"><h2>Параметры лесенки<span class="sp">деньги делятся по ступеням с разными сроками погашения</span></h2><div class="flt ld-form">
+  const form=`<aside class="card ld-side"><h2>Параметры лесенки</h2><p class="note" style="margin:-6px 0 12px">Деньги делятся по ступеням с разными сроками погашения.</p><div class="flt ld-form">
     <label class="field"><span>Сумма, ₽</span><input class="in" id="ld-sum" type="text" inputmode="numeric" value="${esc(q.sum)}"></label>
     <label class="field"><span>Горизонт, лет (1–10)</span><input class="in" id="ld-years" type="number" min="1" max="10" step="1" value="${esc(q.years)}"></label>
     <label class="field"><span>Ступеней</span><input class="in" id="ld-rungs" type="number" min="1" max="12" step="1" placeholder="= лет" value="${esc(q.rungs)}"></label>
@@ -37840,15 +39527,21 @@ function pLadBuild(){
     <label class="sw"><input type="checkbox" id="ld-fl" ${q.floaters?'checked':''}><i></i><div><b>Флоатеры</b><small>купон плавает со ставкой</small></div></label>
     <label class="sw"><input type="checkbox" id="ld-am" ${q.amort?'checked':''}><i></i><div><b>Амортизация</b><small>долг гасится частями</small></div></label>
     <label class="sw"><input type="checkbox" id="ld-mo" ${q.monthly?'checked':''}><i></i><div><b>Ровный доход</b><small>купоны в разные месяцы</small></div></label>
-    <button class="btn" id="ld-go">Подобрать</button></div></div>`;
-  if(!l)return form+`<div class="card empty">Задайте сумму и горизонт и нажмите «Подобрать»: программа составит набор облигаций, которые гасятся по очереди.</div>`;
-  if(l.loading)return form+`<div class="card">${waitBox('Подбираю бумаги и считаю выплаты…')}</div>`;
-  if(l.error||l.data.error)return form+`<div class="msg err">${esc(l.error||l.data.error)}</div>`;
-  return form+ladResult(l.data);
+    <button class="btn" id="ld-go" style="width:100%">Подобрать</button></div></aside>`;
+  const body=!l?`<div class="card empty">Задайте сумму и горизонт слева и нажмите «Подобрать»: программа составит набор облигаций, которые гасятся по очереди.</div>`
+    :l.loading?`<div class="card">${waitBox('Подбираю бумаги и считаю выплаты…')}</div>`
+    :(l.error||l.data.error)?`<div class="msg err">${esc(l.error||l.data.error)}</div>`
+    :ladResult(l.data);
+  return`<div class="ld-split">${form}<div class="ld-main">${body}</div></div>`;
 }
 function bindLad(){
   document.querySelectorAll('[data-ldtab]').forEach(b=>b.onclick=()=>{S.ladTab=b.dataset.ldtab;lsSet('ta_ladtab',S.ladTab);render()});
   document.querySelectorAll('[data-ld]').forEach(b=>b.onclick=()=>{const[k,v]=b.dataset.ld.split(':');S.ladO[k]=v;ladSaveO();render()});
+  document.querySelectorAll('[data-gap-year]').forEach(b=>{
+    const goGap=()=>{const y=+b.dataset.gapYear;if(y)ladOpenGapYear(y)};
+    b.onclick=e=>{e.stopPropagation();goGap()};
+    b.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();goGap()}};
+  });
   const of=$('#ld-offs');if(of)of.onchange=()=>{S.ladO.offers=of.checked;ladSaveO();render()};
   const hw=document.querySelector('.ld-how');if(hw)hw.ontoggle=()=>{S._ladHowOpen=hw.open;S.ladO.how=false;ladSaveO()};
   const bars=$('#ld-bars');if(bars){const d=S.ladP&&S.ladP.data,O=S.ladO;if(d&&!d.empty){const V=d.variants[O.offers&&d.has_offers?'offer':'maturity']||d.variants.offer;bindTip(bars,ladTip(O.gran==='quarter'?V.quarter:V.year))}}
@@ -38155,6 +39848,21 @@ const calP2=n=>String(n).padStart(2,'0');
 const CAL_BADGE={PUT:'of-t-put','CALL':'of-t-call'};
 function calBadge(e){return e.badge?` <span class="tag ${CAL_BADGE[e.badge]||'of-t-unk'} cal-bd">${esc(e.badge)}</span>`:''}
 function calMoney(e){return e.amount!=null?M(e.amount,'rub',2):''}
+function calEvRow(e){
+  const click=e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:e.kind==='dividend'&&e.ticker?stkAttr(e.ticker,'div'):'';
+  const lnk=e.isin?`<span class="cal-ev-go">Карточка →</span>`:'';
+  return`<div class="cal-ev"${click}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}${calBadge(e)}</b><small class="mu">${esc(e.label||calName(e.kind))}${e.note&&!e.label?' · '+esc(e.note):''}</small>${e.label&&e.note?`<small class="mu">${esc(e.note)}</small>`:''}</div>
+    <span class="num cal-am">${calMoney(e)}</span>${lnk}</div>`;
+}
+function calDaySummaryCard(sel,items,today){
+  const list=items||[];
+  const dayTotal=list.reduce((a,e)=>a+(e.amount!=null&&['coupon','redemption','amort','dividend'].includes(calKind(e.kind))?+e.amount:0),0);
+  const wd=['воскресенье','понедельник','вторник','среда','четверг','пятница','суббота'][new Date(sel+'T00:00:00').getDay()];
+  return`<div class="st-card cal-day-card" id="cal-day-card"><div class="cal-dc-h">
+    <div><b>${dlabel(sel)}</b> <span class="mu">${wd}${sel===today?' · сегодня':''} · событий: ${list.length}</span>${dayTotal>0?`<span class="cal-dc-sum num pos">Выплаты: ${M(dayTotal,'rub',2)}</span>`:''}</div>
+    <div class="cal-dc-act"><a class="btn ghost" id="cal-day-ics" href="/api/events.ics?${new URLSearchParams({account:S.account,from:sel,to:sel})}" download="tinvest_events_${esc(sel)}.ics">Скачать .ics за день</a><button type="button" class="btn ghost" id="cal-all">Весь месяц</button></div></div>
+    <div class="cal-dc-body">${list.length?list.map(calEvRow).join(''):'<div class="mu" style="padding:8px 4px;font-size:13px">На выбранный день событий нет.</div>'}</div></div>`;
+}
 function calYearHtml(d,today){
   const y=S.cal.y,by={};
   (d.events||[]).filter(calVis).forEach(e=>(by[e.date]=by[e.date]||[]).push(e));
@@ -38168,7 +39876,7 @@ function calYearHtml(d,today){
       const ds=`${y}-${calP2(m+1)}-${calP2(dd)}`,l=by[ds]||[];cnt+=l.length;
       const gs=[...new Set(l.map(e=>calGroup(e.kind)))].slice(0,3);
       const tip=l.slice(0,5).map(e=>e.title+' — '+(e.label||calName(e.kind))).join('\n')+(l.length>5?`\n…и ещё ${l.length-5}`:'');
-      cells+=`<b class="cy-c ${ds===today?'today':''} ${l.length?'has':''}"${l.length?` data-day="${ds}" title="${esc(dlabel(ds)+'\n'+tip)}"`:''}>${dd}${gs.length?`<s>${gs.map(k=>`<i style="background:${(CAL_KINDS.find(g=>g[0]===k)||[])[2]||'#8d94a3'}"></i>`).join('')}</s>`:''}</b>`;
+      cells+=`<b class="cy-c ${ds===today?'today':''} ${l.length?'has':''}" data-day="${ds}"${l.length?` title="${esc(dlabel(ds)+'\n'+tip)}"`:''}>${dd}${gs.length?`<s>${gs.map(k=>`<i style="background:${(CAL_KINDS.find(g=>g[0]===k)||[])[2]||'#8d94a3'}"></i>`).join('')}</s>`:''}</b>`;
     }
     h+=`<div class="cy-m"><button class="cy-t" data-m="${m}">${MONF[m]}${cnt?` <small>${cnt}</small>`:''}</button><div class="cy-g">${cells}</div></div>`;
   }
@@ -38208,12 +39916,12 @@ function pCal(){
     <button class="btn ghost" id="cal-today">Сегодня</button><span class="cal-vw"><button id="cal-vm" class="${yr?'':'on'}">Месяц</button><button id="cal-vy" class="${yr?'on':''}">Год</button></span><a class="btn" id="cal-ics" href="/api/events.ics?${new URLSearchParams({account:S.account})}" download="tinvest_events.ics" style="margin-left:auto">Скачать .ics</a></div>`;
   const hasOther=c.data&&(c.data.events||[]).some(e=>calGroup(e.kind)==='other');
   const chips=`<div class="cal-chips">${CAL_KINDS.filter(g=>g[0]!=='other'||hasOther).map(g=>`<button class="cal-chip ${S.cal.off[g[0]]?'':'on'}" data-k="${g[0]}"><i style="background:${g[2]}"></i>${g[1]}</button>`).join('')}</div>`;
-  const help=`<p class="note" style="margin:4px 4px 12px">Кнопка «Скачать .ics» сохраняет файл с событиями на год вперёд (все типы, без учёта фильтров). Его можно импортировать в Календарь Google (Настройки → Импорт) или открыть в Календаре Apple двойным щелчком. Файл формируется на вашем компьютере и никуда не отправляется.</p>`;
+  const help=`<p class="note" style="margin:4px 4px 12px">Кнопка «Скачать .ics» сохраняет файл с событиями на год вперёд (или только за выбранный день из карточки дня). Его можно импортировать в Календарь Google (Настройки → Импорт) или открыть в Календаре Apple двойным щелчком.</p>`;
   if(c.loading)return`<div class="card">${nav}${waitBox('Собираю события: заседания ЦБ, выплаты, оферты, размещения…')}</div>`;
   if(c.error)return`<div class="card">${nav}<div class="msg err">${esc(c.error)} <button class="btn ghost" id="cal-r">Повторить</button></div></div>`;
   const d=c.data,evs=(d.events||[]).filter(calVis);
   if(yr){
-    return`${calKpis(evs,'за '+y+' год',d)}<div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${calYearHtml(d,today)}<p class="note" style="margin:10px 4px 0">Точки — типы событий в этот день (до трёх). Нажмите на день, чтобы открыть его в месячном виде, или на название месяца.</p></div>${help}`;
+    return`${calKpis(evs,'за '+y+' год',d)}<div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${calYearHtml(d,today)}<p class="note" style="margin:10px 4px 0">Точки — типы событий в этот день (до трёх). Нажмите на день, чтобы открыть карточку дня, или на название месяца.</p></div>${help}`;
   }
   const by={};evs.forEach(e=>(by[e.date]=by[e.date]||[]).push(e));
   const first=new Date(y,m,1),lead=(first.getDay()+6)%7,days=new Date(y,m+1,0).getDate();
@@ -38226,13 +39934,14 @@ function pCal(){
       ${l.length?`<span class="cal-dots">${kinds.slice(0,6).map(k=>`<i style="background:${(CAL_KINDS.find(g=>g[0]===k)||[])[2]||'#8d94a3'}"></i>`).join('')}</span><span class="cal-n">${l.length}</span>`:''}</div>`;
   }
   const grid=`<div class="cal-grid"><div class="cal-h">Пн</div><div class="cal-h">Вт</div><div class="cal-h">Ср</div><div class="cal-h">Чт</div><div class="cal-h">Пт</div><div class="cal-h">Сб</div><div class="cal-h">Вс</div>${cells}</div>`;
-  const ds=Object.keys(by).filter(x=>!S.cal.sel||x===S.cal.sel).sort();
+  const dayCard=S.cal.sel?calDaySummaryCard(S.cal.sel,by[S.cal.sel],today):'';
+  const ds=Object.keys(by).sort();
   const list=ds.length?ds.map(dt=>`<div class="cal-day" id="cal-d-${dt}"><div class="cal-dh"><b>${dlabel(dt)}</b><span class="mu">${['вс','пн','вт','ср','чт','пт','сб'][new Date(dt+'T00:00:00').getDay()]}${dt===today?' · сегодня':''}</span></div>
-    ${by[dt].map(e=>`<div class="cal-ev"${e.isin?` data-isin="${esc(e.isin)}" title="Открыть карточку выпуска"`:e.kind==='dividend'&&e.ticker?stkAttr(e.ticker,'div'):''}><i style="background:${calCol(e.kind)}"></i><div class="cal-et"><b>${esc(e.title)}${calBadge(e)}</b><small class="mu">${esc(e.label||calName(e.kind))}${e.note&&!e.label?' · '+esc(e.note):''}</small>${e.label&&e.note?`<small class="mu">${esc(e.note)}</small>`:''}</div>
-      <span class="num cal-am">${calMoney(e)}</span></div>`).join('')}</div>`).join(''):'<div class="empty" style="padding:24px">В этом месяце событий нет'+(Object.keys(S.cal.off).some(k=>S.cal.off[k])?' (часть типов скрыта фильтрами)':'')+'</div>';
+    ${by[dt].map(calEvRow).join('')}</div>`).join(''):'<div class="empty" style="padding:24px">В этом месяце событий нет'+(Object.keys(S.cal.off).some(k=>S.cal.off[k])?' (часть типов скрыта фильтрами)':'')+'</div>';
   return`${calKpis(evs,MONF[m].toLowerCase()+' '+y,d)}
-  <div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${grid}${S.cal.sel?`<div class="row" style="margin:10px 4px 0"><span class="mu">Показан день ${dlabel(S.cal.sel)}</span><button class="btn ghost" id="cal-all">Показать весь месяц</button></div>`:''}</div>
-  <div class="card" style="margin-top:16px"><h2>События ${S.cal.sel?'за день':'месяца'}</h2>${list}</div>${help}
+  <div class="card" style="margin-top:16px">${nav}${calKrLine(d)}${chips}${calNotes(d)}${grid}</div>
+  ${dayCard}
+  ${S.cal.sel?'':`<div class="card" style="margin-top:16px"><h2>События месяца</h2>${list}</div>`}${help}
   <p class="note">Источники: сайт Банка России (календарь заседаний), Московская биржа (купоны, оферты, размещения), ваш портфель${(d.sources||{}).watch!=null?', список наблюдения':''}. Даты выплат, размеры будущих купонов и оферт могут измениться — сверяйтесь с решением эмитента. Справочная информация, не инвестиционная рекомендация.</p>`;
 }
 function bindCal(){
@@ -38310,6 +40019,16 @@ function watchMonGroup(){
     ${al.length?al.slice(0,8).map(monAlertHtml).join('')+(al.length>8?`<div class="mu" style="font-size:12px;margin-top:6px">…и ещё ${al.length-8}</div>`:''):'<div class="mon-ok">По бумагам из списка наблюдения тревог нет</div>'}</div>`;
 }
 
+function wtTile(lbl,val,sub,dot,cls){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num ${cls||''}">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
+}
+function wtTargetProg(cur,tgt,isYield){
+  if(tgt==null||cur==null||!(tgt>0))return'';
+  const hit=isYield?(cur>=tgt):(cur<=tgt);
+  const pct=hit?100:Math.max(4,Math.min(99,isYield?(cur/tgt*100):(tgt/cur*100)));
+  const txt=hit?'Цель достигнута':(isYield?`${pct.toFixed(0)}% (ещё +${f2(tgt-cur)}%)`:`ещё −${f2(cur-tgt)}%`);
+  return`<div class="wt-prog-wrap"><div class="wt-prog${hit?' hit':''}"><i style="width:${pct.toFixed(1)}%"></i></div><span class="wt-prog-tx${hit?' hit':''}">${txt}</span></div>`;
+}
 function wtRow(r){
   const th=v=>v!=null?String(v).replace('.',','):'';
   const sp=r.spark&&r.spark.length>2?monSpark(r.spark,70,22):'';
@@ -38319,8 +40038,8 @@ function wtRow(r){
     <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
     <td class="num ${cls(r.chg30)}">${r.chg30!=null?pct(r.chg30,1):'—'}</td><td>${sp}</td>
     <td class="num">${r.dur!=null?f2(r.dur):'—'}</td><td class="num">${r.turn?short(r.turn):'—'}</td>
-    <td><input class="in num wt-in" data-k="target_yield" data-isin="${esc(r.isin)}" value="${esc(th(r.target_yield))}" placeholder="от, %" inputmode="decimal" title="Сообщить, когда доходность станет не ниже"></td>
-    <td><input class="in num wt-in" data-k="target_price" data-isin="${esc(r.isin)}" value="${esc(th(r.target_price))}" placeholder="до, %" inputmode="decimal" title="Сообщить, когда цена станет не выше"></td>
+    <td><div class="wt-prog-wrap"><input class="in num wt-in" data-k="target_yield" data-isin="${esc(r.isin)}" value="${esc(th(r.target_yield))}" placeholder="от, %" inputmode="decimal" title="Сообщить, когда доходность станет не ниже">${wtTargetProg(r.yield_,r.target_yield,true)}</div></td>
+    <td><div class="wt-prog-wrap"><input class="in num wt-in" data-k="target_price" data-isin="${esc(r.isin)}" value="${esc(th(r.target_price))}" placeholder="до, %" inputmode="decimal" title="Сообщить, когда цена станет не выше">${wtTargetProg(r.price,r.target_price,false)}</div></td>
     <td><input class="in wt-in wt-note" data-k="note" data-isin="${esc(r.isin)}" value="${esc(r.note||'')}" placeholder="заметка" maxlength="300"></td>
     <td class="l">${(r.flags||[]).map(f=>`<span class="tag" style="color:var(--neg)">${esc(f)}</span>`).join(' ')}</td>
     <td><button class="btn ghost wt-del" data-wdel="${esc(r.isin)}" title="Убрать из наблюдения">×</button></td></tr>`;
@@ -38336,15 +40055,15 @@ function pWatch(){
   watchEnsure();notesEnsure();
   const w=S.watch,nt=S.wnotes;
   if(!w||w.loading)return`<div class="card">${waitBox('Проверяю бумаги из списка: цены, рейтинги, спреды и цели…')}</div>`;
-  if(w.error)return`<div class="msg err">${esc(w.error)} <button class="btn ghost" id="wt-r">Повторить</button></div>`;
+  if(w.error)return`<div class="st-callout warn">${esc(w.error)} <button class="btn ghost" id="wt-r">Повторить</button></div>`;
   const d=w.data,sm=d.summary,goals=d.alerts.filter(a=>a.kind==='goal').length;
   const hold=(S.bonds&&S.bonds.rows||[]).filter(r=>r.isin).map(r=>[r.isin,r.name,'в портфеле']);
   const opts=[...d.items.map(r=>[r.isin,r.name,'наблюдение']),...hold.filter(h=>!d.items.some(r=>r.isin===h[0]))];
   const notes=((nt&&nt.data)||[]).filter(n=>!S.wfilter||n.isin===S.wfilter);
   const nIsins=[...new Map(((nt&&nt.data)||[]).map(n=>[n.isin,n.name||n.isin])).entries()];
-  return`<div class="g g4">${kpi('Бумаг в списке',d.items.length,'облигации, за которыми вы следите',null,S1)}${kpi('Высокие тревоги',sm.high,'дефолт, понижение рейтинга, сильное падение','neg',S8)}
-    ${kpi('Средние тревоги',sm.medium,'наблюдение, оферты, напоминания','',S3)}${kpi('Цели достигнуты',goals,'доходность или цена дошли до заданной',goals?'pos':'',S2)}</div>
-  ${(d.notes||[]).filter(n=>d.items.length).map(n=>`<div class="msg">${esc(n)}</div>`).join('')}
+  return`<div class="st-tiles">${wtTile('Бумаг в списке',d.items.length,'облигации, за которыми вы следите',d.items.length?'pos':'mu')}${wtTile('Высокие тревоги',sm.high,'дефолт, понижение рейтинга, сильное падение',sm.high?'neg':'pos',sm.high?'neg':'')}
+    ${wtTile('Средние тревоги',sm.medium,'наблюдение, оферты, напоминания',sm.medium?'warn':'mu')}${wtTile('Цели достигнуты',goals,'доходность или цена дошли до заданной',goals?'pos':'mu',goals?'pos':'')}</div>
+  ${(d.notes||[]).filter(n=>d.items.length).map(n=>`<div class="st-callout">${esc(n)}</div>`).join('')}
   <div class="card"><h2>Добавить бумагу<span class="sp">по названию или ISIN, из облигаций Мосбиржи</span></h2>
     <div class="wt-add"><input class="in" id="wt-q" placeholder="например, Самолет или RU000A0JQAM6" autocomplete="off"><div id="wt-sug" class="wt-sug"></div></div>
     <p class="note" style="margin-top:8px">Можно также нажать ☆ в строке скринера или в карточке облигации. Цели задаются прямо в таблице ниже.</p></div>
@@ -38841,7 +40560,20 @@ const KB=[
 <p><b>Пробный период.</b> Новому пользователю бот <b>@tanalyticbot</b> сам даёт 7 дней Pro после первого согласия на обработку данных. За два дня до конца и в день окончания бот пришлёт напоминание.</p>
 <p><b>Как получить Pro.</b> Оплата пока не подключена: напишите боту команду <code>/pro</code> — он покажет, что входит в Pro и к кому обратиться. После выдачи Pro программа подхватит его в течение минуты, перезапускать её не нужно.</p>
 <p><b>Токен Т-Инвестиций</b> хранится только на вашем компьютере и никогда не передаётся боту или серверу данных, на любом тарифе. Тариф влияет лишь на набор функций программы. Если Pro закончился, ваши данные остаются на месте, закрываются только страницы Pro.</p>
-<p><b>Синхронизация между устройствами</b> выключена, пока вы её не включите (Настройки, раздел «Данные»). Если включить, на сервер уходит копия счетов, операций, наблюдения и дневника, <b>зашифрованная на вашем компьютере кодовой фразой</b>: сервер и бот прочитать её не могут. Токен Т-Инвестиций не уходит и в этом режиме. Кодовую фразу восстановить нельзя: потеряв её, копию придётся удалить и создать заново.</p>`}
+<p><b>Синхронизация между устройствами</b> выключена, пока вы её не включите (Настройки, раздел «Данные»). Если включить, на сервер уходит копия счетов, операций, наблюдения и дневника, <b>зашифрованная на вашем компьютере кодовой фразой</b>: сервер и бот прочитать её не могут. Токен Т-Инвестиций не уходит и в этом режиме. Кодовую фразу восстановить нельзя: потеряв её, копию придётся удалить и создать заново.</p>`},
+{id:'tariffs',c:'Программа',t:'Тарифы: Free и Pro',k:'тарифы free pro 0 199 1990 рублей месяц год пробный период 7 дней подписка оплата tanalyticbot',h:`
+<p>В программе предусмотрены два тарифа — <b>Free</b> и <b>Pro</b>. На любом тарифе ваш токен Т-Инвестиций хранится исключительно на вашем компьютере и никогда не передаётся на сервер или в бот.</p>
+<p><b>Тариф Free — 0 ₽.</b> Базовый набор для ежедневного локального учёта:</p>
+<p>— локальное хранение и расчёт портфеля на вашем ПК;</p>
+<p>— импорт отчётов брокеров (Т-Инвестиции, ВТБ, Сбер, БКС, Финам, CSV и Excel) и ручные сделки;</p>
+<p>— демо-портфель для знакомства с программой без подключения счёта;</p>
+<p>— базовые экраны: «Обзор», «Позиции», «Облигации», «Доходность», «Выплаты», «Операции», «Комиссии», «Налоги», «Ребалансировка», «Калькулятор», «Ставки», «Эмитенты», «Наблюдение».</p>
+<p><b>Тариф Pro — 199 ₽/мес или 1 990 ₽/год.</b> Для активного подбора бумаг, контроля рисков и работы с нескольких устройств:</p>
+<p>— серверная проверка тревог 24/7 (уведомления в Telegram о выплатах, офертах, целях и напоминаниях, даже когда программа закрыта);</p>
+<p>— расширенные аналитические инструменты: скринер и сравнение облигаций, «Лесенка», «Сигналы», «Риски и сценарии», «Мониторинг», «Карта рынка», «Техдефолты», «Кто покупает», анализ оферт и прогноз налога на 31 декабря;</p>
+<p>— зашифрованная синхронизация счетов, операций, наблюдения и дневника между устройствами;</p>
+<p>— <b>пробный период 7 дней</b> автоматически выдаётся новым пользователям в боте.</p>
+<p><b>Оплата и доступ сейчас.</b> Онлайн-оплата пока не подключена: Pro-функции открыты для тестирования и выдаются через Telegram-бота <b>@tanalyticbot</b> (команда <code>/pro</code>). Когда Pro-период завершается, локальные данные не удаляются — ограничиваются только расширенные экраны и серверные уведомления.</p>`}
 ];
 
 /* текст статьи без тегов — для поиска */
@@ -39424,16 +41156,19 @@ function pStk(){
   return S.stk.secid?head+stkCardHtml('stk-'):head+stkHome();
 }
 /* Карточка акции без строки поиска. prefix даёт ids: 'stk-' на странице, 'skd-' в панели — они не пересекаются. */
+function stkTile(lbl,val,sub,dot){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
+}
 function stkCardHtml(p){
   const st=S.stk,drw=p!=='stk-';
-  if(st.err)return`<div class="msg err">${esc(st.err)} <button class="btn ghost" id="${p}r">Повторить</button></div>`;
+  if(st.err)return`<div class="st-callout warn">${esc(st.err)} <button class="btn ghost" id="${p}r">Повторить</button></div>`;
   const c=st.card;
   if(!c||c.secid!==st.secid||st.cardTf!==st.tf){loadStk();return`<div class="card">${waitBox('Загружаю '+esc(st.secid)+'…')}</div>`}
   const q=c.quote,fund=c.kind==='fund',fm=c.fund||{};
   const hasDiv=!fund||(c.dividends||{items:[]}).items.length||st.tab==='div';
   const tab=hasDiv&&st.tab==='div'?'div':'main';
   const tabs=hasDiv?`<div class="seg stk-tabs" id="${p}tabs" role="tablist"><button data-t="main" class="${tab==='main'?'on':''}" role="tab" aria-selected="${tab==='main'}">Обзор</button><button data-t="div" class="${tab==='div'?'on':''}" role="tab" aria-selected="${tab==='div'}">Дивиденды</button></div>`:'';
-  const head=`<div class="card stk-hd"><div><h1 class="stk-nm">${fund?'<span class="stk-kind">Фонд</span> ':''}${esc(q.shortname)} <span class="mu">${esc(q.secid)}</span></h1><div class="note">${esc(fund&&fm.full_name?fm.full_name:q.name)} · ${esc(q.sector)} · ${esc(q.isin)}</div></div>
+  const head=`<div class="card stk-hd st-ver"><div><h1 class="stk-nm">${fund?'<span class="stk-kind">Фонд</span> ':''}${esc(q.shortname)} <span class="mu">${esc(q.secid)}</span></h1><div class="note">${esc(fund&&fm.full_name?fm.full_name:q.name)} · ${esc(q.sector)} · ${esc(q.isin)}</div></div>
       <div class="stk-px"><span class="num">${stkPrice(q.price)} ₽</span> <span class="num">${stkPc(q.chg_d)}</span></div></div>${tabs}`;
   if(tab==='div')return head+stkDivTab(c,p);
   const cs=c.candles,sr=c.series||{},ind=st.ind,lab=stkLabel(st.tf);
@@ -39447,12 +41182,13 @@ function stkCardHtml(p){
   const tg=(id,t,on)=>`<label class="sw"><input type="checkbox" id="${p}${id}" ${on?'checked':''}><i></i><div><b>${t}</b></div></label>`;
   const tfs=[['D','День'],['W','Неделя'],['H','Час']];
   const tfSeg=drw?`<div class="seg" id="${p}tf" title="Таймфрейм свечей">${tfs.map(([k,t])=>`<button data-t="${k}" class="${st.tf===k?'on':''}">${t}</button>`).join('')}</div>`:'';
-  const kpis=fund?kpi('За неделю',stkPc(q.chg_w,1),'5 торговых дней')+kpi('За месяц',stkPc(q.chg_m,1),'21 торговый день')+kpi('Оборот за день',stkCap(q.value_today),'Мосбиржа')+kpi('Управляющая компания',`<span style="font-size:15px">${esc(fm.manager||'—')}</span>`,esc(fm.category||q.sector||''))
-    :kpi('За неделю',stkPc(q.chg_w,1),'5 торговых дней')+kpi('За месяц',stkPc(q.chg_m,1),'21 торговый день')+kpi('Капитализация',stkCap(q.cap),'лот: '+q.lot+' шт.')+kpi('Оборот за день',stkCap(q.value_today),'Мосбиржа, TQBR');
+  const dotW=q.chg_w>0?'pos':q.chg_w<0?'neg':'mu',dotM=q.chg_m>0?'pos':q.chg_m<0?'neg':'mu';
+  const kpis=fund?stkTile('За неделю',stkPc(q.chg_w,1),'5 торговых дней',dotW)+stkTile('За месяц',stkPc(q.chg_m,1),'21 торговый день',dotM)+stkTile('Оборот за день',stkCap(q.value_today),'Мосбиржа','mu')+stkTile('Управляющая компания',esc(fm.manager||'—'),esc(fm.category||q.sector||''),'mu')
+    :stkTile('За неделю',stkPc(q.chg_w,1),'5 торговых дней',dotW)+stkTile('За месяц',stkPc(q.chg_m,1),'21 торговый день',dotM)+stkTile('Капитализация',stkCap(q.cap),'лот: '+q.lot+' шт.','mu')+stkTile('Оборот за день',stkCap(q.value_today),'Мосбиржа, TQBR','mu');
   const lower=fund?`<div class="g g2" style="margin-top:16px">${stkTaCard(c)}${stkFundInfo(c)}</div>${stkFundHold(c,p)}${(c.dividends||{items:[]}).items.length?`<div style="margin-top:16px">${stkDivCard(c,p)}</div>`:''}`
     :`<div class="g g2" style="margin-top:16px">${stkTaCard(c)}${stkMulCard(c)}</div>
     <div class="g c-2-1" style="margin-top:16px">${stkDivCard(c,p)}${stkRepCard(c)}</div>`;
-  return head+`<div class="g g4">${kpis}</div>
+  return head+`<div class="st-tiles stk-tiles">${kpis}</div>
     <div class="card" style="margin-top:16px"><div class="row" style="margin-bottom:8px">${tfSeg}${tg('s50','SMA 50',ind.s50)}${tg('s200','SMA 200',ind.s200)}${tg('bb','Боллинджер',ind.bb)}${tg('lv','Уровни',ind.lv)}
         <button class="btn ghost" id="${p}r" style="margin-left:auto">Обновить</button></div>
       <div id="c-${p}chart" class="chart"></div><div id="c-${p}rsi" class="chart"></div><div id="c-${p}macd" class="chart"></div></div>
@@ -40405,6 +42141,28 @@ S.txo={h:null,hAcc:null,hBusy:0,hErr:null,fee:'',skip:(()=>{try{return localStor
 try{S.txo.F=JSON.parse(localStorage.getItem('txo_iis3')||'null')}catch(e){}
 const txoR=n=>bad(n)?'—':M(n,'rub',0),txoS=n=>bad(n)?'—':(n>0?'+':'')+M(n,'rub',0);
 const TXO_NOTE='<p class="note">Расчёт по модели и справочный: проверьте его с брокерским отчётом; налог удерживает брокер, итог за год определяется декларацией. Допущения указаны в блоках.</p>';
+function txoTile(lbl,val,sub,dot,cls){
+  return`<div class="st-tile"><div class="st-tl"><span>${lbl}</span><span class="st-dot ${dot||'mu'}"></span></div><div class="st-tv num ${cls||''}">${val}</div><div class="st-ts">${sub||'&nbsp;'}</div></div>`;
+}
+function txoLdvLabel(c){
+  if(c.ldv_cost>0||(c.ldv&&c.ldv.some(l=>l.status==='reached')))return{cls:'txo-bdg-loss',text:'Потеря ЛДВ'};
+  if(c.ldv_status==='critical'||c.ldv_status==='warn'||(c.ldv&&c.ldv.some(l=>l.days!=null&&l.days<183)))return{cls:'txo-bdg-soon',text:'До ЛДВ < 6 мес'};
+  return{cls:'txo-bdg-ok',text:'Без риска ЛДВ'};
+}
+function txoChecklistHtml(h){
+  const d=h.deadline,t=h.totals,yr=h.year;
+  const saved=lsJson('ta_txo_steps_'+yr,{});
+  const steps=[
+    ['s1',`Проверить налоговую базу и отобранные бумаги (позиций: ${t.n}, экономия ≈ ${txoR(t.saving)})`],
+    ['s2','Убедиться, что лоты со статусом «Без риска ЛДВ» или выгода перекрывает потерю льготы'],
+    ['s3',`Продать убыточные лоты не позднее ${ddm(d.last_trading_day)} (расчёты T+1 до ${ddm(d.sale_day)})`],
+    ['s4','При желании выкупить бумаги обратно после фиксации убытка'],
+    ['s5','Проверить итоговый расчёт НДФЛ в брокерском отчёте за год']
+  ];
+  return`<section class="st-card txo-steps"><header class="st-gh"><h3>Пошаговый план до ${ddm(d.sale_day)}</h3><span>${d.passed?'срок прошёл':'осталось '+d.days+' дн.'}</span></header>
+    ${steps.map(([id,txt])=>`<div class="st-row"><label class="txo-step-lb${saved[id]?' done':''}"><input type="checkbox" data-txostep="${id}" data-txoyear="${yr}" ${saved[id]?'checked':''}><span>${esc(txt)}</span></label></div>`).join('')}
+  </section>`;
+}
 function txoF(){
   return Object.assign({open_year:new Date().getFullYear(),contribution:400000,yield:12,years:10,bracket:'13',income:'',coupon_share:50,reinvest:'1',ldv:'1'},S.txo.F||{});
 }
@@ -40435,36 +42193,38 @@ function txoLoadP(){
 }
 function txoHarvest(){
   const h=S.txo.h;
-  if(S.txo.hErr&&S.txo.hAcc===S.account)return`<div class="msg err">${esc(S.txo.hErr)} <button class="btn ghost" onclick="S.txo.hErr=null;S.txo.hAcc=null;render()">Повторить</button></div>`;
+  if(S.txo.hErr&&S.txo.hAcc===S.account)return`<div class="st-callout warn">${esc(S.txo.hErr)} <button class="btn ghost" onclick="S.txo.hErr=null;S.txo.hAcc=null;render()">Повторить</button></div>`;
   if(!h||S.txo.hAcc!==S.account){txoLoadH();return waitBox('Считаю лоты и налог текущего года…')}
   const ex=(h.iis_excluded||[]).map(x=>`<p class="note"><b>${esc(x.name)}</b>: ${esc(x.reason)}</p>`).join('');
   if(!h.available)return`<div class="empty">${esc(h.reason||'Нет данных для расчёта')}</div>${ex}`;
   const d=h.deadline,t=h.totals;
-  let out=`<div class="g g4">${kpi('Экономия налога',txoR(t.saving),`налог ${h.year}: ${txoR(h.tax_before)} → ${txoR(t.tax_after)}`,t.saving>0?'pos':'',S3)}
-    ${kpi('Комиссии туда-обратно',txoR(t.fees),'продажа и обратная покупка',null,S4)}
-    ${kpi('Чистая выгода модели',txoR(t.net),`позиций в наборе: ${t.n}`,t.net>0?'pos':'',S1)}
-    ${kpi('Последний день сделки',ddm(d.sale_day),d.passed?'срок для этого года прошёл':`осталось ${d.days} дн. (T+1, торги до ${ddm(d.last_trading_day)})`,d.passed?'neg':'',S2)}</div>
-    <div class="row noprint" style="margin:10px 0"><label class="field"><span>Комиссия, % (пусто — по истории)</span><input class="in" id="txo-fee" type="number" step="0.01" min="0" value="${esc(S.txo.fee)}" style="width:140px"></label>
+  let out=`<div class="st-tiles">${txoTile('Экономия налога',txoR(t.saving),`налог ${h.year}: ${txoR(h.tax_before)} → ${txoR(h.tax_after)}`,t.saving>0?'pos':'mu',t.saving>0?'pos':'')}
+    ${txoTile('Комиссии туда-обратно',txoR(t.fees),'продажа и обратная покупка','mu')}
+    ${txoTile('Чистая выгода модели',txoR(t.net),`позиций в наборе: ${t.n}`,t.net>0?'pos':'mu',t.net>0?'pos':'')}
+    ${txoTile('Последний день сделки',ddm(d.sale_day),d.passed?'срок для этого года прошёл':`осталось ${d.days} дн. (T+1, торги до ${ddm(d.last_trading_day)})`,d.passed?'neg':'warn',d.passed?'neg':'')}</div>
+    <div class="row noprint" style="margin:12px 0"><label class="field"><span>Комиссия, % (пусто — по истории)</span><input class="in" id="txo-fee" type="number" step="0.01" min="0" value="${esc(S.txo.fee)}" style="width:140px"></label>
       <label class="txo-chk"><input type="checkbox" id="txo-skip2" ${S.txo.skip?'checked':''}> Не предлагать лоты со стажем ≥ 2 лет</label>
-      <button class="btn" id="txo-fee-go">Пересчитать</button></div>`;
+      <button class="btn" id="txo-fee-go">Пересчитать</button>${h.candidates.length&&typeof taCsvBtn==='function'?taCsvBtn('txo-csv','Выгрузить таблицу кандидатов в CSV'):''}</div>`;
   const sm=h.ldv_summary;
-  if(sm&&(sm.young+sm.warn+sm.critical+sm.reached>0||sm.ldv_cost>0))out+=`<div class="txo-ldvsum"><b>Стаж лотов в наборе:</b> <span class="txo-young">моложе 2 лет: ${sm.young}</span> · <span class="txo-lw">со стажем 2–3 года: ${sm.warn}</span> · <span class="txo-lc">почти ЛДВ: ${sm.critical}</span>${sm.reached?` · ЛДВ уже наступила: ${sm.reached}`:''}${sm.ldv_cost>0?` · потеря ЛДВ ≈ <b>${txoR(sm.ldv_cost)}</b>, выгода с учётом ЛДВ ${txoS(sm.net_ldv)}`:''}</div>`;
+  if(sm&&(sm.young+sm.warn+sm.critical+sm.reached>0||sm.ldv_cost>0))out+=`<div class="st-callout${sm.ldv_cost>0?' warn':''}"><b>Стаж лотов в наборе:</b> <span class="txo-young">моложе 2 лет: ${sm.young}</span> · <span class="txo-lw">со стажем 2–3 года: ${sm.warn}</span> · <span class="txo-lc">почти ЛДВ: ${sm.critical}</span>${sm.reached?` · ЛДВ уже наступила: ${sm.reached}`:''}${sm.ldv_cost>0?` · потеря ЛДВ ≈ <b>${txoR(sm.ldv_cost)}</b>, выгода с учётом ЛДВ ${txoS(sm.net_ldv)}`:''}</div>`;
   if(h.ldv_note)out+=`<p class="note">${esc(h.ldv_note)}</p>`;
   if((h.ldv_skipped||[]).length)out+=`<div class="txo-ldvsum"><b>Исключены из-за стажа ≥ 2 лет:</b><ul class="txo-ul">${h.ldv_skipped.map(x=>`<li>${esc(x.name)} (${esc(x.ticker)}), убыток ${txoR(x.loss)}: ${esc(x.reason)}</li>`).join('')}</ul></div>`;
   if(!h.candidates.length)out+='<div class="empty">Бумаг с нереализованным убытком, продажа которых снизила бы налог, модель не нашла (или налога за год пока нет).</div>';
-  else out+=`<div class="tbl"><table><thead><tr><th>Бумага</th><th>Продать (старые лоты)</th><th>Убыток</th><th>Прибыль в префиксе</th><th>Ставка</th><th>Экономия</th><th>Комиссии</th><th>Чистая выгода</th><th>Примечания</th></tr></thead><tbody>${h.candidates.map(c=>{
-      const nt=[];
+  else out+=`<div class="tbl"><table><thead><tr><th>Бумага</th><th>Продать (старые лоты)</th><th>Убыток</th><th>Прибыль в префиксе</th><th>Ставка</th><th>Экономия</th><th>Комиссии</th><th>Чистая выгода</th><th>Примечания и ЛДВ</th></tr></thead><tbody>${h.candidates.map(c=>{
+      const bdg=txoLdvLabel(c);
+      const nt=[`<span class="tag ${bdg.cls}">${bdg.text}</span>`];
       if(c.selected)nt.push('<span class="tag">в наборе</span>');
       if(c.carry_forward>1)nt.push(`<small class="mu">убыток сверх базы ${txoR(c.carry_forward)} перенесётся</small>`);
       if(c.blind)nt.push('<small class="txo-warn">лоты из перевода: стоимость могла быть неизвестна</small>');
       if(c.ldv_status==='critical')nt.push(`<span class="tag txo-bdg txo-bc">${esc(c.ldv_badge)}</span>`);
       else if(c.ldv_status==='warn')nt.push(`<span class="tag txo-bdg txo-bw">${esc(c.ldv_badge)}</span>`);
-      else if(c.ldv_status==='young')nt.push('<small class="mu">стаж &lt; 2 лет ✓</small>');
+      else if(c.ldv_status==='young')nt.push('<small class="mu">стаж &lt; 2 лет</small>');
       if(c.ldv_cost>0)nt.push(`<small class="mu">потеря ЛДВ ≈ ${txoR(c.ldv_cost)}; выгода с учётом ЛДВ <b>${txoS(c.net_ldv)}</b></small>`);
       c.ldv.forEach(l=>nt.push(`<span class="tag txo-ldv">ЛДВ ${l.status==='reached'?'наступила':`через ${l.days} дн.`}</span> <small class="mu">${ddm(l.bdate)}: прибыль ${txoR(l.gain)}${l.tax_at_stake?`, налог без ЛДВ ≈ ${txoR(l.tax_at_stake)}`:''}; после обратной покупки срок начнётся заново</small>`));
       return`<tr${stkAttrIf(c.ticker)}><td class="l"><b>${esc(c.name)}</b><br><small class="mu">${esc(c.ticker)}</small></td><td class="num">${f2(c.qty)}${c.partial?` из ${f2(c.qty_total)}`:''}<br><small class="mu">${txoR(c.value)}</small></td>
         <td class="num neg">${txoR(-c.loss)}</td><td class="num">${txoR(c.gain_in_prefix)}</td><td class="num">${c.marginal_rate==null?'—':pctp(c.marginal_rate*100,0)}</td>
         <td class="num pos">${txoR(c.saving)}</td><td class="num">${txoR(c.fees)}</td><td class="num ${c.net>0?'pos':'neg'}"><b>${txoS(c.net)}</b></td><td class="l">${nt.join('<br>')}</td></tr>`}).join('')}</tbody></table></div>`;
+  out+=txoChecklistHtml(h);
   out+=`<ul class="txo-ul"><li>${(h.assumptions||[]).map(esc).join('</li><li>')}</li></ul>${ex}`;
   if((h.warnings||[]).length)out+=`<p class="note">${h.warnings.map(esc).join('<br>')}</p>`;
   out+=`<p class="note noprint">Общая картина по налогам и простые подсказки — на странице <a href="#" onclick="go('tax');return false">«Налоги»</a>.</p>`;
@@ -40484,13 +42244,13 @@ function txoPlanner(){
     ${sel('ldv','ЛДВ на обычном счёте',[['1','учитывать'],['0','не учитывать']],F.ldv)}</div>
     <p class="note">Если указан доход за год, ставка (15 % выше 2,4 млн ₽) и предел вычета (не больше уплаченного НДФЛ) определяются по нему.</p>
     ${pre?`<p class="note noprint">У вас есть ИИС «${esc(pre.name)}» (открыт ${ddm(pre.opened)}, тип ${esc(pre.type)}). <a href="#" onclick="txoPrefill(${pre.open_year});return false">Подставить год открытия</a>.</p>`:''}`;
-  if(S.txo.pErr)return out+`<div class="msg err">${esc(S.txo.pErr)}</div>`;
+  if(S.txo.pErr)return out+`<div class="st-callout warn">${esc(S.txo.pErr)}</div>`;
   if(!p){txoLoadP();return out+waitBox('Считаю…')}
   const r=p.rules,i=p.iis,b=p.broker;
-  out+=`<div class="g g4">${kpi('Минимальный срок',`${r.term} лет`,`до конца ${r.term_end_year} г.; горизонт ${p.inputs.years} лет`,r.term_ok?'pos':'neg',S1)}
-    ${kpi('Вычет в год (максимум)',txoR(r.max_refund),`${pctp(r.rate*100,0)} от ${txoR(r.limit)}`,null,S2)}
-    ${kpi('ИИС-3: итог после налогов',txoR(i.net),`на ${txoR(p.own)} своих взносов`,i.net>=b.net?'pos':'',S3)}
-    ${kpi('Обычный счёт: итог',txoR(b.net),`разница ИИС-3 ${txoS(p.advantage)}`,p.advantage>=0?'pos':'neg',S4)}</div>
+  out+=`<div class="st-tiles">${txoTile('Минимальный срок',`${r.term} лет`,`до конца ${r.term_end_year} г.; горизонт ${p.inputs.years} лет`,r.term_ok?'pos':'neg',r.term_ok?'pos':'neg')}
+    ${txoTile('Вычет в год (максимум)',txoR(r.max_refund),`${pctp(r.rate*100,0)} от ${txoR(r.limit)}`,'mu')}
+    ${txoTile('ИИС-3: итог после налогов',txoR(i.net),`на ${txoR(p.own)} своих взносов`,i.net>=b.net?'pos':'mu',i.net>=b.net?'pos':'')}
+    ${txoTile('Обычный счёт: итог',txoR(b.net),`разница ИИС-3 ${txoS(p.advantage)}`,p.advantage>=0?'pos':'neg',p.advantage>=0?'pos':'neg')}</div>
     <div class="tbl" style="margin-top:12px"><table><thead><tr><th>Год</th><th>Взнос</th><th>Вычет за год</th><th>ИИС-3, капитал на конец года</th><th>Обычный счёт, капитал</th><th>Налог с купонов (обычный)</th></tr></thead><tbody>${
       p.rows.map(x=>`<tr><td><b>${x.year}</b></td><td class="num">${txoR(x.contribution)}</td><td class="num pos">${txoR(x.refund)}</td><td class="num">${txoR(x.iis_capital)}</td><td class="num">${txoR(x.broker_capital)}</td><td class="num">${txoR(x.broker_coupon_tax)}</td></tr>`).join('')}</tbody></table></div>
     <div id="txo-ch" class="chart txo-chart"></div>
@@ -40504,7 +42264,7 @@ function txoPlanner(){
       <tr><td class="l">Результат к своим взносам (${txoR(p.own)})</td><td class="num ${i.result_over_own>=0?'pos':'neg'}">${txoS(i.result_over_own)}</td><td class="num ${b.result_over_own>=0?'pos':'neg'}">${txoS(b.result_over_own)}</td></tr></tbody></table></div>`;
   if(p.early.length)out+=`<h3 class="txo-sub">Досрочное закрытие до истечения срока</h3>
     <div class="tbl"><table><thead><tr><th>Закрытие в году</th><th>Капитал</th><th>Вычеты вернуть</th><th>Налог с дохода</th><th>Итого после возврата и налога</th><th>Потеряно относительно срока</th></tr></thead><tbody>${p.early.map(e=>`<tr><td><b>${e.year}</b> <small class="mu">(${e.n}-й год)</small></td><td class="num">${txoR(e.capital)}</td><td class="num neg">${txoR(e.refunds_returned)}</td><td class="num neg">${txoR(e.tax)}</td><td class="num">${txoR(e.net)}</td><td class="num neg">${txoR(e.extra_cost)}</td></tr>`).join('')}</tbody></table></div>`;
-  if((p.warnings||[]).length)out+=`<p class="note txo-warn">${p.warnings.map(esc).join('<br>')}</p>`;
+  if((p.warnings||[]).length)out+=`<div class="st-callout warn">${p.warnings.map(esc).join('<br>')}</div>`;
   out+=`<ul class="txo-ul"><li>Правила (НК РФ ст. 219.1, 219.2): вычет 13 % (15 % при доходе выше 2,4 млн ₽) с взносов до 400 000 ₽ в год — не больше 52 000 / 60 000 ₽ в год и не больше уплаченного НДФЛ; при соблюдении минимального срока освобождается положительный финансовый результат до 30 млн ₽ за всё время. Минимальный срок по году открытия: 2024–2026 — 5 лет, 2027 — 6, 2028 — 7, 2029 — 8, 2030 — 9, с 2031 — 10.</li>
     <li>Допущения модели: взнос в начале года, доходность в конце года, вычет за год поступает в начале следующего (последний — после горизонта); на обычном счёте купоны облагаются налогом ежегодно, прирост цены — при продаже в конце горизонта, ЛДВ — по лотам, купленным более трёх лет назад, в пределах 3 млн ₽ × лет владения.</li>
     <li>Отличие от <a href="#" onclick="go('calc');return false">калькулятора</a>: там ИИС-3 — один из сценариев сравнения стратегий вложений; здесь отдельно учтены срок по году открытия, ставка 13/15 %, предел вычета по НДФЛ, годовая таблица и досрочное закрытие.</li></ul>`;
@@ -40524,6 +42284,18 @@ function bindTxo(){
   const sk=document.getElementById('txo-skip2');
   if(sk)sk.onchange=()=>{S.txo.skip=sk.checked;try{localStorage.setItem('txo_skip2',sk.checked?'1':'0')}catch(e){}S.txo.h=null;S.txo.hAcc=null;render()};
   if(g)g.onclick=()=>{S.txo.fee=(document.getElementById('txo-fee').value||'').trim();S.txo.h=null;S.txo.hAcc=null;render()};
+  const csv=document.getElementById('txo-csv');
+  if(csv&&S.txo.h&&S.txo.h.candidates){
+    csv.onclick=()=>{
+      if(typeof taCsvDownload==='function')taCsvDownload('tax_harvest.csv',['Бумага','Тикер','Продать, шт.','Стоимость, ₽','Убыток, ₽','Прибыль в префиксе, ₽','Ставка, %','Экономия, ₽','Комиссии, ₽','Чистая выгода, ₽','Статус ЛДВ'],
+        S.txo.h.candidates.map(c=>[c.name||'',c.ticker||'',c.qty??'',c.value??'',c.loss??'',c.gain_in_prefix??'',c.marginal_rate!=null?(c.marginal_rate*100).toFixed(0):'',c.saving??'',c.fees??'',c.net??'',txoLdvLabel(c).text]));
+    };
+  }
+  document.querySelectorAll('[data-txostep]').forEach(cb=>cb.onchange=()=>{
+    const yr=cb.dataset.txoyear,key='ta_txo_steps_'+yr,cur=lsJson(key,{});
+    cur[cb.dataset.txostep]=cb.checked?1:0;lsSet(key,JSON.stringify(cur));
+    const lb=cb.closest('.txo-step-lb');if(lb)lb.classList.toggle('done',cb.checked);
+  });
   document.querySelectorAll('.txo-in').forEach(el=>{el.addEventListener('change',()=>{
     const F=txoF();document.querySelectorAll('.txo-in').forEach(e=>{F[e.id.slice(4)]=e.value});
     S.txo.F=F;txoSave();S.txo.p=null;render()})});
@@ -40989,12 +42761,17 @@ const UX={
   checkOff:lsGet('ta_ux_chk_off')==='1',
   ddOpen:false
 };
-/* после загрузки конфига: подтягиваем «уже показано» из ui_seen (localStorage окна может быть пустым) */
+/* после загрузки конфига: подтягиваем «уже показано» из ui_seen и ui_prefs (localStorage окна может быть пустым) */
 function uxSeenSync(){
+  if(typeof uiPrefsHydrate==='function'&&S.cfg)uiPrefsHydrate(S.cfg);
   const w=uiGet('ux_why_off'),c=uiGet('ux_checks'),o=uiGet('ux_chk_off');
   if(w&&typeof w==='object')Object.assign(UX.whyOff,w);
   if(c&&typeof c==='object')Object.assign(UX.checks,c);
   if(o===true||o===1)UX.checkOff=true;
+  if(typeof _hadInitialPage!=='undefined'&&!_hadInitialPage&&S.cfg&&S.cfg.start_page&&PAGES.some(p=>p&&p[0]===S.cfg.start_page)){
+    S.page=S.cfg.start_page;
+  }
+  if(typeof renderNav==='function')try{renderNav()}catch(e){}
 }
 function uxSyncMode(){
   document.documentElement.dataset.uxMode=UX.mode;
@@ -41124,8 +42901,11 @@ renderNav=function(){
   const fx=NAV_FIXED.map(k=>PAGES.find(p=>p&&p[0]===k)).filter(Boolean).map(p=>`<button class="${p[0]===S.page?'on':''}" data-p="${esc(p[0])}" title="${esc(p[1])}" data-tip="${esc(p[1])}">${svgI(IC[p[0]]||IC.set)}<span class="nav-t">${esc(p[1])}</span></button>`).join('');
   $('#nav').innerHTML=h;
   const nf=$('#nav-fix');if(nf)nf.innerHTML=fx;
-  $('#period').innerHTML=PERIODS.map(([k,t])=>`<button class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
-  $('#period').style.display=PERIOD_PAGES.includes(S.page)&&S.data?'':'none';
+  const pe=$('#period');
+  if(pe){
+    pe.innerHTML=PERIODS.map(([k,t])=>`<button type="button" class="${k===S.period?'on':''}" data-k="${k}">${t}</button>`).join('');
+    pe.style.display=PERIOD_PAGES.includes(S.page)&&S.data?'':'none';
+  }
   const a=S.accounts.find(x=>x.id===S.account);
   const pgCur=PAGES.find(p=>p&&p[0]===S.page)||PAGES[0];
   if(pgCur&&S.page!==pgCur[0]){S.page=pgCur[0];persist()}
@@ -42287,6 +44067,278 @@ function bellRefresh(){
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&BELL.open){BELL.open=false;bellDraw()}});
   const _rn=renderNow;
   renderNow=function(){const r=_rn.apply(this,arguments);try{BELL.tries=0;bellRefresh()}catch(e){}return r};
+})();
+/* ── Блокировка экрана, индикатор связи, глобальный перенос файлов и расширение кривой эмитента ── */
+
+/* 1. Индикатор связи в нижней части сайдбара */
+function connSet(state,detail){
+  const el=document.getElementById('conn-st');
+  if(!el)return;
+  el.classList.remove('ok','busy','err');
+  el.classList.add(state==='err'?'err':state==='busy'?'busy':'ok');
+  const tx=el.querySelector('.conn-tx');
+  if(tx)tx.textContent=state==='err'?'Нет связи':state==='busy'?'Обновляется…':'Подключено';
+  el.title=detail||(state==='err'?'Нет связи с локальным сервером':state==='busy'?'Обновляются данные…':'Связь с локальным сервером установлена');
+}
+
+/* 2. Экран блокировки (Touch ID / Windows Hello / PIN) */
+const LOCK_UI={open:false,busy:false};
+function lockBioLabel(){
+  return IS_MAC?'Войти по Touch ID':IS_WIN?'Войти через Windows Hello':'Войти по биометрии';
+}
+function lockHide(){
+  LOCK_UI.open=false;
+  const ov=document.getElementById('lock-ov');
+  if(ov)ov.remove();
+  document.body.classList.remove('lock-open');
+}
+function lockShow(info){
+  info=info||{};
+  if(typeof dropHide==='function')dropHide();
+  let ov=document.getElementById('lock-ov');
+  if(ov){
+    const bio=document.getElementById('lock-bio');
+    if(bio)bio.hidden=info.bio_enabled===false;
+    return;
+  }
+  LOCK_UI.open=true;
+  document.body.classList.add('lock-open');
+  ov=document.createElement('div');
+  ov.id='lock-ov';
+  const showBio=info.bio_enabled!==false;
+  ov.innerHTML=`<div class="lock-box" role="dialog" aria-modal="true" aria-label="Доступ заблокирован">
+    <div class="logo"><i>${typeof LOGO_SVG==='function'?LOGO_SVG(30):''}</i>
+      <div>TAnalytic<small>доступ защищён</small></div></div>
+    <p class="lock-sub">Введите PIN-код или используйте биометрию, чтобы открыть портфель.</p>
+    ${showBio?`<button type="button" class="btn lock-bio" id="lock-bio">${svgI('<path d="M12 11c1.1 0 2 .9 2 2v3c0 1.1-.9 2-2 2s-2-.9-2-2v-3c0-1.1.9-2 2-2z"/><path d="M8 10a4 4 0 0 1 8 0"/><path d="M5.5 11.5a6.5 6.5 0 0 1 13 0"/>',1.8)}<span>${esc(lockBioLabel())}</span></button>`:''}
+    <form id="lock-form" autocomplete="off">
+      <input class="in mono" id="lock-pin" type="password" inputmode="numeric" maxlength="12" placeholder="Введите PIN-код" autocomplete="current-password" autofocus aria-label="PIN-код">
+      <div class="lock-err" id="lock-err" role="alert" hidden></div>
+      <button type="submit" class="btn ghost lock-go" id="lock-pin-go">Разблокировать</button>
+    </form>
+  </div>`;
+  document.body.appendChild(ov);
+  const errEl=document.getElementById('lock-err'),pinEl=document.getElementById('lock-pin'),goBtn=document.getElementById('lock-pin-go'),bioBtn=document.getElementById('lock-bio');
+  const showErr=t=>{if(!errEl)return;errEl.textContent=t||'';errEl.hidden=!t};
+  const onUnlocked=()=>{
+    lockHide();
+    S.err=null;
+    connSet('ok');
+    if(!S.cfg&&typeof boot==='function'){boot();return}
+    if(S.page==='set'&&typeof renderSettings==='function'){renderSettings();return}
+    if(typeof load==='function')load(false);
+  };
+  const tryUnlock=async(body,btn)=>{
+    if(LOCK_UI.busy)return;
+    LOCK_UI.busy=true;if(btn)btn.disabled=true;showErr('');
+    try{
+      const r=await fetch('/api/lock/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      let j={};try{j=await r.json()}catch(e){}
+      if(!r.ok||j.unlocked===false||j.ok===false)throw new Error(j.error||'Не удалось разблокировать');
+      onUnlocked();
+    }catch(e){showErr(e.message||'Не удалось разблокировать');if(pinEl&&body.method==='pin')pinEl.select()}
+    finally{LOCK_UI.busy=false;if(btn)btn.disabled=false}
+  };
+  document.getElementById('lock-form').onsubmit=e=>{
+    e.preventDefault();
+    const pin=(pinEl.value||'').trim();
+    if(!pin){showErr('Введите PIN-код.');pinEl.focus();return}
+    tryUnlock({method:'pin',pin},goBtn);
+  };
+  if(bioBtn)bioBtn.onclick=()=>tryUnlock({method:'bio'},bioBtn);
+  setTimeout(()=>{try{pinEl.focus()}catch(e){}},30);
+}
+async function lockCheckOnBoot(){
+  try{
+    const r=await fetch('/api/lock/status');
+    if(!r.ok)return;
+    const j=await r.json();
+    if(j&&j.enabled&&!j.unlocked)lockShow(j);
+  }catch(e){}
+}
+lockCheckOnBoot();
+
+/* 3. Глобальный перенос файла отчёта (.xlsx / .xls / .csv / .html) в любое место окна */
+let _dropDepth=0;
+function dropHide(){
+  _dropDepth=0;
+  const ov=document.getElementById('drop-ov');
+  if(ov)ov.remove();
+}
+function dropShow(){
+  if(LOCK_UI.open)return;
+  if(document.getElementById('drop-ov'))return;
+  const ov=document.createElement('div');
+  ov.id='drop-ov';
+  ov.innerHTML=`<div class="drop-box">${svgI('<path d="M12 16V4M7 9l5-5 5 5M5 20h14"/>',1.8)}
+    <b>Отпустите файл, чтобы импортировать отчёт брокера</b>
+    <span>Поддерживаются .xlsx, .xls, .csv и .html</span></div>`;
+  document.body.appendChild(ov);
+}
+function handleGlobalDropFile(file){
+  if(!file)return;
+  if(!/\.(xlsx|xlsm|xls|csv|txt|html|htm)$/i.test(file.name||'')){
+    if(typeof toast==='function')toast('Поддерживаются отчёты в форматах .xlsx, .xls, .csv и .html','err',4500);
+    return;
+  }
+  S._pendingDropFile=file;
+  if(typeof window.impDropFile==='function'){window.impDropFile(file);return}
+  if(S.page!=='imp')go('imp');
+  let tries=0;
+  const feed=()=>{
+    if(S.page!=='imp'||!S._pendingDropFile)return;
+    const inp=document.getElementById('ifile');
+    if(inp){
+      const f=S._pendingDropFile;S._pendingDropFile=null;
+      try{
+        const dt=new DataTransfer();dt.items.add(f);inp.files=dt.files;
+        inp.dispatchEvent(new Event('change',{bubbles:true}));
+      }catch(e){
+        const dz=document.getElementById('drop');
+        if(dz&&typeof dz.ondrop==='function')dz.ondrop({preventDefault(){},dataTransfer:{files:[f]}});
+      }
+      return;
+    }
+    if(++tries<60)setTimeout(feed,50);
+  };
+  setTimeout(feed,20);
+}
+(function(){
+  const hasFiles=e=>{
+    const dt=e&&e.dataTransfer;if(!dt||!dt.types)return false;
+    for(let i=0;i<dt.types.length;i++)if(dt.types[i]==='Files')return true;
+    return false;
+  };
+  window.addEventListener('dragenter',e=>{
+    if(!hasFiles(e)||LOCK_UI.open)return;
+    e.preventDefault();
+    _dropDepth++;
+    dropShow();
+  });
+  window.addEventListener('dragover',e=>{
+    if(!hasFiles(e)||LOCK_UI.open)return;
+    e.preventDefault();
+    if(e.dataTransfer)e.dataTransfer.dropEffect='copy';
+  });
+  window.addEventListener('dragleave',e=>{
+    if(!_dropDepth)return;
+    _dropDepth=Math.max(0,_dropDepth-1);
+    if(_dropDepth===0)dropHide();
+  });
+  window.addEventListener('dragend',dropHide);
+  window.addEventListener('drop',e=>{
+    const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];
+    if(!hasFiles(e)&&!f)return;
+    e.preventDefault();
+    dropHide();
+    if(!LOCK_UI.open&&f)handleGlobalDropFile(f);
+  });
+})();
+
+/* 4. Подключаем crosshair и всплывающую подсказку к кривой эмитента в карточке облигации */
+if(typeof bcIssuerCurve==='function'&&typeof chartEnhanceIssuerCurve==='function'){
+  const _origBcIc=bcIssuerCurve;
+  bcIssuerCurve=function(el,ic){
+    _origBcIc(el,ic);
+    try{chartEnhanceIssuerCurve(el,ic)}catch(e){}
+  };
+}
+/* ── Интеграция с оболочкой Tauri v2 (активируется только при наличии window.__TAURI_INTERNALS__) ── */
+(function () {
+  "use strict";
+  const TI = typeof window !== "undefined" ? window.__TAURI_INTERNALS__ : null;
+  if (!TI || typeof TI.invoke !== "function") return;
+
+  const invoke = (cmd, args) => TI.invoke(cmd, args || {});
+  const plat = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || "";
+  const isMac = /Mac|iPhone|iPad/i.test(plat);
+  const isWin = /Win/i.test(plat);
+
+  document.documentElement.classList.add("is-tauri");
+
+  const bridge = {
+    isTauri: true,
+    invoke,
+    minimize: () => invoke("tauri_win_minimize"),
+    toggleMaximize: () => invoke("tauri_win_toggle_max"),
+    close: () => invoke("tauri_win_close"),
+    pickFile: () => invoke("tauri_pick_file"),
+    autostartGet: () => invoke("tauri_autostart_get"),
+    autostartSet: (enabled) => invoke("tauri_autostart_set", { enabled: !!enabled }),
+    bioVerify: (reason) => invoke("tauri_bio_verify", { reason: reason || "Подтвердите вход в TAnalytic" })
+  };
+  window.TAURI_BRIDGE = bridge;
+
+  /* Совместимость с существующим мостом выбора файла (20_imp.js) и управления окном */
+  if (!window.pywebview) {
+    window.pywebview = {
+      api: {
+        pick_file: bridge.pickFile,
+        minimize: bridge.minimize,
+        toggle_maximize: bridge.toggleMaximize,
+        close: bridge.close,
+        platform: () => Promise.resolve(isMac ? "mac" : isWin ? "win" : "linux"),
+        set_theme: () => Promise.resolve(true)
+      }
+    };
+  }
+
+  function mountTitlebar() {
+    const main = document.querySelector("main");
+    if (!main || document.getElementById("tauri-bar")) return;
+
+    const bar = document.createElement("div");
+    bar.id = "tauri-bar";
+    bar.className = "tauri-bar noprint";
+    bar.setAttribute("data-tauri-drag-region", "");
+
+    const logoSvg =
+      '<svg width="15" height="15" viewBox="0 0 32 32" fill="none" aria-hidden="true">' +
+      '<rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.12)"/>' +
+      '<path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="#3b82f6"/>' +
+      '<path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="#2563eb"/>' +
+      '<path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="#60a5fa" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>' +
+      "</svg>";
+
+    const controlsHtml = isMac
+      ? ""
+      : '<div class="tauri-win-btns">' +
+        '<button type="button" class="tauri-btn" id="tauri-min" title="Свернуть" aria-label="Свернуть">' +
+        '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 6h8"/></svg></button>' +
+        '<button type="button" class="tauri-btn" id="tauri-max" title="Развернуть / восстановить" aria-label="Развернуть">' +
+        '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="2.2" y="2.2" width="7.6" height="7.6" rx="1"/></svg></button>' +
+        '<button type="button" class="tauri-btn tauri-close" id="tauri-close" title="Закрыть" aria-label="Закрыть">' +
+        '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></button>' +
+        "</div>";
+
+    bar.innerHTML =
+      '<div class="tauri-brand" data-tauri-drag-region="">' +
+      (isMac ? "" : logoSvg + '<span data-tauri-drag-region="">TAnalytic</span>') +
+      "</div>" +
+      controlsHtml;
+
+    main.prepend(bar);
+
+    bar.addEventListener("dblclick", (e) => {
+      if (e.target && e.target.closest && e.target.closest("button")) return;
+      bridge.toggleMaximize().catch(() => {});
+    });
+
+    if (!isMac) {
+      const bMin = document.getElementById("tauri-min");
+      const bMax = document.getElementById("tauri-max");
+      const bCls = document.getElementById("tauri-close");
+      if (bMin) bMin.onclick = () => bridge.minimize().catch(() => {});
+      if (bMax) bMax.onclick = () => bridge.toggleMaximize().catch(() => {});
+      if (bCls) bCls.onclick = () => bridge.close().catch(() => {});
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", mountTitlebar, { once: true });
+  } else {
+    mountTitlebar();
+  }
 })();
 </script></body></html>
 '''
