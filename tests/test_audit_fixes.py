@@ -100,8 +100,10 @@ class ShellStatus(unittest.TestCase):
         self.assertTrue(M.shell_status(env={"TINVEST_SHELL_REV": "2"}, frozen=True)["outdated"])
         self.assertTrue(M.shell_status(env={"TINVEST_SHELL_REV": "3"}, frozen=True)["outdated"])
 
+    def test_pywebview_rev4_gets_tauri_banner(self):         # ревизия 5 — оболочка Tauri: старым оболочкам предлагаем перейти
+        self.assertTrue(M.shell_status(env={"TINVEST_SHELL_REV": "4"}, frozen=True)["outdated"])
+
     def test_new_shell_ok(self):
-        self.assertFalse(M.shell_status(env={"TINVEST_SHELL_REV": "4"}, frozen=True)["outdated"])
         self.assertFalse(M.shell_status(env={"TINVEST_SHELL_REV": "5"}, frozen=True)["outdated"])
 
     def test_windows_asset_is_installer(self):

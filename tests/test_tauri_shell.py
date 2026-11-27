@@ -148,7 +148,7 @@ class TauriConfigAndFiles(unittest.TestCase):
         self.assertEqual(caps["remote"]["urls"], ["http://127.0.0.1:*/*"])
 
     def test_workflows_and_docs(self):
-        yml_path = os.path.join(ROOT, ".github", "workflows", "tauri.yml")
+        yml_path = os.path.join(ROOT, ".github", "workflows", "release.yml")
         self.assertTrue(os.path.isfile(yml_path))
         yml = open(yml_path, encoding="utf-8").read()
         for runner in ("macos-latest", "macos-15-intel", "windows-latest"):
@@ -156,6 +156,71 @@ class TauriConfigAndFiles(unittest.TestCase):
         self.assertIn("TAnalytic-backend", yml)
         self.assertIn("tauri-apps/tauri-action@v0", yml)
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "packaging", "tauri", "README.md")))
+
+
+class TauriReleasePackaging(unittest.TestCase):
+    def conf(self):
+        with open(os.path.join(TAURI_DIR, "tauri.conf.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_installers_configured(self):
+        b = self.conf()["bundle"]
+        self.assertEqual(b["externalBin"], ["binaries/TAnalytic-backend"])
+        nsis = b["windows"]["nsis"]
+        self.assertEqual(nsis["languages"], ["Russian"])
+        self.assertEqual(nsis["installMode"], "currentUser")
+        self.assertEqual(b["windows"]["webviewInstallMode"]["type"], "downloadBootstrapper")
+        for key in ("headerImage", "sidebarImage", "installerIcon", "installerHooks"):
+            self.assertTrue(os.path.isfile(os.path.join(TAURI_DIR, nsis[key])), key)
+        mac = b["macOS"]
+        self.assertEqual(mac["minimumSystemVersion"], "11.0")
+        self.assertTrue(os.path.isfile(os.path.join(TAURI_DIR, mac["entitlements"])))
+        self.assertTrue(os.path.isfile(os.path.join(TAURI_DIR, mac["dmg"]["background"])))
+        self.assertEqual((mac["dmg"]["windowSize"]["width"], mac["dmg"]["windowSize"]["height"]), (660, 400))
+        self.assertTrue(b["createUpdaterArtifacts"])
+
+    def test_installer_images_sizes(self):
+        import struct
+        def bmp(name):
+            with open(os.path.join(TAURI_DIR, "installer", name), "rb") as f:
+                head = f.read(30)
+            self.assertEqual(head[:2], b"BM")
+            w, h = struct.unpack("<ii", head[18:26])
+            bpp = struct.unpack("<H", head[28:30])[0]
+            return w, abs(h), bpp
+        self.assertEqual(bmp("header.bmp"), (150, 57, 24))
+        self.assertEqual(bmp("sidebar.bmp"), (164, 314, 24))
+
+    def test_nsis_hook_migrates_inno(self):
+        hook = open(os.path.join(TAURI_DIR, "installer", "hooks.nsh"), encoding="utf-8").read()
+        iss = open(os.path.join(ROOT, "packaging", "TAnalytic.iss"), encoding="utf-8-sig").read()
+        app_id = iss.split("AppId={{", 1)[1].split("}", 1)[0]
+        self.assertIn("{%s}_is1" % app_id, hook)
+        self.assertIn("/VERYSILENT", hook)
+        self.assertIn("/SUPPRESSMSGBOXES", hook)
+        self.assertIn("NSIS_HOOK_PREINSTALL", hook)
+        # Inno в тихом режиме данные не удаляет
+        self.assertIn("not UninstallSilent", iss)
+
+    def test_updater_configured(self):
+        conf = self.conf()
+        up = conf["plugins"]["updater"]
+        self.assertEqual(up["endpoints"], ["https://github.com/Kos5o4ka/tinvest-analytics/releases/latest/download/latest.json"])
+        self.assertTrue(up["pubkey"])
+        lib_rs = open(os.path.join(TAURI_DIR, "src", "lib.rs"), encoding="utf-8").read()
+        for cmd in ("tauri_update_check", "tauri_update_install"):
+            self.assertIn(cmd, lib_rs.split("generate_handler![", 1)[1])
+        self.assertIn("tauri_plugin_updater", lib_rs)
+        cargo = open(os.path.join(TAURI_DIR, "Cargo.toml"), encoding="utf-8").read()
+        self.assertIn("tauri-plugin-updater", cargo)
+
+    def test_release_workflow_publishes_tauri_assets(self):
+        yml = open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8").read()
+        for asset in ("TAnalytic-Setup-win.exe", "TAnalytic-mac-arm64.dmg", "TAnalytic-mac-x64.dmg", "latest.json"):
+            self.assertIn(asset, yml)
+        self.assertIn("gh release upload", yml)
+        self.assertIn("SHA256SUMS", yml)
+        self.assertNotIn("ISCC", yml)
 
 
 class FrontendTauriIntegration(unittest.TestCase):

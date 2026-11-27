@@ -405,7 +405,7 @@ class ShellUpdate(unittest.TestCase):
     def test_asset_name_matches_workflow(self):
         yml = open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8").read()
         self.assertIn("asset: " + L.SETUP_ASSET, yml)
-        self.assertEqual(L.SETUP_ARGS[:3], ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"))
+        self.assertEqual(L.SETUP_ARGS[0], "/S")                  # NSIS: тихая установка
 
     def test_pick_setup(self):
         self.assertEqual(L.pick_setup(self.rel()), ("https://github.com/x/Setup.exe", "https://github.com/x/sums"))
@@ -461,8 +461,7 @@ class ShellUpdate(unittest.TestCase):
             L.start_installer(info, popen=lambda cmd, **kw: got.append((cmd, kw)))
             cmd, kw = got[0]
             self.assertEqual(cmd[0], info["path"])
-            for flag in ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"):
-                self.assertIn(flag, cmd)
+            self.assertIn("/S", cmd)
             self.assertTrue(kw["close_fds"])
             with open(info["path"], "ab") as fh:                   # файл изменили после проверки
                 fh.write(b"x")

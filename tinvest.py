@@ -18,7 +18,7 @@ HOME = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), "
 APP_DIR = os.path.join(HOME, "app")
 APP, VER = os.path.join(APP_DIR, FILE), os.path.join(APP_DIR, "version.txt")
 OK_HOSTS = ("api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com")
-SHELL_REV = 4                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
+SHELL_REV = 5                            # ревизия оболочки (окно, иконка, экран обновления); программа сверяет её через TINVEST_SHELL_REV
                                          # 3 — заставка на pywebview и бесшовный переход в окно программы
                                          # 4 — установщик (onedir), трей, автозапуск и обновление оболочки из программы
 os.environ["TINVEST_SHELL_REV"] = str(SHELL_REV)
@@ -153,12 +153,14 @@ def update(report=lambda *a: None, cancel=None, fetch=fetch):
 
 # ───────────────────────────── обновление оболочки: установщик с GitHub ─────────────────────────────
 
-SETUP_ASSET = "TAnalytic-Setup-win.exe"          # установщик Inno Setup (packaging/TAnalytic.iss), публикуется в релизе
+SETUP_ASSET = "TAnalytic-Setup-win.exe"          # установщик NSIS (оболочка Tauri, src-tauri/), публикуется в релизе
 MAC_ASSETS = {"arm64": "TAnalytic-mac-arm64.dmg", "x86_64": "TAnalytic-mac-x64.dmg"}   # образы macOS (packaging/make_dmg.sh)
 MAC_APP_NAME = "TAnalytic.app"                   # так называется приложение внутри образа и на диске
 SETUP_LIMIT = 300_000_000                        # установщик заметно больше одного .py (по умолчанию fetch берёт до 20 МБ)
 UPDATE_DIR = os.path.join(HOME, "update")
-SETUP_ARGS = ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/RELAUNCH=1")   # /RELAUNCH — свой параметр .iss
+# NSIS (Tauri): /S — тихая установка, /UPDATE — режим обновления (установщик закрывает старую копию и сам запускает новую).
+# Старые лаунчеры (ревизия 4 и ниже) передают ключи Inno (/SILENT ...): NSIS их не понимает и просто показывает окно установщика.
+SETUP_ARGS = ("/S", "/UPDATE")
 
 
 def shell_asset(plat=None, machine=None):

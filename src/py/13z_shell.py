@@ -5,7 +5,9 @@
 # Ревизия 3 — заставка на pywebview с бесшовным переходом в окно программы.
 # Ревизия 4 — установщик Windows (onedir), значок в трее, автозапуск и обновление оболочки из программы;
 # на macOS то же обновление из образа .dmg (ревизию не поднимали: сборка macOS с образом уже умеет обновляться).
-SHELL_REV_LATEST = 4
+# Ревизия 5 — оболочка Tauri (установщик NSIS на Windows и образ .dmg на macOS, автообновление через tauri-plugin-updater).
+# Оболочки pywebview (ревизия 4 и ниже) получают баннер с предложением перейти на неё: скачать новый установщик.
+SHELL_REV_LATEST = 5
 SHELL_RELEASES = "https://github.com/Kos5o4ka/tinvest-analytics/releases/latest"
 
 
