@@ -16,6 +16,7 @@ import bisect
 import csv
 import gzip
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -64,7 +65,7 @@ API_GET, API_POST = {}, {}
 STARTUP_HOOKS = []
 SHUTDOWN_HOOKS = []          # вызываются при закрытии программы (app_shutdown)
 # Ключи настроек, которые никогда не отдаются в интерфейс через /api/config (секреты).
-SECRET_KEYS = {"token"}
+SECRET_KEYS = {"token", "lock_pin_hash", "lock_pin_salt"}
 
 DEFAULT_CONFIG = {
     "token": "",
@@ -82,5 +83,11 @@ DEFAULT_CONFIG = {
     "ui_seen": {},          # «показано один раз»: тур, подсказки, чек-лист (не зависит от localStorage окна)
     "mon_drop5": 3.0, "mon_drop30": 7.0, "mon_spread30": 2.0, "mon_sell_days": 5.0, "mon_offer_days": 30,   # пороги тревог «Мониторинга»
     "broker_tariffs": {},   # выбранный тариф для счетов других брокеров: {id счёта: id тарифа из BROKER_TARIFFS}
+    "lock_enabled": False,
+    "lock_bio": True,
+    "lock_pin_hash": "",
+    "lock_pin_salt": "",
+    "start_page": "dash",
+    "ui_prefs": {},
 }
 

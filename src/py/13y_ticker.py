@@ -151,28 +151,73 @@ def tk_fetch_btc():
     return it
 
 
+_tk_btc_lock = threading.Lock()
+_tk_btc_running = [False]
+
+
+def _tk_btc_async():
+    """Запускает фоновый запрос курса BTC (не чаще одного потока одновременно), возвращает Event или None."""
+    with _tk_btc_lock:
+        if _tk_btc_running[0]:
+            return None
+        _tk_btc_running[0] = True
+    ev = threading.Event()
+
+    def job():
+        try:
+            it = tk_fetch_btc()
+            if it and mem_get(("tk_btc",), 60) is None:
+                mem_put(("tk_btc",), it)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with _tk_btc_lock:
+                _tk_btc_running[0] = False
+            ev.set()
+
+    threading.Thread(target=job, daemon=True, name="tk-btc").start()
+    return ev
+
+
 def ticker_payload(force=False):
     ttl = 60 if _stk_trading() else 600
     key = ("tk_payload",)
     hit = None if force else mem_get(key, ttl)
     if hit is not None:
         res = dict(hit)
-        btc = tk_fetch_btc()      # BTC торгуется круглосуточно: свой кэш 60 с
+        btc_raw = mem_get(("tk_btc",), 60)
+        if btc_raw is None:
+            _tk_btc_async()          # не блокируем ответ: обновим BTC в фоне к следующему запросу
+            return res
+        btc = btc_raw or None
         res["items"] = [btc if i["id"] == "BTC" and btc else i for i in hit["items"]]
         if btc and not any(i["id"] == "BTC" for i in res["items"]):
             res["items"].append(btc)
         return res
+
     def _run(fn):
         try:
             return fn()
         except Exception:  # noqa: BLE001
             return None
 
-    idx_it, stk_rows, cets_raw, btc_it = pool_map(
-        _run,
-        [tk_fetch_index, lambda: tk_parse_stocks(stocks_universe(force)), tk_fetch_cets, tk_fetch_btc],
-        workers=4,
-    )
+    if force:
+        idx_it, stk_rows, cets_raw, btc_it = pool_map(
+            _run,
+            [tk_fetch_index, lambda: tk_parse_stocks(stocks_universe(force)), tk_fetch_cets, tk_fetch_btc],
+            workers=4,
+        )
+    else:
+        ev = _tk_btc_async() if mem_get(("tk_btc",), 60) is None else None
+        idx_it, stk_rows, cets_raw = pool_map(
+            _run,
+            [tk_fetch_index, lambda: tk_parse_stocks(stocks_universe(force)), tk_fetch_cets],
+            workers=3,
+        )
+        if mem_get(("tk_btc",), 60) is None and ev is not None:
+            ev.wait(0.4)
+        btc_it = mem_get(("tk_btc",), 60) or None
+
     items = []
     if idx_it:
         items.append(idx_it)

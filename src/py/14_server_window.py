@@ -2,6 +2,12 @@
 
 _ping = [0.0]
 _font_cache = []
+_active_server = [None]
+START_PAGES = {
+    "dash", "ret", "bench", "pos", "bonds", "pay", "off", "ops", "fees", "tax", "reb", "calc", "lad",
+    "mkt", "scr", "cmp", "map", "hm", "sig", "risk", "mon", "watch", "iss", "dfl", "flw", "pri", "fng",
+    "cal", "kb", "imp", "set", "stk", "sst", "crp", "mic", "ofz", "pm", "txo", "dgap", "mm", "arb", "dbx", "rot",
+}
 
 
 def font_inter_bytes():
@@ -88,6 +94,8 @@ class Handler(BaseHTTPRequestHandler):
                 _ping[0] = time.time()
                 return self.send(200, {"ok": True, "app": APP_NAME})
             cfg = load_config()
+            if u.path.startswith("/api/") and u.path not in ("/api/ping", "/api/lock/status") and lock_is_locked(cfg):
+                return self.send(423, {"error": "Программа заблокирована", "locked": True})
             f = q.get("force") == "1"
             acc = q.get("account", "all") or "all"
             if u.path == "/api/config":
@@ -181,6 +189,20 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ApiError("Ожидался JSON-объект.", 400)
             cfg = load_config()
+            if path.startswith("/api/") and path not in ("/api/lock/unlock", "/api/app/shutdown") and lock_is_locked(cfg):
+                return self.send(423, {"error": "Программа заблокирована", "locked": True})
+            if path == "/api/app/shutdown":
+                def _stop():
+                    time.sleep(0.05)
+                    srv = _active_server[0]
+                    if srv is not None:
+                        try:
+                            srv.shutdown()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    app_shutdown()
+                threading.Thread(target=_stop, daemon=True, name="app-shutdown").start()
+                return self.send(200, {"ok": True})
             if path == "/api/config":
                 if body.get("token"):
                     cfg["token"] = "".join(str(body["token"]).split())
@@ -193,6 +215,19 @@ class Handler(BaseHTTPRequestHandler):
                     cfg["ca_file"] = str(body["ca_file"]).strip()
                 if body.get("theme") in ("auto", "dark", "light"):
                     cfg["theme"] = body["theme"]
+                if body.get("start_page") in START_PAGES:
+                    cfg["start_page"] = body["start_page"]
+                if isinstance(body.get("ui_prefs"), dict):
+                    prefs = dict(cfg.get("ui_prefs") if isinstance(cfg.get("ui_prefs"), dict) else {})
+                    for k, v in list(body["ui_prefs"].items())[:40]:
+                        k = str(k)[:40]
+                        if v is None:
+                            prefs.pop(k, None)
+                        elif isinstance(v, (bool, int, float)) and not (isinstance(v, float) and (v != v or abs(v) >= 1e15)):
+                            prefs[k] = v
+                        elif isinstance(v, str):
+                            prefs[k] = v[:120]
+                    cfg["ui_prefs"] = dict(list(prefs.items())[:60])
                 if isinstance(body.get("targets"), dict):
                     tg = {}
                     for k, v in body["targets"].items():
@@ -400,10 +435,7 @@ def app_shutdown():
     if STORE is None:
         return
     try:
-        st = STORE
-        st.conn().execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-        st.conn().close()
-        st.local.c = None
+        STORE.close_all()
     except Exception:  # noqa: BLE001
         pass
 
@@ -458,10 +490,12 @@ def main():
                 hook()
             except Exception:  # noqa: BLE001
                 pass
+        _active_server[0] = srv
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        _active_server[0] = None
         srv.server_close()
         app_shutdown()
     # окно закрыто или Ctrl+C: фоновые расчёты (пулы потоков) прерываем сразу, иначе они падают с трассировкой

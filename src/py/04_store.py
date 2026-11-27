@@ -32,6 +32,8 @@ class Store:
         self.path = path
         self.local = threading.local()
         self.wlock = threading.Lock()
+        self._conns = set()
+        self._conns_lock = threading.Lock()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         apply_pending_restore(path)
         if not os.path.exists(path):
@@ -53,7 +55,29 @@ class Store:
             c.execute("PRAGMA journal_mode=WAL")
             c.execute("PRAGMA synchronous=NORMAL")
             self.local.c = c
+            with self._conns_lock:
+                self._conns.add(c)
         return c
+
+    def close_all(self):
+        """Сбрасывает журнал WAL и закрывает все SQLite-соединения всех потоков."""
+        with self.wlock:
+            with self._conns_lock:
+                conns = list(self._conns)
+                self._conns.clear()
+            ckpt = False
+            for c in conns:
+                if not ckpt:
+                    try:
+                        c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                        ckpt = True
+                    except sqlite3.Error:
+                        pass
+                try:
+                    c.close()
+                except sqlite3.Error:
+                    pass
+            self.local = threading.local()
 
     def write(self, sql, rows=None, many=False):
         with self.wlock:

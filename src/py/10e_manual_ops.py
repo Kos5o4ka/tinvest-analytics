@@ -6,9 +6,10 @@
 # Когда позже загружается отчёт брокера с этими же сделками, ручные дубли заменяются строками отчёта (reconcile_manual_with_report).
 
 MAN_TYPES = {"buy": "BUY", "sell": "SELL", "coupon": "COUPON", "dividend": "DIVIDEND", "deposit": "INPUT",
-             "withdraw": "OUTPUT", "fee": "SERVICE_FEE"}
+             "withdraw": "OUTPUT", "fee": "SERVICE_FEE", "asset_ext": "ASSET_EXT"}
+ASSET_EXT_KINDS = {"deposit_bank": "Банковский вклад", "cash_ext": "Наличные", "real_estate": "Недвижимость"}
 MAN_TRADE, MAN_NEED_SEC = ("buy", "sell"), ("buy", "sell", "coupon", "dividend")
-MAN_SIGN = {"buy": -1, "sell": 1, "coupon": 1, "dividend": 1, "deposit": 1, "withdraw": -1, "fee": -1}
+MAN_SIGN = {"buy": -1, "sell": 1, "coupon": 1, "dividend": 1, "deposit": 1, "withdraw": -1, "fee": -1, "asset_ext": 0}
 MAN_DAYS, MAN_QTY_EPS, MAN_PAY_ABS, MAN_PAY_REL = 2, 1e-3, 5.0, 0.01
 _man_lock = threading.Lock()
 
@@ -167,6 +168,40 @@ def manual_build(body, now=None):
     ident = str(body.get("ident") or "").strip().upper()[:24]
     ticker = str(body.get("ticker") or "").strip().upper()[:24]
     name = str(body.get("name") or "").strip()[:120]
+    gid = str(body.get("group") or "")
+    if gid:
+        if not re.fullmatch(r"man-[a-z0-9]{3,24}", gid):
+            raise ApiError("Неверный номер записи.", 400)
+    else:
+        gid = "man-" + uuid.uuid4().hex[:12]
+    t = (now if now is not None else time.time())
+    iso = day.strftime("%Y-%m-%dT12:00:00Z")
+    if kind == "asset_ext":
+        ak = str(body.get("asset_kind") or "").strip()
+        if ak not in ASSET_EXT_KINDS:
+            raise ApiError("Неизвестный вид неторгового актива.", 400)
+        amount = _man_num(body.get("amount"), "Сумма", 0.0, 1e12, req=True)
+        if not amount or amount <= 0:
+            raise ApiError("Укажите сумму актива.", 400)
+        rate = _man_num(body.get("rate"), "Ставка", 0.0, 1000.0)
+        end_raw = str(body.get("end_date") or "").strip()[:10]
+        end_iso = ""
+        if end_raw:
+            try:
+                end_d = datetime.strptime(end_raw, "%Y-%m-%d").date()
+            except ValueError:
+                raise ApiError("Дата окончания указана неверно.", 400)
+            if end_d.year < 1990 or end_d.year > 2100:
+                raise ApiError("Дата окончания вне допустимых границ.", 400)
+            end_iso = end_d.isoformat()
+        main = {"id": gid, "date": iso, "type": "OPERATION_TYPE_ASSET_EXT",
+                "payment": to_money(0, cur), "name": name or ASSET_EXT_KINDS[ak],
+                "_manual": True, "_asset_ext": True, "_asset_kind": ak, "_amount": round(amount, 2), "_u": t}
+        if rate is not None:
+            main["_rate"] = round(rate, 4)
+        if end_iso:
+            main["_end_date"] = end_iso
+        return [main]
     if mode == "position":
         kind = "buy"
     if kind in MAN_NEED_SEC and not ident:
@@ -185,14 +220,6 @@ def manual_build(body, now=None):
     if not total or total <= 0:
         raise ApiError("Укажите цену или сумму операции.", 400)
     total = round(total, 2)
-    gid = str(body.get("group") or "")
-    if gid:
-        if not re.fullmatch(r"man-[a-z0-9]{3,24}", gid):
-            raise ApiError("Неверный номер записи.", 400)
-    else:
-        gid = "man-" + uuid.uuid4().hex[:12]
-    t = (now if now is not None else time.time())
-    iso = day.strftime("%Y-%m-%dT12:00:00Z")
     main = {"id": gid, "date": iso, "type": "OPERATION_TYPE_" + MAN_TYPES[kind],
             "payment": to_money(MAN_SIGN[kind] * total, cur), "name": name or ident or ticker or "Ручная запись",
             "_manual": True, "_u": t}
@@ -288,11 +315,22 @@ def manual_list(cfg, acc, q, force):
             if not m:
                 continue
             fee = next((o for o in g if o["id"].endswith("-f")), None)
-            out.append({"acc": a["id"], "acc_name": a.get("name"), "group": gid, "date": (m.get("date") or "")[:10],
-                        "type": classify(m.get("type")), "name": m.get("name") or "", "ident": m.get("_sec") or m.get("_isin") or "",
-                        "qty": op_qty(m), "amount": round(abs(qf(m.get("payment"))), 2), "currency": cur_of(m.get("payment")).upper(),
-                        "commission": round(abs(qf(fee.get("payment"))), 2) if fee else 0.0,
-                        "autocash": any(o.get("_manual_autocash") for o in g), "position": bool(m.get("_position"))})
+            is_ext = bool(m.get("_asset_ext"))
+            row = {"acc": a["id"], "acc_name": a.get("name"), "group": gid, "date": (m.get("date") or "")[:10],
+                   "type": "asset_ext" if is_ext else classify(m.get("type")),
+                   "name": m.get("name") or "", "ident": m.get("_sec") or m.get("_isin") or "",
+                   "qty": op_qty(m),
+                   "amount": round(float(m.get("_amount") or 0), 2) if is_ext else round(abs(qf(m.get("payment"))), 2),
+                   "currency": cur_of(m.get("payment")).upper(),
+                   "commission": round(abs(qf(fee.get("payment"))), 2) if fee else 0.0,
+                   "autocash": any(o.get("_manual_autocash") for o in g), "position": bool(m.get("_position"))}
+            if is_ext:
+                row["asset_kind"] = m.get("_asset_kind") or ""
+                if m.get("_rate") is not None:
+                    row["rate"] = m.get("_rate")
+                if m.get("_end_date"):
+                    row["end_date"] = m.get("_end_date")
+            out.append(row)
     out.sort(key=lambda r: (r["date"], r["group"]), reverse=True)
     return {"rows": out[:500], "accounts": [{"id": a["id"], "name": a.get("name")} for a in lst
                                            if str(a["id"]).startswith("imp-") and not (a.get("sync_src") or a.get("demo") or a["id"] == DEMO_ID)]}

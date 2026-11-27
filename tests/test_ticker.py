@@ -1,6 +1,7 @@
 """Бегущая строка котировок: разбор ответов источников и сборка (офлайн, на фикстурах)."""
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -63,6 +64,50 @@ class TickerTest(unittest.TestCase):
             p = m.ticker_payload(True)
             self.assertEqual([i["id"] for i in p["items"]], ["SBER", "USD", "CNY", "GOLD", "BTC"])
         finally:
+            for k, v in saved.items():
+                setattr(m, k, v)
+            m.mem_clear()
+
+    def test_payload_nonblocking_btc(self):
+        saved = {k: getattr(m, k) for k in ("tk_fetch_index", "tk_fetch_cets", "tk_fetch_cbr", "tk_fetch_btc", "stocks_universe")}
+        try:
+            m.mem_clear()
+            m.tk_fetch_index = lambda: m.tk_parse_index({"marketdata": {"columns": ["SECID", "CURRENTVALUE", "LASTCHANGEPRC"], "data": [["IMOEX", 2750.0, 0.1]]}})
+            m.stocks_universe = lambda force=False: [{"secid": "SBER", "price": 300, "chg_d": 1.0}]
+            m.tk_fetch_cets = lambda: m.tk_parse_cets(CETS)
+            m.tk_fetch_cbr = lambda want: m.tk_cbr_items(m.tk_parse_cbr(CBR), {}, want)
+
+            def slow_btc():
+                time.sleep(0.6)
+                return m.tk_parse_btc({"lastPrice": "90000", "priceChangePercent": "1.5"}, "binance")
+
+            m.tk_fetch_btc = slow_btc
+            t0 = time.time()
+            p1 = m.ticker_payload(False)
+            dt1 = time.time() - t0
+            self.assertLess(dt1, 0.55)          # холодный старт не ждёт медленный BTC дольше короткого порога
+            self.assertIn("SBER", [i["id"] for i in p1["items"]])
+
+            for _ in range(30):
+                if m.mem_get(("tk_btc",), 60):
+                    break
+                time.sleep(0.05)
+
+            # После прогрева BTC появляется в ответе сразу
+            p2 = m.ticker_payload(False)
+            self.assertIn("BTC", [i["id"] for i in p2["items"]])
+
+            # Истёкший кэш BTC не блокирует тёплый ответ ticker_payload(False)
+            m._mem.pop(("tk_btc",), None)
+            t1 = time.time()
+            p3 = m.ticker_payload(False)
+            self.assertLess(time.time() - t1, 0.15)
+            self.assertIn("SBER", [i["id"] for i in p3["items"]])
+        finally:
+            for _ in range(30):
+                if not m._tk_btc_running[0]:
+                    break
+                time.sleep(0.05)
             for k, v in saved.items():
                 setattr(m, k, v)
             m.mem_clear()

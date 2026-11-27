@@ -120,9 +120,7 @@ def delete_all_local_data(app_dir=None):
                 for t in ("kv", "ops", "candles", "snaps"):
                     c.execute("DELETE FROM " + t)
                 c.commit()
-                c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                c.close()
-                STORE.local.c = None
+            STORE.close_all()
         except sqlite3.Error:
             pass
         STORE = None
@@ -175,7 +173,37 @@ def ld_wipe_post(cfg, body):
     return delete_all_local_data()
 
 
+def ld_vacuum_post(cfg, body):
+    before = local_data_info()["total"]
+    st = store()
+    with st.wlock:
+        c = st.conn()
+        try:
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            c.execute("VACUUM")
+        except sqlite3.Error as e:
+            raise ApiError("Не удалось сжать базу: %s" % e, 500)
+    after = local_data_info()["total"]
+    return {"ok": True, "freed": max(0, before - after), "info": local_data_info()}
+
+
+def ld_crowd_log_get(cfg, acc, q, force):
+    fn = globals().get("api_crowd_status")
+    st = fn(cfg, acc, q, force) if callable(fn) else {}
+    raw = store().get("crowd_stats") or {}
+    out = dict(st) if isinstance(st, dict) else {}
+    out.setdefault("accepted", int(raw.get("accepted", 0) or 0))
+    out.setdefault("fetched", int(raw.get("fetched", 0) or 0))
+    out.setdefault("errors", int(raw.get("errors", 0) or 0))
+    out.setdefault("last", raw.get("last"))
+    out.setdefault("queue", int(raw.get("queue", 0) or 0))
+    out["stats"] = raw
+    return out
+
+
 API_GET["/api/localdata"] = ld_info_get
 API_POST["/api/localdata/open"] = ld_open_post
 API_POST["/api/localdata/clear"] = ld_clear_post
 API_POST["/api/localdata/wipe"] = ld_wipe_post
+API_POST["/api/localdata/vacuum"] = ld_vacuum_post
+API_GET["/api/crowd/log"] = ld_crowd_log_get

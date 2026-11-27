@@ -1,0 +1,243 @@
+# ═══════════════════════════════ блокировка экрана (PIN / биометрия) ═══════════════════════════════
+# По умолчанию выключена (lock_enabled=False). При включённой блокировке все /api/* (кроме /api/ping, /api/lock/status,
+# /api/lock/unlock, /api/app/shutdown) возвращают HTTP 423 до разблокировки в текущей сессии сервера.
+
+_lock_unlocked = [False]
+_lock_state_lock = threading.Lock()
+_bio_runner = None
+_LOCK_PBKDF_ROUNDS = 120000
+
+_BIO_SWIFT_SRC = (
+    'import Foundation\n'
+    'import LocalAuthentication\n'
+    'let ctx = LAContext()\n'
+    'var err: NSError?\n'
+    'let reason = ProcessInfo.processInfo.environment["TA_BIO_REASON"] ?? "Unlock TAnalytic"\n'
+    'guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) else {\n'
+    '    fputs(err?.localizedDescription ?? "unavailable", stderr)\n'
+    '    exit(2)\n'
+    '}\n'
+    'let sem = DispatchSemaphore(value: 0)\n'
+    'var ok = false\n'
+    'var msg = ""\n'
+    'ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { success, error in\n'
+    '    ok = success\n'
+    '    if let e = error { msg = e.localizedDescription }\n'
+    '    sem.signal()\n'
+    '}\n'
+    'sem.wait()\n'
+    'if !ok { fputs(msg, stderr) }\n'
+    'exit(ok ? 0 : 1)\n'
+)
+
+_BIO_WIN_PS = (
+    "$ErrorActionPreference = 'Stop'\n"
+    "[void][Windows.Security.Credentials.UI.UserConsentVerifier, Windows.Security.Credentials.UI, ContentType = WindowsRuntime]\n"
+    "Add-Type -AssemblyName System.Runtime.WindowsRuntime\n"
+    "$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { "
+    "$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]\n"
+    "function Await($WinRtTask, $ResultType) {\n"
+    "    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)\n"
+    "    $netTask = $asTask.Invoke($null, @($WinRtTask))\n"
+    "    $netTask.Wait(-1) | Out-Null\n"
+    "    $netTask.Result\n"
+    "}\n"
+    "$avail = Await ([Windows.Security.Credentials.UI.UserConsentVerifier]::CheckAvailabilityAsync()) "
+    "([Windows.Security.Credentials.UI.UserConsentVerifierAvailability])\n"
+    "if ($avail -ne 'Available') { Write-Error \"unavailable:$avail\"; exit 2 }\n"
+    "$reason = $env:TA_BIO_REASON\n"
+    "if (-not $reason) { $reason = 'Unlock TAnalytic' }\n"
+    "$res = Await ([Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync($reason)) "
+    "([Windows.Security.Credentials.UI.UserConsentVerificationResult])\n"
+    "if ($res -eq 'Verified') { exit 0 } else { Write-Error \"$res\"; exit 1 }\n"
+)
+
+
+def _lock_hash_pin(pin, salt_bytes):
+    return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt_bytes, _LOCK_PBKDF_ROUNDS).hex()
+
+
+def _lock_verify_pin(cfg, pin):
+    h, s = str(cfg.get("lock_pin_hash") or ""), str(cfg.get("lock_pin_salt") or "")
+    if not h or not s:
+        return False
+    try:
+        salt_bytes = bytes.fromhex(s)
+    except ValueError:
+        return False
+    cand = _lock_hash_pin(str(pin or ""), salt_bytes)
+    return hmac.compare_digest(cand, h)
+
+
+def _lock_configured(cfg):
+    return bool(cfg.get("lock_enabled")) and bool(cfg.get("lock_pin_hash") or cfg.get("lock_bio"))
+
+
+def lock_is_locked(cfg):
+    if not _lock_configured(cfg):
+        return False
+    return not _lock_unlocked[0]
+
+
+def bio_available():
+    if os.environ.get("TINVEST_NO_BIO") == "1":
+        return False
+    sysname = platform.system()
+    if sysname == "Darwin":
+        return os.path.exists("/System/Library/Frameworks/LocalAuthentication.framework")
+    if sysname == "Windows":
+        return bool(shutil.which("powershell"))
+    return False
+
+
+def _bio_mac_cmd():
+    """Возвращает команду запуска macOS LocalAuthentication (кэшированный бинарник в APP_DIR/cache или swift -e)."""
+    h = hashlib.sha256(_BIO_SWIFT_SRC.encode("utf-8")).hexdigest()[:12]
+    cache_dir = os.path.join(APP_DIR, "cache")
+    bin_path = os.path.join(cache_dir, "bio_helper_" + h)
+    if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
+        return [bin_path]
+    swiftc = shutil.which("swiftc")
+    if swiftc:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            src_path = bin_path + ".swift"
+            with open(src_path, "w", encoding="utf-8") as f:
+                f.write(_BIO_SWIFT_SRC)
+            r = subprocess.run([swiftc, "-O", src_path, "-o", bin_path], timeout=30, capture_output=True, text=True)
+            try:
+                os.remove(src_path)
+            except OSError:
+                pass
+            if r.returncode == 0 and os.path.isfile(bin_path):
+                return [bin_path]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return ["swift", "-e", _BIO_SWIFT_SRC]
+
+
+def bio_verify(reason="Разблокировать TAnalytic"):
+    """Нативная проверка биометрии / системного пароля -> (ok: bool, err: str)."""
+    if _bio_runner is not None:
+        return _bio_runner(reason)
+    if not bio_available():
+        return False, "Биометрия недоступна на этом устройстве"
+    env = dict(os.environ, TA_BIO_REASON=str(reason or "Разблокировать TAnalytic"))
+    sysname = platform.system()
+    kw = {"env": env, "timeout": 30, "capture_output": True, "text": True}
+    if sysname == "Darwin":
+        cmd = _bio_mac_cmd()
+    elif sysname == "Windows":
+        cmd = ["powershell", "-NoProfile", "-Command", _BIO_WIN_PS]
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    else:
+        return False, "Биометрия недоступна"
+    try:
+        proc = subprocess.run(cmd, **kw)
+    except subprocess.TimeoutExpired:
+        return False, "Время ожидания биометрии истекло"
+    except OSError as e:
+        return False, str(e)
+    if proc.returncode == 0:
+        return True, ""
+    err = (proc.stderr or proc.stdout or "Проверка отклонена").strip()
+    return False, err[:240]
+
+
+def lock_status_dict(cfg):
+    return {
+        "enabled": bool(cfg.get("lock_enabled")),
+        "unlocked": not lock_is_locked(cfg),
+        "has_pin": bool(cfg.get("lock_pin_hash")),
+        "bio": bool(cfg.get("lock_bio", True)),
+        "bio_available": bio_available(),
+    }
+
+
+def lock_status_get(cfg, acc, q, force):
+    return lock_status_dict(cfg)
+
+
+def lock_setup_post(cfg, body):
+    with _lock_state_lock:
+        was_enabled = _lock_configured(cfg)
+        if was_enabled:
+            if not _lock_unlocked[0]:
+                raise ApiError("Программа заблокирована", 423)
+            if cfg.get("lock_pin_hash") and "current_pin" in body and body.get("current_pin") is not None:
+                if not _lock_verify_pin(cfg, body.get("current_pin")):
+                    raise ApiError("Неверный текущий PIN.", 403)
+        enabled = bool(body["enabled"]) if "enabled" in body else bool(cfg.get("lock_enabled"))
+        if "bio" in body:
+            cfg["lock_bio"] = bool(body["bio"])
+        elif "lock_bio" in body:
+            cfg["lock_bio"] = bool(body["lock_bio"])
+        if body.get("clear_pin"):
+            cfg["lock_pin_hash"] = ""
+            cfg["lock_pin_salt"] = ""
+        elif "pin" in body and body["pin"] is not None:
+            pin = str(body["pin"])
+            if pin:
+                if len(pin) < 4:
+                    raise ApiError("PIN должен содержать не менее 4 символов.", 400)
+                salt = os.urandom(16)
+                cfg["lock_pin_salt"] = salt.hex()
+                cfg["lock_pin_hash"] = _lock_hash_pin(pin, salt)
+            elif not enabled:
+                cfg["lock_pin_hash"] = ""
+                cfg["lock_pin_salt"] = ""
+        if enabled and not (cfg.get("lock_pin_hash") or cfg.get("lock_bio")):
+            raise ApiError("Задайте PIN-код или включите биометрию.", 400)
+        cfg["lock_enabled"] = enabled
+        if _lock_configured(cfg):
+            _lock_unlocked[0] = True     # не блокируем текущую сессию сразу после настройки
+        else:
+            _lock_unlocked[0] = False
+        save_config(cfg)
+        return {"ok": True, **lock_status_dict(cfg)}
+
+
+def lock_unlock_post(cfg, body):
+    with _lock_state_lock:
+        if not lock_is_locked(cfg):
+            return {"ok": True, "unlocked": True}
+        method = str(body.get("method") or ("bio" if body.get("bio") else "pin"))
+        if method == "bio":
+            if not cfg.get("lock_bio"):
+                raise ApiError("Биометрическая разблокировка отключена.", 403)
+            ok, err = bio_verify(str(body.get("reason") or "Разблокировать TAnalytic"))
+            if not ok:
+                raise ApiError(err or "Биометрическая проверка не пройдена.", 403)
+            _lock_unlocked[0] = True
+            return {"ok": True, "unlocked": True}
+        pin = str(body.get("pin") or "")
+        if not cfg.get("lock_pin_hash") or not _lock_verify_pin(cfg, pin):
+            raise ApiError("Неверный PIN.", 403)
+        _lock_unlocked[0] = True
+        return {"ok": True, "unlocked": True}
+
+
+def lock_bio_post(cfg, body):
+    ok, err = bio_verify(str(body.get("reason") or "Проверка биометрии TAnalytic"))
+    return {"ok": bool(ok), "error": err or ""}
+
+
+def lock_now_post(cfg, body):
+    with _lock_state_lock:
+        if _lock_configured(cfg):
+            _lock_unlocked[0] = False
+        return {"ok": True, "locked": lock_is_locked(cfg)}
+
+
+def _lock_on_startup():
+    with _lock_state_lock:
+        _lock_unlocked[0] = False
+
+
+API_GET["/api/lock/status"] = lock_status_get
+API_POST["/api/lock/setup"] = lock_setup_post
+API_POST["/api/lock/unlock"] = lock_unlock_post
+API_POST["/api/lock/bio"] = lock_bio_post
+API_POST["/api/lock/now"] = lock_now_post
+STARTUP_HOOKS.append(_lock_on_startup)
