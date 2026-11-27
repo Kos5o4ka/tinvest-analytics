@@ -34,10 +34,11 @@ function clEnv(P,F,startDate,rng){
   if(rng){let s=0;for(let k=1;k<M;k++){const z=rng.n();zq[k]=z;s=.985*s+.3*z;sh[k]=Math.max(-5,Math.min(6,s))}}
   const key=k=>{const b=base(k);let v=b;
     if(F.scn==='hard')v=b+2;else if(F.scn==='soft')v=Math.min(b,Math.max(b-2,4));else if(F.scn==='own')v=+F.ownKey||kr0;
-    return Math.max(1,v+sh[Math.min(k,M-1)])};
+    return Math.max(1,v+(+F.keyShift||0)+sh[Math.min(k,M-1)])};
   const iy={};(P.inflation.yearly||[]).forEach(x=>{iy[x.year]=x.mid});
   const iyears=Object.keys(iy).map(Number),last=iyears.length?iy[Math.max(...iyears)]:(P.inflation.default!=null?P.inflation.default:4);
-  const D=[1];for(let k=1;k<M;k++){const yr=y0+Math.floor((m0+k-1)/12),i=iy[yr]!=null?iy[yr]:last;D.push(D[k-1]*Math.pow(1+i/100,1/12))}
+  const io=F.inflOvr!==''&&F.inflOvr!=null&&isFinite(+F.inflOvr)?+F.inflOvr:null,ish=+F.inflShift||0;   /* io — своя инфляция вместо прогноза; ish — сдвиг для матрицы чувствительности */
+  const D=[1];for(let k=1;k<M;k++){const yr=y0+Math.floor((m0+k-1)/12),i=io!=null?io:(iy[yr]!=null?iy[yr]:last)+ish;D.push(D[k-1]*Math.pow(1+i/100,1/12))}
   const lq=P.lqdt||{yield:kr0-.7,estimate:true,spread:.7};
   const fsp=lq.estimate?(lq.spread!=null?lq.spread:.7):Math.max(0,Math.min(3,kr0-lq.yield));
   const fundRate=k=>(!lq.estimate&&k<2&&!rng)?lq.yield:Math.max(key(k)-fsp,.1);
@@ -49,7 +50,7 @@ function clEnv(P,F,startDate,rng){
   for(let k=0;k<M-1;k++){G.push(G[k]*(1+fundRate(k)/1200));
     let ze=0,zf=0;if(rng){ze=-.3*zq[k+1]+.954*rng.n();zf=.4*ze+.917*rng.n()}
     E.push(E[k]*Math.exp(mu-(rng?sm*sm/2:0)+sm*ze));X.push(X[k]*Math.exp(fxm-(rng?fsm*fsm/2:0)+fsm*zf))}
-  return{key,kr0,D,fundRate,depRate:k=>Math.max(key(k)-dsp,.1),y0,m0,infl:last,iy,G,E,X,stDiv:(F.stkDiv!==''&&F.stkDiv!=null?+F.stkDiv:st.div),rng};
+  return{key,kr0,D,fundRate,depRate:k=>Math.max(key(k)-dsp,.1),y0,m0,infl:io!=null?io:last+ish,iy,G,E,X,stDiv:(F.stkDiv!==''&&F.stkDiv!=null?+F.stkDiv:st.div),rng};
 }
 function clContrib(p,k){return k===0?p.start:(k<=p.months?p.monthly*Math.pow(1+p.idx/100,Math.floor((k-1)/12)):0)}
 /* счёт: вычет ИИС-3 (ставка и потолок по зарплатному НДФЛ), срок по году открытия, освобождение дохода до 30 млн ₽ */
@@ -175,7 +176,7 @@ function clSimBond(p,env,seg,rng){
 const clStk=(env)=>({G:env.E,div:env.stDiv});
 const clFundA=(env)=>({G:env.G,div:0,fund:true,pY:k=>env.fundRate(k)});
 function clSegBond(id,P){const s=P.segments[id]||P.segments.ofz;return{yield:s.yield,dur:s.dur,beta:CL_BETA[id]!=null?CL_BETA[id]:.7,loss:s.loss,fl:id==='flt'}}
-function clFxSeg(P,F){const f=P.fx_bonds||{yield:6,fx:5};return{yield:f.yield,dur:3,beta:0,loss:P.segments.a?P.segments.a.loss:.6,fx:F.fxWeak!==''&&F.fxWeak!=null?+F.fxWeak:f.fx}}
+function clFxSeg(P,F){const f=P.fx_bonds||{yield:6,fx:5};return{yield:f.yield,dur:3,beta:0,loss:P.segments.a?P.segments.a.loss:.6,fx:F.fxWeak!==''&&F.fxWeak!=null?+F.fxWeak:f.fx,fxv:F.fxWeak!==''&&F.fxWeak!=null?+F.fxWeak:f.fx}}
 function clParts(id,P,F){
   if(id==='dep')return[{w:1,sp:{t:'dep'}}];
   if(id==='fund')return[{w:1,sp:{t:'lots',A:clFundA}}];
@@ -207,27 +208,30 @@ function clCombine(rs,p,env,id){
     r.deposited+=x.deposited;r.deductions+=x.deductions;r.taxes+=x.taxes;r.passive+=x.passive;r.incGross+=x.incGross||0;r.defaults+=x.defaults||0});
   const capN=r.cap[N];r.final=capN;r.finalReal=capN/env.D[N];r.passiveReal=r.passive/env.D[N];r.income=capN-r.deposited-r.deductions;
   const fl=new Array(N+1).fill(0);for(let k=0;k<=N;k++)fl[k]-=clContrib(p,k);fl[N]+=capN;r.xirr=clIrr(fl);
+  r.xirrReal=r.xirr==null?null:((1+r.xirr/100)/Math.pow(env.D[N],12/Math.max(N,1))-1)*100;   /* реальная доходность после налогов: номинальная годовая за вычетом инфляции */
   r.taxLog=[].concat(...rs.map(x=>x.taxLog||[]));r.id=id;return r;
 }
 function clSim(id,p,P,env,F,rng){
   const parts=clParts(id,P,F),rs=parts.map(pt=>{const w=pt.w,ps=w===1?p:Object.assign({},p,{start:p.start*w,monthly:p.monthly*w,sc:w});return clSimPart(pt.sp,ps,env,rng)});
   return clCombine(rs,p,env,id);
 }
-function clParams(F,months,y0){
-  return{start:+F.start||0,monthly:+F.monthly||0,idx:+F.idx||0,months:months||Math.round((+F.years||1)*12),acct:(F.acct==='iisA'||F.acct==='iisB')?'iis3':F.acct,reinvest:!!F.reinvest,freq:+F.freq||12,
+/* индексация взносов: «фикс» — 0, «с инфляцией» — прогноз (или своя инфляция), иначе введённый процент */
+function clInflOf(P,F){return F.inflOvr!==''&&F.inflOvr!=null&&isFinite(+F.inflOvr)?+F.inflOvr:(P&&P.inflation&&P.inflation.default!=null?P.inflation.default:4)}
+function clParams(F,months,y0,P){
+  return{start:+F.start||0,monthly:+F.monthly||0,idx:F.idxMode==='fix'?0:F.idxMode==='infl'?clInflOf(P,F):(+F.idx||0),months:months||Math.round((+F.years||1)*12),acct:(F.acct==='iisA'||F.acct==='iisB')?'iis3':F.acct,reinvest:!!F.reinvest,freq:+F.freq||12,
     lot:+F.lot||0,lotFund:F.lotFund==='fund',reinvDed:!!F.reinvDed,ldv:!!F.ldv,defaults:!!F.defaults,iisYear:+F.iisYear||0,salRate:F.salRate!=null?+F.salRate:13,salary:+F.salary||0,y0:y0||new Date().getFullYear()};
 }
 /* Цель: нужное ежемесячное пополнение при заданном сроке или нужный срок при заданном пополнении (бисекция) */
 function clGoal(F,P,env,sid,real){
-  const T=+F.goalAmt||0,pas=(months,monthly)=>{const p=clParams(F,months,env.y0);p.monthly=monthly;const r=clSim(sid,p,P,env,F);return real===false?r.passive:r.passiveReal};
+  const T=+F.goalAmt||0,pas=(months,monthly)=>{const p=clParams(F,months,env.y0,P);p.monthly=monthly;const r=clSim(sid,p,P,env,F);return real===false?r.passive:r.passiveReal};
   if(F.goalMode==='years'){
-    const m=clParams(F,0,env.y0).monthly;let lo=1,hi=600;
+    const m=clParams(F,0,env.y0,P).monthly;let lo=1,hi=600;
     if(pas(hi,m)<T)return{ok:false};
     if(pas(lo,m)>=T)return{ok:true,months:1};
     while(hi-lo>1){const mid=(lo+hi)>>1;if(pas(mid,m)>=T)hi=mid;else lo=mid}
     return{ok:true,months:hi};
   }
-  const N=clParams(F,0,env.y0).months;let lo=0,hi=1000;
+  const N=clParams(F,0,env.y0,P).months;let lo=0,hi=1000;
   if(pas(N,0)>=T)return{ok:true,monthly:0};
   while(pas(N,hi)<T&&hi<1e9)hi*=2;
   if(pas(N,hi)<T)return{ok:false};
@@ -237,11 +241,76 @@ function clGoal(F,P,env,sid,real){
 /* Монте-Карло: дефолты по траншам, шоки ключевой ставки и рынка акций. Возвращает квантили капитала по месяцам и разброс итога */
 function clQuant(sorted,q){const n=sorted.length;if(!n)return 0;const x=q*(n-1),i=Math.floor(x),f=x-i;return i+1<n?sorted[i]*(1-f)+sorted[i+1]*f:sorted[i]}
 function clMC(F,P,id,runs,seed,startDate){
-  const p=clParams(F,0,(startDate||new Date()).getFullYear()),N=p.months,qs=[.1,.5,.9],cols=[],fin=[];let dfl=0;
+  const p=clParams(F,0,(startDate||new Date()).getFullYear(),P),N=p.months,qs=[.1,.5,.9],cols=[],fin=[];let dfl=0;
   for(let i=0;i<N+1;i++)cols.push(new Float64Array(runs));
   const out={p10:[],p50:[],p90:[],finals:null,defaults:0,runs};
   for(let j=0;j<runs;j++){const rng=clRng((seed||1)*1000003+j*7919+1),env=clEnv(P,F,startDate,rng),r=clSim(id,p,P,env,F,rng);
     for(let k=0;k<=N;k++)cols[k][j]=r.cap[k];fin.push(r.cap[N]);dfl+=r.defaults}
   for(let k=0;k<=N;k++){const a=Array.from(cols[k]).sort((x,y)=>x-y);out.p10.push(clQuant(a,.1));out.p50.push(clQuant(a,.5));out.p90.push(clQuant(a,.9))}
   out.finals=fin.sort((x,y)=>x-y);out.defaults=dfl/runs;return out;
+}
+/* ── Жизнь с капитала: накопление до месяца N, затем ежемесячное снятие (в сегодняшних деньгах, с индексацией на инфляцию) из единого портфеля ──
+   Допущения: к концу накопления позиции пересобираются в тех же пропорциях по цене после налогов (новая база — вся сумма); доход, облагаемый ежегодно (купоны, дивиденды, проценты) —
+   налог в конце года; рост цены (фонды, акции, курс) — налог с доли прироста в каждом снятии; на ИИС-3 с выдержанным сроком налог только после 30 млн ₽ финансового результата
+   за всё время; ЛДВ в фазе снятия считается соблюдённой (лимит 3 млн ₽ × лет не проверяется). */
+function clSigOf(sp,F,P){
+  if(sp.t==='dep')return 0;
+  if(sp.t==='lots')return sp.A===clStk?(+F.stkSig||(P.stocks&&P.stocks.sigma)||22):1;
+  const s=sp.seg;return s.fl?2:(s.fx?((P.fx_bonds&&P.fx_bonds.sigma)||12):6);
+}
+/* доходность на месяце k: ic — облагаемая ежегодно (годовых, %), gd — рост цены (отложенный налог), sig — годовой разброс */
+function clRet(parts,P,F,env,k){
+  let ic=0,gd=0,v=0;const sg=[];
+  for(const pt of parts){const sp=pt.sp,w=pt.w;let a=0,b=0;
+    if(sp.t==='dep')a=env.depRate(k);
+    else if(sp.t==='lots'){if(sp.A===clStk){a=env.stDiv;b=(env.E[k+1]/env.E[k]-1)*1200}else if(sp.A===clFundA)b=env.fundRate(k)}
+    else{const s=sp.seg;a=s.fl?env.key(k)+((s.yield||0)-env.kr0):Math.max(.5,s.yield+(s.beta||0)*(env.key(k)-env.kr0));if(s.fx)b=s.fxv}
+    ic+=w*a;gd+=w*b;sg.push([w,clSigOf(sp,F,P)])}
+  for(let i=0;i<sg.length;i++)for(let j=0;j<sg.length;j++)v+=sg[i][0]*sg[j][0]*sg[i][1]*sg[j][1]*(i===j?1:.3);
+  return{ic,gd,sig:Math.sqrt(v)};
+}
+function clLife(F,P,env,id,K0,N,o){
+  const parts=clParts(id,P,F),H=Math.max(0,Math.min(o.months,720-N)),rng=o.rng||null,iis=!!o.iis,exempt=!!o.exempt,ldv=!!o.ldv&&!iis;
+  let K=K0,B=K0,Iy=0,gY=0,cum=Math.max(0,o.res0||0),dep=null;const path=[K0];
+  for(let j=1;j<=H;j++){
+    const k=N+j,r=clRet(parts,P,F,env,k),m=Math.pow(1+(r.ic+r.gd)/100,1/12)-1;
+    let g=K*m;if(rng&&r.sig>0){const sm=r.sig/100/Math.sqrt(12);g=K*((1+m)*Math.exp(sm*rng.n()-sm*sm/2)-1)}
+    const inc=K*r.ic/1200;Iy+=inc;B+=inc;K+=g;
+    const W=o.spend*env.D[k],take=Math.min(W,K),gr=K>0?Math.max(0,(K-B)/K):0;
+    gY+=take*gr;B-=take*(1-gr);K-=W;
+    if(K<=0){K=0;dep=j;path.push(0);break}
+    if((env.m0+k)%12===0){
+      const base=Iy+(ldv?0:gY);let tax=0;
+      if(iis&&exempt)tax=clNdfl(Math.max(0,cum+base-30e6))-clNdfl(Math.max(0,cum-30e6));else tax=clNdfl(base);
+      tax=Math.min(tax,K);B-=B*tax/(K+tax||1);K-=tax;cum+=base;Iy=0;gY=0;
+    }
+    path.push(K);
+  }
+  return{path,dep,end:K,H};
+}
+/* вечный доход: наибольшее снятие (в сегодняшних деньгах), при котором реальный капитал за горизонт не падает */
+function clPerpetual(F,P,env,id,K0,N,o){
+  const H=Math.min(360,720-N);if(!(K0>0)||H<12)return 0;
+  const ok=w=>{const l=clLife(F,P,env,id,K0,N,Object.assign({},o,{spend:w,months:H,rng:null}));return l.dep==null&&l.end/env.D[N+H]>=K0/env.D[N]*.999};
+  let lo=0,hi=K0/env.D[N]/12*.5+1;if(!ok(0))return 0;
+  for(let i=0;i<4&&ok(hi);i++)hi*=2;
+  for(let i=0;i<45;i++){const mid=(lo+hi)/2;if(ok(mid))lo=mid;else hi=mid}
+  return lo;
+}
+/* целиком: накопление + снятие; rng — одна случайная траектория */
+function clLifeRun(F,P,id,startDate,rng){
+  const env=clEnv(P,F,startDate,rng),p=clParams(F,0,env.y0,P),N=p.months,r=clSim(id,p,P,env,F,rng),ai=clAccInfo(p);
+  const o={spend:+F.spend||0,months:Math.round((+F.spendYears||30)*12),rng,iis:ai.iis,exempt:ai.exempt,ldv:p.ldv,res0:r.final-r.deposited};
+  const life=clLife(F,P,env,id,r.final,N,o);
+  return{env,p,N,r,ai,life,o};
+}
+/* случайные траектории обеих фаз: доля без исчерпания капитала и квантили капитала */
+function clLifeMC(F,P,id,runs,seed,startDate){
+  let ok=0,H0=0;const paths=[],deps=[];
+  for(let j=0;j<runs;j++){const x=clLifeRun(F,P,id,startDate,clRng((seed||1)*1000003+j*7919+1));
+    const full=Array.from(x.r.cap).concat(x.life.path.slice(1));paths.push(full);H0=Math.max(H0,full.length);
+    if(x.life.dep==null)ok++;else deps.push(x.life.dep)}
+  const out={p10:[],p50:[],p90:[],success:ok/runs,runs,depMedian:deps.length?deps.sort((a,b)=>a-b)[deps.length>>1]:null};
+  for(let k=0;k<H0;k++){const a=paths.map(q=>k<q.length?q[k]:0).sort((x,y)=>x-y);out.p10.push(clQuant(a,.1));out.p50.push(clQuant(a,.5));out.p90.push(clQuant(a,.9))}
+  return out;
 }

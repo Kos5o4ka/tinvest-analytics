@@ -30,3 +30,23 @@
 @media(max-width:560px){.cl-grid,.cl-grid.cl-base{grid-template-columns:1fr}.cl-adv>summary span{display:block;margin:4px 0 0}.cl-tabs{width:100%}.cl-tabs button{flex:1;text-align:center}}
 .cl-page{display:grid;gap:16px;min-width:0}.cl-page>*{min-width:0}
 #cl-out,#cg-out{display:grid;gap:16px;min-width:0}#cl-out>*,#cg-out>*{min-width:0}
+/* двухколоночная раскладка: слева параметры (закреплены при прокрутке), справа результат */
+.cl-split{display:grid;grid-template-columns:minmax(340px,410px) minmax(0,1fr);gap:16px;align-items:start}
+.cl-split>*{min-width:0}
+.cl-side{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto;padding:16px}
+.cl-main{display:grid;gap:16px;min-width:0}
+.cl-side .cl-grid,.cl-side .cl-grid.cl-g2{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}
+.cl-side .cl-sec{margin:16px 0 8px}
+.cl-side .field input,.cl-side .field select{width:100%}
+.cl-lv{display:grid;gap:5px;margin:8px 0}
+.cl-lv>span{font-size:12px;color:var(--mu)}
+.cl-lv .seg{width:100%}.cl-lv .seg button{flex:1;text-align:center;white-space:normal}
+.seg button:focus-visible{outline:2px solid var(--ac);outline-offset:1px}
+.cl-pre{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:10px}
+.cl-preset{all:unset;box-sizing:border-box;cursor:pointer;display:grid;gap:3px;padding:9px 11px;border:1px solid var(--line2);border-radius:10px;background:var(--card)}
+.cl-preset b{font-size:13px;color:var(--tx)}.cl-preset small{font-size:11px;line-height:1.35;color:var(--mu)}
+.cl-preset:hover{border-color:var(--ac)}.cl-preset:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.cl-preset[disabled]{opacity:.45;cursor:default}
+.cl-mixbox{margin-top:12px;display:grid;gap:8px}.cl-mixbox input[type=range]{width:100%;accent-color:var(--ac)}
+@media(max-width:1100px){.cl-split{grid-template-columns:1fr}.cl-side{position:static;max-height:none}}
+@media(max-width:560px){.cl-pre{grid-template-columns:1fr}}

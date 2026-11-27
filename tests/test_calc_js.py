@@ -171,5 +171,39 @@ class Engine(unittest.TestCase):
         self.assertAlmostEqual(o["b"], 1.0, places=6)
 
 
+class Life(unittest.TestCase):
+    SETUP = """
+    const F=mkF({acct:'iis3',iisYear:2024,years:3,start:1e6,monthly:0,idx:0,ownRate:12,inflOvr:0,spend:0,spendYears:30,ldv:true});
+    const x=clLifeRun(F,P,'own',SD,null),env=x.env,K0=x.r.final,N=x.N;out.exempt=x.ai.exempt;out.K0=K0;
+    """
+
+    def test_annuity_depletion_month(self):
+        o = js(self.SETUP + """
+        const rm=Math.pow(1.12,1/12)-1,W=K0*0.012;F.spend=W;
+        const y=clLifeRun(F,P,'own',SD,null);out.dep=y.life.dep;out.exp=-Math.log(1-rm*K0/W)/Math.log(1+rm);""")
+        self.assertTrue(o["exempt"])
+        self.assertAlmostEqual(o["dep"], o["exp"], delta=1.5)       # срок исчерпания совпадает с формулой аннуитета
+
+    def test_perpetual_income_keeps_real_capital(self):
+        o = js(self.SETUP + """
+        F.inflOvr=6;const e2=clEnv(P,F,SD),p=x.p,r2=clSim('own',p,P,e2,F),ai=x.ai;
+        const op={spend:0,months:0,iis:ai.iis,exempt:ai.exempt,ldv:true,res0:r2.final-r2.deposited};
+        const w=clPerpetual(F,P,e2,'own',r2.final,N,op);
+        const l=clLife(F,P,e2,'own',r2.final,N,Object.assign({},op,{spend:w,months:360}));
+        const l2=clLife(F,P,e2,'own',r2.final,N,Object.assign({},op,{spend:w*1.5,months:360}));
+        out.w=w;out.ratio=l.end/e2.D[N+360]/(r2.final/e2.D[N]);out.dep2=l2.dep;out.r=(1.12/1.06-1);out.K=r2.final/e2.D[N];""")
+        self.assertGreater(o["w"], 0)
+        self.assertAlmostEqual(o["ratio"], 1.0, delta=0.02)          # снятие вечного дохода не съедает реальный капитал
+        self.assertAlmostEqual(o["w"], o["K"] * o["r"] / 12, delta=o["K"] * o["r"] / 12 * 0.08)
+        self.assertIsNotNone(o["dep2"])                              # полтора вечного дохода капитал исчерпывают
+
+    def test_taxed_withdrawal_is_less_than_tax_free(self):
+        o = js(self.SETUP + """
+        const mk=a=>{const G=mkF({acct:a,iisYear:2024,years:3,start:1e6,monthly:0,idx:0,ownRate:12,inflOvr:4,spend:0,ldv:true}),e=clEnv(P,G,SD),p=clParams(G,0,2026),r=clSim('own',p,P,e,G),ai=clAccInfo(p);
+          return clPerpetual(G,P,e,'own',r.final,p.months,{spend:0,months:0,iis:ai.iis,exempt:ai.exempt,ldv:true,res0:0})/ (r.final/e.D[p.months])};
+        out.iis=mk('iis3');out.plain=mk('plain');""")
+        self.assertGreater(o["iis"], o["plain"])                    # налог на купоны уменьшает безопасное снятие
+
+
 if __name__ == "__main__":
     unittest.main()
