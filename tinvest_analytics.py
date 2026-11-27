@@ -32529,7 +32529,7 @@ aside.cl-side,.cl-side{position:sticky;top:12px;width:100%;max-height:calc(100vh
 .lg-box{width:min(420px,100%);background:var(--card);border:1px solid var(--line2);border-radius:var(--r);padding:28px 28px 22px;display:flex;flex-direction:column;gap:16px;box-shadow:0 20px 60px #0006}
 .lg-box .logo{padding:0;margin:0 0 4px}
 .lg-t{color:var(--tx2);font-size:14px}
-.lg-box #lg-bot,.lg-box #lg-one{justify-content:center;text-align:center;padding:11px 16px;text-decoration:none}
+.lg-box #lg-one{justify-content:center;text-align:center;padding:11px 16px;text-decoration:none}
 .lg-t,.lg-n{text-wrap:pretty}
 #lg-form{display:flex;flex-direction:column;gap:10px}
 #lg-key{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.04em;text-align:center}
@@ -41612,7 +41612,6 @@ function authWho(){
 function authOverlay(show,err){
   let ov=$('#login-ov');
   if(!show){if(ov)ov.remove();return}
-  const bot=esc(AUTH.bot);
   if(ov){const e=$('#lg-err');if(e&&err!==undefined){e.textContent=err;e.style.display=err?'':'none'}return}
   ov=document.createElement('div');ov.id='login-ov';
   ov.innerHTML=`<div class="lg-box" role="dialog" aria-modal="true" aria-label="Вход">
@@ -41621,13 +41620,11 @@ function authOverlay(show,err){
     <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует 7&nbsp;дней.</p>
     <button class="btn" id="lg-one" type="button">Войти через Telegram</button>
     <div class="lg-n" id="lg-one-st" style="display:none" role="status"></div>
-    <a class="btn ghost" id="lg-bot" href="https://t.me/${bot}?start=app" target="_blank" rel="noopener noreferrer">Открыть @${bot} и взять ключ</a>
     <form id="lg-form" autocomplete="off">
       <input class="in" id="lg-key" placeholder="TIA-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" autofocus>
       <div class="lg-err" id="lg-err" style="display:${err?'':'none'}">${esc(err||'')}</div>
-      <button class="btn ghost" id="lg-go" type="submit">Войти</button>
-    </form>
-    <p class="lg-n">Токен Т-Инвестиций остаётся только на этом компьютере и боту не передаётся.</p></div>`;
+      <button class="btn ghost" id="lg-go" type="submit">Войти по ключу</button>
+    </form></div>`;
   document.body.appendChild(ov);
   const inp=$('#lg-key');
   inp.addEventListener('input',()=>{const v=inp.value.toUpperCase().replace(/\s+/g,'');if(v!==inp.value)inp.value=v});
