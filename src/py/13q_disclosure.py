@@ -558,6 +558,44 @@ def _dfl_schedule_row(isin, today=None):
     return dfl_last_due(bz, qty, today)
 
 
+DFL_MSG_URL = "https://e-disclosure.azipi.ru/messages/%d/"
+_DFL_URL_RX = re.compile(r"https://e-disclosure\.(?:azipi\.)?ru/[^\s\"'<>]+")
+
+
+def dfl_msg_url(f):
+    """Ссылка на первоисточник — сообщение эмитента на e-disclosure. Берём url сервера, если он ведёт на раскрытие;
+    иначе собираем по номеру сообщения (doc_id). None, если нечего показать."""
+    u = str(f.get("url") or "").strip()
+    if _DFL_URL_RX.fullmatch(u):
+        return u
+    try:
+        did = int(f.get("doc_id"))
+    except (TypeError, ValueError):
+        return None
+    return DFL_MSG_URL % did if did > 0 else None
+
+
+def _dfl_issuer_name(isin):
+    """Наименование эмитента по ISIN: карточка эмитента Мосбиржи, затем название выпуска; тему сообщения сюда не подставляем
+    (она уходит в отдельное поле subject). None, если определить не удалось."""
+    if not isin:
+        return None
+    try:
+        em = issuer_of(isin) or {}
+        n = em.get("short") or em.get("title")
+        if n and str(n).strip().upper() != str(isin).upper():
+            return str(n).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        n = (_disc_issue_desc(isin) or {}).get("name")
+        if n:
+            return str(n).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def defaults_feed(since=None, isins=None, schedule=False):
     """Лента неисполненных обязательств: сообщения эмитентов (сервер данных) + флаги Мосбиржи по бумагам из isins.
     [{date, status, issuer, inn, isin, obligation, amount, executed, basis, url, date_est}], новые сверху.
@@ -573,12 +611,9 @@ def defaults_feed(since=None, isins=None, schedule=False):
     def one(f):
         d = f.get("data") or {}
         isin = f.get("isin")
-        name = None
-        try:
-            em = issuer_of(isin) if isin else None
-            name = (em or {}).get("short") or (em or {}).get("title")
-        except Exception:  # noqa: BLE001
-            pass
+        name = _dfl_issuer_name(isin)
+        subject = re.sub(r"\s+", " ", str(f.get("title") or "")).strip() or None
+        url = dfl_msg_url(f)
         try:
             ex = _dfl_executed(isin, f) if isin else None
         except Exception:  # noqa: BLE001
@@ -589,9 +624,9 @@ def defaults_feed(since=None, isins=None, schedule=False):
             ob = DISC_OBL_RU.get(o.get("obligation"), "Обязательство")
             num = " №%s" % d["coupon_no"] if d.get("coupon_no") and o.get("obligation") == "coupon" else ""
             out.append({"date": (f.get("published") or "")[:10] or None, "due_date": d.get("due_date") or f.get("due_date"),
-                        "status": "default" if d.get("status") == "default" else "technical", "issuer": name or f.get("title") or "",
-                        "inn": f.get("inn"), "isin": isin, "obligation": ob + num,
-                        "amount": o.get("amount"), "executed": ex, "basis": "Сообщение эмитента", "url": f.get("url"), "date_est": False})
+                        "status": "default" if d.get("status") == "default" else "technical", "issuer": name or isin or "",
+                        "subject": subject, "inn": f.get("inn"), "isin": isin, "obligation": ob + num,
+                        "amount": o.get("amount"), "executed": ex, "basis": "Сообщение эмитента", "url": url, "date_est": False})
         return out
     rows = [r for part in (pool_map(one, raw[:300], workers=6) if raw else []) for r in part]
     have = {r["isin"] for r in rows if r.get("isin")}
@@ -604,7 +639,7 @@ def defaults_feed(since=None, isins=None, schedule=False):
                 return None
             em = issuer_of(isin) or {}
             row = {"date": None, "due_date": None, "status": "default" if fl.get("default") else "technical",
-                   "issuer": em.get("short") or em.get("title") or isin, "inn": em.get("inn"), "isin": isin, "obligation": "",
+                   "issuer": _dfl_issuer_name(isin) or isin, "subject": None, "inn": em.get("inn"), "isin": isin, "obligation": "",
                    "amount": None, "executed": None, "basis": "Флаг Мосбиржи", "url": None, "date_est": False}
             if schedule:
                 try:
@@ -716,43 +751,89 @@ def issuer_flows_get(cfg, acc, q, force):
     return mem_put(key, issuer_cashflows(inn, h))
 
 
-def defaults_get(cfg, acc, q, force):
-    try:
-        days = max(1, min(365, int(q.get("days") or 30)))
-    except ValueError:
-        days = 30
-    since = (q.get("since") or "").strip()
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
-        since = (date.today() - timedelta(days=days)).isoformat()
-    own = str(q.get("own", "1")) != "0"
-    scope = "market" if str(q.get("scope") or "my").strip().lower() == "market" else "my"
-    key = ("defaults", since, own, scope, bool(cfg.get("sandbox")), hash(cfg.get("token") or ""), acc)
-    scan = None
+DFL_FEED_TTL, DFL_FEED_MAXAGE = 30 * 60, 24 * 3600
+_DFL_BG, _DFL_BG_LOCK = set(), threading.Lock()
+
+
+def _dfl_compute(cfg, acc, since, own, scope, mk):
+    """Сборка ответа ленты: {since, scope, rows, configured[, scan]}. mk — результат dfl_market (для scope=market)."""
     mine = _disc_own_isins(cfg, acc) if own else []
     if scope == "market":
-        mk = dfl_market(bool(force))
-        scan = mk["scan"]
         isins = list(dict.fromkeys(mine + mk["isins"]))
-        if not scan["running"] and not force:
-            hit = mem_get(key, 900)
-            if hit:
-                return dict(hit, scan=scan)
     else:
         isins = mine
-        if not force:
-            hit = mem_get(key, 900)
-            if hit:
-                return hit
     rows = defaults_feed(since, isins if (own or scope == "market") else None, schedule=True)
     mineset = set(mine)
     for r in rows:
         r["mine"] = r.get("isin") in mineset
+    if scope == "my" and own:         # «мой портфель»: сообщения других эмитентов из общей ленты сюда не попадают
+        rows = [r for r in rows if r.get("mine")]
     out = {"since": since, "scope": scope, "rows": rows, "configured": bool(ds_conf()[0])}
-    if scan is not None:
-        out["scan"] = scan
-        if scan["running"]:           # промежуточный результат не кэшируем: он меняется по мере обхода
+    if mk is not None:
+        out["scan"] = mk["scan"]
+    return out
+
+
+def _dfl_cache_key(since_q, days, own, scope, cfg, acc):
+    tok = hashlib.sha1(((cfg.get("token") or "") + "|" + str(bool(cfg.get("sandbox")))).encode("utf-8")).hexdigest()[:10]
+    return "dfl_feed_v2:%s:%s:%d:%s:%s" % (scope, since_q or days, int(own), tok, acc)
+
+
+def _dfl_refresh_bg(ckey, cfg, acc, since, own, scope):
+    """Фоновое обновление ленты: один поток на ключ, результат пишется в kv."""
+    with _DFL_BG_LOCK:
+        if ckey in _DFL_BG:
+            return
+        _DFL_BG.add(ckey)
+
+    def run():
+        try:
+            mk = dfl_market(False) if scope == "market" else None
+            out = _dfl_compute(cfg, acc, since, own, scope, mk)
+            if not (mk and mk["scan"]["running"]):
+                store().put(ckey, {"ts": time.time(), "mk_ts": (mk or {}).get("ts"), "out": out})
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with _DFL_BG_LOCK:
+                _DFL_BG.discard(ckey)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def defaults_get(cfg, acc, q, force):
+    """Лента техдефолтов. Готовый результат хранится в kv: открытие экрана отдаёт его сразу (cached_at — время сборки),
+    а устаревший (старше 30 мин или после нового обхода рынка) обновляется в фоне (refreshing=True)."""
+    try:
+        days = max(1, min(365, int(q.get("days") or 30)))
+    except ValueError:
+        days = 30
+    since_q = (q.get("since") or "").strip()
+    since = since_q if re.fullmatch(r"\d{4}-\d{2}-\d{2}", since_q) else (date.today() - timedelta(days=days)).isoformat()
+    own = str(q.get("own", "1")) != "0"
+    scope = "market" if str(q.get("scope") or "my").strip().lower() == "market" else "my"
+    ckey = _dfl_cache_key(since_q if since_q == since else "", days, own, scope, cfg, acc)
+    mk = dfl_market(bool(force)) if scope == "market" else None
+    now = time.time()
+    if not force:
+        try:
+            hit = store().get(ckey)
+        except Exception:  # noqa: BLE001
+            hit = None
+        if isinstance(hit, dict) and isinstance(hit.get("out"), dict) and now - float(hit.get("ts") or 0) < DFL_FEED_MAXAGE:
+            scanning = bool(mk and mk["scan"]["running"])
+            stale = (now - float(hit["ts"]) > DFL_FEED_TTL or hit["out"].get("since") != since
+                     or (mk is not None and hit.get("mk_ts") != mk.get("ts")))
+            if stale and not scanning:      # пока идёт обход рынка, пересборка бессмысленна: дождёмся его конца
+                _dfl_refresh_bg(ckey, cfg, acc, since, own, scope)
+            out = dict(hit["out"], cached_at=hit["ts"], refreshing=bool(stale))
+            if mk is not None:
+                out["scan"] = mk["scan"]
             return out
-    return mem_put(key, out)
+    out = _dfl_compute(cfg, acc, since, own, scope, mk)
+    if not (mk and mk["scan"]["running"]):      # промежуточный результат не кэшируем: он меняется по мере обхода
+        store().put(ckey, {"ts": now, "mk_ts": (mk or {}).get("ts"), "out": out})
+        out = dict(out, cached_at=now)
+    return out
 
 
 API_GET["/api/issuer_flows"] = issuer_flows_get

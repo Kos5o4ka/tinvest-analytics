@@ -11,6 +11,8 @@ function loadDfl(force,quiet){
      if(sc&&sc.running){
        if(D.chg||!$('#dfl-prog'))render();else dflProg();
        D.tm=setTimeout(()=>{if(S.page==='dfl'&&D.key===dflKey())loadDfl(false,true)},3000);
+     }else if(D.data&&D.data.refreshing){
+       render();D.tm=setTimeout(()=>{if(S.page==='dfl'&&D.key===dflKey())loadDfl(false,true)},4000);
      }else render()});
 }
 const dflPl=(n,f)=>{const a=n%10,b=n%100;return a===1&&b!==11?f[0]:a>=2&&a<=4&&(b<10||b>=20)?f[1]:f[2]};
@@ -21,10 +23,10 @@ function dflRows(rows,since){
     const dt=r.date?ddm(r.date)+(r.date_est?` <small class="mu dfl-est" title="Дата оценена по графику выплат Мосбиржи: последняя плановая выплата до сегодняшнего дня. Фактическую дату неисполнения эмитент мог раскрыть иначе.">по графику</small>`:''):'—';
     const ru=safeUrl(r.url);
     return`<tr${r.isin?` data-isin="${esc(r.isin)}" title="Открыть карточку выпуска"`:''}><td class="l">${dt}</td><td class="l"><span class="dfl-b ${st[1]}">${st[0]}</span></td>
-      <td class="l dfl-is"><b>${esc(r.issuer||'—')}</b>${r.mine?' <span class="tag">мой</span>':''}<br><small class="mu num">${r.isin?esc(r.isin):''}${r.isin&&r.inn?' · ':''}${r.inn?'ИНН '+esc(r.inn):''}</small></td>
+      <td class="l dfl-is"><b>${esc(r.issuer||'—')}</b>${r.mine?' <span class="tag">мой</span>':''}${r.subject?`<br><small class="mu dfl-sub" title="Тема сообщения эмитента">${esc(r.subject)}</small>`:''}<br><small class="mu num">${r.isin?esc(r.isin):''}${r.isin&&r.inn?' · ':''}${r.inn?'ИНН '+esc(r.inn):''}</small></td>
       <td class="l">${esc(r.obligation||'—')}${r.due_date&&!r.date_est?`<br><small class="mu">срок ${ddm(r.due_date)}</small>`:''}</td><td class="num">${r.amount==null?'—':short(r.amount)+' ₽'}</td>
       <td class="l">${r.executed?`<span class="pos">исполнено ${ddm(r.executed)}</span>`:'<span class="mu">нет данных</span>'}</td>
-      <td class="l dfl-bs">${ru?`<a href="${esc(ru)}" target="_blank" rel="noopener">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
+      <td class="l dfl-bs">${ru?`<a href="${esc(ru)}" target="_blank" rel="noopener" title="Открыть сообщение эмитента на сайте раскрытия информации">${esc(r.basis)} ↗</a>`:esc(r.basis||'')}</td></tr>`}).join('')+`</tbody></table></div>`;
 }
 function pDfl(){
   const D=S.dfl,key=dflKey();
@@ -43,6 +45,8 @@ function pDfl(){
   if(!d.configured)h+=`<div class="msg" style="margin:10px 0">Сервер данных недоступен: сообщения эмитентов не загружены. Ниже только флаги Мосбиржи.</div>`;
   if(sc&&sc.running)h+=`<div class="msg" style="margin:10px 0"><span class="dfl-spin"></span> <span id="dfl-prog">Проверяю выпуски Мосбиржи: ${sc.done} из ${sc.total}</span> — список дополняется по ходу проверки.</div>`;
   else if(sc&&sc.error)h+=`<div class="msg err" style="margin:10px 0">Обход рынка не завершён: ${esc(sc.error)}</div>`;
+  if(d.cached_at){const t=new Date(d.cached_at*1000),hm=t.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+    h+=`<div class="msg" style="margin:10px 0">Показан сохранённый результат от ${hm}${d.refreshing?' — обновляю в фоне…':'.'}</div>`}
   const isn=new Set(all.map(r=>r.isin||r.issuer)),iss=new Set(all.map(r=>r.inn||r.issuer));
   h+=`<p class="mu" style="margin:0 0 8px" id="dfl-cnt">Найдено: ${isn.size} ${dflPl(isn.size,['выпуск','выпуска','выпусков'])}, эмитентов: ${iss.size}</p>`;
   if(!all.length)return h+`<div class="empty" style="padding:28px 12px">${d.configured?'Неисполненных обязательств не найдено.':'Нет данных для показа.'}</div></div>`;

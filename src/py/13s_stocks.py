@@ -207,6 +207,35 @@ def stk_api_map(cfg):
         return {}
 
 
+def stk_apply_snapshot(rows, snap):
+    """Недельное и месячное изменение из готового среза сервера (по тикеру) -> число заполненных бумаг. Не трогает уже заполненное."""
+    by = {r.get("secid"): r for r in snap or [] if isinstance(r, dict)}
+    n = 0
+    for r in rows:
+        x = by.get(r.get("secid"))
+        if not x:
+            continue
+        for f in ("chg_w", "chg_m"):
+            if r.get(f) is None and isinstance(x.get(f), (int, float)) and not isinstance(x.get(f), bool):
+                r[f] = x[f]
+        n += r.get("chg_w") is not None and r.get("chg_m") is not None
+    return n
+
+
+def _stk_fill_changes(rows):
+    """chg_w / chg_m: сначала из среза сервера (без десятков запросов за историей закрытий). Если срез недоступен, устарел или
+    не покрывает торгуемые бумаги — прежний путь (цены закрытий с Мосбиржи); при полном покрытии он не нужен."""
+    try:
+        snap = market_snapshot_stocks()
+    except Exception:  # noqa: BLE001
+        snap = None
+    if snap:
+        stk_apply_snapshot(rows, snap)
+        if all(r.get("chg_w") is not None and r.get("chg_m") is not None for r in rows if (r.get("value_today") or 0) > 0):
+            return
+    _stk_changes(rows)
+
+
 def _stk_tqbr_rows(force=False):
     """Все бумаги TQBR (акции и фонды) с chg_w/chg_m; общий кэш. Фонды помечены is_fund (INSTRID «IF…»)."""
     key = ("stk_universe",)
@@ -216,7 +245,7 @@ def _stk_tqbr_rows(force=False):
             rows = None if force else mem_get(key, _stk_ttl())
             if rows is None:
                 rows = stk_rows_from_iss(_stk_iss(STK_SH % "TQBR", 40), STK_SECTORS)
-                _stk_changes(rows)
+                _stk_fill_changes(rows)
                 mem_put(key, rows)
     return rows
 

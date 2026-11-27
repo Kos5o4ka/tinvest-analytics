@@ -48,7 +48,7 @@ function pPri(){
   if(d.error)return`<div class="msg err">${esc(d.error)} <button class="btn ghost" id="pri-r">Повторить</button></div>`;
   const today=localIso(),rows=d.rows;
   // календарь будущих размещений недоступен (investmint закрыл доступ программам): остальное на экране работает по данным Мосбиржи
-  const calNote=d.cal_error?`<div class="msg" style="margin-top:16px">Календарь будущих размещений сейчас недоступен: ${esc(d.cal_error)}. Размещения, которые уже идут на Мосбирже, показаны выше; калькулятор премии работает.</div>`:'';
+  const calNote=d.cal_error?`<div class="msg" style="margin-top:16px">Календарь заранее объявленных размещений сейчас недоступен: ${esc(d.cal_error)}. ${d.cal_fallback?'Ниже показаны выпуски с площадок размещения Мосбиржи (дата начала — по данным биржи); выпуски, объявленные, но ещё не заведённые на площадку, пока не видны.':'Размещения, которые уже идут на Мосбирже, показаны выше.'} Калькулятор премии работает.</div>`:'';
   const wk=localIso(new Date(Date.now()+7*864e5));
   const body=rows.map(r=>`<tr class="${r.start===today?'pnew':''}"${r.isin?` data-isin="${esc(r.isin)}"`:''}><td class="l"><b>${esc(r.short||r.issuer)}</b><br><small class="mu">${esc(r.desc)}</small>${r.isin?`<br><small class="mu num">${isinTxt(r.isin)}</small>`:''}</td>
     <td class="l">${r.rating?ratingTag(r.rating):'<span class="mu">—</span>'}</td>
