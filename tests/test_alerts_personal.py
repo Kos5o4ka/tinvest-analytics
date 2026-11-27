@@ -128,6 +128,122 @@ class Checker(unittest.TestCase):
         self.assertEqual((len(out), out[0], deferred), (2, urgent, 1))     # срочное — отдельным сообщением и первым
         self.assertEqual(SA.coalesce_messages(msgs[:2]), (msgs[:2], 0))
 
+    def test_disclosure_and_flow_alerts_units(self):
+        sub = self.sub(
+            goals=[{"isin": "RU000A100001", "name": "Эмитент А", "watch_only": True}],
+            offers=[{"isin": "RU000A100002", "name": "Эмитент Б", "kind": "put", "date": "2026-12-10"}],
+        )
+        disclosures = [
+            {"doc_id": 10, "isin": "RU000A100001", "kind": "default", "title": "Технический дефолт по купону", "published": "2026-11-24"},
+            {"doc_id": 11, "isin": "RU000A100001", "kind": "rating", "title": "Понижение рейтинга до ruBBB-", "published": "2026-11-24"},
+            {"doc_id": 12, "isin": "RU000A100002", "kind": "coupon_declared", "title": "Объявлена ставка купона перед офертой",
+             "data": {"new_rate": 19.5}, "published": "2026-11-24"},
+            {"doc_id": 13, "isin": "RU000A100001", "kind": "material", "title": "Существенный факт о досрочном выкупе", "published": "2026-11-24"},
+            {"doc_id": 14, "isin": "RU000A100001", "kind": "coupon_paid", "title": "Выплата купона", "data": {"paid_pct": 100.0}},
+            {"doc_id": 15, "isin": "RU000A999999", "kind": "default", "title": "Чужой дефолт"},
+        ]
+        d_al = SA.disclosure_alerts(sub, disclosures, sent=set(), now=self.NOW)
+        self.assertEqual(len(d_al), 4)
+        self.assertEqual({a["kind"] for a in d_al}, {"default", "rating", "coupon_declared", "disclosure"})
+        self.assertEqual([a["severity"] for a in d_al if a["kind"] == "default"][0], 2)
+        self.assertEqual([a["severity"] for a in d_al if a["kind"] == "rating"][0], 2)
+        self.assertEqual([a["severity"] for a in d_al if a["kind"] == "coupon_declared"][0], 2)
+        self.assertIn("19,50%", [a["message"] for a in d_al if a["kind"] == "coupon_declared"][0])
+        self.assertEqual(SA.disclosure_alerts(sub, disclosures, sent={a["id"] for a in d_al}, now=self.NOW), [])
+
+        flows = {
+            "spikes": [
+                {"ts": self.NOW - 300, "secid": "A1", "isin": "RU000A100001", "name": "Эмитент А", "value": 15_000_000, "ratio": 4.2},
+                {"ts": self.NOW - 300, "secid": "A1", "isin": "RU000A100001", "name": "Эмитент А", "value": 5_000_000, "ratio": 2.5},
+                {"ts": self.NOW - 300, "secid": "X9", "isin": "RU000A999999", "name": "Чужая", "value": 20_000_000, "ratio": 5.0},
+            ],
+            "large": [
+                {"ts": self.NOW - 120, "secid": "A1", "isin": "RU000A100001", "name": "Эмитент А", "side": "buy", "price": 98.5, "value": 12_500_000},
+            ],
+        }
+        f_al = SA.flow_alerts(sub, flows, sent=set(), now=self.NOW)
+        self.assertEqual(len(f_al), 2)
+        self.assertEqual({a["kind"] for a in f_al}, {"flow_spike", "flow_large"})
+        self.assertEqual(SA.flow_alerts(sub, flows, sent={a["id"] for a in f_al}, now=self.NOW), [])
+
+    def test_alert_mute_skips_until_expiry(self):
+        self.db.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        self.db.execute("INSERT INTO meta(k, v) VALUES(?, ?)", ("alert_mute:1:RU000A100001", str(int(self.NOW + 7 * 86400))))
+        self.db.execute("UPDATE keys SET expires=? WHERE tg_id=1", (self.NOW + 30 * 86400,))
+        self.db.execute("UPDATE users SET plan_until=? WHERE tg_id=1", (self.NOW + 30 * 86400,))
+        self.db.commit()
+        sub = self.sub(reminders=[], offers=[], pay_days=0, pays=[])
+        self.st.put(1, sub)
+        self.ck.run_once(
+            disclosure_rows=[{"doc_id": 1, "isin": "RU000A100001", "kind": "default", "title": "Дефолт"}],
+            flow_rows=[{"ts": self.NOW - 60, "secid": "A1", "isin": "RU000A100001", "ratio": 5.0, "value": 10_000_000}],
+        )
+        self.assertEqual(self.nt.msgs, [])
+        self.assertEqual(self.st.sent_keys(1), [])
+
+        # После истечения паузы (7 дней + 1 сек) оповещения снова приходят
+        self.clock[0] = self.NOW + 7 * 86400 + 1
+        self.ck.run_once(
+            disclosure_rows=[{"doc_id": 1, "isin": "RU000A100001", "kind": "default", "title": "Дефолт"}],
+            flow_rows=[{"ts": self.clock[0] - 60, "secid": "A1", "isin": "RU000A100001", "ratio": 5.0, "value": 10_000_000}],
+        )
+        self.assertTrue(self.nt.msgs)
+        joined = "\n".join(t for _u, t in self.nt.msgs)
+        self.assertIn("Дефолт", joined)
+        self.assertIn("Всплеск объёма", joined)
+
+    def test_checker_reads_worker_sqlite_dbs_when_data_dir_given(self):
+        import sqlite3
+        ddir = tempfile.mkdtemp(prefix="tdata_alerts_")
+        ddb = sqlite3.connect(os.path.join(ddir, "disclosure.sqlite"))
+        ddb.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, published TEXT)")
+        ddb.execute("CREATE TABLE facts(doc_id INTEGER, n INTEGER, isin TEXT, kind TEXT, event_date TEXT, data TEXT)")
+        ddb.execute("INSERT INTO docs VALUES(77, 'Понижение рейтинга Эмитента до ruB+', '2026-11-24')")
+        ddb.execute("INSERT INTO facts VALUES(77, 0, 'RU000A100001', 'rating', '2026-11-24', '{\"rating\":\"ruB+\"}')")
+        ddb.commit()
+        ddb.close()
+
+        fdb = sqlite3.connect(os.path.join(ddir, "flows.sqlite"))
+        fdb.execute("CREATE TABLE instruments(secid TEXT PRIMARY KEY, isin TEXT, name TEXT)")
+        fdb.execute("CREATE TABLE spikes(secid TEXT, day TEXT, slot INTEGER, ts REAL, value REAL, median REAL, ratio REAL)")
+        fdb.execute("CREATE TABLE large(tid TEXT PRIMARY KEY, ts REAL, secid TEXT, cls TEXT, side TEXT, price REAL, qty REAL, value REAL, src TEXT)")
+        fdb.execute("INSERT INTO instruments VALUES('A1', 'RU000A100001', 'Выпуск 1')")
+        fdb.execute("INSERT INTO spikes VALUES('A1', '2026-11-24', 10, ?, 12000000, 3000000, 4.0)", (self.NOW - 120,))
+        fdb.commit()
+        fdb.close()
+
+        self.ck.data_dir = ddir
+        self.st.put(1, self.sub(reminders=[], offers=[], pay_days=0, pays=[]))
+        self.ck.run_once()
+        joined = "\n".join(t for _u, t in self.nt.msgs)
+        self.assertIn("Понижение рейтинга", joined)
+        self.assertIn("Всплеск объёма", joined)
+
+    def test_checker_respects_min_severity_and_coalesces(self):
+        self.db.execute("ALTER TABLE users ADD COLUMN min_severity INTEGER NOT NULL DEFAULT 0")
+        self.db.execute("UPDATE users SET min_severity=2 WHERE tg_id=1")
+        self.db.commit()
+        sub = self.sub(offers=[], pay_days=3)
+        self.st.put(1, sub)
+        disclosures = [
+            {"doc_id": 1, "isin": "RU000A100001", "kind": "default", "title": "Техдефолт по купону"},
+            {"doc_id": 2, "isin": "RU000A100001", "kind": "material", "title": "Существенный факт об собрании"},
+        ]
+        flows = [{"ts": self.NOW - 60, "secid": "A1", "isin": "RU000A100001", "ratio": 4.0, "value": 9_000_000}]
+        self.ck.run_once(disclosure_rows=disclosures, flow_rows=flows)
+        # При min_severity=2 отправляется только критический техдефолт (severity=2)
+        self.assertEqual(len(self.nt.msgs), 1)
+        self.assertEqual(self.nt.sevs, [2])
+        self.assertIn("Техдефолт", self.nt.msgs[0][1])
+
+        # Понижаем порог до 0 — оставшиеся 3+ обычных сообщения (цель+напоминание, раскрытие, поток, выплата) склеиваются в сводку
+        self.db.execute("UPDATE users SET min_severity=0 WHERE tg_id=1")
+        self.db.commit()
+        self.ck.run_once(disclosure_rows=disclosures, flow_rows=flows)
+        self.assertEqual(len(self.nt.msgs), 2)
+        self.assertIn("Сводка событий", self.nt.msgs[1][1])
+        self.assertIn("Всплеск объёма", self.nt.msgs[1][1])
+
 
 if __name__ == "__main__":
     unittest.main()
