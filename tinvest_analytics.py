@@ -28745,7 +28745,7 @@ def main():
 PAGE = r'''<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TAnalytic</title>
-<script>(function(){try{var t=localStorage.getItem('ta_theme')||'auto';document.documentElement.dataset.theme=t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}catch(e){document.documentElement.dataset.theme='dark'}})()</script>
+<script>(function(){try{var t=localStorage.getItem('ta_theme')||'auto';document.documentElement.dataset.theme=t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}catch(e){document.documentElement.dataset.theme='dark'}try{var a=localStorage.getItem('ta_accent'),d=localStorage.getItem('ta_density');if(a&&a!=='blue')document.documentElement.dataset.accent=a;if(d==='compact')document.documentElement.dataset.density='compact'}catch(e){}})()</script>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg width='32' height='32' viewBox='0 0 32 32' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cdefs%3E%3ClinearGradient id='fg' x1='4' y1='4' x2='28' y2='28' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0' stop-color='%233b82f6'/%3E%3Cstop offset='.5' stop-color='%232563eb'/%3E%3Cstop offset='1' stop-color='%231d4ed8'/%3E%3C/linearGradient%3E%3ClinearGradient id='fa' x1='12' y1='6' x2='26' y2='20' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0' stop-color='%2360a5fa'/%3E%3Cstop offset='1' stop-color='%2338bdf8'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='%230f1420' stroke='rgba(255,255,255,.08)'/%3E%3Cpath d='M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z' fill='url(%23fg)'/%3E%3Cpath d='M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z' fill='url(%23fg)'/%3E%3Cpath d='M18.5 16l6-6m0 0h-4m4 0v4' stroke='url(%23fa)' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
 /* ── Единые токены оформления ──
@@ -29849,6 +29849,11 @@ tr.scr-low td{opacity:.5}
 .shr-cvw{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:8px;display:flex;justify-content:center}
 .shr-cvw canvas{width:100%;height:auto;border-radius:8px;display:block}
 .shr-ft{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:12.5px}
+
+.shr-cvw canvas{width:auto;max-width:100%;max-height:52vh}
+.shr-chk{display:inline-flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:12.5px;color:var(--tx2)}
+.shr-chk label{display:inline-flex;gap:5px;align-items:center;cursor:pointer}
+.shr-mod{background:var(--d2);box-shadow:var(--d2-hl),var(--d2-shadow)}
 /* ── UX-реворкинг: режимы, вкладки, дропдаун счёта, сворачиваемый сайдбар, 3 карточки онбординга, подсказки, мини-тур ── */
 .logo{position:relative}
 .side-tog{all:unset;cursor:pointer;margin-left:auto;width:24px;height:24px;border-radius:7px;display:grid;place-items:center;color:var(--mu);font-size:15px;border:1px solid transparent;transition:.15s}
@@ -30241,16 +30246,17 @@ aside{background:var(--side);border-right:1px solid var(--line)}
 .card{background:linear-gradient(180deg,#ffffff05,#ffffff00 120px),var(--card);border:1px solid var(--line);border-radius:var(--r);
   box-shadow:var(--hl),var(--elev);padding:var(--pad-card)}
 [data-theme=light] .card{background:var(--card)}
-.card h2{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em;margin-bottom:16px}
+/* заголовки карточек — обычным регистром; капсом остаются только мелкие надзаголовки (.st-gh h3, .kpi .k, .hero .lbl) */
+.card h2{font-size:14.5px;font-weight:620;color:var(--tx);letter-spacing:-.012em;margin-bottom:14px}
 .card h2 .sp{text-transform:none;letter-spacing:0;font-size:12px}
 .card h2 .btn,.card h2 button,.card h2 a{text-transform:none;letter-spacing:0}
 .wrap{gap:var(--gap)}
 .g{gap:var(--gap)}
 
 /* ── главный блок «Стоимость портфеля» ── */
-.hero{background:radial-gradient(90% 140% at 100% 0%,#3b82f61f 0%,transparent 55%),radial-gradient(60% 90% at 0% 100%,#2bc48a0d 0%,transparent 60%),linear-gradient(180deg,#ffffff06,#ffffff00),var(--card);padding:26px 28px}
+.hero{background:radial-gradient(90% 140% at 100% 0%,rgba(var(--ac-rgb),.12) 0%,transparent 55%),radial-gradient(60% 90% at 0% 100%,#2bc48a0d 0%,transparent 60%),linear-gradient(180deg,#ffffff06,#ffffff00),var(--d2);padding:26px 28px;box-shadow:var(--d2-hl),var(--d2-shadow)}
 .hero:after{display:none}
-[data-theme=light] .hero{background:radial-gradient(90% 140% at 100% 0%,#2563eb14 0%,transparent 55%),var(--card)}
+[data-theme=light] .hero{background:radial-gradient(90% 140% at 100% 0%,rgba(var(--ac-rgb),.08) 0%,transparent 55%),var(--d2)}
 .hero .lbl{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em}
 .hero .val{font-size:46px;font-weight:600;letter-spacing:-.04em;margin-top:8px}
 .hero .val small{font-size:26px;font-weight:500;color:var(--mu)}
@@ -30338,6 +30344,33 @@ tr:hover td,.tbl table tr:hover td:first-child{background:var(--card-hover)}
 .ov-leave>div{animation:ovOut .22s cubic-bezier(.4,0,1,1) forwards!important}
 @keyframes ovFade{to{opacity:0}}
 @keyframes ovOut{to{transform:translateX(100%)}}
+
+/* ── Уровни глубины: 0 — фон и меню, 1 — карточки, 2 — главные блоки, всплывающие меню, окна и панели ── */
+.more-dd,.tour-pop,#ks{background:var(--d2);box-shadow:var(--d2-hl),var(--d2-shadow)}
+#bc-ov .bc-dr,#sk-ov .sk-dr{box-shadow:var(--d2-hl),-24px 0 64px -12px #000000a6}
+
+/* ── Иконки duotone: подложка .ic-d внутри svg.ic; в покое спокойная, при наведении и в активном пункте горит акцентом ── */
+svg.ic{transition:transform .18s cubic-bezier(.3,1.35,.5,1)}
+svg.ic .ic-d{fill:currentColor;fill-opacity:.14;stroke:none;transition:fill-opacity .18s ease,fill .18s ease}
+.nav button:hover svg.ic .ic-d,.st-sh>i svg.ic .ic-d,.empty svg.ic .ic-d{fill-opacity:.24}
+.nav button.on svg.ic{color:var(--ac-tx)}
+.nav button.on svg.ic .ic-d{fill:var(--ac);fill-opacity:.34}
+.nav button:hover svg.ic{transform:scale(1.06)}
+@media(prefers-reduced-motion:reduce){svg.ic,svg.ic .ic-d{transition:none}.nav button:hover svg.ic{transform:none}}
+/* стеклянные капсулы для иконок в заголовках разделов и пустых экранов */
+.st-sh>i{background:radial-gradient(120% 120% at 20% 0%,rgba(var(--ac-rgb),.22),transparent 70%),var(--card2);box-shadow:inset 0 1px 0 #ffffff1c,0 0 0 1px var(--line2),0 4px 12px -4px #00000066}
+[data-theme=light] .st-sh>i{box-shadow:inset 0 1px 0 #ffffff,0 0 0 1px var(--line2),0 4px 12px -6px #0f172a33}
+.empty svg.ic{opacity:.7;color:var(--ac-tx)}
+
+/* ── Плотность интерфейса (Настройки → Внешний вид) ── */
+:root[data-density=compact] body{font-size:13.5px}
+:root[data-density=compact] .card h2{margin-bottom:10px}
+:root[data-density=compact] .hero{padding:18px 20px}
+:root[data-density=compact] .nav button{padding:6px 10px}
+:root[data-density=compact] #view{padding:16px 22px 40px}
+/* цифры: табличные, знак валюты приглушён (не только в Hero, но и в крупных показателях) */
+.kpi .v,.hero .val,.hero .meta b,.pill,.num{font-variant-numeric:tabular-nums lining-nums}
+.kpi .v small,.kpi .v .cur{opacity:.65;font-weight:500}
 /* ── Графики: единая палитра, волосяная сетка, скруглённые столбики, подсветка при наведении, анимация появления ──
    Загружается после 52_premium.css. Палитра серий --s1..--s8: синий, голубой, бирюзовый, янтарный, розовый, оливковый, фиолетовый, коралловый
    (порядок диаграмм задаёт PAL в 01_core.js: синий → бирюзовый → янтарный → фиолетовый → розовый → голубой → оливковый → коралловый). */
@@ -30697,6 +30730,14 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 /* адаптация под узкое окно ПК */
 @media(max-width:1380px){.st-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:1100px){.st{grid-template-columns:190px minmax(0,1fr);gap:26px}.st-c .st-wide,.st-secret .in{width:240px}.st-sel{min-width:220px}}
+
+/* выбор акцентного цвета и плотности */
+.st-acc{display:inline-flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.st-acc>button{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;border:1px solid var(--line2);background:var(--card2);font-size:12.5px;color:var(--tx2);transition:border-color .15s,box-shadow .15s,color .15s}
+.st-acc>button i{width:14px;height:14px;border-radius:50%;background:var(--sw);box-shadow:inset 0 1px 0 #ffffff55,0 0 0 1px #00000033}
+.st-acc>button:hover{border-color:var(--ac);color:var(--tx)}
+.st-acc>button.on{border-color:var(--ac);box-shadow:0 0 0 3px var(--ac-glow);color:var(--tx)}
+.st-acc>button:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
 #shell-bar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding:8px 28px;border-bottom:1px solid var(--line);
   background:linear-gradient(90deg,#2bc48a1f,#2bc48a08 60%,transparent),var(--bg);font-size:12.5px;color:var(--tx2)}
 #shell-bar b{color:var(--tx)}
@@ -30911,39 +30952,43 @@ document.addEventListener('click',e=>{
   const c=e.target.closest&&e.target.closest('[data-copy]');
   if(c){e.stopPropagation();e.preventDefault();copyText(c.dataset.copy,c.dataset.copyMsg||'ISIN скопирован')}
 },true);
+/* Иконки: единая duotone-система на сетке 24×24. Замкнутые фигуры, помеченные D(…), получают мягкую заливку (класс ic-d, цвет — currentColor),
+   поверх идёт ровный контур. Заливка усиливается у активного пункта меню и в заголовках разделов (см. 52_premium.css). */
+const D=s=>s.replace(/<(rect|path|circle|ellipse)\b([^>]*?)\/>/g,'<$1 class="ic-d"$2/><$1$2/>');
 const IC={
- dash:'<path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"/>',
- ret:'<path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
- pos:'<path d="M21 12A9 9 0 1 1 12 3v9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/>',
- bonds:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h6M7 13h10M7 16h4"/>',
- pay:'<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M8 14h2M14 14h2M8 17h2"/>',
- ops:'<path d="M4 6h16M4 12h16M4 18h10"/>',
- fees:'<path d="M12 2v20M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>',
- tax:'<path d="M9 14l6-6M9.5 8.5h.01M14.5 13.5h.01"/><path d="M5 3h14v18l-3.5-2-3.5 2-3.5-2L5 21z"/>',
- imp:'<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
- cmp:'<path d="M8 4v16M16 4v16M4 8h8M12 16h8"/>',
- scr:'<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/>',
- risk:'<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
- hm:'<rect x="3" y="3" width="10" height="11"/><rect x="13" y="3" width="8" height="6"/><rect x="13" y="9" width="8" height="5"/><rect x="3" y="14" width="18" height="7"/>',
+ dash:D('<rect x="3" y="3" width="8" height="10" rx="2"/>')+'<rect x="13" y="3" width="8" height="6" rx="2"/>'+D('<rect x="13" y="11" width="8" height="10" rx="2"/>')+'<rect x="3" y="15" width="8" height="6" rx="2"/>',
+ ret:'<path class="ic-d" d="M3 21v-4l6-6 4 4 8-8v14z"/><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
+ pos:D('<path d="M21 12A9 9 0 1 1 12 3v9z"/>')+'<path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/>',
+ bonds:D('<rect x="3" y="5" width="18" height="14" rx="2.5"/>')+'<path d="M7 9.5h6M7 13.5h4"/>'+D('<circle cx="16.5" cy="13" r="2.2"/>'),
+ pay:'<path class="ic-d" d="M3 9.5h18V6.5a2.5 2.5 0 0 0-2.5-2.5h-13A2.5 2.5 0 0 0 3 6.5z"/><rect x="3" y="4" width="18" height="17" rx="2.5"/><path d="M8 2v4M16 2v4M3 9.5h18"/>'+D('<circle cx="15.5" cy="15" r="2.2"/>'),
+ ops:D('<rect x="3.5" y="4" width="17" height="16" rx="2.5"/>')+'<path d="M8 9h8M8 13h8M8 17h5"/>',
+ fees:D('<circle cx="12" cy="12" r="9"/>')+'<path d="M9 15l6-6"/><circle cx="9.3" cy="9.3" r=".9" fill="currentColor"/><circle cx="14.7" cy="14.7" r=".9" fill="currentColor"/>',
+ tax:D('<path d="M5 3h14v18l-3.5-2-3.5 2-3.5-2L5 21z"/>')+'<path d="M9 14l6-6"/><circle cx="9.5" cy="8.5" r=".8" fill="currentColor"/><circle cx="14.5" cy="13.5" r=".8" fill="currentColor"/>',
+ imp:D('<path d="M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3"/>')+'<path d="M12 3v12M7 10l5 5 5-5"/>',
+ cmp:D('<rect x="4" y="9" width="7" height="11" rx="1.6"/>')+D('<rect x="13" y="4" width="7" height="16" rx="1.6"/>'),
+ scr:D('<circle cx="10.5" cy="10.5" r="7.5"/>')+'<path d="M21 21l-5.2-5.2M7.5 12l2-2 1.8 1.5 2.5-3"/>',
+ risk:D('<path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.7-7.5 9.8-4.3-1.1-7.5-5.2-7.5-9.8V6z"/>')+'<path d="M12 8.5v4.5M12 16h.01"/>',
+ hm:D('<rect x="3" y="3" width="10" height="11" rx="2"/>')+'<rect x="15" y="3" width="6" height="6" rx="1.5"/>'+D('<rect x="15" y="11" width="6" height="10" rx="1.5"/>')+'<rect x="3" y="16" width="10" height="5" rx="1.5"/>',
  sig:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
- flw:'<path d="M3 20V10M9 20V4M15 20v-7M21 20V8"/>',
- dfl:'<path d="M12 3l9 16H3z"/><path d="M9 15l6-5M9 10l6 5"/>',
- mon:'<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/>',
- map:'<circle cx="7" cy="16" r="2"/><circle cx="12" cy="9" r="2.5"/><circle cx="18" cy="13" r="1.6"/><path d="M3 3v18h18"/>',
- pri:'<path d="M12 2l2.6 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.4 6.1 20.1l1.6-6.7L2.5 8.9l6.9-.6z"/>',
- mkt:'<path d="M3 4v16h18"/><path d="M7 14l4-4 3 3 5-6"/>',
- reb:'<path d="M12 3v18M5 7h14M5 7l-2 6a3 3 0 0 0 6 0zM19 7l-2 6a3 3 0 0 0 6 0z"/>',
- bench:'<path d="M3 20h18"/><path d="M6 16V9M11 16V5M16 16v-5M20 16v-8"/>',
- calc:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2M12 11h2M16 11h0M8 15h2M12 15h2M8 18h2M12 18h4"/>',
+ flw:D('<rect x="3.5" y="11" width="3.5" height="9" rx="1"/>')+D('<rect x="10.25" y="4" width="3.5" height="16" rx="1"/>')+D('<rect x="17" y="8" width="3.5" height="12" rx="1"/>'),
+ dfl:D('<path d="M12 3l9 16H3z"/>')+'<path d="M9 15l6-5M9 10l6 5"/>',
+ mon:D('<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>')+'<path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
+ map:D('<circle cx="7" cy="16" r="2"/>')+D('<circle cx="12" cy="9" r="2.5"/>')+D('<circle cx="18" cy="13" r="1.8"/>')+'<path d="M3 3v18h18"/>',
+ pri:D('<path d="M12 2l2.6 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.4 6.1 20.1l1.6-6.7L2.5 8.9l6.9-.6z"/>'),
+ mkt:'<path d="M3 4v16h18"/><path class="ic-d" d="M7 14l4-4 3 3 5-6v10H7z"/><path d="M7 14l4-4 3 3 5-6"/>',
+ reb:'<path d="M12 3v18M5 7h14M8 21h8"/>'+D('<path d="M5 7l-2 6a3 3 0 0 0 6 0z"/>')+D('<path d="M19 7l-2 6a3 3 0 0 0 6 0z"/>'),
+ bench:'<path d="M3 20h18"/>'+D('<rect x="5" y="9" width="3" height="8" rx=".8"/>')+D('<rect x="10.5" y="5" width="3" height="12" rx=".8"/>')+D('<rect x="16" y="11" width="3" height="6" rx=".8"/>'),
+ calc:'<rect x="4" y="2.5" width="16" height="19" rx="2.5"/>'+D('<rect x="7.5" y="5.5" width="9" height="4" rx="1"/>')+'<path d="M8 13h.01M12 13h.01M16 13h.01M8 16.5h.01M12 16.5h.01M16 16.5h.01"/>',
  off:'<path d="M4 12h12M12 7l5 5-5 5"/><path d="M20 4v16"/>',
- lad:'<path d="M7 3v18M17 3v18M7 7h10M7 12h10M7 17h10"/>',
- iss:'<path d="M4 21V8l8-5 8 5v13"/><path d="M9 21v-6h6v6M8 11h.01M12 11h.01M16 11h.01"/>',
- cal:'<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M12 14l1.2 2.4 2.6.4-1.9 1.8.5 2.6-2.4-1.3-2.4 1.3.5-2.6-1.9-1.8 2.6-.4z"/>',
- watch:'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
- kb:'<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5M9 8h6M9 12h4"/>',
- fng:'<path d="M4 17a8 8 0 0 1 16 0"/><path d="M12 17l4-5"/><circle cx="12" cy="17" r="1.2"/>',
- set:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>'};
-const svgI=(p,sw=1.8)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+ lad:D('<rect x="3" y="15" width="5" height="6" rx="1.2"/>')+D('<rect x="9.5" y="10" width="5" height="11" rx="1.2"/>')+D('<rect x="16" y="4" width="5" height="17" rx="1.2"/>'),
+ iss:D('<path d="M4 21V8l8-5 8 5v13z"/>')+'<path d="M9 21v-6h6v6M8 11h.01M12 11h.01M16 11h.01"/>',
+ cal:'<path class="ic-d" d="M3 9.5h18V6.5a2.5 2.5 0 0 0-2.5-2.5h-13A2.5 2.5 0 0 0 3 6.5z"/><rect x="3" y="4" width="18" height="17" rx="2.5"/><path d="M8 2v4M16 2v4M3 9.5h18"/><path d="M12 13.5l1.1 2.2 2.4.35-1.75 1.7.4 2.4-2.15-1.15-2.15 1.15.4-2.4-1.75-1.7 2.4-.35z"/>',
+ watch:D('<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/>')+'<circle cx="12" cy="12" r="3"/>',
+ kb:D('<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/>')+'<path d="M4 21V5M9 8h6M9 12h4"/>',
+ fng:D('<path d="M4 17a8 8 0 0 1 16 0z"/>')+'<path d="M12 17l4-5"/><circle cx="12" cy="17" r="1.2"/>',
+ set:D('<circle cx="12" cy="12" r="3.5"/>')+'<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>'};
+/* единый рендерер: класс ic включает duotone-слой и анимацию, штрих 1.7, скруглённые концы */
+const svgI=(p,sw=1.7)=>`<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${p}</svg>`;
 const PAGES=[['dash','Обзор'],['ret','Доходность'],['bench','Сравнение с рынком'],['pos','Позиции'],['bonds','Облигации'],['pay','Выплаты'],['off','Оферты'],['ops','Операции'],['fees','Комиссии'],['tax','Налоги'],['reb','Ребалансировка'],['calc','Калькулятор'],['lad','Лесенка облигаций'],['mkt','Ставки'],['scr','Скринер облигаций'],['cmp','Сравнение облигаций'],['map','Карта рынка'],['hm','Тепловая карта'],['sig','Сигналы'],['risk','Риски и сценарии'],['mon','Мониторинг'],['watch','Наблюдение'],['iss','Эмитенты'],['dfl','Техдефолты'],['flw','Кто покупает'],['pri','Первичка'],['fng','Страх и жадность'],['cal','Календарь событий'],null,['kb','База знаний'],['imp','Импорт отчётов'],['set','Настройки']];
 /* группы меню: ключи страниц остаются прежними, PAGES — плоский список для поиска названий */
 const NAV_GROUPS=[['Портфель',['dash','ret','bench','pos','bonds','pay','off','ops','fees']],['Учёт и планы',['tax','reb','calc','lad']],
@@ -31414,7 +31459,7 @@ const TYPES={share:'Акции',bond:'Облигации',etf:'Фонды',curre
 const SECT={financial:'Финансы',it:'IT',telecom:'Телеком',energy:'Энергетика',utilities:'Электроэнергетика',materials:'Сырьё и материалы',industrials:'Промышленность',
   consumer:'Потребительский',health_care:'Здравоохранение',real_estate:'Недвижимость',government:'Государство',municipal:'Муниципальные',ecomaterials:'Экология',
   green_energy:'Зелёная энергетика',green_buildings:'Зелёное строительство',electrocars:'Электромобили',other:'Прочее'};
-function kpi(k,v,s,c,dot,go){return`<div class="card kpi${go?' kpi-go':''}"${go?` data-go="${go}" role="link" tabindex="0" title="Открыть раздел"`:''}><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}">${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
+function kpi(k,v,s,c,dot,go){return`<div class="card kpi${go?' kpi-go':''}"${go?` data-go="${go}" role="link" tabindex="0" title="Открыть раздел"`:''}><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}"${/<|\n/.test(String(v))?'':` data-tick="kpi-${S.page}-${k}"`}>${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
 const periodName=()=>PERIODS.find(p=>p[0]===S.period)[1].toLowerCase();
 const waitBox=t=>`<div class="wait">${t||'Считаю…'}</div>`;
 function monthsSeries(n=36){
@@ -31496,10 +31541,10 @@ function pDash(){
     <div class="row" style="margin-top:10px;flex-wrap:wrap">${p.daily!=null?`<span class="pill ${cls(p.daily)}">${SM(p.daily)} · ${pct(p.daily_pct)} за день</span>`:''}
     <span class="pill ${cls(p.upnl)}">${SM(p.upnl)} · ${pct(p.yield_pct)} по открытым позициям</span>
     <span class="hero-acts"><button class="btn" data-go="scr">+ Подобрать бумагу</button><button class="btn ghost" data-share-card="1" title="Сделать PNG-карточку без сумм">Поделиться PNG</button></span></div></div>
-    <div class="meta"><div><span>Вложено (пополнения − выводы)</span><b class="num">${M(d.invested,'rub',0)}</b></div>
-    <div><span>Прибыль за всё время</span><b class="num ${cls(profit)}">${profit==null?'—':SM(profit)}</b>${ppct!=null?` <span class="mu num" style="display:inline">${pct(ppct,1)}</span>`:''}</div>
-    <div><span>Доходность за период (TWR) ${_q('xirr','Доходность без влияния пополнений и выводов — подробнее в Базе знаний')}</span><b class="num ${hs?cls(hs.total):''}">${hs?pct(hs.total*100,2):S.hist&&!S.hist.error?'—':'…'}</b></div>
-    <div><span>XIRR, % годовых ${_q('xirr','Годовая доходность с учётом сумм и дат пополнений')}</span><b class="num ${cls(d.xirr)}">${d.xirr==null?'—':pct(d.xirr*100,1)}</b></div></div></div>`;
+    <div class="meta"><div><span>Вложено (пополнения − выводы)</span><b class="num" data-tick="dash-inv">${M(d.invested,'rub',0)}</b></div>
+    <div><span>Прибыль за всё время</span><b class="num ${cls(profit)}" data-tick="dash-profit">${profit==null?'—':SM(profit)}</b>${ppct!=null?` <span class="mu num" style="display:inline">${pct(ppct,1)}</span>`:''}</div>
+    <div><span>Доходность за период (TWR) ${_q('xirr','Доходность без влияния пополнений и выводов — подробнее в Базе знаний')}</span><b class="num ${hs?cls(hs.total):''}" data-tick="dash-twr">${hs?pct(hs.total*100,2):S.hist&&!S.hist.error?'—':'…'}</b></div>
+    <div><span>XIRR, % годовых ${_q('xirr','Годовая доходность с учётом сумм и дат пополнений')}</span><b class="num ${cls(d.xirr)}" data-tick="dash-xirr">${d.xirr==null?'—':pct(d.xirr*100,1)}</b></div></div></div>`;
   const turn=(t.buy_turnover||0)+(t.sell_turnover||0);
   const kpis=`<div class="g g6">
     ${kpi('Реализовано по сделкам',SM(t.realized||0),'фиксированный результат продаж',cls(t.realized),S1,'pm')}
@@ -33731,6 +33776,10 @@ async function renderSettings(){
   const perm=('Notification' in window)?Notification.permission:'unsupported';
   const look=stGroup('Тема оформления',
     `<div class="st-pad"><div class="st-themes" id="thsel" role="group" aria-label="Тема оформления">${themes.map(([k,t,d])=>`<button type="button" data-t="${k}" class="${th===k?'on':''}" aria-pressed="${th===k}">${k==='auto'?`<span class="th-prev th-auto">${prev('dark')}${prev('light')}</span>`:prev(k)}<span class="th-n"><b>${t}</b>${d?`<small>${d}</small>`:''}</span><em class="th-c">${stIco('check',2.6)}</em></button>`).join('')}</div></div>`,{hint:'применяется сразу',q:'светлая тёмная авто оформление'})+
+    stGroup('Акцент и плотность',
+    stRow('Акцентный цвет','Цвет кнопок, ссылок и выделений во всей программе',`<div class="st-acc" id="accsel" role="group" aria-label="Акцентный цвет">${ACCENTS.map(([k,t,c])=>`<button type="button" data-a="${k}" class="${curAccent()===k?'on':''}" aria-pressed="${curAccent()===k}" title="${t}" style="--sw:${c}"><i></i><span>${t}</span></button>`).join('')}</div>`)+
+    stRow('Плотность интерфейса','Компактная убирает лишние отступы: на экране помещается больше строк',`<div class="st-acc st-dens" id="denssel" role="group" aria-label="Плотность интерфейса">${[['comfort','Комфортная'],['compact','Компактная']].map(([k,t])=>`<button type="button" data-d="${k}" class="${curDensity()===k?'on':''}" aria-pressed="${curDensity()===k}"><span>${t}</span></button>`).join('')}</div>`),
+    {hint:'внешний вид',q:'акцент цвет плотность компактная комфортная синий изумрудный графит фиолетовый'})+
     stGroup('Напоминания',
     stRow('Напоминать о выплатах','За сколько дней предупреждать на «Обзоре» и в «Выплатах» (0 — выключить)',`<input class="in num st-num" id="nd" type="number" min="0" max="60" value="${c.notify_days??7}" aria-label="За сколько дней напоминать о выплатах"><span class="st-unit">дн.</span>`)+
     stRow('Системные уведомления','Приходят, пока программа открыта',`<span class="st-who" id="ntf-st">${perm==='granted'?'Разрешены':perm==='denied'?'Запрещены в браузере':perm==='unsupported'?'Не поддерживаются':'Не разрешены'}</span><button class="btn ghost" id="ntf" ${perm==='granted'||perm==='unsupported'?'disabled':''}>Разрешить</button>`)+
@@ -33772,6 +33821,10 @@ async function renderSettings(){
   view.addEventListener('scroll',window._stSpyH,{passive:true});stSpy();
   stTiles(c);
   /* тема: сохраняется сразу */
+  $('#accsel').onclick=e=>{const b=e.target.closest('[data-a]');if(!b)return;applyAccent(b.dataset.a);
+    $('#accsel').querySelectorAll('button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-pressed',on)});stMsg('Акцентный цвет сохранён',1,true)};
+  $('#denssel').onclick=e=>{const b=e.target.closest('[data-d]');if(!b)return;applyDensity(b.dataset.d);
+    $('#denssel').querySelectorAll('button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-pressed',on)});stMsg('Плотность сохранена',1,true)};
   $('#thsel').onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;applyTheme(b.dataset.t);post('/api/config',{theme:b.dataset.t}).then(()=>stOk(b)).catch(()=>{});
     $('#thsel').querySelectorAll('button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-pressed',on)});stMsg('Тема сохранена',1,true)};
   /* ключевая ставка: сохраняется сразу */
@@ -33815,6 +33868,12 @@ function applyTheme(t){try{localStorage.setItem('ta_theme',t)}catch(e){}const h=
 /* окно программы (pywebview): системная шапка Windows в тон теме */
 function nativeTheme(){try{const a=window.pywebview&&pywebview.api;if(a&&a.set_theme)a.set_theme(document.documentElement.dataset.theme==='light'?'light':'dark')}catch(e){}}
 window.addEventListener('pywebviewready',nativeTheme);
+/* акцентный цвет и плотность интерфейса: хранятся в браузере окна, применяются до отрисовки (см. скрипт в <head>) */
+const ACCENTS=[['blue','Синий','#3b82f6'],['emerald','Изумрудный','#10b981'],['graphite','Графит','#64748b'],['violet','Фиолетовый','#8b5cf6']];
+function curAccent(){let a='blue';try{a=localStorage.getItem('ta_accent')||'blue'}catch(e){}return ACCENTS.some(x=>x[0]===a)?a:'blue'}
+function curDensity(){let d='comfort';try{d=localStorage.getItem('ta_density')||'comfort'}catch(e){}return d==='compact'?'compact':'comfort'}
+function applyAccent(a){try{localStorage.setItem('ta_accent',a)}catch(e){}const h=document.documentElement;if(a==='blue')delete h.dataset.accent;else h.dataset.accent=a}
+function applyDensity(d){try{localStorage.setItem('ta_density',d)}catch(e){}const h=document.documentElement;if(d==='compact')h.dataset.density='compact';else delete h.dataset.density}
 function thmLabel(){const e=document.getElementById('thm-t');if(e)e.textContent=document.documentElement.dataset.theme==='light'?'Тёмная тема':'Светлая тема'}
 function curTheme(){let t='auto';try{t=localStorage.getItem('ta_theme')||(S.cfg&&S.cfg.theme)||'auto'}catch(e){}return t}
 // один клик = видимая смена: от того, что сейчас на экране (раньше цикл auto→light→dark→auto при тёмной системе давал «пустой» клик dark→auto)
@@ -38737,12 +38796,19 @@ function tkrLoad(){
   setInterval(()=>{if(!document.hidden)tkrLoad()},60000);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden)tkrLoad()});
 })();
-/* ── Карточка портфеля для шаринга (PNG 1200×630, строго без сумм в рублях) ── */
-const SHR={open:false,theme:'',bench:'both'};
+/* ── Карточка портфеля для шаринга (PNG, строго без сумм в рублях): 3 формата, 4 темы, выбор показателей ── */
+const SHR_FMT={wide:{w:1200,h:630,n:'Пост 1200×630'},sq:{w:1080,h:1080,n:'Квадрат 1080×1080'},story:{w:1080,h:1920,n:'Истории 1080×1920'}};
+const SHR_TH={
+  dark:{n:'Тёмный графит',dk:1,bg:'#0f131a',card:'#171d28',line:'#263042',tx:'#f2f5fa',tx2:'#9aa6bc',ac:'#3b82f6',pos:'#10b981',neg:'#ff6b6b',s1:'#4da3ff',s2:'#f5a623',s3:'#3ecf8e',grid:'#ffffff10',glow:'77,163,255',track:'#ffffff12'},
+  light:{n:'Светлый минимал',dk:0,bg:'#f4f6fa',card:'#ffffff',line:'#dde3ee',tx:'#141923',tx2:'#5c677d',ac:'#2563eb',pos:'#128a5a',neg:'#d63c41',s1:'#2474e5',s2:'#d98200',s3:'#128a5a',grid:'#00000010',glow:'36,116,229',track:'#00000010'},
+  blue:{n:'Глубокий синий',dk:1,bg:'#0a1330',card:'#10204d',line:'#25407f',tx:'#eef3ff',tx2:'#a3b5e3',ac:'#4f8ef7',pos:'#34d399',neg:'#ff7b84',s1:'#6aa8ff',s2:'#f5b94a',s3:'#3ecf8e',grid:'#ffffff16',glow:'79,142,247',track:'#ffffff16'},
+  emerald:{n:'Изумруд',dk:1,bg:'#06130f',card:'#0d221a',line:'#1c4b3b',tx:'#ecfdf5',tx2:'#8fc9b2',ac:'#10b981',pos:'#34d399',neg:'#ff7b84',s1:'#34d399',s2:'#f5b94a',s3:'#6aa8ff',grid:'#ffffff14',glow:'16,185,129',track:'#ffffff14'}
+};
+const SHR={open:false,theme:'',bench:'both',fmt:'wide',show:{xirr:true,dd:true,alloc:true}};
 function shareOpen(){
   if(!S.data||!S.data.portfolio){uiAlert({title:'Нечего показывать',body:'Сначала откройте портфель или демо-режим.'});return}
   SHR.open=true;
-  if(!SHR.theme)SHR.theme=document.documentElement.dataset.theme==='light'?'light':'dark';
+  if(!SHR.theme||!SHR_TH[SHR.theme])SHR.theme=document.documentElement.dataset.theme==='light'?'light':'dark';
   shareMount();
 }
 function shareClose(){
@@ -38755,13 +38821,15 @@ function shareMount(){
   const hs=typeof histSlice==='function'?histSlice():null;
   const hasB=!!(hs&&hs.bench&&(hs.bench.TMOS||hs.bench.LQDT));
   bg.innerHTML=`<div class="shr-mod" role="dialog" aria-modal="true" aria-label="Поделиться портфелем PNG">
-    <div class="shr-hd"><div><b>Поделиться портфелем (PNG)</b><small class="mu"> · 1200×630 · строго без сумм в рублях</small></div>
+    <div class="shr-hd"><div><b>Поделиться портфелем (PNG)</b><small class="mu"> · ${SHR_FMT[SHR.fmt].w}×${SHR_FMT[SHR.fmt].h} · строго без сумм в рублях</small></div>
       <button class="btn ghost" id="shr-x" aria-label="Закрыть">✕</button></div>
     <div class="shr-bar">
-      <div class="seg" id="shr-th"><button class="${SHR.theme==='dark'?'on':''}" data-st="dark">Тёмная</button><button class="${SHR.theme==='light'?'on':''}" data-st="light">Светлая</button></div>
+      <div class="seg" id="shr-fm" aria-label="Формат">${Object.keys(SHR_FMT).map(k=>`<button class="${SHR.fmt===k?'on':''}" data-sf="${k}">${SHR_FMT[k].n}</button>`).join('')}</div>
+      <div class="seg" id="shr-th" aria-label="Тема карточки">${Object.keys(SHR_TH).map(k=>`<button class="${SHR.theme===k?'on':''}" data-st="${k}">${SHR_TH[k].n}</button>`).join('')}</div>
+      <div class="shr-chk" id="shr-sh"><span class="mu">Показать:</span>${[['xirr','XIRR'],['dd','просадку'],['alloc','структуру']].map(([k,t])=>`<label><input type="checkbox" data-sh="${k}"${SHR.show[k]?' checked':''}> ${t}</label>`).join('')}</div>
       ${hasB?`<div class="seg" id="shr-bn"><button class="${SHR.bench==='both'?'on':''}" data-sb="both">TMOS + LQDT</button><button class="${SHR.bench==='TMOS'?'on':''}" data-sb="TMOS">TMOS</button><button class="${SHR.bench==='LQDT'?'on':''}" data-sb="LQDT">LQDT</button><button class="${SHR.bench==='none'?'on':''}" data-sb="none">Без бенчмарка</button></div>`:''}
     </div>
-    <div class="shr-cvw"><canvas id="shr-cv" width="1200" height="630"></canvas></div>
+    <div class="shr-cvw"><canvas id="shr-cv" width="${SHR_FMT[SHR.fmt].w}" height="${SHR_FMT[SHR.fmt].h}"></canvas></div>
     <div class="shr-ft">
       <span class="mu" id="shr-st">Скрыты все абсолютные суммы и названия счетов — видны только %, график TWR и доли активов.</span>
       <div class="row" style="gap:8px">
@@ -38773,6 +38841,8 @@ function shareMount(){
   bg.onclick=e=>{if(e.target===bg)shareClose()};
   $('#shr-x').onclick=shareClose;
   bg.querySelectorAll('[data-st]').forEach(b=>b.onclick=()=>{SHR.theme=b.dataset.st;shareMount()});
+  bg.querySelectorAll('[data-sf]').forEach(b=>b.onclick=()=>{SHR.fmt=b.dataset.sf;shareMount()});
+  bg.querySelectorAll('[data-sh]').forEach(b=>b.onchange=()=>{SHR.show[b.dataset.sh]=b.checked;shareMount()});
   bg.querySelectorAll('[data-sb]').forEach(b=>b.onclick=()=>{SHR.bench=b.dataset.sb;shareMount()});
   const cv=$('#shr-cv');
   shareDraw(cv);
@@ -38805,19 +38875,17 @@ function _shrPct(v,d=1){
 }
 function shareDraw(cv){
   if(!cv)return;
-  const ctx=cv.getContext('2d'),W=1200,H=630,dk=SHR.theme!=='light';
-  const C=dk
-    ?{bg:'#0f131a',card:'#171d28',line:'#263042',tx:'#f2f5fa',tx2:'#9aa6bc',ac:'#3b82f6',pos:'#10b981',neg:'#ff6b6b',s1:'#4da3ff',s2:'#f5a623',s3:'#3ecf8e',grid:'#ffffff10'}
-    :{bg:'#f4f6fa',card:'#ffffff',line:'#dde3ee',tx:'#141923',tx2:'#5c677d',ac:'#2563eb',pos:'#128a5a',neg:'#d63c41',s1:'#2474e5',s2:'#d98200',s3:'#128a5a',grid:'#00000010'};
+  const FM=SHR_FMT[SHR.fmt]||SHR_FMT.wide,W=FM.w,H=FM.h;cv.width=W;cv.height=H;
+  const ctx=cv.getContext('2d'),C=SHR_TH[SHR.theme]||SHR_TH.dark,dk=!!C.dk,tall=H>=W,sc=H>1500?1.25:1;
   ctx.fillStyle=C.bg;ctx.fillRect(0,0,W,H);
   // Subtle accent glow
   const gr=ctx.createRadialGradient(180,80,10,180,80,460);
-  gr.addColorStop(0,dk?'rgba(77,163,255,0.14)':'rgba(36,116,229,0.09)');
+  gr.addColorStop(0,'rgba('+C.glow+','+(dk?0.16:0.09)+')');
   gr.addColorStop(1,'rgba(0,0,0,0)');
   ctx.fillStyle=gr;ctx.fillRect(0,0,W,H);
 
   const d=S.data||{},p=d.portfolio||{},hs=typeof histSlice==='function'?histSlice():null;
-  const F='system-ui,-apple-system,Segoe UI,Roboto,sans-serif';
+  const F='Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif';
 
   // Header brand badge
   ctx.fillStyle=C.ac;_shrRR(ctx,44,36,40,40,10);ctx.fill();
@@ -38846,27 +38914,30 @@ function shareDraw(cv){
       if(lastB!=null&&twrV!=null){alphaV=twrV-lastB*100;alphaSub='к '+bk+' ('+_shrPct(lastB*100,1)+')'}
     }
   }
-  const kpis=[
-    ['Доходность (TWR)',_shrPct(twrV,2),twrV==null?C.tx:twrV>=0?C.pos:C.neg,'без влияния пополнений'],
-    ['Годовая (XIRR)',_shrPct(xirrV,1),xirrV==null?C.tx:xirrV>=0?C.pos:C.neg,'с учётом дат и сумм'],
-    ['Макс. просадка',_shrPct(ddV,1),ddV!=null&&ddV<0?C.neg:C.tx,'от пика до дна'],
-    ['К бенчмарку',_shrPct(alphaV,1),alphaV==null?C.tx:alphaV>=0?C.pos:C.neg,alphaSub]
+  const kpisAll=[
+    ['twr','Доходность (TWR)',_shrPct(twrV,2),twrV==null?C.tx:twrV>=0?C.pos:C.neg,'без влияния пополнений'],
+    ['xirr','Годовая (XIRR)',_shrPct(xirrV,1),xirrV==null?C.tx:xirrV>=0?C.pos:C.neg,'с учётом дат и сумм'],
+    ['dd','Макс. просадка',_shrPct(ddV,1),ddV!=null&&ddV<0?C.neg:C.tx,'от пика до дна'],
+    ['bench','К бенчмарку',_shrPct(alphaV,1),alphaV==null?C.tx:alphaV>=0?C.pos:C.neg,alphaSub]
   ];
-  const kw=(W-88-36)/4;
-  kpis.forEach(([lbl,val,col,sub],i)=>{
-    const x=44+i*(kw+12),y=96;
-    ctx.fillStyle=C.card;_shrRR(ctx,x,y,kw,92,14);ctx.fill();
+  const kpis=kpisAll.filter(k=>k[0]==='twr'||(k[0]==='bench'?SHR.bench!=='none':SHR.show[k[0]]));
+  const KG=12,kTop=96,tileH=Math.round(92*sc),cols=tall?2:kpis.length,rowsN=Math.ceil(kpis.length/cols);
+  const kw=(W-88-KG*(cols-1))/cols;
+  kpis.forEach(([,lbl,val,col,sub],i)=>{
+    const x=44+(i%cols)*(kw+KG),y=kTop+Math.floor(i/cols)*(tileH+KG);
+    ctx.fillStyle=C.card;_shrRR(ctx,x,y,kw,tileH,14);ctx.fill();
     ctx.strokeStyle=C.line;ctx.lineWidth=1;ctx.stroke();
-    ctx.fillStyle=C.tx2;ctx.font='500 13px '+F;ctx.fillText(lbl,x+18,y+26);
-    ctx.fillStyle=col;ctx.font='700 28px '+F;ctx.fillText(val,x+18,y+60);
-    ctx.fillStyle=C.tx2;ctx.font='400 12px '+F;ctx.fillText(sub,x+18,y+80);
+    ctx.fillStyle=C.tx2;ctx.font='500 '+13*sc+'px '+F;ctx.fillText(lbl,x+18,y+26*sc);
+    ctx.fillStyle=col;ctx.font='700 '+28*sc+'px '+F;ctx.fillText(val,x+18,y+60*sc);
+    ctx.fillStyle=C.tx2;ctx.font='400 '+12*sc+'px '+F;ctx.fillText(sub,x+18,y+80*sc);
   });
 
   // Left panel: TWR curve
-  const cx=44,cy=206,cw=740,ch=362;
+  const showAlloc=!!SHR.show.alloc,py=kTop+rowsN*tileH+(rowsN-1)*KG+18,pBot=H-62;
+  const cx=44,cy=py,cw=tall||!showAlloc?W-88:740,ch=tall&&showAlloc?Math.round((pBot-py-16)*0.5):pBot-py;
   ctx.fillStyle=C.card;_shrRR(ctx,cx,cy,cw,ch,16);ctx.fill();
   ctx.strokeStyle=C.line;ctx.lineWidth=1;ctx.stroke();
-  ctx.fillStyle=C.tx;ctx.font='600 16px '+F;ctx.fillText('Кривая доходности TWR, %',cx+22,cy+32);
+  ctx.fillStyle=C.tx;ctx.font='600 '+16*sc+'px '+F;ctx.fillText('Кривая доходности TWR, %',cx+22,cy+32);
 
   if(hs&&hs.twr&&hs.twr.length>1){
     const sList=[{name:'Портфель',col:C.s1,w:3,dash:[],arr:hs.twr.map(x=>x*100)}];
@@ -38908,8 +38979,8 @@ function shareDraw(cv){
     // Area under portfolio line
     const pArr=sList[0].arr;
     const ag=ctx.createLinearGradient(0,py0,0,py1);
-    ag.addColorStop(0,dk?'rgba(77,163,255,0.28)':'rgba(36,116,229,0.20)');
-    ag.addColorStop(1,'rgba(77,163,255,0.0)');
+    ag.addColorStop(0,'rgba('+C.glow+','+(dk?0.30:0.20)+')');
+    ag.addColorStop(1,'rgba('+C.glow+',0)');
     ctx.beginPath();ctx.moveTo(X(0),py1);
     for(let i=0;i<n;i++)ctx.lineTo(X(i),Y(pArr[i]));
     ctx.lineTo(X(n-1),py1);ctx.closePath();ctx.fillStyle=ag;ctx.fill();
@@ -38937,10 +39008,11 @@ function shareDraw(cv){
   }
 
   // Right panel: Asset allocation (% ONLY)
-  const rx=cx+cw+16,ry=cy,rw=W-44-rx,rh=ch;
+  const rx=tall?44:cx+cw+16,ry=tall?cy+ch+16:cy,rw=W-44-rx,rh=tall?pBot-ry:ch;
+  if(showAlloc){
   ctx.fillStyle=C.card;_shrRR(ctx,rx,ry,rw,rh,16);ctx.fill();
   ctx.strokeStyle=C.line;ctx.lineWidth=1;ctx.stroke();
-  ctx.fillStyle=C.tx;ctx.font='600 16px '+F;ctx.fillText('Структура портфеля, %',rx+22,ry+32);
+  ctx.fillStyle=C.tx;ctx.font='600 '+16*sc+'px '+F;ctx.fillText('Структура портфеля, %',rx+22,ry+32);
 
   const rawAlloc=[
     ['Облигации',p.bonds,'#f5a623'],
@@ -38953,17 +39025,19 @@ function shareDraw(cv){
   const tot=rawAlloc.reduce((a,[,v])=>a+v,0)||1;
   rawAlloc.sort((a,b)=>b[1]-a[1]);
   let ay=ry+66;
+  const step=Math.max(34,Math.min(60*sc,(rh-84)/Math.max(1,rawAlloc.length)));
   rawAlloc.forEach(([name,val,col])=>{
     const pctV=val/tot*100;
     ctx.fillStyle=C.tx;ctx.font='500 14px '+F;ctx.fillText(name,rx+22,ay);
     ctx.fillStyle=C.tx;ctx.font='700 14px '+F;ctx.textAlign='right';
     ctx.fillText(pctV.toFixed(1).replace('.',',')+' %',rx+rw-22,ay);ctx.textAlign='left';
     const bw=rw-44;
-    ctx.fillStyle=dk?'#ffffff12':'#00000010';_shrRR(ctx,rx+22,ay+8,bw,10,5);ctx.fill();
+    ctx.fillStyle=C.track;_shrRR(ctx,rx+22,ay+8,bw,10,5);ctx.fill();
     ctx.fillStyle=col;_shrRR(ctx,rx+22,ay+8,Math.max(8,bw*Math.min(1,pctV/100)),10,5);ctx.fill();
-    ay+=46;
+    ay+=step;
   });
   if(!rawAlloc.length){ctx.fillStyle=C.tx2;ctx.font='500 14px '+F;ctx.fillText('Нет открытых позиций',rx+22,ry+80)}
+  }
 
   // Footer
   ctx.fillStyle=C.tx2;ctx.font='500 12.5px '+F;

@@ -1,9 +1,16 @@
-/* ── Карточка портфеля для шаринга (PNG 1200×630, строго без сумм в рублях) ── */
-const SHR={open:false,theme:'',bench:'both'};
+/* ── Карточка портфеля для шаринга (PNG, строго без сумм в рублях): 3 формата, 4 темы, выбор показателей ── */
+const SHR_FMT={wide:{w:1200,h:630,n:'Пост 1200×630'},sq:{w:1080,h:1080,n:'Квадрат 1080×1080'},story:{w:1080,h:1920,n:'Истории 1080×1920'}};
+const SHR_TH={
+  dark:{n:'Тёмный графит',dk:1,bg:'#0f131a',card:'#171d28',line:'#263042',tx:'#f2f5fa',tx2:'#9aa6bc',ac:'#3b82f6',pos:'#10b981',neg:'#ff6b6b',s1:'#4da3ff',s2:'#f5a623',s3:'#3ecf8e',grid:'#ffffff10',glow:'77,163,255',track:'#ffffff12'},
+  light:{n:'Светлый минимал',dk:0,bg:'#f4f6fa',card:'#ffffff',line:'#dde3ee',tx:'#141923',tx2:'#5c677d',ac:'#2563eb',pos:'#128a5a',neg:'#d63c41',s1:'#2474e5',s2:'#d98200',s3:'#128a5a',grid:'#00000010',glow:'36,116,229',track:'#00000010'},
+  blue:{n:'Глубокий синий',dk:1,bg:'#0a1330',card:'#10204d',line:'#25407f',tx:'#eef3ff',tx2:'#a3b5e3',ac:'#4f8ef7',pos:'#34d399',neg:'#ff7b84',s1:'#6aa8ff',s2:'#f5b94a',s3:'#3ecf8e',grid:'#ffffff16',glow:'79,142,247',track:'#ffffff16'},
+  emerald:{n:'Изумруд',dk:1,bg:'#06130f',card:'#0d221a',line:'#1c4b3b',tx:'#ecfdf5',tx2:'#8fc9b2',ac:'#10b981',pos:'#34d399',neg:'#ff7b84',s1:'#34d399',s2:'#f5b94a',s3:'#6aa8ff',grid:'#ffffff14',glow:'16,185,129',track:'#ffffff14'}
+};
+const SHR={open:false,theme:'',bench:'both',fmt:'wide',show:{xirr:true,dd:true,alloc:true}};
 function shareOpen(){
   if(!S.data||!S.data.portfolio){uiAlert({title:'Нечего показывать',body:'Сначала откройте портфель или демо-режим.'});return}
   SHR.open=true;
-  if(!SHR.theme)SHR.theme=document.documentElement.dataset.theme==='light'?'light':'dark';
+  if(!SHR.theme||!SHR_TH[SHR.theme])SHR.theme=document.documentElement.dataset.theme==='light'?'light':'dark';
   shareMount();
 }
 function shareClose(){
@@ -16,13 +23,15 @@ function shareMount(){
   const hs=typeof histSlice==='function'?histSlice():null;
   const hasB=!!(hs&&hs.bench&&(hs.bench.TMOS||hs.bench.LQDT));
   bg.innerHTML=`<div class="shr-mod" role="dialog" aria-modal="true" aria-label="Поделиться портфелем PNG">
-    <div class="shr-hd"><div><b>Поделиться портфелем (PNG)</b><small class="mu"> · 1200×630 · строго без сумм в рублях</small></div>
+    <div class="shr-hd"><div><b>Поделиться портфелем (PNG)</b><small class="mu"> · ${SHR_FMT[SHR.fmt].w}×${SHR_FMT[SHR.fmt].h} · строго без сумм в рублях</small></div>
       <button class="btn ghost" id="shr-x" aria-label="Закрыть">✕</button></div>
     <div class="shr-bar">
-      <div class="seg" id="shr-th"><button class="${SHR.theme==='dark'?'on':''}" data-st="dark">Тёмная</button><button class="${SHR.theme==='light'?'on':''}" data-st="light">Светлая</button></div>
+      <div class="seg" id="shr-fm" aria-label="Формат">${Object.keys(SHR_FMT).map(k=>`<button class="${SHR.fmt===k?'on':''}" data-sf="${k}">${SHR_FMT[k].n}</button>`).join('')}</div>
+      <div class="seg" id="shr-th" aria-label="Тема карточки">${Object.keys(SHR_TH).map(k=>`<button class="${SHR.theme===k?'on':''}" data-st="${k}">${SHR_TH[k].n}</button>`).join('')}</div>
+      <div class="shr-chk" id="shr-sh"><span class="mu">Показать:</span>${[['xirr','XIRR'],['dd','просадку'],['alloc','структуру']].map(([k,t])=>`<label><input type="checkbox" data-sh="${k}"${SHR.show[k]?' checked':''}> ${t}</label>`).join('')}</div>
       ${hasB?`<div class="seg" id="shr-bn"><button class="${SHR.bench==='both'?'on':''}" data-sb="both">TMOS + LQDT</button><button class="${SHR.bench==='TMOS'?'on':''}" data-sb="TMOS">TMOS</button><button class="${SHR.bench==='LQDT'?'on':''}" data-sb="LQDT">LQDT</button><button class="${SHR.bench==='none'?'on':''}" data-sb="none">Без бенчмарка</button></div>`:''}
     </div>
-    <div class="shr-cvw"><canvas id="shr-cv" width="1200" height="630"></canvas></div>
+    <div class="shr-cvw"><canvas id="shr-cv" width="${SHR_FMT[SHR.fmt].w}" height="${SHR_FMT[SHR.fmt].h}"></canvas></div>
     <div class="shr-ft">
       <span class="mu" id="shr-st">Скрыты все абсолютные суммы и названия счетов — видны только %, график TWR и доли активов.</span>
       <div class="row" style="gap:8px">
@@ -34,6 +43,8 @@ function shareMount(){
   bg.onclick=e=>{if(e.target===bg)shareClose()};
   $('#shr-x').onclick=shareClose;
   bg.querySelectorAll('[data-st]').forEach(b=>b.onclick=()=>{SHR.theme=b.dataset.st;shareMount()});
+  bg.querySelectorAll('[data-sf]').forEach(b=>b.onclick=()=>{SHR.fmt=b.dataset.sf;shareMount()});
+  bg.querySelectorAll('[data-sh]').forEach(b=>b.onchange=()=>{SHR.show[b.dataset.sh]=b.checked;shareMount()});
   bg.querySelectorAll('[data-sb]').forEach(b=>b.onclick=()=>{SHR.bench=b.dataset.sb;shareMount()});
   const cv=$('#shr-cv');
   shareDraw(cv);
@@ -66,19 +77,17 @@ function _shrPct(v,d=1){
 }
 function shareDraw(cv){
   if(!cv)return;
-  const ctx=cv.getContext('2d'),W=1200,H=630,dk=SHR.theme!=='light';
-  const C=dk
-    ?{bg:'#0f131a',card:'#171d28',line:'#263042',tx:'#f2f5fa',tx2:'#9aa6bc',ac:'#3b82f6',pos:'#10b981',neg:'#ff6b6b',s1:'#4da3ff',s2:'#f5a623',s3:'#3ecf8e',grid:'#ffffff10'}
-    :{bg:'#f4f6fa',card:'#ffffff',line:'#dde3ee',tx:'#141923',tx2:'#5c677d',ac:'#2563eb',pos:'#128a5a',neg:'#d63c41',s1:'#2474e5',s2:'#d98200',s3:'#128a5a',grid:'#00000010'};
+  const FM=SHR_FMT[SHR.fmt]||SHR_FMT.wide,W=FM.w,H=FM.h;cv.width=W;cv.height=H;
+  const ctx=cv.getContext('2d'),C=SHR_TH[SHR.theme]||SHR_TH.dark,dk=!!C.dk,tall=H>=W,sc=H>1500?1.25:1;
   ctx.fillStyle=C.bg;ctx.fillRect(0,0,W,H);
   // Subtle accent glow
   const gr=ctx.createRadialGradient(180,80,10,180,80,460);
-  gr.addColorStop(0,dk?'rgba(77,163,255,0.14)':'rgba(36,116,229,0.09)');
+  gr.addColorStop(0,'rgba('+C.glow+','+(dk?0.16:0.09)+')');
   gr.addColorStop(1,'rgba(0,0,0,0)');
   ctx.fillStyle=gr;ctx.fillRect(0,0,W,H);
 
   const d=S.data||{},p=d.portfolio||{},hs=typeof histSlice==='function'?histSlice():null;
-  const F='system-ui,-apple-system,Segoe UI,Roboto,sans-serif';
+  const F='Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif';
 
   // Header brand badge
   ctx.fillStyle=C.ac;_shrRR(ctx,44,36,40,40,10);ctx.fill();
@@ -107,27 +116,30 @@ function shareDraw(cv){
       if(lastB!=null&&twrV!=null){alphaV=twrV-lastB*100;alphaSub='к '+bk+' ('+_shrPct(lastB*100,1)+')'}
     }
   }
-  const kpis=[
-    ['Доходность (TWR)',_shrPct(twrV,2),twrV==null?C.tx:twrV>=0?C.pos:C.neg,'без влияния пополнений'],
-    ['Годовая (XIRR)',_shrPct(xirrV,1),xirrV==null?C.tx:xirrV>=0?C.pos:C.neg,'с учётом дат и сумм'],
-    ['Макс. просадка',_shrPct(ddV,1),ddV!=null&&ddV<0?C.neg:C.tx,'от пика до дна'],
-    ['К бенчмарку',_shrPct(alphaV,1),alphaV==null?C.tx:alphaV>=0?C.pos:C.neg,alphaSub]
+  const kpisAll=[
+    ['twr','Доходность (TWR)',_shrPct(twrV,2),twrV==null?C.tx:twrV>=0?C.pos:C.neg,'без влияния пополнений'],
+    ['xirr','Годовая (XIRR)',_shrPct(xirrV,1),xirrV==null?C.tx:xirrV>=0?C.pos:C.neg,'с учётом дат и сумм'],
+    ['dd','Макс. просадка',_shrPct(ddV,1),ddV!=null&&ddV<0?C.neg:C.tx,'от пика до дна'],
+    ['bench','К бенчмарку',_shrPct(alphaV,1),alphaV==null?C.tx:alphaV>=0?C.pos:C.neg,alphaSub]
   ];
-  const kw=(W-88-36)/4;
-  kpis.forEach(([lbl,val,col,sub],i)=>{
-    const x=44+i*(kw+12),y=96;
-    ctx.fillStyle=C.card;_shrRR(ctx,x,y,kw,92,14);ctx.fill();
+  const kpis=kpisAll.filter(k=>k[0]==='twr'||(k[0]==='bench'?SHR.bench!=='none':SHR.show[k[0]]));
+  const KG=12,kTop=96,tileH=Math.round(92*sc),cols=tall?2:kpis.length,rowsN=Math.ceil(kpis.length/cols);
+  const kw=(W-88-KG*(cols-1))/cols;
+  kpis.forEach(([,lbl,val,col,sub],i)=>{
+    const x=44+(i%cols)*(kw+KG),y=kTop+Math.floor(i/cols)*(tileH+KG);
+    ctx.fillStyle=C.card;_shrRR(ctx,x,y,kw,tileH,14);ctx.fill();
     ctx.strokeStyle=C.line;ctx.lineWidth=1;ctx.stroke();
-    ctx.fillStyle=C.tx2;ctx.font='500 13px '+F;ctx.fillText(lbl,x+18,y+26);
-    ctx.fillStyle=col;ctx.font='700 28px '+F;ctx.fillText(val,x+18,y+60);
-    ctx.fillStyle=C.tx2;ctx.font='400 12px '+F;ctx.fillText(sub,x+18,y+80);
+    ctx.fillStyle=C.tx2;ctx.font='500 '+13*sc+'px '+F;ctx.fillText(lbl,x+18,y+26*sc);
+    ctx.fillStyle=col;ctx.font='700 '+28*sc+'px '+F;ctx.fillText(val,x+18,y+60*sc);
+    ctx.fillStyle=C.tx2;ctx.font='400 '+12*sc+'px '+F;ctx.fillText(sub,x+18,y+80*sc);
   });
 
   // Left panel: TWR curve
-  const cx=44,cy=206,cw=740,ch=362;
+  const showAlloc=!!SHR.show.alloc,py=kTop+rowsN*tileH+(rowsN-1)*KG+18,pBot=H-62;
+  const cx=44,cy=py,cw=tall||!showAlloc?W-88:740,ch=tall&&showAlloc?Math.round((pBot-py-16)*0.5):pBot-py;
   ctx.fillStyle=C.card;_shrRR(ctx,cx,cy,cw,ch,16);ctx.fill();
   ctx.strokeStyle=C.line;ctx.lineWidth=1;ctx.stroke();
-  ctx.fillStyle=C.tx;ctx.font='600 16px '+F;ctx.fillText('Кривая доходности TWR, %',cx+22,cy+32);
+  ctx.fillStyle=C.tx;ctx.font='600 '+16*sc+'px '+F;ctx.fillText('Кривая доходности TWR, %',cx+22,cy+32);
 
   if(hs&&hs.twr&&hs.twr.length>1){
     const sList=[{name:'Портфель',col:C.s1,w:3,dash:[],arr:hs.twr.map(x=>x*100)}];
@@ -169,8 +181,8 @@ function shareDraw(cv){
     // Area under portfolio line
     const pArr=sList[0].arr;
     const ag=ctx.createLinearGradient(0,py0,0,py1);
-    ag.addColorStop(0,dk?'rgba(77,163,255,0.28)':'rgba(36,116,229,0.20)');
-    ag.addColorStop(1,'rgba(77,163,255,0.0)');
+    ag.addColorStop(0,'rgba('+C.glow+','+(dk?0.30:0.20)+')');
+    ag.addColorStop(1,'rgba('+C.glow+',0)');
     ctx.beginPath();ctx.moveTo(X(0),py1);
     for(let i=0;i<n;i++)ctx.lineTo(X(i),Y(pArr[i]));
     ctx.lineTo(X(n-1),py1);ctx.closePath();ctx.fillStyle=ag;ctx.fill();
@@ -198,10 +210,11 @@ function shareDraw(cv){
   }
 
   // Right panel: Asset allocation (% ONLY)
-  const rx=cx+cw+16,ry=cy,rw=W-44-rx,rh=ch;
+  const rx=tall?44:cx+cw+16,ry=tall?cy+ch+16:cy,rw=W-44-rx,rh=tall?pBot-ry:ch;
+  if(showAlloc){
   ctx.fillStyle=C.card;_shrRR(ctx,rx,ry,rw,rh,16);ctx.fill();
   ctx.strokeStyle=C.line;ctx.lineWidth=1;ctx.stroke();
-  ctx.fillStyle=C.tx;ctx.font='600 16px '+F;ctx.fillText('Структура портфеля, %',rx+22,ry+32);
+  ctx.fillStyle=C.tx;ctx.font='600 '+16*sc+'px '+F;ctx.fillText('Структура портфеля, %',rx+22,ry+32);
 
   const rawAlloc=[
     ['Облигации',p.bonds,'#f5a623'],
@@ -214,17 +227,19 @@ function shareDraw(cv){
   const tot=rawAlloc.reduce((a,[,v])=>a+v,0)||1;
   rawAlloc.sort((a,b)=>b[1]-a[1]);
   let ay=ry+66;
+  const step=Math.max(34,Math.min(60*sc,(rh-84)/Math.max(1,rawAlloc.length)));
   rawAlloc.forEach(([name,val,col])=>{
     const pctV=val/tot*100;
     ctx.fillStyle=C.tx;ctx.font='500 14px '+F;ctx.fillText(name,rx+22,ay);
     ctx.fillStyle=C.tx;ctx.font='700 14px '+F;ctx.textAlign='right';
     ctx.fillText(pctV.toFixed(1).replace('.',',')+' %',rx+rw-22,ay);ctx.textAlign='left';
     const bw=rw-44;
-    ctx.fillStyle=dk?'#ffffff12':'#00000010';_shrRR(ctx,rx+22,ay+8,bw,10,5);ctx.fill();
+    ctx.fillStyle=C.track;_shrRR(ctx,rx+22,ay+8,bw,10,5);ctx.fill();
     ctx.fillStyle=col;_shrRR(ctx,rx+22,ay+8,Math.max(8,bw*Math.min(1,pctV/100)),10,5);ctx.fill();
-    ay+=46;
+    ay+=step;
   });
   if(!rawAlloc.length){ctx.fillStyle=C.tx2;ctx.font='500 14px '+F;ctx.fillText('Нет открытых позиций',rx+22,ry+80)}
+  }
 
   // Footer
   ctx.fillStyle=C.tx2;ctx.font='500 12.5px '+F;

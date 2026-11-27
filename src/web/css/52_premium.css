@@ -46,16 +46,17 @@ aside{background:var(--side);border-right:1px solid var(--line)}
 .card{background:linear-gradient(180deg,#ffffff05,#ffffff00 120px),var(--card);border:1px solid var(--line);border-radius:var(--r);
   box-shadow:var(--hl),var(--elev);padding:var(--pad-card)}
 [data-theme=light] .card{background:var(--card)}
-.card h2{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em;margin-bottom:16px}
+/* заголовки карточек — обычным регистром; капсом остаются только мелкие надзаголовки (.st-gh h3, .kpi .k, .hero .lbl) */
+.card h2{font-size:14.5px;font-weight:620;color:var(--tx);letter-spacing:-.012em;margin-bottom:14px}
 .card h2 .sp{text-transform:none;letter-spacing:0;font-size:12px}
 .card h2 .btn,.card h2 button,.card h2 a{text-transform:none;letter-spacing:0}
 .wrap{gap:var(--gap)}
 .g{gap:var(--gap)}
 
 /* ── главный блок «Стоимость портфеля» ── */
-.hero{background:radial-gradient(90% 140% at 100% 0%,#3b82f61f 0%,transparent 55%),radial-gradient(60% 90% at 0% 100%,#2bc48a0d 0%,transparent 60%),linear-gradient(180deg,#ffffff06,#ffffff00),var(--card);padding:26px 28px}
+.hero{background:radial-gradient(90% 140% at 100% 0%,rgba(var(--ac-rgb),.12) 0%,transparent 55%),radial-gradient(60% 90% at 0% 100%,#2bc48a0d 0%,transparent 60%),linear-gradient(180deg,#ffffff06,#ffffff00),var(--d2);padding:26px 28px;box-shadow:var(--d2-hl),var(--d2-shadow)}
 .hero:after{display:none}
-[data-theme=light] .hero{background:radial-gradient(90% 140% at 100% 0%,#2563eb14 0%,transparent 55%),var(--card)}
+[data-theme=light] .hero{background:radial-gradient(90% 140% at 100% 0%,rgba(var(--ac-rgb),.08) 0%,transparent 55%),var(--d2)}
 .hero .lbl{font-size:11.5px;font-weight:650;color:var(--lbl);text-transform:uppercase;letter-spacing:.07em}
 .hero .val{font-size:46px;font-weight:600;letter-spacing:-.04em;margin-top:8px}
 .hero .val small{font-size:26px;font-weight:500;color:var(--mu)}
@@ -143,3 +144,30 @@ tr:hover td,.tbl table tr:hover td:first-child{background:var(--card-hover)}
 .ov-leave>div{animation:ovOut .22s cubic-bezier(.4,0,1,1) forwards!important}
 @keyframes ovFade{to{opacity:0}}
 @keyframes ovOut{to{transform:translateX(100%)}}
+
+/* ── Уровни глубины: 0 — фон и меню, 1 — карточки, 2 — главные блоки, всплывающие меню, окна и панели ── */
+.more-dd,.tour-pop,#ks{background:var(--d2);box-shadow:var(--d2-hl),var(--d2-shadow)}
+#bc-ov .bc-dr,#sk-ov .sk-dr{box-shadow:var(--d2-hl),-24px 0 64px -12px #000000a6}
+
+/* ── Иконки duotone: подложка .ic-d внутри svg.ic; в покое спокойная, при наведении и в активном пункте горит акцентом ── */
+svg.ic{transition:transform .18s cubic-bezier(.3,1.35,.5,1)}
+svg.ic .ic-d{fill:currentColor;fill-opacity:.14;stroke:none;transition:fill-opacity .18s ease,fill .18s ease}
+.nav button:hover svg.ic .ic-d,.st-sh>i svg.ic .ic-d,.empty svg.ic .ic-d{fill-opacity:.24}
+.nav button.on svg.ic{color:var(--ac-tx)}
+.nav button.on svg.ic .ic-d{fill:var(--ac);fill-opacity:.34}
+.nav button:hover svg.ic{transform:scale(1.06)}
+@media(prefers-reduced-motion:reduce){svg.ic,svg.ic .ic-d{transition:none}.nav button:hover svg.ic{transform:none}}
+/* стеклянные капсулы для иконок в заголовках разделов и пустых экранов */
+.st-sh>i{background:radial-gradient(120% 120% at 20% 0%,rgba(var(--ac-rgb),.22),transparent 70%),var(--card2);box-shadow:inset 0 1px 0 #ffffff1c,0 0 0 1px var(--line2),0 4px 12px -4px #00000066}
+[data-theme=light] .st-sh>i{box-shadow:inset 0 1px 0 #ffffff,0 0 0 1px var(--line2),0 4px 12px -6px #0f172a33}
+.empty svg.ic{opacity:.7;color:var(--ac-tx)}
+
+/* ── Плотность интерфейса (Настройки → Внешний вид) ── */
+:root[data-density=compact] body{font-size:13.5px}
+:root[data-density=compact] .card h2{margin-bottom:10px}
+:root[data-density=compact] .hero{padding:18px 20px}
+:root[data-density=compact] .nav button{padding:6px 10px}
+:root[data-density=compact] #view{padding:16px 22px 40px}
+/* цифры: табличные, знак валюты приглушён (не только в Hero, но и в крупных показателях) */
+.kpi .v,.hero .val,.hero .meta b,.pill,.num{font-variant-numeric:tabular-nums lining-nums}
+.kpi .v small,.kpi .v .cur{opacity:.65;font-weight:500}
