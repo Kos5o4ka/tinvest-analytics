@@ -441,12 +441,12 @@ def import_merge_ops(old, new, periods=None, old_periods=None):
             per = o.get("_period")
             if per and len(per) == 2 and per[0] and per[1]:
                 old_ranges.append((per[0], per[1]))
-        ds = [(o.get("date") or "")[:10] for o in old_list if not o.get("_opening") and (o.get("date") or "")[:10]]
+        ds = [(o.get("date") or "")[:10] for o in old_list if not o.get("_opening") and not o.get("_manual") and (o.get("date") or "")[:10]]
         if ds:
             old_ranges.append((min(ds), max(ds)))
     avail = defaultdict(int)
     for o in old_list:
-        if not o.get("_opening") and op_key(o) not in new_keys:
+        if not o.get("_opening") and not o.get("_manual") and op_key(o) not in new_keys:
             avail[_op_sem_sig(o)] += 1
     by_id = {}
     for o in old_list:
@@ -465,19 +465,11 @@ def import_merge_ops(old, new, periods=None, old_periods=None):
     return ops
 
 
-def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, synth=True, old_periods=None):
-    """Находит бумаги, склеивает с уже сохранёнными операциями счёта (existing) и пересчитывает по всему набору:
-    досчитанные пополнения (synth) и FIFO идут по всей истории, а не только по новому файлу."""
-    if not keep_demo:
-        demo_remove()  # настоящий отчёт заменяет демо-портфель
-    existing = [dict(o) for o in existing or []]
-    for o in existing:
-        o.pop("yield", None)
-        o.pop("_yield", None)
-        if str(o.get("instrumentUid") or "").startswith("imp:"):  # раньше не нашлись на бирже — пробуем ещё раз
-            o["_ident"] = o.pop("instrumentUid")[4:]
-    ids = resolve_idents(client, [o.get("_ident") for o in list(ops) + existing])
-    for o in list(ops) + existing:
+def imp_apply_idents(client, all_ops):
+    """Находит бумаги по коду из отчёта (_ident): проставляет instrumentUid и название; не найденные получают «imp:КОД».
+    Меняет операции на месте. -> {код: описание}."""
+    ids = resolve_idents(client, [o.get("_ident") for o in all_ops])
+    for o in all_ops:
         ident = o.pop("_ident", "")
         if ident:
             o["_sec"] = ident      # код бумаги в отчёте (ISIN или тикер): по нему находятся сплиты при слиянии файлов
@@ -493,6 +485,25 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
         elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out",
                                                "fee_broker", "tax_trade", "tax_dividend", "tax_coupon"):
             o["instrumentUid"] = "imp:" + ident
+    return ids
+
+
+def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, synth=True, old_periods=None, report=None):
+    """Находит бумаги, склеивает с уже сохранёнными операциями счёта (existing) и пересчитывает по всему набору:
+    досчитанные пополнения (synth) и FIFO идут по всей истории, а не только по новому файлу."""
+    if not keep_demo:
+        demo_remove()  # настоящий отчёт заменяет демо-портфель
+    existing = [dict(o) for o in existing or []]
+    for o in existing:
+        o.pop("yield", None)
+        o.pop("_yield", None)
+        if str(o.get("instrumentUid") or "").startswith("imp:"):  # раньше не нашлись на бирже — пробуем ещё раз
+            o["_ident"] = o.pop("instrumentUid")[4:]
+    ids = imp_apply_idents(client, list(ops) + existing)
+    if existing:                         # ручные сделки, уже попавшие в новый отчёт, заменяются строками отчёта
+        existing, rec = reconcile_manual_with_report(existing, ops)
+        if report is not None:
+            report["reconciled"] = rec
     ops = import_merge_ops(existing, ops, periods, old_periods=old_periods) if existing else sorted(
         ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
     ops = import_apply_splits(ops)   # пары обмена на дни сплитов по всей истории счёта
@@ -543,6 +554,8 @@ def find_duplicate_import(raw, ops=None, lst=None):
     new_ids = set(_imp_op_ids(ops)) if ops is not None else set()
     ops_hash = _imp_ops_hash(ops) if ops is not None else None
     for acc in lst:
+        if acc.get("sync_src"):
+            continue                         # снимок счёта из облака: в него отчёты не загружаются
         for f in acc.get("files") or []:
             if f.get("sha256") == file_sha:
                 return {"id": acc["id"], "name": acc.get("name") or acc["id"], "file": f.get("name") or ""}
@@ -585,6 +598,8 @@ def find_overlap_account(ops, lst=None):
             new_loose.add(_op_loose_sig(o))
     best = None
     for acc in lst:
+        if acc.get("sync_src"):
+            continue
         ex_ops = st.ops(acc["id"])
         ex_ids = {op_key(o) for o in ex_ops if not o.get("_opening") and not o.get("_synthetic")}
         hits = len(new_ids & ex_ids)
@@ -613,7 +628,8 @@ def import_parse_info(body):
     overlap = None if dup else find_overlap_account(ops, lst)
     return {"count": len(ops), "skipped": skipped, "kinds": kinds, "sample": sample,
             "from": ops[0]["date"][:10] if ops else None, "to": ops[-1]["date"][:10] if ops else None,
-            "duplicate_of": dup, "overlap_account": overlap}
+            "duplicate_of": dup, "overlap_account": overlap,
+            "manual_matches": manual_matches_preview(ops, body.get("target"), lst)}
 
 
 def import_commit(client, body):
@@ -644,8 +660,9 @@ def import_commit(client, body):
         finfo["from"], finfo["to"] = f_from, f_to
     old_periods = [(f.get("from"), f.get("to")) for f in ex["files"] if f.get("from") and f.get("to")]
     periods = old_periods + ([(f_from, f_to)] if f_from and f_to else [])
-    ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) if ex["files"] else None,
-                               periods=periods, synth=not fmt, old_periods=old_periods)
+    rep = {}
+    ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) or None,       # и счёт, где пока только ручные записи
+                               periods=periods, synth=not fmt, old_periods=old_periods, report=rep)
     ex["files"].append(finfo)
     ex["ops"] = len(ops)
     store().ops_clear(acc_id)
@@ -653,8 +670,9 @@ def import_commit(client, body):
     store().put("imports", lst)
     mem_clear()
     found = sum(1 for v in ids.values() if v.get("uid"))
+    sync_kick_safe()
     return {"ok": True, "id": acc_id, "count": finfo["count"], "total": len(ops), "skipped": skipped,
-            "resolved": found, "idents": len(ids)}
+            "resolved": found, "idents": len(ids), "reconciled": len(rep.get("reconciled") or [])}
 
 
 TEMPLATE_CSV = ("Дата;Тип операции;ISIN;Тикер;Название;Количество;Цена;Сумма;Валюта;Комиссия;НКД\n"

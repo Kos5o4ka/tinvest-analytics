@@ -53,4 +53,7 @@
 .cl-fan3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px;text-align:center}
 .cl-mx td,.cl-mx th{text-align:center}.cl-mx td.l,.cl-mx th.l{text-align:left}
 .cl-main .g.g2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.cl-main .g.g2>*{min-width:0}
+.cl-main .g.g4{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:14px}.cl-main .g.g4>*{min-width:0}
+.cl-main .kpi .v{font-size:clamp(17px,1.4vw,21px);white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;line-height:1.2}
+.cl-main .kpi .s{white-space:normal;overflow:visible;text-overflow:clip}
 @media(max-width:1500px){.cl-main .g.g2{grid-template-columns:1fr}}

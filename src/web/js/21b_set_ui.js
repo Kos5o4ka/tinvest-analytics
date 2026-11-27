@@ -133,7 +133,7 @@ async function renderSettings(){
     <div class="msg info" id="st-empty" hidden>Ничего не найдено. Попробуйте другое слово, например «токен», «тема» или «копия».</div>
   </div></div>`;
   const main=document.getElementById('st-main');
-  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)),
+  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)+setSyncHtml(c)),
     sec(5,setNewsHtml(c)),sec(6,setDangerHtml(c))];
   main.insertAdjacentHTML('beforeend',html.join(''));
   if(keep){view.scrollTop=keep;const st=view.querySelector('.st');if(st)st.classList.remove('fade')}
@@ -168,6 +168,7 @@ async function renderSettings(){
   try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
+  try{bindSetSync(c,msg)}catch(e){}
   try{bindSetCrowd(c,msg)}catch(e){}
   try{bindSetShell(msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}

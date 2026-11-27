@@ -253,6 +253,8 @@ class Handler(BaseHTTPRequestHandler):
                 save_config(cfg)
                 ds_reset()
                 mem_clear(persist=False)        # сохранённые отчёты привязаны к токену (token_key): настройки их не портят
+                if "targets" in body or "broker_tariffs" in body:
+                    sync_kick_safe()
                 return self.send(200, {"ok": True, "app": APP_NAME})
             if path == "/api/ratings/refresh":
                 return self.send(200, {"started": ratings_start(force=True), **ratings_status()})
@@ -301,6 +303,7 @@ class Handler(BaseHTTPRequestHandler):
                 store().put("imports", lst)
                 store().ops_clear(body.get("id") or "")
                 mem_clear()
+                sync_kick_safe()
                 return self.send(200, {"ok": True, "app": APP_NAME})
             if path in ("/api/sandbox/open", "/api/sandbox/payin"):
                 if not cfg["sandbox"]:

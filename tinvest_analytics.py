@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 APP_NAME = "TAnalytic"
-APP_VERSION = "0.29"
+APP_VERSION = "0.31"
 APP_DIR = os.environ.get("TINVEST_HOME") or os.path.join(os.path.expanduser("~"), ".tinvest_analytics")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DB_PATH = os.path.join(APP_DIR, "data.db")
@@ -5826,12 +5826,12 @@ def import_merge_ops(old, new, periods=None, old_periods=None):
             per = o.get("_period")
             if per and len(per) == 2 and per[0] and per[1]:
                 old_ranges.append((per[0], per[1]))
-        ds = [(o.get("date") or "")[:10] for o in old_list if not o.get("_opening") and (o.get("date") or "")[:10]]
+        ds = [(o.get("date") or "")[:10] for o in old_list if not o.get("_opening") and not o.get("_manual") and (o.get("date") or "")[:10]]
         if ds:
             old_ranges.append((min(ds), max(ds)))
     avail = defaultdict(int)
     for o in old_list:
-        if not o.get("_opening") and op_key(o) not in new_keys:
+        if not o.get("_opening") and not o.get("_manual") and op_key(o) not in new_keys:
             avail[_op_sem_sig(o)] += 1
     by_id = {}
     for o in old_list:
@@ -5850,19 +5850,11 @@ def import_merge_ops(old, new, periods=None, old_periods=None):
     return ops
 
 
-def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, synth=True, old_periods=None):
-    """Находит бумаги, склеивает с уже сохранёнными операциями счёта (existing) и пересчитывает по всему набору:
-    досчитанные пополнения (synth) и FIFO идут по всей истории, а не только по новому файлу."""
-    if not keep_demo:
-        demo_remove()  # настоящий отчёт заменяет демо-портфель
-    existing = [dict(o) for o in existing or []]
-    for o in existing:
-        o.pop("yield", None)
-        o.pop("_yield", None)
-        if str(o.get("instrumentUid") or "").startswith("imp:"):  # раньше не нашлись на бирже — пробуем ещё раз
-            o["_ident"] = o.pop("instrumentUid")[4:]
-    ids = resolve_idents(client, [o.get("_ident") for o in list(ops) + existing])
-    for o in list(ops) + existing:
+def imp_apply_idents(client, all_ops):
+    """Находит бумаги по коду из отчёта (_ident): проставляет instrumentUid и название; не найденные получают «imp:КОД».
+    Меняет операции на месте. -> {код: описание}."""
+    ids = resolve_idents(client, [o.get("_ident") for o in all_ops])
+    for o in all_ops:
         ident = o.pop("_ident", "")
         if ident:
             o["_sec"] = ident      # код бумаги в отчёте (ISIN или тикер): по нему находятся сплиты при слиянии файлов
@@ -5878,6 +5870,25 @@ def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, s
         elif ident and classify(o["type"]) in ("buy", "sell", "repayments", "coupons", "dividends", "sec_in", "sec_out",
                                                "fee_broker", "tax_trade", "tax_dividend", "tax_coupon"):
             o["instrumentUid"] = "imp:" + ident
+    return ids
+
+
+def finalize_import(client, ops, keep_demo=False, existing=None, periods=None, synth=True, old_periods=None, report=None):
+    """Находит бумаги, склеивает с уже сохранёнными операциями счёта (existing) и пересчитывает по всему набору:
+    досчитанные пополнения (synth) и FIFO идут по всей истории, а не только по новому файлу."""
+    if not keep_demo:
+        demo_remove()  # настоящий отчёт заменяет демо-портфель
+    existing = [dict(o) for o in existing or []]
+    for o in existing:
+        o.pop("yield", None)
+        o.pop("_yield", None)
+        if str(o.get("instrumentUid") or "").startswith("imp:"):  # раньше не нашлись на бирже — пробуем ещё раз
+            o["_ident"] = o.pop("instrumentUid")[4:]
+    ids = imp_apply_idents(client, list(ops) + existing)
+    if existing:                         # ручные сделки, уже попавшие в новый отчёт, заменяются строками отчёта
+        existing, rec = reconcile_manual_with_report(existing, ops)
+        if report is not None:
+            report["reconciled"] = rec
     ops = import_merge_ops(existing, ops, periods, old_periods=old_periods) if existing else sorted(
         ops, key=lambda o: (o["date"], 0 if o.get("_opening") else 1))
     ops = import_apply_splits(ops)   # пары обмена на дни сплитов по всей истории счёта
@@ -5928,6 +5939,8 @@ def find_duplicate_import(raw, ops=None, lst=None):
     new_ids = set(_imp_op_ids(ops)) if ops is not None else set()
     ops_hash = _imp_ops_hash(ops) if ops is not None else None
     for acc in lst:
+        if acc.get("sync_src"):
+            continue                         # снимок счёта из облака: в него отчёты не загружаются
         for f in acc.get("files") or []:
             if f.get("sha256") == file_sha:
                 return {"id": acc["id"], "name": acc.get("name") or acc["id"], "file": f.get("name") or ""}
@@ -5970,6 +5983,8 @@ def find_overlap_account(ops, lst=None):
             new_loose.add(_op_loose_sig(o))
     best = None
     for acc in lst:
+        if acc.get("sync_src"):
+            continue
         ex_ops = st.ops(acc["id"])
         ex_ids = {op_key(o) for o in ex_ops if not o.get("_opening") and not o.get("_synthetic")}
         hits = len(new_ids & ex_ids)
@@ -5998,7 +6013,8 @@ def import_parse_info(body):
     overlap = None if dup else find_overlap_account(ops, lst)
     return {"count": len(ops), "skipped": skipped, "kinds": kinds, "sample": sample,
             "from": ops[0]["date"][:10] if ops else None, "to": ops[-1]["date"][:10] if ops else None,
-            "duplicate_of": dup, "overlap_account": overlap}
+            "duplicate_of": dup, "overlap_account": overlap,
+            "manual_matches": manual_matches_preview(ops, body.get("target"), lst)}
 
 
 def import_commit(client, body):
@@ -6029,8 +6045,9 @@ def import_commit(client, body):
         finfo["from"], finfo["to"] = f_from, f_to
     old_periods = [(f.get("from"), f.get("to")) for f in ex["files"] if f.get("from") and f.get("to")]
     periods = old_periods + ([(f_from, f_to)] if f_from and f_to else [])
-    ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) if ex["files"] else None,
-                               periods=periods, synth=not fmt, old_periods=old_periods)
+    rep = {}
+    ops, ids = finalize_import(client, ops, existing=store().ops(acc_id) or None,       # и счёт, где пока только ручные записи
+                               periods=periods, synth=not fmt, old_periods=old_periods, report=rep)
     ex["files"].append(finfo)
     ex["ops"] = len(ops)
     store().ops_clear(acc_id)
@@ -6038,8 +6055,9 @@ def import_commit(client, body):
     store().put("imports", lst)
     mem_clear()
     found = sum(1 for v in ids.values() if v.get("uid"))
+    sync_kick_safe()
     return {"ok": True, "id": acc_id, "count": finfo["count"], "total": len(ops), "skipped": skipped,
-            "resolved": found, "idents": len(ids)}
+            "resolved": found, "idents": len(ids), "reconciled": len(rep.get("reconciled") or [])}
 
 
 TEMPLATE_CSV = ("Дата;Тип операции;ISIN;Тикер;Название;Количество;Цена;Сумма;Валюта;Комиссия;НКД\n"
@@ -6787,7 +6805,7 @@ def tbank_preview(ops, meta):
     bad_cash = {c: [a, b] for c, (a, b) in rec["cash"].items() if abs(a - b) >= 1.0}
     bad_pos = sorted(((abs(a - b), k, a, b) for k, (a, b) in rec["pos"].items() if abs(a - b) >= 0.5), reverse=True)
     st = meta["stat"]
-    mine = [x for x in imports_list() if x.get("format") == meta["format"]]  # добавлять предлагаем только к счетам того же брокера
+    mine = [x for x in imports_list() if (x.get("format") == meta["format"] or x.get("manual")) and not x.get("sync_src")]  # добавлять предлагаем только к счетам того же брокера
     return {"format": meta["format"], "title": meta["title"], "period": meta["period"], "count": len(ops),
             "kinds": dict(kinds), "kinds_ru": TB_KIND_RU, "repo_skipped": st.get("repo", 0), "mirror_skipped": st.get("mirror", 0),
             "opening_sec": st.get("opening_sec", 0), "xfer": st.get("xfer_in", 0) + st.get("xfer_out", 0),
@@ -6795,7 +6813,8 @@ def tbank_preview(ops, meta):
             "pos_worst": [[k, a, b] for _, k, a, b in bad_pos[:5]],
             "sample": [[o["date"][:10], op_type(o), o.get("name") or "", op_qty(o), qf(o["payment"]), cur_of(o["payment"])]
                        for o in ops if not o.get("_opening") and classify(o["type"]) != "other"][:12],
-            "targets": [{"id": x["id"], "name": x.get("name") or ""} for x in mine]}
+            "targets": [{"id": x["id"], "name": x.get("name") or ""} for x in mine],
+            "manual_matches": manual_matches_preview(ops, None)}
 
 
 def import_preview_any(filename, raw):
@@ -7341,6 +7360,339 @@ def split_timeline(events, splits):
     """Сделки (время, ±кол-во, цена) вперемешку с маркерами сплитов (время, None, коэффициент) в хронологическом порядке."""
     return sorted(list(events) + [(datetime.strptime(d, "%Y-%m-%d"), None, r) for d, r in splits],
                   key=lambda z: (z[0], 0 if z[1] is None else 1))
+# ═══════════════════════════ ручной учёт сделок и сверка с отчётами брокера ═══════════════════════════
+# Ручная запись — обычная операция счёта (как строка отчёта) с пометкой _manual: поэтому FIFO, доходность, налоги и графики
+# работают без особых случаев. Одна «группа» записей (id вида man-<12 знаков>): сама сделка, комиссия («<id>-f») и пополнение
+# под покупку («<id>-c», _manual_autocash), чтобы остаток денег не уходил в минус. Ручные записи возможны только в счетах
+# с кодом imp-…: операции счетов Т-Инвестиций заново загружаются из API и перезаписываются целиком.
+# Когда позже загружается отчёт брокера с этими же сделками, ручные дубли заменяются строками отчёта (reconcile_manual_with_report).
+
+MAN_TYPES = {"buy": "BUY", "sell": "SELL", "coupon": "COUPON", "dividend": "DIVIDEND", "deposit": "INPUT",
+             "withdraw": "OUTPUT", "fee": "SERVICE_FEE"}
+MAN_TRADE, MAN_NEED_SEC = ("buy", "sell"), ("buy", "sell", "coupon", "dividend")
+MAN_SIGN = {"buy": -1, "sell": 1, "coupon": 1, "dividend": 1, "deposit": 1, "withdraw": -1, "fee": -1}
+MAN_DAYS, MAN_QTY_EPS, MAN_PAY_ABS, MAN_PAY_REL = 2, 1e-3, 5.0, 0.01
+_man_lock = threading.Lock()
+
+
+def sync_kick_safe():
+    """Данные изменились: отправить в облако, если синхронизация включена (ошибки не мешают основной работе)."""
+    try:
+        fn = globals().get("sync_kick")
+        if fn:
+            fn()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ───────────── сверка ручных сделок с отчётом ─────────────
+def _man_idents(o):
+    """Все известные коды бумаги операции (ISIN, тикер, uid) в верхнем регистре."""
+    out = set()
+    for k in ("instrumentUid", "figi", "_sec", "_ident", "_isin", "_ticker"):
+        v = str(o.get(k) or "").strip().upper()
+        if v.startswith("IMP:"):
+            v = v[4:]
+        if v:
+            out.add(v)
+    return out
+
+
+def _man_day(o):
+    try:
+        return datetime.strptime((o.get("date") or "")[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def reconcile_manual_with_report(existing, new_ops, apply=True):
+    """Находит ручные сделки (_manual), уже попавшие в загружаемый отчёт: та же бумага и направление, количество (±0,001),
+    дата не дальше 2 дней (Т+1, выходные), сумма отличается меньше чем на 1 % (но не меньше 5 ₽).
+    Каждая строка отчёта «закрывает» не больше одной ручной записи. Совпавшие ручные записи заменяются строками отчёта;
+    вместе с ними уходят их комиссия и пополнение под покупку, если в отчёте есть свои комиссии и пополнения (иначе остаются,
+    чтобы остаток денег не изменился). -> (оставшиеся записи счёта, [описание заменённых]).
+    apply=False — только подсчёт (для предварительного просмотра)."""
+    rep = [o for o in new_ops or [] if not o.get("_opening") and not o.get("_synthetic")]
+    rep_kinds = {classify(o.get("type")) for o in rep}
+    used, hit = set(), {}
+    for man in existing or []:
+        if not man.get("_manual") or man.get("_manual_autocash") or man.get("_pair"):
+            continue
+        kind = classify(man.get("type"))
+        if kind not in ("buy", "sell", "coupons", "dividends"):
+            continue
+        ids, day, qty, pay = _man_idents(man), _man_day(man), op_qty(man), abs(qf(man.get("payment")))
+        if not ids or day is None:
+            continue
+        best = None
+        for i, r in enumerate(rep):
+            if i in used or classify(r.get("type")) != kind or not (ids & _man_idents(r)):
+                continue
+            if abs(op_qty(r) - qty) > MAN_QTY_EPS:
+                continue
+            rd = _man_day(r)
+            if rd is None or abs((rd - day).days) > MAN_DAYS:
+                continue
+            if abs(abs(qf(r.get("payment"))) - pay) > max(MAN_PAY_ABS, pay * MAN_PAY_REL):
+                continue
+            gap = abs((rd - day).days)
+            if best is None or gap < best[0]:
+                best = (gap, i)
+        if best:
+            used.add(best[1])
+            hit[man["id"]] = man
+    if not hit:
+        return list(existing or []), []
+    drop = set(hit)
+    for o in existing or []:
+        pair = o.get("_pair")
+        if pair in hit and ((o.get("_manual_autocash") and "deposits" in rep_kinds) or
+                            (classify(o.get("type")) == "fee_broker" and "fee_broker" in rep_kinds)):
+            drop.add(o.get("id"))
+    info = [{"id": m["id"], "date": (m.get("date") or "")[:10], "name": m.get("name") or "", "type": classify(m.get("type")),
+             "qty": op_qty(m), "amount": round(abs(qf(m.get("payment"))), 2)} for m in hit.values()]
+    info.sort(key=lambda x: (x["date"], x["id"]))
+    if not apply:
+        return list(existing or []), info
+    return [o for o in existing or [] if o.get("id") not in drop], info
+
+
+def manual_matches_preview(new_ops, target, lst=None):
+    """Сколько ручных сделок уже есть в загружаемом отчёте: {count, sample[]}. Проверяются счёт target или все счета."""
+    lst = imports_list() if lst is None else lst
+    ex = []
+    for a in lst:
+        if a.get("sync_src") or (target and str(target).startswith("imp-") and a["id"] != target):
+            continue
+        ex += [o for o in store().ops(a["id"]) if o.get("_manual")]
+    if not ex:
+        return {"count": 0, "sample": []}
+    _kept, info = reconcile_manual_with_report(ex, new_ops, apply=False)
+    return {"count": len(info), "sample": info[:5]}
+
+
+# ───────────── пересчёт счёта ─────────────
+def manual_recompute(client, ops):
+    """Операции счёта после правки: поиск бумаг для новых записей, порядок по датам, FIFO и доходность сделок."""
+    ops = [dict(o) for o in ops]
+    for o in ops:
+        o.pop("yield", None)
+        o.pop("_yield", None)
+        if str(o.get("instrumentUid") or "").startswith("imp:") and not o.get("_ident"):
+            o["_ident"] = o["instrumentUid"][4:]
+    if any(o.get("_ident") for o in ops):
+        imp_apply_idents(client, ops)
+    ops.sort(key=lambda o: (o.get("date") or "", 0 if o.get("_opening") else 1))
+    fifo(ops)
+    for o in ops:
+        if "_yield" in o:
+            o["yield"] = to_money(round(o.pop("_yield"), 9), cur_of(o["payment"]))
+    return ops
+
+
+def _man_check_acc(lst, acc_id):
+    x = next((a for a in lst if a.get("id") == acc_id), None)
+    if x is None or not str(acc_id).startswith("imp-") or x.get("sync_src") or x.get("demo") or acc_id == DEMO_ID:
+        raise ApiError("Ручные записи можно добавлять только в счета из импорта и ручные счета.", 400)
+    return x
+
+
+def _man_num(v, name, lo=0.0, hi=1e12, req=False):
+    if v is None or str(v).strip() == "":
+        if req:
+            raise ApiError("Заполните поле «%s»." % name, 400)
+        return None
+    try:
+        x = float(str(v).replace(",", ".").replace(" ", "").replace(" ", ""))
+    except ValueError:
+        raise ApiError("Поле «%s»: нужно число." % name, 400)
+    if x != x or x < lo or x > hi:
+        raise ApiError("Поле «%s»: значение вне допустимых границ." % name, 400)
+    return x
+
+
+def manual_build(body, now=None):
+    """Тело запроса -> список операций группы (сделка, комиссия, пополнение). Проверяет значения."""
+    kind = str(body.get("kind") or "buy")
+    if kind not in MAN_TYPES:
+        raise ApiError("Неизвестный тип операции.", 400)
+    mode = "position" if body.get("mode") == "position" else "op"
+    try:
+        day = datetime.strptime(str(body.get("date") or date.today().isoformat())[:10], "%Y-%m-%d").date()
+    except ValueError:
+        raise ApiError("Дата указана неверно.", 400)
+    if day > date.today() + timedelta(days=1) or day.year < 1990:
+        raise ApiError("Дата вне допустимых границ.", 400)
+    cur = str(body.get("currency") or "rub").lower()
+    if not re.fullmatch(r"[a-z]{3}", cur):
+        raise ApiError("Валюта указана неверно.", 400)
+    ident = str(body.get("ident") or "").strip().upper()[:24]
+    ticker = str(body.get("ticker") or "").strip().upper()[:24]
+    name = str(body.get("name") or "").strip()[:120]
+    if mode == "position":
+        kind = "buy"
+    if kind in MAN_NEED_SEC and not ident:
+        raise ApiError("Укажите бумагу: тикер или ISIN.", 400)
+    qty = _man_num(body.get("qty"), "Количество", 0.0, 1e9, req=kind in MAN_TRADE)
+    if kind in MAN_TRADE and not qty:
+        raise ApiError("Количество должно быть больше нуля.", 400)
+    price = _man_num(body.get("price"), "Цена", 0.0, 1e9)
+    amount = _man_num(body.get("amount"), "Сумма", 0.0, 1e12)
+    nkd = _man_num(body.get("nkd"), "НКД", 0.0, 1e12) or 0.0
+    comm = _man_num(body.get("commission"), "Комиссия", 0.0, 1e9) or 0.0
+    if kind in MAN_TRADE:
+        total = amount if amount else (qty * price + nkd if price else None)
+    else:
+        total = amount
+    if not total or total <= 0:
+        raise ApiError("Укажите цену или сумму операции.", 400)
+    total = round(total, 2)
+    gid = str(body.get("group") or "")
+    if gid:
+        if not re.fullmatch(r"man-[a-z0-9]{3,24}", gid):
+            raise ApiError("Неверный номер записи.", 400)
+    else:
+        gid = "man-" + uuid.uuid4().hex[:12]
+    t = (now if now is not None else time.time())
+    iso = day.strftime("%Y-%m-%dT12:00:00Z")
+    main = {"id": gid, "date": iso, "type": "OPERATION_TYPE_" + MAN_TYPES[kind],
+            "payment": to_money(MAN_SIGN[kind] * total, cur), "name": name or ident or ticker or "Ручная запись",
+            "_manual": True, "_u": t}
+    if ident:
+        main["_ident"] = ident
+    if ticker and ticker != ident:
+        main["_ticker"] = ticker
+    if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}\d", ident):
+        main["_isin"] = ident
+    if mode == "position":
+        main["_position"] = True
+    if qty:
+        main["quantity"] = main["quantityDone"] = str(int(qty)) if qty == int(qty) else repr(round(qty, 9))
+        main["price"] = to_money(round(total / qty, 9) if kind in MAN_TRADE else (price or 0), cur)
+    out = [main]
+    if comm and kind in MAN_TRADE:
+        out.append({"id": gid + "-f", "date": iso, "type": "OPERATION_TYPE_BROKER_FEE", "payment": to_money(-round(comm, 2), cur),
+                    "name": "Комиссия: " + main["name"], "_manual": True, "_pair": gid, "_u": t,
+                    **({"_ident": ident} if ident else {})})
+    if kind == "buy" and body.get("autocash", True):
+        out.append({"id": gid + "-c", "date": iso, "type": "OPERATION_TYPE_INPUT", "payment": to_money(round(total + comm, 2), cur),
+                    "name": "Пополнение под покупку", "_manual": True, "_manual_autocash": True, "_pair": gid, "_u": t})
+    return out
+
+
+def _man_group(o):
+    i = str(o.get("id") or "")
+    return i[:-2] if i.endswith(("-f", "-c")) and o.get("_pair") else i
+
+
+def manual_post(cfg, body):
+    act = str(body.get("action") or "save")
+    st = store()
+    with _man_lock:
+        lst = imports_list()
+        if act == "delete":
+            acc_id, gid = str(body.get("acc") or ""), str(body.get("group") or "")
+            _man_check_acc(lst, acc_id)
+            ops = st.ops(acc_id)
+            keep = [o for o in ops if not (o.get("_manual") and _man_group(o) == gid)]
+            if len(keep) == len(ops):
+                raise ApiError("Запись не найдена.", 404)
+            _man_store(cfg, lst, acc_id, keep)
+            return {"ok": True, "removed": len(ops) - len(keep)}
+        acc_id = str(body.get("acc") or "")
+        if not acc_id:
+            nm = str(body.get("acc_name") or "").strip()[:80]
+            if not nm:
+                raise ApiError("Выберите счёт или назовите новый ручной счёт.", 400)
+            demo_remove()
+            acc_id = "imp-" + uuid.uuid4().hex[:10]
+            lst.append({"id": acc_id, "name": nm, "broker": "Ручной учёт", "created": utc_now_str(), "files": [], "manual": True,
+                        "broker_id": broker_detect_import("", b"", "", str(body.get("broker") or ""), nm)})
+        _man_check_acc(lst, acc_id)
+        new = manual_build(body)
+        gid = new[0]["id"]
+        ops = [o for o in st.ops(acc_id) if not (o.get("_manual") and _man_group(o) == gid)]
+        if str(body.get("group") or "") and len(ops) == len(st.ops(acc_id)):
+            raise ApiError("Запись для правки не найдена.", 404)
+        _man_store(cfg, lst, acc_id, ops + new)
+        return {"ok": True, "acc": acc_id, "group": gid}
+
+
+def _man_store(cfg, lst, acc_id, ops):
+    ops = manual_recompute(TInvest(cfg), ops)
+    st = store()
+    st.ops_clear(acc_id)
+    st.ops_put(acc_id, ops)
+    for a in lst:
+        if a["id"] == acc_id:
+            a["ops"] = len(ops)
+    st.put("imports", lst)
+    mem_clear()
+    sync_kick_safe()
+
+
+def manual_list(cfg, acc, q, force):
+    """Ручные записи счёта: группы (сделка + комиссия + пополнение) для таблицы правки."""
+    acc_id = str((q or {}).get("acc") or "")
+    lst = imports_list()
+    out = []
+    for a in lst:
+        if acc_id and a["id"] != acc_id:
+            continue
+        if a.get("sync_src") or a.get("demo") or a["id"] == DEMO_ID:
+            continue
+        groups = {}
+        for o in store().ops(a["id"]):
+            if o.get("_manual"):
+                groups.setdefault(_man_group(o), []).append(o)
+        for gid, g in groups.items():
+            m = next((o for o in g if o["id"] == gid), None)
+            if not m:
+                continue
+            fee = next((o for o in g if o["id"].endswith("-f")), None)
+            out.append({"acc": a["id"], "acc_name": a.get("name"), "group": gid, "date": (m.get("date") or "")[:10],
+                        "type": classify(m.get("type")), "name": m.get("name") or "", "ident": m.get("_sec") or m.get("_isin") or "",
+                        "qty": op_qty(m), "amount": round(abs(qf(m.get("payment"))), 2), "currency": cur_of(m.get("payment")).upper(),
+                        "commission": round(abs(qf(fee.get("payment"))), 2) if fee else 0.0,
+                        "autocash": any(o.get("_manual_autocash") for o in g), "position": bool(m.get("_position"))})
+    out.sort(key=lambda r: (r["date"], r["group"]), reverse=True)
+    return {"rows": out[:500], "accounts": [{"id": a["id"], "name": a.get("name")} for a in lst
+                                           if str(a["id"]).startswith("imp-") and not (a.get("sync_src") or a.get("demo") or a["id"] == DEMO_ID)]}
+
+
+def manual_search(cfg, acc, q, force):
+    """Поиск бумаги для ручной записи: тикер, ISIN или название (облигации, акции, фонды). Цена — по рынку."""
+    s = str((q or {}).get("q") or "").strip().lower()
+    if len(s) < 2:
+        return {"rows": []}
+    out = []
+
+    def ok(*vals):
+        return any(s in str(v or "").lower() for v in vals)
+    try:
+        for r in screener_rows():
+            if ok(r.get("name"), r.get("isin"), r.get("id"), r.get("full")):
+                out.append({"ident": r.get("isin") or r["id"], "ticker": r["id"], "name": r.get("name") or r["id"], "kind": "bond",
+                            "price": r.get("price"), "price_pct": True, "nominal": r.get("nominal"), "nkd": r.get("nkd"),
+                            "currency": (r.get("cur") or "RUB").lower(), "turn": r.get("turn") or 0})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for r in list(stocks_universe()) + list(funds_universe()):
+            if ok(r.get("secid"), r.get("isin"), r.get("name"), r.get("shortname")):
+                out.append({"ident": r.get("isin") or r["secid"], "ticker": r["secid"], "name": r.get("shortname") or r.get("name"),
+                            "kind": "fund" if r.get("is_fund") else "share", "price": r.get("price"), "price_pct": False,
+                            "currency": "rub", "turn": r.get("value_today") or 0})
+    except Exception:  # noqa: BLE001
+        pass
+    out.sort(key=lambda x: (not str(x["name"]).lower().startswith(s) and not x["ticker"].lower().startswith(s), -(x["turn"] or 0)))
+    return {"rows": out[:12]}
+
+
+API_POST["/api/ops/manual"] = manual_post
+API_POST["/api/ops/manual/delete"] = lambda cfg, body: manual_post(cfg, dict(body, action="delete"))
+API_GET["/api/ops/manual"] = manual_list
+API_GET["/api/ops/manual/search"] = manual_search
 # ═══════════════════════════════ счета и сводка ═══════════════════════════════
 
 _mem, _mem_lock = {}, threading.Lock()
@@ -7453,7 +7805,16 @@ def _list_accounts(cfg, key):
         for a, (t, n) in zip(accs, pool_map(tot, accs)):
             a["total"], a["empty"] = t, (t < 0.01 and n == 0)
             a["broker_id"], a["broker_name"] = "tinvest", BROKERS["tinvest"]
+        if accs and not client.sandbox:
+            try:        # названия счетов нужны облачной синхронизации (счёт без токена на другом устройстве)
+                store().put(SYNC_TB_KEY, {a["id"]: {"name": a["name"], "type": a["type"], "opened": a.get("opened")}
+                                          for a in accs if not a["closed"]})
+            except Exception:  # noqa: BLE001
+                pass
+    live = {a["id"] for a in accs}
     for imp in imports_list():
+        if imp.get("sync_src") and imp.get("src_acc") in live:
+            continue                          # на этом компьютере счёт идёт по API: снимок из облака не нужен
         a = {"id": imp["id"], "name": imp["name"], "kind": "import", "type": imp.get("broker") or "",
              "closed": False, "opened": None}
         a["broker_id"], a["broker_name"] = broker_of_account(imp)
@@ -7710,6 +8071,69 @@ def warmup_start():
         except Exception:  # noqa: BLE001
             pass
     threading.Thread(target=job, daemon=True, name="warmup").start()
+# ═══════════════ вход в один клик: ссылка t.me/<бот>?start=auth_<нонс> без копирования ключа ═══════════════
+# Приложение создаёт на сервере ожидающую ссылку: нонс (идёт в ссылку, на сервере хранится хешем) и хеш секрета verifier
+# (сам секрет остаётся в памяти программы). Пользователь подтверждает вход в боте; приложение опрашивает сервер, предъявляя
+# verifier, и получает ключ один раз (pending -> approved -> consumed, 120 секунд). Токен Т-Инвестиций в этом обмене не участвует.
+
+_auth_link = {"nonce": "", "verifier": "", "at": 0.0}
+AUTH_LINK_TTL = 120
+
+
+def _auth_link_post(path, body):
+    srv = ds_conf()[0]
+    if not srv:
+        raise ApiError("Сервер данных отключён: вход не нужен.", 400)
+    req = urllib.request.Request(srv + "/v1/auth/" + path, data=json.dumps(body).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": EXT_UA["User-Agent"]})
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=_ssl()) as r:
+            code, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        code, raw = e.code, e.read()
+    except Exception as e:  # noqa: BLE001
+        raise ApiError("Нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__), 502)
+    try:
+        j = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        j = None
+    return code, (j if isinstance(j, dict) else {})
+
+
+def auth_link_start(cfg, body):
+    nonce, verifier = secrets.token_urlsafe(18), secrets.token_urlsafe(32)      # 24 и 43 знака; в ссылке Telegram до 64 знаков
+    code, j = _auth_link_post("start", {"nonce": nonce, "challenge": hashlib.sha256(verifier.encode("utf-8")).hexdigest()})
+    if code == 404:
+        raise ApiError("Этот сервер данных пока не поддерживает вход в один клик: вставьте ключ из бота.", 404)
+    if code == 429:
+        raise ApiError("Слишком много попыток входа, повторите позже.", 429)
+    if code != 200 or not j.get("ok"):
+        raise ApiError("Сервер не принял запрос входа (ответ %d)." % code, 502)
+    _auth_link.update(nonce=nonce, verifier=verifier, at=time.time())
+    return {"ok": True, "url": "https://t.me/%s?start=auth_%s" % (_auth["bot"].lstrip("@"), nonce), "ttl": int(j.get("ttl") or AUTH_LINK_TTL)}
+
+
+def auth_link_poll(cfg, body):
+    nonce, verifier = _auth_link["nonce"], _auth_link["verifier"]
+    if not nonce or time.time() - _auth_link["at"] > AUTH_LINK_TTL + 15:
+        _auth_link.update(nonce="", verifier="")
+        return {"state": "expired"}
+    code, j = _auth_link_post("poll", {"nonce": nonce, "verifier": verifier})
+    if code != 200 or not j.get("ok"):
+        _auth_link.update(nonce="", verifier="")
+        return {"state": "expired"}
+    st = j.get("state")
+    if st == "approved" and j.get("key"):
+        _auth_link.update(nonce="", verifier="")
+        res = auth_login(cfg, {"key": j["key"]})
+        if isinstance(res, tuple):
+            return {"state": "expired"}
+        return {"state": "approved", "auth": res}
+    return {"state": "pending" if st == "pending" else "expired"}
+
+
+API_POST["/api/auth/link/start"] = auth_link_start
+API_POST["/api/auth/link/poll"] = auth_link_poll
 # ═══════════════ единая точка исходящих запросов за ПУБЛИЧНЫМИ данными (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО, логотипы) ═══════════════
 # Публичные данные идут через сервер данных (DS_DEFAULT; для разработки и тестов — TINVEST_DATA_SERVER / TINVEST_DATA_KEY):
 # GET|POST {сервер}/v1/fetch?url=... Сервер кэширует ответы и сам ходит к источникам. При любой неудаче сервера
@@ -16732,6 +17156,7 @@ def watch_post(cfg, body):
         store().put(WATCH_KEY, items)
     mem_clear_watch()
     tg_srv_kick()
+    sync_kick_safe()
     return {"ok": True, "isins": [x["isin"] for x in items], "in_watch": any(x["isin"] == isin for x in items)}
 
 
@@ -16798,6 +17223,7 @@ def notes_post(cfg, body):
         store().put(NOTES_KEY, items)
     mem_clear_watch()
     tg_srv_kick()
+    sync_kick_safe()
     return {"ok": True}
 
 
@@ -17838,6 +18264,7 @@ def tax_settings_save(cfg, body):
                 cur["loss_carry"][str(y)] = round(a, 2)
     store().put(TAX_SETTINGS_KEY, cur)
     mem_clear_tax()
+    sync_kick_safe()
     return tax_settings()
 
 
@@ -18904,6 +19331,690 @@ API_GET["/api/tax"] = tax_get
 API_GET["/api/tax/reb"] = tax_reb_get
 API_GET["/api/tax/decl.csv"] = tax_decl_csv_get
 API_POST["/api/tax/settings"] = tax_post_settings
+# ═══════════════ облачная синхронизация между устройствами: шифрование, слепок, слияние ═══════════════
+# Токен Т-Инвестиций в слепок не входит никогда. В слепок попадают только: счета, импортированные из отчётов и добавленные
+# вручную (названия, брокер, список файлов), их операции, «снимки» счетов Т-Инвестиций (операции без токена, чтобы открыть
+# счёт на втором компьютере), список наблюдения, дневник, несекретные настройки (цели ребалансировки, тарифы брокеров, налоговые
+# настройки). Слепок сжимается и шифруется на этом компьютере ключом из кодовой фразы (AES-256-CTR + HMAC-SHA256, как у резервной
+# копии) — сервер хранит только шифртекст и прочитать его не может.
+# Слияние — трёхстороннее (прежнее согласованное состояние, локальное, удалённое) по записям: правка с одной стороны побеждает
+# неизменённое с другой, удаление с одной стороны переносится, при правках с обеих сторон побеждает более свежая запись.
+import zlib
+
+SYNC_MAGIC = b"TINVSYN1"
+SYNC_ITER = 300000
+SYNC_V = 1
+SYNC_TOMB_DAYS = 180
+SYNC_CFG_KEYS = ("targets", "broker_tariffs")
+SYNC_BASE_KEY, SYNC_STATE_KEY, SYNC_TB_KEY = "sync_base_v1", "sync_state_v1", "tb_accounts_v1"
+SYNC_BOT_ACC = "imp-tgbot"           # ручной счёт для операций, присланных боту
+SYNC_MASS_LOSS = 0.5                  # пропала больше половины записей: считаем, что локальные данные сброшены, а не удалены
+SYNC_SECRET_FIELDS = ("token", "data_key", "backup_password", "sync_master")
+SECRET_KEYS.add("sync_master")
+
+
+class SyncError(Exception):
+    pass
+
+
+# ───────────── шифрование ─────────────
+def sync_derive(phrase, salt_b64):
+    """Кодовая фраза + соль -> 32-байтный мастер-ключ (PBKDF2-HMAC-SHA256). Фраза на диск не сохраняется."""
+    import unicodedata
+    p = unicodedata.normalize("NFC", str(phrase or "")).strip()
+    if len(p) < 12:
+        raise SyncError("Кодовая фраза слишком короткая: нужно не меньше 12 символов.")
+    salt = base64.b64decode(salt_b64.encode("ascii"))
+    return hashlib.pbkdf2_hmac("sha256", p.encode("utf-8"), salt, SYNC_ITER, 32)
+
+
+def sync_new_salt():
+    return base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+
+
+def sync_new_phrase():
+    """Случайная фраза: 5 групп по 4 символа из алфавита без похожих знаков (около 100 бит)."""
+    al = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "-".join("".join(secrets.choice(al) for _ in range(4)) for _ in range(5))
+
+
+def _sync_keys(master):
+    return (hmac.new(master, b"tinvest-sync-enc", hashlib.sha256).digest(),
+            hmac.new(master, b"tinvest-sync-mac", hashlib.sha256).digest())
+
+
+def sync_seal(master, plain):
+    """MAGIC(8) | nonce(12) | шифртекст | HMAC-SHA256(32) по всему предыдущему."""
+    ek, mk = _sync_keys(master)
+    nonce = secrets.token_bytes(12)
+    head = SYNC_MAGIC + nonce
+    body = aes256_ctr(ek, nonce + b"\0\0\0\0", plain)
+    return head + body + hmac.new(mk, head + body, hashlib.sha256).digest()
+
+
+def sync_open(master, blob):
+    if len(blob) < 8 + 12 + 32 or blob[:8] != SYNC_MAGIC:
+        raise SyncError("Облачная копия повреждена или создана другой версией программы.")
+    ek, mk = _sync_keys(master)
+    if not hmac.compare_digest(hmac.new(mk, blob[:-32], hashlib.sha256).digest(), blob[-32:]):
+        raise SyncError("Неверная кодовая фраза или облачная копия повреждена.")
+    return aes256_ctr(ek, blob[8:20] + b"\0\0\0\0", blob[20:-32])
+
+
+def sync_pack(recs, tombs, device="", now=None):
+    doc = {"v": SYNC_V, "device": device, "at": now if now is not None else time.time(), "recs": recs, "tombs": tombs}
+    return zlib.compress(json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 6)
+
+
+def sync_unpack(plain):
+    try:
+        doc = json.loads(zlib.decompress(plain).decode("utf-8"))
+    except (zlib.error, ValueError, UnicodeDecodeError):
+        raise SyncError("Облачная копия повреждена.")
+    if not isinstance(doc, dict) or doc.get("v") != SYNC_V or not isinstance(doc.get("recs"), dict):
+        raise SyncError("Облачная копия создана более новой версией программы: обновите TAnalytic.")
+    return doc["recs"], dict(doc.get("tombs") or {})
+
+
+# ───────────── записи слепка ─────────────
+def _sync_sig(v):
+    return json.dumps(v, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _sync_same(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    return _sync_sig(a.get("v")) == _sync_sig(b.get("v"))
+
+
+def _sync_logical(acc_id):
+    return acc_id
+
+
+def _sync_rec_op(o, derived):
+    """Запись операции; метка времени — момент правки ручной записи (_u), чтобы в споре побеждала правка, сделанная позже,
+    а не та, что раньше дошла до облака."""
+    r = {"k": "op", "v": _sync_op_clean(o, derived)}
+    if o.get("_u"):
+        r["u"] = float(o["_u"])
+    return r
+
+
+def _sync_op_clean(o, derived):
+    o = {k: v for k, v in o.items() if k not in ("_acc", "_accname")}
+    if derived:                       # доходность сделки пересчитывается FIFO на каждом устройстве
+        o.pop("yield", None)
+        o.pop("_yield", None)
+    return o
+
+
+def sync_collect(cfg, st=None):
+    """Локальное состояние -> {rid: {"k": вид, "v": значение}}. Без токена, счетов брокера по API и секретов."""
+    st = st or store()
+    recs = {}
+    demo = lambda x: bool(x.get("demo") or x.get("id") == DEMO_ID)      # noqa: E731
+    live_ids = set()
+    tbm = st.get(SYNC_TB_KEY) or {}
+    if (cfg.get("token") or "").strip() and not cfg.get("sandbox"):
+        pre = token_key(cfg) + ":"
+        for aid, m in tbm.items():
+            ops = st.ops(pre + aid)
+            if not ops:
+                continue
+            live_ids.add(aid)
+            recs["acc:tb:" + aid] = {"k": "acc", "v": {"kind": "tb", "aid": aid, "name": str(m.get("name") or aid)[:80],
+                                                         "type": str(m.get("type") or "")[:20]}}
+            for o in ops:
+                recs["op:tb:%s|%s" % (aid, op_key(o))] = _sync_rec_op(o, False)
+    for x in imports_list():
+        if demo(x) or not str(x.get("id") or "").startswith("imp-"):
+            continue
+        xid = x["id"]
+        if x.get("sync_src") == "tinvest":                      # снимок счёта Т-Инвестиций, полученный из облака
+            aid = x.get("src_acc") or ""
+            if aid in live_ids or not aid:
+                continue                                       # на компьютере с токеном источник истины — API
+            recs["acc:tb:" + aid] = {"k": "acc", "v": {"kind": "tb", "aid": aid, "name": str(x.get("name") or aid)[:80],
+                                                         "type": str(x.get("type") or "")[:20]}}
+            for o in st.ops(xid):
+                recs["op:tb:%s|%s" % (aid, op_key(o))] = _sync_rec_op(o, False)
+            continue
+        v = {k: val for k, val in x.items() if k != "ops"}
+        recs["acc:" + xid] = {"k": "acc", "v": v}
+        for o in st.ops(xid):
+            recs["op:%s|%s" % (xid, op_key(o))] = _sync_rec_op(o, True)
+    for it in watch_items():
+        recs["watch:" + it["isin"]] = {"k": "watch", "v": it}
+    for n in notes_all():
+        recs["note:" + n["id"]] = {"k": "note", "v": n}
+    for k in SYNC_CFG_KEYS:
+        if cfg.get(k):
+            recs["cfg:" + k] = {"k": "cfg", "v": cfg[k]}
+    tax = st.get(TAX_SETTINGS_KEY)
+    if tax:
+        recs["kv:tax"] = {"k": "kv", "v": tax}
+    return recs
+
+
+def _sync_deletable(rid):
+    """Исчезновение записи считается удалением пользователем. Операции счетов Т-Инвестиций по API не удаляются никогда."""
+    return not rid.startswith("op:tb:")
+
+
+def sync_local_view(cur, base, now):
+    """Локальные записи с метками времени правки + удаления с прошлой синхронизации. -> (recs, tombs, base_eff).
+    Метка записи: прежняя, если запись не менялась с прошлой синхронизации; иначе «сейчас»; без прежнего состояния (первая
+    синхронизация этого устройства) — 0, чтобы в спорах побеждали данные облака. Если пропало больше половины записей
+    (стёрта база, восстановлена копия), это не удаление: прежнее состояние отбрасывается, и данные вернутся из облака."""
+    brecs, btombs = base.get("recs") or {}, dict(base.get("tombs") or {})
+    lost = [rid for rid in brecs if rid not in cur and _sync_deletable(rid)]
+    if len(brecs) >= 20 and len(lost) > len(brecs) * SYNC_MASS_LOSS:
+        base, brecs, lost = {"recs": {}, "tombs": btombs}, {}, []
+    recs = {}
+    for rid, r in cur.items():
+        b = brecs.get(rid)
+        recs[rid] = {"k": r["k"], "v": r["v"], "u": (b.get("u") or 0) if b and _sync_same(b, r) else (r.get("u") or (now if brecs else 0))}
+    for rid in lost:
+        btombs[rid] = max(now, btombs.get(rid, 0))
+    return recs, btombs, base
+
+
+def _sync_killed(tombs, rid, rec):
+    t = tombs.get(rid)
+    return t is not None and t >= (rec.get("u") or 0)
+
+
+def _sync_merge_acc(a, b):
+    """Один счёт правили на двух устройствах: свежая запись + объединённый список загруженных файлов."""
+    new, old = (a, b) if (a.get("u") or 0) >= (b.get("u") or 0) else (b, a)
+    v = dict(new["v"])
+    files, seen = [], set()
+    for f in (new["v"].get("files") or []) + (old["v"].get("files") or []):
+        key = f.get("sha256") or f.get("name")
+        if key not in seen:
+            seen.add(key)
+            files.append(f)
+    if files:
+        v["files"] = files
+    return {"k": "acc", "v": v, "u": new.get("u") or 0}
+
+
+def sync_merge(base, local, remote, tombs_l, tombs_r, now):
+    """Трёхстороннее слияние записей. base/local/remote: {rid: {"k","v","u"}}. -> (merged, tombs).
+    Удаления: запись пропала с одной стороны относительно base — удаляем; удалили с одной стороны, а с другой правили —
+    побеждает более поздняя из двух меток (время удаления против времени правки)."""
+    tombs = {}
+    cutoff = now - SYNC_TOMB_DAYS * 86400
+    for src in (tombs_r or {}, tombs_l or {}):
+        for rid, ts in src.items():
+            if ts > tombs.get(rid, 0):
+                tombs[rid] = ts
+    tombs = {k: v for k, v in tombs.items() if v > cutoff}
+    out = {}
+    for rid in set(base) | set(local) | set(remote):
+        b, l, r = base.get(rid), local.get(rid), remote.get(rid)
+        if _sync_same(l, r):
+            res = l if l is not None else None
+            if l is not None and r is not None and (r.get("u") or 0) > (l.get("u") or 0):
+                res = r
+        elif _sync_same(b, l):
+            res = r
+        elif _sync_same(b, r):
+            res = l
+        elif l is None or r is None:
+            live = l if l is not None else r
+            res = None if _sync_killed(tombs, rid, live) else live
+        elif l["k"] == "acc":
+            res = _sync_merge_acc(l, r)
+        else:
+            res = r if (r.get("u") or 0) > (l.get("u") or 0) else l
+        if res is not None and _sync_killed(tombs, rid, res):
+            res = None                                    # удалено позже, чем правили
+        if res is not None:
+            out[rid] = res
+    # операции удалённых счетов не нужны
+    accs = {rid[4:] for rid in out if rid.startswith("acc:")}
+    for rid in [r for r in out if r.startswith("op:")]:
+        if rid[3:].split("|", 1)[0] not in accs:
+            out.pop(rid)
+    return out, tombs
+
+
+# ───────────── очередь из бота ─────────────
+SYNC_BOT_KINDS = {"buy": "BUY", "sell": "SELL", "deposit": "INPUT", "withdraw": "OUTPUT"}
+
+
+def sync_queue_recs(items, now):
+    """Элементы очереди бота -> записи слепка (ручные операции в счёте «Из Telegram» и заметки).
+    Идентификатор операции строится из номера в очереди, поэтому повторная обработка ничего не дублирует.
+    -> (recs, ids): ids — все разобранные элементы (в т.ч. непригодные), чтобы подтвердить и не копить их."""
+    recs, ids = {}, []
+    for it in items or []:
+        try:
+            qid = int(it["id"])
+            op = it.get("op") or {}
+            created = float(it.get("created_at") or now)
+        except (KeyError, TypeError, ValueError):
+            continue
+        ids.append(qid)
+        kind = str(op.get("kind") or "")
+        day = str(op.get("date") or "")[:10]
+        if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+            day = datetime.fromtimestamp(created, timezone.utc).strftime("%Y-%m-%d")
+        if kind == "note":
+            isin = str(op.get("isin") or "").strip().upper()
+            text = str(op.get("text") or "").strip()[:2000]
+            if re.fullmatch(r"[A-Z0-9]{6,16}", isin) and text:
+                nid = "nb%d" % qid
+                recs["note:" + nid] = {"k": "note", "u": created, "v": {"id": nid, "isin": isin, "date": day, "text": text}}
+            continue
+        if kind not in SYNC_BOT_KINDS:
+            continue
+        try:
+            qty = float(op.get("qty") or 0)
+            price = float(op.get("price") or 0)
+            amount = float(op.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        ident = str(op.get("secid") or "").strip().upper()[:24]
+        oid = "man-bot%d" % qid
+        if kind in ("buy", "sell"):
+            if not ident or qty <= 0 or (price <= 0 and amount <= 0) or qty > 1e9 or price > 1e9:
+                continue
+            total = round(amount if amount > 0 else qty * price, 2)
+            sign = -1 if kind == "buy" else 1
+            o = {"id": oid, "date": day + "T12:00:00Z", "type": "OPERATION_TYPE_" + SYNC_BOT_KINDS[kind],
+                 "payment": to_money(sign * total), "name": ident, "_ident": ident, "_manual": True, "_u": created,
+                 "quantity": str(int(qty)) if qty == int(qty) else repr(qty), "price": to_money(round(total / qty, 6))}
+            o["quantityDone"] = o["quantity"]
+            recs["op:%s|%s" % (SYNC_BOT_ACC, oid)] = {"k": "op", "u": created, "v": o}
+            if kind == "buy":                                  # деньги на покупку: пополнение на ту же сумму
+                c = {"id": oid + "-c", "date": o["date"], "type": "OPERATION_TYPE_INPUT", "payment": to_money(total),
+                     "name": "Пополнение под покупку", "_manual": True, "_manual_autocash": True, "_pair": oid, "_u": created}
+                recs["op:%s|%s" % (SYNC_BOT_ACC, c["id"])] = {"k": "op", "u": created, "v": c}
+        else:
+            if amount <= 0 or amount > 1e12:
+                continue
+            o = {"id": oid, "date": day + "T12:00:00Z", "type": "OPERATION_TYPE_" + SYNC_BOT_KINDS[kind],
+                 "payment": to_money(amount if kind == "deposit" else -amount),
+                 "name": "Пополнение" if kind == "deposit" else "Вывод", "_manual": True, "_u": created}
+            recs["op:%s|%s" % (SYNC_BOT_ACC, oid)] = {"k": "op", "u": created, "v": o}
+    if any(r["k"] == "op" for r in recs.values()):
+        recs["acc:" + SYNC_BOT_ACC] = {"k": "acc", "u": 0, "v": {
+            "id": SYNC_BOT_ACC, "name": "Из Telegram", "broker": "Ручной учёт", "manual": True, "files": [],
+            "created": utc_now_str()}}
+    return recs, ids
+# ═══════════════ облачная синхронизация: обмен с сервером данных, применение слияния, настройки ═══════════════
+# По умолчанию выключена (cfg["sync_enabled"]). Токен Т-Инвестиций на сервер не передаётся никогда; на сервер уходит
+# только зашифрованный на этом компьютере блок (см. 13l2_sync_core.py). Ключ шифрования (производный от кодовой фразы)
+# хранится в настройках как секрет и в резервные копии не попадает; сама фраза на диск не записывается.
+
+SYNC_PERIOD = 600                      # опрос облака, пока программа открыта
+SYNC_KICK_DELAY = 6                    # после правки данных — через столько секунд
+_sync_lock = threading.Lock()
+_sync_kick_state = {"timer": None}
+
+
+def sync_device_name(cfg):
+    import platform
+    name = str(cfg.get("sync_device") or "").strip()
+    return (name or {"Darwin": "macOS", "Windows": "Windows", "Linux": "Linux"}.get(platform.system(), platform.system() or "ПК"))[:40]
+
+
+def sync_req(method, path, body=None, timeout=90):
+    """{сервер}/v1/sync/<path> -> (код, dict). Бросает ApiError, если сервера или ключа нет или нет связи."""
+    srv, key = ds_conf()
+    if not srv or not key:
+        raise ApiError("Для синхронизации нужен вход по ключу из Telegram-бота.", 400)
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(srv.rstrip("/") + "/v1/sync/" + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json", "X-Client-Key": key,
+                                          "User-Agent": EXT_UA["User-Agent"]})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+            code, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        code, raw = e.code, e.read()
+    except Exception as e:  # noqa: BLE001
+        raise ApiError("Нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__), 502)
+    try:
+        j = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        j = None
+    j = j if isinstance(j, dict) else {}
+    if code in (401, 403):
+        raise ApiError("Ключ из бота не принят: войдите заново.", 401)
+    if code == 404:
+        raise ApiError("Этот сервер данных пока не поддерживает синхронизацию.", 404)
+    if code == 429:
+        raise ApiError("Слишком частые обращения к серверу, повторим позже.", 429)
+    return code, j
+
+
+def _sync_recs_equal(a, b):
+    if set(a) != set(b):
+        return False
+    return all(_sync_same(a[k], b[k]) and (a[k].get("u") or 0) == (b[k].get("u") or 0) for k in a)
+
+
+def _sync_ops_sigs(recs):
+    return {rid: _sync_sig(r["v"]) for rid, r in recs.items() if r["k"] == "op"}
+
+
+def sync_apply(cfg, merged, cur):
+    """Записывает результат слияния в локальную базу. cur — состояние до слияния (sync_collect). Токен и секреты не трогает."""
+    st = store()
+    # --- счета и операции ---
+    lst_old = imports_list()
+    byid = {x.get("id"): x for x in lst_old}
+    keep = [x for x in lst_old if x.get("demo") or x.get("id") == DEMO_ID or not str(x.get("id") or "").startswith("imp-")]
+    ops_by = defaultdict(list)
+    for rid, r in merged.items():
+        if r["k"] == "op":
+            ops_by[rid[3:].split("|", 1)[0]].append(r["v"])
+    cur_sigs, new_sigs = _sync_ops_sigs(cur), _sync_ops_sigs(merged)
+    dirty = set()
+    for rid in set(cur_sigs) | set(new_sigs):
+        if cur_sigs.get(rid) != new_sigs.get(rid):
+            dirty.add(rid[3:].split("|", 1)[0])
+    client = TInvest(cfg)
+    new_list, seen = list(keep), set()
+    for rid in sorted(merged):
+        r = merged[rid]
+        if r["k"] != "acc":
+            continue
+        v = r["v"]
+        if v.get("kind") == "tb":
+            logical, xid = "tb:" + v["aid"], "imp-tb-" + v["aid"]
+            ex = dict(byid.get(xid) or {})
+            ex.update({"id": xid, "name": v.get("name") or v["aid"], "broker": "Т-Инвестиции", "broker_id": "tinvest",
+                       "type": v.get("type") or "", "sync_src": "tinvest", "src_acc": v["aid"], "snapshot": True})
+            ex.setdefault("files", [])
+            ex.setdefault("created", utc_now_str())
+            derived = False
+        else:
+            logical, xid, ex, derived = v["id"], v["id"], dict(v), True
+        seen.add(xid)
+        ops = [dict(o) for o in ops_by.get(logical, [])]
+        if logical in dirty or xid not in byid:
+            if derived:
+                ops = manual_recompute(client, ops)
+            else:
+                ops.sort(key=lambda o: o.get("date") or "")
+            st.ops_clear(xid)
+            st.ops_put(xid, ops)
+        ex["ops"] = len(ops)
+        new_list.append(ex)
+    for x in lst_old:                              # счета, удалённые на другом устройстве
+        xid = str(x.get("id") or "")
+        if xid.startswith("imp-") and not (x.get("demo") or xid == DEMO_ID) and xid not in seen:
+            st.ops_clear(xid)
+    st.put("imports", new_list)
+    # --- наблюдение, дневник ---
+    for name, key, getter in (("watch", WATCH_KEY, watch_items), ("note", NOTES_KEY, notes_all)):
+        sid = (lambda it: it["isin"]) if name == "watch" else (lambda it: it["id"])
+        want = {rid[len(name) + 1:]: r["v"] for rid, r in merged.items() if r["k"] == name}
+        have = {sid(it): it for it in getter()}
+        if _sync_sig(want) != _sync_sig(have):
+            order = [k for k in have if k in want] + sorted(k for k in want if k not in have)
+            st.put(key, [want[k] for k in order])
+    # --- настройки ---
+    upd = {}
+    for k in SYNC_CFG_KEYS:
+        r = merged.get("cfg:" + k)
+        if r and cfg.get(k) != r["v"]:
+            upd[k] = r["v"]
+    if upd:
+        c2 = load_config()
+        c2.update(upd)
+        save_config(c2)
+    t = merged.get("kv:tax")
+    if t and st.get(TAX_SETTINGS_KEY) != t["v"]:
+        st.put(TAX_SETTINGS_KEY, t["v"])
+    mem_clear()
+    try:
+        mem_clear_watch()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sync_state_save(**kw):
+    st = dict(store().get(SYNC_STATE_KEY) or {})
+    st.update(kw)
+    store().put(SYNC_STATE_KEY, st)
+    return st
+
+
+def sync_cfg_ready(cfg):
+    return bool(cfg.get("sync_enabled") and cfg.get("sync_master") and cfg.get("sync_salt"))
+
+
+def sync_run(reason=""):
+    """Один цикл: забрать из облака, слить, при необходимости отправить обратно и применить локально. -> статус."""
+    cfg = load_config()
+    if not sync_cfg_ready(cfg):
+        raise ApiError("Синхронизация выключена.", 400)
+    with _sync_lock:
+        try:
+            res = _sync_run(cfg)
+            _sync_state_save(error="", at=time.time(), **res)
+        except ApiError as e:
+            _sync_state_save(error=str(e))
+            raise
+        except SyncError as e:
+            _sync_state_save(error=str(e))
+            raise ApiError(str(e), 400)
+    return sync_status()
+
+
+def _sync_run(cfg):
+    st = store()
+    master, salt = bytes.fromhex(cfg["sync_master"]), cfg["sync_salt"]
+    state = st.get(SYNC_STATE_KEY) or {}
+    base = st.get(SYNC_BASE_KEY) or {}
+    device = sync_device_name(cfg)
+    now = time.time()
+    cur = sync_collect(cfg, st)
+    for _attempt in range(4):
+        code, j = sync_req("GET", "pull")
+        if code != 200 or not j.get("ok"):
+            raise ApiError("Сервер ответил %d на запрос облачной копии." % code, 502)
+        queue = j.get("queue_items") or []
+        if j.get("exists"):
+            if j.get("salt") != salt:
+                raise ApiError("Облачная копия создана с другой кодовой фразой. Выключите синхронизацию и подключитесь заново.", 409)
+            remote, tombs_r = sync_unpack(sync_open(master, base64.b64decode(j["blob"])))
+            rev = int(j["rev"])
+        else:
+            if state.get("rev"):
+                _sync_off(cfg)
+                raise ApiError("Облачная копия удалена на сервере (возможно, кнопкой на другом устройстве). Синхронизация выключена, "
+                               "данные на этом компьютере не тронуты.", 410)
+            remote, tombs_r, rev = {}, {}, 0
+        qrecs, qids = sync_queue_recs(queue, now)
+        local, tombs_l, base_eff = sync_local_view(cur, base, now)
+        for rid, r in qrecs.items():
+            if rid not in local and not _sync_killed(tombs_l, rid, r):
+                local[rid] = r
+        merged, tombs = sync_merge(base_eff.get("recs") or {}, local, remote, tombs_l, tombs_r, now)
+        pushed = False
+        if not j.get("exists") or not _sync_recs_equal(merged, remote) or tombs != tombs_r or qids:
+            blob = sync_seal(master, sync_pack(merged, tombs, device, now))
+            code, pj = sync_req("POST", "push", {"base_rev": rev, "device": device, "salt": salt, "sha256": hashlib.sha256(blob).hexdigest(),
+                                                  "blob": base64.b64encode(blob).decode("ascii"), "ack_queue_ids": qids})
+            if code == 409:
+                continue                                    # кто-то успел раньше: заново забираем и сливаем
+            if code == 413:
+                raise ApiError("Данные не помещаются в облачную копию (до 4 МБ в сжатом виде).", 413)
+            if code != 200 or not pj.get("ok"):
+                raise ApiError("Сервер не принял облачную копию (ответ %d)." % code, 502)
+            rev, pushed = int(pj["rev"]), True
+        if not _sync_recs_equal(merged, cur_with_u(cur, merged)):
+            sync_apply(cfg, merged, cur)
+        st.put(SYNC_BASE_KEY, {"recs": merged, "tombs": tombs})
+        return {"rev": rev, "device": device, "pushed": pushed, "records": len(merged), "queue_taken": len(qids)}
+    raise ApiError("Не удалось согласовать изменения: данные одновременно меняют на нескольких устройствах. Повторите позже.", 409)
+
+
+def cur_with_u(cur, merged):
+    """Локальные записи с метками слияния (для сравнения «изменилось ли что-то локально»)."""
+    return {rid: dict(r, u=(merged.get(rid) or {}).get("u") or 0) for rid, r in cur.items()}
+
+
+def _sync_off(cfg):
+    c2 = load_config()
+    c2["sync_enabled"], c2["sync_master"] = False, ""
+    save_config(c2)
+    store().put(SYNC_BASE_KEY, {})
+
+
+def sync_status(cfg=None):
+    cfg = cfg or load_config()
+    st = store().get(SYNC_STATE_KEY) or {}
+    srv, key = ds_conf()
+    return {"enabled": bool(cfg.get("sync_enabled")), "ready": sync_cfg_ready(cfg), "logged_in": bool(srv and key),
+            "rev": st.get("rev") or 0, "at": st.get("at"), "error": st.get("error") or "", "device": st.get("device") or sync_device_name(cfg),
+            "records": st.get("records") or 0, "queue_taken": st.get("queue_taken") or 0}
+
+
+def sync_run_bg(reason=""):
+    try:
+        sync_run(reason)
+    except Exception:  # noqa: BLE001      ошибка уже записана в состояние и показывается в Настройках
+        pass
+
+
+def sync_kick(delay=SYNC_KICK_DELAY):
+    """Данные изменились: через несколько секунд отправить в облако (если синхронизация включена). Серия правок — один запуск."""
+    try:
+        if not sync_cfg_ready(load_config()):
+            return
+    except Exception:  # noqa: BLE001
+        return
+    with _sync_lock_kick:
+        t = _sync_kick_state.get("timer")
+        if t:
+            t.cancel()
+        t = threading.Timer(delay, sync_run_bg, args=("kick",))
+        t.daemon = True
+        _sync_kick_state["timer"] = t
+        t.start()
+
+
+_sync_lock_kick = threading.Lock()
+
+
+def sync_loop():
+    time.sleep(25)
+    while True:
+        try:
+            if sync_cfg_ready(load_config()):
+                sync_run_bg("loop")
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(SYNC_PERIOD)
+
+
+def sync_start():
+    threading.Thread(target=sync_loop, daemon=True, name="sync").start()
+
+
+STARTUP_HOOKS.append(sync_start)
+
+
+# ───────────── включение, выключение, удаление ─────────────
+def sync_enable(cfg, body):
+    mode = str(body.get("mode") or "create")
+    srv, key = ds_conf()
+    if not srv or not key:
+        raise ApiError("Для синхронизации нужен вход по ключу из Telegram-бота.", 400)
+    code, meta = sync_req("GET", "meta")
+    phrase, generated = str(body.get("phrase") or "").strip(), False
+    if mode == "create":
+        if meta.get("exists"):
+            raise ApiError("На сервере уже есть облачная копия. Подключитесь к ней по её кодовой фразе или сначала удалите её.", 409)
+        if not phrase:
+            phrase, generated = sync_new_phrase(), True
+        salt = sync_new_salt()
+        master = sync_derive(phrase, salt)
+    elif mode == "join":
+        if not meta.get("exists"):
+            raise ApiError("На сервере нет облачной копии: сначала включите синхронизацию на другом устройстве.", 404)
+        salt = meta["salt"]
+        try:
+            master = sync_derive(phrase, salt)
+            code, j = sync_req("GET", "pull")
+            sync_open(master, base64.b64decode(j["blob"]))          # проверка кодовой фразы до сохранения
+        except SyncError as e:
+            raise ApiError(str(e), 400)
+    else:
+        raise ApiError("Неизвестный режим.", 400)
+    c2 = load_config()
+    c2.update(sync_enabled=True, sync_master=master.hex(), sync_salt=salt)
+    save_config(c2)
+    store().put(SYNC_BASE_KEY, {})
+    store().put(SYNC_STATE_KEY, {})
+    try:
+        sync_run("enable")
+    except ApiError:
+        pass
+    out = sync_status()
+    out["ok"] = True
+    if generated:
+        out["phrase"] = phrase
+    return out
+
+
+def sync_disable(cfg, delete_remote=False):
+    """Выключает синхронизацию; локальные данные остаются. delete_remote — ещё и стирает облачную копию и очередь на сервере."""
+    deleted = None
+    if delete_remote:
+        code, j = sync_req("POST", "delete", {})
+        if code != 200:
+            raise ApiError("Не удалось удалить данные на сервере (ответ %d). Синхронизация осталась включённой." % code, 502)
+        deleted = bool(j.get("deleted"))
+    c2 = load_config()
+    c2["sync_enabled"], c2["sync_master"], c2["sync_salt"] = False, "", ""
+    save_config(c2)
+    store().put(SYNC_BASE_KEY, {})
+    store().put(SYNC_STATE_KEY, {})
+    out = sync_status()
+    out.update(ok=True, deleted=deleted)
+    return out
+
+
+def sync_server_info():
+    """Есть ли облачная копия на сервере (для экрана подключения второго устройства)."""
+    code, j = sync_req("GET", "meta")
+    return {"exists": bool(j.get("exists")), "rev": j.get("rev") or 0, "updated_at": j.get("updated_at"),
+            "device": j.get("device") or "", "size": j.get("size") or 0, "queue": j.get("queue") or 0}
+
+
+def sync_post(cfg, body):
+    act = str(body.get("action") or "")
+    if act == "enable":
+        return sync_enable(cfg, body)
+    if act == "now":
+        return sync_run("manual")
+    if act == "disable":
+        return sync_disable(cfg, bool(body.get("delete_remote")))
+    if act == "delete":
+        return sync_disable(cfg, True)
+    raise ApiError("Неизвестное действие.", 400)
+
+
+def sync_get(cfg, acc, q, force):
+    out = sync_status(cfg)
+    if force and out["logged_in"]:
+        try:
+            out["server"] = sync_server_info()
+        except ApiError as e:
+            out["server_error"] = str(e)
+    return out
+
+
+API_GET["/api/sync"] = sync_get
+API_POST["/api/sync"] = sync_post
 # ═══════════════════════════════ зашифрованная резервная копия и экспорт ═══════════════════════════════
 # Шифрование: стандартный AES-256 (FIPS-197) в режиме CTR (NIST SP 800-38A) на чистом Python + HMAC-SHA256
 # (encrypt-then-MAC), ключи из пароля через PBKDF2-HMAC-SHA256. Своих шифров нет.
@@ -20039,7 +21150,7 @@ def _ld_protected_keys():
     names = ("WATCH_KEY", "NOTES_KEY", "TG_SENT_KEY", "TG_STATE_KEY", "TG_SRV_KEY", "TAX_SETTINGS_KEY",
              "SIG_HIST_KEY", "RT_LOG_KEY", "MKT_HIST_KEY", "MKT_HIST2_KEY", "MON_SNAP_KEY",
              "PRI_SNAP_KEY", "BF_KEY", "FNG_SP_KEY", "FNG_FL_KEY", "_WI_KEY")
-    keys = {"backup_status", "weekly_cpi_notes_v1"}
+    keys = {"backup_status", "weekly_cpi_notes_v1", "sync_base_v1", "sync_state_v1", "tb_accounts_v1"}
     for n in names:
         v = globals().get(n)
         if isinstance(v, str):
@@ -28688,6 +29799,8 @@ class Handler(BaseHTTPRequestHandler):
                 save_config(cfg)
                 ds_reset()
                 mem_clear(persist=False)        # сохранённые отчёты привязаны к токену (token_key): настройки их не портят
+                if "targets" in body or "broker_tariffs" in body:
+                    sync_kick_safe()
                 return self.send(200, {"ok": True, "app": APP_NAME})
             if path == "/api/ratings/refresh":
                 return self.send(200, {"started": ratings_start(force=True), **ratings_status()})
@@ -28736,6 +29849,7 @@ class Handler(BaseHTTPRequestHandler):
                 store().put("imports", lst)
                 store().ops_clear(body.get("id") or "")
                 mem_clear()
+                sync_kick_safe()
                 return self.send(200, {"ok": True, "app": APP_NAME})
             if path in ("/api/sandbox/open", "/api/sandbox/payin"):
                 if not cfg["sandbox"]:
@@ -29468,6 +30582,9 @@ tr.scr-low td{opacity:.5}
 .cl-fan3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px;text-align:center}
 .cl-mx td,.cl-mx th{text-align:center}.cl-mx td.l,.cl-mx th.l{text-align:left}
 .cl-main .g.g2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.cl-main .g.g2>*{min-width:0}
+.cl-main .g.g4{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:14px}.cl-main .g.g4>*{min-width:0}
+.cl-main .kpi .v{font-size:clamp(17px,1.4vw,21px);white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;line-height:1.2}
+.cl-main .kpi .s{white-space:normal;overflow:visible;text-overflow:clip}
 @media(max-width:1500px){.cl-main .g.g2{grid-template-columns:1fr}}
 /* оферты и лесенка */
 .of-card{margin-bottom:14px}.of-urgent{border-color:#ff6b6b55}
@@ -33059,8 +34176,9 @@ function pOps(){
   return`<div class="card"><div class="row" style="margin-bottom:14px">
     <input class="in" id="oq" placeholder="Поиск: название, тикер, тип операции…" value="${esc(S.opsQ)}" style="flex:1;min-width:240px">
     <div class="seg" id="ok">${KINDS.map(([k,t])=>`<button class="${k===S.opsK?'on':''}" data-k="${k}">${t}</button>`).join('')}</div>
-    <a class="btn ghost" style="text-decoration:none" href="/api/operations.csv?${new URLSearchParams({period:S.period,account:S.account})}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',2)}CSV</a></div>
-    <div id="otab"></div></div>`;
+    <a class="btn ghost" style="text-decoration:none" href="/api/operations.csv?${new URLSearchParams({period:S.period,account:S.account})}">${svgI('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',2)}CSV</a>
+    <button class="btn" id="man-add" title="Внести сделку или текущую позицию вручную, без загрузки отчёта">+ Добавить сделку</button></div>
+    <div id="otab"></div></div><div id="man-list"></div>`;
 }
 function drawOps(){
   const all=opsFiltered(),rows=all.slice(0,S.opsN),el=$('#otab');if(!el)return;
@@ -33421,6 +34539,7 @@ async function renderImport(){
     const cash=Object.entries(pv.cash_bad||{});
     step=`<div class="card fade"><h2>2. ${esc(pv.title)}<span class="sp">${esc(im.filename)} · ${ddm(pv.period.from)} — ${ddm(pv.period.to)}</span></h2>
       <div class="msg ok">Распознан формат «${esc(pv.title)}». Операций: <b>${pv.count}</b><br>${Object.entries(bd).filter(e=>e[1]).map(([k,v])=>`${ru[k]||k}: ${v}`).join(' · ')}</div>
+      ${pv.manual_matches&&pv.manual_matches.count?`<div class="msg info">Найдено ручных сделок, уже попавших в этот отчёт: <b>${pv.manual_matches.count}</b>. При загрузке они будут заменены строками отчёта, а не задвоятся.${pv.manual_matches.sample.map(m=>`<br>${ddm(m.date)} · ${esc(m.name)} · ${m.qty} шт. · ${f2(m.amount)}`).join('')}</div>`:''}
       <p class="note" style="margin:10px 0">${pv.repo_skipped?`Сделки РЕПО (${pv.repo_skipped} строк) и строки`:'Строки'} отчёта, дублирующие сделки (${pv.mirror_skipped}), не считаются: деньги и бумаги берутся из сделок, выплат и налогов. Входящие остатки на начало периода (бумаг: ${pv.opening_sec}) добавляются служебными операциями и снимаются сами, когда загружен более ранний отчёт${pv.xfer?`; движений бумаг без сделок: ${pv.xfer}`:''}.</p>
       <div class="msg ${pv.cash_ok&&!pv.pos_bad?'ok':'err'}">Сверка с итогами отчёта: деньги ${pv.cash_ok?'сходятся':'не сходятся ('+cash.map(([c,v])=>`${c.toUpperCase()}: по отчёту ${f0(v[0])}, по операциям ${f0(v[1])}`).join('; ')+')'}; бумаги — ${pv.pos_bad?`расхождений: ${pv.pos_bad} из ${pv.pos_total}`:`все ${pv.pos_total} сходятся`}.</div>
       <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${pv.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>
@@ -33442,13 +34561,14 @@ async function renderImport(){
         <div style="margin-top:8px;font-weight:600">Перетащите файл сюда или нажмите, чтобы выбрать</div>
         <div class="note" style="margin-top:4px">CSV, Excel (.xlsx) или HTML-отчёт брокера — Сбер, ВТБ, Альфа, БКС, Финам и др.</div></div>
       <div class="g g3" style="margin-top:16px;gap:12px">
-        <label class="field"><span>Куда загрузить</span><select class="in" id="itarget"><option value="">Новый счёт</option>${imps.map(x=>`<option value="${esc(x.id)}"${im&&im.target===x.id?' selected':''}>${esc(x.name)}</option>`).join('')}</select></label>
+        <label class="field"><span>Куда загрузить</span><select class="in" id="itarget"><option value="">Новый счёт</option>${imps.filter(x=>!x.sync_src).map(x=>`<option value="${esc(x.id)}"${im&&im.target===x.id?' selected':''}>${esc(x.name)}</option>`).join('')}</select></label>
         <label class="field"><span>Название счёта</span><input class="in" id="iname" placeholder="Например: Сбер ИИС" value="${esc(im&&im.name||'')}"></label>
         <label class="field"><span>Брокер</span><input class="in" id="ibroker" placeholder="Сбер, ВТБ, БКС…" value="${esc(im&&im.broker||'')}"></label></div>
       <p class="note" style="margin-top:12px">Лучше всего подходит выгрузка всех операций (сделки + движение денег) за всё время. Если формат не распознаётся — заполните <a href="/api/import/template.csv" download="tanalytic-template.csv" style="color:var(--ac)">шаблон CSV</a>. Бумаги находятся по ISIN или тикеру через API Т-Инвестиций, чтобы подтянуть текущие цены, названия, логотипы и купоны. Данные сохраняются только в локальной базе.</p></div>
     ${step}
     <div class="card"><h2>Импортированные счета</h2>${imps.length?`<div class="li">${imps.map(x=>{const ps=(x.files||[]).map(f=>f.from&&f.to?[f.from,f.to]:null).filter(Boolean);const span=ps.length?` · ${ddm(ps.map(p=>p[0]).sort()[0])} — ${ddm(ps.map(p=>p[1]).sort().slice(-1)[0])}`:'';return`<div class="it">${logo({name:x.name,ticker:x.name},34)}<div><b>${esc(x.name)}</b><small>${esc(x.broker||'')}${x.broker?' · ':''}файлов: ${x.files.length} · операций: ${f0(x.ops||x.files.reduce((a,f)=>a+f.count,0))}${span}</small></div>
-      <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`}).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div></div>`;
+      <div class="row"><select class="in" data-brk="${esc(x.id)}" title="Брокер счёта: тарифы Т-Инвестиций считаются только для счетов Т-Инвестиций" style="width:auto">${Object.entries(cfg.brokers||{}).map(([k,v])=>`<option value="${k}"${k===x.broker_id?' selected':''}>${esc(v)}</option>`).join('')}</select><button class="btn ghost" data-open="${esc(x.id)}">Открыть</button><button class="btn danger" data-del="${esc(x.id)}">Удалить</button></div></div>`}).join('')}</div>`:'<div class="empty" style="padding:20px">Пока ничего не импортировано</div>'}</div>
+    <div class="card"><h2>Ручной учёт</h2><p class="note">Купили бумаги у другого брокера или хотите быстро внести текущую позицию? Добавьте сделку вручную: загружать отчёт не нужно. Когда отчёт появится, совпавшие записи заменятся строками отчёта, дублей не будет.</p><div class="row" style="margin-top:10px"><button class="btn" id="man-add2">Добавить сделку или позицию</button></div></div><div id="man-list"></div></div>`;
   const msg=(t,k)=>{$('#imsg').innerHTML=t?`<div class="msg ${k||'err'}">${t}</div>`:'';if(t)$('#imsg').scrollIntoView({block:'nearest'})};
   const drop=$('#drop'),inp=$('#ifile');
   // в окне программы — системный диалог (надёжнее скрытого <input type=file> в WebView2), в браузере — обычный выбор файла
@@ -33480,7 +34600,7 @@ async function renderImport(){
       document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=true);b.textContent='Импортирую…';
       try{const res=await post('/api/import/commit',{filename:im.filename,data:im.data,name:$('#iname').value||im.name,broker:$('#ibroker').value,target:b.dataset.tbc});
         S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
-        await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
+        await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.${res.reconciled?` Ручных записей заменено строками отчёта: ${res.reconciled}.`:''}`,'ok');load(true)}
       catch(err){document.querySelectorAll('[data-tbc]').forEach(x=>x.disabled=false);await renderImport();msg(esc(err.message))}})
   }
   if(im&&im.preview&&!tb){
@@ -33491,17 +34611,19 @@ async function renderImport(){
         let ovNote='';
         if(!$('#itarget').value&&r.overlap_account){$('#itarget').value=r.overlap_account.id;S.imp.target=r.overlap_account.id;ovNote=`<div class="msg info" style="margin-top:10px">Найдены пересекающиеся операции со счётом «${esc(r.overlap_account.name)}» (${r.overlap_account.matches} шт.) — выбран этот счёт, чтобы сделки за общий период не продублировались.</div>`}
         if(r.duplicate_of)msg('');      // то же предупреждение уже есть ниже, рядом с результатом разбора
+        const mmNote=r.manual_matches&&r.manual_matches.count?`<div class="msg info" style="margin-top:10px">Найдено ручных сделок, уже попавших в этот отчёт: <b>${r.manual_matches.count}</b>. При загрузке они будут заменены строками отчёта, а не задвоятся.${r.manual_matches.sample.map(m=>`<br>${ddm(m.date)} · ${esc(m.name)} · ${m.qty} шт. · ${f2(m.amount)}`).join('')}</div>`:'';
         const dupMsg=r.duplicate_of?`<div class="msg err" style="margin-top:10px">Этот отчёт уже загружен в счёт «${esc(r.duplicate_of.name)}». Повторная загрузка запрещена, чтобы сделки не задвоились.</div>`:'';
         $('#iresult').innerHTML=`<div class="msg ${r.count?'ok':'err'}">Распознано операций: <b>${r.count}</b>${r.skipped?`, пропущено строк: ${r.skipped}`:''}${r.from?` · с ${ddm(r.from)} по ${ddm(r.to)}`:''}<br>${Object.entries(r.kinds).map(([k,v])=>`${K[k]||k}: ${v}`).join(' · ')}</div>${dupMsg}${ovNote}
-          <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${r.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>
+          <div class="tbl" style="margin-top:10px;border:1px solid var(--line)"><table><thead><tr><th class="l">Дата</th><th class="l">Тип</th><th class="l">Инструмент</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>${r.sample.map(x=>`<tr><td class="l">${ddm(x[0])}</td><td class="l"><span class="tag">${esc(OPN[x[1]]||x[1])}</span></td><td class="l">${esc(x[2])}</td><td class="num">${x[3]||''}</td><td class="num ${cls(x[4])}">${SM(x[4],x[5])}</td></tr>`).join('')}</tbody></table></div>${mmNote}
           ${r.count&&!r.duplicate_of?'<div class="row" style="margin-top:14px"><button class="btn" id="icommit">Импортировать</button><span class="note">Бумаги будут найдены через API Т-Инвестиций — это займёт несколько секунд.</span></div>':''}`;
         const c=$('#icommit');if(c)c.onclick=async ev=>{const bb=ev.currentTarget;bb.disabled=true;bb.textContent='Импортирую…';
           try{const res=await post('/api/import/commit',{...req(),name:$('#iname').value||im.name,broker:$('#ibroker').value,target:$('#itarget').value});
             S.imp=null;S.account=res.id;S.data=S.bonds=S.hist=null;persist();
-            await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.`,'ok');load(true)}
+            await renderImport();msg(`Импортировано операций: ${res.count}${res.total!==res.count?` (всего в портфеле: ${res.total})`:''}. Бумаг найдено на бирже: ${res.resolved} из ${res.idents}.${res.reconciled?` Ручных записей заменено строками отчёта: ${res.reconciled}.`:''}`,'ok');load(true)}
           catch(err){bb.disabled=false;bb.textContent='Импортировать';msg(esc(err.message))}}}
       catch(err){$('#iresult').innerHTML=`<div class="msg err">${esc(err.message)}</div>`}finally{b.disabled=false}};
   }
+  try{const mb=$('#man-add2');if(mb)mb.onclick=()=>manualOpen();manualDrawList()}catch(e){}
   document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(!await uiConfirm({title:'Удалить импортированный счёт?', body:'Счёт и его операции будут удалены из локальной базы. Исходный файл отчёта можно загрузить снова.', danger:true, okText:'Удалить'}))return;
     await post('/api/import/delete',{id:b.dataset.del});if(S.account===b.dataset.del)S.account='all';S.data=S.bonds=S.hist=null;persist();renderImport();load(true)});
   document.querySelectorAll('[data-brk]').forEach(s=>s.onchange=async()=>{
@@ -33509,6 +34631,109 @@ async function renderImport(){
   document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{S.account=b.dataset.open;S.bonds=S.hist=null;persist();S.page='dash';renderNav();load(false)});
 }
 
+/* ── Ручной учёт: добавить сделку или текущую позицию, не загружая отчёт ── */
+const MAN={rows:[],accounts:[],pick:null};
+const MAN_KINDS=[['buy','Покупка'],['sell','Продажа'],['coupon','Купон'],['dividend','Дивиденд'],['deposit','Пополнение'],['withdraw','Вывод'],['fee','Комиссия, обслуживание']];
+const MAN_TYPE={buy:'buy',sell:'sell',coupons:'coupon',dividends:'dividend',deposits:'deposit',withdrawals:'withdraw',fee_service:'fee',fee_broker:'fee'};
+function manNum(v){const x=parseFloat(String(v==null?'':v).replace(/\s/g,'').replace(',','.'));return isFinite(x)?x:0}
+function manClose(){const o=document.getElementById('man-ov');if(o)o.remove()}
+async function manualOpen(row){
+  manClose();
+  let accs=[];
+  try{accs=(await api('/api/ops/manual')).accounts}catch(e){toast(e.message,'err');return}
+  const ed=row||null;MAN.pick=ed?{ident:ed.ident,ticker:'',name:ed.name}:null;
+  const kind=ed?(MAN_TYPE[ed.type]||'buy'):'buy';
+  const ov=document.createElement('div');ov.id='man-ov';ov.className='shr-bg';
+  ov.innerHTML=`<div class="card" role="dialog" aria-modal="true" aria-label="Ручная запись" style="width:min(640px,100%);max-height:92vh;overflow:auto">
+    <h2>${ed?'Изменить запись':'Добавить сделку или позицию'}<span class="sp"><button class="btn ghost" id="man-x" aria-label="Закрыть">Закрыть</button></span></h2>
+    <p class="note">Запись становится обычной операцией счёта: доходность, налоги и графики считаются как по отчёту. Когда вы позже загрузите отчёт брокера с этой сделкой, ручная запись будет заменена строкой отчёта, а не задвоится.</p>
+    <div class="seg" id="man-mode" style="margin:10px 0"><button data-m="op" class="${ed&&ed.position?'':'on'}">Операция</button><button data-m="position" class="${ed&&ed.position?'on':''}">Текущая позиция без истории</button></div>
+    <div class="g g3" style="gap:12px">
+      <label class="field"><span>Счёт</span><select class="in" id="man-acc">${ed?'':'<option value="">Новый ручной счёт</option>'}${accs.map(a=>`<option value="${esc(a.id)}"${ed&&ed.acc===a.id?' selected':''}>${esc(a.name)}</option>`).join('')}</select></label>
+      <label class="field" id="man-newname"><span>Название нового счёта</span><input class="in" id="man-accname" placeholder="Например: Другой брокер" value="Ручной счёт"></label>
+      <label class="field" id="man-kindf"><span>Тип операции</span><select class="in" id="man-kind">${MAN_KINDS.map(([k,t])=>`<option value="${k}"${k===kind?' selected':''}>${t}</option>`).join('')}</select></label>
+    </div>
+    <div id="man-secbox"><label class="field" style="margin-top:12px"><span>Бумага: тикер, ISIN или название</span><input class="in" id="man-q" placeholder="Например: SBER или ОФЗ 26238" autocomplete="off" value="${esc(ed?ed.name:'')}"></label>
+      <div id="man-found" class="li" style="margin-top:6px"></div></div>
+    <div class="g g3" style="gap:12px;margin-top:12px">
+      <label class="field"><span>Дата</span><input class="in" type="date" id="man-date" value="${esc(ed?ed.date:localIso(new Date()))}"></label>
+      <label class="field" id="man-qtyf"><span>Количество, шт.</span><input class="in" id="man-qty" inputmode="decimal" value="${ed&&ed.qty?esc(ed.qty):''}"></label>
+      <label class="field" id="man-pricef"><span id="man-pricel">Цена за штуку, ₽</span><input class="in" id="man-price" inputmode="decimal" value="${ed&&ed.qty?esc(+(ed.amount/ed.qty).toFixed(4)):''}"></label>
+      <label class="field" id="man-nkdf"><span>НКД, ₽ (облигации)</span><input class="in" id="man-nkd" inputmode="decimal"></label>
+      <label class="field"><span id="man-amountl">Сумма, ₽</span><input class="in" id="man-amount" inputmode="decimal" value="${ed?esc(ed.amount):''}"></label>
+      <label class="field" id="man-commf"><span>Комиссия, ₽</span><input class="in" id="man-comm" inputmode="decimal" value="${ed&&ed.commission?esc(ed.commission):''}"></label>
+    </div>
+    <label class="row" id="man-cashf" style="margin-top:12px;gap:8px;align-items:center"><input type="checkbox" id="man-cash"${!ed||ed.autocash?' checked':''}><span>Учесть пополнение под покупку: деньги на счёте не уйдут в минус</span></label>
+    <div class="msg err" id="man-err" style="display:none;margin-top:10px"></div>
+    <div class="row" style="margin-top:14px"><button class="btn" id="man-save">Сохранить</button><button class="btn ghost" id="man-cancel">Отмена</button></div></div>`;
+  document.body.appendChild(ov);
+  const g=id=>document.getElementById(id),mode=()=>g('man-mode').querySelector('.on').dataset.m;
+  const showHide=()=>{
+    const pos=mode()==='position',k=pos?'buy':g('man-kind').value,trade=k==='buy'||k==='sell',sec=['buy','sell','coupon','dividend'].includes(k);
+    g('man-newname').style.display=g('man-acc').value===''?'':'none';
+    g('man-kindf').style.display=pos?'none':'';
+    g('man-secbox').style.display=sec?'':'none';
+    g('man-qtyf').style.display=trade?'':'none';g('man-pricef').style.display=trade?'':'none';g('man-nkdf').style.display=k==='buy'&&!pos?'':'none';
+    g('man-commf').style.display=trade&&!pos?'':'none';g('man-cashf').style.display=k==='buy'?'':'none';
+    g('man-pricel').textContent=MAN.pick&&MAN.pick.pct?'Цена, % от номинала':'Цена за штуку, ₽';
+    g('man-amountl').textContent=trade?'Сумма сделки, ₽ (считается сама)':'Сумма, ₽';
+    g('man-date').previousElementSibling.textContent=pos?'Дата покупки (по желанию)':'Дата';
+  };
+  const calc=()=>{
+    const q=manNum(g('man-qty').value),p=manNum(g('man-price').value),n=manNum(g('man-nkd').value);
+    const unit=MAN.pick&&MAN.pick.pct?p*(MAN.pick.nominal||1000)/100:p;
+    if(q&&p)g('man-amount').value=(+(q*unit+n).toFixed(2)).toString();
+  };
+  g('man-acc').onchange=showHide;g('man-kind').onchange=showHide;
+  g('man-mode').onclick=e=>{const b=e.target.closest('[data-m]');if(!b)return;g('man-mode').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));showHide()};
+  ['man-qty','man-price','man-nkd'].forEach(id=>g(id).oninput=calc);
+  let to;
+  g('man-q').oninput=()=>{clearTimeout(to);MAN.pick=null;to=setTimeout(async()=>{
+    const q=g('man-q').value.trim();if(q.length<2){g('man-found').innerHTML='';return}
+    try{const r=await api('/api/ops/manual/search?q='+encodeURIComponent(q));
+      g('man-found').innerHTML=r.rows.length?r.rows.map((x,i)=>`<div class="it" data-i="${i}" style="cursor:pointer"><div><b>${esc(x.name)}</b><small>${esc(x.ticker)}${x.ident&&x.ident!==x.ticker?' · '+esc(x.ident):''} · ${x.kind==='bond'?'облигация':x.kind==='fund'?'фонд':'акция'}${x.price?' · '+(x.price_pct?x.price+' %':f2(x.price)+' ₽'):''}</small></div></div>`).join(''):'<div class="note">Ничего не найдено: можно ввести тикер или ISIN вручную.</div>';
+      g('man-found').onclick=e=>{const it=e.target.closest('[data-i]');if(!it)return;const x=r.rows[+it.dataset.i];
+        MAN.pick={ident:x.ident,ticker:x.ticker,name:x.name,pct:!!x.price_pct,nominal:+x.nominal||1000};
+        g('man-q').value=x.name;g('man-found').innerHTML='';
+        if(x.price&&!g('man-price').value)g('man-price').value=x.price;
+        if(x.price_pct&&x.nkd&&!g('man-nkd').value)g('man-nkd').value=x.nkd;
+        showHide();calc()}}
+    catch(e){g('man-found').innerHTML=''}},250)};
+  g('man-x').onclick=g('man-cancel').onclick=manClose;
+  ov.addEventListener('mousedown',e=>{if(e.target===ov)manClose()});
+  g('man-save').onclick=async e=>{
+    const b=e.currentTarget,er=g('man-err');er.style.display='none';
+    const pos=mode()==='position',k=pos?'buy':g('man-kind').value,typed=g('man-q').value.trim();
+    const pk=MAN.pick||{ident:typed.toUpperCase().replace(/\s+/g,''),ticker:'',name:typed};
+    const unit=MAN.pick&&MAN.pick.pct?manNum(g('man-price').value)*(MAN.pick.nominal||1000)/100:manNum(g('man-price').value);
+    const body={acc:g('man-acc').value,acc_name:g('man-accname').value,group:ed?ed.group:'',mode:pos?'position':'op',kind:k,date:g('man-date').value||undefined,
+      ident:pk.ident,ticker:pk.ticker,name:pk.name,qty:g('man-qty').value,price:unit||'',amount:g('man-amount').value,nkd:manNum(g('man-nkd').value)||'',
+      commission:g('man-comm').value,autocash:g('man-cash').checked};
+    b.disabled=true;
+    try{await post('/api/ops/manual',body);manClose();S.data=S.bonds=S.hist=null;toast('Запись сохранена.','ok');
+      if(S.page==='ops'||S.page==='imp'){S.page==='imp'?renderImport():manualDrawList()}load(true)}
+    catch(x){er.textContent=x.message;er.style.display=''}finally{b.disabled=false}
+  };
+  showHide();
+}
+async function manualDrawList(){
+  const box=document.getElementById('man-list');if(!box)return;
+  try{const r=await api('/api/ops/manual');MAN.rows=r.rows;
+    if(!r.rows.length){box.innerHTML='';return}
+    const T={buy:'Покупка',sell:'Продажа',coupons:'Купон',dividends:'Дивиденд',deposits:'Пополнение',withdrawals:'Вывод',fee_service:'Комиссия',fee_broker:'Комиссия'};
+    box.innerHTML=`<div class="card"><h2>Ручные записи<span class="sp">${r.rows.length}</span></h2><div class="tbl"><table><thead><tr><th class="l">Дата</th><th class="l">Операция</th><th class="l">Бумага</th><th class="l">Счёт</th><th>Кол-во</th><th>Сумма</th><th></th></tr></thead><tbody>${
+      r.rows.slice(0,100).map((x,i)=>`<tr><td class="l num t2">${esc(x.date)}</td><td class="l"><span class="tag">${esc(x.position?'Позиция':T[x.type]||x.type)}</span></td><td class="l">${esc(x.name)}</td><td class="l t2">${esc(x.acc_name||'')}</td><td class="num">${x.qty||''}</td><td class="num">${f2(x.amount)}</td><td class="num"><button class="btn ghost" data-me="${i}">Изменить</button> <button class="btn ghost danger" data-md="${i}">Удалить</button></td></tr>`).join('')}</tbody></table></div></div>`;
+    box.onclick=async e=>{
+      const be=e.target.closest('[data-me]'),bd=e.target.closest('[data-md]');
+      if(be)return manualOpen(MAN.rows[+be.dataset.me]);
+      if(bd){const x=MAN.rows[+bd.dataset.md];if(!await uiConfirm({title:'Удалить ручную запись?', body:'Запись «'+x.name+'» от '+x.date+' будет удалена; вместе с ней уйдут её комиссия и пополнение под покупку.', danger:true, okText:'Удалить'}))return;
+        try{await post('/api/ops/manual/delete',{acc:x.acc,group:x.group});S.data=S.bonds=S.hist=null;toast('Запись удалена.','ok');manualDrawList();load(true)}catch(err){toast(err.message,'err')}}};
+  }catch(e){box.innerHTML=''}
+}
+function manualBindOps(){
+  const b=document.getElementById('man-add');if(b)b.onclick=()=>manualOpen();
+  manualDrawList();
+}
 /* ── Настройки: двухпанельный экран (навигация слева, панель состояния, строки-настройки) ── */
 /* ── кирпичики разметки ── */
 const ST_ICO={
@@ -33631,7 +34856,7 @@ function setDsHtml(c){
     stRow('Ключ доступа',`Выдаёт @${esc(AUTH.bot)}${keySet?' · <span class="pos">сохранён</span>, пустое поле ничего не меняет':''}`,stSecret('ds-key',keySet?'••••••••':'вставьте ключ','autocomplete="off"','Ключ доступа к серверу данных'))+
     stRow('Действия','',`<button class="btn" id="ds-save" disabled>Сохранить</button><button class="btn ghost" id="ds-test">Проверить</button>${keySet?'<button class="btn ghost danger" id="ds-clr">Удалить ключ</button>':''}`)+
     `<p class="st-line" id="ds-st">Загружаю…</p>`+
-    stMore('Что передаётся на сервер','Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через сервер TAnalytic: он сам обновляет их раз в час, поэтому экраны открываются без ожидания источников. Портфель и токен Т-Инвестиций идут напрямую в Т-Банк и на сервер не передаются.'),
+    stMore('Что передаётся на сервер','Данные рынка (Мосбиржа, ФНС, ЦБ, рейтинги, МСФО) берутся через сервер TAnalytic: он сам обновляет их раз в час, поэтому экраны открываются без ожидания источников. Токен Т-Инвестиций идёт только напрямую в Т-Банк и на сервер не передаётся никогда. Портфель на сервер не передаётся, пока вы не включите синхронизацию между устройствами (Настройки, «Данные»): тогда на сервер уходит копия, зашифрованная на вашем компьютере, которую сервер прочитать не может.'),
     {id:'ds-card',hint:'данные рынка'});
 }
 async function dsStatus(){
@@ -34007,7 +35232,7 @@ async function renderSettings(){
     <div class="msg info" id="st-empty" hidden>Ничего не найдено. Попробуйте другое слово, например «токен», «тема» или «копия».</div>
   </div></div>`;
   const main=document.getElementById('st-main');
-  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)),
+  const html=[sec(0,conn+setDsHtml(c)),sec(1,setAccHtml()+setTgHtml(c)),sec(2,look),sec(3,calc),sec(4,setLocalHtml(c)+setBackupHtml(c)+setSyncHtml(c)),
     sec(5,setNewsHtml(c)),sec(6,setDangerHtml(c))];
   main.insertAdjacentHTML('beforeend',html.join(''));
   if(keep){view.scrollTop=keep;const st=view.querySelector('.st');if(st)st.classList.remove('fade')}
@@ -34042,6 +35267,7 @@ async function renderSettings(){
   try{bindSetDs(c,msg)}catch(e){}
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
+  try{bindSetSync(c,msg)}catch(e){}
   try{bindSetCrowd(c,msg)}catch(e){}
   try{bindSetShell(msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
@@ -34064,6 +35290,65 @@ async function renderSettings(){
   if($('#clr'))$('#clr').onclick=e=>busy(e.currentTarget,async()=>{if(!await uiConfirm({title:'Удалить токен?', body:'Сохранённый токен Т-Инвестиций будет стёрт с этого компьютера.', danger:true, okText:'Удалить'}))return;await post('/api/config',{clear_token:true});if(S.cfg)S.cfg.token_set=false;updateModeBadge(S.cfg);reset();renderSettings()});
   if($('#sbopen'))$('#sbopen').onclick=e=>busy(e.currentTarget,async()=>{const r=await post('/api/sandbox/open');S.account=r.accountId;persist();S.data=null;msg('Открыт счёт '+r.accountId,1);load(true)});
   if($('#sbpay'))$('#sbpay').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sandbox/payin',{accountId:S.account,amount:$('#amt').value});S.data=S.bonds=S.hist=null;msg('Счёт пополнен на '+M(+$('#amt').value,'rub',0),1);load(true)});
+}
+/* ── Настройки: синхронизация между устройствами (выключена по умолчанию, данные шифруются на этом компьютере) ── */
+function setSyncHtml(c){
+  const enabled=!!c.sync_enabled;
+  const what='<b>Что уходит на сервер:</b> счета из отчётов брокеров и ручные счета с их операциями (даты, бумаги, количество, суммы), '+
+    'снимки счетов Т-Инвестиций (только операции, без токена), список наблюдения, дневник (вместе с текстом заметок), цели ребалансировки, тарифы брокеров и налоговые настройки. '+
+    '<b>Что не уходит никогда:</b> токен Т-Инвестиций, ключ входа, пароль резервной копии и рыночный кэш.';
+  const how='Всё это сжимается и шифруется <b>на вашем компьютере</b> ключом из кодовой фразы (AES-256). На сервере лежит только шифрованный блок: ни администратор сервера, ни бот прочитать его не могут. '+
+    'Поэтому бот не показывает ваш портфель. <b>Потеряете кодовую фразу — расшифровать копию не сможет никто</b>: её придётся удалить и создать заново. '+
+    'Одно исключение: сделки, которые вы отправили боту командами <code>/buy</code> и <code>/sell</code>, лежат на сервере открытым текстом, пока программа не заберёт их при ближайшей синхронизации.';
+  const off=`<div class="st-callout">Синхронизация <b>выключена</b>. Пока вы её не включите, портфель остаётся только на этом компьютере. Если включить, данные ниже будут храниться на сервере в зашифрованном виде.</div>
+    <p class="st-line">${what}</p><p class="st-line">${how}</p>
+    <div id="sy-need" class="st-line" hidden>Сначала войдите по ключу из Telegram-бота: синхронизация привязана к вашему аккаунту Telegram.</div>
+    ${stRow('Первое устройство','Создать облачную копию. Кодовую фразу можно придумать самому (от 12 знаков) или оставить поле пустым: тогда программа создаст случайную',`<input class="in st-wide" id="sy-new" placeholder="своя кодовая фраза (по желанию)" autocomplete="off" spellcheck="false" aria-label="Своя кодовая фраза"><button class="btn" id="sy-create">Включить и создать копию</button>`,{stack:1})}
+    ${stRow('Второе устройство','Подключиться к копии, созданной на другом компьютере: нужна её кодовая фраза',`<input class="in st-wide" id="sy-join-ph" placeholder="кодовая фраза с первого устройства" autocomplete="off" spellcheck="false" aria-label="Кодовая фраза"><button class="btn ghost" id="sy-join">Подключить это устройство</button>`,{stack:1})}`;
+  const on=`<div class="st-callout"><b>Синхронизация включена.</b> Данные шифруются на этом компьютере; сервер хранит только шифртекст.</div>
+    <p class="st-line" id="sy-st">Загружаю…</p>
+    ${stRow('Действия','Обмен происходит сам: через несколько секунд после изменений и раз в 10 минут, пока программа открыта',`<button class="btn" id="sy-now">Синхронизировать сейчас</button><button class="btn ghost" id="sy-off">Выключить на этом компьютере</button>`)}
+    ${stRow('Данные на сервере','Стирает облачную копию и очередь сделок из бота, выключает синхронизацию. Данные на этом компьютере остаются',`<button class="btn ghost danger" id="sy-del">Удалить мои данные с сервера</button>`)}
+    <p class="st-line">${what}</p><p class="st-line">${how}</p>`;
+  return stGroup('Синхронизация между устройствами',`<div id="sy-body">${enabled?on:off}</div><div id="sy-phrase"></div>`,{id:'sy-card',hint:'по желанию, выключена'});
+}
+function bindSetSync(c,msg){
+  const g=id=>document.getElementById(id);if(!g('sy-card'))return;
+  const busy=async(b,fn)=>{b.disabled=true;try{await fn()}catch(e){msg(e.message)}finally{b.disabled=false}};
+  const redraw=async()=>{try{S.cfg=await api('/api/config');if(typeof renderSettings==='function')renderSettings()}catch(e){}};
+  const showSt=async()=>{
+    const el=g('sy-st');if(!el)return;
+    try{
+      const s=await api('/api/sync');
+      el.textContent=(s.error?'Ошибка: '+s.error+' ':'')+(s.at?`Последняя синхронизация: ${authTime(s.at)}, версия ${s.rev}, устройство «${s.device}», записей: ${s.records}.`:'Ещё не синхронизировано.');
+      el.classList.toggle('st-err',!!s.error);
+    }catch(e){el.textContent=e.message||''}
+  };
+  const need=g('sy-need');
+  if(need)api('/api/sync').then(s=>{need.hidden=!!s.logged_in}).catch(()=>{});
+  if(g('sy-create'))g('sy-create').onclick=e=>busy(e.currentTarget,async()=>{
+    if(!await uiConfirm({title:'Включить синхронизацию?', body:'На сервер будет отправлен зашифрованный на этом компьютере блок: счета и операции, наблюдение, дневник, цели, тарифы и налоговые настройки. Токен Т-Инвестиций не отправляется. Без кодовой фразы расшифровать блок нельзя.', okText:'Включить'}))return;
+    const r=await post('/api/sync',{action:'enable',mode:'create',phrase:g('sy-new').value});
+    if(r.phrase){
+      g('sy-phrase').innerHTML=`<div class="st-callout warn"><b>Запишите кодовую фразу сейчас.</b> Она показывается один раз и нигде не сохраняется; без неё второе устройство не подключить, а копию не восстановить.<div style="margin:8px 0"><code id="sy-ph-val" style="font-size:16px;user-select:all">${esc(r.phrase)}</code></div><button class="btn ghost" id="sy-ph-copy">Скопировать</button> <button class="btn" id="sy-ph-ok">Я записал(а) фразу</button></div>`;
+      g('sy-ph-copy').onclick=async()=>{try{await navigator.clipboard.writeText(r.phrase);msg('Фраза скопирована.',1)}catch(x){msg('Выделите фразу и скопируйте вручную.')}};
+      g('sy-ph-ok').onclick=()=>redraw();
+      g('sy-body').hidden=true;
+    }else{msg('Синхронизация включена.',1);redraw()}
+  });
+  if(g('sy-join'))g('sy-join').onclick=e=>busy(e.currentTarget,async()=>{
+    const ph=g('sy-join-ph').value;if(!ph.trim())return msg('Введите кодовую фразу.');
+    await post('/api/sync',{action:'enable',mode:'join',phrase:ph});msg('Устройство подключено, данные загружены.',1);
+    try{S.data=S.bonds=S.hist=null}catch(x){}redraw();
+  });
+  if(g('sy-now'))g('sy-now').onclick=e=>busy(e.currentTarget,async()=>{await post('/api/sync',{action:'now'});msg('Синхронизировано.',1);showSt();try{S.data=S.bonds=S.hist=null}catch(x){}});
+  if(g('sy-off'))g('sy-off').onclick=e=>busy(e.currentTarget,async()=>{
+    if(!await uiConfirm({title:'Выключить синхронизацию?', body:'Данные на этом компьютере и копия на сервере останутся; чтобы вернуться, понадобится кодовая фраза.', okText:'Выключить'}))return;
+    await post('/api/sync',{action:'disable'});msg('Синхронизация выключена.',1);redraw()});
+  if(g('sy-del'))g('sy-del').onclick=e=>busy(e.currentTarget,async()=>{
+    if(!await uiConfirm({title:'Удалить облачную копию с сервера?', body:'Будут стёрты зашифрованный блок и очередь сделок из бота; синхронизация выключится. Данные на этом компьютере останутся. На других устройствах синхронизация остановится сама. Это нельзя отменить.', danger:true, okText:'Удалить с сервера'}))return;
+    await post('/api/sync',{action:'delete'});msg('Данные удалены с сервера.',1);redraw()});
+  showSt();
 }
 /* ── тема, печать ── */
 function themeNow(t){return t==='auto'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):t}
@@ -34426,6 +35711,13 @@ function bindReb(){
 
 /* ── список обновлений и роадмап ── */
 const CHANGELOG=[
+  ['0.31','27.11.2026',[
+    '<b>Новый калькулятор</b>: единый движок, честный ИИС-3 (срок по году открытия, лимит НДФЛ, освобождение пассивного дохода), акции, флоатеры, замещающие облигации и свой микс; вкладка «Жизнь с капитала», коридор исходов (P10–P90), сравнение двух стратегий, матрица чувствительности и цена промедления',
+    '<b>Оформление и интерфейс</b>: встроенный шрифт Inter, контрастные токены, два уровня глубины карточек, иконки duotone, выбор акцентного цвета и плотности в Настройках, свои диалоги вместо системных alert/confirm, три формата PNG-карточки (пост, квадрат, истории)',
+    '<b>Установщики и окно приложения</b>: Windows-установщик и трей с автозапуском, macOS-образ .dmg с обновлением из программы, сохранение профиля WebView, исправлена вёрстка и навигация (закреплённый низ меню, колокольчик, быстрые переходы)',
+    '<b>Синхронизация между устройствами</b> (по желанию, выключена по умолчанию; Настройки, раздел «Данные»): счета из отчётов и ручные счета, операции, снимки счетов Т-Инвестиций, наблюдение, дневник, цели и налоговые настройки переносятся на другой компьютер. Данные шифруются на вашем компьютере кодовой фразой (AES-256), сервер хранит только шифртекст и прочитать его не может; токен Т-Инвестиций не передаётся никогда. Правки с двух устройств сливаются по записям, удаления не «воскресают». Кнопка «Удалить мои данные с сервера»',
+    '<b>Ручной учёт</b>: «Добавить сделку» в разделе «Операции» и «Импорт» (покупка, продажа, купон, дивиденд, пополнение, вывод, комиссия) и режим «Текущая позиция без истории»; запись можно изменить и удалить. Когда позже загружается отчёт брокера с этой же сделкой, ручная запись заменяется строкой отчёта, а не задваивается; счёт, где были только ручные записи, больше не теряет их при первой загрузке отчёта',
+    '<b>Вход в один клик и бот</b>: кнопка «Войти через Telegram» открывает бота без копирования ключа; команды бота <code>/buy</code>, <code>/sell</code>, <code>/deposit</code>, <code>/withdraw</code> и <code>/note</code> попадают в программу при синхронизации, добавлены <code>/pays</code>, <code>/offers</code>, <code>/devices</code>, <code>/panic</code>; тихие часы и часовой пояс берутся из настроек бота (<code>/quiet</code>)']],
   ['0.29','25.11.2026',['<b>Проверка тревог на сервере, пока программа закрыта</b>: цели по наблюдению, напоминания дневника (без текста заметок), ближайшие оферты и выплаты по облигациям портфеля проверяются сервером данных каждые 15 минут, кроме ночи (22:00–08:00 МСК). Включается в «Настройках»; управлять и удалить подписку можно и в боте командой <code>/alerts</code>','<b>СЧА и расчётная цена (iNAV) фондов</b>: в карточке фонда показываются текущая iNAV Мосбиржи, отклонение биржевой цены от расчётной, последняя СЧА по отчётам УК, дата и управляющая компания','<b>Настройки</b>: кнопка «глаз» теперь показывает ранее сохранённые секреты (токен, ключ сервера данных, пароль резервной копии) с проверкой доступа только из окна программы','<b>Обучающий тур и дивиденды</b>: рамка тура отслеживает сдвиги интерфейса и появление бегущей строки; таблица дивидендных гэпов в карточке акции открывается сразу развёрнутой']],
   ['0.28','24.11.2026',['<b>Фонды</b> открываются в карточке: котировка, график, теханализ, управляющая компания и <b>состав фонда</b> с долями бумаг (у фондов Т-Капитала — фактический, у индексных — состав индекса)','<b>Дивиденды в карточке акции</b>: история выплат с 2000-х (dohod.ru), рост за 5 и 10 лет, сколько лет подряд платят, надёжность, закрытие гэпа, «держать или продать» и ваши полученные дивиденды. Выплаты, операции, календарь и скринер открывают карточку сразу на этой вкладке','<b>Комиссии</b>: оптимизатор тарифа считает только счета Т-Инвестиций и всегда за последние 12 месяцев. Брокер импортированного отчёта определяется автоматически; для других брокеров — свой блок с выбором тарифа (пока заданы тарифы ВТБ)','<b>Календарь</b>: купоны по импортированным отчётам и демо-портфелю теперь видны (график берётся с Мосбиржи), строка с ключевой ставкой и днями до следующего заседания ЦБ','Облигации в юанях и долларах получают цену с Мосбиржи без токена (по курсу ЦБ)','Рейтинги в карточке облигации ведут на пресс-релизы агентств; на кривой эмитента подписано, что значит линия','Новый экран загрузки и обновления в стиле программы, плавный переход в основное окно. Если ваше приложение устарело, программа предложит скачать новое','Обучающий тур запускается только после обновления, подсказки стали непрозрачными; база данных сама чистится от устаревшего кэша; плавное закрытие выезжающей панели']],
   ['0.27','23.11.2026',['<b>Премиальный облик</b>: спокойная графитовая палитра, карточки с глубиной, шапка в одну строку, аккуратные вкладки разделов, приглушённые значки бумаг, новая иконка приложения и лаунчер в том же стиле','<b>Графики</b> в едином стиле: широкие скруглённые столбики, тонкая сетка, линии с заливкой, пончик с зазорами, плавное появление и новые подсказки','<b>Настройки</b> заново: разделы слева и поиск по настройкам, плитки состояния (токен, сервер данных, бот, данные), переключатели сохраняются сразу, опасные действия — в отдельной зоне','<b>Рейтинги из канала @ru_ratings</b>: клик по рейтингу открывает пресс-релиз агентства, при нескольких агентствах — список','<b>Горячие клавиши</b> (? — шпаргалка): g и буква — переход в раздел, r — обновить, h — скрыть суммы, t — тема; в поиске Ctrl+K — калькулятор (например 150000*0,13) и быстрые команды','<b>Первичка</b>: затянувшиеся размещения больше не теряются, «размещено» считается с даты старта, видно число дней размещения','<b>Налоги</b>: лимит освобождения ИИС-3 (30 млн ₽), ставка вычета ИИС 13 или 15 % — в настройках налогов','Уведомления в Telegram оформлены аккуратнее; звук интерфейса убран','Исправлено: дробные количества при импорте отчётов, доходность XIRR при неупорядоченных потоках, ошибка дюрации у дефолтных бумаг, кнопка «Повторить» на карте рынка, повторные фоновые пересчёты, вход по адресу [::1]']],
@@ -34440,7 +35732,7 @@ const CHANGELOG=[
  ['0.18','12.11.2026',['<b>Новое название — TAnalytic</b> (ранее T-Invest Analytics). Ваши данные и настройки остаются на месте','<b>Ключ из бота действует 7 дней</b> вместо суток','<b>Демо-портфель</b>: на первом экране можно посмотреть программу на модельном портфеле облигаций, не вводя токен','<b>Оферты и сравнение с аналогами</b>: вместо подсказок «предъявить / держать» — сравнение доходностей к оферте, к погашению и медианы похожих выпусков','<b>Калькулятор</b>: из типов счёта оставлены обычный счёт и ИИС-3 — с 2024 года открыть ИИС типа А или Б нельзя','Календарь размещений и отчётность МСФО теперь разбираются на сервере данных — меньше поломок при изменении сайтов-источников','Защита локального сервера программы от запросов с чужих сайтов']],
  ['0.17','12.11.2026',['<b>Оферты PUT и CALL</b>: тип каждой оферты по данным Мосбиржи, все будущие даты (не только ближайшие), фильтры по сроку и типу; у одного выпуска могут быть обе','<b>Помощник по оферте</b>: когда эмитент объявит новый купон, подсказка — оставить бумагу или предъявить, и даты подачи заявки','<b>Доходность с учётом колла</b>: для CALL — худшая из доходностей к погашению и к колл-дате; лесенка переносит ступень только на пут-оферту','<b>Календарь и Telegram</b>: приём заявок, последний день и выкуп по пут-оферте, возможный колл; напоминания от @tanalyticbot','<b>Сравнение облигаций</b> рядом (до 4) и <b>документы выпуска</b> в карточке: раскрытие информации эмитента и страница на Мосбирже','<b>Налоги</b>: прогноз на 31 декабря и какие убыточные бумаги продать до конца года, чтобы уменьшить налог (с учётом ЛДВ)','<b>Калькулятор</b>: цель по пассивному доходу — сколько нужно капитала и сколько докладывать в месяц','<b>Тарифы Free и Pro</b>: портфель бесплатно, инструменты анализа — в Pro; новым пользователям 7 дней Pro в подарок','<b>Первый запуск по шагам</b>, карточка <b>«Сегодня»</b> на обзоре, <b>база знаний</b>, понятные настройки и раздел «Данные на компьютере»','Исправлено: LQDT и TMOS на графике доходности после перевода фондов на другой режим торгов; песочница больше не включена по умолчанию']],
  ['0.16','12.11.2026',['<b>Вход по ключу из Telegram-бота</b> @tanalyticbot: ключ действует 7 дней, новый — командой /key. Токен Т-Инвестиций остаётся только на этом компьютере','<b>Приложения для macOS и Windows</b>: скачать и открыть, без установки Python; программа обновляется сама, окно загрузки с прогрессом','<b>«Лесенка облигаций»</b>: вкладка «Мой портфель» — когда вернутся деньги по годам и кварталам, перегруженные и пустые годы, таблица по периодам','<b>«Первичка»</b>: объём выпуска, сколько размещено, оборот за день и разбивка по дням для новых выпусков','<b>«Ставки»</b>: понятная кривая КБД — сегодня против выбранной даты, выводы простыми словами и таблица по срокам; подписи дат на графиках больше не наезжают друг на друга']],
- ['0.15','11.11.2026',['<b>Обмены бумаг</b>: ГДР и АДР, обменянные на российские акции (TCS → T, YNDX → YDEX, FIVE → X5, Хэдхантер, Циан, Эталон, ВК), и слияние выпусков учитываются без продажи: история стоимости без провалов, налоговые лоты переходят на новую бумагу с ценой и датой покупки','<b>История стоимости</b>: дивиденды, выплаченные на карту, больше не попадают в остаток на счёте; бумаги после делистинга с нулевой оценкой брокера не держат старую цену — расчёт сходится с фактической стоимостью счетов','<b>Финансы эмитентов по МСФО</b>: отчётность групп (данные smart-lab) для эмитентов с акциями на бирже и их «дочек» (Газпром капитал, ИКС 5 Финанс и др.), отдельные схемы для банков и лизинга; РСБУ остаётся рядом для сравнения','<b>Меню по разделам</b>: «Портфель», «Учёт и планы», «Рынок», «Риски и контроль»; разделы сворачиваются, ненужные можно скрыть в «Настройках»','<b>Быстрый поиск</b> Ctrl+K / ⌘K: разделы, бумаги портфеля и каталога, команды','<b>Скрыть суммы</b> (глаз в шапке): балансы и суммы заменяются точками, проценты остаются — для скриншотов','<b>Облигации</b>: наборы колонок «Основное», «Аналитика», «Календарь»; скринер — фильтры по обороту, типу купона и сроку до оферты; ISIN копируется по клику','<b>Налоги</b>: ожидаемая доплата по прогрессивной шкале, если доходы на нескольких счетах вместе превышают порог; импорт отчётов больше не принимает удержание НДФЛ за дивиденд или купон','<b>Сервер данных</b> (по желанию): данные Мосбиржи, ФНС, ЦБ, рейтингов и МСФО можно брать через свой сервер с общим кэшем; если он недоступен — напрямую. Токен и портфель на сервер не передаются','<b>Подсказка по токену</b> со ссылкой на страницу выпуска токена в Т-Инвестициях','Исправлено: число эмитентов в облигациях, дивиденды в валюте в календаре выплат, себестоимость амортизируемых облигаций в импорте, сброс набранного текста при фоновом обновлении, понятное сообщение о восстановлении копии; строка «не является ИИР» в интерфейсе, PDF и Telegram']],
+ ['0.15','11.11.2026',['<b>Обмены бумаг</b>: ГДР и АДР, обменянные на российские акции (TCS → T, YNDX → YDEX, FIVE → X5, Хэдхантер, Циан, Эталон, ВК), и слияние выпусков учитываются без продажи: история стоимости без провалов, налоговые лоты переходят на новую бумагу с ценой и датой покупки','<b>История стоимости</b>: дивиденды, выплаченные на карту, больше не попадают в остаток на счёте; бумаги после делистинга с нулевой оценкой брокера не держат старую цену — расчёт сходится с фактической стоимостью счетов','<b>Финансы эмитентов по МСФО</b>: отчётность групп (данные smart-lab) для эмитентов с акциями на бирже и их «дочек» (Газпром капитал, ИКС 5 Финанс и др.), отдельные схемы для банков и лизинга; РСБУ остаётся рядом для сравнения','<b>Меню по разделам</b>: «Портфель», «Учёт и планы», «Рынок», «Риски и контроль»; разделы сворачиваются, ненужные можно скрыть в «Настройках»','<b>Быстрый поиск</b> Ctrl+K / ⌘K: разделы, бумаги портфеля и каталога, команды','<b>Скрыть суммы</b> (глаз в шапке): балансы и суммы заменяются точками, проценты остаются — для скриншотов','<b>Облигации</b>: наборы колонок «Основное», «Аналитика», «Календарь»; скринер — фильтры по обороту, типу купона и сроку до оферты; ISIN копируется по клику','<b>Налоги</b>: ожидаемая доплата по прогрессивной шкале, если доходы на нескольких счетах вместе превышают порог; импорт отчётов больше не принимает удержание НДФЛ за дивиденд или купон','<b>Сервер данных</b> (по желанию): данные Мосбиржи, ФНС, ЦБ, рейтингов и МСФО можно брать через свой сервер с общим кэшем; если он недоступен — напрямую. Токен на сервер не передаётся никогда; портфель уходит на сервер только если вы сами включили синхронизацию между устройствами, и только в зашифрованном на вашем компьютере виде (с версии 0.31)','<b>Подсказка по токену</b> со ссылкой на страницу выпуска токена в Т-Инвестициях','Исправлено: число эмитентов в облигациях, дивиденды в валюте в календаре выплат, себестоимость амортизируемых облигаций в импорте, сброс набранного текста при фоновом обновлении, понятное сообщение о восстановлении копии; строка «не является ИИР» в интерфейсе, PDF и Telegram']],
  ['0.14','11.11.2026',['<b>Налоги по лотам</b> (FIFO): налог по годам против удержанного брокером, ЛДВ по датам покупки и когда она наступит, ИИС (А, Б, ИИС-3), перенос убытков прошлых лет, курсовые разницы по курсу ЦБ, подсказки до конца года, сводка для 3-НДФЛ','<b>Ребалансировка с учётом налога</b>: сначала лоты с убытком или с наступившей ЛДВ','<b>Точная история стоимости портфеля</b>: исправлены фьючерсы (в кэш попадала условная стоимость контракта), одна бумага под разными идентификаторами, сплиты и консолидации, амортизация и задержка купона — исчезли ложные скачки до ±24 % в день, доходность за период и просадка теперь совпадают с XIRR по пополнениям','Рейтинги эмитентов на странице «Эмитенты» берутся из данных облигаций портфеля']],
  ['0.13','11.11.2026',['<b>«Эмитенты»</b>: отчётность компаний из ГИР БО ФНС (выручка, прибыль, долг, капитал за несколько лет), скоринг 0–100 с объяснением баллов, «рынок оценивает риск выше или ниже, чем следует из отчётности», кредитная история; блок «Финансы эмитента» в карточке облигации','<b>«Наблюдение»</b>: бумаги вне портфеля с тревогами и целями по доходности и цене, ★ в скринере и карточке; <b>дневник</b> с напоминаниями пересмотреть','<b>Уведомления в личный Telegram-бот</b> (по желанию): тревоги, цели, выплаты, ежедневная сводка','<b>«Календарь событий»</b>: заседания ЦБ, купоны, погашения, амортизации, оферты, размещения, бумаги из наблюдения; экспорт в Google/Apple Календарь (.ics)','<b>Первичка против вторички</b>: как торгуются новые выпуски через 1, 7 и 30 дней по рейтингам и отраслям','<b>«Ставки»</b>: кривая КБД сейчас против 1–12 месяцев назад и история спредов по рейтингам','<b>Зашифрованная резервная копия</b> (AES-256) в папку облачного диска, автоматически раз в день, с восстановлением; <b>экспорт таблиц</b> в Excel и CSV','Токены и пароли не попадают в обычную резервную копию']],
  ['0.12','11.11.2026',['<b>«Сравнение с рынком»</b>: портфель против индексов облигаций Мосбиржи (ОФЗ, корпоративные, ВДО), фондов ликвидности и облигационных фондов; «те же деньги в те же дни» в рублях; волатильность, просадка, коэффициент Шарпа, бета; ликвидность позиций и премия к фонду ликвидности','<b>«Калькулятор»</b> инвестиций: пополнения, реинвест купонов с округлением до лотов, налоги 13/15 %, ИИС-3 и ЛДВ, инфляция по прогнозу ЦБ, сценарии ключевой ставки, ожидаемые потери от дефолтов, сравнение стратегий и расчёт цели «пассивный доход в месяц»','<b>«Оферты»</b>: держать, предъявить к выкупу или продать на бирже — с учётом нового купона и доходности аналогов','<b>«Лесенка облигаций»</b>: подбор бумаг под сумму, срок и минимальный рейтинг с графиком выплат','Дюрационный разрыв и <b>реальная доходность</b> (за вычетом инфляции) в «Рисках и сценариях»','Флоатеры и амортизации в <b>календаре выплат</b> — по прогнозу ключевой ставки','Линия фонда ликвидности на карте рынка и в скринере','Быстрый повторный запуск: данные открываются сразу и обновляются в фоне; автотесты расчётов']],
@@ -34536,7 +35828,7 @@ function bindPage(){
   if(S.page==='pos'){sortable('#ptab','sort');const pt=$('#ptype');if(pt)pt.onclick=e=>{const b=e.target.closest('[data-t]');if(!b)return;S.posType=b.dataset.t;render()}};const pq=$('#pq');if(pq){pq.oninput=()=>{S.posQ=pq.value;posFilterApply()};posFilterApply()}
   if(S.page==='bonds')sortable('#btab','bsort');
   if(S.page==='ops'){let to;$('#oq').oninput=e=>{clearTimeout(to);to=setTimeout(()=>{S.opsQ=e.target.value;S.opsN=200;drawOps()},150)};
-    $('#ok').onclick=e=>{const b=e.target.closest('[data-k]');if(!b)return;S.opsK=b.dataset.k;S.opsN=200;$('#ok').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));drawOps()};drawOps()}
+    $('#ok').onclick=e=>{const b=e.target.closest('[data-k]');if(!b)return;S.opsK=b.dataset.k;S.opsN=200;$('#ok').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));drawOps()};drawOps();try{manualBindOps()}catch(x){}}
 }
 
 /* заставка: скрывается после первой отрисовки страницы, по таймеру (8 с) или при ошибке запуска */
@@ -37283,7 +38575,9 @@ function authOverlay(show,err){
     <div class="logo"><i>${typeof LOGO_SVG==='function'?LOGO_SVG(28):''}</i>
       <div>TAnalytic<small>аналитика портфеля</small></div></div>
     <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует 7 дней.</p>
-    <a class="btn" id="lg-bot" href="https://t.me/${bot}?start=app" target="_blank" rel="noopener noreferrer">Открыть @${bot}</a>
+    <button class="btn" id="lg-one" type="button">Войти через Telegram</button>
+    <div class="lg-n" id="lg-one-st" style="display:none" role="status"></div>
+    <a class="btn ghost" id="lg-bot" href="https://t.me/${bot}?start=app" target="_blank" rel="noopener noreferrer">Открыть @${bot} и взять ключ</a>
     <form id="lg-form" autocomplete="off">
       <input class="in" id="lg-key" placeholder="TIA-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" autofocus>
       <div class="lg-err" id="lg-err" style="display:${err?'':'none'}">${esc(err||'')}</div>
@@ -37300,7 +38594,31 @@ function authOverlay(show,err){
     catch(x){er.textContent=x.message||'Не удалось войти';er.style.display=''}
     finally{AUTH.busy=false;b.disabled=false}
   };
+  $('#lg-one').onclick=authOneClick;
   setTimeout(()=>inp.focus(),30);
+}
+/* Вход в один клик: ссылка в бота, подтверждение в Telegram, ключ приходит сам (без копирования) */
+let authLinkTimer=0;
+async function authOneClick(){
+  const st=$('#lg-one-st'),b=$('#lg-one'),er=$('#lg-err');if(!st||!b||AUTH.busy)return;
+  const say=t=>{st.textContent=t;st.style.display=t?'':'none'};
+  clearTimeout(authLinkTimer);er.style.display='none';b.disabled=true;
+  try{
+    const r=await post('/api/auth/link/start');
+    const a=document.createElement('a');a.href=r.url;a.target='_blank';a.rel='noopener noreferrer';document.body.appendChild(a);a.click();a.remove();
+    say('Откройте Telegram и нажмите «Подтвердить вход» в чате с ботом. Жду подтверждения…');
+    const until=Date.now()+(r.ttl+20)*1000;
+    const poll=async()=>{
+      if(!$('#lg-one-st'))return;
+      try{
+        const p=await post('/api/auth/link/poll');
+        if(p.state==='approved'){AUTH.st=p.auth;authApply();try{load(false)}catch(x){}return}
+        if(p.state==='expired'||Date.now()>until){say('Время подтверждения вышло. Нажмите кнопку ещё раз или вставьте ключ вручную.');b.disabled=false;return}
+      }catch(x){say(x.message||'Не удалось проверить подтверждение.');b.disabled=false;return}
+      authLinkTimer=setTimeout(poll,2000);
+    };
+    authLinkTimer=setTimeout(poll,2000);
+  }catch(x){say('');er.textContent=x.message||'Не удалось начать вход';er.style.display='';b.disabled=false}
 }
 function authApply(){
   const s=AUTH.st;if(!s)return;
@@ -37522,7 +38840,8 @@ const KB=[
 <p><b>Pro</b> — инструменты анализа: скринер и сравнение облигаций, лесенка, сигналы, риски и сценарии, мониторинг, карта рынка, сравнение доходностей по оферте, прогноз налога на 31 декабря и уведомления в Telegram.</p>
 <p><b>Пробный период.</b> Новому пользователю бот <b>@tanalyticbot</b> сам даёт 7 дней Pro после первого согласия на обработку данных. За два дня до конца и в день окончания бот пришлёт напоминание.</p>
 <p><b>Как получить Pro.</b> Оплата пока не подключена: напишите боту команду <code>/pro</code> — он покажет, что входит в Pro и к кому обратиться. После выдачи Pro программа подхватит его в течение минуты, перезапускать её не нужно.</p>
-<p><b>Токен Т-Инвестиций</b> хранится только на вашем компьютере и никогда не передаётся боту или серверу данных, на любом тарифе. Тариф влияет лишь на набор функций программы. Если Pro закончился, ваши данные остаются на месте, закрываются только страницы Pro.</p>`}
+<p><b>Токен Т-Инвестиций</b> хранится только на вашем компьютере и никогда не передаётся боту или серверу данных, на любом тарифе. Тариф влияет лишь на набор функций программы. Если Pro закончился, ваши данные остаются на месте, закрываются только страницы Pro.</p>
+<p><b>Синхронизация между устройствами</b> выключена, пока вы её не включите (Настройки, раздел «Данные»). Если включить, на сервер уходит копия счетов, операций, наблюдения и дневника, <b>зашифрованная на вашем компьютере кодовой фразой</b>: сервер и бот прочитать её не могут. Токен Т-Инвестиций не уходит и в этом режиме. Кодовую фразу восстановить нельзя: потеряв её, копию придётся удалить и создать заново.</p>`}
 ];
 
 /* текст статьи без тегов — для поиска */

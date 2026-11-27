@@ -140,6 +140,7 @@ def tax_settings_save(cfg, body):
                 cur["loss_carry"][str(y)] = round(a, 2)
     store().put(TAX_SETTINGS_KEY, cur)
     mem_clear_tax()
+    sync_kick_safe()
     return tax_settings()
 
 
