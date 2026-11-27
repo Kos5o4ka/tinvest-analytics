@@ -81,6 +81,25 @@ function scrYld(r){
   const sub=r.linker?'реальная, над ИПЦ':off?`<span class="y-warn">к оферте ⚠${dt?' через '+dt:''}</span>`:'к погашению';
   return`<div class="cell-stack r" title="${esc(SCR_TAX_TIP)}"><b class="y-big">${pctp(scrY(r),2)}${off?'<i class="ofw" title="Доходность посчитана к оферте'+(dt?' (через '+dt+')':'')+'">⚠</i>':''}</b><span class="cell-sub">${sub}</span></div>`;
 }
+/* бумаги, которые уже есть на выбранном счёте: ISIN и тикер -> количество */
+function scrMine(){
+  const b=S.bonds&&S.bonds.rows;if(!b)return null;
+  if(S._scrMineSrc!==b){S._scrMineSrc=b;const m=new Map();b.forEach(x=>{if(x.isin)m.set(x.isin,x.qty||0);if(x.ticker)m.set(x.ticker,x.qty||0)});S._scrMine=m}
+  return S._scrMine;
+}
+function scrOwn(id){
+  const m=scrMine();if(!m||!m.has(id))return'';
+  const q=m.get(id);
+  return` <span class="tag scr-own" title="Эта бумага уже есть на выбранном счёте">в портфеле${q?' · '+f0(q)+' шт.':''}</span>`;
+}
+/* сохранённые пользовательские наборы фильтров */
+function scrSavedLoad(){
+  let a=null;try{a=JSON.parse(lsGet('scr_saved')||'null')}catch(e){}
+  if(!Array.isArray(a))a=[];
+  return a.filter(x=>x&&x.id&&x.name&&x.f&&typeof x.f==='object');
+}
+function scrSavedStore(a){S.scrSaved=a;lsSet('scr_saved',JSON.stringify(a))}
+S.scrSaved=scrSavedLoad();S.scrSaving=false;
 function scrRowHtml(r,fl){
   const id=r.isin||r.id,cls=[];
   if(fl>0&&r.yield<fl)cls.push('scr-low');
@@ -88,7 +107,7 @@ function scrRowHtml(r,fl){
   const rt=r.rating?`<div class="cell-stack"><span class="cell-sub">${esc(r.rt_agency||'')}</span><span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}${rtClick(r.rt_links).cls}" title="${esc(r.rt_agency||'')}${r.rt_approx?' (приблизительное совпадение названия)':''}${r.rt_links?'\nНажмите, чтобы открыть пресс-релиз':''}"${rtClick(r.rt_links).attr}>${r.rt_approx?'≈ ':''}${esc(r.rating)}</span></div>`:'<span class="mu">—</span>';
   const yrs=r.perp?'<span class="tag">бессрочная</span>':`<div class="cell-stack r"><span>${ddm(r.mat)}</span><span class="cell-sub">${(S.sf.toOffer&&r.yoff!=null?r.yoff:r.years).toFixed(1).replace('.',',')} г${S.sf.toOffer&&r.yoff!=null?' до оферты':''}</span></div>`;
   return`<tr${cls.length?` class="${cls.join(' ')}"`:''}${fl>0&&r.yield<fl?' title="Доходность ниже, чем у фонда ликвидности"':''} data-isin="${esc(id)}"><td class="wt-std">${watchStar(id)}</td>
-    <td class="l"><div class="cell-stack"><b>${esc(r.name)}</b><small class="cell-sub mu num">${isinTxt(id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></div></td>
+    <td class="l"><div class="cell-stack"><b>${esc(r.name)}${scrOwn(id)}</b><small class="cell-sub mu num">${isinTxt(id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></div></td>
     <td class="l">${rt}</td><td class="l">${r.sector?esc(SECT[r.sector]||r.sector):'<span class="mu">—</span>'}</td>
     <td class="num"><div class="cell-stack r"><span>${f2(r.price)}</span><span class="spk" data-spark="${esc(r.id||id)}"></span></div></td><td class="num">${scrYld(r)}</td><td class="num">${r.cy!=null?f2(r.cy):'—'}</td>
     <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
@@ -247,7 +266,7 @@ function pScr0(){
   return`<div class="card"><h2>Подбор облигаций<span class="sp" id="scr-cnt"></span></h2>
     <div class="scr-bar">
       <input class="in" id="f-q" value="${esc(f.q)}" placeholder="Поиск по названию или ISIN…" aria-label="Поиск облигаций">
-      <div class="scr-presets">${SCR_PRESETS.map(([k,t])=>`<button class="scr-chip${S.scrPreset===k?' on':''}" data-pr="${k}">${t}</button>`).join('')}</div>
+      <div class="scr-presets">${SCR_PRESETS.map(([k,t])=>`<button class="scr-chip${S.scrPreset===k?' on':''}" data-pr="${k}">${t}</button>`).join('')}${S.scrSaved.map(x=>`<span class="scr-chip scr-sv${S.scrPreset==='sv:'+x.id?' on':''}"><button class="scr-sv-b" data-sv="${esc(x.id)}" title="Мой сохранённый фильтр">${esc(x.name)}</button><button class="scr-sv-x" data-svx="${esc(x.id)}" aria-label="Удалить фильтр ${esc(x.name)}" title="Удалить">×</button></span>`).join('')}${S.scrSaving?`<span class="scr-sv-new"><input class="in" id="scr-sv-name" maxlength="40" placeholder="Название фильтра" aria-label="Название фильтра"><button class="btn" id="scr-sv-ok">Сохранить</button><button class="btn ghost" id="scr-sv-no">Отмена</button></span>`:(ac||f.q?`<button class="scr-chip" id="scr-sv-add" title="Запомнить текущие настройки фильтра">+ Сохранить фильтр</button>`:'')}</div>
       <div class="seg scr-dens" id="scr-dens" role="group" aria-label="Плотность таблицы (клавиша V)">${SCR_DENS.map(([k,t])=>`<button data-dn="${k}" class="${S.scrDens===k?'on':''}">${t}</button>`).join('')}</div>
       <div class="seg scr-real" id="scr-real" title="${esc(d.infl_exp!=null?`Реальная доходность = номинальная − ожидаемая инфляция ${f2(d.infl_exp)} % (${d.infl_src||'прогноз'}). У линкеров ОФЗ-ИН биржа и так показывает реальную доходность.`:'Нет прогноза инфляции — реальная доходность недоступна')}"><button data-rl="0" class="${S.scrReal&&d.infl_exp!=null?'':'on'}">Номинальная</button><button data-rl="1" class="${S.scrReal&&d.infl_exp!=null?'on':''}"${d.infl_exp==null?' disabled':''}>Реальная</button></div>
       <button class="btn ghost" id="scr-ftog">${S.scrOpen?'Скрыть фильтры':'Фильтры'}${ac?` (${ac})`:''}</button>
@@ -288,6 +307,31 @@ function bindScr(){
     else{const p=SCR_PRESETS.find(x=>x[0]===k);S.scrPreset=k;S.sf=Object.assign({},SCR_DEF,p?p[2]:{})}
     S.sn=150;S.scrBox=null;render();
   });
+  document.querySelectorAll('.scr-sv-b[data-sv]').forEach(b=>b.onclick=()=>{
+    const k='sv:'+b.dataset.sv;
+    if(S.scrPreset===k){S.scrPreset='';S.sf=Object.assign({},SCR_DEF)}
+    else{const p=S.scrSaved.find(x=>x.id===b.dataset.sv);if(!p)return;S.scrPreset=k;S.sf=Object.assign({},SCR_DEF,p.f)}
+    S.sn=150;S.scrBox=null;render();
+  });
+  document.querySelectorAll('.scr-sv-x[data-svx]').forEach(b=>b.onclick=e=>{
+    e.stopPropagation();scrSavedStore(S.scrSaved.filter(x=>x.id!==b.dataset.svx));
+    if(S.scrPreset==='sv:'+b.dataset.svx)S.scrPreset='';
+    render();
+  });
+  const sva=$('#scr-sv-add');if(sva)sva.onclick=()=>{S.scrSaving=true;render()};
+  const svn=$('#scr-sv-name');
+  if(svn){
+    svn.focus();
+    const ok=()=>{
+      const nm=svn.value.trim();if(!nm){svn.focus();return}
+      const id='u'+Date.now().toString(36);
+      scrSavedStore(S.scrSaved.concat([{id,name:nm.slice(0,40),f:Object.assign({},S.sf)}]));
+      S.scrSaving=false;S.scrPreset='sv:'+id;render();
+    };
+    $('#scr-sv-ok').onclick=ok;
+    svn.onkeydown=e=>{if(e.key==='Enter')ok();else if(e.key==='Escape'){S.scrSaving=false;render()}};
+    $('#scr-sv-no').onclick=()=>{S.scrSaving=false;render()};
+  }
   const rs=$('#f-reset');if(rs)rs.onclick=()=>{S.scrBox=null;S.scrPreset='';S.sf=Object.assign({},SCR_DEF);S.sn=150;render()};
   const dn=$('#scr-dens');if(dn)dn.onclick=e=>{const b=e.target.closest('[data-dn]');if(b)scrSetDens(b.dataset.dn)};
   const rl=$('#scr-real');if(rl)rl.onclick=e=>{const b=e.target.closest('[data-rl]');if(!b||b.disabled)return;S.scrReal=b.dataset.rl==='1';lsSet('scr_real',S.scrReal?'1':'0');

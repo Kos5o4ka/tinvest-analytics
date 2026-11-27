@@ -2,10 +2,10 @@
 
 /* Сайдбар: прокручивается только основной список, служебные пункты закреплены внизу */
 @media(min-width:761px){
-  aside{overflow:hidden}
-  aside .nav-main{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
-  aside .nav-fix{flex:none;border-top:1px solid var(--line);margin-top:6px;padding-top:6px}
-  aside .side-foot{margin-top:0;flex:none}
+  body>aside{overflow:hidden}
+  body>aside .nav-main{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
+  body>aside .nav-fix{flex:none;border-top:1px solid var(--line);margin-top:6px;padding-top:6px}
+  body>aside .side-foot{margin-top:0;flex:none}
 }
 @media(max-width:760px){.nav-fix{flex-direction:row;overflow-x:auto;border-top:0;padding:0}}
 .nav-tip{position:fixed;z-index:3000;pointer-events:none;background:var(--card2);color:var(--tx);border:1px solid var(--line2);border-radius:8px;padding:5px 10px;font-size:12.5px;font-weight:550;white-space:nowrap;box-shadow:0 8px 22px #00000066}
@@ -33,6 +33,51 @@
 /* Бегущая строка: кнопка закрытия не наезжает на текст */
 .tkr .tk-x{position:relative;z-index:1;background:var(--card2);border-left:1px solid var(--line);margin-left:4px}
 .tkr.off .tk-x{background:transparent;border-left:0}
+
+/* Таблицы: залипающая первая колонка при наведении того же тона, что и остальные ячейки строки */
+.tbl table tr:hover td:first-child{background:linear-gradient(#ffffff05,#ffffff05),var(--card)}
+
+/* Кликабельные карточки показателей на «Обзоре» */
+.kpi.kpi-go{cursor:pointer;position:relative;transition:transform .15s,border-color .15s,background-color .15s}
+.kpi.kpi-go::after{content:"→";position:absolute;right:14px;top:12px;color:var(--mu);opacity:0;transform:translateX(-4px);transition:.15s}
+.kpi.kpi-go:hover,.kpi.kpi-go:focus-visible{transform:translateY(-1px);border-color:var(--ac);outline:none}
+.kpi.kpi-go:hover::after,.kpi.kpi-go:focus-visible::after{opacity:1;transform:none;color:var(--ac-tx)}
+
+/* Скринер: свои фильтры и отметка «в портфеле» */
+.scr-sv{display:inline-flex;align-items:center;padding:0;overflow:hidden}
+.scr-sv button{all:unset;cursor:pointer;padding:6px 8px;font-size:12px}
+.scr-sv .scr-sv-b{padding:6px 4px 6px 11px}
+.scr-sv .scr-sv-x{color:var(--mu);padding:6px 10px 6px 6px}
+.scr-sv .scr-sv-x:hover{color:var(--neg)}
+.scr-sv-new{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}
+.scr-sv-new .in{width:170px;padding:5px 10px}
+.scr-sv-new .btn{padding:5px 11px;font-size:12.5px}
+.tag.scr-own{background:#3b82f61f;color:var(--ac-tx);font-weight:600;font-size:10.5px;margin-left:6px;vertical-align:1px}
+
+/* Колокольчик уведомлений */
+#bell{position:relative;padding:7px 10px}
+#bell svg{width:17px;height:17px}
+#bell .bell-n{position:absolute;top:-5px;right:-5px;min-width:17px;height:17px;padding:0 4px;border-radius:99px;background:var(--neg);color:#fff;font-size:10.5px;font-weight:700;line-height:17px;text-align:center;display:none}
+#bell.has .bell-n{display:block}
+.bell-dd{width:min(420px,calc(100vw - 32px));max-height:min(70vh,520px);overflow:auto;gap:4px}
+.bell-h{padding:6px 10px 4px;font-size:11.5px;font-weight:650;text-transform:uppercase;letter-spacing:.05em;color:var(--mu)}
+.bell-row{all:unset;box-sizing:border-box;cursor:pointer;display:block;width:100%;padding:6px 8px;border-radius:9px}
+.bell-row:hover,.bell-row:focus-visible{background:var(--card2)}
+.bell-row .mon-al{pointer-events:none}
+.bell-it{font-size:13px;line-height:1.45;color:var(--tx2);padding:4px 2px}
+.bell-empty{padding:10px;font-size:12.5px}
+.bell-f{display:flex;gap:8px;flex-wrap:wrap;padding:8px 6px 4px;border-top:1px solid var(--line);margin-top:4px}
+.bell-f .btn{padding:5px 11px;font-size:12.5px}
+@media(min-width:761px) and (max-width:1100px){.top #bell{width:36px;height:36px;padding:0;border-radius:50%;justify-content:center;flex:none}}
+
+/* Панель навигации Настроек — тоже <aside>: общие стили сайдбара (ширина 252px, рамка, отступы) на неё не действуют */
+.st aside.st-side{width:auto;padding:2px 0 0;border:0;overflow:visible;flex:none}
+
+/* Онбординг внутри Настроек: карточка не шире колонки */
+#ob-host{min-width:0}
+#ob-host .ob-card{min-width:0;max-width:100%}
+.ob-cards{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr)}
+@media(max-width:1180px){.ob-cards{grid-template-columns:minmax(0,1fr)}}
 
 /* Настройки: кнопки не наезжают на описание, при нехватке места уходят под текст */
 .st-row{flex-wrap:wrap}

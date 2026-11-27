@@ -18,11 +18,11 @@ function pDash(){
     <div><span>XIRR, % годовых ${_q('xirr','Годовая доходность с учётом сумм и дат пополнений')}</span><b class="num ${cls(d.xirr)}">${d.xirr==null?'—':pct(d.xirr*100,1)}</b></div></div></div>`;
   const turn=(t.buy_turnover||0)+(t.sell_turnover||0);
   const kpis=`<div class="g g6">
-    ${kpi('Реализовано по сделкам',SM(t.realized||0),'фиксированный результат продаж',cls(t.realized),S1)}
-    ${kpi('Пассивный доход',M(income),`дивиденды ${short(t.dividends||0)} · купоны ${short(t.coupons||0)}`,income?'pos':'',S3)}
-    ${kpi('Комиссии брокера',M(sumK(t,['fee_broker','fee_service','fee_other'])),turn?`${f2((t.fee_broker||0)/turn*100)} % от оборота`:'',null,S2)}
+    ${kpi('Реализовано по сделкам',SM(t.realized||0),'фиксированный результат продаж',cls(t.realized),S1,'pm')}
+    ${kpi('Пассивный доход',M(income),`дивиденды ${short(t.dividends||0)} · купоны ${short(t.coupons||0)}`,income?'pos':'',S3,'pay')}
+    ${kpi('Комиссии брокера',M(sumK(t,['fee_broker','fee_service','fee_other'])),turn?`${f2((t.fee_broker||0)/turn*100)} % от оборота`:'',null,S2,'fees')}
     ${kpi('Плата за маржу',M(t.margin_fee||0),t.varmargin?`вар. маржа ${SM(t.varmargin)}`:'шорт и кредитное плечо',null,S5)}
-    ${kpi('Налоги удержано',M(taxes),'подробнее — во вкладке «Налоги»',null,S4)}
+    ${kpi('Налоги удержано',M(taxes),'подробнее — во вкладке «Налоги»',null,S4,'tax')}
     ${kpi('Оборот',M(turn,'rub',0),`покупки ${short(t.buy_turnover||0)} · продажи ${short(t.sell_turnover||0)}`,null,S7)}</div>`;
   const alloc=[['Акции',p.shares,S1],['Облигации',p.bonds,S3],['Фонды',p.etf,S4],['Валюта и деньги',p.currencies,S7],['Фьючерсы',p.futures,S5],['Структурные',p.sp,S2],['Опционы',p.options,S6],['Прочее',p.other,S8]].map(([n,v,c])=>({n,v,c}));
   chart('c-alloc',donut,{items:alloc,cap:'Портфель'});

@@ -9,7 +9,7 @@ const TYPES={share:'Акции',bond:'Облигации',etf:'Фонды',curre
 const SECT={financial:'Финансы',it:'IT',telecom:'Телеком',energy:'Энергетика',utilities:'Электроэнергетика',materials:'Сырьё и материалы',industrials:'Промышленность',
   consumer:'Потребительский',health_care:'Здравоохранение',real_estate:'Недвижимость',government:'Государство',municipal:'Муниципальные',ecomaterials:'Экология',
   green_energy:'Зелёная энергетика',green_buildings:'Зелёное строительство',electrocars:'Электромобили',other:'Прочее'};
-function kpi(k,v,s,c,dot){return`<div class="card kpi"><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}">${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
+function kpi(k,v,s,c,dot,go){return`<div class="card kpi${go?' kpi-go':''}"${go?` data-go="${go}" role="link" tabindex="0" title="Открыть раздел"`:''}><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}">${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
 const periodName=()=>PERIODS.find(p=>p[0]===S.period)[1].toLowerCase();
 const waitBox=t=>`<div class="wait">${t||'Считаю…'}</div>`;
 function monthsSeries(n=36){

@@ -29371,10 +29371,10 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 
 /* Сайдбар: прокручивается только основной список, служебные пункты закреплены внизу */
 @media(min-width:761px){
-  aside{overflow:hidden}
-  aside .nav-main{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
-  aside .nav-fix{flex:none;border-top:1px solid var(--line);margin-top:6px;padding-top:6px}
-  aside .side-foot{margin-top:0;flex:none}
+  body>aside{overflow:hidden}
+  body>aside .nav-main{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
+  body>aside .nav-fix{flex:none;border-top:1px solid var(--line);margin-top:6px;padding-top:6px}
+  body>aside .side-foot{margin-top:0;flex:none}
 }
 @media(max-width:760px){.nav-fix{flex-direction:row;overflow-x:auto;border-top:0;padding:0}}
 .nav-tip{position:fixed;z-index:3000;pointer-events:none;background:var(--card2);color:var(--tx);border:1px solid var(--line2);border-radius:8px;padding:5px 10px;font-size:12.5px;font-weight:550;white-space:nowrap;box-shadow:0 8px 22px #00000066}
@@ -29402,6 +29402,51 @@ svg.anim .arc{animation:chArc .5s cubic-bezier(.16,1,.3,1) both}
 /* Бегущая строка: кнопка закрытия не наезжает на текст */
 .tkr .tk-x{position:relative;z-index:1;background:var(--card2);border-left:1px solid var(--line);margin-left:4px}
 .tkr.off .tk-x{background:transparent;border-left:0}
+
+/* Таблицы: залипающая первая колонка при наведении того же тона, что и остальные ячейки строки */
+.tbl table tr:hover td:first-child{background:linear-gradient(#ffffff05,#ffffff05),var(--card)}
+
+/* Кликабельные карточки показателей на «Обзоре» */
+.kpi.kpi-go{cursor:pointer;position:relative;transition:transform .15s,border-color .15s,background-color .15s}
+.kpi.kpi-go::after{content:"→";position:absolute;right:14px;top:12px;color:var(--mu);opacity:0;transform:translateX(-4px);transition:.15s}
+.kpi.kpi-go:hover,.kpi.kpi-go:focus-visible{transform:translateY(-1px);border-color:var(--ac);outline:none}
+.kpi.kpi-go:hover::after,.kpi.kpi-go:focus-visible::after{opacity:1;transform:none;color:var(--ac-tx)}
+
+/* Скринер: свои фильтры и отметка «в портфеле» */
+.scr-sv{display:inline-flex;align-items:center;padding:0;overflow:hidden}
+.scr-sv button{all:unset;cursor:pointer;padding:6px 8px;font-size:12px}
+.scr-sv .scr-sv-b{padding:6px 4px 6px 11px}
+.scr-sv .scr-sv-x{color:var(--mu);padding:6px 10px 6px 6px}
+.scr-sv .scr-sv-x:hover{color:var(--neg)}
+.scr-sv-new{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}
+.scr-sv-new .in{width:170px;padding:5px 10px}
+.scr-sv-new .btn{padding:5px 11px;font-size:12.5px}
+.tag.scr-own{background:#3b82f61f;color:var(--ac-tx);font-weight:600;font-size:10.5px;margin-left:6px;vertical-align:1px}
+
+/* Колокольчик уведомлений */
+#bell{position:relative;padding:7px 10px}
+#bell svg{width:17px;height:17px}
+#bell .bell-n{position:absolute;top:-5px;right:-5px;min-width:17px;height:17px;padding:0 4px;border-radius:99px;background:var(--neg);color:#fff;font-size:10.5px;font-weight:700;line-height:17px;text-align:center;display:none}
+#bell.has .bell-n{display:block}
+.bell-dd{width:min(420px,calc(100vw - 32px));max-height:min(70vh,520px);overflow:auto;gap:4px}
+.bell-h{padding:6px 10px 4px;font-size:11.5px;font-weight:650;text-transform:uppercase;letter-spacing:.05em;color:var(--mu)}
+.bell-row{all:unset;box-sizing:border-box;cursor:pointer;display:block;width:100%;padding:6px 8px;border-radius:9px}
+.bell-row:hover,.bell-row:focus-visible{background:var(--card2)}
+.bell-row .mon-al{pointer-events:none}
+.bell-it{font-size:13px;line-height:1.45;color:var(--tx2);padding:4px 2px}
+.bell-empty{padding:10px;font-size:12.5px}
+.bell-f{display:flex;gap:8px;flex-wrap:wrap;padding:8px 6px 4px;border-top:1px solid var(--line);margin-top:4px}
+.bell-f .btn{padding:5px 11px;font-size:12.5px}
+@media(min-width:761px) and (max-width:1100px){.top #bell{width:36px;height:36px;padding:0;border-radius:50%;justify-content:center;flex:none}}
+
+/* Панель навигации Настроек — тоже <aside>: общие стили сайдбара (ширина 252px, рамка, отступы) на неё не действуют */
+.st aside.st-side{width:auto;padding:2px 0 0;border:0;overflow:visible;flex:none}
+
+/* Онбординг внутри Настроек: карточка не шире колонки */
+#ob-host{min-width:0}
+#ob-host .ob-card{min-width:0;max-width:100%}
+.ob-cards{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr)}
+@media(max-width:1180px){.ob-cards{grid-template-columns:minmax(0,1fr)}}
 
 /* Настройки: кнопки не наезжают на описание, при нехватке места уходят под текст */
 .st-row{flex-wrap:wrap}
@@ -30020,7 +30065,7 @@ const TYPES={share:'Акции',bond:'Облигации',etf:'Фонды',curre
 const SECT={financial:'Финансы',it:'IT',telecom:'Телеком',energy:'Энергетика',utilities:'Электроэнергетика',materials:'Сырьё и материалы',industrials:'Промышленность',
   consumer:'Потребительский',health_care:'Здравоохранение',real_estate:'Недвижимость',government:'Государство',municipal:'Муниципальные',ecomaterials:'Экология',
   green_energy:'Зелёная энергетика',green_buildings:'Зелёное строительство',electrocars:'Электромобили',other:'Прочее'};
-function kpi(k,v,s,c,dot){return`<div class="card kpi"><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}">${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
+function kpi(k,v,s,c,dot,go){return`<div class="card kpi${go?' kpi-go':''}"${go?` data-go="${go}" role="link" tabindex="0" title="Открыть раздел"`:''}><div class="k">${dot?`<i style="background:${dot}"></i>`:''}${k}</div><div class="v num ${c||''}">${v}</div><div class="s">${s||'&nbsp;'}</div></div>`}
 const periodName=()=>PERIODS.find(p=>p[0]===S.period)[1].toLowerCase();
 const waitBox=t=>`<div class="wait">${t||'Считаю…'}</div>`;
 function monthsSeries(n=36){
@@ -30069,11 +30114,11 @@ function pDash(){
     <div><span>XIRR, % годовых ${_q('xirr','Годовая доходность с учётом сумм и дат пополнений')}</span><b class="num ${cls(d.xirr)}">${d.xirr==null?'—':pct(d.xirr*100,1)}</b></div></div></div>`;
   const turn=(t.buy_turnover||0)+(t.sell_turnover||0);
   const kpis=`<div class="g g6">
-    ${kpi('Реализовано по сделкам',SM(t.realized||0),'фиксированный результат продаж',cls(t.realized),S1)}
-    ${kpi('Пассивный доход',M(income),`дивиденды ${short(t.dividends||0)} · купоны ${short(t.coupons||0)}`,income?'pos':'',S3)}
-    ${kpi('Комиссии брокера',M(sumK(t,['fee_broker','fee_service','fee_other'])),turn?`${f2((t.fee_broker||0)/turn*100)} % от оборота`:'',null,S2)}
+    ${kpi('Реализовано по сделкам',SM(t.realized||0),'фиксированный результат продаж',cls(t.realized),S1,'pm')}
+    ${kpi('Пассивный доход',M(income),`дивиденды ${short(t.dividends||0)} · купоны ${short(t.coupons||0)}`,income?'pos':'',S3,'pay')}
+    ${kpi('Комиссии брокера',M(sumK(t,['fee_broker','fee_service','fee_other'])),turn?`${f2((t.fee_broker||0)/turn*100)} % от оборота`:'',null,S2,'fees')}
     ${kpi('Плата за маржу',M(t.margin_fee||0),t.varmargin?`вар. маржа ${SM(t.varmargin)}`:'шорт и кредитное плечо',null,S5)}
-    ${kpi('Налоги удержано',M(taxes),'подробнее — во вкладке «Налоги»',null,S4)}
+    ${kpi('Налоги удержано',M(taxes),'подробнее — во вкладке «Налоги»',null,S4,'tax')}
     ${kpi('Оборот',M(turn,'rub',0),`покупки ${short(t.buy_turnover||0)} · продажи ${short(t.sell_turnover||0)}`,null,S7)}</div>`;
   const alloc=[['Акции',p.shares,S1],['Облигации',p.bonds,S3],['Фонды',p.etf,S4],['Валюта и деньги',p.currencies,S7],['Фьючерсы',p.futures,S5],['Структурные',p.sp,S2],['Опционы',p.options,S6],['Прочее',p.other,S8]].map(([n,v,c])=>({n,v,c}));
   chart('c-alloc',donut,{items:alloc,cap:'Портфель'});
@@ -30749,6 +30794,25 @@ function scrYld(r){
   const sub=r.linker?'реальная, над ИПЦ':off?`<span class="y-warn">к оферте ⚠${dt?' через '+dt:''}</span>`:'к погашению';
   return`<div class="cell-stack r" title="${esc(SCR_TAX_TIP)}"><b class="y-big">${pctp(scrY(r),2)}${off?'<i class="ofw" title="Доходность посчитана к оферте'+(dt?' (через '+dt+')':'')+'">⚠</i>':''}</b><span class="cell-sub">${sub}</span></div>`;
 }
+/* бумаги, которые уже есть на выбранном счёте: ISIN и тикер -> количество */
+function scrMine(){
+  const b=S.bonds&&S.bonds.rows;if(!b)return null;
+  if(S._scrMineSrc!==b){S._scrMineSrc=b;const m=new Map();b.forEach(x=>{if(x.isin)m.set(x.isin,x.qty||0);if(x.ticker)m.set(x.ticker,x.qty||0)});S._scrMine=m}
+  return S._scrMine;
+}
+function scrOwn(id){
+  const m=scrMine();if(!m||!m.has(id))return'';
+  const q=m.get(id);
+  return` <span class="tag scr-own" title="Эта бумага уже есть на выбранном счёте">в портфеле${q?' · '+f0(q)+' шт.':''}</span>`;
+}
+/* сохранённые пользовательские наборы фильтров */
+function scrSavedLoad(){
+  let a=null;try{a=JSON.parse(lsGet('scr_saved')||'null')}catch(e){}
+  if(!Array.isArray(a))a=[];
+  return a.filter(x=>x&&x.id&&x.name&&x.f&&typeof x.f==='object');
+}
+function scrSavedStore(a){S.scrSaved=a;lsSet('scr_saved',JSON.stringify(a))}
+S.scrSaved=scrSavedLoad();S.scrSaving=false;
 function scrRowHtml(r,fl){
   const id=r.isin||r.id,cls=[];
   if(fl>0&&r.yield<fl)cls.push('scr-low');
@@ -30756,7 +30820,7 @@ function scrRowHtml(r,fl){
   const rt=r.rating?`<div class="cell-stack"><span class="cell-sub">${esc(r.rt_agency||'')}</span><span class="tag rt rt-${rBucket(r.rating).split(' ')[0]}${rtClick(r.rt_links).cls}" title="${esc(r.rt_agency||'')}${r.rt_approx?' (приблизительное совпадение названия)':''}${r.rt_links?'\nНажмите, чтобы открыть пресс-релиз':''}"${rtClick(r.rt_links).attr}>${r.rt_approx?'≈ ':''}${esc(r.rating)}</span></div>`:'<span class="mu">—</span>';
   const yrs=r.perp?'<span class="tag">бессрочная</span>':`<div class="cell-stack r"><span>${ddm(r.mat)}</span><span class="cell-sub">${(S.sf.toOffer&&r.yoff!=null?r.yoff:r.years).toFixed(1).replace('.',',')} г${S.sf.toOffer&&r.yoff!=null?' до оферты':''}</span></div>`;
   return`<tr${cls.length?` class="${cls.join(' ')}"`:''}${fl>0&&r.yield<fl?' title="Доходность ниже, чем у фонда ликвидности"':''} data-isin="${esc(id)}"><td class="wt-std">${watchStar(id)}</td>
-    <td class="l"><div class="cell-stack"><b>${esc(r.name)}</b><small class="cell-sub mu num">${isinTxt(id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></div></td>
+    <td class="l"><div class="cell-stack"><b>${esc(r.name)}${scrOwn(id)}</b><small class="cell-sub mu num">${isinTxt(id)}${r.offer?' · оферта '+ddm(r.offer):''}</small></div></td>
     <td class="l">${rt}</td><td class="l">${r.sector?esc(SECT[r.sector]||r.sector):'<span class="mu">—</span>'}</td>
     <td class="num"><div class="cell-stack r"><span>${f2(r.price)}</span><span class="spk" data-spark="${esc(r.id||id)}"></span></div></td><td class="num">${scrYld(r)}</td><td class="num">${r.cy!=null?f2(r.cy):'—'}</td>
     <td class="num ${r.spread!=null?(r.spread>=0?'pos':'neg'):'mu'}">${r.spread!=null?(r.spread>0?'+':'')+f2(r.spread):'—'}</td>
@@ -30915,7 +30979,7 @@ function pScr0(){
   return`<div class="card"><h2>Подбор облигаций<span class="sp" id="scr-cnt"></span></h2>
     <div class="scr-bar">
       <input class="in" id="f-q" value="${esc(f.q)}" placeholder="Поиск по названию или ISIN…" aria-label="Поиск облигаций">
-      <div class="scr-presets">${SCR_PRESETS.map(([k,t])=>`<button class="scr-chip${S.scrPreset===k?' on':''}" data-pr="${k}">${t}</button>`).join('')}</div>
+      <div class="scr-presets">${SCR_PRESETS.map(([k,t])=>`<button class="scr-chip${S.scrPreset===k?' on':''}" data-pr="${k}">${t}</button>`).join('')}${S.scrSaved.map(x=>`<span class="scr-chip scr-sv${S.scrPreset==='sv:'+x.id?' on':''}"><button class="scr-sv-b" data-sv="${esc(x.id)}" title="Мой сохранённый фильтр">${esc(x.name)}</button><button class="scr-sv-x" data-svx="${esc(x.id)}" aria-label="Удалить фильтр ${esc(x.name)}" title="Удалить">×</button></span>`).join('')}${S.scrSaving?`<span class="scr-sv-new"><input class="in" id="scr-sv-name" maxlength="40" placeholder="Название фильтра" aria-label="Название фильтра"><button class="btn" id="scr-sv-ok">Сохранить</button><button class="btn ghost" id="scr-sv-no">Отмена</button></span>`:(ac||f.q?`<button class="scr-chip" id="scr-sv-add" title="Запомнить текущие настройки фильтра">+ Сохранить фильтр</button>`:'')}</div>
       <div class="seg scr-dens" id="scr-dens" role="group" aria-label="Плотность таблицы (клавиша V)">${SCR_DENS.map(([k,t])=>`<button data-dn="${k}" class="${S.scrDens===k?'on':''}">${t}</button>`).join('')}</div>
       <div class="seg scr-real" id="scr-real" title="${esc(d.infl_exp!=null?`Реальная доходность = номинальная − ожидаемая инфляция ${f2(d.infl_exp)} % (${d.infl_src||'прогноз'}). У линкеров ОФЗ-ИН биржа и так показывает реальную доходность.`:'Нет прогноза инфляции — реальная доходность недоступна')}"><button data-rl="0" class="${S.scrReal&&d.infl_exp!=null?'':'on'}">Номинальная</button><button data-rl="1" class="${S.scrReal&&d.infl_exp!=null?'on':''}"${d.infl_exp==null?' disabled':''}>Реальная</button></div>
       <button class="btn ghost" id="scr-ftog">${S.scrOpen?'Скрыть фильтры':'Фильтры'}${ac?` (${ac})`:''}</button>
@@ -30956,6 +31020,31 @@ function bindScr(){
     else{const p=SCR_PRESETS.find(x=>x[0]===k);S.scrPreset=k;S.sf=Object.assign({},SCR_DEF,p?p[2]:{})}
     S.sn=150;S.scrBox=null;render();
   });
+  document.querySelectorAll('.scr-sv-b[data-sv]').forEach(b=>b.onclick=()=>{
+    const k='sv:'+b.dataset.sv;
+    if(S.scrPreset===k){S.scrPreset='';S.sf=Object.assign({},SCR_DEF)}
+    else{const p=S.scrSaved.find(x=>x.id===b.dataset.sv);if(!p)return;S.scrPreset=k;S.sf=Object.assign({},SCR_DEF,p.f)}
+    S.sn=150;S.scrBox=null;render();
+  });
+  document.querySelectorAll('.scr-sv-x[data-svx]').forEach(b=>b.onclick=e=>{
+    e.stopPropagation();scrSavedStore(S.scrSaved.filter(x=>x.id!==b.dataset.svx));
+    if(S.scrPreset==='sv:'+b.dataset.svx)S.scrPreset='';
+    render();
+  });
+  const sva=$('#scr-sv-add');if(sva)sva.onclick=()=>{S.scrSaving=true;render()};
+  const svn=$('#scr-sv-name');
+  if(svn){
+    svn.focus();
+    const ok=()=>{
+      const nm=svn.value.trim();if(!nm){svn.focus();return}
+      const id='u'+Date.now().toString(36);
+      scrSavedStore(S.scrSaved.concat([{id,name:nm.slice(0,40),f:Object.assign({},S.sf)}]));
+      S.scrSaving=false;S.scrPreset='sv:'+id;render();
+    };
+    $('#scr-sv-ok').onclick=ok;
+    svn.onkeydown=e=>{if(e.key==='Enter')ok();else if(e.key==='Escape'){S.scrSaving=false;render()}};
+    $('#scr-sv-no').onclick=()=>{S.scrSaving=false;render()};
+  }
   const rs=$('#f-reset');if(rs)rs.onclick=()=>{S.scrBox=null;S.scrPreset='';S.sf=Object.assign({},SCR_DEF);S.sn=150;render()};
   const dn=$('#scr-dens');if(dn)dn.onclick=e=>{const b=e.target.closest('[data-dn]');if(b)scrSetDens(b.dataset.dn)};
   const rl=$('#scr-real');if(rl)rl.onclick=e=>{const b=e.target.closest('[data-rl]');if(!b||b.disabled)return;S.scrReal=b.dataset.rl==='1';lsSet('scr_real',S.scrReal?'1':'0');
@@ -35033,7 +35122,19 @@ function kpCommands(){
     {g:'Команды',t:'Сменить тему',k:'тема оформление светлая тёмная',run:()=>$('#thm').click()},
     {g:'Команды',t:'Экспорт операций (CSV)',k:'экспорт операции csv скачать выгрузка',run:()=>{location.href='/api/operations.csv?'+new URLSearchParams({period:S.period,account:S.account});toast('Загрузка CSV…','info')}},
     {g:'Команды',t:'Горячие клавиши',k:'горячие клавиши шпаргалка помощь hotkeys shortcuts',run:()=>{if(typeof ksToggle==='function')ksToggle()}},
-    {g:'Команды',t:'Перейти в настройки',k:'настройки конфигурация токен settings',run:()=>go('set')}];
+    {g:'Команды',t:'Перейти в настройки',k:'настройки конфигурация токен settings',run:()=>go('set')}]
+    .concat(kpAccountCmds(),typeof uxSetMode==='function'&&typeof UX!=='undefined'?[
+      {g:'Команды',t:'Режим: Базовый',k:'режим базовый простой mode basic',run:()=>uxSetMode('basic')},
+      {g:'Команды',t:'Режим: Профи',k:'режим профи полный все разделы mode pro',run:()=>uxSetMode('pro')}]:[]);
+}
+/* переключение активного счёта прямо из палитры */
+function kpAccountCmds(){
+  const accs=(S.accounts||[]).filter(a=>!a.empty);
+  if(!accs.length||!S.data)return[];
+  const pick=id=>()=>{if(id===S.account)return;S.account=id;S.bonds=S.hist=null;persist();renderAccounts();renderNav();load(false)};
+  const out=accs.length>1?[{g:'Команды',t:'Счёт: Все счета',k:'счёт все счета account',run:pick('all')}]:[];
+  accs.forEach(a=>out.push({g:'Команды',t:'Счёт: '+a.name,k:'счёт переключить account '+(a.id||''),run:pick(a.id)}));
+  return out;
 }
 function kpSecurities(q){
   const out=[],seen=new Set();
@@ -35060,6 +35161,12 @@ function kpBuild(raw){
   PAGES.filter(Boolean).forEach(p=>{const sc=kpScore(p[1],q);if(sc)res.push({g:'Разделы',t:p[1],sc,s:S.navHidden.includes(p[0])&&!NAV_PINNED.includes(p[0])?'скрыт в меню':'',run:()=>go(p[0])})});
   if(q)KB.forEach((a,i)=>{const tk=kpNorm(a.t+' '+a.k),sc=q.split(/\s+/).filter(Boolean).every(w=>tk.includes(w))?kpScore(a.t+' '+a.k,q):0;if(sc)res.push({g:'База знаний',t:a.t,s:a.c,sc,run:()=>kbOpen(a.id)})});
   if(q)res.push(...kpSecurities(q));
+  const im=raw.trim().toUpperCase().match(/^[A-Z]{2}[A-Z0-9]{9}[0-9]$/);
+  if(im){
+    const isin=im[0];
+    if(typeof watchToggle==='function')res.push({g:'Команды',t:'В наблюдение / из наблюдения: '+isin,sc:50,run:()=>{watchToggle(isin).then(on=>toast(on?'Добавлено в наблюдение':'Убрано из наблюдения')).catch(()=>toast('Не удалось изменить наблюдение'))}});
+    if(typeof cmpAdd==='function')res.push({g:'Команды',t:'В сравнение: '+isin,sc:50,run:()=>cmpAdd(isin)});
+  }
   const order={'Калькулятор':-1,'Команды':q?1:0,'Разделы':q?0:1,'База знаний':2,'Бумаги':3};
   const calc=typeof calcEval==='function'?calcEval(raw):null;
   if(calc!==null)res.push({g:'Калькулятор',t:'= '+calcFmt(calc),s:'Enter — скопировать',sc:99,run:()=>copyText(calcRaw(calc),'Скопировано: '+calcFmt(calc))});
@@ -37856,7 +37963,7 @@ function tourClick(e){
     return;
   }
   /* клик по сайдбару не блокируется: тур закрывается, а переход выполняется как обычно */
-  if(e.target.closest&&e.target.closest('aside')&&!(TOUR.tgt&&TOUR.tgt.contains(e.target))){tourStop();return}
+  if(e.target.closest&&e.target.closest('#nav,#nav-fix,#ux-mode')&&!(TOUR.tgt&&TOUR.tgt.contains(e.target))){tourStop();return}
   /* микро-задача: клик по подсвеченному элементу проходит насквозь и переводит на следующий шаг */
   const st=TOUR.list[TOUR.i];
   if(st&&st.task&&TOUR.tgt&&TOUR.tgt.contains(e.target)){
@@ -38680,6 +38787,71 @@ function drawerClose(ov,cb){
   (dr||ov).addEventListener('animationend',e=>{if(e.target===(dr||ov))end()});
   setTimeout(end,DRAWER_OUT+80);     /* страховка: animationend может не прийти (вкладка в фоне) */
 }
+/* ── Дополнения интерфейса: колокольчик уведомлений в шапке, клавиатура для кликабельных карточек ── */
+
+/* Enter / пробел на кликабельной карточке показателя открывает раздел */
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Enter'&&e.key!==' ')return;
+  const k=e.target.closest&&e.target.closest('.kpi-go');
+  if(!k||e.target!==k)return;
+  e.preventDefault();go(k.dataset.go);
+});
+
+/* ── Колокольчик: тревоги мониторинга, открытые оферты и ближайшие выплаты ── */
+const BELL={open:false,tries:0};
+function bellItems(){
+  const out=[];
+  const m=S.mon&&S.mon.data;
+  if(m&&m.alerts)m.alerts.filter(a=>a.severity!=='info').slice(0,6).forEach(a=>out.push({sev:a.severity,html:monAlertHtml(a),go:'mon'}));
+  const d=S.today&&S.today.data;
+  if(d&&!d.empty){
+    if(d.offers&&d.offers.items)d.offers.items.filter(o=>o.status==='open').slice(0,3).forEach(o=>out.push({sev:'medium',html:`<div class="bell-it">${tdOfferText(o)}</div>`,go:'off'}));
+    if(d.payments&&d.payments.count)out.push({sev:'info',html:`<div class="bell-it">На ближайшие ${d.payments.days} дн.: <b class="num pos">${M(d.payments.sum,'rub',0)}</b> · ${d.payments.count} ${obPl(d.payments.count,'выплата','выплаты','выплат')}</div>`,go:'pay'});
+  }
+  return out;
+}
+function bellCount(){return bellItems().filter(x=>x.sev==='high'||x.sev==='medium').length}
+function bellDraw(){
+  const w=document.getElementById('bell-wrap');if(!w)return;
+  const show=!!(S.data&&S.data.portfolio);
+  w.style.display=show?'':'none';
+  if(!show)return;
+  const n=bellCount(),b=document.getElementById('bell');
+  b.classList.toggle('has',n>0);
+  b.querySelector('.bell-n').textContent=n>9?'9+':String(n||'');
+  b.setAttribute('aria-label',n?`Уведомления: ${n}`:'Уведомления');
+  const dd=document.getElementById('bell-dd');
+  if(BELL.open){
+    const it=bellItems();
+    dd.innerHTML=`<div class="bell-h">Уведомления</div>`+(it.length?it.map(x=>`<button type="button" class="bell-row" data-bgo="${x.go}">${x.html}</button>`).join(''):'<div class="bell-empty mu">Новых событий нет: значимых тревог и открытых оферт по портфелю сейчас нет.</div>')
+      +`<div class="bell-f"><button type="button" class="btn ghost" data-bgo="mon">Мониторинг</button><button type="button" class="btn ghost" data-bgo="cal">Календарь событий</button></div>`;
+    dd.hidden=false;
+  }else dd.hidden=true;
+  b.setAttribute('aria-expanded',BELL.open?'true':'false');
+}
+function bellRefresh(){
+  if(!(S.data&&S.data.portfolio)){bellDraw();return}
+  let busy=false;
+  try{todayEnsure();if(S.today&&S.today.loading)busy=true}catch(e){}
+  try{if(S.bonds&&S.bonds.rows&&S.bonds.rows.length){monEnsure();if(S.mon&&S.mon.loading)busy=true}}catch(e){}
+  bellDraw();
+  if(busy&&BELL.tries<6){BELL.tries++;setTimeout(bellRefresh,2000)}
+}
+(()=>{
+  const srch=document.getElementById('srch');if(!srch)return;
+  const w=document.createElement('div');w.className='more-wrap bell-wrap';w.id='bell-wrap';w.style.display='none';
+  w.innerHTML=`<button class="btn ghost" id="bell" type="button" title="Уведомления: тревоги, оферты, выплаты" aria-label="Уведомления" aria-haspopup="true" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 16v-5a6 6 0 0 0-12 0v5l-2 3h16z"/><path d="M10 21h4"/></svg><span class="bell-n"></span></button><div class="more-dd bell-dd noprint" id="bell-dd" hidden></div>`;
+  srch.parentNode.insertBefore(w,srch);
+  w.addEventListener('click',e=>{
+    const g=e.target.closest('[data-bgo]');
+    if(g){BELL.open=false;bellDraw();go(g.dataset.bgo);return}
+    if(e.target.closest('#bell')){BELL.open=!BELL.open;if(BELL.open)bellRefresh();else bellDraw()}
+  });
+  document.addEventListener('click',e=>{if(BELL.open&&!e.target.closest('#bell-wrap')){BELL.open=false;bellDraw()}});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&BELL.open){BELL.open=false;bellDraw()}});
+  const _rn=renderNow;
+  renderNow=function(){const r=_rn.apply(this,arguments);try{BELL.tries=0;bellRefresh()}catch(e){}return r};
+})();
 </script></body></html>
 '''
 

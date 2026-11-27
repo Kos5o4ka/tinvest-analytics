@@ -143,7 +143,7 @@ function tourClick(e){
     return;
   }
   /* клик по сайдбару не блокируется: тур закрывается, а переход выполняется как обычно */
-  if(e.target.closest&&e.target.closest('aside')&&!(TOUR.tgt&&TOUR.tgt.contains(e.target))){tourStop();return}
+  if(e.target.closest&&e.target.closest('#nav,#nav-fix,#ux-mode')&&!(TOUR.tgt&&TOUR.tgt.contains(e.target))){tourStop();return}
   /* микро-задача: клик по подсвеченному элементу проходит насквозь и переводит на следующий шаг */
   const st=TOUR.list[TOUR.i];
   if(st&&st.task&&TOUR.tgt&&TOUR.tgt.contains(e.target)){
