@@ -8735,8 +8735,13 @@ def auth_status(force=False):
     with _ds_lock:
         if not force:
             if _auth["need_login"]:
-                return {"state": "need_login", "error": "invalid" if key else "nokey", "expires": None, "username": "",
-                        "bot": _auth["bot"], "server": srv}
+                last = _auth["res"] or {}
+                err = last.get("error") if key and last.get("server") == srv else ""
+                r = {"state": "need_login", "error": err or ("invalid" if key else "nokey"), "expires": None, "username": "",
+                     "bot": _auth["bot"], "server": srv}
+                if last.get("max_devices") and err in ("devices", "device_blocked"):
+                    r["max_devices"] = last["max_devices"]
+                return r
             if _auth["res"] and now - _auth["at"] < AUTH_TTL and _auth["res"].get("server") == srv:
                 r = _auth["res"]
                 if not (r["state"] == "ok" and r["expires"] and r["expires"] <= now):

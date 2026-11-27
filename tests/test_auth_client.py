@@ -111,6 +111,13 @@ class AuthClientTests(unittest.TestCase):
         self.set_cfg(self.st.base, "TIA-AAAA-AAAA-AAAA")
         self.assertEqual(self.m.auth_status(True)["plan"], "pro")
 
+    def test_device_limit_reason_survives_cached_status(self):
+        """6-й компьютер: «ключ уже на 5 компьютерах» не превращается в «неверный ключ» при следующем опросе."""
+        self.st.keys["TIA-DDDD-DDDD-DDDD"] = ("devices", 0)
+        self.set_cfg(self.st.base, "TIA-DDDD-DDDD-DDDD")
+        self.assertEqual(self.m.auth_status(True)["error"], "devices")
+        self.assertEqual(self.m.auth_status(False)["error"], "devices")
+
     def test_no_key_need_login(self):
         r = self.m.auth_status(True)
         self.assertEqual((r["state"], r["error"], r["bot"]), ("need_login", "nokey", "stubbot"))
