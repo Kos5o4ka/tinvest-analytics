@@ -9,16 +9,26 @@ const _renderSettingsOrig=renderSettings;
 renderSettings=async function(){
   let c=S.cfg;
   try{c=await api('/api/config');S.cfg=c}catch(e){}
-  if(c&&!c.token_set&&!(c.imports||[]).length&&!ob.skip){ob.done=false;ob.err='';return obRender()}
-  return _renderSettingsOrig();
+  const r=await _renderSettingsOrig();
+  /* онбординг — карточка сверху внутри настроек, а не вместо них */
+  if(c&&!c.token_set&&!(c.imports||[]).length&&!ob.skip){
+    const m=document.getElementById('st-main');
+    if(m&&!document.getElementById('ob-host')){
+      ob.done=false;ob.err='';
+      const w=document.getElementById('st-welcome');if(w)w.remove();
+      m.insertAdjacentHTML('afterbegin','<div id="ob-host"></div>');
+      obRender();
+    }
+  }
+  return r;
 };
 function obStep(n,state,title,body){
   return`<div class="ob-step ${state}"><div class="ob-n">${state==='done'?'✓':n}</div><div class="ob-b"><h3>${title}</h3>${body||''}</div></div>`;
 }
 function obRender(){
-  const v=$('#view');if(!v)return;
+  const v=document.getElementById('ob-host');if(!v)return;
   const tokDone=ob.done;
-  v.innerHTML=`<div class="wrap fade" style="max-width:960px"><div class="card ob-card">
+  v.innerHTML=`<div class="card ob-card fade">
     <div class="ob-hd"><div class="ob-t">Добро пожаловать в TAnalytic</div>
       <p class="t2">Выберите удобный способ начать — это займёт меньше минуты. Все данные хранятся только на вашем компьютере.</p></div>
     <div class="ob-cards">
@@ -52,14 +62,14 @@ function obRender(){
       <span>Хотите просто изучить рынок без портфеля?</span>
       <button class="lnk" id="ob-mkt">Скринер облигаций →</button>
       <span class="mu"> · </span><button class="lnk" id="ob-calc">Калькулятор →</button>
-      <span class="mu"> · </span><button class="lnk" id="ob-all">Все настройки</button>
+      <span class="mu"> · </span><button class="lnk" id="ob-all">Скрыть это приветствие</button>
     </div>
-  </div></div>`;
+  </div>`;
   const dm=$('#ob-demo');if(dm)dm.onclick=()=>demoEnter(dm);
   const imp=$('#ob-imp');if(imp)imp.onclick=()=>go('imp');
   const mkt=$('#ob-mkt');if(mkt)mkt.onclick=()=>go('scr');
   const clc=$('#ob-calc');if(clc)clc.onclick=()=>go('calc');
-  const all=$('#ob-all');if(all)all.onclick=()=>{ob.skip=true;renderSettings()};
+  const all=$('#ob-all');if(all)all.onclick=()=>{ob.skip=true;const h=document.getElementById('ob-host');if(h)h.remove()};
   const b=$('#ob-save');if(!b)return;
   const input=$('#ob-tok'),sb=$('#ob-sb');
   if(sb)sb.onchange=()=>{ob.sb=sb.checked};
