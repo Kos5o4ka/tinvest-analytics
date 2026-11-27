@@ -1412,7 +1412,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not st.auth_rate_ok(ip):
                     return self._send(429, {"ok": False, "error": "rate_limit"})
                 return self._send(200, dict(st.auth_start(j.get("nonce"), j.get("challenge")), ok=True))
-            return self._send(200, dict(st.auth_poll(j.get("nonce"), j.get("verifier")), ok=True))
+            return self._send(200, dict(st.auth_poll(j.get("nonce"), j.get("verifier"), ip), ok=True))
         except sync.SyncError as e:
             return self._send(e.code, {"ok": False, "error": e.error})
         except sqlite3.Error:

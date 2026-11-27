@@ -44,6 +44,8 @@ SCHEMA = (
 AUTH_TTL = 120
 AUTH_MAX_ROWS = 5000
 AUTH_START_PER_HOUR = 30             # на один адрес
+AUTH_POLL_PER_HOUR = 900             # опросов на один адрес (приложение опрашивает раз в 2 с, до ~70 раз за вход)
+AUTH_POLL_PER_NONCE = 150            # опросов одной ссылки за её жизнь
 NONCE_RX = re.compile(r"^[A-Za-z0-9_-]{16,59}$")       # у параметра start в Telegram не больше 64 символов, 5 из них занимает «auth_»
 
 
@@ -68,7 +70,7 @@ class SyncStore:
         self.path, self.clock = path, clock
         self._local = threading.local()
         self._ready = False
-        self._lk, self._push, self._starts = threading.Lock(), {}, {}
+        self._lk, self._push, self._starts, self._polls, self._polls_n = threading.Lock(), {}, {}, {}, {}
 
     def conn(self):
         c = getattr(self._local, "c", None)
@@ -219,6 +221,30 @@ class SyncStore:
             self._starts[ip] = xs
             return True
 
+    def poll_rate_ok(self, ip, nh):
+        """Ограничение опросов: на адрес за час и на одну ссылку за её жизнь (опрос не должен нагружать базу)."""
+        now = self.clock()
+        with self._lk:
+            if ip is not None:
+                xs = [t for t in self._polls.get(ip, []) if now - t < 3600]
+                ok = len(xs) < AUTH_POLL_PER_HOUR
+                if ok:
+                    xs.append(now)
+                if len(self._polls) > 10000:
+                    self._polls.clear()
+                self._polls[ip] = xs
+                if not ok:
+                    return False
+            ns = [t for t in self._polls_n.get(nh, []) if now - t < AUTH_TTL * 2]
+            if len(ns) >= AUTH_POLL_PER_NONCE:
+                self._polls_n[nh] = ns
+                return False
+            ns.append(now)
+            if len(self._polls_n) > 20000:
+                self._polls_n.clear()
+            self._polls_n[nh] = ns
+            return True
+
     @staticmethod
     def _nh(nonce):
         return hashlib.sha256(nonce.encode("utf-8")).hexdigest()
@@ -238,19 +264,27 @@ class SyncStore:
             raise SyncError(409, "nonce_used")
         return {"ttl": AUTH_TTL}
 
-    def auth_poll(self, nonce, verifier):
+    def auth_poll(self, nonce, verifier, ip=None):
         """-> {"state": pending | approved | expired, "key"}. Ключ выдаётся один раз: строка становится consumed, ключ стирается."""
         if not isinstance(nonce, str) or not NONCE_RX.match(nonce) or not isinstance(verifier, str) or not 16 <= len(verifier) <= 128:
             raise SyncError(400, "bad_request")
-        c = self.conn()
+        try:
+            vhash = hashlib.sha256(verifier.encode("utf-8")).hexdigest()
+        except UnicodeEncodeError:                                  # одинокие суррогаты в JSON: это не наш verifier
+            raise SyncError(400, "bad_request")
         nh = self._nh(nonce)
+        if not self.poll_rate_ok(ip, nh):
+            raise SyncError(429, "rate_limit")
+        c = self.conn()
+        if c.execute("SELECT 1 FROM auth_links WHERE nonce_hash=?", (nh,)).fetchone() is None:
+            return {"state": "expired"}                             # нет ссылки: блокировку записи не берём
         c.execute("BEGIN IMMEDIATE")
         err = None
         try:
             r = c.execute("SELECT challenge, state, created, key_plain, tries FROM auth_links WHERE nonce_hash=?", (nh,)).fetchone()
             out = {"state": "expired"}
             if r:
-                if not hmac.compare_digest(hashlib.sha256(verifier.encode("utf-8")).hexdigest(), r[0]):
+                if not hmac.compare_digest(vhash, r[0]):
                     if r[4] + 1 >= 5:                                   # подбор секрета: гасим ссылку
                         c.execute("DELETE FROM auth_links WHERE nonce_hash=?", (nh,))
                     else:

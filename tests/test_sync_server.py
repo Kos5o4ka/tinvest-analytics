@@ -193,6 +193,38 @@ class AuthLink(unittest.TestCase):
         self.assertFalse(self.st.auth_rate_ok("1.2.3.4"))
         self.assertTrue(self.st.auth_rate_ok("5.6.7.8"))
 
+    def test_poll_rate_limits_per_ip_and_per_nonce(self):
+        self.st.auth_start(self.NONCE, self.ch)
+        for _ in range(SY.AUTH_POLL_PER_NONCE):
+            self.st.auth_poll(self.NONCE, self.VER, "1.1.1.1")
+        with self.assertRaises(SY.SyncError) as cm:
+            self.st.auth_poll(self.NONCE, self.VER, "1.1.1.1")
+        self.assertEqual(cm.exception.code, 429)
+        for i in range(SY.AUTH_POLL_PER_HOUR):                       # другой адрес и другие ссылки: свой счёт на адрес
+            self.assertEqual(self.st.auth_poll("%022d" % i, self.VER, "2.2.2.2"), {"state": "expired"})
+        with self.assertRaises(SY.SyncError) as cm:
+            self.st.auth_poll("z" * 22, self.VER, "2.2.2.2")
+        self.assertEqual(cm.exception.code, 429)
+        self.now[0] += 3601
+        self.assertEqual(self.st.auth_poll("z" * 22, self.VER, "2.2.2.2"), {"state": "expired"})
+
+    def test_poll_without_nonce_does_not_take_write_lock(self):
+        self.st.conn()
+        other = sqlite3.connect(self.p, isolation_level=None)
+        other.execute("BEGIN IMMEDIATE")                              # кто-то держит блокировку записи
+        try:
+            t0 = time.time()
+            self.assertEqual(self.st.auth_poll("m" * 22, self.VER), {"state": "expired"})
+            self.assertLess(time.time() - t0, 1.0)
+        finally:
+            other.execute("ROLLBACK")
+            other.close()
+
+    def test_lone_surrogate_verifier_is_bad_request(self):
+        with self.assertRaises(SY.SyncError) as cm:
+            self.st.auth_poll(self.NONCE, "\ud800" * 20)
+        self.assertEqual(cm.exception.code, 400)
+
 
 class Http(unittest.TestCase):
     def setUp(self):
@@ -253,6 +285,11 @@ class Http(unittest.TestCase):
         c, j = self.call("/v1/auth/poll", {"nonce": n, "verifier": "w" * 40}, key="")
         self.assertEqual((c, j["error"]), (403, "bad_verifier"))
         self.assertEqual(self.call("/v1/auth/start", {"nonce": "x"}, key="")[0], 400)
+        req = urllib.request.Request(self.url + "/v1/auth/poll", data=json.dumps({"nonce": n, "verifier": "\ud800" * 20}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 400)
 
 
 if __name__ == "__main__":
