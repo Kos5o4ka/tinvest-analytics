@@ -70,7 +70,35 @@ def _lock_verify_pin(cfg, pin):
 
 
 def _lock_configured(cfg):
-    return bool(cfg.get("lock_enabled")) and bool(cfg.get("lock_pin_hash") or cfg.get("lock_bio"))
+    """Блокировка действует только с заданным PIN: биометрия — удобство поверх PIN, а не единственный ключ
+    (иначе без Touch ID / Windows Hello в программу не войти)."""
+    return bool(cfg.get("lock_enabled")) and bool(cfg.get("lock_pin_hash"))
+
+
+# защита от перебора PIN: после LOCK_FREE_TRIES неудач — растущая пауза (в памяти процесса)
+LOCK_FREE_TRIES = 5
+LOCK_MAX_WAIT = 300
+_lock_fails = {"n": 0, "until": 0.0}
+
+
+def _lock_throttle_check(now=None):
+    now = time.time() if now is None else now
+    left = _lock_fails["until"] - now
+    if left > 0:
+        raise ApiError("Слишком много неверных попыток. Подождите %d с." % int(left + 0.999), 429)
+
+
+def _lock_fail(now=None):
+    now = time.time() if now is None else now
+    _lock_fails["n"] += 1
+    extra = _lock_fails["n"] - LOCK_FREE_TRIES
+    if extra >= 0:
+        _lock_fails["until"] = now + min(LOCK_MAX_WAIT, 2 ** min(extra, 9) * 2)
+
+
+def _lock_ok():
+    _lock_fails["n"] = 0
+    _lock_fails["until"] = 0.0
 
 
 def lock_is_locked(cfg):
@@ -152,6 +180,8 @@ def lock_status_dict(cfg):
         "has_pin": bool(cfg.get("lock_pin_hash")),
         "bio": bool(cfg.get("lock_bio", True)),
         "bio_available": bio_available(),
+        "reset_hint": "Если PIN забыт: закройте программу и удалите строки lock_enabled, lock_pin_hash и lock_pin_salt "
+                      "из файла %s" % CONFIG_PATH,
     }
 
 
@@ -160,51 +190,47 @@ def lock_status_get(cfg, acc, q, force):
 
 
 def lock_setup_post(cfg, body):
+    """Настройка блокировки. Поля: enabled, pin (новый), clear_pin, bio, current_pin.
+    Если PIN уже задан, любое изменение требует текущий PIN (иначе блокировку снимет любой, кто сел за открытую программу)."""
     with _lock_state_lock:
-        was_enabled = _lock_configured(cfg)
-        if was_enabled:
-            if not _lock_unlocked[0]:
-                raise ApiError("Программа заблокирована", 423)
-            if cfg.get("lock_pin_hash") and "current_pin" in body and body.get("current_pin") is not None:
-                if not _lock_verify_pin(cfg, body.get("current_pin")):
-                    raise ApiError("Неверный текущий PIN.", 403)
+        if _lock_configured(cfg) and not _lock_unlocked[0]:
+            raise ApiError("Программа заблокирована", 423)
+        if cfg.get("lock_pin_hash"):
+            _lock_throttle_check()
+            if not _lock_verify_pin(cfg, body.get("current_pin")):
+                _lock_fail()
+                raise ApiError("Неверный текущий PIN.", 403)
+            _lock_ok()
         enabled = bool(body["enabled"]) if "enabled" in body else bool(cfg.get("lock_enabled"))
         if "bio" in body:
             cfg["lock_bio"] = bool(body["bio"])
-        elif "lock_bio" in body:
-            cfg["lock_bio"] = bool(body["lock_bio"])
         if body.get("clear_pin"):
             cfg["lock_pin_hash"] = ""
             cfg["lock_pin_salt"] = ""
-        elif "pin" in body and body["pin"] is not None:
-            pin = str(body["pin"])
-            if pin:
-                if len(pin) < 4:
-                    raise ApiError("PIN должен содержать не менее 4 символов.", 400)
-                salt = os.urandom(16)
-                cfg["lock_pin_salt"] = salt.hex()
-                cfg["lock_pin_hash"] = _lock_hash_pin(pin, salt)
-            elif not enabled:
-                cfg["lock_pin_hash"] = ""
-                cfg["lock_pin_salt"] = ""
-        if enabled and not (cfg.get("lock_pin_hash") or cfg.get("lock_bio")):
-            raise ApiError("Задайте PIN-код или включите биометрию.", 400)
+            enabled = False                                  # без PIN блокировка не действует
+        elif body.get("pin"):
+            pin = str(body["pin"]).strip()
+            if not (4 <= len(pin) <= 12) or not pin.isdigit():
+                raise ApiError("PIN — от 4 до 12 цифр.", 400)
+            salt = os.urandom(16)
+            cfg["lock_pin_salt"] = salt.hex()
+            cfg["lock_pin_hash"] = _lock_hash_pin(pin, salt)
+        if enabled and not cfg.get("lock_pin_hash"):
+            raise ApiError("Сначала задайте PIN-код: он нужен, даже если включена биометрия.", 400)
         cfg["lock_enabled"] = enabled
-        if _lock_configured(cfg):
-            _lock_unlocked[0] = True     # не блокируем текущую сессию сразу после настройки
-        else:
-            _lock_unlocked[0] = False
+        _lock_unlocked[0] = True                             # текущую сессию сразу после настройки не блокируем
         save_config(cfg)
-        return {"ok": True, **lock_status_dict(cfg)}
+        return dict(lock_status_dict(cfg), ok=True)
 
 
 def lock_unlock_post(cfg, body):
     with _lock_state_lock:
         if not lock_is_locked(cfg):
             return {"ok": True, "unlocked": True}
+        _lock_throttle_check()
         method = str(body.get("method") or ("bio" if body.get("bio") else "pin"))
         if method == "bio":
-            if not cfg.get("lock_bio"):
+            if not cfg.get("lock_bio", True):
                 raise ApiError("Биометрическая разблокировка отключена.", 403)
             ok, err = bio_verify(str(body.get("reason") or "Разблокировать TAnalytic"))
             if not ok:
@@ -212,13 +238,16 @@ def lock_unlock_post(cfg, body):
             _lock_unlocked[0] = True
             return {"ok": True, "unlocked": True}
         pin = str(body.get("pin") or "")
-        if not cfg.get("lock_pin_hash") or not _lock_verify_pin(cfg, pin):
+        if not _lock_verify_pin(cfg, pin):
+            _lock_fail()
             raise ApiError("Неверный PIN.", 403)
+        _lock_ok()
         _lock_unlocked[0] = True
         return {"ok": True, "unlocked": True}
 
 
 def lock_bio_post(cfg, body):
+    """Проверка биометрии из Настроек (только в разблокированной программе: сюда не пускает проверка 423)."""
     ok, err = bio_verify(str(body.get("reason") or "Проверка биометрии TAnalytic"))
     return {"ok": bool(ok), "error": err or ""}
 

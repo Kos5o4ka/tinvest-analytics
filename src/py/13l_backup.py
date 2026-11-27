@@ -152,7 +152,8 @@ def decrypt_bytes(password, blob):
 
 # ───────────── содержимое копии ─────────────
 
-BK_SKIP_RESTORE = {"token", "sandbox", "verify_ssl", "ca_file", "hosts_prod", "hosts_sandbox"}
+BK_SKIP_RESTORE = {"token", "sandbox", "verify_ssl", "ca_file", "hosts_prod", "hosts_sandbox",
+                   "lock_enabled", "lock_bio", "lock_pin_hash", "lock_pin_salt"}   # блокировка — настройка этого компьютера
 
 
 def backup_plain():

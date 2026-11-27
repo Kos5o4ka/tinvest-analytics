@@ -65,6 +65,7 @@ class LockTests(unittest.TestCase, _HttpMixin):
         cfg.update(lock_enabled=False, lock_bio=True, lock_pin_hash="", lock_pin_salt="")
         M.save_config(cfg)
         M._lock_unlocked[0] = False
+        M._lock_ok()                        # счётчик неверных PIN не переносится между тестами
 
     def tearDown(self):
         M._bio_runner = self._old_bio
@@ -126,7 +127,9 @@ class LockTests(unittest.TestCase, _HttpMixin):
         self.assertEqual(self.req("GET", "/api/lock/status")[1]["enabled"], False)
 
     def test_bio_unlock_and_test_endpoint(self):
-        self.assertEqual(self.req("POST", "/api/lock/setup", {"enabled": True, "bio": True})[0], 200)
+        # без PIN блокировку не включить (иначе без биометрии в программу не войти)
+        self.assertEqual(self.req("POST", "/api/lock/setup", {"enabled": True, "bio": True})[0], 400)
+        self.assertEqual(self.req("POST", "/api/lock/setup", {"enabled": True, "bio": True, "pin": "2468"})[0], 200)
         self.req("POST", "/api/lock/now", {})
 
         M._bio_runner = lambda reason: (False, "cancelled")
@@ -143,10 +146,26 @@ class LockTests(unittest.TestCase, _HttpMixin):
         self.assertFalse(M.lock_is_locked(M.load_config()))
 
         # При выключенной lock_bio биометрическая разблокировка запрещена
-        self.req("POST", "/api/lock/setup", {"enabled": True, "pin": "1111", "bio": False})
+        self.assertEqual(self.req("POST", "/api/lock/setup", {"bio": False})[0], 403)          # без текущего PIN нельзя
+        self.assertEqual(self.req("POST", "/api/lock/setup", {"bio": False, "current_pin": "2468"})[0], 200)
         self.req("POST", "/api/lock/now", {})
         M._bio_runner = lambda reason: (True, "")
         self.assertEqual(self.req("POST", "/api/lock/unlock", {"method": "bio"})[0], 403)
+        self.assertEqual(self.req("POST", "/api/lock/unlock", {"pin": "2468"})[0], 200)
+
+    def test_pin_bruteforce_throttled(self):
+        M._lock_ok()
+        self.assertEqual(self.req("POST", "/api/lock/setup", {"enabled": True, "pin": "5555"})[0], 200)
+        self.req("POST", "/api/lock/now", {})
+        codes = [self.req("POST", "/api/lock/unlock", {"pin": "0000"})[0] for _ in range(M.LOCK_FREE_TRIES + 1)]
+        self.assertEqual(codes[:M.LOCK_FREE_TRIES], [403] * M.LOCK_FREE_TRIES)
+        self.assertEqual(self.req("POST", "/api/lock/unlock", {"pin": "5555"})[0], 429)   # даже верный PIN ждёт паузу
+        M._lock_ok()
+        self.assertEqual(self.req("POST", "/api/lock/unlock", {"pin": "5555"})[0], 200)
+
+    def test_backup_restore_keeps_lock(self):
+        for k in ("lock_enabled", "lock_bio", "lock_pin_hash", "lock_pin_salt"):
+            self.assertIn(k, M.BK_SKIP_RESTORE)
 
     def test_no_bio_env_and_startup_reset(self):
         old_env = os.environ.get("TINVEST_NO_BIO")

@@ -20299,7 +20299,8 @@ def decrypt_bytes(password, blob):
 
 # ───────────── содержимое копии ─────────────
 
-BK_SKIP_RESTORE = {"token", "sandbox", "verify_ssl", "ca_file", "hosts_prod", "hosts_sandbox"}
+BK_SKIP_RESTORE = {"token", "sandbox", "verify_ssl", "ca_file", "hosts_prod", "hosts_sandbox",
+                   "lock_enabled", "lock_bio", "lock_pin_hash", "lock_pin_salt"}   # блокировка — настройка этого компьютера
 
 
 def backup_plain():
@@ -29704,7 +29705,35 @@ def _lock_verify_pin(cfg, pin):
 
 
 def _lock_configured(cfg):
-    return bool(cfg.get("lock_enabled")) and bool(cfg.get("lock_pin_hash") or cfg.get("lock_bio"))
+    """Блокировка действует только с заданным PIN: биометрия — удобство поверх PIN, а не единственный ключ
+    (иначе без Touch ID / Windows Hello в программу не войти)."""
+    return bool(cfg.get("lock_enabled")) and bool(cfg.get("lock_pin_hash"))
+
+
+# защита от перебора PIN: после LOCK_FREE_TRIES неудач — растущая пауза (в памяти процесса)
+LOCK_FREE_TRIES = 5
+LOCK_MAX_WAIT = 300
+_lock_fails = {"n": 0, "until": 0.0}
+
+
+def _lock_throttle_check(now=None):
+    now = time.time() if now is None else now
+    left = _lock_fails["until"] - now
+    if left > 0:
+        raise ApiError("Слишком много неверных попыток. Подождите %d с." % int(left + 0.999), 429)
+
+
+def _lock_fail(now=None):
+    now = time.time() if now is None else now
+    _lock_fails["n"] += 1
+    extra = _lock_fails["n"] - LOCK_FREE_TRIES
+    if extra >= 0:
+        _lock_fails["until"] = now + min(LOCK_MAX_WAIT, 2 ** min(extra, 9) * 2)
+
+
+def _lock_ok():
+    _lock_fails["n"] = 0
+    _lock_fails["until"] = 0.0
 
 
 def lock_is_locked(cfg):
@@ -29786,6 +29815,8 @@ def lock_status_dict(cfg):
         "has_pin": bool(cfg.get("lock_pin_hash")),
         "bio": bool(cfg.get("lock_bio", True)),
         "bio_available": bio_available(),
+        "reset_hint": "Если PIN забыт: закройте программу и удалите строки lock_enabled, lock_pin_hash и lock_pin_salt "
+                      "из файла %s" % CONFIG_PATH,
     }
 
 
@@ -29794,51 +29825,47 @@ def lock_status_get(cfg, acc, q, force):
 
 
 def lock_setup_post(cfg, body):
+    """Настройка блокировки. Поля: enabled, pin (новый), clear_pin, bio, current_pin.
+    Если PIN уже задан, любое изменение требует текущий PIN (иначе блокировку снимет любой, кто сел за открытую программу)."""
     with _lock_state_lock:
-        was_enabled = _lock_configured(cfg)
-        if was_enabled:
-            if not _lock_unlocked[0]:
-                raise ApiError("Программа заблокирована", 423)
-            if cfg.get("lock_pin_hash") and "current_pin" in body and body.get("current_pin") is not None:
-                if not _lock_verify_pin(cfg, body.get("current_pin")):
-                    raise ApiError("Неверный текущий PIN.", 403)
+        if _lock_configured(cfg) and not _lock_unlocked[0]:
+            raise ApiError("Программа заблокирована", 423)
+        if cfg.get("lock_pin_hash"):
+            _lock_throttle_check()
+            if not _lock_verify_pin(cfg, body.get("current_pin")):
+                _lock_fail()
+                raise ApiError("Неверный текущий PIN.", 403)
+            _lock_ok()
         enabled = bool(body["enabled"]) if "enabled" in body else bool(cfg.get("lock_enabled"))
         if "bio" in body:
             cfg["lock_bio"] = bool(body["bio"])
-        elif "lock_bio" in body:
-            cfg["lock_bio"] = bool(body["lock_bio"])
         if body.get("clear_pin"):
             cfg["lock_pin_hash"] = ""
             cfg["lock_pin_salt"] = ""
-        elif "pin" in body and body["pin"] is not None:
-            pin = str(body["pin"])
-            if pin:
-                if len(pin) < 4:
-                    raise ApiError("PIN должен содержать не менее 4 символов.", 400)
-                salt = os.urandom(16)
-                cfg["lock_pin_salt"] = salt.hex()
-                cfg["lock_pin_hash"] = _lock_hash_pin(pin, salt)
-            elif not enabled:
-                cfg["lock_pin_hash"] = ""
-                cfg["lock_pin_salt"] = ""
-        if enabled and not (cfg.get("lock_pin_hash") or cfg.get("lock_bio")):
-            raise ApiError("Задайте PIN-код или включите биометрию.", 400)
+            enabled = False                                  # без PIN блокировка не действует
+        elif body.get("pin"):
+            pin = str(body["pin"]).strip()
+            if not (4 <= len(pin) <= 12) or not pin.isdigit():
+                raise ApiError("PIN — от 4 до 12 цифр.", 400)
+            salt = os.urandom(16)
+            cfg["lock_pin_salt"] = salt.hex()
+            cfg["lock_pin_hash"] = _lock_hash_pin(pin, salt)
+        if enabled and not cfg.get("lock_pin_hash"):
+            raise ApiError("Сначала задайте PIN-код: он нужен, даже если включена биометрия.", 400)
         cfg["lock_enabled"] = enabled
-        if _lock_configured(cfg):
-            _lock_unlocked[0] = True     # не блокируем текущую сессию сразу после настройки
-        else:
-            _lock_unlocked[0] = False
+        _lock_unlocked[0] = True                             # текущую сессию сразу после настройки не блокируем
         save_config(cfg)
-        return {"ok": True, **lock_status_dict(cfg)}
+        return dict(lock_status_dict(cfg), ok=True)
 
 
 def lock_unlock_post(cfg, body):
     with _lock_state_lock:
         if not lock_is_locked(cfg):
             return {"ok": True, "unlocked": True}
+        _lock_throttle_check()
         method = str(body.get("method") or ("bio" if body.get("bio") else "pin"))
         if method == "bio":
-            if not cfg.get("lock_bio"):
+            if not cfg.get("lock_bio", True):
                 raise ApiError("Биометрическая разблокировка отключена.", 403)
             ok, err = bio_verify(str(body.get("reason") or "Разблокировать TAnalytic"))
             if not ok:
@@ -29846,13 +29873,16 @@ def lock_unlock_post(cfg, body):
             _lock_unlocked[0] = True
             return {"ok": True, "unlocked": True}
         pin = str(body.get("pin") or "")
-        if not cfg.get("lock_pin_hash") or not _lock_verify_pin(cfg, pin):
+        if not _lock_verify_pin(cfg, pin):
+            _lock_fail()
             raise ApiError("Неверный PIN.", 403)
+        _lock_ok()
         _lock_unlocked[0] = True
         return {"ok": True, "unlocked": True}
 
 
 def lock_bio_post(cfg, body):
+    """Проверка биометрии из Настроек (только в разблокированной программе: сюда не пускает проверка 423)."""
     ok, err = bio_verify(str(body.get("reason") or "Проверка биометрии TAnalytic"))
     return {"ok": bool(ok), "error": err or ""}
 
@@ -30349,7 +30379,11 @@ class Handler(BaseHTTPRequestHandler):
             if fn:
                 return self._reply(fn(cfg, body))
             self.send(404, {"error": "not found"})
-        self.guard(run)
+        if path in CONFIG_RMW_PATHS:                # «прочитать — изменить — записать» config.json по очереди,
+            with _cfg_post_lock:                     # иначе параллельные сохранения теряют правки друг друга
+                self.guard(run)
+        else:
+            self.guard(run)
 
 
 # ═══════════════════════════════ окно приложения ═══════════════════════════════
@@ -30395,6 +30429,10 @@ def open_window(url):
             pass
     webbrowser.open(url)
     return None
+
+
+_cfg_post_lock = threading.Lock()
+CONFIG_RMW_PATHS = {"/api/config", "/api/lock/setup", "/api/shell/tray"}
 
 
 class LocalHTTPServer(ThreadingHTTPServer):
@@ -32722,6 +32760,9 @@ body.lock-open{overflow:hidden}
 .drop-box svg{width:42px;height:42px;color:var(--ac-tx)}
 .drop-box b{font-size:16px;font-weight:650;color:var(--tx)}
 .drop-box span{font-size:13px;color:var(--mu)}
+
+/* экран блокировки: подсказка для забытого PIN */
+.lock-forgot{font-size:12px;color:var(--mu)}.lock-forgot summary{cursor:pointer;color:var(--tx2)}.lock-forgot p{margin:6px 0 0;word-break:break-all}
 /* ── Стили безрамочной шапки Tauri v2 (действуют только при html.is-tauri) ── */
 .tauri-bar{
   display:none;
@@ -33153,7 +33194,7 @@ async function api(path,opt){
   let j={};
   try{j=await r.json()}catch(e){}
   if(r.status===423){
-    if(typeof lockShow==='function')lockShow(j);
+    if(typeof lockShow==='function')fetch('/api/lock/status').then(r=>r.json()).then(st=>{if(st&&st.enabled&&!st.unlocked)lockShow(st)}).catch(()=>lockShow(j));   // ответ мог прийти уже после разблокировки
     throw new Error(j.error||'Доступ заблокирован');
   }
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
@@ -33713,23 +33754,28 @@ function uiDlgNext(){
   const id='ui-dlg-t'+Date.now();
   ov.innerHTML=`<div class="ui-dlg${o.danger?' danger':''}${o.kind==='err'?' err':''}" role="${o.confirm?'alertdialog':'dialog'}" aria-modal="true" aria-labelledby="${id}">
     <div class="ui-dlg-h"><i class="ui-dlg-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ic}</svg></i>
-    <h3 id="${id}">${esc(o.title||'')}</h3></div>${paras?`<div class="ui-dlg-b">${paras}</div>`:''}
+    <h3 id="${id}">${esc(o.title||'')}</h3></div>${paras?`<div class="ui-dlg-b">${paras}</div>`:''}${o.input?`<div class="ui-dlg-b"><input class="in${o.input.mono?' mono':''}" id="ui-dlg-in" type="${o.input.type==='password'?'password':'text'}"${o.input.numeric?' inputmode="numeric"':''} maxlength="${+o.input.max||200}" placeholder="${esc(o.input.placeholder||'')}" autocomplete="off" aria-label="${esc(o.input.label||o.title||'')}" style="width:100%"></div>`:''}
     <div class="ui-dlg-f">${o.confirm?`<button class="btn ghost" data-r="0">${esc(o.cancelText||'Отмена')}</button>`:''}<button class="btn${o.danger?' danger solid':''}" data-r="1">${esc(o.okText||(o.confirm?'Подтвердить':'Понятно'))}</button></div></div>`;
   document.body.appendChild(ov);
   let done=false;
   const close=r=>{if(done)return;done=true;window.removeEventListener('keydown',key,true);ov.classList.remove('is-in');
-    setTimeout(()=>{ov.remove();try{if(prev&&prev.focus&&document.contains(prev))prev.focus()}catch(e){}it.resolve(o.confirm?!!r:undefined);uiDlgNext()},140)};
-  const btns=[...ov.querySelectorAll('button[data-r]')];
-  btns.forEach(b=>b.onclick=()=>close(b.dataset.r==='1'));
+    const val=inp?inp.value:'';
+    setTimeout(()=>{ov.remove();try{if(prev&&prev.focus&&document.contains(prev))prev.focus()}catch(e){}it.resolve(o.input?(r?val:null):o.confirm?!!r:undefined);uiDlgNext()},140)};
+  const inp=ov.querySelector('#ui-dlg-in');
+  const btns=[...(inp?[inp]:[]),...ov.querySelectorAll('button[data-r]')];
+  if(inp)inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();close(true)}});
+  btns.forEach(b=>{if(b.dataset.r!=null)b.onclick=()=>close(b.dataset.r==='1')});
   ov.addEventListener('mousedown',e=>{if(e.target===ov)close(false)});
   function key(e){
     if(e.key==='Escape'){e.preventDefault();e.stopPropagation();close(false);return}
     if(e.key==='Tab'){e.preventDefault();e.stopPropagation();const i=btns.indexOf(document.activeElement);btns[(i+(e.shiftKey?btns.length-1:1))%btns.length].focus()}
   }
   window.addEventListener('keydown',key,true);
-  requestAnimationFrame(()=>{ov.classList.add('is-in');(o.danger&&o.confirm?btns[0]:btns[btns.length-1]).focus()});
+  requestAnimationFrame(()=>{ov.classList.add('is-in');(inp||(o.danger&&o.confirm?btns[0]:btns[btns.length-1])).focus()});
 }
 function uiConfirm(o){return uiDlgOpen(uiDlgNorm(o,{confirm:true,title:'Подтвердите действие'}))}
+/* ввод значения: uiPrompt({title,body,input:{type:'password',numeric:true,max:12,placeholder}}) → Promise<string|null> */
+function uiPrompt(o){o=uiDlgNorm(o,{confirm:true,title:'Введите значение'});o.input=o.input||{};return uiDlgOpen(o)}
 function uiAlert(o){return uiDlgOpen(uiDlgNorm(o,{confirm:false,title:'Сообщение'}))}
 /* ошибка запроса одним вызовом: uiErr(e) или uiErr(e,'Не удалось удалить') */
 function uiErr(e,title){return uiAlert({title:title||'Ошибка',body:(e&&e.message)||String(e||''),kind:'err'})}
@@ -35741,7 +35787,7 @@ async function renderImport(){
     if(a&&a.pick_file){try{const r=await a.pick_file();if(r&&r.error)return msg(esc(r.error));if(r&&r.b64)return pickData(r.name,r.b64);if(r===null)return}catch(e){}}
     inp.click()};
   drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};drop.ondragleave=()=>drop.classList.remove('over');
-  drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');if(e.dataTransfer.files[0])pick(e.dataTransfer.files[0])};
+  drop.ondrop=e=>{e.preventDefault();e.stopPropagation();drop.classList.remove('over');if(e.dataTransfer.files[0])pick(e.dataTransfer.files[0])};
   inp.onchange=()=>{if(inp.files[0])pick(inp.files[0])};
   async function pick(f){
     if(f.size>60*1024*1024)return msg('Файл больше 60 МБ.');
@@ -36180,73 +36226,55 @@ async function bindSetLock(c,msg){
   const g=id=>document.getElementById(id);if(!g('lk-card'))return;
   const dPin=stDirty('lk-pin-save',['lk-pin']);
   stEnter(['lk-pin'],'lk-pin-save');
-  const saveLock=async(payload)=>{
-    try{return await post('/api/lock/settings',payload)}
-    catch(e){
-      if(/404|not found/i.test(String(e.message||''))){
-        const cfgP={};
-        if('enabled' in payload)cfgP.lock_enabled=payload.enabled;
-        if('bio_enabled' in payload)cfgP.lock_bio=payload.bio_enabled;
-        if('pin' in payload)cfgP.lock_pin=payload.pin;
-        return await post('/api/config',cfgP);
-      }
-      throw e;
-    }
+  let st={enabled:!!c.lock_enabled,has_pin:false,bio:c.lock_bio!==false,bio_available:false};
+  /* если PIN уже задан, сервер требует текущий PIN на любое изменение */
+  const askPin=async()=>{
+    if(!st.has_pin)return '';
+    const v=await uiPrompt({title:'Текущий PIN-код',body:'Подтвердите изменение настроек блокировки.',okText:'Подтвердить',input:{type:'password',numeric:true,max:12,mono:true,placeholder:'PIN-код'}});
+    if(v==null)throw new Error('');
+    return v.trim();
   };
+  const saveLock=async payload=>post('/api/lock/setup',Object.assign({current_pin:await askPin()},payload));
   const applySt=s=>{
-    if(!s)return;
-    if(s.enabled!=null)g('lk-en').checked=!!s.enabled;
-    if(s.bio_enabled!=null)g('lk-bio').checked=!!s.bio_enabled;
+    if(!s)return;st=Object.assign(st,s);
+    g('lk-en').checked=!!st.enabled;
+    g('lk-bio').checked=!!st.bio;
     const pst=g('lk-pin-st');
-    if(pst)pst.innerHTML=s.has_pin?'<span class="pos">PIN задан</span>':'PIN не задан';
-    const bioAv=s.bio_available!==false;
-    g('lk-bio').disabled=!bioAv;
-    g('lk-bio-test').disabled=!bioAv;
+    if(pst)pst.innerHTML=st.has_pin?'<span class="pos">PIN задан</span>':'PIN не задан — без него блокировку не включить';
+    g('lk-bio').disabled=!st.bio_available;
+    g('lk-bio-test').disabled=!st.bio_available;
+    g('lk-now').disabled=!(st.enabled&&st.has_pin);
     const h=g('lk-card').querySelector('.st-gh span');
-    if(h)h.innerHTML=g('lk-en').checked?'<span class="pos">включена</span>':'выключена';
+    if(h)h.innerHTML=st.enabled&&st.has_pin?'<span class="pos">включена</span>':'выключена';
   };
-  api('/api/lock/status').then(s=>{applySt(s)}).catch(()=>{
-    const pst=g('lk-pin-st');if(pst)pst.textContent=c.secret_set&&c.secret_set.lock_pin?'PIN задан':'PIN не задан';
-  });
+  const fail=(x,undo)=>{undo&&undo();if(x&&x.message)msg(x.message)};
+  api('/api/lock/status').then(applySt).catch(()=>{});
   g('lk-en').onchange=async e=>{
     const el=e.currentTarget,on=el.checked;
-    try{
-      const r=await saveLock({enabled:on});
-      c.lock_enabled=on;applySt(r);stOk(el);
-      msg(on?'Блокировка при входе включена.':'Блокировка при входе выключена.',1);
-    }catch(x){el.checked=!on;msg(x.message)}
+    if(on&&!st.has_pin){el.checked=false;msg('Сначала задайте PIN-код: он нужен, даже если включена биометрия.');g('lk-pin').focus();return}
+    try{applySt(await saveLock({enabled:on}));stOk(el);msg(on?'Блокировка при входе включена.':'Блокировка при входе выключена.',1)}
+    catch(x){fail(x,()=>{el.checked=!on})}
   };
   g('lk-bio').onchange=async e=>{
     const el=e.currentTarget,on=el.checked;
-    try{
-      const r=await saveLock({bio_enabled:on});
-      c.lock_bio=on;applySt(r);stOk(el);
-    }catch(x){el.checked=!on;msg(x.message)}
+    try{applySt(await saveLock({bio:on}));stOk(el)}catch(x){fail(x,()=>{el.checked=!on})}
   };
   g('lk-pin-save').onclick=async e=>{
     const b=e.currentTarget,pin=(g('lk-pin').value||'').trim();
-    if(pin.length<4){msg('PIN-код должен содержать минимум 4 символа.');return}
+    if(!/^\d{4,12}$/.test(pin)){msg('PIN-код — от 4 до 12 цифр.');return}
     b.disabled=true;
-    try{
-      const r=await saveLock({pin});
-      g('lk-pin').value='';dPin.rebase();applySt(Object.assign({has_pin:true},r));stOk(b);msg('PIN-код сохранён.',1);
-    }catch(x){msg(x.message);dPin.upd()}
+    try{applySt(await saveLock({pin}));g('lk-pin').value='';dPin.rebase();stOk(b);msg('PIN-код сохранён.',1)}
+    catch(x){fail(x);dPin.upd()}
   };
   g('lk-bio-test').onclick=async e=>{
     const b=e.currentTarget;b.disabled=true;
-    try{
-      let r;
-      try{r=await post('/api/lock/bio/test',{})}
-      catch(err){if(/404|not found/i.test(String(err.message||'')))r=await post('/api/lock/unlock',{method:'bio',test:true});else throw err}
-      msg(r&&r.ok===false?(r.error||'Биометрия не подтверждена.'):'Биометрия подтверждена.',r&&r.ok!==false?1:0);
-    }catch(x){msg(x.message)}finally{b.disabled=false}
+    try{const r=await post('/api/lock/bio',{});msg(r&&r.ok?'Биометрия подтверждена.':(r&&r.error)||'Биометрия не подтверждена.',r&&r.ok?1:0)}
+    catch(x){fail(x)}finally{b.disabled=!st.bio_available}
   };
   g('lk-now').onclick=async e=>{
     const b=e.currentTarget;b.disabled=true;
-    try{
-      try{await post('/api/lock/lock',{})}catch(err){if(!/404|not found/i.test(String(err.message||'')))throw err}
-      if(typeof lockShow==='function')lockShow({enabled:true,bio_enabled:g('lk-bio').checked});
-    }catch(x){msg(x.message)}finally{b.disabled=false}
+    try{const r=await post('/api/lock/now',{});if(r&&r.locked&&typeof lockShow==='function')lockShow(st);else msg('Блокировка не включена.')}
+    catch(x){fail(x)}finally{b.disabled=false}
   };
 }
 /* ── Настройки: Telegram, резервная копия, экспорт, помощь с раскрытиями (строки-настройки, мгновенное сохранение) ── */
@@ -44098,14 +44126,14 @@ function lockShow(info){
   let ov=document.getElementById('lock-ov');
   if(ov){
     const bio=document.getElementById('lock-bio');
-    if(bio)bio.hidden=info.bio_enabled===false;
+    if(bio)bio.hidden=!(info.bio&&info.bio_available);
     return;
   }
   LOCK_UI.open=true;
   document.body.classList.add('lock-open');
   ov=document.createElement('div');
   ov.id='lock-ov';
-  const showBio=info.bio_enabled!==false;
+  const showBio=!!(info.bio&&info.bio_available);
   ov.innerHTML=`<div class="lock-box" role="dialog" aria-modal="true" aria-label="Доступ заблокирован">
     <div class="logo"><i>${typeof LOGO_SVG==='function'?LOGO_SVG(30):''}</i>
       <div>TAnalytic<small>доступ защищён</small></div></div>
@@ -44116,6 +44144,7 @@ function lockShow(info){
       <div class="lock-err" id="lock-err" role="alert" hidden></div>
       <button type="submit" class="btn ghost lock-go" id="lock-pin-go">Разблокировать</button>
     </form>
+    ${info.reset_hint?`<details class="lock-forgot"><summary>Забыли PIN-код?</summary><p>${esc(info.reset_hint)}</p></details>`:''}
   </div>`;
   document.body.appendChild(ov);
   const errEl=document.getElementById('lock-err'),pinEl=document.getElementById('lock-pin'),goBtn=document.getElementById('lock-pin-go'),bioBtn=document.getElementById('lock-bio');

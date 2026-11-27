@@ -357,7 +357,11 @@ class Handler(BaseHTTPRequestHandler):
             if fn:
                 return self._reply(fn(cfg, body))
             self.send(404, {"error": "not found"})
-        self.guard(run)
+        if path in CONFIG_RMW_PATHS:                # «прочитать — изменить — записать» config.json по очереди,
+            with _cfg_post_lock:                     # иначе параллельные сохранения теряют правки друг друга
+                self.guard(run)
+        else:
+            self.guard(run)
 
 
 # ═══════════════════════════════ окно приложения ═══════════════════════════════
@@ -403,6 +407,10 @@ def open_window(url):
             pass
     webbrowser.open(url)
     return None
+
+
+_cfg_post_lock = threading.Lock()
+CONFIG_RMW_PATHS = {"/api/config", "/api/lock/setup", "/api/shell/tray"}
 
 
 class LocalHTTPServer(ThreadingHTTPServer):

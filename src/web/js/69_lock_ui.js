@@ -28,14 +28,14 @@ function lockShow(info){
   let ov=document.getElementById('lock-ov');
   if(ov){
     const bio=document.getElementById('lock-bio');
-    if(bio)bio.hidden=info.bio_enabled===false;
+    if(bio)bio.hidden=!(info.bio&&info.bio_available);
     return;
   }
   LOCK_UI.open=true;
   document.body.classList.add('lock-open');
   ov=document.createElement('div');
   ov.id='lock-ov';
-  const showBio=info.bio_enabled!==false;
+  const showBio=!!(info.bio&&info.bio_available);
   ov.innerHTML=`<div class="lock-box" role="dialog" aria-modal="true" aria-label="Доступ заблокирован">
     <div class="logo"><i>${typeof LOGO_SVG==='function'?LOGO_SVG(30):''}</i>
       <div>TAnalytic<small>доступ защищён</small></div></div>
@@ -46,6 +46,7 @@ function lockShow(info){
       <div class="lock-err" id="lock-err" role="alert" hidden></div>
       <button type="submit" class="btn ghost lock-go" id="lock-pin-go">Разблокировать</button>
     </form>
+    ${info.reset_hint?`<details class="lock-forgot"><summary>Забыли PIN-код?</summary><p>${esc(info.reset_hint)}</p></details>`:''}
   </div>`;
   document.body.appendChild(ov);
   const errEl=document.getElementById('lock-err'),pinEl=document.getElementById('lock-pin'),goBtn=document.getElementById('lock-pin-go'),bioBtn=document.getElementById('lock-bio');

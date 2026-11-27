@@ -64,7 +64,7 @@ async function renderImport(){
     if(a&&a.pick_file){try{const r=await a.pick_file();if(r&&r.error)return msg(esc(r.error));if(r&&r.b64)return pickData(r.name,r.b64);if(r===null)return}catch(e){}}
     inp.click()};
   drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};drop.ondragleave=()=>drop.classList.remove('over');
-  drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');if(e.dataTransfer.files[0])pick(e.dataTransfer.files[0])};
+  drop.ondrop=e=>{e.preventDefault();e.stopPropagation();drop.classList.remove('over');if(e.dataTransfer.files[0])pick(e.dataTransfer.files[0])};
   inp.onchange=()=>{if(inp.files[0])pick(inp.files[0])};
   async function pick(f){
     if(f.size>60*1024*1024)return msg('Файл больше 60 МБ.');

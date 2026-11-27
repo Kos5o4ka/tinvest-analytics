@@ -17,23 +17,28 @@ function uiDlgNext(){
   const id='ui-dlg-t'+Date.now();
   ov.innerHTML=`<div class="ui-dlg${o.danger?' danger':''}${o.kind==='err'?' err':''}" role="${o.confirm?'alertdialog':'dialog'}" aria-modal="true" aria-labelledby="${id}">
     <div class="ui-dlg-h"><i class="ui-dlg-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ic}</svg></i>
-    <h3 id="${id}">${esc(o.title||'')}</h3></div>${paras?`<div class="ui-dlg-b">${paras}</div>`:''}
+    <h3 id="${id}">${esc(o.title||'')}</h3></div>${paras?`<div class="ui-dlg-b">${paras}</div>`:''}${o.input?`<div class="ui-dlg-b"><input class="in${o.input.mono?' mono':''}" id="ui-dlg-in" type="${o.input.type==='password'?'password':'text'}"${o.input.numeric?' inputmode="numeric"':''} maxlength="${+o.input.max||200}" placeholder="${esc(o.input.placeholder||'')}" autocomplete="off" aria-label="${esc(o.input.label||o.title||'')}" style="width:100%"></div>`:''}
     <div class="ui-dlg-f">${o.confirm?`<button class="btn ghost" data-r="0">${esc(o.cancelText||'Отмена')}</button>`:''}<button class="btn${o.danger?' danger solid':''}" data-r="1">${esc(o.okText||(o.confirm?'Подтвердить':'Понятно'))}</button></div></div>`;
   document.body.appendChild(ov);
   let done=false;
   const close=r=>{if(done)return;done=true;window.removeEventListener('keydown',key,true);ov.classList.remove('is-in');
-    setTimeout(()=>{ov.remove();try{if(prev&&prev.focus&&document.contains(prev))prev.focus()}catch(e){}it.resolve(o.confirm?!!r:undefined);uiDlgNext()},140)};
-  const btns=[...ov.querySelectorAll('button[data-r]')];
-  btns.forEach(b=>b.onclick=()=>close(b.dataset.r==='1'));
+    const val=inp?inp.value:'';
+    setTimeout(()=>{ov.remove();try{if(prev&&prev.focus&&document.contains(prev))prev.focus()}catch(e){}it.resolve(o.input?(r?val:null):o.confirm?!!r:undefined);uiDlgNext()},140)};
+  const inp=ov.querySelector('#ui-dlg-in');
+  const btns=[...(inp?[inp]:[]),...ov.querySelectorAll('button[data-r]')];
+  if(inp)inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();close(true)}});
+  btns.forEach(b=>{if(b.dataset.r!=null)b.onclick=()=>close(b.dataset.r==='1')});
   ov.addEventListener('mousedown',e=>{if(e.target===ov)close(false)});
   function key(e){
     if(e.key==='Escape'){e.preventDefault();e.stopPropagation();close(false);return}
     if(e.key==='Tab'){e.preventDefault();e.stopPropagation();const i=btns.indexOf(document.activeElement);btns[(i+(e.shiftKey?btns.length-1:1))%btns.length].focus()}
   }
   window.addEventListener('keydown',key,true);
-  requestAnimationFrame(()=>{ov.classList.add('is-in');(o.danger&&o.confirm?btns[0]:btns[btns.length-1]).focus()});
+  requestAnimationFrame(()=>{ov.classList.add('is-in');(inp||(o.danger&&o.confirm?btns[0]:btns[btns.length-1])).focus()});
 }
 function uiConfirm(o){return uiDlgOpen(uiDlgNorm(o,{confirm:true,title:'Подтвердите действие'}))}
+/* ввод значения: uiPrompt({title,body,input:{type:'password',numeric:true,max:12,placeholder}}) → Promise<string|null> */
+function uiPrompt(o){o=uiDlgNorm(o,{confirm:true,title:'Введите значение'});o.input=o.input||{};return uiDlgOpen(o)}
 function uiAlert(o){return uiDlgOpen(uiDlgNorm(o,{confirm:false,title:'Сообщение'}))}
 /* ошибка запроса одним вызовом: uiErr(e) или uiErr(e,'Не удалось удалить') */
 function uiErr(e,title){return uiAlert({title:title||'Ошибка',body:(e&&e.message)||String(e||''),kind:'err'})}

@@ -123,7 +123,7 @@ async function api(path,opt){
   let j={};
   try{j=await r.json()}catch(e){}
   if(r.status===423){
-    if(typeof lockShow==='function')lockShow(j);
+    if(typeof lockShow==='function')fetch('/api/lock/status').then(r=>r.json()).then(st=>{if(st&&st.enabled&&!st.unlocked)lockShow(st)}).catch(()=>lockShow(j));   // ответ мог прийти уже после разблокировки
     throw new Error(j.error||'Доступ заблокирован');
   }
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));

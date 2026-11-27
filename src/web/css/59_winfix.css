@@ -161,3 +161,6 @@ body.lock-open{overflow:hidden}
 .drop-box svg{width:42px;height:42px;color:var(--ac-tx)}
 .drop-box b{font-size:16px;font-weight:650;color:var(--tx)}
 .drop-box span{font-size:13px;color:var(--mu)}
+
+/* экран блокировки: подсказка для забытого PIN */
+.lock-forgot{font-size:12px;color:var(--mu)}.lock-forgot summary{cursor:pointer;color:var(--tx2)}.lock-forgot p{margin:6px 0 0;word-break:break-all}

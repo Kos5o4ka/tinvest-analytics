@@ -250,72 +250,54 @@ async function bindSetLock(c,msg){
   const g=id=>document.getElementById(id);if(!g('lk-card'))return;
   const dPin=stDirty('lk-pin-save',['lk-pin']);
   stEnter(['lk-pin'],'lk-pin-save');
-  const saveLock=async(payload)=>{
-    try{return await post('/api/lock/settings',payload)}
-    catch(e){
-      if(/404|not found/i.test(String(e.message||''))){
-        const cfgP={};
-        if('enabled' in payload)cfgP.lock_enabled=payload.enabled;
-        if('bio_enabled' in payload)cfgP.lock_bio=payload.bio_enabled;
-        if('pin' in payload)cfgP.lock_pin=payload.pin;
-        return await post('/api/config',cfgP);
-      }
-      throw e;
-    }
+  let st={enabled:!!c.lock_enabled,has_pin:false,bio:c.lock_bio!==false,bio_available:false};
+  /* если PIN уже задан, сервер требует текущий PIN на любое изменение */
+  const askPin=async()=>{
+    if(!st.has_pin)return '';
+    const v=await uiPrompt({title:'Текущий PIN-код',body:'Подтвердите изменение настроек блокировки.',okText:'Подтвердить',input:{type:'password',numeric:true,max:12,mono:true,placeholder:'PIN-код'}});
+    if(v==null)throw new Error('');
+    return v.trim();
   };
+  const saveLock=async payload=>post('/api/lock/setup',Object.assign({current_pin:await askPin()},payload));
   const applySt=s=>{
-    if(!s)return;
-    if(s.enabled!=null)g('lk-en').checked=!!s.enabled;
-    if(s.bio_enabled!=null)g('lk-bio').checked=!!s.bio_enabled;
+    if(!s)return;st=Object.assign(st,s);
+    g('lk-en').checked=!!st.enabled;
+    g('lk-bio').checked=!!st.bio;
     const pst=g('lk-pin-st');
-    if(pst)pst.innerHTML=s.has_pin?'<span class="pos">PIN задан</span>':'PIN не задан';
-    const bioAv=s.bio_available!==false;
-    g('lk-bio').disabled=!bioAv;
-    g('lk-bio-test').disabled=!bioAv;
+    if(pst)pst.innerHTML=st.has_pin?'<span class="pos">PIN задан</span>':'PIN не задан — без него блокировку не включить';
+    g('lk-bio').disabled=!st.bio_available;
+    g('lk-bio-test').disabled=!st.bio_available;
+    g('lk-now').disabled=!(st.enabled&&st.has_pin);
     const h=g('lk-card').querySelector('.st-gh span');
-    if(h)h.innerHTML=g('lk-en').checked?'<span class="pos">включена</span>':'выключена';
+    if(h)h.innerHTML=st.enabled&&st.has_pin?'<span class="pos">включена</span>':'выключена';
   };
-  api('/api/lock/status').then(s=>{applySt(s)}).catch(()=>{
-    const pst=g('lk-pin-st');if(pst)pst.textContent=c.secret_set&&c.secret_set.lock_pin?'PIN задан':'PIN не задан';
-  });
+  const fail=(x,undo)=>{undo&&undo();if(x&&x.message)msg(x.message)};
+  api('/api/lock/status').then(applySt).catch(()=>{});
   g('lk-en').onchange=async e=>{
     const el=e.currentTarget,on=el.checked;
-    try{
-      const r=await saveLock({enabled:on});
-      c.lock_enabled=on;applySt(r);stOk(el);
-      msg(on?'Блокировка при входе включена.':'Блокировка при входе выключена.',1);
-    }catch(x){el.checked=!on;msg(x.message)}
+    if(on&&!st.has_pin){el.checked=false;msg('Сначала задайте PIN-код: он нужен, даже если включена биометрия.');g('lk-pin').focus();return}
+    try{applySt(await saveLock({enabled:on}));stOk(el);msg(on?'Блокировка при входе включена.':'Блокировка при входе выключена.',1)}
+    catch(x){fail(x,()=>{el.checked=!on})}
   };
   g('lk-bio').onchange=async e=>{
     const el=e.currentTarget,on=el.checked;
-    try{
-      const r=await saveLock({bio_enabled:on});
-      c.lock_bio=on;applySt(r);stOk(el);
-    }catch(x){el.checked=!on;msg(x.message)}
+    try{applySt(await saveLock({bio:on}));stOk(el)}catch(x){fail(x,()=>{el.checked=!on})}
   };
   g('lk-pin-save').onclick=async e=>{
     const b=e.currentTarget,pin=(g('lk-pin').value||'').trim();
-    if(pin.length<4){msg('PIN-код должен содержать минимум 4 символа.');return}
+    if(!/^\d{4,12}$/.test(pin)){msg('PIN-код — от 4 до 12 цифр.');return}
     b.disabled=true;
-    try{
-      const r=await saveLock({pin});
-      g('lk-pin').value='';dPin.rebase();applySt(Object.assign({has_pin:true},r));stOk(b);msg('PIN-код сохранён.',1);
-    }catch(x){msg(x.message);dPin.upd()}
+    try{applySt(await saveLock({pin}));g('lk-pin').value='';dPin.rebase();stOk(b);msg('PIN-код сохранён.',1)}
+    catch(x){fail(x);dPin.upd()}
   };
   g('lk-bio-test').onclick=async e=>{
     const b=e.currentTarget;b.disabled=true;
-    try{
-      let r;
-      try{r=await post('/api/lock/bio/test',{})}
-      catch(err){if(/404|not found/i.test(String(err.message||'')))r=await post('/api/lock/unlock',{method:'bio',test:true});else throw err}
-      msg(r&&r.ok===false?(r.error||'Биометрия не подтверждена.'):'Биометрия подтверждена.',r&&r.ok!==false?1:0);
-    }catch(x){msg(x.message)}finally{b.disabled=false}
+    try{const r=await post('/api/lock/bio',{});msg(r&&r.ok?'Биометрия подтверждена.':(r&&r.error)||'Биометрия не подтверждена.',r&&r.ok?1:0)}
+    catch(x){fail(x)}finally{b.disabled=!st.bio_available}
   };
   g('lk-now').onclick=async e=>{
     const b=e.currentTarget;b.disabled=true;
-    try{
-      try{await post('/api/lock/lock',{})}catch(err){if(!/404|not found/i.test(String(err.message||'')))throw err}
-      if(typeof lockShow==='function')lockShow({enabled:true,bio_enabled:g('lk-bio').checked});
-    }catch(x){msg(x.message)}finally{b.disabled=false}
+    try{const r=await post('/api/lock/now',{});if(r&&r.locked&&typeof lockShow==='function')lockShow(st);else msg('Блокировка не включена.')}
+    catch(x){fail(x)}finally{b.disabled=false}
   };
 }

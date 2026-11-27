@@ -263,18 +263,19 @@ class TestLockAndDragDrop(unittest.TestCase):
         let lockCalledWith = null;
         function lockShow(j){{ lockCalledWith = j; }}
         function fetch(){{
-          return Promise.resolve({{ ok: false, status: 423, json: () => Promise.resolve({{ error: 'locked', bio_enabled: true }}) }});
+          return Promise.resolve({{ ok: false, status: 423, json: () => Promise.resolve({{ error: 'locked', enabled: true, unlocked: false }}) }});
         }}
         (async () => {{
           let err = null;
           try {{ await api('/api/summary'); }} catch(e) {{ err = e.message; }}
+          for (let i = 0; i < 5; i++) await Promise.resolve();   // экран блокировки берёт настройки из /api/lock/status
           print(JSON.stringify({{ err, lockCalledWith }}));
         }})();
         """
         out = _run_jsc(code)
         res = json.loads(out.strip().splitlines()[-1])
         self.assertEqual(res["err"], "locked")
-        self.assertEqual(res["lockCalledWith"], {"error": "locked", "bio_enabled": True})
+        self.assertEqual(res["lockCalledWith"], {"error": "locked", "enabled": True, "unlocked": False})
 
     def test_lock_and_drop_overlay_markup_and_endpoints(self):
         lock_js = _read("src/web/js/69_lock_ui.js")
