@@ -32529,7 +32529,8 @@ aside.cl-side,.cl-side{position:sticky;top:12px;width:100%;max-height:calc(100vh
 .lg-box{width:min(420px,100%);background:var(--card);border:1px solid var(--line2);border-radius:var(--r);padding:28px 28px 22px;display:flex;flex-direction:column;gap:16px;box-shadow:0 20px 60px #0006}
 .lg-box .logo{padding:0;margin:0 0 4px}
 .lg-t{color:var(--tx2);font-size:14px}
-.lg-box #lg-bot{justify-content:center;padding:11px 16px;text-decoration:none}
+.lg-box #lg-bot,.lg-box #lg-one{justify-content:center;text-align:center;padding:11px 16px;text-decoration:none}
+.lg-t,.lg-n{text-wrap:pretty}
 #lg-form{display:flex;flex-direction:column;gap:10px}
 #lg-key{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.04em;text-align:center}
 #lg-go{justify-content:center;padding:10px 16px}
@@ -41617,7 +41618,7 @@ function authOverlay(show,err){
   ov.innerHTML=`<div class="lg-box" role="dialog" aria-modal="true" aria-label="Вход">
     <div class="logo"><i>${typeof LOGO_SVG==='function'?LOGO_SVG(28):''}</i>
       <div>TAnalytic<small>аналитика портфеля</small></div></div>
-    <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует 7 дней.</p>
+    <p class="lg-t">Вход по ключу из Telegram-бота. Ключ действует 7&nbsp;дней.</p>
     <button class="btn" id="lg-one" type="button">Войти через Telegram</button>
     <div class="lg-n" id="lg-one-st" style="display:none" role="status"></div>
     <a class="btn ghost" id="lg-bot" href="https://t.me/${bot}?start=app" target="_blank" rel="noopener noreferrer">Открыть @${bot} и взять ключ</a>
