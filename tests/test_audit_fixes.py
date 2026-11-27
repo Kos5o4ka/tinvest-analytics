@@ -117,11 +117,94 @@ class ShellStatus(unittest.TestCase):
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tinvest.py"), encoding="utf-8").read()
         self.assertEqual(int(re.search(r"^SHELL_REV = (\d+)", src, re.M).group(1)), M.SHELL_REV_LATEST)
 
+    def test_tray_only_for_new_windows_shell(self):
+        self.assertTrue(M.tray_supported(env={"TINVEST_SHELL_REV": "4"}, frozen=True, plat="win32"))
+        self.assertFalse(M.tray_supported(env={"TINVEST_SHELL_REV": "3"}, frozen=True, plat="win32"))   # старая оболочка трея не умеет
+        self.assertFalse(M.tray_supported(env={"TINVEST_SHELL_REV": "4"}, frozen=True, plat="darwin"))  # на macOS пункты скрыты
+        self.assertFalse(M.tray_supported(env={"TINVEST_SHELL_REV": "4"}, frozen=False, plat="win32"))  # из исходников
+        st = M.shell_status(env={"TINVEST_SHELL_REV": "4"}, frozen=True, cfg={"tray_close": True})
+        self.assertEqual((st["tray"], st["tray_close"]), (sys.platform == "win32", sys.platform == "win32"))
+
+    def test_tray_close_default_off(self):
+        self.assertFalse(M.DEFAULT_CONFIG["tray_close"])
+        self.assertFalse(M.shell_status(env={"TINVEST_SHELL_REV": "4"}, frozen=True, cfg={})["tray_close"])
+
     def test_source_run_never_outdated(self):
         self.assertFalse(M.shell_status(env={}, frozen=False)["outdated"])
 
     def test_garbage_rev(self):
         self.assertTrue(M.shell_status(env={"TINVEST_SHELL_REV": "x"}, frozen=True)["outdated"])
+
+
+class FakeWinreg:
+    """Подмена winreg: словарь «ключ → значения»; ведёт журнал вызовов."""
+    HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ = "HKCU", 1, 2, 1
+
+    def __init__(self, data=None, missing_key=False):
+        self.keys = {} if missing_key else {M.AUTOSTART_KEY: dict(data or {})}
+        self.closed = 0
+
+    def OpenKey(self, root, path, res=0, access=0):
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        return path
+
+    def CreateKeyEx(self, root, path, res=0, access=0):
+        self.keys.setdefault(path, {})
+        return path
+
+    def QueryValueEx(self, k, name):
+        if name not in self.keys[k]:
+            raise FileNotFoundError(name)
+        return self.keys[k][name], 1
+
+    def SetValueEx(self, k, name, res, typ, val):
+        self.keys[k][name] = val
+
+    def DeleteValue(self, k, name):
+        if name not in self.keys[k]:
+            raise FileNotFoundError(name)
+        del self.keys[k][name]
+
+    def CloseKey(self, k):
+        self.closed += 1
+
+
+class Autostart(unittest.TestCase):
+    EXE = r"C:\Users\u\AppData\Local\Programs\TAnalytic\TAnalytic.exe"
+
+    def test_set_writes_run_value_with_tray_flag(self):
+        reg = FakeWinreg()
+        self.assertTrue(M.autostart_set(True, reg=reg, exe=self.EXE))
+        self.assertEqual(reg.keys[M.AUTOSTART_KEY]["TAnalytic"], '"%s" --tray' % self.EXE)
+        self.assertTrue(M.autostart_get(reg))
+        self.assertEqual(reg.closed, 2)                                  # ключи закрываются
+
+    def test_set_creates_missing_key(self):
+        reg = FakeWinreg(missing_key=True)
+        M.autostart_set(True, reg=reg, exe=self.EXE)
+        self.assertTrue(M.autostart_get(reg))
+
+    def test_off_removes_value_and_is_idempotent(self):
+        reg = FakeWinreg({"TAnalytic": "x", "Other": "y"})
+        self.assertFalse(M.autostart_set(False, reg=reg))
+        self.assertEqual(reg.keys[M.AUTOSTART_KEY], {"Other": "y"})      # чужие записи не тронуты
+        self.assertFalse(M.autostart_get(reg))
+        self.assertFalse(M.autostart_set(False, reg=reg))                # повторное выключение без ошибки
+        self.assertFalse(M.autostart_set(False, reg=FakeWinreg(missing_key=True)))
+
+    def test_get_without_winreg_or_key(self):
+        self.assertFalse(M.autostart_get(FakeWinreg(missing_key=True)))
+        self.assertFalse(M.autostart_get(object()))                      # модуль без нужных функций (macOS и т. п.)
+
+    def test_value_name_matches_installer(self):
+        iss = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packaging", "TAnalytic.iss"),
+                   encoding="utf-8-sig").read()
+        self.assertIn('ValueName: "{#MyAppName}"', iss)
+        self.assertIn("#define MyAppName \"%s\"" % M.AUTOSTART_NAME, iss)
+        self.assertIn("Software\\Microsoft\\Windows\\CurrentVersion\\Run", iss)
+        self.assertIn("--tray", iss)
+        self.assertIn("AppMutex=TAnalyticSingleInstanceMutex", iss)
 
 
 if __name__ == "__main__":

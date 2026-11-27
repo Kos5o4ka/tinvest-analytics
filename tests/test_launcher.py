@@ -337,6 +337,45 @@ class Splash(unittest.TestCase):
         self.assertEqual([n for n in dir(api) if not n.startswith("_")], ["browser", "close", "minimize", "retry", "run"])
 
 
+class TrayLogic(unittest.TestCase):
+    """Трей без Windows: решения принимаются чистыми функциями, WinForms-часть проверяется вручную."""
+    def test_should_hide_on_close(self):
+        self.assertTrue(L.should_hide_on_close(False, True, True))
+        self.assertFalse(L.should_hide_on_close(True, True, True))      # настоящий выход (Выход в трее, обновление)
+        self.assertFalse(L.should_hide_on_close(False, False, True))    # значка нет — закрываем, невидимой программы не бывает
+        self.assertFalse(L.should_hide_on_close(False, True, False))    # настройка выключена (по умолчанию)
+
+    def test_tray_wanted_reads_app_hook(self):
+        old = getattr(sys, "tanalytic_tray", None)
+        try:
+            sys.tanalytic_tray = lambda: True
+            self.assertTrue(L.tray_wanted())
+            sys.tanalytic_tray = lambda: 1 / 0
+            self.assertFalse(L.tray_wanted())                           # ошибка в программе не мешает закрыть окно
+            sys.tanalytic_tray = None
+            self.assertFalse(L.tray_wanted())
+        finally:
+            if old is None:
+                del sys.tanalytic_tray
+            else:
+                sys.tanalytic_tray = old
+
+    def test_split_args_strips_tray(self):
+        r = L.split_args(["--tray", "--no-update", "--port", "9"], env={}, plat="win32")
+        self.assertEqual(r, (True, False, True, ["--port", "9"]))
+        self.assertEqual(L.split_args(["--tray"], env={}, plat="darwin")[2:], (False, []))   # на macOS трея нет
+        self.assertTrue(L.split_args([], env={"TINVEST_NO_GUI": "1"}, plat="win32")[1])
+
+    def test_tray_without_windows_is_harmless(self):
+        class W:
+            native = None
+        t = L.Tray(W())
+        self.assertFalse(t.start(force=True))                           # нет WinForms — значка нет, ошибки нет
+        self.assertFalse(t.ready)
+        t.dispose()
+        t.sync()
+
+
 class ShellUpdate(unittest.TestCase):
     """Обновление оболочки: установщик с GitHub, сверка SHA256, запуск без сети и без Windows."""
     SETUP = b"MZ fake installer" * 100

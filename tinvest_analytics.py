@@ -26965,20 +26965,110 @@ SHELL_REV_LATEST = 4
 SHELL_RELEASES = "https://github.com/Kos5o4ka/tinvest-analytics/releases/latest"
 
 
-def shell_status(env=None, frozen=None):
+DEFAULT_CONFIG.setdefault("tray_close", False)      # «При закрытии окна сворачивать в трей» (Windows); по умолчанию выключено
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "TAnalytic"                         # то же имя значения пишет установщик (packaging/TAnalytic.iss)
+
+
+def shell_rev(env=None):
+    env = os.environ if env is None else env
+    try:
+        return int(env.get("TINVEST_SHELL_REV") or 0)
+    except ValueError:
+        return 0
+
+
+def tray_supported(env=None, frozen=None, plat=None):
+    """Трей и автозапуск — только у собранной оболочки ревизии 4+ на Windows (на macOS пункты скрыты)."""
+    frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    return bool(frozen and (sys.platform if plat is None else plat) == "win32" and shell_rev(env) >= 4)
+
+
+def autostart_command(exe=None):
+    return '"%s" --tray' % (exe or sys.executable)
+
+
+def autostart_get(reg=None):
+    """Включён ли запуск вместе с Windows: есть ли значение TAnalytic в HKCU\\...\\Run. reg — модуль winreg (подменяется в тестах)."""
+    try:
+        reg = reg or __import__("winreg")
+        k = reg.OpenKey(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_READ)
+        try:
+            reg.QueryValueEx(k, AUTOSTART_NAME)
+            return True
+        finally:
+            reg.CloseKey(k)
+    except Exception:  # noqa: BLE001 — нет ключа, нет winreg (macOS), нет прав
+        return False
+
+
+def autostart_set(on, reg=None, exe=None):
+    """Включает или выключает запуск вместе с Windows (запись текущего пользователя, права администратора не нужны)."""
+    reg = reg or __import__("winreg")
+    if on:
+        k = reg.CreateKeyEx(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_SET_VALUE)
+        try:
+            reg.SetValueEx(k, AUTOSTART_NAME, 0, reg.REG_SZ, autostart_command(exe))
+        finally:
+            reg.CloseKey(k)
+        return True
+    try:
+        k = reg.OpenKey(reg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, reg.KEY_SET_VALUE)
+    except OSError:
+        return False                                  # ключа нет — выключать нечего
+    try:
+        reg.DeleteValue(k, AUTOSTART_NAME)
+    except OSError:
+        pass                                          # значения уже нет
+    finally:
+        reg.CloseKey(k)
+    return False
+
+
+def tray_close_wanted():
+    """Читает лаунчер при закрытии окна (sys.tanalytic_tray)."""
+    try:
+        return bool(load_config().get("tray_close"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def shell_status(env=None, frozen=None, cfg=None, reg=None):
     env = os.environ if env is None else env
     frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
-    try:
-        rev = int(env.get("TINVEST_SHELL_REV") or 0)
-    except ValueError:
-        rev = 0
+    rev = shell_rev(env)
     asset = {"darwin": "TAnalytic-mac-arm64.zip" if platform.machine() == "arm64" else "TAnalytic-mac-x64.zip",
              "win32": "TAnalytic-Setup-win.exe"}.get(sys.platform)
+    tray = tray_supported(env, frozen)
     return {"frozen": frozen, "rev": rev, "latest": SHELL_REV_LATEST, "outdated": bool(frozen and rev < SHELL_REV_LATEST),
-            "url": SHELL_RELEASES, "asset": asset}
+            "url": SHELL_RELEASES, "asset": asset,
+            "tray": tray, "tray_close": bool(tray and (cfg or {}).get("tray_close")),
+            "autostart": bool(tray and autostart_get(reg))}
 
 
-API_GET["/api/shell"] = lambda cfg, acc, q, force: shell_status()
+def api_shell_tray(cfg, body):
+    if not tray_supported():
+        raise ApiError("Трей и автозапуск доступны только в установленной версии для Windows.", 400)
+    if "tray_close" in body:
+        cfg["tray_close"] = bool(body["tray_close"])
+        save_config(cfg)
+        hook = getattr(sys, "tanalytic_tray_sync", None)       # лаунчер показывает или убирает значок в трее
+        if callable(hook):
+            try:
+                hook()
+            except Exception:  # noqa: BLE001
+                pass
+    if "autostart" in body:
+        try:
+            autostart_set(bool(body["autostart"]))
+        except Exception as e:  # noqa: BLE001
+            raise ApiError("Не удалось изменить автозапуск: %s" % e, 500)
+    return shell_status(cfg=cfg)
+
+
+API_GET["/api/shell"] = lambda cfg, acc, q, force: shell_status(cfg=cfg)
+API_POST["/api/shell/tray"] = api_shell_tray
+sys.tanalytic_tray = tray_close_wanted               # лаунчер спрашивает при закрытии окна: свернуть в трей или выйти
 # ═══════════════════════════════ HTTP-сервер ═══════════════════════════════
 
 _ping = [0.0]
@@ -32069,6 +32159,20 @@ async function bindSetCrowd(c,msg){
   on.onchange=async()=>{try{await post('/api/crowd/settings',{enabled:on.checked});stOk(on);msg(on.checked?'Спасибо! Программа будет скачивать страницы, пока она открыта.':'Помощь выключена.',1);show()}catch(e){msg(e.message);on.checked=!on.checked}};
   show();
 }
+/* ── Окно программы: трей и автозапуск (только установленная версия для Windows; на macOS карточки нет) ── */
+async function bindSetShell(msg){
+  let s;try{s=await api("/api/shell")}catch(e){return}
+  const sec=document.getElementById("set-look");
+  if(!s||!s.tray||!sec||document.getElementById("shell-card"))return;
+  sec.insertAdjacentHTML("beforeend",stGroup("Окно программы",
+    stRow("При закрытии окна сворачивать в трей","Программа продолжает работать в фоне: резервные копии, проверка тревог. Выйти можно из меню значка в трее",stSw("tray-close",!!s.tray_close,"При закрытии окна сворачивать в трей"))+
+    stRow("Запускать вместе с Windows","После входа в систему программа открывается сразу в трее, без окна",stSw("tray-auto",!!s.autostart,"Запускать вместе с Windows")),
+    {id:"shell-card",hint:"Windows"}));
+  const bind=(id,key)=>{const el=document.getElementById(id);if(!el)return;
+    el.onchange=async()=>{try{const r=await post("/api/shell/tray",{[key]:el.checked});stOk(el);
+      el.checked=!!r[key];msg("Сохранено",1,true)}catch(e){msg(e.message);el.checked=!el.checked}}};
+  bind("tray-close","tray_close");bind("tray-auto","autostart");
+}
 /* ── Настройки: панель состояния, поиск, журнал изменений и сборка экрана ── */
 /* ── панель состояния ── */
 function stTile(id,lbl,ico,go){return`<div class="st-tile" id="${id}"><div class="st-tl"><i>${stIco(ico)}</i>${lbl}<span class="st-dot mu" data-d></span></div><div class="st-tv" data-v>…</div><div class="st-ts" data-s>Загружаю</div><button class="btn ghost st-ta" data-to="${go}" data-a>Открыть</button></div>`}
@@ -32232,6 +32336,7 @@ async function renderSettings(){
   try{bindSetTg(c,msg)}catch(e){}
   try{bindSetBackup(c,msg)}catch(e){}
   try{bindSetCrowd(c,msg)}catch(e){}
+  try{bindSetShell(msg)}catch(e){}
   try{bindSetAcc(msg)}catch(e){}
   /* адреса API, сертификат и проверка SSL больше не редактируются в окне: в настройках остаются как были */
   const body=()=>({token:stSecVal('tok'),sandbox:$('#sb').checked});
