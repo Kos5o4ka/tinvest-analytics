@@ -237,9 +237,20 @@ def weekly_payload(st, loading=False, err=None):
             "sources": [ROSSTAT_NEWS]}
 
 
+def weekly_inflation_calc():
+    """Для calc_worker на сервере: докачать недостающее синхронно и вернуть готовый ответ экрана."""
+    st = weekly_collect(deep=not _wi_state()["deep"], save=lambda s: store().put(_WI_KEY, s))
+    store().put(_WI_KEY, st)
+    return weekly_payload(st)
+
+
 def weekly_inflation(force=False):
     """Отдаёт то, что уже разобрано; недостающее (свежие недели раз в 12 ч, история при первом запуске) докачивается в фоне."""
     st = _wi_state()
+    if not force and (time.time() - st["t"] > _WI_TTL or not st["deep"]):
+        got = ds_calc("inflation")                    # сервер уже собрал всю историю: не качаем её у себя
+        if got and isinstance(got[0], dict) and got[0].get("years") and not got[0].get("empty"):
+            return dict(got[0], loading=False)
     with _wi_lock:
         stale = force or (time.time() - st["t"] > _WI_TTL or not st["deep"]) and time.time() - _wi["last"] > 600
         if stale and not _wi["running"]:

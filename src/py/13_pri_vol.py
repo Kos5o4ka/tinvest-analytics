@@ -584,6 +584,14 @@ def _pv_run():
 
 
 def primary_volumes_payload(force=False):
+    if not force:                                     # готовый расчёт сервера (calc_worker), если он свежий
+        with _pv_lock:
+            need = _pv["res"] is None or time.time() - _pv["t"] >= pv_ttl()
+        if need:
+            got = ds_calc("pri_vol")
+            if got and isinstance(got[0], dict) and isinstance(got[0].get("rows"), list) and time.time() - got[1] < pv_ttl():
+                with _pv_lock:
+                    _pv.update(res=got[0], t=got[1], err=None)
     with _pv_lock:
         fresh = _pv["res"] is not None and time.time() - _pv["t"] < pv_ttl() and not force
         if not fresh and not _pv["running"]:

@@ -358,7 +358,20 @@ def ds_history(market, secid, frm, till=None, timeout=90):
 
 
 
+def ds_calc(name, timeout=20):
+    """Готовый результат calc_worker с сервера: -> (data, время расчёта) либо None (нет сервера, старый сервер, результата нет)."""
+    j = _ds_parsed_full("calc/" + name, None, timeout)
+    if not j or not isinstance(j.get("t"), (int, float)):
+        return None
+    return j.get("data"), float(j["t"])
+
+
 def ds_parsed(name, params=None, timeout=20):
+    j = _ds_parsed_full(name, params, timeout)
+    return j.get("data") if j else None
+
+
+def _ds_parsed_full(name, params=None, timeout=20):
     """Готовый разбор страницы источника с сервера данных: GET {сервер}/v1/parsed/<name>?... -> data либо None.
     None: сервер выключен/недоступен, старый сервер (404), ok:false, другая версия формата. Тогда вызывающий разбирает страницу сам."""
     srv, key = ds_conf()
@@ -387,7 +400,7 @@ def ds_parsed(name, params=None, timeout=20):
         return None
     if not isinstance(j, dict) or j.get("ok") is not True or j.get("v") != DS_PARSED_V:
         return None
-    return j.get("data")
+    return j
 
 
 def ext_open(url, data=None, headers=None, timeout=25, jar=None):

@@ -60,7 +60,9 @@ def register_calcs(lib):
     st = getattr(lib, "_fng", None)
     if isinstance(st, dict):
         PROGRESS["fng"] = lambda: "этап «%s», дней с закрытиями %s из %s" % (st.get("phase") or "—", st.get("have", 0), st.get("need", 0))
-    # шаг 2: CALCS["inflation"] = (lib.weekly_inflation, 3600)
+    # период < CALC_MAX_AGE сервера (час), иначе клиенты получат «устарело» и посчитают сами
+    CALCS["pri_vol"] = (lib.pv_compute, 300)         # объёмы первичных размещений (живые данные: в торги клиент ждёт не старше 5 мин)
+    CALCS["inflation"] = (lib.weekly_inflation_calc, 3000)   # недельная инфляция: вся история заметок Росстата один раз на сервере
 
 
 def write_result(data_dir, name, data, now=None):

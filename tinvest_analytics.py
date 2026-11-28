@@ -8701,7 +8701,20 @@ def ds_history(market, secid, frm, till=None, timeout=90):
 
 
 
+def ds_calc(name, timeout=20):
+    """Готовый результат calc_worker с сервера: -> (data, время расчёта) либо None (нет сервера, старый сервер, результата нет)."""
+    j = _ds_parsed_full("calc/" + name, None, timeout)
+    if not j or not isinstance(j.get("t"), (int, float)):
+        return None
+    return j.get("data"), float(j["t"])
+
+
 def ds_parsed(name, params=None, timeout=20):
+    j = _ds_parsed_full(name, params, timeout)
+    return j.get("data") if j else None
+
+
+def _ds_parsed_full(name, params=None, timeout=20):
     """Готовый разбор страницы источника с сервера данных: GET {сервер}/v1/parsed/<name>?... -> data либо None.
     None: сервер выключен/недоступен, старый сервер (404), ok:false, другая версия формата. Тогда вызывающий разбирает страницу сам."""
     srv, key = ds_conf()
@@ -8730,7 +8743,7 @@ def ds_parsed(name, params=None, timeout=20):
         return None
     if not isinstance(j, dict) or j.get("ok") is not True or j.get("v") != DS_PARSED_V:
         return None
-    return j.get("data")
+    return j
 
 
 def ext_open(url, data=None, headers=None, timeout=25, jar=None):
@@ -12905,6 +12918,14 @@ def _pv_run():
 
 
 def primary_volumes_payload(force=False):
+    if not force:                                     # готовый расчёт сервера (calc_worker), если он свежий
+        with _pv_lock:
+            need = _pv["res"] is None or time.time() - _pv["t"] >= pv_ttl()
+        if need:
+            got = ds_calc("pri_vol")
+            if got and isinstance(got[0], dict) and isinstance(got[0].get("rows"), list) and time.time() - got[1] < pv_ttl():
+                with _pv_lock:
+                    _pv.update(res=got[0], t=got[1], err=None)
     with _pv_lock:
         fresh = _pv["res"] is not None and time.time() - _pv["t"] < pv_ttl() and not force
         if not fresh and not _pv["running"]:
@@ -23698,9 +23719,20 @@ def weekly_payload(st, loading=False, err=None):
             "sources": [ROSSTAT_NEWS]}
 
 
+def weekly_inflation_calc():
+    """Для calc_worker на сервере: докачать недостающее синхронно и вернуть готовый ответ экрана."""
+    st = weekly_collect(deep=not _wi_state()["deep"], save=lambda s: store().put(_WI_KEY, s))
+    store().put(_WI_KEY, st)
+    return weekly_payload(st)
+
+
 def weekly_inflation(force=False):
     """Отдаёт то, что уже разобрано; недостающее (свежие недели раз в 12 ч, история при первом запуске) докачивается в фоне."""
     st = _wi_state()
+    if not force and (time.time() - st["t"] > _WI_TTL or not st["deep"]):
+        got = ds_calc("inflation")                    # сервер уже собрал всю историю: не качаем её у себя
+        if got and isinstance(got[0], dict) and got[0].get("years") and not got[0].get("empty"):
+            return dict(got[0], loading=False)
     with _wi_lock:
         stale = force or (time.time() - st["t"] > _WI_TTL or not st["deep"]) and time.time() - _wi["last"] > 600
         if stale and not _wi["running"]:
