@@ -8363,6 +8363,7 @@ _ds_lock = threading.Lock()
 _ds_bypass = {}                          # host -> до какого времени не ходить через сервер (источник заблокировал сервер: 429/captcha)
 _direct_block = {}                       # host -> [до какого времени не ходить и напрямую, число подряд отказов]
 DS_BYPASS_DEFAULT, DS_BYPASS_MIN, DS_BYPASS_MAX = 300, 30, 1800
+DS_TIMEOUT_BYPASS = 600                    # источник, по которому сервер не ответил вовремя, — 10 минут напрямую
 DIRECT_BLOCK_BASE, DIRECT_BLOCK_MAX = 120, 1800
 _ds_conf_cache = [0.0, ("", "")]
 _auth = {"need_login": False, "at": 0.0, "res": None, "bot": DS_BOT_DEFAULT}
@@ -8655,7 +8656,9 @@ def _ds_request(srv, key, url, data, headers, timeout):
         _ds_down("сервер ответил %d%s" % (e.code, " (неверный ключ)" if e.code in (401, 403) else ""))
         return None
     except Exception as e:  # noqa: BLE001
-        if _ds_is_timeout(e):                          # медленный ответ одного запроса — не повод отключать сервер для всех
+        if _ds_is_timeout(e):                          # медленный ответ одного запроса — не повод отключать сервер для всех,
+            # но этот источник сервер сейчас не тянет (ждали ~30 с): следующие запросы к нему идут напрямую, а не ждут так же
+            _ds_note_bypass((urllib.parse.urlparse(url).hostname or "").lower(), str(DS_TIMEOUT_BYPASS))
             return None
         _ds_down("нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
         return None
@@ -8782,6 +8785,11 @@ def ext_open(url, data=None, headers=None, timeout=25, jar=None):
             result = r.status, body, r.headers.get("Content-Type") or ""
     except urllib.error.HTTPError as e:
         _direct_note_fail(host, e)
+        raise
+    except (urllib.error.URLError, OSError):
+        # напрямую источник недоступен (например, из-за границы): обход сервера для этого хоста снимаем — пусть медленно, но через сервер
+        with _ds_lock:
+            _ds_bypass.pop(host, None)
         raise
     _direct_note_ok(host)
     return result
@@ -34545,6 +34553,11 @@ table.cmp .cmp-slot{min-width:200px;vertical-align:middle;background:var(--card2
 .guide-kb{margin-top:10px;font-size:12px;color:var(--mu)}
 .guide-kb a{color:var(--ac)}
 @media(max-width:700px){.guide-row{flex-wrap:wrap}.guide-sum{flex-basis:100%;white-space:normal}}
+
+/* Шапка: заголовок раздела не сжимается до одной буквы из-за строки входа и подписи поиска (окно 1280 px) */
+.top h1{flex:0 1 auto;min-width:6.5em}
+@media(max-width:1600px){.top .srch-pill .srch-tx{display:none}}
+@media(max-width:1440px){.who .who-key{display:none}}
 </style></head>
 <body>
 <div id="boot-splash" class="boot-splash" aria-hidden="true"><div class="boot-box"><div class="boot-logo"><svg width="64" height="64" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bsg" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#2563eb"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient><linearGradient id="bsa" x1="12" y1="6" x2="26" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="#0f1420" stroke="rgba(255,255,255,.08)"/><path d="M7 9c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1.5c0 .55-.45 1-1 1H8c-.55 0-1-.45-1-1V9z" fill="url(#bsg)"/><path d="M13.5 11.5h5V23c0 1.1-.9 2-2 2h-1c-1.1 0-2-.9-2-2V11.5z" fill="url(#bsg)"/><path d="M18.5 16l6-6m0 0h-4m4 0v4" stroke="url(#bsa)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="boot-title">TAnalytic <span class="boot-ver">Pro</span></div><div class="boot-bar"><div class="boot-bar-fill"></div></div><div class="boot-status" id="boot-status">Загружаю портфель…</div></div></div>
@@ -41912,7 +41925,7 @@ function authWho(){
   const s=AUTH.st;
   if(!s||s.state!=='ok'||(!s.username&&!s.expires)){el.innerHTML='';el.style.display='none';return}
   el.style.display='';
-  el.innerHTML=proPill()+`<span title="Вход по ключу из @${esc(AUTH.bot)}">${s.username?'@'+esc(s.username):'ключ'}${s.expires?' · до '+esc(authTime(s.expires)):''}</span><button id="who-out" title="Выйти и стереть ключ с этого компьютера">Выйти</button>`;
+  el.innerHTML=proPill()+`<span class="who-key" title="Вход по ключу из @${esc(AUTH.bot)}${s.expires?', ключ действует до '+esc(authTime(s.expires)):''}">${s.username?'@'+esc(s.username):'ключ'}${s.expires?' · до '+esc(authTime(s.expires)):''}</span><button id="who-out" title="Выйти и стереть ключ с этого компьютера">Выйти</button>`;
   $('#who-out').onclick=async()=>{try{AUTH.st=await post('/api/auth/logout');authApply()}catch(e){}};
 }
 function authOverlay(show,err){

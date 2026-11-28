@@ -14,7 +14,7 @@ function authWho(){
   const s=AUTH.st;
   if(!s||s.state!=='ok'||(!s.username&&!s.expires)){el.innerHTML='';el.style.display='none';return}
   el.style.display='';
-  el.innerHTML=proPill()+`<span title="Вход по ключу из @${esc(AUTH.bot)}">${s.username?'@'+esc(s.username):'ключ'}${s.expires?' · до '+esc(authTime(s.expires)):''}</span><button id="who-out" title="Выйти и стереть ключ с этого компьютера">Выйти</button>`;
+  el.innerHTML=proPill()+`<span class="who-key" title="Вход по ключу из @${esc(AUTH.bot)}${s.expires?', ключ действует до '+esc(authTime(s.expires)):''}">${s.username?'@'+esc(s.username):'ключ'}${s.expires?' · до '+esc(authTime(s.expires)):''}</span><button id="who-out" title="Выйти и стереть ключ с этого компьютера">Выйти</button>`;
   $('#who-out').onclick=async()=>{try{AUTH.st=await post('/api/auth/logout');authApply()}catch(e){}};
 }
 function authOverlay(show,err){

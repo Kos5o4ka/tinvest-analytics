@@ -252,6 +252,29 @@ class ExtOpenTests(unittest.TestCase):
             self.assertTrue(want - 2 <= left <= want, left)
             self.m._direct_block["127.0.0.1"][0] = time.time() - 1
 
+    def test_server_timeout_sends_host_direct(self):
+        """Сервер не ответил по источнику за отведённое время: следующие запросы к этому хосту не ждут сервер снова."""
+        import socket
+        from unittest import mock
+        self.set_cfg(self.fk.base, "k")
+        calls = []
+
+        def slow(req, timeout=30):
+            calls.append(req.full_url)
+            raise socket.timeout("timed out")
+        with mock.patch.object(self.m, "ds_urlopen", slow):
+            self.assertEqual(self.m.ext_open(self.fk.base + "/a")[1], b"direct")
+            self.assertEqual(self.m.ext_open(self.fk.base + "/b")[1], b"direct")
+        self.assertEqual(len(calls), 1)                                   # второй запрос сразу напрямую
+        self.assertTrue(self.m._ds_bypassed("127.0.0.1"))
+        self.assertLess(self.m._ds_state["down_until"], time.time())     # сервер для других источников не отключён
+        dead = "http://127.0.0.1:1"                                       # напрямую хост недоступен -> обход снимается
+        self.m._ds_note_bypass("127.0.0.1", "600")
+        with mock.patch.object(self.m, "ds_urlopen", slow):
+            with self.assertRaises(urllib.error.URLError):
+                self.m.ext_open(dead + "/c", timeout=2)
+        self.assertFalse(self.m._ds_bypassed("127.0.0.1"))
+
     def test_direct_403_only_when_bypassed(self):
         with self.assertRaises(urllib.error.HTTPError):
             self.m.ext_open(self.fk.base + "/d403")

@@ -14,3 +14,8 @@
 .guide-kb{margin-top:10px;font-size:12px;color:var(--mu)}
 .guide-kb a{color:var(--ac)}
 @media(max-width:700px){.guide-row{flex-wrap:wrap}.guide-sum{flex-basis:100%;white-space:normal}}
+
+/* Шапка: заголовок раздела не сжимается до одной буквы из-за строки входа и подписи поиска (окно 1280 px) */
+.top h1{flex:0 1 auto;min-width:6.5em}
+@media(max-width:1600px){.top .srch-pill .srch-tx{display:none}}
+@media(max-width:1440px){.who .who-key{display:none}}

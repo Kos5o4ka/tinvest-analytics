@@ -20,6 +20,7 @@ _ds_lock = threading.Lock()
 _ds_bypass = {}                          # host -> до какого времени не ходить через сервер (источник заблокировал сервер: 429/captcha)
 _direct_block = {}                       # host -> [до какого времени не ходить и напрямую, число подряд отказов]
 DS_BYPASS_DEFAULT, DS_BYPASS_MIN, DS_BYPASS_MAX = 300, 30, 1800
+DS_TIMEOUT_BYPASS = 600                    # источник, по которому сервер не ответил вовремя, — 10 минут напрямую
 DIRECT_BLOCK_BASE, DIRECT_BLOCK_MAX = 120, 1800
 _ds_conf_cache = [0.0, ("", "")]
 _auth = {"need_login": False, "at": 0.0, "res": None, "bot": DS_BOT_DEFAULT}
@@ -312,7 +313,9 @@ def _ds_request(srv, key, url, data, headers, timeout):
         _ds_down("сервер ответил %d%s" % (e.code, " (неверный ключ)" if e.code in (401, 403) else ""))
         return None
     except Exception as e:  # noqa: BLE001
-        if _ds_is_timeout(e):                          # медленный ответ одного запроса — не повод отключать сервер для всех
+        if _ds_is_timeout(e):                          # медленный ответ одного запроса — не повод отключать сервер для всех,
+            # но этот источник сервер сейчас не тянет (ждали ~30 с): следующие запросы к нему идут напрямую, а не ждут так же
+            _ds_note_bypass((urllib.parse.urlparse(url).hostname or "").lower(), str(DS_TIMEOUT_BYPASS))
             return None
         _ds_down("нет связи с сервером: %s" % (getattr(e, "reason", None) or type(e).__name__))
         return None
@@ -439,6 +442,11 @@ def ext_open(url, data=None, headers=None, timeout=25, jar=None):
             result = r.status, body, r.headers.get("Content-Type") or ""
     except urllib.error.HTTPError as e:
         _direct_note_fail(host, e)
+        raise
+    except (urllib.error.URLError, OSError):
+        # напрямую источник недоступен (например, из-за границы): обход сервера для этого хоста снимаем — пусть медленно, но через сервер
+        with _ds_lock:
+            _ds_bypass.pop(host, None)
         raise
     _direct_note_ok(host)
     return result
