@@ -150,17 +150,31 @@ jobs:
             echo "TAURI_EXTRA=" >> "$GITHUB_ENV"
           fi
 
+      - name: Секреты Apple (только заданные)
+        if: runner.os == 'macOS'
+        env:
+          S_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          S_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          S_APPLE_ID: ${{ secrets.APPLE_ID }}
+          S_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          S_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Без сертификата Tauri подписывает ad-hoc (signingIdentity "-" в tauri.conf.json)
+          if [ -n "$S_APPLE_CERTIFICATE" ] && [ -n "$S_APPLE_CERTIFICATE_PASSWORD" ]; then
+            { echo "APPLE_CERTIFICATE<<APPLE_EOF"; echo "$S_APPLE_CERTIFICATE"; echo "APPLE_EOF"
+              echo "APPLE_CERTIFICATE_PASSWORD=$S_APPLE_CERTIFICATE_PASSWORD"; } >> "$GITHUB_ENV"
+          fi
+          if [ -n "$S_APPLE_ID" ] && [ -n "$S_APPLE_PASSWORD" ] && [ -n "$S_APPLE_TEAM_ID" ]; then
+            { echo "APPLE_ID=$S_APPLE_ID"; echo "APPLE_PASSWORD=$S_APPLE_PASSWORD"; echo "APPLE_TEAM_ID=$S_APPLE_TEAM_ID"; } >> "$GITHUB_ENV"
+          fi
+
       - name: Сборка приложения Tauri v2
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # APPLE_* попадают сюда из шага «Секреты Apple» только если заданы: пустой APPLE_CERTIFICATE ломает импорт в Tauri
           # В CI (CI=true) бандлер DMG добавляет --skip-jenkins и пропускает AppleScript Finder: тогда нет фона, позиций значков
           # и скрытия расширения («TAnalytic.app» вместо «TAnalytic»). Раннер macOS имеет сеанс Finder, скрипт отрабатывает.
           TAURI_BUNDLER_DMG_IGNORE_CI: "true"
