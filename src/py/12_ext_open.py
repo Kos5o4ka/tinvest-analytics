@@ -620,5 +620,48 @@ def http_bytes(url, timeout=30):
     return ext_open(url, timeout=timeout)[1]
 
 
+_ds_batch_off = [0.0]                      # старый сервер без /v1/batch: не спрашиваем 10 минут
+
+
+def ext_get_many(urls, timeout=60):
+    """Много GET одним запросом к серверу данных (/v1/batch). -> список той же длины: (статус, байты, content-type) или None.
+    None — элемент не получен (нет сервера, старый сервер, ошибка источника): его вызывающий берёт обычным ext_open."""
+    out = [None] * len(urls)
+    srv, key = ds_conf()
+    now = time.time()
+    if not urls or not srv or now < _ds_state["down_until"] or now < _ds_batch_off[0]:
+        return out
+    hd = {"User-Agent": EXT_UA["User-Agent"], "Content-Type": "application/json", "Accept-Encoding": "gzip"}
+    if key:
+        hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
+    for i0 in range(0, len(urls), 100):
+        part = urls[i0:i0 + 100]
+        try:
+            req = urllib.request.Request(srv + "/v1/batch", data=json.dumps({"urls": part}).encode("utf-8"), headers=hd, method="POST")
+            with ds_urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+                if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+                    raw = gzip.decompress(raw)
+                items = json.loads(raw.decode("utf-8", "replace")).get("items") or []
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 405):
+                _ds_batch_off[0] = time.time() + 600
+            return out
+        except Exception:  # noqa: BLE001
+            return out
+        for k, it in enumerate(items[:len(part)]):
+            if not isinstance(it, dict) or "b" not in it:
+                continue
+            try:
+                out[i0 + k] = (int(it.get("s") or 0), base64.b64decode(it["b"]), str(it.get("ct") or ""))
+            except (ValueError, TypeError):
+                continue
+            xc = it.get("x")
+            with _ds_lock:
+                _ds_state[xc if xc in ("hit", "stale") else "miss"] += 1
+    return out
+
+
 def http_text(url, timeout=25):
     return ext_open(url, timeout=timeout)[1].decode("utf-8", "replace")

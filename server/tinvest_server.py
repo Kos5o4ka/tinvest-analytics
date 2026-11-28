@@ -9,6 +9,7 @@
     python3 tinvest_server.py [--host 127.0.0.1] [--port 8780] [--data DIR] [--key KEY] [--keys-db PATH --bot NAME] [--verbose]
 """
 import argparse
+import base64
 import gzip
 import hashlib
 import hmac
@@ -614,6 +615,7 @@ UA_BY_HOST = {"smart-lab.ru": UA_BROWSER, "invest-brands.cdn-tinkoff.ru": "Mozil
 FORWARD_HEADERS = ("Referer", "Cookie", "Accept", "Accept-Language")
 
 MAX_BODY_IN = 1024 * 1024
+BATCH_MAX, BATCH_PAR, BATCH_MAX_BYTES = 100, 8, 30 * 1024 * 1024    # /v1/batch: адресов, параллельно к источникам, размер ответа
 MAX_BODY_OUT = 25 * 1024 * 1024
 UPSTREAM_TIMEOUT = 30
 
@@ -1194,6 +1196,38 @@ class DataServer:
         self._stat(host, "miss")
         return res
 
+    def batch(self, urls):
+        """Несколько GET через кэш сервера одним ответом (/v1/batch). Ошибка или блокировка источника по элементу -> {"err"}:
+        такой адрес приложение повторит обычным /v1/fetch, где вся обработка ошибок уже есть. Суммарный размер ограничен."""
+        out = [None] * len(urls)
+        sem = threading.Semaphore(BATCH_PAR)
+
+        def one(i, url):
+            with sem:
+                if not self.url_allowed(url):
+                    out[i] = {"err": "host not allowed"}
+                    return
+                try:
+                    r = self.fetch("GET", url)
+                except Exception as e:  # noqa: BLE001
+                    out[i] = {"err": type(e).__name__}
+                    return
+                if r.blocked is not None or r.error:
+                    out[i] = {"err": "upstream"}
+                    return
+                out[i] = {"s": r.status, "ct": r.ctype, "x": r.xcache, "b": base64.b64encode(r.body).decode("ascii")}
+        ths = [threading.Thread(target=one, args=(i, u), daemon=True) for i, u in enumerate(urls)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+        total = 0
+        for i, it in enumerate(out):
+            total += len((it or {}).get("b") or "")
+            if total > BATCH_MAX_BYTES:
+                out[i] = {"err": "size"}
+        return out
+
     def fetch_json(self, url):
         """GET через кэш сервера -> разобранный JSON или None (для проверки тревог)."""
         r = self.fetch("GET", url)
@@ -1517,6 +1551,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, {"ok": False, "error": str(e)})
         if u.path == "/v1/stats":
             return self._send(200, app.stats())
+        if u.path == "/v1/batch":
+            if self.command != "POST":
+                return self._send(405, {"ok": False, "error": "method not allowed"}, extra=[("Allow", "POST")])
+            try:
+                urls = json.loads(body.decode("utf-8") or "{}").get("urls")
+            except (ValueError, AttributeError, UnicodeDecodeError):
+                urls = None
+            if not isinstance(urls, list) or not urls or len(urls) > BATCH_MAX or not all(isinstance(x, str) for x in urls):
+                return self._send(400, {"ok": False, "error": "urls: list of 1..%d strings" % BATCH_MAX})
+            return self._send(200, {"ok": True, "items": app.batch(urls)})
         if u.path == "/v1/fetch":
             url = (parse_qs(u.query).get("url") or [""])[0]
             if not app.url_allowed(url):

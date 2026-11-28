@@ -388,6 +388,19 @@ def spark_payload(ids, budget=25.0):
         i = (i or "").strip().upper()
         if re.match(r"^[A-Z0-9]{5,16}$", i) and i not in seen:
             seen.append(i)
+    need = []
+    with _spark_lock:
+        need = [i for i in seen[:SPARK_MAX_IDS] if (i, date.today()) not in _spark_cache]
+    if len(need) > 1:                                 # одним пакетом через сервер данных; что не пришло — по одному ниже
+        for i, res in zip(need, ext_get_many([SPARK_URL % (i, frm) for i in need])):
+            if not res or res[0] != 200:
+                continue
+            try:
+                vals = spark_parse(json.loads(res[1].decode("utf-8", "replace")))
+            except (ValueError, TypeError):
+                continue
+            with _spark_lock:
+                _spark_cache[(i, date.today())] = vals
     for i in seen[:SPARK_MAX_IDS]:
         key = (i, date.today())
         with _spark_lock:
