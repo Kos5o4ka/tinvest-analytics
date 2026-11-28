@@ -17,6 +17,7 @@ import html as html_mod
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -617,11 +618,19 @@ FORWARD_HEADERS = ("Referer", "Cookie", "Accept", "Accept-Language")
 MAX_BODY_IN = 1024 * 1024
 BATCH_MAX, BATCH_PAR, BATCH_MAX_BYTES = 100, 8, 30 * 1024 * 1024    # /v1/batch: адресов, параллельно к источникам, размер ответа
 MAX_BODY_OUT = 25 * 1024 * 1024
-UPSTREAM_TIMEOUT = 30
+UPSTREAM_TIMEOUT = 20      # меньше ожидания приложения (25–30 с): сервер успевает ответить «источник не ответил», и приложение идёт напрямую
 
 
 class UpstreamError(Exception):
     pass
+
+
+def _unreachable(e):
+    """Источник не ответил или оборвал соединение (не HTTP-ответ и не «слишком большой ответ»)."""
+    if isinstance(e, urllib.error.URLError) and not isinstance(e, urllib.error.HTTPError):
+        e = e.reason if isinstance(e.reason, BaseException) else e
+    return isinstance(e, (socket.timeout, TimeoutError, ConnectionError)) or (
+        isinstance(e, OSError) and not isinstance(e, urllib.error.HTTPError)) or "timed out" in str(e)
 
 
 # ───────────────────────── авторизация ─────────────────────────
@@ -924,6 +933,7 @@ BLOCK_SCAN = 20 * 1024
 COOLDOWN_BASE, COOLDOWN_MAX = 60, 1800          # экспоненциально: 60, 120, 240 … 1800 с (если источник не прислал Retry-After)
 RETRY_AFTER_MIN, RETRY_AFTER_MAX = 30, 6 * 3600
 STRIKES_403, STRIKES_403_WINDOW = 2, 600        # 403 морозит хост только со 2-го подряд в течение 10 минут
+# так же «источник не отвечает» (тайм-аут, обрыв соединения): со 2-го раза за 10 минут хост на паузе, приложения сразу идут напрямую
 
 
 def block_kind(status, ctype, data):
@@ -1100,12 +1110,13 @@ class DataServer:
         """Источник заблокировал запрос -> секунд паузы для хоста (0 — паузы нет: одиночный 403)."""
         now = self.clock()
         with self._blk_lock:
-            st = self._blk.setdefault(host, {"until": 0.0, "n": 0, "s403": []})
-            if status == 403:
-                st["s403"] = [t for t in st["s403"] if now - t < STRIKES_403_WINDOW] + [now]
-                if len(st["s403"]) < STRIKES_403:
+            st = self._blk.setdefault(host, {"until": 0.0, "n": 0, "s403": [], "sdown": []})
+            if status in (403, "down"):
+                k = "s403" if status == 403 else "sdown"
+                st[k] = [t for t in st.get(k, []) if now - t < STRIKES_403_WINDOW] + [now]
+                if len(st[k]) < STRIKES_403:
                     return 0
-                st["s403"] = []
+                st[k] = []
             if retry_after is not None:
                 d = min(max(retry_after, RETRY_AFTER_MIN), RETRY_AFTER_MAX)
             else:
@@ -1118,7 +1129,7 @@ class DataServer:
         with self._blk_lock:
             st = self._blk.get(host)
             if st:
-                st["n"], st["s403"] = 0, []
+                st["n"], st["s403"], st["sdown"] = 0, [], []
 
     # --- TTL ---
     def ttl_for(self, host, url, method, now):
@@ -1426,6 +1437,10 @@ class DataServer:
             up_headers = up[4] if len(up) > 4 else {}
         except Exception as e:  # noqa: BLE001
             self._stat(host, "upstream_errors")
+            if _unreachable(e):                                 # источник не отвечает (тайм-аут, обрыв): со 2-го раза — пауза хоста
+                left = self._note_block(host, "down", None)
+                if left:
+                    return self._blocked_result(left)
             return Result(502, "text/plain", ("upstream error: %s" % type(e).__name__).encode(), error=str(e))
         if status >= 500:
             self._stat(host, "upstream_errors")

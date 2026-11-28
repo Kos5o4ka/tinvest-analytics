@@ -447,6 +447,28 @@ class BlockTests(unittest.TestCase):
         st, _, h = self.f.call(self.f.up.url("/b"))
         self.assertEqual(h["X-Upstream-Blocked"], "0")
 
+    def test_unreachable_upstream_pauses_host(self):
+        """Источник не отвечает (тайм-аут): со 2-го раза хост на паузе — приложения получают X-Upstream-Blocked сразу, без ожидания."""
+        import socket
+        orig = self.f.app.upstream
+        calls = []
+
+        def up(m, url, b, c, h):
+            calls.append(url)
+            raise urllib.error.URLError(socket.timeout("timed out"))
+        self.f.app.upstream = up
+        try:
+            st, _, h = self.f.call(self.f.up.url("/t1"))
+            self.assertEqual(st, 502)                                      # одиночный тайм-аут — паузы нет
+            self.assertNotIn("X-Upstream-Blocked", h)
+            st, _, h = self.f.call(self.f.up.url("/t2"))
+            self.assertEqual((st, h["X-Upstream-Blocked"]), (503, "60"))
+            self.f.call(self.f.up.url("/t3"))
+            self.assertEqual(len(calls), 2)                                # на паузе к источнику не ходим
+            self.assertFalse(ts._unreachable(ts.UpstreamError("response too large")))
+        finally:
+            self.f.app.upstream = orig
+
     def test_parsed_blocked_502(self):
         self.f.app.allowed["iss.moex.com"] = None
         orig = self.f.app.upstream
