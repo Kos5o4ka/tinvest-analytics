@@ -54,6 +54,9 @@ def _bench_fetch(code, frm, to=None):
     """Дневные закрытия с Мосбиржи (ISS отдаёт страницами по 100 строк). Фонд на нескольких досках за день — строка с максимальным оборотом."""
     fund = _bench_kind(code) == "fund"
     mkt = "shares" if fund else "index"
+    h = ds_history(mkt, code, frm, to)               # архив сервера: один запрос вместо ~20 страниц ISS
+    if h and str(h.get("cov_from") or "9") <= frm:     # архив покрывает весь запрошенный срок без пропусков
+        return {r[0]: float(r[1]) for r in h["rows"] if r and r[1] is not None}
     cols = "BOARDID,TRADEDATE,CLOSE,VALUE" if fund else "TRADEDATE,CLOSE"
     out, best, start = {}, {}, 0
     for _ in range(80):

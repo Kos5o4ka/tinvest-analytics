@@ -33,7 +33,8 @@ import crowd  # noqa: E402  (очередь и приём страниц рас�
 import alerts  # noqa: E402  (серверная проверка тревог, пока приложение закрыто; см. alerts.py)
 import trial  # noqa: E402  (привязка пробного периода к ПК по хэшу, см. trial.py)
 import sync  # noqa: E402  (зашифрованная облачная копия, очередь из бота, вход в один клик; см. sync.py)
-import devices  # noqa: E402  (не больше N компьютеров на аккаунт по хэшу ПК, см. devices.py)
+import devices  # noqa: E402
+import history  # noqa: E402  (архив дневных цен Мосбиржи, /v1/history; см. history.py)  (не больше N компьютеров на аккаунт по хэшу ПК, см. devices.py)
 
 VERSION = "1.1.0"
 MIN, HOUR, DAY = 60, 3600, 86400
@@ -1001,6 +1002,7 @@ class DataServer:
         self.ttl = _TtlFlight(clock)
         self._meta = {}
         self._crowd, self._crowd_lock = None, threading.Lock()
+        self.history = history.HistoryStore(os.path.join(data_dir, "history.sqlite"), self.fetch_json, clock)
 
     @property
     def crowd(self):
@@ -1366,6 +1368,9 @@ class DataServer:
             try:
                 st = self.refresh_once()
                 print("кэш: обновлено %(refreshed)d из %(candidates)d, ошибок %(failed)d, удалено %(purged)d за %(seconds)d с" % st, flush=True)
+                ok, bad, gone = self.history.refresh_all()
+                if ok or bad or gone:
+                    print("архив цен: освежено %d, ошибок %d, удалено %d" % (ok, bad, gone), flush=True)
             except Exception as e:  # noqa: BLE001
                 print("кэш: фоновое обновление не удалось: %s" % e, flush=True)
             stop.wait(period or WARM_PERIOD)
@@ -1502,6 +1507,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._alerts(u, info, body)
         if u.path.startswith("/v1/sync/"):
             return self._sync(u, info, body)
+        if u.path == "/v1/history":
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            try:
+                return self._send(200, app.history.query(q.get("market", ""), q.get("secid", ""), q.get("from", ""), q.get("till")))
+            except ValueError:
+                return self._send(400, {"ok": False, "error": "bad params"})
+            except (history.HistoryError, sqlite3.Error) as e:
+                return self._send(502, {"ok": False, "error": str(e)})
         if u.path == "/v1/stats":
             return self._send(200, app.stats())
         if u.path == "/v1/fetch":

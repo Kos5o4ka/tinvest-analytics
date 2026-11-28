@@ -319,6 +319,43 @@ def _ds_request(srv, key, url, data, headers, timeout):
 
 
 DS_PARSED_V = 1
+_ds_hist_off = [0.0]                       # старый сервер без /v1/history: не спрашиваем 10 минут
+
+
+def ds_history(market, secid, frm, till=None, timeout=90):
+    """Дневная история бумаги из архива сервера данных одним запросом (вместо десятков страниц ISS).
+    -> {"from", "till", "cov_from", "rows": [[дата, close, value, yield], ...]} либо None (сервера нет, старый сервер, ошибка)."""
+    srv, key = ds_conf()
+    now = time.time()
+    if not srv or now < _ds_state["down_until"] or now < _ds_hist_off[0]:
+        return None
+    q = {"market": market, "secid": secid, "from": frm}
+    if till:
+        q["till"] = till
+    hd = {"User-Agent": EXT_UA["User-Agent"], "Accept-Encoding": "gzip"}
+    if key:
+        hd["X-Client-Key"] = key
+        hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
+    try:
+        with ds_urlopen(urllib.request.Request(srv + "/v1/history?" + urllib.parse.urlencode(q), headers=hd), timeout=timeout) as r:
+            raw = r.read()
+            if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+                raw = gzip.decompress(raw)
+            j = json.loads(raw.decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            _ds_hist_off[0] = time.time() + 600
+        elif e.code == 401:
+            with _ds_lock:
+                _auth["need_login"] = True
+                _auth["res"] = None
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(j, dict) or j.get("ok") is not True or not isinstance(j.get("rows"), list):
+        return None
+    return j
+
 
 
 def ds_parsed(name, params=None, timeout=20):
