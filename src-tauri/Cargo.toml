@@ -1,6 +1,6 @@
 [package]
 name = "tanalytic"
-version = "0.31.0"
+version = "0.32.0"
 description = "TAnalytic — аналитика брокерских счетов и облигаций"
 authors = ["Kos5o4ka"]
 edition = "2021"

@@ -30,7 +30,7 @@ class TauriConfigAndFiles(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             conf = json.load(f)
         self.assertEqual(conf["productName"], "TAnalytic")
-        self.assertEqual(conf["version"], "0.31.0")
+        self.assertEqual(conf["version"], "0.32.0")
         self.assertEqual(conf["identifier"], "ru.tanalytic.desktop")
         win = conf["app"]["windows"][0]
         self.assertEqual(win["label"], "main")
@@ -56,7 +56,7 @@ class TauriConfigAndFiles(unittest.TestCase):
             data = None
         if data is not None:
             self.assertEqual(data["package"]["name"], "tanalytic")
-            self.assertEqual(data["package"]["version"], "0.31.0")
+            self.assertEqual(data["package"]["version"], "0.32.0")
             self.assertEqual(data["lib"]["name"], "tanalytic_lib")
             deps = data["dependencies"]
             for dep in (
