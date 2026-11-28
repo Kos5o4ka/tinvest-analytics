@@ -88,6 +88,10 @@ class ExtOpenTests(unittest.TestCase):
         self.orig = dict(self.m._ds_state)
         self.m._ds_bypass.clear()
         self.m._direct_block.clear()
+        self.m._direct_down.clear()
+        self._df = set(self.m.DS_DIRECT_FIRST)
+        self.m.DS_DIRECT_FIRST.clear()                       # в этих тестах iss.moex.com — через фейковый сервер, без сети
+        self.addCleanup(lambda: (self.m.DS_DIRECT_FIRST.clear(), self.m.DS_DIRECT_FIRST.update(self._df)))
         os.environ["TINVEST_DATA_SERVER"] = "off"
         os.environ.pop("TINVEST_DATA_KEY", None)
         self.set_cfg("", "")
@@ -274,6 +278,20 @@ class ExtOpenTests(unittest.TestCase):
             with self.assertRaises(urllib.error.URLError):
                 self.m.ext_open(dead + "/c", timeout=2)
         self.assertFalse(self.m._ds_bypassed("127.0.0.1"))
+
+    def test_direct_first_host_then_server_fallback(self):
+        """Источник, который банит IP сервера: сначала напрямую; если сеть не пускает — через сервер, и 10 минут сразу через сервер."""
+        self.set_cfg(self.fk.base, "k")
+        self.m.DS_DIRECT_FIRST.add("127.0.0.1")
+        n = len(self.fk.log)
+        self.assertEqual(self.m.ext_open(self.fk.base + "/x")[1], b"direct")
+        self.assertEqual(len(self.fk.log), n + 1)                         # один прямой запрос, сервер не трогали
+        self.assertFalse(any(p.startswith("/v1/fetch") for p, _k, _c in self.fk.log[n:]))
+        out = self.m.ext_get_many([self.fk.base + "/p%d" % i for i in range(5)])
+        self.assertEqual([r[1] for r in out], [b"direct"] * 5)           # пачка напрямую
+        dead = "http://127.0.0.1:1"
+        self.assertEqual(self.m.ext_open(dead + "/y", timeout=2)[1], b"via-server")
+        self.assertFalse(self.m._direct_first("127.0.0.1"))               # дальше сразу через сервер
 
     def test_direct_403_only_when_bypassed(self):
         with self.assertRaises(urllib.error.HTTPError):

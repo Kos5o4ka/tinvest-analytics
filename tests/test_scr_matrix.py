@@ -79,6 +79,8 @@ class SparkTests(unittest.TestCase):
                 raise OSError("down")
             return json.dumps(self.J)
         T.http_text = fake
+        saved_many = T.ext_get_many
+        T.ext_get_many = lambda urls, *a, **k: [None] * len(urls)          # без сети: пачка не пришла, по одному через http_text
         T._spark_cache.clear()
         try:
             out = T.spark_payload(["RU000A0ZZZ01", "ru000a0zzz01", "bad id!", "RUBAD0000000", "RU000A0ZZZ02"])
@@ -88,6 +90,7 @@ class SparkTests(unittest.TestCase):
             self.assertEqual(len(calls), n)                                   # из кэша
         finally:
             T.http_text = saved
+            T.ext_get_many = saved_many
             T._spark_cache.clear()
 
 

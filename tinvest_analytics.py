@@ -8749,25 +8749,24 @@ def _ds_parsed_full(name, params=None, timeout=20):
     return j
 
 
-def ext_open(url, data=None, headers=None, timeout=25, jar=None):
-    """Запрос публичных данных -> (статус, байты, content-type). При HTTP-ошибке источника бросает urllib.error.HTTPError
-    (как и прежний urlopen). jar — dict с cookie сессии (обновляется из ответа), нужен, например, raexpert (CSRF)."""
-    headers = dict(headers or {})
-    if jar:
-        headers["Cookie"] = _cookie_header(jar)
-    srv, key = ds_conf()
-    host = (urllib.parse.urlparse(url).hostname or "").lower()
-    if srv and time.time() >= _ds_state["down_until"] and not _ds_bypassed(host):
-        res = _ds_request(srv, key, url, data, headers, timeout)
-        if res is not None:
-            status, body, ct, cookies, xc = res
-            with _ds_lock:
-                _ds_state[xc if xc in ("hit", "stale") else "miss"] += 1
-            if jar is not None:
-                _jar_update(jar, cookies)
-            if status >= 400:
-                raise urllib.error.HTTPError(url, status, "HTTP %d" % status, {"Content-Type": ct}, io.BytesIO(body))
-            return status, body, ct
+DIRECT_PAR = 8                           # параллельных прямых запросов к одному источнику в пачке
+DS_DIRECT_FIRST = {"iss.moex.com"}      # источники, которые банят IP сервера: сначала напрямую, сервер — запасной путь
+DIRECT_DOWN_SECS = 600
+_direct_down = {}                        # host -> до какого времени напрямую не пробуем (сеть не пускает, например из-за границы)
+
+
+def _direct_first(host):
+    if host not in DS_DIRECT_FIRST:
+        return False
+    with _ds_lock:
+        t = _direct_down.get(host, 0.0)
+        if t and t <= time.time():
+            _direct_down.pop(host, None)
+            t = 0.0
+    return not t
+
+
+def _ext_direct(url, data, headers, timeout, jar, host):
     wait = _direct_wait(host)
     if wait:                                            # источник ограничил и прямые запросы: сети не касаемся
         raise urllib.error.HTTPError(url, 429, "Источник %s временно ограничил запросы, повтор через %d с" % (host, wait),
@@ -8787,12 +8786,47 @@ def ext_open(url, data=None, headers=None, timeout=25, jar=None):
         _direct_note_fail(host, e)
         raise
     except (urllib.error.URLError, OSError):
-        # напрямую источник недоступен (например, из-за границы): обход сервера для этого хоста снимаем — пусть медленно, но через сервер
+        # напрямую источник недоступен (например, из-за границы): обход сервера снимаем — пусть медленно, но через сервер
         with _ds_lock:
             _ds_bypass.pop(host, None)
+            if host in DS_DIRECT_FIRST:
+                _direct_down[host] = time.time() + DIRECT_DOWN_SECS
         raise
     _direct_note_ok(host)
     return result
+
+
+def ext_open(url, data=None, headers=None, timeout=25, jar=None):
+    """Запрос публичных данных -> (статус, байты, content-type). При HTTP-ошибке источника бросает urllib.error.HTTPError
+    (как и прежний urlopen). jar — dict с cookie сессии (обновляется из ответа), нужен, например, raexpert (CSRF).
+    Мосбиржа (DS_DIRECT_FIRST) — сначала напрямую: IP сервера она банит; через сервер — только если напрямую сеть не пускает."""
+    headers = dict(headers or {})
+    if jar:
+        headers["Cookie"] = _cookie_header(jar)
+    srv, key = ds_conf()
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    direct_err = None
+    if _direct_first(host):
+        try:
+            return _ext_direct(url, data, headers, timeout, jar, host)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, OSError) as e:
+            direct_err = e
+    if srv and time.time() >= _ds_state["down_until"] and not _ds_bypassed(host):
+        res = _ds_request(srv, key, url, data, headers, timeout)
+        if res is not None:
+            status, body, ct, cookies, xc = res
+            with _ds_lock:
+                _ds_state[xc if xc in ("hit", "stale") else "miss"] += 1
+            if jar is not None:
+                _jar_update(jar, cookies)
+            if status >= 400:
+                raise urllib.error.HTTPError(url, status, "HTTP %d" % status, {"Content-Type": ct}, io.BytesIO(body))
+            return status, body, ct
+    if direct_err is not None:                          # напрямую уже не вышло, сервер тоже не помог
+        raise direct_err
+    return _ext_direct(url, data, headers, timeout, jar, host)
 
 
 def ds_status():
@@ -8978,6 +9012,20 @@ def ext_get_many(urls, timeout=60):
     """Много GET одним запросом к серверу данных (/v1/batch). -> список той же длины: (статус, байты, content-type) или None.
     None — элемент не получен (нет сервера, старый сервер, ошибка источника): его вызывающий берёт обычным ext_open."""
     out = [None] * len(urls)
+    direct = [i for i, u in enumerate(urls) if _direct_first((urllib.parse.urlparse(u).hostname or "").lower())]
+    if direct:                                           # Мосбиржа — пачкой напрямую, параллельно (IP сервера она банит)
+        def one(i):
+            try:
+                return ext_open(urls[i], timeout=min(timeout, 25))
+            except Exception:  # noqa: BLE001
+                return None
+        for i, r in zip(direct, pool_map(one, direct, workers=DIRECT_PAR)):
+            out[i] = r
+        rest = [i for i in range(len(urls)) if i not in set(direct)]
+        if rest:
+            for i, r in zip(rest, ext_get_many([urls[i] for i in rest], timeout)):
+                out[i] = r
+        return out
     srv, key = ds_conf()
     now = time.time()
     if not urls or not srv or now < _ds_state["down_until"] or now < _ds_batch_off[0]:
