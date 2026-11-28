@@ -131,7 +131,7 @@ class Snapshot(unittest.TestCase):
         def uo(req, timeout=0, context=None):
             seen.update(req.headers)
             return _resp(gzip.compress(json.dumps(_snap()).encode()), {"Content-Encoding": "gzip", "ETag": '"e1"'})
-        with mock.patch.object(M.urllib.request, "urlopen", side_effect=uo):
+        with mock.patch.object(M, "ds_urlopen", side_effect=uo):
             d = M.market_snapshot_get("stocks", force=True)
         self.assertEqual(d["data"][0]["secid"], "SBER")
         self.assertEqual(seen.get("Accept-encoding"), "gzip")
@@ -139,7 +139,7 @@ class Snapshot(unittest.TestCase):
         self.assertNotIn("Authorization", seen)
 
     def test_plain_body_works(self):
-        with mock.patch.object(M.urllib.request, "urlopen", return_value=_resp(json.dumps(_snap()).encode())):
+        with mock.patch.object(M, "ds_urlopen", return_value=_resp(json.dumps(_snap()).encode())):
             self.assertIsNotNone(M.market_snapshot_get("stocks", force=True))
 
     def test_gunzip_bomb_limited(self):
@@ -147,25 +147,25 @@ class Snapshot(unittest.TestCase):
             M.snap_gunzip(gzip.compress(b"0" * 5000), limit=100)
 
     def test_304_uses_stored(self):
-        with mock.patch.object(M.urllib.request, "urlopen", return_value=_resp(json.dumps(_snap()).encode(), {"ETag": '"e1"'})):
+        with mock.patch.object(M, "ds_urlopen", return_value=_resp(json.dumps(_snap()).encode(), {"ETag": '"e1"'})):
             M.market_snapshot_get("stocks", force=True)
         seen = {}
 
         def uo(req, timeout=0, context=None):
             seen.update(req.headers)
             raise urllib.error.HTTPError(req.full_url, 304, "Not Modified", {}, None)
-        with mock.patch.object(M.urllib.request, "urlopen", side_effect=uo):
+        with mock.patch.object(M, "ds_urlopen", side_effect=uo):
             d = M.market_snapshot_get("stocks", force=True)
         self.assertEqual(seen.get("If-none-match"), '"e1"')
         self.assertEqual(d["data"][0]["secid"], "SBER")
 
     def test_fallbacks_to_none(self):
-        with mock.patch.object(M.urllib.request, "urlopen", side_effect=OSError("down")):
+        with mock.patch.object(M, "ds_urlopen", side_effect=OSError("down")):
             self.assertIsNone(M.market_snapshot_get("stocks", force=True))
-        with mock.patch.object(M.urllib.request, "urlopen", return_value=_resp(json.dumps({"ok": True, "data": {"empty": True}}).encode())):
+        with mock.patch.object(M, "ds_urlopen", return_value=_resp(json.dumps({"ok": True, "data": {"empty": True}}).encode())):
             self.assertIsNone(M.market_snapshot_get("stocks", force=True))
         old = _snap(age=M.MARKET_SNAP_STALE + 60)
-        with mock.patch.object(M.urllib.request, "urlopen", return_value=_resp(json.dumps(old).encode())):
+        with mock.patch.object(M, "ds_urlopen", return_value=_resp(json.dumps(old).encode())):
             self.assertIsNone(M.market_snapshot_get("stocks", force=True))
             self.assertIsNone(M.market_snapshot_stocks())
 

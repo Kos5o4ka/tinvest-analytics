@@ -46,8 +46,114 @@ def ds_conf():
     return url, key
 
 
+# ─────────────── постоянные соединения с сервером данных (keep-alive) ───────────────
+# urlopen открывает новое TCP- и TLS-соединение на каждый запрос: +0,1–0,3 с даже к ответу из кэша, а экраны делают сотни
+# запросов. Здесь соединения переиспользуются: общий пул под замком (не thread-local — многие вызовы создают свой
+# ThreadPoolExecutor, и соединения умерших потоков утекали бы). Контракт как у urlopen: при коде >= 400 — HTTPError с
+# заголовками (get/get_all работают), тайм-ауты пробрасываются как есть. Через прокси (HTTPS_PROXY и системный) — прежний urlopen.
+DS_POOL_MAX = 8
+_ds_pool = {}                            # (схема, хост:порт) -> [свободные соединения]
+_ds_pool_lock = threading.Lock()
+_DS_RETRY_ERR = (http.client.RemoteDisconnected, http.client.BadStatusLine, http.client.CannotSendRequest,
+                 http.client.ResponseNotReady, BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ssl.SSLError)
+
+
+class _DsResp:
+    """Ответ, прочитанный целиком (соединение сразу возвращается в пул)."""
+
+    def __init__(self, status, headers, body):
+        self.status, self.headers, self._b = status, headers, io.BytesIO(body)
+
+    def read(self, n=-1):
+        return self._b.read(n)
+
+    def getcode(self):
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def ds_pool_clear():
+    with _ds_pool_lock:
+        conns = [c for lst in _ds_pool.values() for c in lst]
+        _ds_pool.clear()
+    for c in conns:
+        try:
+            c.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _ds_pool_get(key, timeout):
+    with _ds_pool_lock:
+        lst = _ds_pool.get(key)
+        c = lst.pop() if lst else None
+    if c is not None:
+        c.timeout = timeout
+        if c.sock is not None:
+            try:
+                c.sock.settimeout(timeout)
+            except OSError:
+                c.close()
+        return c, True
+    scheme, netloc = key
+    if scheme == "https":
+        return http.client.HTTPSConnection(netloc, timeout=timeout, context=_ssl()), False
+    return http.client.HTTPConnection(netloc, timeout=timeout), False
+
+
+def _ds_pool_put(key, c):
+    with _ds_pool_lock:
+        lst = _ds_pool.setdefault(key, [])
+        if len(lst) < DS_POOL_MAX:
+            lst.append(c)
+            return
+    c.close()
+
+
+def ds_urlopen(req, timeout=30):
+    """Замена urllib.request.urlopen(req, timeout, context=_ssl()) для запросов к серверу данных."""
+    u = urllib.parse.urlsplit(req.full_url)
+    if u.scheme not in ("http", "https") or urllib.request.getproxies().get(u.scheme):
+        return urllib.request.urlopen(req, timeout=timeout, context=_ssl())
+    key = (u.scheme, u.netloc)
+    path = (u.path or "/") + ("?" + u.query if u.query else "")
+    hd = dict(req.header_items())
+    hd.setdefault("Host", u.netloc)
+    for attempt in (0, 1):
+        c, reused = _ds_pool_get(key, timeout)
+        try:
+            c.request(req.get_method(), path, body=req.data, headers=hd)
+            r = c.getresponse()
+            body = r.read()
+        except _DS_RETRY_ERR as e:
+            c.close()
+            if reused and attempt == 0:                # сервер закрыл простаивающее соединение — повторяем на новом
+                continue
+            raise urllib.error.URLError(e)
+        except (socket.timeout, TimeoutError):
+            c.close()
+            raise
+        except OSError as e:
+            c.close()
+            raise urllib.error.URLError(e)
+        if r.will_close:
+            c.close()
+        else:
+            _ds_pool_put(key, c)
+        if r.status >= 400:
+            raise urllib.error.HTTPError(req.full_url, r.status, r.reason, r.headers, io.BytesIO(body))
+        return _DsResp(r.status, r.headers, body)
+    raise urllib.error.URLError("нет соединения")      # недостижимо: второй проход либо вернул ответ, либо бросил
+
+
 def ds_reset():
     _ds_conf_cache[0] = 0.0
+    ds_pool_clear()
     with _ds_lock:
         _ds_state["down_until"] = 0.0
         _ds_state["error"] = ""
@@ -185,7 +291,7 @@ def _ds_request(srv, key, url, data, headers, timeout):
     req = urllib.request.Request(srv + "/v1/fetch?url=" + urllib.parse.quote(url, safe=""), data=data, headers=hd,
                                  method="POST" if data is not None else "GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout + 5, context=_ssl()) as r:
+        with ds_urlopen(req, timeout=timeout + 5) as r:
             body = r.read()
             return (r.status, body, r.headers.get("Content-Type") or "", r.headers.get_all("X-Set-Cookie") or [],
                     r.headers.get("X-Cache") or "miss")
@@ -228,7 +334,7 @@ def ds_parsed(name, params=None, timeout=20):
         hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     try:
         req = urllib.request.Request(srv + "/v1/parsed/" + name + q, headers=hd)
-        with urllib.request.urlopen(req, timeout=timeout + 5, context=_ssl()) as r:
+        with ds_urlopen(req, timeout=timeout + 5) as r:
             j = json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):

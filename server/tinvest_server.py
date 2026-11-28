@@ -1413,6 +1413,9 @@ class DataServer:
 class Handler(BaseHTTPRequestHandler):
     server_version = "tinvest-data/" + VERSION
     protocol_version = "HTTP/1.1"
+    # Соединение держится открытым между запросами (keep-alive) — клиенту не нужно заново открывать TCP и TLS на каждый запрос.
+    # Простаивающее соединение закрывается через timeout секунд, иначе оно бесконечно держит поток сервера.
+    timeout = 15
     app = None   # DataServer
 
     def log_message(self, fmt, *args):
@@ -1457,6 +1460,7 @@ class Handler(BaseHTTPRequestHandler):
         body = b""
         n = int(self.headers.get("Content-Length") or 0)
         if n > (sync.MAX_BODY if u.path == "/v1/sync/push" else MAX_BODY_IN):
+            self.close_connection = True              # тело не прочитано: соединение дальше использовать нельзя
             return self._send(413, {"error": "body too large"})
         if n:
             body = self.rfile.read(n)

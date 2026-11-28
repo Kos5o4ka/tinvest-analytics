@@ -56,6 +56,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("Host", "") in ("127.0.0.1:%d" % port, "localhost:%d" % port, "[::1]:%d" % port)
 
     def guard(self, fn):
+        u = urlparse(self.path)
+        t0, c0 = time.time(), (perf_snapshot() if u.path.startswith("/api/") else None)
+        try:
+            self._guard(fn)
+        finally:
+            if c0 is not None:
+                perf_log(perf_label(u.path, u.query), time.time() - t0, c0)
+
+    def _guard(self, fn):
         try:
             fn()
         except ApiError as e:

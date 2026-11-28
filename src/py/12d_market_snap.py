@@ -25,7 +25,7 @@ def _snap_http(url, headers, timeout):
     """GET -> (код, тело, заголовки). 304 возвращается как обычный результат с пустым телом; gzip распаковывается."""
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+        with ds_urlopen(req, timeout=timeout) as r:
             code, body, hd = r.status, r.read(MARKET_SNAP_MAX_BYTES + 1), r.headers
     except urllib.error.HTTPError as e:
         if e.code != 304:

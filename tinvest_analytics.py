@@ -17,6 +17,7 @@ import csv
 import gzip
 import hashlib
 import hmac
+import http.client
 import io
 import json
 import os
@@ -2074,6 +2075,7 @@ class TInvest:
                     "Authorization": "Bearer " + self.token, "Content-Type": "application/json",
                     "Accept": "application/json", "x-app-name": "tinvest-analytics"})
                 try:
+                    perf_count("tinvest")
                     with API_SEM:
                         with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
                             TInvest._good_host[self.sandbox] = host
@@ -8387,8 +8389,114 @@ def ds_conf():
     return url, key
 
 
+# ─────────────── постоянные соединения с сервером данных (keep-alive) ───────────────
+# urlopen открывает новое TCP- и TLS-соединение на каждый запрос: +0,1–0,3 с даже к ответу из кэша, а экраны делают сотни
+# запросов. Здесь соединения переиспользуются: общий пул под замком (не thread-local — многие вызовы создают свой
+# ThreadPoolExecutor, и соединения умерших потоков утекали бы). Контракт как у urlopen: при коде >= 400 — HTTPError с
+# заголовками (get/get_all работают), тайм-ауты пробрасываются как есть. Через прокси (HTTPS_PROXY и системный) — прежний urlopen.
+DS_POOL_MAX = 8
+_ds_pool = {}                            # (схема, хост:порт) -> [свободные соединения]
+_ds_pool_lock = threading.Lock()
+_DS_RETRY_ERR = (http.client.RemoteDisconnected, http.client.BadStatusLine, http.client.CannotSendRequest,
+                 http.client.ResponseNotReady, BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ssl.SSLError)
+
+
+class _DsResp:
+    """Ответ, прочитанный целиком (соединение сразу возвращается в пул)."""
+
+    def __init__(self, status, headers, body):
+        self.status, self.headers, self._b = status, headers, io.BytesIO(body)
+
+    def read(self, n=-1):
+        return self._b.read(n)
+
+    def getcode(self):
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def ds_pool_clear():
+    with _ds_pool_lock:
+        conns = [c for lst in _ds_pool.values() for c in lst]
+        _ds_pool.clear()
+    for c in conns:
+        try:
+            c.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _ds_pool_get(key, timeout):
+    with _ds_pool_lock:
+        lst = _ds_pool.get(key)
+        c = lst.pop() if lst else None
+    if c is not None:
+        c.timeout = timeout
+        if c.sock is not None:
+            try:
+                c.sock.settimeout(timeout)
+            except OSError:
+                c.close()
+        return c, True
+    scheme, netloc = key
+    if scheme == "https":
+        return http.client.HTTPSConnection(netloc, timeout=timeout, context=_ssl()), False
+    return http.client.HTTPConnection(netloc, timeout=timeout), False
+
+
+def _ds_pool_put(key, c):
+    with _ds_pool_lock:
+        lst = _ds_pool.setdefault(key, [])
+        if len(lst) < DS_POOL_MAX:
+            lst.append(c)
+            return
+    c.close()
+
+
+def ds_urlopen(req, timeout=30):
+    """Замена urllib.request.urlopen(req, timeout, context=_ssl()) для запросов к серверу данных."""
+    u = urllib.parse.urlsplit(req.full_url)
+    if u.scheme not in ("http", "https") or urllib.request.getproxies().get(u.scheme):
+        return urllib.request.urlopen(req, timeout=timeout, context=_ssl())
+    key = (u.scheme, u.netloc)
+    path = (u.path or "/") + ("?" + u.query if u.query else "")
+    hd = dict(req.header_items())
+    hd.setdefault("Host", u.netloc)
+    for attempt in (0, 1):
+        c, reused = _ds_pool_get(key, timeout)
+        try:
+            c.request(req.get_method(), path, body=req.data, headers=hd)
+            r = c.getresponse()
+            body = r.read()
+        except _DS_RETRY_ERR as e:
+            c.close()
+            if reused and attempt == 0:                # сервер закрыл простаивающее соединение — повторяем на новом
+                continue
+            raise urllib.error.URLError(e)
+        except (socket.timeout, TimeoutError):
+            c.close()
+            raise
+        except OSError as e:
+            c.close()
+            raise urllib.error.URLError(e)
+        if r.will_close:
+            c.close()
+        else:
+            _ds_pool_put(key, c)
+        if r.status >= 400:
+            raise urllib.error.HTTPError(req.full_url, r.status, r.reason, r.headers, io.BytesIO(body))
+        return _DsResp(r.status, r.headers, body)
+    raise urllib.error.URLError("нет соединения")      # недостижимо: второй проход либо вернул ответ, либо бросил
+
+
 def ds_reset():
     _ds_conf_cache[0] = 0.0
+    ds_pool_clear()
     with _ds_lock:
         _ds_state["down_until"] = 0.0
         _ds_state["error"] = ""
@@ -8526,7 +8634,7 @@ def _ds_request(srv, key, url, data, headers, timeout):
     req = urllib.request.Request(srv + "/v1/fetch?url=" + urllib.parse.quote(url, safe=""), data=data, headers=hd,
                                  method="POST" if data is not None else "GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout + 5, context=_ssl()) as r:
+        with ds_urlopen(req, timeout=timeout + 5) as r:
             body = r.read()
             return (r.status, body, r.headers.get("Content-Type") or "", r.headers.get_all("X-Set-Cookie") or [],
                     r.headers.get("X-Cache") or "miss")
@@ -8569,7 +8677,7 @@ def ds_parsed(name, params=None, timeout=20):
         hd.update(hwid_headers())                      # хэш ПК: лимит компьютеров на аккаунт
     try:
         req = urllib.request.Request(srv + "/v1/parsed/" + name + q, headers=hd)
-        with urllib.request.urlopen(req, timeout=timeout + 5, context=_ssl()) as r:
+        with ds_urlopen(req, timeout=timeout + 5) as r:
             j = json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
@@ -10653,7 +10761,7 @@ def _snap_http(url, headers, timeout):
     """GET -> (код, тело, заголовки). 304 возвращается как обычный результат с пустым телом; gzip распаковывается."""
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_ssl()) as r:
+        with ds_urlopen(req, timeout=timeout) as r:
             code, body, hd = r.status, r.read(MARKET_SNAP_MAX_BYTES + 1), r.headers
     except urllib.error.HTTPError as e:
         if e.code != 304:
@@ -10822,6 +10930,62 @@ def hwid_headers():
         return {"X-Hwid": hwid_get()}
     except Exception:  # noqa: BLE001
         return {}
+# ═══════════════ Журнал медленных экранов: сколько секунд и сетевых запросов ушло на запрос интерфейса ═══════════════
+# Пишется в <папка данных>/perf.log только для запросов дольше PERF_MIN_SEC. Тела запросов и параметры с данными не пишутся:
+# только путь, имя экрана (page=…/kind=… из адреса) и счётчики. Счётчики общие на процесс, поэтому при параллельных
+# запросах цифры приблизительные (об этом сказано в шапке файла).
+
+PERF_MIN_SEC = 0.5
+PERF_MAX_BYTES = 1_000_000
+_perf_lock = threading.Lock()
+_perf_cnt = {"tinvest": 0}
+PERF_HEAD = ("# TAnalytic: медленные запросы интерфейса (дольше %.1f с). Колонки: время, путь, секунды, запросы к серверу данных "
+             "(из кэша / мимо кэша / устаревшие), напрямую к источникам, к API Т-Инвестиций. Счётчики общие на программу: "
+             "если в это время шли другие загрузки, цифры приблизительные.\n" % PERF_MIN_SEC)
+
+
+def perf_count(k):
+    with _perf_lock:
+        _perf_cnt[k] = _perf_cnt.get(k, 0) + 1
+
+
+def perf_snapshot():
+    with _ds_lock:
+        s = {k: _ds_state.get(k, 0) for k in ("hit", "miss", "stale", "direct")}
+    with _perf_lock:
+        s["tinvest"] = _perf_cnt.get("tinvest", 0)
+    return s
+
+
+def perf_label(path, query=""):
+    """Путь + безопасные уточнения (page, kind, tab), чтобы различать экраны с общим адресом. Остальные параметры отбрасываются."""
+    try:
+        q = parse_qs(query or "")
+    except Exception:  # noqa: BLE001
+        q = {}
+    extra = ["%s=%s" % (k, re.sub(r"[^\w.-]", "", (q.get(k) or [""])[0])[:24]) for k in ("page", "kind", "tab", "mode") if q.get(k)]
+    return path + (("?" + "&".join(extra)) if extra else "")
+
+
+def perf_log(label, sec, before, after=None):
+    if sec < PERF_MIN_SEC:
+        return
+    after = after or perf_snapshot()
+    d = {k: after.get(k, 0) - before.get(k, 0) for k in after}
+    line = "%s\t%s\t%.2f\tсервер %d/%d/%d\tнапрямую %d\tТ-Инвестиции %d\n" % (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), label, sec, d["hit"], d["miss"], d["stale"], d["direct"], d["tinvest"])
+    path = os.path.join(APP_DIR, "perf.log")
+    try:
+        with _perf_lock:
+            if os.path.exists(path) and os.path.getsize(path) > PERF_MAX_BYTES:
+                os.replace(path, path + ".1")
+            new = not os.path.exists(path)
+            with open(path, "a", encoding="utf-8") as f:
+                if new:
+                    f.write(PERF_HEAD)
+                f.write(line)
+    except OSError:
+        pass
 # ── курс КБД сегодня, спред к КБД ──
 
 _kbd_now = {"t": 0, "pts": []}
@@ -31227,6 +31391,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("Host", "") in ("127.0.0.1:%d" % port, "localhost:%d" % port, "[::1]:%d" % port)
 
     def guard(self, fn):
+        u = urlparse(self.path)
+        t0, c0 = time.time(), (perf_snapshot() if u.path.startswith("/api/") else None)
+        try:
+            self._guard(fn)
+        finally:
+            if c0 is not None:
+                perf_log(perf_label(u.path, u.query), time.time() - t0, c0)
+
+    def _guard(self, fn):
         try:
             fn()
         except ApiError as e:

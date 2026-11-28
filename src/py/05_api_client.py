@@ -74,6 +74,7 @@ class TInvest:
                     "Authorization": "Bearer " + self.token, "Content-Type": "application/json",
                     "Accept": "application/json", "x-app-name": "tinvest-analytics"})
                 try:
+                    perf_count("tinvest")
                     with API_SEM:
                         with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
                             TInvest._good_host[self.sandbox] = host

@@ -17,6 +17,7 @@ import csv
 import gzip
 import hashlib
 import hmac
+import http.client
 import io
 import json
 import os
